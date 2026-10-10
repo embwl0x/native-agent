@@ -374,9 +374,8 @@ func appendRetiredProductionAdaptiveEffortErrors(repo: URL, errors: inout [Strin
         "Sources/NativeAgentApp/AppModel.swift",
         "Sources/NativeAgentApp/AppModel+ViewClientOps.swift",
         "Sources/NativeAgentApp/ChatView+SlashCommands.swift",
-        "Sources/NativeAgentApp/NativeClient+ApprovalExecutors.swift",
+        "Sources/NativeAgentApp/AppApprovalTransactionEffects.swift",
         "Modules/NativeAgentCore/Sources/ApprovalTransactions/ApprovalTransactionCoordinator.swift",
-        "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift",
     ]
     for path in productionBoundaryFiles {
         let url = repo.appendingPathComponent(path)
@@ -504,7 +503,6 @@ let enforcedFamilies: [Family] = [
     Family(label: "AppModel", directory: "Sources/NativeAgentApp", prefix: "AppModel+"),
     Family(label: "EngineRuntime", directory: "Modules/NativeAgentCore/Sources/EngineRuntime", prefix: "Engine"),
     Family(label: "BackgroundLoopsAssembly", directory: "Sources/NativeAgentApp", prefix: "BackgroundLoopsAssembly+"),
-    Family(label: "NativeClient", directory: "Sources/NativeAgentApp", prefix: "NativeClient+"),
     Family(label: "ApprovalTransactionCoordinator", directory: "Modules/NativeAgentCore/Sources/ApprovalTransactions", prefix: "ApprovalTransactionCoordinator"),
     Family(label: "SchedulerDueJobRunner", directory: "Modules/NativeAgentCore/Sources/SchedulerExecution", prefix: "SchedulerDueJobRunner+"),
     Family(label: "NativeOAuthFlow", directory: "Modules/NativeAgentCore/Sources/ProviderRouting", prefix: "NativeOAuthFlow+", additionalDirectories: ["Modules/NativeAgentCore/Sources/Connectors"]),

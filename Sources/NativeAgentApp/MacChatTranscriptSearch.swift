@@ -284,6 +284,20 @@ final class MacChatTranscriptSearchController {
         return results[selectedIndex].messageID
     }
 
+    /// Select one message by id as a search result is selected, so the
+    /// transcript pages to it and scrolls there. False when it is not here.
+    @discardableResult
+    func reveal(messageID: String) -> Bool {
+        guard let document = documents.first(where: { $0.messageID == messageID }) else { return false }
+        setQuery("")
+        results = [MacChatTranscriptSearchResult(messageID: messageID, ordinal: document.ordinal)]
+        totalMatchCount = 1
+        cursor = MacChatTranscriptSearchCursor(resultCount: 1)
+        phase = .results
+        selectionRevision &+= 1
+        return true
+    }
+
     func reset(for sessionID: String) {
         searchTask?.cancel()
         searchTask = nil

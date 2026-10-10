@@ -1,5 +1,6 @@
 import Privacy
 import Foundation
+import ApprovalTransactions
 import AttentionRouting
 import Agents
 import ChatOrchestration
@@ -20,6 +21,7 @@ import CoreGraphics
 import MacControl
 import ApprovalInbox
 import WorkshopExecution
+import Browser
 
 extension AppToolExecutor {
     convenience init(
@@ -62,7 +64,6 @@ extension AppToolExecutor {
         dryRun: Bool,
         input: [String: JSONValue]
     ) async throws -> JSONValue {
-        let client = NativeClient()
         return try await defaultBrowserActionRunner(
             actionId: actionId, dryRun: dryRun, input: input,
             chrome: { NativeAgentEngine.live.chrome }, macPersonAway: Self.macPersonAway,
@@ -73,12 +74,12 @@ extension AppToolExecutor {
                     return (setup.folder, setup.extensionsPageOpened, setup.message)
                 },
                 readStatus: {
-                    try await NativeClient.browserActionRoutes.visibleBrowserStatus(
-                        JSONValue.fromEncodable(try await client.getBrowserStatus()))
+                    try await BrowserActionRoutes.app.visibleBrowserStatus(JSONValue.fromEncodable(
+                        try await RuntimeReadProjection.getBrowserStatus(dataRoot: PersistenceCore.defaultDataRoot())))
                 },
                 runNativeAction: { actionId, dryRun, input in
-                    let receipt = try await client.runNativeAction(
-                        id: actionId, dryRun: dryRun, input: try jsonObjectToAny(input))
+                    let receipt = try await NativeActionRoutes.runNativeAction(
+                        id: actionId, dryRun: dryRun, input: try jsonObjectToAny(input), dataRoot: nil, browser: .app)
                     return try JSONValue.fromEncodable(receipt)
                 }
             ))
@@ -94,8 +95,7 @@ extension AppToolExecutor {
     /// Only the step the task is blocked on; approving is User's below Full
     /// Mac, and the door refuses it there.
     static func decideBlockedWorkshopStep(id: String, approve: Bool) async throws -> JSONValue {
-        let client = NativeClient()
-        guard let execution = try await client.makeWorkshopExecutionRunner().getWorkshopExecution(id) else {
+        guard let execution = try await BackgroundLoopsAssembly.makeWorkshopExecutionRunner().getWorkshopExecution(id) else {
             return .object(["status": .string("not_found"), "id": .string(id),
                 "detail": .string("No Desk task has this execution id. app workshop.status lists them.")])
         }
@@ -112,12 +112,14 @@ extension AppToolExecutor {
         let provenance = ApprovalResolutionProvenance.local(
             decidedBy: PersonaCompiler.agentDisplayName(dataRoot: PersistenceCore.defaultDataRoot()))
         if approve {
-            let record = try await client.approveStep(executionId: id, stepId: execution.currentStepId, provenance: provenance)
+            let record = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
+                executionId: id, stepId: execution.currentStepId, decision: "approve", provenance: provenance)
             return .object(["status": .string("approved"), "id": .string(id), "step_id": .string(execution.currentStepId),
                 "execution_status": .string(record.status),
                 "detail": .string("Approved the waiting step; the task runs on from it.")])
         }
-        let record = try await client.rejectStep(executionId: id, stepId: execution.currentStepId, provenance: provenance)
+        let record = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
+            executionId: id, stepId: execution.currentStepId, decision: "reject", provenance: provenance)
         return .object(["status": .string("rejected"), "id": .string(id), "step_id": .string(execution.currentStepId),
             "execution_status": .string(record.status),
             "detail": .string("Denied the waiting step; the task stops without running it.")])

@@ -342,7 +342,7 @@ public enum StudioCanonProposal {
     ///   `StudioCanonSeatGate` inside her live turn. It is not optional and
     ///   cannot be reconstructed later: an executor replaying a resolved card
     ///   has no live turn, so it cannot call this at all — see
-    ///   `NativeClient+ApprovalExecutors`, which refuses and annotates instead
+    ///   `ApprovalTransactionCoordinator`, which refuses and annotates instead
     ///   of inventing one.
     public static func applyResolved(
         record: ApprovalRecord,

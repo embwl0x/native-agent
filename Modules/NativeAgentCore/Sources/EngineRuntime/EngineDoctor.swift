@@ -10,8 +10,8 @@ import PersistenceCore
 /// background-loop watchdog for one data root, in core types. Diagnostics,
 /// Status, the health pill, the menu line, Setup and Support Snapshot render
 /// this state; the health read is nonisolated so the phone lane uses the same
-/// owner. Checks still run through the Doctor executors on `NativeClient`
-/// (`runDoctor`, `liveDoctorCoverageChecks`, `getHealthCard`).
+/// owner. Checks run through the app's Doctor port (`AppDoctorPort`:
+/// `runDoctor`, `liveDoctorCoverageChecks`, `getHealthCard`).
 @MainActor
 @Observable
 public final class DoctorFacade {

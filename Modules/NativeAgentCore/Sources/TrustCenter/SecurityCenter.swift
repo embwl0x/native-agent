@@ -478,17 +478,6 @@ public actor SwiftNativeSecurityCenter {
         //   1. Remote origins must be authenticated by their canonical surface
         //      owner (Telegram allowlist, paired iOS identity, verified Slack).
         //      A surface label alone never receives Full Mac authority.
-        //   2. NOT self-modification. evolution_propose / self_install profile
-        //      as .critical (evolution_write / evolution_apply_trigger); a yolo
-        //      window does NOT satisfy their Developer-Mode requirement, so the
-        //      dev-mode block still fires for them even locally. Self-modification
-        //      keeps maximum defense (this block + confirm autonomy + the
-        //      human-approved install card). The claude/codex bridge is open to
-        //      these as of 2026-06-13, but the install card is the gate: yolo
-        //      never rides the self-evolution surface, and self_install only
-        //      stages a card the user resolves.
-        // The self-evolution / training-promotion developerMode gates in
-        // SelfImprovement read the raw policy flag and are likewise untouched.
         let yoloSatisfiesDevMode = fullMacYoloAuthority.admitted
         if decision != .block,
            profile.risk == .critical,

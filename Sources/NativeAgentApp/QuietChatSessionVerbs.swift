@@ -160,7 +160,7 @@ enum QuietChatSessionVerbs {
         }
         if !reachesUser, ["show", "detach", "close_window"].contains(verb) {
             return .failure(Refusal(json: failure(
-                "users_screen",
+                "owners_screen",
                 "\(verb) moves the person's screen, and they did not start this turn. Ask them first, "
                 + "or tell them where it is (\(session.title), session_id \(session.id)) and let them open it.",
                 session
@@ -171,7 +171,7 @@ enum QuietChatSessionVerbs {
             && !text(input["turn_id"]).isEmpty && isRunning(session.id, appModel)
         if !reachesUser, (["stop", "archive", "regenerate", "clear"].contains(verb) || interruptsReply), userIsIn(session.id, appModel) {
             return .failure(Refusal(json: failure(
-                "user_is_in_it",
+                "owner_is_in_it",
                 "The person is in \(session.title) (on screen or in its own window), and they did not start this turn. "
                 + "Ask them first, or leave it to them.",
                 session

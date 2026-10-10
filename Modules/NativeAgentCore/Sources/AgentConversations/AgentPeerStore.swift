@@ -31,6 +31,10 @@ public struct AgentRoundTripProof: Codable, Sendable, Equatable {
     public let credentialKey: String?
     public var appBundlePath: String?
     public var appVersion: String?
+    /// The recipe the round trip ran on (`AgentRecipeStore`): its version, and
+    /// its digest, which also catches a hand edit that bumped nothing.
+    public var recipeVersion: Int?
+    public var recipeDigest: String?
 }
 
 struct AgentConnectionProbe: Codable, Sendable, Equatable {
@@ -49,7 +53,18 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
         return AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.bundleIDs } ?? []
     }
 
-    func stampApp(_ proof: inout AgentRoundTripProof) {
+    /// Its recipe's id (`AgentRecipeStore`): its host's row, or for an A2A
+    /// contact its own id, since its card is a recipe of its own.
+    public var recipeID: String? { transport == .a2a ? id : AgentPeerStore.hostRowID(endpoint) }
+
+    /// What "unverified" later compares against: the recipe the send used,
+    /// as the transport captured it when the send started, and the app's own
+    /// version (CFBundleShortVersionString).
+    func stampVersions(_ proof: inout AgentRoundTripProof, recipe: AgentRecipeStore.Recipe?) {
+        if let recipe {
+            proof.recipeVersion = recipe.recipeVersion
+            proof.recipeDigest = recipe.hostDigest
+        }
         guard let app = appBundleIDs.compactMap(AgentHostRow.applicationURL).first else { return }
         proof.appBundlePath = app.path
         proof.appVersion = Self.appVersion(at: app.path)
@@ -379,7 +394,8 @@ public struct AgentPeerStore: Sendable {
     }
 
     /// Consume this exact challenge once; unrelated, stale and replayed traffic cannot prove it.
-    package func finishConnectionProbe(peerID: String, nonce: String, ran: Bool, workspace: String) -> Bool {
+    package func finishConnectionProbe(peerID: String, nonce: String, ran: Bool, workspace: String,
+                                       recipe: AgentRecipeStore.Recipe? = nil) -> Bool {
         (try? CredentialFileLock.withLock(fileURL) {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID }),
@@ -391,7 +407,7 @@ public struct AgentPeerStore: Sendable {
             if arrived, let at = probe.receivedAt {
                 peers[index].mcpReturnProof = AgentRoundTripProof(at: at, endpoint: peer.endpoint,
                     executable: nil, version: nil, workspace: workspace, credentialKey: peer.credentialKey)
-                peer.stampApp(&peers[index].mcpReturnProof!)
+                peer.stampVersions(&peers[index].mcpReturnProof!, recipe: recipe)
                 peers[index].unavailableAt = nil
             }
             try write(peers)
@@ -400,9 +416,10 @@ public struct AgentPeerStore: Sendable {
     }
 
     /// Called only by a transport after a validated response to its request.
-    /// Inbound traffic alone never writes round-trip evidence.
+    /// Inbound traffic alone never writes round-trip evidence. `recipe` is the
+    /// one the send used, captured when it started; a route no recipe drives has none.
     public func recordRoundTrip(peerID: String, executable: String? = nil,
-                                version: String? = nil, workspace: String) {
+                                version: String? = nil, workspace: String, recipe: AgentRecipeStore.Recipe? = nil) {
         try? prepareDirectory()
         try? CredentialFileLock.withLock(fileURL) {
             var peers = try read()
@@ -411,7 +428,7 @@ public struct AgentPeerStore: Sendable {
             var proof = AgentRoundTripProof(
                 at: ISO8601DateFormatter().string(from: Date()), endpoint: peer.endpoint,
                 executable: executable, version: version, workspace: workspace, credentialKey: peer.credentialKey)
-            peer.stampApp(&proof)
+            peer.stampVersions(&proof, recipe: recipe)
             peers[index].roundTripProof = proof
             peers[index].unavailableAt = nil
             try write(peers)
@@ -481,8 +498,8 @@ public struct AgentPeerStore: Sendable {
             (lhs.transport != .mcpHost || lhs.hostWorkspace == rhs.hostWorkspace)
     }
 
-    /// The known-agent row id behind an `mcp://<id>` endpoint, or nil. A row
-    /// this build does not have is not an identity this store will accept.
+    /// The known-agent row id behind an `mcp://<id>` endpoint, or nil. A host
+    /// with no recipe is not an identity this store will accept.
     public static func hostRowID(_ endpoint: URL) -> String? {
         if let bundle = desktopBundleID(endpoint) {
             return AgentHostDirectory.rows.first { $0.route == .desktopChat && $0.bundleIDs.contains(bundle) }?.id
@@ -519,6 +536,10 @@ public struct AgentPeerStore: Sendable {
     }
 
     public static func validate(_ contact: AgentPeerContact) throws {
+        try validate(contact, allowRetiredHost: false)
+    }
+
+    private static func validate(_ contact: AgentPeerContact, allowRetiredHost: Bool) throws {
         guard validID(contact.id), !contact.name.isEmpty,
               contact.name.count <= maximumNameLength,
               contact.name.utf8.count <= maximumNameLength * 4,
@@ -557,12 +578,17 @@ public struct AgentPeerStore: Sendable {
             // An identity, not an address: nothing here is ever dialled, and
             // the key this contact owns is the only thing that resolves an
             // inbound request to it.
-            guard let id = hostRowID(contact.endpoint),
-                  let row = AgentHostDirectory.rows.first(where: { $0.id == id }) else { throw AgentPeerStoreError.invalidEndpoint }
-            if contact.transport == .acp {
-                guard contact.endpoint.scheme == "acp", row.acp != nil else { throw AgentPeerStoreError.invalidEndpoint }
-            } else if contact.endpoint.scheme != "mcp" { throw AgentPeerStoreError.invalidEndpoint }
-            if row.requiresWorkspace {
+            let scheme = contact.transport == .acp ? "acp" : "mcp"
+            guard let host = contact.endpoint.host, !host.isEmpty,
+                  contact.endpoint.absoluteString == scheme + "://" + host,
+                  contact.endpoint.absoluteString.utf8.count <= maximumEndpointLength,
+                  host.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 45 })
+            else { throw AgentPeerStoreError.invalidEndpoint }
+            let row = hostRowID(contact.endpoint).flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
+            // Saved retired identities remain checked and removable; upsert rejects them.
+            guard row != nil || allowRetiredHost,
+                  contact.transport != .acp || row == nil || row?.acp != nil else { throw AgentPeerStoreError.invalidEndpoint }
+            if row?.requiresWorkspace == true || (row == nil && contact.hostWorkspace != nil) {
                 guard let folder = contact.hostWorkspace, folder.hasPrefix("/"),
                       !folder.contains("\0"), folder.utf8.count <= 4096 else { throw AgentPeerStoreError.invalidEndpoint }
             } else if contact.hostWorkspace != nil { throw AgentPeerStoreError.invalidEndpoint }
@@ -633,7 +659,7 @@ public struct AgentPeerStore: Sendable {
             guard peers.count <= Self.maximumContacts, Set(peers.map(\.id)).count == peers.count else {
                 throw AgentPeerStoreError.invalidConfiguration
             }
-            for peer in peers { try Self.validate(peer) }
+            for peer in peers { try Self.validate(peer, allowRetiredHost: true) }
             return peers
         } catch { throw AgentPeerStoreError.invalidConfiguration }
     }

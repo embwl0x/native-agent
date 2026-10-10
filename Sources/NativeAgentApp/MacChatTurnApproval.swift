@@ -12,7 +12,7 @@ import PersistenceCore
 /// function from the inbox rows the app already refreshes onto a display
 /// value, plus the honesty rules for reading a row's outcome.
 ///
-/// TrustCenter, the autonomy gates, and `NativeClient+ApprovalExecutors`
+/// TrustCenter, the autonomy gates, and `ApprovalTransactionCoordinator`
 /// are untouched — the card renders a decision and dispatches it through the
 /// same `resolveApproval` call every other surface uses.
 struct MacChatTurnCardApproval: Sendable, Equatable {

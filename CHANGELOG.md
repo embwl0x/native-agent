@@ -6,6 +6,20 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.6.1 — the body heals, the window follows (2026-10-10)
+
+### Surfaces as data
+- One layout document (ui/layout.json) drives the sidebar, rail, chat column, Today, the agent's home and the phone's More; layout.read / layout.write with undo; the glass language untouched.
+
+### Fewer rounds
+- The app door does many actions in one call with per-action receipts; refusals name the next step; Diagnostics shows rounds per turn and the heaviest asks.
+
+### A body that heals itself
+- Recipes as data for every agent host and A2A peer; discovery of any installed agent; heal on contact with one bound retry; every Doctor finding has an owner and a route, readings never wake anyone, warnings name their harm; the harness queue and daily body report; stalls cut at the provider's learned first-output deadline with an honest sentence.
+
+### The mind and the calls
+- Memory holds memories only; judgment loop (misses → lessons → growth); every model call carries a purpose; rule-shaped calls are rules.
+
 ## 0.6.0 — more of the Mac, on any model (2026-10-09)
 
 ### One door

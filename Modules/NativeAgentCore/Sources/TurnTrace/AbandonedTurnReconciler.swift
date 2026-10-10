@@ -68,18 +68,22 @@ public struct AbandonedTurnReconciler: Sendable {
         /// Sessions whose turn was cut off by the previous process ending
         /// shortly before this launch — the ones worth a one-line note.
         public let interruptedSessions: [(sessionId: String, surface: String)]
+        /// Why the sweep could not conclude: a day file it could not read or a
+        /// row it could not append. Nil for a conclusive sweep.
+        public let failure: String?
 
         public init(acceptedScanned: Int, reconciled: [String], tooRecentToJudge: Int,
-                    interruptedSessions: [(sessionId: String, surface: String)] = []) {
+                    interruptedSessions: [(sessionId: String, surface: String)] = [], failure: String? = nil) {
             self.acceptedScanned = acceptedScanned
             self.reconciled = reconciled
             self.tooRecentToJudge = tooRecentToJudge
             self.interruptedSessions = interruptedSessions
+            self.failure = failure
         }
 
         public static func == (lhs: Outcome, rhs: Outcome) -> Bool {
             lhs.acceptedScanned == rhs.acceptedScanned && lhs.reconciled == rhs.reconciled
-                && lhs.tooRecentToJudge == rhs.tooRecentToJudge
+                && lhs.tooRecentToJudge == rhs.tooRecentToJudge && lhs.failure == rhs.failure
                 && lhs.interruptedSessions.map { $0.sessionId + "|" + $0.surface }
                     == rhs.interruptedSessions.map { $0.sessionId + "|" + $0.surface }
         }
@@ -114,7 +118,8 @@ public struct AbandonedTurnReconciler: Sendable {
             // (GPT-5.6 round review r3, 2026-09-11).
             guard FileManager.default.fileExists(atPath: path.path) else { continue }
             guard let handle = try? String(contentsOf: path, encoding: .utf8) else {
-                return Outcome(acceptedScanned: 0, reconciled: [], tooRecentToJudge: 0)
+                return Outcome(acceptedScanned: 0, reconciled: [], tooRecentToJudge: 0,
+                               failure: "\(path.lastPathComponent) is unreadable")
             }
             for line in handle.split(separator: "\n", omittingEmptySubsequences: true) {
                 // Most rows are a turn's steps. Only a row naming a lifecycle
@@ -148,7 +153,7 @@ public struct AbandonedTurnReconciler: Sendable {
         var tooRecent = 0
         var written: [String] = []
         var writeAttempts = 0
-        var persistenceFailed = false
+        var persistenceFailure: String?
         var deferred = false
         var interrupted: [(sessionId: String, surface: String)] = []
         let candidates = accepted
@@ -238,7 +243,7 @@ public struct AbandonedTurnReconciler: Sendable {
                     }
                 }
             } catch {
-                persistenceFailed = true
+                persistenceFailure = "guarded append failed: \(error)"
                 FileHandle.standardError.write(
                     Data("TurnTracePersistLane: guarded append failed (turn \(turnId)): \(error)\n".utf8)
                 )
@@ -253,7 +258,7 @@ public struct AbandonedTurnReconciler: Sendable {
         // review, 2026-09-11).
         // A failed read/append or deferred candidate leaves the window pending.
         // Already confirmed terminals make the next pass idempotent.
-        if !persistenceFailed, !deferred, let newestScannedDay = Self.dayCalendar.date(
+        if persistenceFailure == nil, !deferred, let newestScannedDay = Self.dayCalendar.date(
             byAdding: .day, value: -scan.newestOffset, to: today
         ) {
             writeCursor(day: newestScannedDay)
@@ -262,7 +267,8 @@ public struct AbandonedTurnReconciler: Sendable {
             acceptedScanned: accepted.count,
             reconciled: written,
             tooRecentToJudge: tooRecent,
-            interruptedSessions: interrupted
+            interruptedSessions: interrupted,
+            failure: persistenceFailure
         )
     }
 

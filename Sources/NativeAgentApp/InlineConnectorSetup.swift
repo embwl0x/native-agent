@@ -185,7 +185,7 @@ enum InlineConnectorSetup {
             // Providers' own configure call — the same one its sheet makes.
             // `defaultModel: nil` so saving a key never silently repoints the
             // provider at a different model.
-            _ = try await appModel.configureProvider(
+            try await appModel.configureProvider(
                 provider, apiKey: key, authMode: "api_key", defaultModel: nil
             )
         } catch {
@@ -218,7 +218,7 @@ enum InlineConnectorSetup {
         if !chatID.isEmpty, !chats.contains(chatID) { chats.append(chatID) }
         let users = (existing?.allowedUserIds ?? []).map(String.init)
         do {
-            try await appModel.client.configureTelegram(
+            try await appModel.configureTelegram(
                 token: token,
                 allowedChatIds: chats,
                 allowedUserIds: users,
@@ -236,7 +236,7 @@ enum InlineConnectorSetup {
             return Outcome(note: "@\(username) verified; add an allowed chat ID before it can take messages")
         }
         do {
-            _ = try await appModel.client.testTelegram(chatId: target, dataRoot: dataRoot)
+            _ = try await appModel.sendTelegramTestReply(chatId: target, dataRoot: dataRoot)
             return Outcome(note: "@\(username) verified, test reply sent")
         } catch {
             return Outcome(error: "@\(username) is saved, but the test reply failed: \(error.localizedDescription)")

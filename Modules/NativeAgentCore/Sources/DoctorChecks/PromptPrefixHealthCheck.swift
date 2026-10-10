@@ -220,6 +220,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     + " Prefix-cache health is UNMEASURED \(window.describedAs) — this row"
                     + " is not reporting zero problems, it is reporting that it could not"
                     + " look.",
+                harm: "Prefix reuse problems cannot be diagnosed from the saved turns.",
                 repair: "Check permissions and encoding on data/turn_traces/<day>.jsonl."
             )
         }
@@ -244,7 +245,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
         if summary.isEmptyFeed {
             return CheckResult(
-                id: id, title: title, status: "ok",
+                id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
                     + " data/turn_traces. Prefix-cache health has not been observed."
                     + " \(shapeLine)",
@@ -254,7 +255,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         guard !v2FirstCalls.isEmpty else {
             return CheckResult(
                 // A bounded tail is not a failed measurement before the first eligible turn.
-                id: id, title: title, status: v1CallCount > 0 || summary.malformedLines > 0 ? "warn" : "ok",
+                id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
                     + " trace day(s) read and \(summary.matchedRows) row(s) in window, but not"
                     + " one eligible chat call used the current prompt format. Nothing about prefix reuse"
@@ -507,12 +508,13 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 + " stable mass for the affected sessions."
         } else if !coverageParts.isEmpty || unjudgedFirstCalls > 0 {
             // Incomplete coverage or missing metrics cannot certify health.
-            status = "warn"
+            status = "unmeasured"
         }
 
         return CheckResult(
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",
+            harm: DoctorSafeRepairPolicy.isAdverse(status) ? "Repeated prompt processing uses extra provider time and tokens." : nil,
             repair: repair
         )
     }

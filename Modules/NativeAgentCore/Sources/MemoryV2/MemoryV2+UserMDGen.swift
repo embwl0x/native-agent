@@ -270,24 +270,6 @@ public actor UserMDGenerator {
         // machine cruft.
         let items = memories.sorted { $0.createdAt > $1.createdAt }
         for m in items {
-            // Skill pointers are recall-only surfacing rows, not user facts.
-            // USER.md rides every prompt — rendering them here would re-crea-
-            // te the per-turn tax the skills-recall rework exists to avoid
-            // (gpt-5.5 review HIGH, 2026-07-03).
-            if m.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { continue }
-            if Self.memoryKind(m) == "skill" { continue }
-            // Workshop execution outcomes are the AGENT'S work journal —
-            // legitimate durable memories (E-2 writes them so she remembers
-            // what she built), but they are facts about her work, not about
-            // the USER. Without this gate they flooded the identity doc: 46
-            // of ~60 bullets were "Workshop execution X completed/failed"
-            // rows (User, 2026-08-06). Provenance-gated, not content-sniffed:
-            // the literal must equal WorkshopExecutionMemory.sourcePrefix
-            // ("workshop:") — MemoryV2 cannot import WorkshopExecution
-            // (dependency direction), so the two spellings are pinned by
-            // convention only. If sourcePrefix ever changes, this literal
-            // and UserMDGenTests must change with it.
-            if (m.source ?? "").hasPrefix("workshop:") { continue }
             // USER.md is User's IDENTITY doc, not the agent's working memory.
             // The workshop gate above killed one pollution source; the disease
             // was that renderBody projected EVERY active row, and the store
@@ -345,11 +327,21 @@ public actor UserMDGenerator {
     /// than the agent's work. The union observed live 2026-08-06 across
     /// chat.commit_memory and adaptive-promoter rows; extend deliberately,
     /// never automatically — every addition puts rows on a doc that rides
-    /// every prompt.
+    /// every prompt. Also the pinned core's admission (`userPromptCore`).
+    /// `moment` and `experience` are hers, not facts about User (10-10): they
+    /// ride recall, the Memories page and the diary.
     static let userIdentityKinds: Set<String> = [
         "user_fact", "user_preference", "preference", "relationship",
-        "identity", "attribute", "moment", "experience",
+        "identity", "attribute",
     ]
+
+    /// Why a memory of `kind` cannot be pinned, or nil when it can. The pinned
+    /// core carries only `userIdentityKinds`; every pin writer (the chat tool,
+    /// the Memories page, the phone) refuses with these words.
+    public static func pinRefusal(kind: String?) -> String? {
+        userIdentityKinds.contains(kind ?? "") ? nil
+            : "Pins carry facts about the owner; a \(kind ?? "memory with no kind") stays in recall, so nothing changed."
+    }
 
     private static func memoryKind(_ memory: StoredMemory) -> String? {
         guard case .object(let obj)? = memory.metadata,

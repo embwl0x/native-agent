@@ -1,214 +1,19 @@
 import Foundation
-import Darwin
 import NativeAgentCore
 import PersistenceCore
-import TrustCenter
 
-// Training, promotion, and evaluation readers, their caller-facing gate
-// predicates, and stored JSON field projections.
+// Evaluation reads remain independent of the weekly runtime improvement pass.
 extension SwiftNativeSelfImprovement {
-
-    // MARK: - Trust gates
-    // NativeClient consults these gates before exposing training/promotion data.
-    // A missing outer object or leaf preserves the default-true gate; a saved
-    // leaf must be a literal Bool. Damaged saved authority denies outright.
-    // Developer Mode is a separate explicit override after a successful read.
-    //
-    // 2026-09-13: these gates read saved leaves with Python-style truthiness,
-    // so `"autonomous_training": "false"` ENABLED training and
-    // `"developerMode": "false"` overrode every flag. Both are policy the
-    // canonical TrustCenter read rejects; the gates now go through the shared
-    // `SavedTrustPolicyAuthority` predicate and require literal booleans.
-
-    /// Only a missing policy receives bootstrap defaults. Existing unreadable,
-    /// malformed or wrongly-shaped policy must not open default-true gates.
-    func savedTrustAuthority() -> SavedTrustPolicyAuthority {
-        SavedTrustPolicyAuthority.read(dataRoot: trainingPromotionDataRoot())
-    }
-
-    /// One saved trust leaf, strictly. Absent policy / absent block / absent
-    /// leaf keep the shipped default; damaged authority and any non-Bool leaf
-    /// throw, so a caller can never mistake corrupt policy for a configured
-    /// value.
-    func trustLeafBool(
-        block: String,
-        key: String,
-        defaultWhenAbsent: Bool
-    ) throws -> Bool {
-        switch savedTrustAuthority() {
-        case .absent:
-            return defaultWhenAbsent
-        case .damaged:
-            throw CocoaError(.propertyListReadCorrupt)
-        case .present(let policy):
-            guard let blockValue = policy[block] else { return defaultWhenAbsent }
-            guard case .object(let nested) = blockValue else {
-                throw CocoaError(.propertyListReadCorrupt)
-            }
-            guard let leaf = nested[key] else { return defaultWhenAbsent }
-            guard case .bool(let value) = leaf else {
-                throw CocoaError(.propertyListReadCorrupt)
-            }
-            return value
-        }
-    }
-
-    /// Developer Mode is an explicit operator escalation, independent of the
-    /// Full Mac permission preset — and only a literal `true` is that
-    /// escalation. `"developerMode": "false"` used to override every flag.
-    private func developerModeEscalation() -> Bool {
-        guard case .present(let policy) = savedTrustAuthority() else { return false }
-        guard case .bool(true)? = policy["developerMode"] else { return false }
-        return true
-    }
-
-    /// Read the live policy: deny on read failure, otherwise allow Developer
-    /// Mode or the autonomous-training leaf (default true when absent).
-    public func trainingAllowed() async -> Bool {
-        if developerModeEscalation() { return true }
-        return (try? trustLeafBool(
-            block: "trainingPolicy",
-            key: "autonomous_training",
-            defaultWhenAbsent: true
-        )) ?? false
-    }
-
-    /// Read the live policy: deny on read failure, otherwise allow Developer
-    /// Mode or the promotion-enabled leaf (default true when absent).
-    public func promotionAllowed() async -> Bool {
-        if developerModeEscalation() { return true }
-        return (try? trustLeafBool(
-            block: "promotionPolicy",
-            key: "enabled",
-            defaultWhenAbsent: true
-        )) ?? false
-    }
-
-    /// Shared training and promotion journal root.
-    func trainingJournalDir() -> URL {
-        trainingPromotionDataRoot().appendingPathComponent("training_journal", isDirectory: true)
-    }
-
-    /// Visible files matching the suffix, sorted by UTF-8 filename bytes.
-    /// Reverse order is newest-first for timestamp-prefixed filenames.
-    /// Missing or unreadable directories return an empty list.
-    static func sortedJSONFiles(
-        in dir: URL,
-        suffix: String = ".json",
-        reversedName: Bool
-    ) -> [URL] {
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-        let matched = entries.filter { $0.lastPathComponent.hasSuffix(suffix) }
-        // Sort by file NAME (UTF-8 byte order) to match Python's sorted(glob()).
-        let sorted = matched.sorted { lhs, rhs in
-            Array(lhs.lastPathComponent.utf8)
-                .lexicographicallyPrecedes(Array(rhs.lastPathComponent.utf8))
-        }
-        return reversedName ? sorted.reversed() : sorted
-    }
-
-    /// Read an object, or nil for missing, malformed, or non-object JSON.
-    func readJSONObject(_ url: URL) async throws -> [String: JSONValue]? {
-        let raw = try await trainingPromotionPersistence().readJSON(url, ifMissing: .null)
-        guard case .object(let obj) = raw else { return nil }
-        return obj
-    }
-
-    // MARK: GET /v1/training/runs
-
-    /// Newest-first graded runs projected to the five summary fields below;
-    /// absent fields are null.
-    public func listTrainingRunsLocal() async throws -> JSONValue {
-        let dir = trainingJournalDir().appendingPathComponent("drill_runs", isDirectory: true)
-        let files = Self.sortedJSONFiles(in: dir, suffix: "-graded.json", reversedName: true)
-        var out: [JSONValue] = []
-        for f in files {
-            guard let obj = try await readJSONObject(f) else { continue }
-            out.append(.object([
-                "run_id": obj["run_id"] ?? .null,
-                "suite_name": obj["suite_name"] ?? .null,
-                "graded_at": obj["graded_at"] ?? .null,
-                "total_score": obj["total_score"] ?? .null,
-                "max_score": obj["max_score"] ?? .null,
-            ]))
-        }
-        return .array(out)
-    }
-
-    // MARK: GET /v1/training/runs/<id>  (detail sibling of list_runs)
-
-    /// Return the full graded-run JSON, with nil for a missing file and an
-    /// empty object for parse failure. Valid non-object JSON passes through.
-    /// The run ID is appended verbatim; callers supply the stored run identifier.
-    public func getTrainingRunLocal(runId: String) async throws -> JSONValue? {
-        let dir = trainingJournalDir().appendingPathComponent("drill_runs", isDirectory: true)
-        let f = dir.appendingPathComponent("\(runId)-graded.json")
-        guard FileManager.default.fileExists(atPath: f.path) else { return nil }
-        return try await trainingPromotionPersistence().readJSON(f, ifMissing: .object([:]))
-    }
-
-    // MARK: GET /v1/training/proposals
-
-    /// Full proposal objects in forward filename order; no field projection.
-    public func listTrainingProposalsLocal() async throws -> JSONValue {
-        let dir = trainingJournalDir().appendingPathComponent("proposals", isDirectory: true)
-        let files = Self.sortedJSONFiles(in: dir, reversedName: false)
-        var out: [JSONValue] = []
-        for f in files {
-            guard let obj = try await readJSONObject(f) else { continue }
-            out.append(.object(obj))
-        }
-        return .array(out)
-    }
-
-    // MARK: GET /v1/promotion/candidates
-
-    /// Newest-first candidates projected to the stored candidate field set.
-    /// Extra fields are omitted and missing fields become null.
-    public func listPromotionCandidatesLocal() async throws -> JSONValue {
-        let dir = trainingJournalDir().appendingPathComponent("promotion_candidates", isDirectory: true)
-        let files = Self.sortedJSONFiles(in: dir, reversedName: true)
-        var out: [JSONValue] = []
-        for f in files {
-            guard let obj = try await readJSONObject(f) else { continue }
-            out.append(Self.projectCandidateRun(obj))
-        }
-        return .array(out)
-    }
-
-    // MARK: GET /v1/promotion/pending
-
-    /// Forward filename order, pending status only, projected to stage fields.
-    public func listPromotionPendingLocal() async throws -> JSONValue {
-        let dir = trainingJournalDir().appendingPathComponent("promotion_stages", isDirectory: true)
-        let files = Self.sortedJSONFiles(in: dir, reversedName: false)
-        var out: [JSONValue] = []
-        for f in files {
-            guard let obj = try await readJSONObject(f) else { continue }
-            if case .string(let status)? = obj["status"], status == "pending" {
-                out.append(Self.projectStage(obj))
-            }
-        }
-        return .array(out)
-    }
-
     // MARK: GET /v1/evals/runs
 
     /// Read the evaluations array and sort descending by `pythonStrOr(createdAt)`.
     /// Non-array storage returns empty. Preserve input order for equal keys by
     /// carrying the original index as the ascending tiebreaker.
     public func listEvalsLocal() async throws -> JSONValue {
-        let url = trainingPromotionDataRoot()
+        let url = dataRoot
             .appendingPathComponent("evals", isDirectory: true)
             .appendingPathComponent("runs.json")
-        let raw = try await trainingPromotionPersistence().readJSON(url, ifMissing: .array([]))
+        let raw = try await persistence.readJSON(url, ifMissing: .array([]))
         guard case .array(let arr) = raw else { return .array([]) }
         let keyed: [(key: String, idx: Int, value: JSONValue)] = arr.enumerated().map { (i, item) in
             var key = ""
@@ -251,52 +56,46 @@ extension SwiftNativeSelfImprovement {
         }
     }
 
-    /// Use the default only for an absent key. Present values use Python-style
-    /// scalar strings (null becomes "None"); containers use JSON serialization.
-    /// Defaulting a malformed change_type to "append" would authorize it.
-    static func pythonStr(_ v: JSONValue?, defaultWhenAbsent: String) -> String {
-        guard let v else { return defaultWhenAbsent }   // key absent → Python default
-        switch v {
-        case .null:            return "None"            // str(None) == "None"
-        case .bool(let b):     return b ? "True" : "False"
-        case .int(let i):      return String(i)
-        case .double(let d):   return String(d)
-        case .string(let s):   return s
-        case .array(let a):    return (try? JSONValue.array(a).serialize(pretty: false)) ?? "[]"
-        case .object(let o):   return (try? JSONValue.object(o).serialize(pretty: false)) ?? "{}"
-        }
+    public func evals() async throws -> [EvalRun] {
+        try JSONDecoder().decode([EvalRun].self, from: try await listEvalsLocal().serializedData(pretty: false))
     }
+}
 
-    // MARK: - Dataclass field projection
+// FIX: only `id` truly required; non-identifying fields defaulted so one
+// omitted key doesn't throw the whole endpoint decode.
+public struct EvalCheck: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var title: String = ""
+    public var passed: Bool = false
+    public var detail: String = ""
 
-    /// Stored candidate field order. Missing fields project as null.
-    private static let candidateRunFields: [String] = [
-        "candidate_id", "source", "tier", "patches", "status", "created_at",
-        "finished_at", "harness", "decision", "decision_reason",
-        "worktree_path", "branch_name", "merged_commit_sha", "error",
-    ]
-
-    private static func projectCandidateRun(_ obj: [String: JSONValue]) -> JSONValue {
-        var out: [String: JSONValue] = [:]
-        for k in candidateRunFields { out[k] = obj[k] ?? .null }
-        return .object(out)
+    // FIX-2026-05-28: synthesized Decodable throws keyNotFound on missing non-
+    // optional keys despite Swift defaults; decodeIfPresent ?? default fixes it.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        self.passed = try c.decodeIfPresent(Bool.self, forKey: .passed) ?? false
+        self.detail = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
     }
+}
 
-    /// Stage dataclass fields in declaration order.
-    private static let stageFields: [String] = [
-        "candidate_id", "tier", "harness", "delta", "staged_at",
-        "worktree_path", "branch_name", "status", "resolved_at",
-        "resolution_reason",
-    ]
+public struct EvalRun: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var name: String = ""
+    public var status: String = ""
+    public var checks: [EvalCheck] = []
+    public var createdAt: String = ""
+    public var durationSeconds: Double?
 
-    private static func projectStage(_ obj: [String: JSONValue]) -> JSONValue {
-        var out: [String: JSONValue] = [:]
-        for k in stageFields {
-            // `status` defaults to "pending" on the dataclass; but we only
-            // reach here for status=="pending" anyway, so the file always has it.
-            out[k] = obj[k] ?? .null
-        }
-        return .object(out)
+    // FIX-2026-05-28: see EvalCheck. id required; everything else lenient.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        self.status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+        self.checks = try c.decodeIfPresent([EvalCheck].self, forKey: .checks) ?? []
+        self.createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        self.durationSeconds = try c.decodeIfPresent(Double.self, forKey: .durationSeconds)
     }
-
 }

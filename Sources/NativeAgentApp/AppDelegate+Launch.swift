@@ -323,11 +323,10 @@ extension AppDelegate {
         // five `await`s; a single SQLite open block stalled all five. Each
         // subsystem is now independent; the launch task returns immediately.
         Task.detached(priority: .utility) {
-            // Skills-recall rework (2026-07-03): reconcile skill-pointer
-            // memory rows against the bodies on disk. Lives HERE and not in
-            // the window .task — that block only fires when the main window
-            // appears, and the app cold-starts menu-bar-only (the exact trap
-            // the ClaudeBridge comment in NativeAgentApp.swift records).
+            // Lives HERE and not in the window .task — that block only fires
+            // when the main window appears, and the app cold-starts
+            // menu-bar-only (the exact trap the ClaudeBridge comment in
+            // NativeAgentApp.swift records).
             let downloadDescriptor = Bundle.main.url(forResource: "embedding-download", withExtension: "json")
                 .flatMap { try? Data(contentsOf: $0) }
                 .flatMap { try? EmbeddingModelDownload.Descriptor.parse($0) }
@@ -335,7 +334,6 @@ extension AppDelegate {
                 await reconcileMemoryEmbeddingEpochAtLaunch()
             }
             await SkillRegistryMigration.inheritBuiltInDescriptions(dataRoot: PersistenceCore.defaultDataRoot())
-            await syncSkillPointerIndex()
         }
         // The transcript-aging lane defers through the same body throttle as
         // every other background-cognition lane. Installing the gate is a
@@ -350,6 +348,8 @@ extension AppDelegate {
                 let report = try await ChatSessionIndexReconciler(
                     dataRoot: NativeAgentPaths.dataRoot
                 ).reconcile()
+                OrganPulse.record("launch.chat_index", found: report.sessionsRecovered + report.staleRowsRepaired + report.corruptTranscripts,
+                                  note: "recovered \(report.sessionsRecovered), repaired \(report.staleRowsRepaired), corrupt \(report.corruptTranscripts) of \(report.transcriptsExamined)")
                 if report.sessionsRecovered > 0 || report.corruptTranscripts > 0
                     || report.staleRowsRepaired > 0 {
                     logger.info(
@@ -374,20 +374,6 @@ extension AppDelegate {
             let loops = BackgroundLoopsAssembly.assembleAllLoops()
             await installBotProviderCheck()
             await BackgroundLoopsManager.shared.start(loops: loops)
-            // CRASH RECONCILIATION for the Workshop→memory lane (gpt-5.5
-            // review BLOCKING 1, 2026-08-02). Execution-memory writes are handed
-            // off to a detached queue, so a crash — or a kill inside the 3s
-            // termination budget — can leave a terminal `mission.json` on disk
-            // with no memory behind it. `applicationWillTerminate` drains the
-            // queue for a CLEAN quit; this repairs the unclean one, bounded to
-            // recent executions (see the method's own doc for the window).
-            //
-            // Sequenced INSIDE this task, after `start(loops:)`, because
-            // WorkshopExecutorRef is configured by the loop assembly — a
-            // sibling Task.detached would race it and find the ref nil.
-            if let executor = WorkshopExecutorRef.shared.current() {
-                _ = await executor.reconcileMissedExecutionMemories()
-            }
         }
         // Refresh the doctor snapshot ONCE after this launch's first completed
         // turn, so the turn-behaviour checks in data/doctor/latest.json report
@@ -402,9 +388,10 @@ extension AppDelegate {
             // ordinary set_status ops under its canonical flock; it never
             // rewrites the event log or hot-edits desk_state.json.
             do {
-                _ = try await SwiftNativeDeskStore(
+                let ops = try await SwiftNativeDeskStore(
                     dataRoot: PersistenceCore.defaultDataRoot()
                 ).reconcileTerminalParentsWithNonTerminalDescendants()
+                OrganPulse.record("launch.desk_hierarchy", found: ops.count, note: "\(ops.count) statuses set")
             } catch {
                 FileHandle.standardError.write(
                     Data("Desk hierarchy reconciliation failed: \(error)\n".utf8)
@@ -440,7 +427,8 @@ extension AppDelegate {
             // if the wounds still exist and no card was staged before.
             // Staging only — NOTHING mutates the memory store until the
             // card is explicitly approved (resolveApproval → memory.repair
-            // executor). Idempotent across launches via stamp files.
+            // executor), except the one-time archive of retired inventory
+            // rows. Idempotent across launches via stamp/done files.
             //
             // Review blocker fix (2026-06-10): reconcile FIRST — a crash
             // between resolve-persist and the repair executor leaves a
@@ -449,7 +437,8 @@ extension AppDelegate {
             // runs the idempotent executor for any resolved memory.repair
             // record lacking an execution annotation (and, for canceled
             // ones, clears the stamp so stageIfNeeded below re-stages).
-            await NativeClient.reconcileUnappliedMemoryRepairs()
+            let repairs = await MemoryApprovalTransactions.reconcileUnappliedMemoryRepairs(dataRoot: PersistenceCore.defaultDataRoot())
+            OrganPulse.record("launch.memory_repairs", found: repairs, note: "\(repairs) re-run")
             await MemoryRepairOneShot.stageIfNeeded(
                 dataRoot: PersistenceCore.defaultDataRoot(),
                 presentation: AppMemoryRepairPresentation())
@@ -466,10 +455,28 @@ extension AppDelegate {
             // already-applied by fingerprint, cleans denied/orphaned
             // candidate stores. All approval-gated; nothing here mutates
             // the memory store without an approved card.
-            await NativeClient.reconcileUnappliedKindBackfills()
-            await NativeClient.stageKindBackfillIfNeeded()
-            _ = await MemoryConsolidationGate.reconcile(
-                dataRoot: PersistenceCore.defaultDataRoot())
+            let backfills = await MemoryApprovalTransactions.reconcileUnappliedKindBackfills(dataRoot: PersistenceCore.defaultDataRoot())
+            OrganPulse.record("launch.kind_backfills", found: backfills, note: "\(backfills) re-run")
+            await MemoryApprovalTransactions.stageKindBackfillIfNeeded(
+                dataRoot: PersistenceCore.defaultDataRoot(),
+                ports: MemoryApprovalTransactionPorts(
+                    makeLLMClient: { BackgroundLoopsAssembly.makeSharedLLMClient() }
+                )
+            )
+            var settled = 0, failures: [String] = []
+            for swap in await MemoryConsolidationGate.reconcile(dataRoot: PersistenceCore.defaultDataRoot()) {
+                switch swap {
+                case .applied, .alreadyApplied, .staleRefused, .cleanedUpDenied: settled += 1
+                case .pendingApproval: break
+                case .failed(let runId, let reason), .projectionFailed(let runId, let reason): failures.append("\(runId): \(reason)")
+                }
+            }
+            if failures.isEmpty {
+                OrganPulse.record("launch.consolidation_swaps", found: settled, note: "\(settled) settled")
+            } else {
+                OrganPulse.record("launch.consolidation_swaps", .skipped,
+                                  note: "\(settled) settled, \(failures.count) failed: " + failures.joined(separator: "; "))
+            }
             // U5 W-A item 3 (2026-06-11): generic resolve→execute crash-
             // window reconcile for the four kinds that lacked launch
             // coverage (rem.proposal, execution.step, self_improvement.apply,
@@ -485,12 +492,15 @@ extension AppDelegate {
             // recorded outcome-unknown/failed and is never reopened merely to
             // heal an approval annotation.
             do {
-                _ = try await SwiftNativeBrowserClient.defaultClient()
-                    .executeBrowserOperation(.recoverStrandedRunning)
+                let stranded = try await SwiftNativeBrowserClient.defaultClient()
+                    .executeBrowserOperation(.recoverStrandedRunning).recoveredCount
+                OrganPulse.record("launch.browser_stranded", found: stranded, note: "\(stranded) closed as outcome unknown")
             } catch {
                 nativeLog("[browser] restart recovery failed: %@", String(describing: error))
             }
-            await NativeClient.reconcileUnappliedApprovalExecutions()
+            let approvals = await ApprovalTransactionCoordinator.app().reconcileUnappliedApprovalExecutions()
+            OrganPulse.record("launch.approval_executions", found: approvals, note: "\(approvals) re-run")
+            Task { await ApprovalTransactionCoordinator.settleDeskWaitsOnEveryResolve(dataRoot: PersistenceCore.defaultDataRoot()) }
             // Terminal-event reconciliation normally stages this exact card.
             // Launch repair closes the safe crash/restart gap without a poll:
             // if enough canonical procedure receipts already exist, stage the
@@ -499,7 +509,9 @@ extension AppDelegate {
             // the ones that still match load again; any that cannot stay off
             // and leave one inbox line saying why.
             let procedureDataRoot = PersistenceCore.defaultDataRoot()
-            for line in await WorkshopProcedureLegacyRevalidation.runIfNeeded(dataRoot: procedureDataRoot) {
+            let keptOff = await WorkshopProcedureLegacyRevalidation.runIfNeeded(dataRoot: procedureDataRoot)
+            OrganPulse.record("launch.procedure_revalidation", found: keptOff.count, note: "\(keptOff.count) kept off")
+            for line in keptOff {
                 let cardID = "procedure-legacy-revalidation-\(CausalTransitionEvidence.opaqueIdentity(line).prefix(16))"
                 _ = try? await LiveNotificationInbox(
                     path: LiveNotificationInbox.livePath(dataRoot: procedureDataRoot)
@@ -515,32 +527,16 @@ extension AppDelegate {
                     "status": .string("unread"),
                 ]), id: cardID)
             }
-            await WorkshopProcedureExactActivationCoordinator
+            let activationCards = await WorkshopProcedureExactActivationCoordinator
                 .reconcileLocalFileCopyIfQualified()
-            // U2b wave 2: self-evolution lane, in dependency order —
-            // (1) post-install verify FIRST: an in-flight install's
-            //     pending_verify must reach its verdict (verified card /
-            //     auto-revert / wait) before anything re-drives executors;
-            // (2) crash-window reconcile: resolved self_evolution.apply
-            //     records lacking an executedAction annotation re-run the
-            //     idempotent executor (promote is marker-idempotent, the
-            //     install leg heals on already-staged state, and the
-            //     systemRebuild gate is re-checked — with the per-action
-            //     flag off the executor stops at the annotated "awaiting
-            //     systemRebuild.enabled" boundary, never the installer);
-            // (3) staging: GREEN candidates become explicit-human-only
-            //     approval cards (risk pinned critical; no auto-approve
-            //     path exists for this action).
-            let evolutionDeps = NativeClient.selfEvolutionDeps()
-            await SelfEvolutionApprovalExecutor.runEvolutionVerifyAtLaunch(deps: evolutionDeps)
-            await ApprovalTransactionCoordinator.reconcileUnappliedSelfEvolution(deps: evolutionDeps)
-            await BackgroundLoopsAssembly.stageEvolutionApprovals()
+            OrganPulse.record("launch.procedure_activation", found: activationCards, note: "\(activationCards) review staged")
             // Same shape for REM: staging used to run ONLY inside the weekly
             // job, so a row appended by a pass whose staging failed waited up
             // to a week for a card (Astra audit 2026-09-11, finding 9). This
             // generates no REM batch — bounded catch-up through the same
             // stager, idempotent against the store's approval stamp.
-            await BackgroundLoopsAssembly.stagePendingREMProposalsAtLaunch()
+            let remStaged = await BackgroundLoopsAssembly.stagePendingREMProposalsAtLaunch()
+            OrganPulse.record("launch.rem_staging", found: remStaged, note: "\(remStaged) staged")
         }
 
         // PATCH-2026-06-17 dream-single-owner: dream cadence is owned solely
@@ -762,22 +758,6 @@ extension AppDelegate {
         group.enter()
         Task.detached {
             await SensesAssembly.shutdown()
-            group.leave()
-        }
-        // Workshop execution memories are written OFF the terminal path by a
-        // detached queue, and `BackgroundLoopsManager.stop()` cancels loop
-        // tasks — it does not drain that queue (gpt-5.5 review BLOCKING 1,
-        // 2026-08-02). Without this, an execution that reached terminal moments
-        // before quit left `mission.json` on disk and no memory: she did the
-        // work and could not remember it. Bounded BELOW the 3s budget so a
-        // wedged SQLite/embedder can never hold up quit — an unfinished drain
-        // logs what it abandoned instead of blocking. The crash case (this
-        // never runs at all) is repaired at next launch by
-        // `reconcileMissedExecutionMemories`.
-        group.enter()
-        Task.detached {
-            await WorkshopExecutorRef.shared.current()?
-                .waitForExecutionMemoryWrites(timeout: 2.5)
             group.leave()
         }
         // MCP stdio children don't reliably exit on stdin EOF — stop the

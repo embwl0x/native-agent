@@ -1448,7 +1448,7 @@ struct MacControlWorkbenchView: View {
         do {
             let bodyData = try JSONSerialization.data(withJSONObject: body)
             let result = try await appModel
-                .macControlRun(path: path, bodyData: bodyData, timeout: 90)
+                .macControlRun(path: path, bodyData: bodyData)
             let statusCode = result.statusCode
             let json = result.json
             let data = result.rawData

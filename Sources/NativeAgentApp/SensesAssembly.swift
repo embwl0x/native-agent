@@ -77,7 +77,6 @@ enum SensesAssembly {
             ? NativeAgentChatApprovalFiler(dataRoot: dataRoot) : nil
         let dispatcher = makeGatedToolDispatchClient(
             tools: NativeAgentEngine.live.toolDispatchClient(
-                includeEvolutionBridge: profile.includesEvolutionBridge,
                 denyExternalMcp: profile.deniesExternalMCP, enforceAppAutonomy: false,
                 swarmApprovalFiler: filer),
             fileAccess: ChatToolSessionContext.fileAccess ?? "read_only", approvalFiler: filer,

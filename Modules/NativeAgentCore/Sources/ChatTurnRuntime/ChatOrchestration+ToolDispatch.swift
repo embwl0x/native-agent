@@ -89,25 +89,32 @@ extension SwiftNativeTurnEngine {
                 return (prepared, call.undeclaredKeys.isEmpty && !folded, call.input, call.undeclaredKeys)
             }
         let prepared = planned.filter(\.offered).map(\.call)
-        let slots = await Self.runIterationDispatchGroups(
-            prepared: prepared,
-            modelId: modelId,
-            surface: surface,
-            personaID: personaID,
-            fluidContextTurn: fluidContextTurn,
-            tools: tools,
-            progress: progress,
-            cancelFlagPath: cancelFlagPath,
-            // Mixed or not is decided on everything the model called in this
-            // step, before unoffered calls are dropped.
-            stepToolNames: planned.map { ToolNameAliases.ranTool($0.call.internalName, input: $0.call.dispatchInput) },
-            onToolUse: { p in
-                await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
-            },
-            onOutcome: { p, result, _ in
-                await progress?(.toolResult(name: p.internalName, output: result))
-            }
-        )
+        // Mixed or not is decided on everything the model called in this
+        // step, before unoffered calls are dropped, a list's entries each.
+        let stepToolNames = planned.flatMap { ToolNameAliases.ranTools($0.call.internalName, input: $0.call.dispatchInput) }
+        let slots = await AppDoorReentry.$heldSend.withValue(Self.heldOutboundResult(stepToolNames: stepToolNames)) {
+            await Self.runIterationDispatchGroups(
+                prepared: prepared,
+                modelId: modelId,
+                surface: surface,
+                personaID: personaID,
+                fluidContextTurn: fluidContextTurn,
+                tools: tools,
+                progress: progress,
+                cancelFlagPath: cancelFlagPath,
+                stepToolNames: stepToolNames,
+                onToolUse: { p in
+                    await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
+                },
+                onOutcome: { p, result, _ in
+                    // A held send never reached the dispatcher, but she made it.
+                    if case .object(let fields) = result, fields["held_for_results"] == .bool(true) {
+                        ChatToolDispatchTracer.traceUndispatched(tool: p.internalName, input: p.dispatchInput, surface: surface, result: result)
+                    }
+                    await progress?(.toolResult(name: p.internalName, output: result))
+                }
+            )
+        }
 
         // Re-interleave in ORIGINAL INDEX ORDER: dispatched slots come back in
         // `prepared` order, refused calls are synthesized in place. Every
@@ -145,6 +152,8 @@ extension SwiftNativeTurnEngine {
                     sessionId: sessionId,
                     appDoor: appDoor
                 )
+                ChatToolDispatchTracer.traceUndispatched(tool: entry.call.internalName, input: entry.call.dispatchInput,
+                                                         surface: surface, result: out.record.result)
             }
             records.append(out.record)
             blocks.append(out.block)
@@ -215,7 +224,7 @@ extension SwiftNativeTurnEngine {
     /// therefore not run when the same reply also calls anything else: the
     /// others run, it comes back unsent, and the model sends again once it has
     /// read their results. A reply of only such calls runs as written.
-    nonisolated static let outboundMessageTools: Set<String> = [
+    package nonisolated static let outboundMessageTools: Set<String> = [
         "agent_message", "claude_message", "codex_message", "omp_message",
         "invoke_codex",
         "messages_send", "mail_send", "mail_reply", "agentmail_send",
@@ -249,11 +258,20 @@ extension SwiftNativeTurnEngine {
     /// her call translated to it (a folded tool's action, workspace's home
     /// item, the catalog's find), else app's home.
     nonisolated static func notOfferedToolResult(_ name: String, input: [String: JSONValue] = [:]) -> JSONValue {
-        .object([
+        // The one next step: the same call through app, or none at all.
+        let call = ToolNameAliases.appCall(name, input: input)
+        return .object([
             "error": .string("tool '\(name)' is not offered in this conversation, so it was not run. "
                 + ToolNameAliases.foldedToolHint(name, input: input)),
             "not_offered": .bool(true),
             "effects": .string("none"),
+            "remedy": .object([
+                "kind": .string(call == nil ? "none" : "correct_route"),
+                "instruction": .string(call == nil
+                    ? "Nothing ran, and app has no call by that name; don't retry it. Tell the person why if the work needs it."
+                    : "Nothing ran. Make next_call instead."),
+                "next_call": call.map { .object(["tool": .string("app"), "input": .object($0)]) } ?? .null,
+            ]),
         ])
     }
 

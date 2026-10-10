@@ -665,19 +665,6 @@ extension SwiftToolDispatcher {
         return .object(env)
     }
 
-    /// nil-EvolutionToolBridge envelope (mirror dispatchMacIntegrationTool's
-    /// bridge_not_wired handling): the app-side bridge wasn't injected
-    /// (headless / restricted surface). Returned, never thrown — keep the turn
-    /// intact for the LLM to explain.
-    static func evolutionBridgeNotWiredEnvelope(tool: String) -> JSONValue {
-        .object([
-            "status": .string("failed"),
-            "reason": .string("bridge_not_wired"),
-            "tool": .string(tool),
-            "fix": .string("App-side EvolutionToolBridge not injected; this surface cannot reach the self-evolution store."),
-        ])
-    }
-
     // Write the audit receipt to disk. Returns (auditURL, optional error
     // string). Fail-soft + visible: if the write fails the caller folds
     // `audit_error` into the response envelope so failures aren't silent.

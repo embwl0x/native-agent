@@ -31,9 +31,9 @@ public struct WorkshopStorageMigrationReport: Codable, Equatable, Sendable {
 /// storage, and the branch was pure dead weight carrying a recursive
 /// merge + tree-archive. A dataRoot that still contains `missions/` is now
 /// simply IGNORED — nothing is read, moved, merged, or archived out of it.
-/// The only remaining consumer of the legacy `missions.json` filename is the
-/// backup-restore mapping in `NativeClient+TrustBackupOps.swift`, which lands
-/// it at `workshop/legacy_executions.json` where the live readers look.
+/// The legacy flat execution list is read only at
+/// `workshop/legacy_executions.json` (`legacyWorkshopExecutionsPath`); no
+/// restore path maps the old `missions.json` name any more.
 public enum WorkshopStorageMigrator {
     // 2026-09-18: UI readers can arrive before AppKit's launch continuation.
     // Share the off-main migration with them instead of racing its renames.

@@ -1,4 +1,6 @@
 import Darwin
+import Foundation
+import BackgroundWork
 
 /// Last-gasp crash stack: on a fatal signal, write the backtrace to a file
 /// opened at launch, then re-raise so macOS still files its own report. The
@@ -12,6 +14,8 @@ enum CrashBreadcrumbs {
         let opened = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard opened >= 0 else { return }
         fd = opened
+        let launched = "\n" + BodyReport.launchMark + Date().ISO8601Format() + "\n"
+        _ = launched.withCString { write(opened, $0, strlen($0)) }
         var action = sigaction()
         action.__sigaction_u.__sa_handler = { signum in
             signal(signum, SIG_DFL)
@@ -27,7 +31,7 @@ enum CrashBreadcrumbs {
         }
         action.sa_flags = SA_RESETHAND | SA_NODEFER
         sigemptyset(&action.sa_mask)
-        // TERM/HUP name an outside kill; a clean exit leaves its own line, so silence means SIGKILL.
+        // TERM/HUP name an outside kill; a clean exit leaves its own line, so silence after the launch row means SIGKILL.
         for signum in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGTERM, SIGHUP] { sigaction(signum, &action, nil) }
         atexit {
             let line: StaticString = "\nNativeAgent exited\n"

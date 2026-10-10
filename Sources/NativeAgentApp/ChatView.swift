@@ -124,6 +124,26 @@ struct ChatTurnCardClearancePadding: ViewModifier {
     }
 }
 
+enum ChatTurnNoticeDestination: Equatable {
+    case chatTop
+    case globalWarning
+    case globalInfo
+}
+
+enum ChatTurnNoticePresentation {
+    static func destination(for kind: String) -> ChatTurnNoticeDestination {
+        // 2026-09-22 WHY: reconnect notices live in the turn's own lane, which
+        // clears when the turn ends, so a long-held one never outlives the retry.
+        if kind == "provider_retry" {
+            return .chatTop
+        }
+        if kind.contains("timeout") {
+            return .globalWarning
+        }
+        return .globalInfo
+    }
+}
+
 /// Value-only presentation rules used by the chat viewport. The view is their
 /// sole consumer; no state is duplicated here.
 enum ChatViewportPresentation {
@@ -351,7 +371,7 @@ struct ChatTurnCardInset: View {
     @Environment(AppModel.self) var appModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Simple view has no Work pane, so its card keeps the thumbnail.
-    @Environment(\.chatHidesConversationList) private var hidesConversationList
+    @Environment(\.layoutProfile) private var layoutProfile
     let store: ChatTurnCardClearance
 
     var body: some View {
@@ -363,7 +383,7 @@ struct ChatTurnCardInset: View {
                 // the one stop control (2026-09-23).
                 MacChatTurnCardHost(
                     sessionId: appModel.activeChatSessionId,
-                    onOpenScreen: hidesConversationList ? nil : { WorkPaneState.shared.userShow(.screen) }
+                    onOpenScreen: layoutProfile == SimpleViewMode.simple ? nil : { WorkPaneState.shared.userShow(.screen) }
                 )
                 // User, 2026-09-03: the working card shares the
                 // composer's frame, edge to edge.
@@ -441,8 +461,10 @@ struct ChatView: View {
     /// Chat stays mounted behind the page switch (ContentView, 2026-09-13), so
     /// this — not `onDisappear` — is how a hidden chat knows to stop acting.
     @Environment(\.chatPageIsVisible) var chatPageIsVisible
-    /// Simple view shows this page without its conversation list (SimpleViewMode).
-    @Environment(\.chatHidesConversationList) var hidesConversationList
+    /// Simple view shows this page without its conversation list (as its
+    /// profile is seeded), Work pane or new-chat button (SimpleViewMode).
+    @Environment(\.layoutProfile) var layoutProfile
+    var inSimple: Bool { layoutProfile == SimpleViewMode.simple }
     /// ⌘0: the conversations column goes with the rail (WorkPane.swift).
     @AppStorage(WorkPaneState.sidebarsHiddenKey) var sidebarsHidden = false
     /// The Work pane beside the chat; main window only, so never in Simple.
@@ -634,10 +656,6 @@ struct ChatView: View {
     /// newer click and become the newest AppModel selection request.
     @State var runningSessionNavigationGeneration: UInt = 0
     @AppStorage("NativeAgent.pinnedChatSessionIds") var pinnedChatSessionIdsRaw = ""
-    /// The bridge/agent sessions ride under one "Working" row; this is whether
-    /// that row is open. Collapsed by default — they are not the conversation.
-    @State var shellWorkingExpanded = false
-    @State var shellBriefsExpanded = false
 
     var clearConfirmationBinding: Binding<Bool> {
         Binding(
@@ -762,7 +780,7 @@ struct ChatView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            if !hidesConversationList && !sidebarsHidden { shellConversationsColumn }
+            if !shellColumnBlocks.isEmpty && !sidebarsHidden { shellConversationsColumn }
             chatColumn
                 // The chat gives the pane its width down to this floor (the
                 // detached window's); past it the pane narrows instead.
@@ -783,13 +801,13 @@ struct ChatView: View {
                         return true
                     }
                 ))
-            if !hidesConversationList && workPaneOpen {
+            if !inSimple && workPaneOpen {
                 WorkPane()
                     .layoutPriority(1)
                     .transition(NativeAgentMotion.fade)
             }
             // The offscreen copy a quiet read mounts never opens the pane.
-            if !hidesConversationList && !quietOffscreenRead { WorkPaneAutoOpen() }
+            if !inSimple && !quietOffscreenRead { WorkPaneAutoOpen() }
             // D4: the three token-rate read-aloud triggers used to hang off
             // THIS view's modifier chain, so every streamed delta re-evaluated
             // `chatMessages.last?.content` alongside the whole root body (and
@@ -924,6 +942,14 @@ struct ChatView: View {
         // whole-transcript read (2026-09-14, snappiness).
         .onChange(of: appModel.engine.transcripts.structureVersion) {
             inlineCards.refreshSoon(sessionID: appModel.activeChatSessionId)
+        }
+        // A link that names a message (a miss's history locator) lands on it
+        // through the transcript search's own selection, paging and scroll.
+        .onChange(of: appModel.pendingChatMessageID, initial: true) { _, messageID in
+            guard let messageID else { return }
+            appModel.pendingChatMessageID = nil
+            openTranscriptSearch()
+            transcriptSearch.reveal(messageID: messageID)
         }
         // H5: the only channel by which text written OUTSIDE the composer
         // (skill-build starter, suggestion chip) reaches it. Bumped rarely and
@@ -1222,11 +1248,11 @@ struct ChatView: View {
                                 ShellRoomHeader(
                                     name: appModel.agentDisplayName,
                                     status: shellStatus,
-                                    onNewChat: hidesConversationList
+                                    onNewChat: inSimple
                                         ? { Task { await appModel.newChatSession() } }
                                         : nil,
                                     notes: notes,
-                                    work: hidesConversationList ? nil : WorkPaneHeaderButton()
+                                    work: inSimple ? nil : WorkPaneHeaderButton()
                                 )
                                 // Agent, 2026-09-03: with the transcript
                                 // running under it the header needs material.
@@ -1246,7 +1272,7 @@ struct ChatView: View {
                                 .background {
                                     // Simple: no sheet here; over the haze it
                                     // read as a lighter band with a seam.
-                                    if !hidesConversationList {
+                                    if !inSimple {
                                         ShellSheet()
                                             .ignoresSafeArea(edges: .top)
                                     }
@@ -1522,7 +1548,7 @@ struct ChatView: View {
                                 draft: draft,
                                 placeholder: shellComposerPlaceholder,
                                 isActive: chatPageIsVisible,
-                                recipient: hidesConversationList ? appModel.agentAddressName : nil,
+                                recipient: inSimple ? appModel.agentAddressName : nil,
                                 voiceInput: voiceInput,
                                 capabilitiesStore: capabilitiesStore,
                                 voiceSessionId: voiceSessionId,
@@ -1684,7 +1710,7 @@ struct ChatSidebarArchiveButton: View {
     }
 }
 
-/// M12: the honest counterpart to `try? await api.getX() ?? existingValue`.
+/// M12: the honest counterpart to `try? await <read>() ?? existingValue`.
 /// Shown above a panel whose last refresh could not reach every endpoint, so
 /// the user knows the values below are carried over rather than current.
 /// The stale-data notice for one rail panel, reading `panelRefreshStatus`

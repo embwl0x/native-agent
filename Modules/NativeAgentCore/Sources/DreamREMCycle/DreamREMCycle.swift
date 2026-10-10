@@ -298,9 +298,7 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
 /// Nightly dreams run at 03:30 on the MACHINE's own clock and write the
 /// previous local calendar day's diary key.
 public enum DreamREMSchedule {
-    /// The person's own zone. A fixed America/Chicago fired the nightly dream
-    /// at 09:30 in Berlin and 01:30 in Los Angeles, and stamped the diary file
-    /// with a date key from someone else's calendar.
+    /// The Mac's current time zone for both scheduling and diary date keys.
     public static var timeZoneIdentifier: String { TimeZone.current.identifier }
 
     /// Dream loop fire time.
@@ -634,7 +632,7 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
             let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
             // 2026-06-05 dream-design-restore (pass 2): thread the
             // memory-delta provider through so the scheduler-driven run
-            // (NativeClient.runDream → SwiftNativeDreamREMCycle) gets the
+            // (BackgroundLoopsAssembly.runDream → SwiftNativeDreamREMCycle) gets the
             // same Self-half wiring as the BackgroundLoopsAssembly path.
             // Without this, the scheduler bypasses the assembly and the
             // Self-half is permanently empty for the nightly run.

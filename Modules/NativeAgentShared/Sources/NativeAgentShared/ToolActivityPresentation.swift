@@ -114,6 +114,7 @@ public enum ToolActivityPresentation {
             switch outcome {
             case "succeeded": label = "Completed"
             case "failed": label = "Failed"
+            case "refused": label = "Refused"
             case "cancelled": label = "Stopped"
             case "timeout": label = "Timed out"
             default: label = "Completion not confirmed"

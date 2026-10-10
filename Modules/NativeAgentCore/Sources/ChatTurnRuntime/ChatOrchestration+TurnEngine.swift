@@ -418,6 +418,7 @@ public actor SwiftNativeTurnEngine {
             queryEmbedding: readyQueryEmbedding?.values,
             alternateQueryEmbedding: readyQueryEmbedding?.alternateValues,
             queryEmbeddingModelFingerprint: readyQueryEmbedding?.modelFingerprint,
+            queryEmbeddingModelID: readyQueryEmbedding?.modelID,
             // Authoritative mandatory context (especially accumulated explicit
             // corrections) may grow beyond the ordinary 6k ranked packet. Keep
             // the common case byte-identical, but allow one bounded retry with
@@ -598,14 +599,6 @@ public actor SwiftNativeTurnEngine {
                 if memoryFloorDropped > 0 {
                     trace.setCount("contextFlow.memoryFloorDropped", memoryFloorDropped)
                 }
-                // Ambient corrections the per-turn correction cap held back.
-                // Published only when it held something, so an untouched
-                // turn's trace row is byte-identical to a pre-cap one.
-                let correctionCapDropped = preparedContextTurn.packet.receipt
-                    .correctionCapDropped
-                if correctionCapDropped > 0 {
-                    trace.setCount("contextFlow.correctionCapDropped", correctionCapDropped)
-                }
                 // Lead-and-pointer receipts. `truncatedAtoms` is how many bodies
                 // became a rule plus a pointer, `leadChars` is what those leads
                 // cost, and `expandableAfterTruncation` must equal
@@ -645,8 +638,11 @@ public actor SwiftNativeTurnEngine {
                 // SwiftNativePersonaEngine is the only persona engine; there is
                 // no uncompiled persona prompt to drop back to.
                 let compiler = PersonaCompiler(engine: swiftPersona)
+                // The saved name is required, as above: an unreadable profile
+                // fails the turn with the compiler's repair text.
                 let packet = try await compiler.compile(
-                    surface: surface, personaOverride: personaOverride, userMemoryCore: userMemoryCore
+                    surface: surface, personaOverride: personaOverride, userMemoryCore: userMemoryCore,
+                    identityRequired: true
                 )
                 resolvedPersonaID = packet.personaId
                 personaFingerprint = packet.fingerprint
@@ -929,7 +925,7 @@ public actor SwiftNativeTurnEngine {
         // contextFlow.memoryRecords averaged ~12 — a measurement lie, not a
         // recall outage. The legacy lane keeps its own honest name; on a
         // legacy (non-ContextFlow) turn both lanes read the same value.
-        trace.setCount("memory.recallHits", baseContext.resolvedRecalledIds.count)
+        trace.setInjectedMemoryIDs(baseContext.resolvedRecalledIds)
         trace.setCount("memory.recallHits.legacy", recalled.count)
         trace.setCount("system.stableChars", finalContext.systemSegments?.stable.count ?? 0)
         trace.setCount("system.dynamicChars", finalContext.systemSegments?.dynamic.count ?? 0)
@@ -2223,8 +2219,6 @@ public actor SwiftNativeTurnEngine {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !body.isEmpty {
             stableLines.append(body)
-        } else {
-            stableLines.append("You are a helpful assistant.")
         }
         if includeNaturalExpressionGuidance {
             // Phase 5A: the first-run invitation rules are for an agent that

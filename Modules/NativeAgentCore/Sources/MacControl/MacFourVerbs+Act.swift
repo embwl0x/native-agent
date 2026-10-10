@@ -160,7 +160,7 @@ extension MacFourVerbs {
                     + "Only use front:true when the task explicitly asks to bring \(anchor) forward.\n" + reply.text,
                 detail: reply.detail.merging([
                     "error": .string("needs_front"), "status": .string("needs_front"),
-                    "needs_front_reason": .string(reason), "user_front_changed": .bool(false),
+                    "needs_front_reason": .string(reason), "owner_front_changed": .bool(false),
                 ]) { _, new in new }
             )
         }
@@ -212,7 +212,7 @@ extension MacFourVerbs {
         }
         let acted = await run((pid, nil))
         // A new front app chosen mid-act must not be replaced by the old one.
-        guard Self.string(acted.detail["error"]) != "user_changed_apps" else { return acted }
+        guard Self.string(acted.detail["error"]) != "owner_changed_apps" else { return acted }
         let wasFront = pid == previousPid
         let restored = wasFront ? true : await restore()
         return MacFourVerbsReply(
@@ -222,7 +222,7 @@ extension MacFourVerbs {
                     + (restored ? "put \(previousName) back." : "couldn't put \(previousName) back, so \(app) is still in front."))
                 + "\n" + acted.text,
             detail: acted.detail.merging([
-                "brought_forward": .string(app), "user_front_changed": .bool(true), "user_front_restored": .bool(restored),
+                "brought_forward": .string(app), "owner_front_changed": .bool(true), "owner_front_restored": .bool(restored),
             ]) { _, new in new }
         )
     }
@@ -257,21 +257,21 @@ extension MacFourVerbs {
             return MacFourVerbsReply(
                 ok: false,
                 text: "I can't tell which process \(appName) is, so I won't bring it forward. Nothing moved.",
-                detail: ["error": .string("front_unknown"), "user_front_changed": .bool(false)]
+                detail: ["error": .string("front_unknown"), "owner_front_changed": .bool(false)]
             )
         }
         if anchored.isFront {
             let reply = await run((targetPid, anchored.windowFrame))
-            return stamped(reply, note: nil, ["user_front_changed": .bool(
-                Self.bool(reply.detail["user_front_changed"]) == true
-                    || Self.string(reply.detail["error"]) == "user_changed_apps"
+            return stamped(reply, note: nil, ["owner_front_changed": .bool(
+                Self.bool(reply.detail["owner_front_changed"]) == true
+                    || Self.string(reply.detail["error"]) == "owner_changed_apps"
             )])
         }
         guard let previous = anchored.frontmostApp else {
             return MacFourVerbsReply(
                 ok: false,
                 text: "I can't tell which app is in front, so I won't bring \(appName) forward — I couldn't put it back. Nothing moved.",
-                detail: ["error": .string("front_unknown"), "user_front_changed": .bool(false)]
+                detail: ["error": .string("front_unknown"), "owner_front_changed": .bool(false)]
             )
         }
         if let miss = await missBefore(anchored) { return miss }
@@ -292,11 +292,11 @@ extension MacFourVerbs {
         }
         func restoreWords(_ restore: (restored: Bool, gone: Bool)) -> (String, [String: JSONValue]) {
             let extra: [String: JSONValue] = [
-                "user_front_restored": .bool(restore.restored),
+                "owner_front_restored": .bool(restore.restored),
                 "restored_app": .string(previous.name),
-            ].merging(restore.gone ? ["error_restore": .string("user_front_gone")] : [:]) { _, new in new }
+            ].merging(restore.gone ? ["error_restore": .string("owner_front_gone")] : [:]) { _, new in new }
             if restore.restored { return ("\(previous.name) is back in front", extra) }
-            if restore.gone { return ("\(previous.name) has quit since, so there was nothing to put back (user_front_gone)", extra) }
+            if restore.gone { return ("\(previous.name) has quit since, so there was nothing to put back (owner_front_gone)", extra) }
             return ("I couldn't put \(previous.name) back, so \(appName) is still in front", extra)
         }
         let startedAt = clock.monotonicSeconds()
@@ -322,16 +322,16 @@ extension MacFourVerbs {
                     + "I haven't acted; " + words + ".",
                 detail: extra.merging([
                     "error": .string(windowChanged ? "front_window_changed" : "front_raise_failed"),
-                    "user_front_changed": .bool(true),
+                    "owner_front_changed": .bool(true),
                 ]) { _, new in new }
             )
         }
         let frame = MacFourVerbs.frame(raisedOutput["window_frame"]) ?? anchored.windowFrame
         var reply = await run((targetPid, frame))
-        if Self.string(reply.detail["error"]) == "user_changed_apps" {
+        if Self.string(reply.detail["error"]) == "owner_changed_apps" {
             // He picked a new front app mid-act; putting his old one back would undo him.
             return stamped(reply, note: nil, [
-                "brought_forward": .string(appName), "user_front_changed": .bool(true), "user_front_restored": .bool(false),
+                "brought_forward": .string(appName), "owner_front_changed": .bool(true), "owner_front_restored": .bool(false),
             ])
         }
         var restored = await restore()
@@ -353,7 +353,7 @@ extension MacFourVerbs {
         return stamped(reply, note: note, extra.merging([
             "brought_forward": .string(appName),
             "front_seconds": .int(Int64(seconds)),
-            "user_front_changed": .bool(true),
+            "owner_front_changed": .bool(true),
         ]) { _, new in new })
     }
 
@@ -666,7 +666,7 @@ extension MacFourVerbs {
                     "status": .string("needs_front"),
                     "needs_front_reason": .string(reason),
                     "background": .bool(true),
-                    "user_front_changed": .bool(false),
+                    "owner_front_changed": .bool(false),
                     "ax_delivered": .bool(delivered),
                 ]
             )
@@ -743,7 +743,7 @@ extension MacFourVerbs {
             if let before, before.pid != expect.pid {
                 return MacFourVerbsReply(
                     ok: false, text: "The person changed apps; nothing pressed.",
-                    detail: ["error": .string("user_changed_apps"), "user_front_changed": .bool(true)]
+                    detail: ["error": .string("owner_changed_apps"), "owner_front_changed": .bool(true)]
                 )
             }
             // A sheet, dialog or panel (Open, Save) takes its own keys — cmd+shift+g
@@ -847,7 +847,7 @@ extension MacFourVerbs {
                 text: "The front window changed before I could act (front_window_changed), so I haven't touched anything.\n"
                     + sighting.render,
                 // Another app took the front (User, mostly): his choice stands, nothing is put back over it.
-                detail: ["error": .string(sighting.pid != expect.pid ? "user_changed_apps" : "front_window_changed")]
+                detail: ["error": .string(sighting.pid != expect.pid ? "owner_changed_apps" : "front_window_changed")]
             )
         }
         // An explicit menu path goes straight to the menu organ.
@@ -1208,8 +1208,8 @@ extension MacFourVerbs {
                     func otherApp() -> MacFourVerbsReply {
                         MacFourVerbsReply(
                             ok: false,
-                            text: "Another app came to the front before I could type (user_changed_apps), so I typed nothing.\n" + now.render,
-                            detail: ["error": .string("user_changed_apps"), "verb": .string("type"), "target": .string(target)]
+                            text: "Another app came to the front before I could type (owner_changed_apps), so I typed nothing.\n" + now.render,
+                            detail: ["error": .string("owner_changed_apps"), "verb": .string("type"), "target": .string(target)]
                         )
                     }
                     guard sameApp(now) else { return otherApp() }
@@ -1241,7 +1241,7 @@ extension MacFourVerbs {
                     "verb": .string(verb.rawValue),
                     "target": .string(target),
                 ]) { current, _ in current }
-                if let changed = output["front_app_changed"] { detail["user_front_changed"] = changed }
+                if let changed = output["front_app_changed"] { detail["owner_front_changed"] = changed }
                 return MacFourVerbsReply(ok: false, text: line, detail: detail)
             }
 
@@ -1307,7 +1307,7 @@ extension MacFourVerbs {
             }
             if case .seen(let hit) = after { line += "\n" + hit.render }
             var detail = Self.operationDetail(result)
-            if let frontChanged { detail["user_front_changed"] = .bool(frontChanged) }
+            if let frontChanged { detail["owner_front_changed"] = .bool(frontChanged) }
             if app != nil { detail["background"] = .bool(true) }
             if let leftOpen = output["menu_left_open"] { detail["menu_left_open"] = leftOpen }
             detail["verb"] = .string(verb.rawValue)
@@ -1409,8 +1409,8 @@ extension MacFourVerbs {
         guard string(reply.detail["error"]) == "front_changed" else { return reply }
         return MacFourVerbsReply(
             ok: false,
-            text: "Another app came to the front before I could \(verbName) (user_changed_apps), so I sent nothing more.\n" + reply.text,
-            detail: reply.detail.merging(["error": .string("user_changed_apps")]) { _, new in new }
+            text: "Another app came to the front before I could \(verbName) (owner_changed_apps), so I sent nothing more.\n" + reply.text,
+            detail: reply.detail.merging(["error": .string("owner_changed_apps")]) { _, new in new }
         )
     }
 
@@ -1823,8 +1823,8 @@ extension MacFourVerbs {
             }
             let parts = reply.text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
             if parts.count > 1 { screen = String(parts[1]) }
-            if Self.bool(reply.detail["user_front_changed"]) == true
-                || Self.string(reply.detail["error"]) == "user_changed_apps" { frontChanged = true }
+            if Self.bool(reply.detail["owner_front_changed"]) == true
+                || Self.string(reply.detail["error"]) == "owner_changed_apps" { frontChanged = true }
             let verified = Self.string(reply.detail["verification"]) == MotorVerificationState.satisfied.rawValue
             let mark = !reply.ok ? "✗" : (verified ? "✓" : "~ (unverified)")
             lines.append("\(index + 1) \(parts.first.map(String.init) ?? step.target) \(mark)")
@@ -1837,7 +1837,7 @@ extension MacFourVerbs {
                 detail["failed_step"] = .int(Int64(index + 1))
                 detail["steps_completed"] = .int(Int64(index))
                 detail["steps_total"] = .int(Int64(steps.count))
-                detail["user_front_changed"] = .bool(frontChanged)
+                detail["owner_front_changed"] = .bool(frontChanged)
                 return MacFourVerbsReply(
                     ok: false,
                     text: "Stopped at step \(index + 1) of \(steps.count) (\(why)); the rest were not run.\n"
@@ -1853,7 +1853,7 @@ extension MacFourVerbs {
             detail: [
                 "steps_completed": .int(Int64(steps.count)),
                 "steps_total": .int(Int64(steps.count)),
-                "user_front_changed": .bool(frontChanged),
+                "owner_front_changed": .bool(frontChanged),
                 "background": .bool(app != nil),
             ]
         )
@@ -1887,7 +1887,7 @@ extension MacFourVerbs {
                 // User took the front during the lookup: his choice stands.
                 return MacFourVerbsReply(
                     ok: false, text: "The person changed apps; nothing pressed.",
-                    detail: ["error": .string("user_changed_apps"), "menu_path": .string(path)]
+                    detail: ["error": .string("owner_changed_apps"), "menu_path": .string(path)]
                 )
             }
             guard pressed?.ok == true else {
@@ -1941,7 +1941,7 @@ extension MacFourVerbs {
         var detail: [String: JSONValue] = [
             "menu_path": .string(path),
             "target": .string(target),
-            "user_front_changed": .bool(false),
+            "owner_front_changed": .bool(false),
         ]
         if let glyphs { detail["shortcut"] = .string(glyphs) }
         if let chord { detail["chord"] = .string(chord) }
@@ -1977,7 +1977,7 @@ extension MacFourVerbs {
         if pressed?.error == "front_changed" {
             return MacFourVerbsReply(
                 ok: false, text: "The person changed apps; nothing pressed.",
-                detail: ["error": .string("user_changed_apps"), "menu_path": .string(path)]
+                detail: ["error": .string("owner_changed_apps"), "menu_path": .string(path)]
             )
         }
         guard pressed?.ok == true else {
@@ -2138,7 +2138,7 @@ extension MacFourVerbs {
             ok: false,
             text: "No \"\(rawVerb.trimmingCharacters(in: .whitespacesAndNewlines))\" verb. Use: "
                 + verbs.joined(separator: ", ") + ". Nothing moved.",
-            detail: ["error": .string("unknown_verb"), "verb": .string(rawVerb), "user_front_changed": .bool(false)]
+            detail: ["error": .string("unknown_verb"), "verb": .string(rawVerb), "owner_front_changed": .bool(false)]
         )
     }
 
@@ -2183,7 +2183,7 @@ extension MacFourVerbs {
             ok: false,
             text: "Nothing in \(name) is called \"\(target)\" — not in its window or its menus — so I didn't bring \(name) forward. Nothing moved.\n"
                 + seen.render,
-            detail: ["error": .string("no_match"), "target": .string(target), "user_front_changed": .bool(false)]
+            detail: ["error": .string("no_match"), "target": .string(target), "owner_front_changed": .bool(false)]
         )
     }
 

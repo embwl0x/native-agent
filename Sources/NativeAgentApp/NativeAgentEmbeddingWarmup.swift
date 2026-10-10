@@ -1,7 +1,7 @@
 import Foundation
 import MemoryV2
+import NativeAgentCore
 import PersistenceCore
-import PersonaEngine
 
 // Eagerly load the resident Neural Engine embedder without blocking app launch.
 func maybeWarmEmbeddingsForFastMode() async {
@@ -10,11 +10,13 @@ func maybeWarmEmbeddingsForFastMode() async {
     let memory = SwiftNativeMemoryV2.shared
     guard let snapshot = await memory.embeddingRuntimeSnapshot() else {
         nativeLog("[embedding-warmup] SKIP: embeddingRuntimeSnapshot() returned nil — memoryV2 actor not initialized yet?")
+        OrganPulse.record("embedding_warmup", .skipped, note: "memory store not attached")
         return
     }
     nativeLog("[embedding-warmup] snapshot: mode=\(snapshot.mode) backend=requested:\(snapshot.requestedBackend)/effective:\(snapshot.effectiveBackend) coreMLLoaded=\(snapshot.coreMLLoaded) modelLoadable=\(snapshot.modelLoadable) resourcesAvailable=\(snapshot.coreMLResourcesAvailable) modelId=\(snapshot.modelId)")
     if snapshot.coreMLLoaded {
         nativeLog("[embedding-warmup] SKIP: already loaded by another path")
+        OrganPulse.record("embedding_warmup", .nothing, note: "already loaded")
         return
     }
     // Intentionally NOT gating on modelLoadable. If resources aren't on
@@ -25,6 +27,7 @@ func maybeWarmEmbeddingsForFastMode() async {
     do {
         try await memory.warmUpEmbedder()
         nativeLog("[embedding-warmup] SUCCESS: MiniLM eagerly warmed for Fast mode")
+        OrganPulse.record("embedding_warmup", .worked, note: "embedder loaded")
         let after = await memory.embeddingRuntimeSnapshot()
         nativeLog("[embedding-warmup] post-load snapshot: coreMLLoaded=\(after?.coreMLLoaded ?? false) effectiveBackend=\(after?.effectiveBackend ?? "nil")")
     } catch {
@@ -91,47 +94,5 @@ func reconcileMemoryEmbeddingEpochAtLaunch() async -> Bool {
         writeReceipt(["status": "failed", "error": String(describing: error)])
         nativeLog("[memory-epoch] activation failed; prior corpus retained: %@", String(describing: error))
         return false
-    }
-}
-
-// Skills-recall rework (2026-07-03): launch/mutation skill-pointer sync. Scans
-// the runtime + persona skill bodies and reconciles the memory store's
-// "skill-pointer:<name>" rows (see MemoryV2+SkillIndex.swift). Fail-LOUD to
-// stderr — the whole point of the rework is that skills stop being silently
-// invisible, so a broken sync must not be silent either.
-@discardableResult
-func syncSkillPointerIndex(
-    memory: SwiftNativeMemoryV2 = .shared,
-    dataRoot: URL = PersistenceCore.defaultDataRoot(),
-    personaRoot: URL = PersonaRootResolver.resolve()
-) async -> SwiftNativeMemoryV2.SkillIndexSyncResult? {
-    nativeLog("[skill-index] sync starting")
-    let bodiesDirs = [
-        dataRoot.appendingPathComponent("skills/bodies", isDirectory: true),
-        personaRoot
-            .appendingPathComponent("skills/bodies", isDirectory: true),
-    ]
-    let runtimeRegistry = dataRoot.appendingPathComponent("skills/registry.json")
-    // Receipt on disk, not stderr: the installed app's stderr goes nowhere
-    // readable, and a silent sync failure recreates the invisible-library
-    // problem this rework exists to fix. The MemoryV2 owner writes the same
-    // receipt for launch and mutation-triggered reconciliation.
-    let receipt = dataRoot.appendingPathComponent("skills/.pointer_sync_receipt.json")
-    do {
-        let result = try await memory
-            .syncSkillPointersRecordingReceipt(
-                bodiesDirs: bodiesDirs,
-                runtimeRegistryURL: runtimeRegistry,
-                receiptURL: receipt
-            )
-        nativeLog("[skill-index] sync ok")
-        nativeLog(
-            "[skill-index] added=%d updated=%d removed=%d unchanged=%d",
-            result.added, result.updated, result.removed, result.unchanged
-        )
-        return result
-    } catch {
-        nativeLog("[skill-index] SYNC FAILED: %@", String(describing: error))
-        return nil
     }
 }

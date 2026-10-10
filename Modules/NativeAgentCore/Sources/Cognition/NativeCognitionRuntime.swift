@@ -1,4 +1,5 @@
 import Foundation
+import BackgroundLoops
 import ChatOrchestration
 import CognitiveSubstrate
 import Context
@@ -294,7 +295,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     func noteTurnFinished(runId: String) {
         let key = runId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return }
-        liveTurnStartedAtByRunId.removeValue(forKey: key)
+        guard liveTurnStartedAtByRunId.removeValue(forKey: key) != nil else { return }
         liveTurnRunOrder.removeAll { $0 == key }
         pruneExpiredLiveTurns(asOf: now())
     }
@@ -825,6 +826,12 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             prepare: { [substrate] origin in
                 await substrate.afterTurnContext(origin: origin)
             },
+            isIdle: { [weak self, dataRoot] in
+                guard let self,
+                      dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
+                else { return false }
+                return await self.liveTurnLatchCount() == 0
+            },
             finish: { [weak self, substrate] context, interpretation, noveltySkipped in
                 // A novelty-gated turn never asked, so it leaves no caring
                 // receipt (it would read as a failed call); the trace has it.
@@ -1340,7 +1347,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         case .allowed: break
         }
         do {
-            let persistenceEnabled = await substrate.configurationSnapshot().persistenceEnabled
+            let configuration = await substrate.configurationSnapshot()
+            let persistenceEnabled = configuration.persistenceEnabled
             let ran = try await substrate.runMaintenanceChecked(reason: reason)
             guard ran else {
                 // Review round 2 (HIGH): a not-ran outcome includes "still due
@@ -1351,7 +1359,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 await rescheduleCognitionMaintenanceDeadline(
                     notBefore: now().addingTimeInterval(Self.cognitionMaintenanceContentionRetryDelay)
                 )
-                return .skipped("cognitive maintenance not due or disabled")
+                return .skipped(configuration.enabled
+                    ? "cognitive maintenance not due or busy"
+                    : LoopTickOutcome.offPrefix + "cognition disabled")
             }
             await rescheduleCognitionMaintenanceDeadline()
             publishRuntimeChange(reason: "maintenance:completed")
@@ -1373,7 +1383,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         if let bootstrapFailure { return .failed(bootstrapFailure) }
         let configuration = await substrate.configurationSnapshot()
         guard configuration.enabled, configuration.replayEnabled else {
-            return .skipped("cognitive replay disabled")
+            return .skipped(LoopTickOutcome.offPrefix + "cognitive replay disabled")
         }
         switch await backgroundCognitionGate(reason: reason) {
         case .skipped(let reason): return .skipped(reason)

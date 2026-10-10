@@ -24,7 +24,7 @@ public extension SwiftNativeWorkshopRunner {
         let schemaSource = record.plan.prefix(16).map {
             procedureArgumentShape($0.args)
         }.joined(separator: ">")
-        // GRDB is transitively visible in this module (via MemoryV2), and its
+        // GRDB is transitively visible in this module (via CognitiveSubstrate), and its
         // `SQL` string-interpolation + `joined(separator:)` overloads can win
         // type inference over plain String for an unannotated interpolating
         // closure. That hashes an unstable SQL debug description (it embeds a

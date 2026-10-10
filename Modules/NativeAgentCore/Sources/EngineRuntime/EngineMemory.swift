@@ -3,9 +3,10 @@ import Observation
 import PersistenceCore
 import MemoryV2
 import KnowledgeGraph
+import TrustCenter
 
-/// `NativeAgentEngine.memory` (S10's first typed facade; the domain's
-/// NativeClient seam is gone): MemoryV2 and the Knowledge Graph for one data root, in
+/// `NativeAgentEngine.memory` (S10's first typed facade): MemoryV2 and the
+/// Knowledge Graph for one data root, in
 /// core types. The kept list, the review queue, search and the graph are
 /// observable state the Memories and Knowledge Graph pages render; the reads
 /// and writes are nonisolated so the phone lanes use the same owner.
@@ -57,9 +58,9 @@ public final class MemoryFacade {
 
     // MARK: - Reads
 
-    /// Active memories: the newest `limit` (nil is every one), or the
-    /// recall-eligible rows for `ids` (search resolves hits outside the
-    /// bounded list).
+    /// Active memories: the newest `limit` (nil is every one), graduated
+    /// lessons among them as history, or the recall-eligible rows for `ids`
+    /// (search resolves hits outside the bounded list).
     public nonisolated func activeMemories(ids: [String]? = nil, limit: Int? = 200) async throws -> [MemoryV2.MemoryRecord] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let stored: [StoredMemory]
@@ -73,7 +74,7 @@ public final class MemoryFacade {
             }
             stored = matches
         } else {
-            stored = try await storage.listMemories(persona: nil, status: "active", limit: limit)
+            stored = try await storage.listMemories(persona: nil, status: "active", limit: limit, keepingGraduated: true)
         }
         return stored.map(MemoryV2.MemoryRecord.init(stored:))
     }
@@ -90,6 +91,12 @@ public final class MemoryFacade {
     }
 
     // MARK: - Writes
+
+    /// One new memory in this root's store. Resolving the owner may open and
+    /// migrate the store, so this never runs on the caller's actor.
+    public nonisolated func store(content: String, source: String, metadata: JSONValue?) async throws {
+        _ = try await owner.store(content: content, source: source, metadata: metadata)
+    }
 
     /// Merges only `pinned` inside the canonical transaction.
     public nonisolated func setPinned(_ pinned: Bool, id: String) async throws {
@@ -198,12 +205,34 @@ public final class MemoryFacade {
 
     // MARK: - Knowledge Graph
 
+    nonisolated private var graphPath: URL {
+        dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("knowledge_graph.json")
+    }
+
     nonisolated private var graphReader: any KnowledgeGraphReader {
-        makeKnowledgeGraphReader(
-            graphPath: dataRoot
-                .appendingPathComponent("memory", isDirectory: true)
-                .appendingPathComponent("knowledge_graph.json")
+        makeKnowledgeGraphReader(graphPath: graphPath)
+    }
+
+    /// The graph canvas, entity list and status, all from one checked
+    /// snapshot of this root's graph, so a page never composes them from
+    /// different generations. The Desk task count is supplementary: an
+    /// unreadable Desk leaves it nil rather than failing a sound graph.
+    public nonisolated func graphView() async throws -> KnowledgeGraphViewRead {
+        let projection = try await KnowledgeGraphReadProjection.canonicalAgentGraphProjection(
+            graphPath: graphPath, timestamp: SwiftNativeManifestSigner.isoTimestamp
         )
+        let executionCount = try? await DeskFacade(dataRoot: dataRoot).taskRows().count
+        return KnowledgeGraphViewRead(
+            agentGraph: KnowledgeGraphReadProjection.agentGraph(from: projection, executionCount: executionCount),
+            entities: projection.entities,
+            status: KnowledgeGraphReadProjection.graphIndexStatus(from: projection)
+        )
+    }
+
+    public nonisolated func searchGraph(query: String) async throws -> GraphSearchResponse {
+        try await KnowledgeGraphReadProjection.searchGraph(query: query, graphPath: graphPath)
     }
 
     /// Reads every page. Termination is store-authoritative (total_entities)
@@ -275,6 +304,13 @@ public final class MemoryFacade {
         }
         return found
     }
+}
+
+/// One coherent mounted graph read; see `MemoryFacade.graphView()`.
+public struct KnowledgeGraphViewRead: Sendable {
+    public let agentGraph: AgentGraph
+    public let entities: [GraphEntity]
+    public let status: GraphIndexStatus
 }
 
 extension ProposalRecord {

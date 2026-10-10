@@ -1,4 +1,5 @@
 import AppToolRuntime
+import ChatOrchestration
 import Foundation
 import Observation
 import NativeAgentShared
@@ -33,7 +34,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
 
     // ── Advanced (disclosure-toggle reveal) ───────────────────────────────
     // personality + connectors are Advanced (set-once tabs) — they live in
-    // `advancedItems`, not `primaryItems`; keep the case lines here to match.
+    // `advancedItems`, not the rail; keep the case lines here to match.
     case personality = "Personality"     // agent identity and voice
     case connectors = "Connectors"
     case command = "Command Center"
@@ -94,11 +95,16 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     // User, 2026-09-04: Advanced emptied onto the rail. Memories, Personality,
     // Trust, Connectors and Diagnostics carry tabs (ShellRailPages.swift);
     // Providers, Capabilities and Notifications stand alone. Settings stays
-    // last, at the bottom.
-    static let primaryItems: [SidebarItem] = [
-        .chat, .activity, .memories, .desk, .inboxPolicy,
-        .personality, .providers, .trust, .connectors, .capabilities, .diagnostics, .settings,
-    ]
+    // last, at the bottom (the rail's seed, `SurfaceLayout.vocabulary`).
+    /// Advanced's rail top to bottom as the layout shows it (ui/layout.json,
+    /// the rail's blocks by their page ids): a page, or nil for the line
+    /// between its groups. The Navigate menu's digits and ⌘K's pages read its
+    /// pages, so ⌘N is the Nth rail row.
+    static func rail(_ layout: SurfaceLayout) -> [SidebarItem?] {
+        layout.shown("rail", profile: SimpleViewMode.advanced).map { block in
+            QuietPages.all.first { $0.id == block.name && $0.tab == nil }?.item
+        }
+    }
 
     /// The first tab of a rail page that carries tabs; nil for a plain page.
     static func shellFirstTab(for item: SidebarItem) -> String? {

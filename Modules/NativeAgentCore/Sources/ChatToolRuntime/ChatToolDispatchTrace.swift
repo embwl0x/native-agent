@@ -101,10 +101,10 @@ extension ChatToolOutcome {
             case "scheduler_update_job":
                 nextCall = .object(["tool": .string("scheduler_list_jobs"), "input": .object([:])])
             default:
-                // Through the door, app {find} shows the action and its args;
-                // a lane calling by name has its own declared tools.
+                // Through the door, app {find} shows an action's accepted args;
+                // for any other failure it is a round spent, not a next step.
                 let words = (action ?? named ?? "").replacingOccurrences(of: ".", with: " ").replacingOccurrences(of: "_", with: " ")
-                nextCall = door && !words.isEmpty
+                nextCall = door && correction && !words.isEmpty
                     ? .object(["tool": .string("app"), "input": .object(["find": .string(words)])]) : .null
             }
             let fix = effects == "none" ? text("fix") : nil
@@ -115,10 +115,10 @@ extension ChatToolOutcome {
                 "instruction": .string(fix ?? (correction
                     ? "Correct \(argument!) to the accepted shape, then call \(action.map { "app " + $0 } ?? named!) again with the intended values. Do not guess missing choices. Use next_call to inspect accepted choices or the current state if needed."
                     : effects == "none"
-                        ? "Inspect the tool contract and resolve the reported prerequisite before retrying."
+                        ? "Nothing changed. Do what the reason names, or tell the person why."
                         : effects == "occurred"
                             ? "The call took effect. Read the affected state before making another change; do not replay it blindly."
-                            : "Inspect the tool contract, then verify the affected state with its reader before retrying; the failed call may have taken effect.")),
+                            : "It may have taken effect: read the affected state before retrying, or tell the person why.")),
                 "next_call": nextCall,
             ])
         }
@@ -337,13 +337,13 @@ extension ChatToolOutcome {
                 return .unknown
             }
             switch resultClass {
-            case .failed, .timeout: return .failed
+            case .failed, .refused, .timeout: return .failed
             case .cancelled, .succeeded, .unknown: return .unknown
             }
         }
         switch resultClass {
         case .succeeded: return .succeeded
-        case .failed, .timeout: return .failed
+        case .failed, .refused, .timeout: return .failed
         // User, 2026-09-06: a Stop is not the tool failing. A cancelled slot
         // never reached its implementation, so it is no evidence either way —
         // grading it as a failure manufactured a low-confidence tool reflex out
@@ -411,7 +411,7 @@ extension ChatToolOutcome {
         switch exactResultClass(output) {
         case .cancelled: return "result_cancelled"
         case .timeout: return "result_timeout"
-        case .failed: return "result_failed"
+        case .failed, .refused: return "result_failed"
         case .succeeded, .unknown: return "result_failure_envelope"
         }
     }
@@ -498,7 +498,7 @@ extension ChatToolOutcome {
 /// result (or thrown error) reaches the tool loop unchanged.
 ///
 /// Row schema matches the existing writers (DispatchLedger,
-/// NativeClient.appendCapabilityPackTrace):
+/// CapabilityPackInstall.appendCapabilityPackTrace):
 ///   {id, kind, title, status, payload, createdAt} with ISO8601 createdAt.
 package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
     private let inner: any ToolDispatchClient
@@ -517,9 +517,14 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             .appendingPathComponent("events.jsonl")
     }
 
+    /// The dispatch a call runs inside (a script's or a list's own app call,
+    /// home's reads); nil on a call the model made.
+    @TaskLocal private static var parent: String?
+
     package func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let startNs = DispatchTime.now().uptimeNanoseconds
         let receiptID = UUID().uuidString.lowercased()
+        let parent = Self.parent
         // Turn Inspector W1: mirror a "begin" event onto the bus the instant
         // the dispatch starts, so the live Inspector shows a tool as RUNNING
         // (not just on completion). Bus-only — the events.jsonl row stays a
@@ -527,11 +532,14 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         Self.fireBusEvent(
             tool: tool, input: input, surface: surface,
             phase: "begin", status: "running", durationMs: nil, result: nil,
-            evidence: Self.dispatchEvidence(tool: tool, input: input, status: "running", result: nil, receiptID: receiptID)
+            evidence: Self.dispatchEvidence(tool: tool, input: input, status: "running", result: nil, receiptID: receiptID),
+            parent: parent
         )
         let result: JSONValue
         do {
-            result = ChatToolOutcome.normalizedFailure(try await inner.dispatch(tool: tool, input: input, surface: surface), tool: tool)
+            result = ChatToolOutcome.normalizedFailure(try await Self.$parent.withValue(receiptID) {
+                try await inner.dispatch(tool: tool, input: input, surface: surface)
+            }, tool: tool)
         } catch {
             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
             let failure = ChatToolOutcome.failure(error: error, tool: tool)
@@ -539,7 +547,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             Self.fireBusEvent(
                 tool: tool, input: input, surface: surface,
                 phase: "end", status: "failed", durationMs: durationMs,
-                result: failure, evidence: evidence
+                result: failure, evidence: evidence, parent: parent
             )
             await appendTraceRow(
                 tool: tool, input: input, surface: surface,
@@ -562,7 +570,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         let evidence = Self.dispatchEvidence(tool: tool, input: input, status: status, result: result, receiptID: receiptID)
         Self.fireBusEvent(
             tool: tool, input: input, surface: surface,
-            phase: "end", status: status, durationMs: durationMs, result: result, evidence: evidence
+            phase: "end", status: status, durationMs: durationMs, result: result, evidence: evidence, parent: parent
         )
         await appendTraceRow(
             tool: tool, input: input, surface: surface,
@@ -575,6 +583,15 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         return result
     }
 
+    /// A call the loop answered without dispatching it (not offered, held):
+    /// still one the model made, so it is traced as one that failed.
+    package static func traceUndispatched(tool: String, input: [String: JSONValue], surface: String, result: JSONValue) {
+        fireBusEvent(tool: tool, input: input, surface: surface, phase: "end", status: "failed", durationMs: nil, result: result,
+                     evidence: dispatchEvidence(tool: tool, input: input, status: "failed", result: result,
+                                                receiptID: UUID().uuidString.lowercased()),
+                     parent: nil)
+    }
+
     /// Mirror dispatch evidence and redacted previews onto the turn bus.
     private static func fireBusEvent(
         tool: String,
@@ -584,7 +601,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         status: String,
         durationMs: Int?,
         result: JSONValue?,
-        evidence: [String: JSONValue]
+        evidence: [String: JSONValue],
+        parent: String?
     ) {
         guard TurnTraceContext.turnId != nil else { return }
         var payload: [String: JSONValue] = [
@@ -599,12 +617,13 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             )),
         ]
         if let durationMs { payload["durationMs"] = .int(Int64(durationMs)) }
+        if let parent { payload["parentId"] = .string(parent) }
         // An app call as a person is shown it: the action it ran.
         let shown = ToolNameAliases.shown(tool, input: .object(input)).name
         if shown != tool { payload["shown"] = .string(shown) }
         // Her-screen Phase 4 — "User's screen touched: y/n" for the proof tasks.
         if tool == "act", case .object(let reply)? = result, case .object(let detail)? = reply["detail"],
-           let changed = detail["user_front_changed"] {
+           let changed = detail["owner_front_changed"] {
             payload["user_front_changed"] = changed
         }
         if let result {

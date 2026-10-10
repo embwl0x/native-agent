@@ -37,14 +37,14 @@ import MemoryV2
 // MARK: - CheckResult
 
 /// Stable Doctor check shape:
-///   {"id", "title", "status", "detail", "repair"}.
-/// status is one of "ok" | "warn" | "fail". `repair` is the optional
-/// remediation hint.
+///   {"id", "title", "status", "detail", "harm", "repair"}.
+/// Readings use "unmeasured"; adverse rows say why they matter in `harm`.
 public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
     public let id: String
     public let title: String
     public let status: String
     public let detail: String
+    public let harm: String?
     /// Executable repair instruction in reports; legacy core checks are
     /// normalized by DoctorActionRuntime before they reach consumers.
     public let repair: String?
@@ -56,32 +56,39 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
     /// Set where `human_action` is a sign-in or permission — the only steps
     /// Doctor hands to User, gathered into one inbox ask.
     public let ask: DoctorAskKind?
+    /// Who heals an adverse row (`DoctorOwner.of`). A check declares only
+    /// `builder` where a build is the fix; Doctor derives the rest.
+    public let owner: DoctorOwner?
 
     public init(
         id: String,
         title: String,
         status: String,
         detail: String,
+        harm: String? = nil,
         repair: String? = nil,
         receipt: String? = nil,
         human_action: String? = nil,
         repair_available: Bool? = nil,
-        ask: DoctorAskKind? = nil
+        ask: DoctorAskKind? = nil,
+        owner: DoctorOwner? = nil
     ) {
         self.id = id
         self.title = title
         self.status = status
         self.detail = detail
+        self.harm = harm
         self.repair = repair
         self.receipt = receipt
         self.human_action = human_action
         self.repair_available = repair_available
         self.ask = ask
+        self.owner = owner
     }
 
     /// The human step for an adverse row, including older cached rows with
     /// only legacy repair copy. Doctor repairs what it can; a row with neither
-    /// a repair nor a step stands on its detail, which says what is wrong.
+    /// a repair nor a step names its harm before it can be routed.
     public func recoveryAction(repairAvailable: Bool) -> String? {
         if let action = human_action?.trimmingCharacters(in: .whitespacesAndNewlines), !action.isEmpty {
             return action
@@ -95,9 +102,43 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
     }
 }
 
+extension CheckResult {
+    /// The reported row: its human step, an executable repair only where one
+    /// runs, and its owner. Every writer of a Doctor report settles through it.
+    public func settled(liveAvailable: Bool, coreAvailable: Bool) -> CheckResult {
+        let humanAction = recoveryAction(repairAvailable: liveAvailable || coreAvailable) ?? (liveAvailable
+            ? "Open Diagnostics → Doctor and press Repair to retry this live service."
+            : coreAvailable && id == "persona_engine"
+            ? "Persona and identity documents require your decision. Open Diagnostics → Doctor and press Repair to create missing persona documents; automatic checks never write them."
+            : nil)
+        return CheckResult(id: id, title: title, status: status, detail: detail, harm: harm,
+                           repair: liveAvailable ? "Run Repair Safe Issues to retry this live service." : (coreAvailable ? repair : nil),
+                           receipt: receipt,
+                           human_action: humanAction, repair_available: liveAvailable || coreAvailable, ask: ask,
+                           owner: DoctorOwner.of(self, repairAvailable: liveAvailable || coreAvailable))
+    }
+}
+
 public enum DoctorAskKind: String, Sendable, Codable, Equatable {
     case signIn = "sign_in"
     case permission
+}
+
+/// Each adverse row's healer and route: `app` repairs it, `owner` (User) gets
+/// the one doctor-ask card, `agent` (Agent) is woken to triage it, `builder`
+/// goes to the harness queue for a code fix.
+public enum DoctorOwner: String, Sendable, Codable, Equatable {
+    case app, owner, agent, builder
+
+    /// A live repair or handler is the app's; a sign-in or permission is
+    /// User's; a declared build fix is the builder's; Agent triages a named harm.
+    public static func of(_ row: CheckResult, repairAvailable: Bool) -> DoctorOwner? {
+        guard DoctorSafeRepairPolicy.isAdverse(row.status) else { return nil }
+        if repairAvailable { return .app }
+        if row.ask != nil { return .owner }
+        guard let harm = row.harm?.trimmingCharacters(in: .whitespacesAndNewlines), !harm.isEmpty else { return nil }
+        return row.owner == .builder ? .builder : .agent
+    }
 }
 
 // MARK: - DoctorCheck
@@ -371,6 +412,7 @@ public struct StorageCheck: DoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "Could not prepare app storage: \(error.localizedDescription)",
+                harm: "Conversations and memories cannot be saved on this Mac.",
                 repair: nil
             )
         }
@@ -463,7 +505,8 @@ public struct ChatSessionsCheck: DoctorCheck {
         CheckResult(
             id: id, title: title, status: "fail",
             detail: "Chat session store failed: \(reason)",
-            repair: "Run Repair Safe Issues to recreate app-owned chat directories."
+            harm: "Saved conversations cannot be found or reopened.",
+            human_action: "Restore chat/sessions.json from a readable backup, then run Doctor again."
         )
     }
 }
@@ -495,8 +538,8 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
     public let title: String = "Persona Engine 2.0"
     private let engineProvider: @Sendable () -> SwiftNativePersonaEngine
 
-    public init(engineProvider: @escaping @Sendable () -> SwiftNativePersonaEngine = { SwiftNativePersonaEngine() }) {
-        self.engineProvider = engineProvider
+    public init(root: URL? = nil, engineProvider: (@Sendable () -> SwiftNativePersonaEngine)? = nil) {
+        self.engineProvider = engineProvider ?? { root.map { SwiftNativePersonaEngine.isolated(dataRoot: $0) } ?? SwiftNativePersonaEngine() }
     }
 
     public func run(repair: Bool) async -> CheckResult {
@@ -514,6 +557,7 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                     title: title,
                     status: after.status,
                     detail: after.detail,
+                    harm: after.harm,
                     repair: "Seeded missing persona doc(s): \(repaired.joined(separator: ", "))."
                 )
             } catch {
@@ -522,6 +566,7 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                     title: title,
                     status: "fail",
                     detail: "Persona repair failed: \(error.localizedDescription)",
+                    harm: "Her identity documents cannot be loaded.",
                     repair: "Could not seed missing persona docs."
                 )
             }
@@ -535,6 +580,7 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                     title: title,
                     status: "fail",
                     detail: "Persona compiler failed: SOUL.md is absent from \(rootPath)",
+                    harm: "Her identity is missing from the conversation.",
                     repair: "Run Repair Safe Issues to normalize the personality profile."
                 )
             }
@@ -564,6 +610,7 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                         title: title,
                         status: "fail",
                         detail: "Onboarding completed on this Mac but \(profileURL.path) is missing or unreadable, so the configured agent and user names are gone and a default profile is being used in their place.",
+                        harm: "She is using default names instead of the configured agent and user names.",
                         repair: "Restore memory/profile.json from a backup, or set the names again in Settings. Repair will not write this file — it must not invent a name."
                     )
                 }
@@ -581,6 +628,7 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "Persona compiler failed: \(error.localizedDescription)",
+                harm: "Her identity documents cannot be loaded.",
                 repair: "Run Repair Safe Issues to normalize the personality profile."
             )
         }
@@ -703,6 +751,7 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "Could not repair \(unrepaired.count) runtime JSON store(s): \(unrepaired.prefix(5).joined(separator: "; "))",
+                harm: "Saved provider, consent or registry choices remain unavailable.",
                 repair: repaired.isEmpty ? nil : "Completed: \(repaired.joined(separator: "; "))."
             )
         }
@@ -726,6 +775,7 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "\(issueCount) runtime JSON store(s) are malformed or wrong-shaped: \((malformed + wrongShape).prefix(8).joined(separator: ", "))",
+                harm: "Saved provider, consent or registry choices cannot be used.",
                 repair: "Run Repair Safe Issues to back up and reset malformed app-owned JSON stores.",
                 receipt: repaired.isEmpty ? nil : "Completed: \(repaired.joined(separator: "; ")).",
                 human_action: "These stores hold provider, consent and registry choices, so Doctor never resets them by itself. Open Diagnostics → Doctor and press Repair to back up and reset them to empty."
@@ -737,6 +787,7 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "warn",
                 detail: "\(missing.count) runtime JSON store(s) are missing but can be recreated: \(missing.prefix(8).joined(separator: ", "))",
+                harm: "Provider, consent or registry choices cannot be saved until their stores exist.",
                 repair: "Run Repair Safe Issues to create missing app-owned JSON stores."
             )
         }
@@ -909,6 +960,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                         title: title,
                         status: "fail",
                         detail: "Could not create chat message directory: \(error.localizedDescription)",
+                        harm: "New conversation messages cannot be saved.",
                         repair: nil
                     )
                 }
@@ -918,6 +970,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "warn",
                 detail: "Chat message directory is missing at \(dir.path).",
+                harm: "New conversation messages cannot be saved.",
                 repair: "Run Repair Safe Issues to recreate chat message storage."
             )
         }
@@ -934,6 +987,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "Could not list chat message directory: \(error.localizedDescription)",
+                harm: "Saved conversation messages cannot be read.",
                 repair: nil
             )
         }
@@ -1020,6 +1074,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                             title: title,
                             status: "fail",
                             detail: "Could not repair \(file.lastPathComponent): \(error.localizedDescription)",
+                            harm: "Damaged conversation messages remain unreadable.",
                             repair: repairedFiles.isEmpty ? nil : "Repaired: \(repairedFiles.joined(separator: ", "))."
                         )
                     }
@@ -1048,6 +1103,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "\(malformedLines) malformed chat JSONL row(s) across \(malformedFiles.count) file(s).",
+                harm: "Parts of saved conversations cannot be read.",
                 repair: "Run Repair Safe Issues to back up malformed JSONL files and keep valid rows."
             )
         }
@@ -1096,6 +1152,7 @@ public struct MemoryStoreCheck: DoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "Could not prepare memory directory: \(error.localizedDescription)",
+                harm: "Her memories cannot be saved.",
                 repair: nil
             )
         }
@@ -1129,6 +1186,7 @@ public struct MemoryStoreCheck: DoctorCheck {
                     title: title,
                     status: "fail",
                     detail: "Knowledge graph tables in memory.sqlite could not be read: \(error.localizedDescription)",
+                    harm: "She cannot recall connections between her saved memories.",
                     repair: nil
                 )
             }
@@ -1138,7 +1196,7 @@ public struct MemoryStoreCheck: DoctorCheck {
             return CheckResult(
                 id: id,
                 title: title,
-                status: "warn",
+                status: "unmeasured",
                 detail: "Memory store warning(s): \(warnings.joined(separator: ", ")).",
                 repair: "Run MemoryV2 migration if memory.sqlite is absent — Doctor cannot safely rebuild the store."
             )
@@ -1179,13 +1237,6 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                 + "They are marked completed and will not run again; free disk space or fix iCloud permissions."
             )
         }
-        let corrupt = ICloudSyncStatePaths.processedIdsCorruptBackup(dataRoot: dataRoot)
-        if FileManager.default.fileExists(atPath: corrupt.path) {
-            warnings.append(
-                "The processed-command list was unreadable and was preserved as processed_ids.corrupt.json — "
-                + "iPhone commands from before that point may be re-run."
-            )
-        }
         let skipsURL = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
         if let data = try? Data(contentsOf: skipsURL),
            let skips = try? JSONDecoder().decode([String: String].self, from: data) {
@@ -1209,15 +1260,25 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
     /// downgrading a harder existing status.
     private func merging(_ result: CheckResult) -> CheckResult {
         let warnings = Self.localSyncStateWarnings(dataRoot: dataRoot)
-        guard !warnings.isEmpty else { return result }
-        let status = result.status == "fail" ? "fail" : "warn"
+        let corrupt = ICloudSyncStatePaths.processedIdsCorruptBackup(dataRoot: dataRoot)
+        let history = FileManager.default.fileExists(atPath: corrupt.path)
+            ? " The processed-command list was unreadable and was preserved as processed_ids.corrupt.json — iPhone commands from before that point may be re-run." : ""
+        guard !warnings.isEmpty || !history.isEmpty else { return result }
+        let status = warnings.isEmpty
+            ? (result.status == "ok" ? "unmeasured" : result.status)
+            : (result.status == "fail" ? "fail" : "warn")
         return CheckResult(
             id: result.id,
             title: result.title,
             status: status,
-            detail: "\(result.detail) \(warnings.joined(separator: " "))",
+            detail: "\(result.detail)" + (warnings.isEmpty ? "" : " " + warnings.joined(separator: " ")) + history,
+            harm: warnings.isEmpty ? result.harm : [result.harm, "The phone may show old information or miss command completion records."].compactMap { $0 }.joined(separator: " "),
             repair: result.repair,
-            ask: result.ask
+            receipt: result.receipt,
+            human_action: result.human_action,
+            repair_available: result.repair_available,
+            ask: result.ask,
+            owner: result.owner
         )
     }
 
@@ -1237,7 +1298,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
         let services = Self.entitlementValues(DeviceCloudKitPreflight.iCloudServicesEntitlementKey)
         guard let snapshot = await ICloudBridgeHealthReader.snapshot(dataRoot: dataRoot) else {
             return merging(CheckResult(
-                id: id, title: title, status: "warn",
+                id: id, title: title, status: "unmeasured",
                 detail: "iCloud transport health is unmeasured; the app's bridge has not started."
             ))
         }
@@ -1250,15 +1311,20 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
             return merging(CheckResult(
                 id: id, title: title, status: "warn",
                 detail: "The active \(cloudKit ? "CloudKit" : "iCloud Drive") transport lacks its signed \(service) service or container entitlement.",
-                repair: "Install a signed NativeAgent build granting \(service) and container \(containerID)."
+                harm: "The phone cannot exchange messages with her through iCloud.",
+                repair: "Install a signed NativeAgent build granting \(service) and container \(containerID).",
+                owner: .builder
             ))
         }
         if cloudKit {
             return merging(cloudKitResult(snapshot))
         }
+        // Doctor's launch run can precede the bridge's first transfer. Not
+        // measured yet is a reading, not a defect: nothing is wrong and
+        // nothing can be done, so it must not wake her or the phone.
         if case .unmeasured = snapshot.health {
             return merging(CheckResult(
-                id: id, title: title, status: "warn", detail: "iCloud Drive is starting; transport health is not measured yet."
+                id: id, title: title, status: "unmeasured", detail: "iCloud Drive is starting; transport health is not measured yet."
             ))
         }
         guard case .available = snapshot.health, let docsURL = snapshot.documentsURL else {
@@ -1266,6 +1332,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
             return merging(CheckResult(
                 id: id, title: title, status: "warn",
                 detail: signedIn ? "The active iCloud Drive container is unavailable." : "The active iCloud Drive transport has no signed-in iCloud account.",
+                harm: "The phone cannot exchange messages with her through iCloud.",
                 repair: signedIn
                     ? "Open System Settings → Apple Account → iCloud → Drive and turn on Sync this Mac; allow NativeAgent under Apps Syncing to iCloud Drive."
                     : "Open System Settings → Apple Account and sign in to iCloud.",
@@ -1301,6 +1368,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                             title: title,
                             status: "fail",
                             detail: "Could not create \(rel): \(error.localizedDescription)",
+                            harm: "The phone cannot exchange messages with her through iCloud.",
                             repair: created.isEmpty ? nil : "Created: \(created.joined(separator: ", "))."
                         )
                     }
@@ -1322,6 +1390,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "warn",
                 detail: "Missing iCloud/APNS bridge path(s): \(missing.joined(separator: ", ")).",
+                harm: "The phone cannot exchange messages with her through iCloud.",
                 repair: "Run Repair Safe Issues to recreate bridge directories."
             ))
         }
@@ -1344,10 +1413,12 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
             : failures.map(\.detail).joined(separator: " ")
         return CheckResult(
             id: id, title: title,
-            status: receive.status == "ok" && snapshot.sendMeasured && failures.isEmpty ? "ok" : "warn",
+            status: failures.isEmpty ? (receive.status == "ok" && !snapshot.sendMeasured ? "unmeasured" : receive.status) : "warn",
             detail: "\(receive.detail) \(send)",
+            harm: receive.harm ?? failures.compactMap(\.harm).first,
             repair: receive.repair ?? failures.compactMap(\.repair).first,
-            ask: receive.ask ?? failures.compactMap(\.ask).first
+            ask: receive.ask ?? failures.compactMap(\.ask).first,
+            owner: receive.owner ?? failures.compactMap(\.owner).first
         )
     }
 
@@ -1356,8 +1427,11 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
         let detail: String
         var action: String?
         var ask: DoctorAskKind?
+        var owner: DoctorOwner?
         switch health {
         case .unmeasured:
+            // Not measured yet (see the iCloud Drive branch above): a reading.
+            status = "unmeasured"
             detail = "CloudKit \(operation) health is unmeasured. iCloud Drive is not required."
         case .available:
             status = "ok"
@@ -1367,6 +1441,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
             action = "Open System Settings → Apple Account and sign in to iCloud."
             ask = .signIn
         case .notEntitled:
+            owner = .builder
             detail = "CloudKit \(operation) is not configured with its required entitlements."
             action = "Install a signed NativeAgent build granting CloudKit and container \(NativeAgentICloudBridgeConstants.containerID)."
         case .quotaExceeded:
@@ -1379,6 +1454,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                 action = "Open System Settings → Apple Account and complete iCloud sign-in."
                 ask = .signIn
             case .missingEntitlement:
+                owner = .builder
                 action = "Install a signed NativeAgent build granting CloudKit and container \(NativeAgentICloudBridgeConstants.containerID)."
             case .managedAccountRestricted:
                 action = "Ask your Apple Account administrator to allow CloudKit for NativeAgent."
@@ -1388,7 +1464,9 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
         case .unavailable(let reason):
             detail = "The active CloudKit transport's last \(operation) failed: \(reason)"
         }
-        return CheckResult(id: id, title: title, status: status, detail: detail, repair: action, ask: ask)
+        return CheckResult(id: id, title: title, status: status, detail: detail,
+                           harm: status == "warn" ? "The phone cannot exchange messages with her through iCloud." : nil,
+                           repair: action, ask: ask, owner: owner)
     }
 }
 
@@ -1445,42 +1523,47 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
     /// a model the store had not been embedded with. Title and detail now name
     /// the model the runtime RESOLVES, and the detail says separately whether
     /// the bundled MiniLM floor is still there.
-    public var title: String { "Core ML Embedder (\(Self.resolvedModelID))" }
+    public var title: String { "Core ML Embedder (\(resolvedModelID))" }
 
-    private static var resolvedModelID: String {
-        (try? CoreMLEmbeddingProvider.installedExtrasModel(root: defaultDataRoot()))?.modelID
+    private var resolvedModelID: String {
+        (try? CoreMLEmbeddingProvider.installedExtrasModel(root: root))?.modelID
             ?? CoreMLEmbeddingProvider.bundledModelID
     }
 
-    public init() {}
+    private let root: URL
+
+    public init(root: URL = defaultDataRoot()) { self.root = root }
 
     public func run(repair: Bool) async -> CheckResult {
         // An installed model whose manifest is unusable fails here by name —
         // it is never reported as the MiniLM floor loading (S12, 2026-09-26).
         do {
-            _ = try CoreMLEmbeddingProvider.installedExtrasModel(root: defaultDataRoot())
+            _ = try CoreMLEmbeddingProvider.installedExtrasModel(root: root)
         } catch {
             return CheckResult(
                 id: id, title: "Core ML Embedder (installed model)", status: "fail",
                 detail: "\(error.localizedDescription). Semantic recall is off until the installed model is fixed or removed.",
+                harm: "She cannot search her memories by meaning.",
                 repair: repair ? "Cannot repair: the installed model's files need fixing, not cached state." : nil
             )
         }
-        guard CoreMLEmbeddingProvider.bundledResourcesAvailable(extrasRoot: defaultDataRoot()) else {
+        guard CoreMLEmbeddingProvider.bundledResourcesAvailable(extrasRoot: root) else {
             return CheckResult(
                 id: id, title: title, status: "fail",
                 // A2.4: dropped a stale "script/install_minilm.sh" pointer —
                 // that Python-era script no longer exists; the model ships in
                 // the MemoryV2 resource bundle and only a reinstall restores it.
                 detail: "minilm.mlpackage or minilm_vocab.txt is missing from the app bundle — reinstall the app.",
+                harm: "She cannot search her memories by meaning.",
                 repair: repair ? "Cannot repair: bundle resources are missing, not cached state." : nil
             )
         }
         if repair {
-            CoreMLEmbeddingProvider.wipeBundledCompileCache(extrasRoot: defaultDataRoot())
+            CoreMLEmbeddingProvider.wipeBundledCompileCache(extrasRoot: root)
             let after = await probe()
             return CheckResult(
                 id: id, title: title, status: after.status, detail: after.detail,
+                harm: after.harm,
                 repair: "Wiped the CoreML compile cache and re-probed the model load."
             )
         }
@@ -1498,7 +1581,7 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
             // Full real-path probe: compile-cache resolution + MLModel load +
             // WordPiece vocab. Same code the runtime's first embed() runs — so
             // this loads whatever the runtime resolves, extras model included.
-            let provider = try CoreMLEmbeddingProvider.bundled(extrasRoot: defaultDataRoot())
+            let provider = try CoreMLEmbeddingProvider.bundled(extrasRoot: root)
             return CheckResult(
                 id: id, title: title, status: "ok",
                 detail: "\(provider.modelId), \(provider.dimensions)-d, loads: model compiles/loads from cache and the WordPiece vocab parses. \(floor)"
@@ -1506,7 +1589,8 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
         } catch {
             return CheckResult(
                 id: id, title: title, status: "fail",
-                detail: "\(Self.resolvedModelID) failed to load: \(String(describing: error)). Semantic recall is degraded until this is repaired. \(floor)",
+                detail: "\(resolvedModelID) failed to load: \(String(describing: error)). Semantic recall is degraded until this is repaired. \(floor)",
+                harm: "She cannot reliably search her memories by meaning.",
                 repair: "Run Repair Safe Issues to clear the Core ML compile cache and retry loading the model."
             )
         }
@@ -1530,7 +1614,7 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
 /// STATUS SEMANTICS:
 ///   • `fail` — a feed cannot be read at all, or holds rows this build cannot
 ///     use. Compaction is blocked; the feed can only grow.
-///   • `warn` — every feed is decodable but one has grown past
+///   • `unmeasured` — every feed is decodable but one has grown past
 ///     `growthWarnMultiple`× its own compaction threshold (i.e. compaction has
 ///     not run in a long time), or a torn trailing line was seen.
 ///   • `ok` — nothing skipped and every feed is inside its normal band. Missing
@@ -1586,14 +1670,16 @@ public struct OpLogHealthCheck: DoctorCheck {
             return CheckResult(
                 id: id, title: title, status: "fail",
                 detail: "Op-log compaction is blocked: \(detail)",
+                harm: "Saved work may be unreadable and its history will keep growing.",
                 repair: "Run the newest build of NativeAgent.app — "
                     + "the feed holds rows an older binary cannot decode, and compaction refuses to "
-                    + "delete them. The feed keeps growing until a build that understands them runs."
+                    + "delete them. The feed keeps growing until a build that understands them runs.",
+                owner: .builder
             )
         }
         if warned {
             return CheckResult(
-                id: id, title: title, status: "warn",
+                id: id, title: title, status: "unmeasured",
                 detail: "An op-log feed has grown well past its compaction threshold: \(detail)",
                 repair: "Usually self-healing — the next write past the threshold compacts. If it "
                     + "persists, a writer is failing before it reaches the compaction step."
@@ -1784,6 +1870,7 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
         if !findings.isEmpty { detail += " " + findings.joined(separator: " ") }
         return CheckResult(id: id, title: title, status: findings.isEmpty ? "ok" : "warn",
                            detail: detail,
+                           harm: findings.isEmpty ? nil : "She cannot keep using the affected services without renewed access.",
                            repair: refreshable ? DoctorSafeRepairPolicy.oauthRefreshInstruction : nil,
                            receipt: repaired.isEmpty ? nil : "Repaired: refreshed \(repaired.joined(separator: ", ")).",
                            human_action: asks.isEmpty ? nil : asks.joined(separator: " "),
@@ -1798,59 +1885,38 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
     /// inline default argument) so `DoctorHeartbeatPolicy` can DERIVE the
     /// unattended-sweep exclusions from the same array the app runs, instead
     /// of keeping a second hand-maintained list beside it.
-    public static let defaultChecks: [DoctorCheck] = [
-        StorageCheck(),
-        RuntimeJSONStoresCheck(),
-        RunLedgerIntegrityCheck(),
-        TurnTraceIntegrityCheck(),
-        ChatSessionsCheck(),
-        // One-thread-many-surfaces Phase 0: hot session count, 24h mints BY
-        // MINT SITE, and the source-flapping detector. Read-only.
-        SessionIdentityCheck(),
-        // 2026-09-02: two per-turn health rows over the turn-trace feed, so a
-        // regression in either can no longer be invisible. Both are read-only,
-        // bounded (tailed day files), and run ONLY inside a Doctor pass —
-        // never on a turn, a timer, or the cognition runtime. Both are
-        // `heartbeatEligible == false`: they are for a person reading Doctor,
-        // never for an unattended sweep that can wake User.
-        //   * PromptPrefixHealthCheck — cross-turn prefix cache reuse.
-        //   * SubconsciousVitalsCheck — capsule attachment and felt/Inner/Sound
-        //     variety, plus the organism's own chemistry.
-        PromptPrefixHealthCheck(),
-        SubconsciousVitalsCheck(),
-        ChatMessagesIntegrityCheck(),
-        PersonaEngineCheck(),
-        MemoryStoreCheck(),
-        CoreMLEmbedderCheck(),
-        ICloudBridgeStateCheck(),
-        OpLogHealthCheck(),
-        OAuthTokenExpiryCheck(),
-    ]
+    public static let defaultChecks: [DoctorCheck] = checks()
 
-    /// `defaultChecks` with every memoizing check REBUILT, so this runner
-    /// measures instead of replaying.
-    ///
-    /// Astra audit 2026-09-11 finding 6: `defaultChecks` is a `static let` of
-    /// check INSTANCES, and `PromptPrefixHealthCheck` / `SubconsciousVitalsCheck`
-    /// each own a 60-second `DoctorScanCache` actor. "One memo per check
-    /// instance" therefore means "one memo per PROCESS" — constructing a new
-    /// `SwiftNativeDoctorChecks` gets a new actor wrapped around the same two
-    /// check values and the same two memos. So the first-turn refresh ran right
-    /// after launch, hit both memos, and republished the launch measurement
-    /// ("zero rows since launch") under a fresh `runAt`; the drained trace files
-    /// were never opened, because `run()` consults the memo before `measure()`.
-    ///
-    /// A caller that exists BECAUSE something just became true asks for this.
-    /// The polling health card keeps `defaultChecks` and its memo: there the
-    /// memo is doing its job, sparing a trace-file scan every few seconds.
-    public static func freshMeasurementChecks() -> [DoctorCheck] {
-        defaultChecks.map { check in
-            switch check.id {
-            case "prompt_prefix_health": PromptPrefixHealthCheck(cacheTTL: 0)
-            case "subconscious_vitals": SubconsciousVitalsCheck(cacheTTL: 0)
-            default: check
-            }
-        }
+    public static func checks(root: URL? = nil) -> [DoctorCheck] {
+        let dataRoot = root ?? defaultDataRoot()
+        return [
+            StorageCheck(root: dataRoot),
+            RuntimeJSONStoresCheck(root: dataRoot),
+            RunLedgerIntegrityCheck(root: dataRoot),
+            TurnTraceIntegrityCheck(root: dataRoot),
+            ChatSessionsCheck(root: dataRoot),
+            // One-thread-many-surfaces Phase 0: hot session count, 24h mints BY
+            // MINT SITE, and the source-flapping detector. Read-only.
+            SessionIdentityCheck(root: dataRoot),
+            // 2026-09-02: two per-turn health rows over the turn-trace feed, so a
+            // regression in either can no longer be invisible. Both are read-only,
+            // bounded (tailed day files), and run ONLY inside a Doctor pass —
+            // never on a turn, a timer, or the cognition runtime. Both are
+            // `heartbeatEligible == false`: they are for a person reading Doctor,
+            // never for an unattended sweep that can wake User.
+            //   * PromptPrefixHealthCheck — cross-turn prefix cache reuse.
+            //   * SubconsciousVitalsCheck — capsule attachment and felt/Inner/Sound
+            //     variety, plus the organism's own chemistry.
+            PromptPrefixHealthCheck(root: dataRoot),
+            SubconsciousVitalsCheck(root: dataRoot),
+            ChatMessagesIntegrityCheck(root: dataRoot),
+            PersonaEngineCheck(root: root),
+            MemoryStoreCheck(root: dataRoot),
+            CoreMLEmbedderCheck(root: dataRoot),
+            ICloudBridgeStateCheck(dataRoot: dataRoot),
+            OpLogHealthCheck(root: dataRoot),
+            OAuthTokenExpiryCheck(root: dataRoot),
+        ]
     }
 
     public init(checks: [DoctorCheck] = SwiftNativeDoctorChecks.defaultChecks) {
@@ -1939,6 +2005,17 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
 
 // MARK: - Factory
 
-public func makeDoctorChecks() -> any DoctorChecksProtocol {
-    return SwiftNativeDoctorChecks()
+public func makeDoctorChecks(root: URL? = nil, freshMeasurement: Bool = false) -> any DoctorChecksProtocol {
+    let root = root == defaultDataRoot() ? nil : root
+    var checks = root.map { SwiftNativeDoctorChecks.checks(root: $0) } ?? SwiftNativeDoctorChecks.defaultChecks
+    if freshMeasurement {
+        checks = checks.map { check in
+            switch check.id {
+            case "prompt_prefix_health": PromptPrefixHealthCheck(root: root ?? defaultDataRoot(), cacheTTL: 0)
+            case "subconscious_vitals": SubconsciousVitalsCheck(root: root ?? defaultDataRoot(), cacheTTL: 0)
+            default: check
+            }
+        }
+    }
+    return SwiftNativeDoctorChecks(checks: checks)
 }

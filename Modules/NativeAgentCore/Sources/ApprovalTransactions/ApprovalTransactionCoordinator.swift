@@ -1,4 +1,3 @@
-import SelfImprovement
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -8,6 +7,7 @@ import TurnTrace
 import MemoryV2
 import AgentWorkspace
 import ApprovalInbox
+import Desk
 import ChatOrchestration
 import TrustCenter
 import ToolRegistry
@@ -220,13 +220,42 @@ public struct ApprovalTransactionCoordinator: Sendable {
                             "no proposal text in payload OR store row \(proposalId) — "
                             + "refusing to flip approved without the GROWTH write"])
                 }
+                let row = store.loadAll().first(where: { $0.id == proposalId })
+                let graduating = (row?.support == .standing ? row?.supportingPassages ?? [] : []).flatMap { passage in
+                    passage.sourceRefs.filter { $0.hasPrefix("memory:") }
+                        .map { (id: String($0.dropFirst("memory:".count)), quote: passage.quote) }
+                }
+                // A standing card quotes its correction as it was offered. One
+                // rewritten, corrected or let go since is stale: nothing lands,
+                // and the card is closed without refusing the lesson.
+                for item in graduating {
+                    let memory = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot).memory(id: item.id)
+                    guard let memory, memory.status == "active", MemoryLifecycle.isRecallEligible(memory.lifecycle),
+                          memory.content == item.quote else {
+                        _ = try await store.applyDenial(proposalId: proposalId, reason: "stale", tombstone: false)
+                        try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
+                            id: rec.id,
+                            executedAction: .object(["op": .string("rem_proposal_stale"), "proposalId": .string(proposalId),
+                                                     "error": .string("stale")]),
+                            detail: "Standing lesson stale — the correction it came from changed since this card was "
+                                + "offered. Nothing was added to GROWTH and the memory was not graduated.")
+                        return
+                    }
+                }
                 let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
                 let appended = try await REMGrowthWriter.appendApprovedLesson(
                     personaRoot: personaRoot, proposalText: proposalText)
+                // A standing lesson lives in GROWTH now: the correction it came
+                // from graduates — kept as history, never recalled. Before the
+                // flip, so a failure leaves the row to be re-staged and retried.
+                for item in graduating {
+                    _ = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).updateMemory(
+                        id: item.id, update: .object(["lifecycle": .string(MemoryLifecycle.graduated)]))
+                }
                 _ = try await store.applyApproval(proposalId: proposalId)
                 // Phase 5 C1: the lesson keeps the moment that taught it.
                 // Best-effort: the approval stands whatever happens here.
-                if let row = store.loadAll().first(where: { $0.id == proposalId }) {
+                if let row {
                     do {
                         try await REMLessonOrigin.record(
                             row, memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot), dataRoot: dataRoot)
@@ -385,6 +414,48 @@ public struct ApprovalTransactionCoordinator: Sendable {
                         .errorDescription ?? "the canon is the agent's to tend"))
     }
 
+    private func retireSelfEvolutionApproval(from rec: ApprovalRecord) async {
+        try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
+            id: rec.id, executedAction: .object(["op": .string("self_evolution_retired")]),
+            detail: "Code evolution is no longer available; no code was changed or installed.",
+            root: dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot())
+    }
+
+    /// A Desk item that waits on an approval names it in its blocked reason or
+    /// waiting-on, by full id or its first eight characters; nothing else links
+    /// the two. Once that approval is decided the wait is over and the item
+    /// says so: the decision as a note, then back to todo when approved, or
+    /// blocked on a new plan otherwise. An item naming more than one approval
+    /// stays its owner's call.
+    public static func settleDeskWaits(dataRoot: URL) async {
+        do {
+            let approvals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: ApprovalFilter())
+            try await SwiftNativeDeskStore(dataRoot: dataRoot).settleWaits { item in
+                let tokens = [item.blockedReason, item.waitingOn].compactMap { $0?.lowercased() }
+                    .flatMap { $0.split { !$0.isHexDigit && $0 != "-" } }.filter { $0.count >= 8 }
+                let named = approvals.filter { row in tokens.contains { row.id.lowercased().hasPrefix($0) } }
+                guard named.count == 1, let row = named.first, let decision = row.decision else { return nil }
+                let line = "Decided: \(decision)" + (row.decidedBy.map { " by \($0)" } ?? "")
+                    + (row.resolvedAt.map { " on \($0.prefix(10))" } ?? "")
+                return ("\(line) (approval \(row.id)).", decision == "approved" ? .todo : .blocked,
+                        decision == "approved" ? nil : "\(line) — needs a new plan")
+            }
+        } catch {
+            nativeLog("[deskApprovalWait] Desk waits on decided approvals were not settled: \(error)")
+        }
+    }
+
+    /// Settle what was decided while the app was down, then again on every
+    /// resolve the inbox publishes, whoever resolved it. Subscribes first so a
+    /// decision landing during the launch pass is not missed.
+    public static func settleDeskWaitsOnEveryResolve(dataRoot: URL) async {
+        let events = await ApprovalLifecycleBus.shared.events()
+        await settleDeskWaits(dataRoot: dataRoot)
+        for await event in events where event.phase == .resolved {
+            await settleDeskWaits(dataRoot: dataRoot)
+        }
+    }
+
     // MARK: - U5 W-A item 3: generic resolve→execute crash-window reconcile
 
     /// One reconcilable approval kind: the action string, an eligibility/
@@ -435,15 +506,19 @@ public struct ApprovalTransactionCoordinator: Sendable {
     ///     the payload's runId in a TERMINAL state (the executor persists
     ///     the run BEFORE annotating) and, when found, heals the missing
     ///     annotation from the persisted run WITHOUT re-opening the URL.
-    public func reconcileUnappliedApprovalExecutions() async {
+    /// Returns how many resolved approvals it re-ran: production kinds, chat
+    /// tools and connector actions.
+    @discardableResult
+    public func reconcileUnappliedApprovalExecutions() async -> Int {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let records = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot)
-        await Self.reconcileUnappliedApprovalExecutions(
+        let executed = await Self.reconcileUnappliedApprovalExecutions(
             dataRoot: dataRoot,
             kinds: productionApprovalReconcileKinds(), records: records)
-        let receiptFailures = await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot, records: records)
-        await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot, records: records)
-        await checkpointApprovalReconciliation(dataRoot: dataRoot, records: records, retry: receiptFailures)
+        let chatTools = await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot, records: records)
+        let connectors = await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot, records: records)
+        await checkpointApprovalReconciliation(dataRoot: dataRoot, records: records, retry: chatTools.failures)
+        return executed + chatTools.executed + connectors
     }
 
     struct ApprovalReconciliationCursor: Codable {
@@ -519,11 +594,9 @@ public struct ApprovalTransactionCoordinator: Sendable {
             var cursor = try ApprovalReconciliationCursor.read(dataRoot)
             let refreshed = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .resolved)
             let selected = Set(records.map(\.id))
-            // 2026-09-19: a deferred install has an annotation but still needs
-            // the later self-evolution launch pass, including after relaunch.
             let unresolved = refreshed.filter {
                 selected.contains($0.id) && (($0.decision == "approved" && $0.executedAction == nil)
-                    || SelfEvolutionApprovalExecutor.isDeferredEvolutionInstall($0) || retry.contains($0.id))
+                    || retry.contains($0.id))
             }.map(\.id)
             let retainedIDs = Set(refreshed.map(\.id))
             cursor.retry.removeAll { selected.contains($0) || !retainedIDs.contains($0) }
@@ -548,12 +621,14 @@ public struct ApprovalTransactionCoordinator: Sendable {
     /// Scan core, split out so tests can run it against a fixture root with
     /// recording executors (the production executors are hardwired to the
     /// default data root).
+    @discardableResult
     public static func reconcileUnappliedApprovalExecutions(
         dataRoot: URL,
         kinds: [ApprovalExecutionReconcileKind],
         records: [ApprovalRecord]? = nil
-    ) async {
+    ) async -> Int {
         let resolved = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
+        var executed = 0
         for kind in kinds {
             for rec in resolved where rec.executedAction == nil
                 && ExecutionEventVocabulary.matches(rec.action, kind.action) {
@@ -561,8 +636,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 nativeLog("[approvalReconcile] reconciling unexecuted resolved \(kind.action) "
                     + "\(rec.id) (decision: \(rec.decision ?? "?"))")
                 await kind.execute(rec)
+                executed += 1
             }
         }
+        return executed
     }
 
     /// self_improvement.apply eligibility: resolve only ever runs the
@@ -589,6 +666,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 action: "self_improvement.apply",
                 shouldReconcile: { Self.selfImprovementReconcileEligible($0) },
                 execute: { await client.applyApprovedSelfImprovement(from: $0) }),
+            ApprovalExecutionReconcileKind(
+                action: "self_evolution.apply",
+                shouldReconcile: { _ in true },
+                execute: { await client.retireSelfEvolutionApproval(from: $0) }),
             ApprovalExecutionReconcileKind(
                 action: "browser.open_url",
                 shouldReconcile: { _ in true },
@@ -763,39 +844,25 @@ public struct ApprovalTransactionCoordinator: Sendable {
         ConversationSurfaceProfile(surface).isRemote
     }
 
-    private func evolutionBridgeEnabledForApprovalReplay(surface: String) -> Bool {
-        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized == effects.telegramSurface {
-            return effects.telegramIncludesEvolutionBridge
-        }
-        // Sol, 2026-09-15: `agent-bridge` is a remote surface, so this returned
-        // false and an approved `self_install` / `evolution_*` replay reached a
-        // DISABLED backend — the person clicked Approve and nothing happened.
-        // Reaching this replay at all already means the approval record exists,
-        // was resolved-approved for this exact tool and body, and was spent by
-        // the executor; the peer authenticated with its own scoped credential.
-        // That is the person's own decision, so it gets the real backend.
-        if PeerTurnEffectPolicy.isPeerBridge(surface: surface) { return true }
-        return !Self.isRemoteChatApprovalSurface(surface)
-    }
-
     @discardableResult
     public func reconcileUnappliedChatToolApprovalExecutions(
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
         records: [ApprovalRecord]? = nil,
         continuation: ChatApprovalContinuation? = nil
-    ) async -> Set<String> {
+    ) async -> (executed: Int, failures: Set<String>) {
         let continuation: ChatApprovalContinuation = continuation ?? { root, session, envelope, prompt in
             try await self.continueChatToolApproval(dataRoot: root, sessionID: session, envelope: envelope, prompt: prompt)
         }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         var failures: Set<String> = []
+        var executed = 0
         let resolved = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
         for rec in resolved where Self.chatToolApprovalReplay(from: rec) != nil {
             if Self.chatToolApprovalReplayNeedsExecution(rec) {
                 nativeLog("[approvalReconcile] reconciling eligible resolved chat tool approval "
                     + "\(rec.id) action=\(rec.action) decision=\(rec.decision ?? "?")")
                 await applyResolvedChatToolApproval(from: rec, dataRoot: dataRoot, continuation: continuation)
+                executed += 1
             }
             // Execution truth and conversational continuity are separate
             // commits. Heal the latter too: an approved tool that ran before a
@@ -810,19 +877,23 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 failures.insert(rec.id)
             }
         }
-        return failures
+        return (executed, failures)
     }
 
+    @discardableResult
     public func reconcileUnappliedConnectorActionApprovals(
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
         records: [ApprovalRecord]? = nil
-    ) async {
+    ) async -> Int {
         let resolved = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
         let client = self
+        var executed = 0
         for record in resolved
         where record.action.hasPrefix("connector.action.") && record.executedAction == nil {
             _ = await client.applyResolvedConnectorAction(from: record, dataRoot: dataRoot)
+            executed += 1
         }
+        return executed
     }
 
     public struct ConnectorActionApprovalReplay: Sendable {
@@ -1098,9 +1169,6 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 replay.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             )
             let tools = effects.toolDispatchClient(
-                includeEvolutionBridge: evolutionBridgeEnabledForApprovalReplay(
-                    surface: replay.surface
-                ),
                 denyExternalMcp: isBuiltInBridge,
                 enforceAppAutonomy: false
             )
@@ -1150,7 +1218,9 @@ public struct ApprovalTransactionCoordinator: Sendable {
                                                 payload["agentExactProtocol"] == .bool(true)
                                             } else { false }
                                             return try await AgentConversationApproval.replay(id: rec.id, dataRoot: dataRoot,
-                                                exactProtocol: exactProtocol, perform: send)
+                                                exactProtocol: exactProtocol, dispatch: { tool, input in
+                                                    try await gated.dispatch(tool: tool, input: input, surface: replay.surface)
+                                                }, perform: send)
                                         }
                                         return try await send()
                                     }
@@ -1263,7 +1333,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         let ok: Bool? = {
             switch resultClass {
             case .succeeded: return true
-            case .failed, .timeout: return false
+            case .failed, .refused, .timeout: return false
             case .cancelled, .unknown: return nil
             }
         }()
@@ -1274,7 +1344,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         case .unknown: outcomeDescription = "Outcome unconfirmed"
         case .cancelled: outcomeDescription = "Cancelled"
         case .timeout: outcomeDescription = "Timed out"
-        case .failed: outcomeDescription = "Failed"
+        case .failed, .refused: outcomeDescription = "Failed"
         case .succeeded: outcomeDescription = "Completed"
         }
         let statusSummary = decision == "approved"
@@ -1306,6 +1376,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
             envelope["ok"] = .bool(true)
         case .failed:
             envelope["status"] = .string("failed")
+            envelope["ok"] = .bool(false)
+            envelope["error"] = failureDetail
+        case .refused:
+            envelope["status"] = .string("refused")
             envelope["ok"] = .bool(false)
             envelope["error"] = failureDetail
         case .timeout:
@@ -1420,6 +1494,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             switch resultClass {
             case .succeeded: return "succeeded"
             case .failed: return "failed"
+            case .refused: return "refused"
             case .cancelled: return "cancelled"
             case .timeout: return "timed_out"
             case .unknown: return "outcome_unknown"
@@ -1767,18 +1842,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
             // and at the start of every gated consolidation.
             _ = await MemoryConsolidationGate.reconcile(
                 dataRoot: PersistenceCore.defaultDataRoot())
-        } else if rec.action == SelfEvolutionApprovalExecutor.selfEvolutionAction {
-            // U2b wave 2: approve runs the green-candidate-gated promote and
-            // stops at the systemRebuild boundary (annotated deferred —
-            // op evolution_install_deferred — while the per-action flag is
-            // off; the launch reconcile resumes the install once the gate
-            // opens); deny marks the proposal denied (never
-            // re-proposed); cancel leaves it staged for a fresh card. The
-            // executor self-guards and annotates every terminal; crash
-            // window healed by reconcileUnappliedSelfEvolution at launch.
-            // NEVER auto-approved: this branch only runs from an explicit
-            // human resolve (no auto-approve path consults evolution cards).
-            await SelfEvolutionApprovalExecutor.applyResolvedSelfEvolution(from: rec, deps: effects.selfEvolutionDependencies())
+        } else if rec.action == "self_evolution.apply" {
+            await retireSelfEvolutionApproval(from: rec)
         } else if rec.action == SwiftNativeApprovalInbox.procedureExactActivationApprovalAction {
             await Self.applyResolvedProcedureExactActivation(
                 from: rec,

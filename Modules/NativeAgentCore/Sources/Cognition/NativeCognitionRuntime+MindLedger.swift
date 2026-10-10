@@ -200,7 +200,7 @@ extension NativeCognitionRuntime {
     public static func rejectionRefusal(for record: MemoryRecord?) -> String? {
         guard let record else { return "that memory could not be read, so it cannot be checked; nothing was rejected" }
         let tags = Set((record.tags ?? []).map { $0.lowercased() })
-        if record.pinned == true { return "that memory is pinned to your core; only User unpins it" }
+        if record.pinned == true { return "that memory is pinned to your core; only the owner unpins it" }
         if record.memoryKind == "correction" || tags.contains("correction") {
             return "that memory is a correction; corrections always stand"
         }

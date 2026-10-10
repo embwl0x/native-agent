@@ -14,6 +14,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+import DreamREMCycle
 
 // MARK: - Persona and runtime introspection tools
 
@@ -105,18 +106,78 @@ extension SwiftToolDispatcher {
         let kind = try requireString(input, "kind")
         let content = try requireString(input, "content")
         let engine = SwiftNativePersonaEngine(root: personaRootForTools(), dataRoot: dataRoot)
+        // GROWTH keeps the lines REM approved, graduated standing lessons among
+        // them (a 10-09 rewrite silently dropped some). One goes only when
+        // `retire` names it with a reason; it is then tombstoned, as a REM deny
+        // is, and the pins follow.
+        var retire: [String: String] = [:]
+        if case .object(let named)? = input["retire"] {
+            for case let (line, .string(why)) in named where !why.trimmingCharacters(in: .whitespaces).isEmpty {
+                retire[line.trimmingCharacters(in: .whitespacesAndNewlines)] = why
+            }
+        }
+        // Read under GROWTH's own lock, the one REM's writer appends under, so
+        // a lesson published mid-rewrite is in this read or lands after this
+        // write. Strict: an unreadable history refuses rather than reading as
+        // "nothing to protect".
+        let store = REMProposalStore(dataRoot: dataRoot)
+        let keeping: @Sendable (String) throws -> Void = { [retire] current in
+            let rows: [REMProposalRow]
+            do { rows = try store.loadAllStrictly() } catch {
+                throw PersonaWriteError.ioFailure("the REM approval history could not be read "
+                    + "(\(error.localizedDescription)), so GROWTH's approved lines can't be checked. Nothing was written.")
+            }
+            let dropped = Self.remLines(rows, in: current).filter {
+                !REMGrowthWriter.containsEntryParagraph(content, $0) && retire[$0] == nil
+            }
+            guard dropped.isEmpty else {
+                throw PersonaWriteError.invalidInput(
+                    "this GROWTH rewrite drops \(dropped.count) line(s) REM approved:\n"
+                    + dropped.map { "- \"\($0)\"" }.joined(separator: "\n")
+                    + "\nKeep each one, or retire it with a reason: retire: {\"<the line, exactly>\": \"<why it goes>\"}. "
+                    + "Nothing was written.")
+            }
+        }
         do {
             let result = try await engine.personaWrite(
                 kind: kind,
                 content: content,
-                skillName: optionalString(input, "skill_name")
+                skillName: optionalString(input, "skill_name"),
+                keeping: canonicalPersonaKind(kind) == "growth" ? keeping : nil
             )
-            return personaWriteResultJSON(result)
+            var fields: [String: JSONValue] = [:]
+            if case .object(let saved) = personaWriteResultJSON(result) { fields = saved }
+            if !retire.isEmpty, canonicalPersonaKind(kind) == "growth" {
+                do {
+                    let retired = try store.loadAllStrictly().filter { row in
+                        let line = row.proposalText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return row.status != "denied" && retire[line] != nil && !REMGrowthWriter.containsEntryParagraph(content, line)
+                    }
+                    for row in retired {
+                        try await REMTombstoneStore(dataRoot: dataRoot).record(
+                            row.asREMProposal, reason: retire[row.proposalText.trimmingCharacters(in: .whitespacesAndNewlines)] ?? "")
+                    }
+                    try REMConsolidator.emitREMPinsIndex(dataRoot: dataRoot)
+                    fields["retired"] = .array(retired.map { .string($0.proposalText) })
+                } catch {
+                    fields["retire_failed"] = .string("GROWTH was written, but retiring its lines failed "
+                        + "(\(error.localizedDescription)); REM may offer them again.")
+                }
+            }
+            return .object(fields)
         } catch {
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher persona_write failed: \(error.localizedDescription)"
             )
         }
+    }
+
+    /// The REM lessons standing in a GROWTH body: approved, or appended by an
+    /// approval whose flip has not landed yet. A denied one never stands.
+    static func remLines(_ rows: [REMProposalRow], in body: String) -> [String] {
+        rows.filter { $0.status != "denied" && REMProposalStore.supportsProposalTarget($0.targetDoc) }
+            .map { $0.proposalText.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { REMGrowthWriter.containsEntryParagraph(body, $0) }
     }
 
     func impl_persona_append_section(input: [String: JSONValue]) async throws -> JSONValue {
@@ -155,7 +216,7 @@ extension SwiftToolDispatcher {
             "provider": provider,
             "dispatch": .object([
                 "provider_tools_field": .bool(true),
-                "tool_loop": .string("SwiftNativeTurnEngine.executeTurnWithToolLoop"),
+                "tool_loop": .string("SwiftNativeTurnEngine.executeTurnWithStreamingToolLoop"),
                 "dispatcher": .string("SwiftToolDispatcher"),
             ]),
             "runtime_instance_id": .string(runtimeInstanceID),

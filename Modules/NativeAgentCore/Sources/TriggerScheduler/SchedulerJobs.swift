@@ -132,8 +132,9 @@ import WorkshopExecution
 //     evaluation are app-owned; arbitrary due-job execution uses the same
 //     connector/action runners that own those effects.
 //
-// The production Swift caller is NativeClient.createJob(name:kind:intervalSeconds:)
-// (→ AppModel.createDreamJob). The connector-action create path is reachable
+// The production Swift callers are the app's job writers
+// (`makeSchedulerJobWriter`: the recurring improvement and her scheduler
+// tools). The connector-action create path is reachable
 // ONLY through the daemon's own dispatcher (scheduler.create_job), never the
 // Swift HTTP seam, so delegating that one branch costs the native path nothing
 // the Swift surface actually exercises.
@@ -834,25 +835,8 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
 
 enum SchedulerJobNormalizer {
     static let allowedKinds: Set<String> = [
-        "notify", "connector_action", "dream", "rem", "improve", "harness_benchmark", "proactive_scan", "workshop",
+        "notify", "connector_action", "dream", "rem", "harness_benchmark", "proactive_scan", "workshop",
     ]
-
-    /// DEFAULT_IMPROVEMENT_OBJECTIVE — EXACT copy so a
-    /// defaulted `improve` job runs with the same instructions as the daemon.
-    /// The em-dash (—) and wording are byte-for-byte the Python constant.
-    static let defaultImprovementObjective =
-        "Make NativeAgent meaningfully better. Survey the ENTIRE system end to "
-        + "end and decide for yourself what is most worth improving — do not "
-        + "restrict yourself to any predefined list. Consider, among anything "
-        + "else you notice: your own recent runs, evals, Doctor reports, error "
-        + "and crash logs, telemetry, test results and gaps, prior staged and "
-        + "failed self-improvement attempts, user feedback, the bug ledger, and "
-        + "the codebase itself (daemon, providers, iOS app, scripts, "
-        + "architecture, performance, reliability, security, UX, missing "
-        + "capabilities, and tech debt). Identify the single highest-value "
-        + "concrete improvement you can FULLY implement and verify right now, "
-        + "then implement exactly that one improvement, tested and "
-        + "receipt-backed."
 
     // MARK: top-level normalize
 
@@ -992,14 +976,12 @@ enum SchedulerJobNormalizer {
             if case .object(let opts)? = rawOpts {
                 outPayload["deliveryOptions"] = .object(opts)
             }
-        case "dream", "rem", "improve":
+        case "dream", "rem":
             // objective = str(payload.objective or body.objective or "").strip()
             var objective = (string(pyOr(payload["objective"], body["objective"], .string(""))) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if objective.isEmpty {
-                objective = kind == "improve"
-                    ? defaultImprovementObjective
-                    : (kind == "rem" ? "Scheduled REM consolidation" : "Scheduled reflection")
+                objective = kind == "rem" ? "Scheduled REM consolidation" : "Scheduled reflection"
             }
             outPayload = ["objective": .string(objective.prefixString(2000))]
         case "workshop":

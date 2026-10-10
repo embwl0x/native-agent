@@ -115,7 +115,7 @@ let extraDeps: [String: [String]] = [
     "AgentLinkTransport": ["PersistenceCore", "ProviderRouting"],
     "EngineRuntime": ["Agents", "AppToolRuntime", "ApprovalInbox", "ApprovalTransactions", "AttentionRouting", "BackgroundLoops", "BackgroundWork", "Browser", "ChatOrchestration", "ChromeControl", "Cognition", "CognitiveSubstrate", "Connectors", "Context", "ContextFlow", "Desk", "DeviceSync", "DoctorChecks", "DreamREMCycle", "GitHubConnector", "KnowledgeGraph", "MCPDispatcher", "MacAssistantStatus", "MacControl", "MemoryV2", "NotificationInbox", "PersistenceCore", "PersonaEngine", "ProviderRouting", "Research", "SelfImprovement", "Skills", "SlackBot", "SlackConnector", "StandingBots", "TelegramBot", "ToolExecution", "ToolRegistry", "Transcripts", "TriggerScheduler", "TrustCenter", "TrustPersistence", "WorkshopExecution"],
     // Approval transactions compose canonical owners; host effects arrive through ports.
-    "ApprovalTransactions": ["SelfImprovement", "Procedures", "AgentWorkspace", "ApprovalInbox", "Browser", "ChatOrchestration", "Cognition", "Dispatcher", "DreamREMCycle", "FeedPolicy", "MacControl", "MacIntegration", "MemoryV2", "PersistenceCore", "PersonaEngine", "Privacy", "ProviderRouting", "Studio", "TelegramBot", "TrustCenter", "TurnTrace", "WorkshopExecution"],
+    "ApprovalTransactions": ["Procedures", "AgentWorkspace", "ApprovalInbox", "Browser", "ChatOrchestration", "Cognition", "Desk", "Dispatcher", "DreamREMCycle", "FeedPolicy", "MacControl", "MacIntegration", "MemoryV2", "PersistenceCore", "PersonaEngine", "Privacy", "ProviderRouting", "Studio", "TelegramBot", "TrustCenter", "TurnTrace", "WorkshopExecution"],
     // Tool policy composes the existing owners; UI and platform effects arrive through ports.
     "AppToolRuntime": ["Senses", "Agents", "ApprovalInbox", "ChatOrchestration", "Desk", "ChromeControl", "Browser", "Cognition", "CognitiveSubstrate", "Context", "MacControl", "Research", "PersistenceCore", "TrustCenter", "WorkshopExecution", "StandingBots", "ToolRegistry", "Privacy", "AttentionRouting", "MacIntegration", "PersonaEngine", "ProviderRouting", "DeviceSync", "Dispatcher", "Studio", "DoctorChecks", "TrustPersistence", "Skills", "MemoryV2"],
     "PersistenceCore": ["FeedPolicy"],
@@ -172,9 +172,9 @@ let extraDeps: [String: [String]] = [
     // TrustCenter's own shape + known-field-type validation. No cycle —
     // TrustCenter's closure is PersistenceCore / ToolRegistry and neither
     // depends on these three.
-    "MemoryV2": ["Skills", "PersistenceCore", "PersonaEngine", "KnowledgeGraph", "ApprovalInbox", "TrustCenter", "Procedures", "FeedPolicy", "CognitiveSubstrate", "Senses", "ChatTurnContracts"],
+    "MemoryV2": ["PersistenceCore", "PersonaEngine", "KnowledgeGraph", "ApprovalInbox", "TrustCenter", "Procedures", "FeedPolicy", "CognitiveSubstrate", "Senses", "ChatTurnContracts"],
     "DreamREMCycle": ["PersistenceCore", "PersonaEngine", "ProviderRouting", "KnowledgeGraph", "TrustCenter", "Transcripts", "SwarmRuns"],
-    "SelfImprovement": ["PersistenceCore", "TrustCenter", "FeedPolicy", "ApprovalInbox", "NotificationInbox", "SystemOps", "DoctorChecks"],
+    "SelfImprovement": ["PersistenceCore"],
     "TrustCenter": ["PersistenceCore", "ToolRegistry", "FeedPolicy", "Skills", "WorkflowOrchestration"],
     // Backup/recovery composes existing owners above TrustCenter: MemoryV2
     // and ApprovalInbox already depend on TrustCenter, so it cannot own them.
@@ -205,11 +205,11 @@ let extraDeps: [String: [String]] = [
     // mirrors comes through DeviceSyncHost. Nothing imports it back.
     "DeviceSync": ["MacControl", "PersistenceCore", "CognitiveSubstrate", "Cognition", "ChatOrchestration", "KnowledgeGraph", "MemoryV2", "ApprovalInbox", "NotificationInbox", "ProviderRouting", "MacIntegration", "TrustCenter", "WorkshopExecution", "PersonaEngine", "Transcripts", "Desk", "Privacy", "DeviceSyncState", "TriggerScheduler", "AgentConversations", "TurnTrace"],
     "AttentionRouting": ["PersistenceCore", "FeedPolicy", "ChatOrchestration", "DeviceSync", "TelegramBot", "Desk", "TriggerScheduler", "NotificationInbox", "ApprovalInbox", "StandingBots"],
-    "ProviderRouting": ["PersistenceCore", "TurnTrace"],
+    "ProviderRouting": ["PersistenceCore", "TurnTrace", "FeedPolicy"],
     "BackgroundLoops": ["PersistenceCore", "DoctorChecks", "DreamREMCycle", "ProviderRouting", "TriggerScheduler", "Studio", "FeedPolicy"],
     // Cross-domain runner bodies sit above their domain owners; the scheduler
     // stays dependency-light and remains the only registration/single-flight owner.
-    "BackgroundWork": ["ActivityWatch", "ApprovalInbox", "AttentionRouting", "BackgroundLoops", "ChatOrchestration", "Cognition", "CognitiveSubstrate", "Context", "Desk", "DeviceSync", "DoctorChecks", "DreamREMCycle", "GitHubConnector", "MemoryV2", "NotificationInbox", "PersistenceCore", "PersonaEngine", "Privacy", "ProviderRouting", "SelfImprovement", "StandingBots", "TelegramBot", "TriggerScheduler", "TrustCenter", "TurnTrace", "WorkshopExecution"],
+    "BackgroundWork": ["ActivityWatch", "AgentConversations", "AgentWorkspace", "ApprovalInbox", "AttentionRouting", "BackgroundLoops", "ChatOrchestration", "Cognition", "CognitiveSubstrate", "Context", "Desk", "DeviceSync", "DoctorChecks", "DreamREMCycle", "GitHubConnector", "MemoryV2", "NotificationInbox", "PersistenceCore", "PersonaEngine", "Privacy", "ProviderRouting", "StandingBots", "TelegramBot", "TriggerScheduler", "TrustCenter", "TurnTrace", "WorkshopExecution"],
     "ToolExecution": ["PersistenceCore", "TrustCenter", "ToolRegistry", "Desk"],
     "Research": ["PersistenceCore", "Privacy", "FeedPolicy", "MacControl", "ProviderRouting"],
     "TriggerScheduler": ["PersistenceCore", "WorkshopExecution", "Desk", "ActivityWatch", "Privacy", "FeedPolicy", "NotificationInbox", "TrustCenter"],
@@ -222,12 +222,7 @@ let extraDeps: [String: [String]] = [
     "MacControl": ["Senses", "PersistenceCore", "TrustCenter", "FeedPolicy"],
     "Onboarding": ["PersistenceCore", "PersonaEngine"],
     "MacAssistantStatus": ["PersistenceCore", "TrustCenter"],
-    // MemoryV2 (2026-08-02, NORTHSTAR clause 1): a finished Workshop execution
-    // writes one prose memory of what it did, on the `missions` disclosure
-    // surface the policy already carried but nothing ever filled. No cycle —
-    // MemoryV2 depends on PersistenceCore/KnowledgeGraph/ApprovalInbox and
-    // never imports WorkshopExecution. See WorkshopExecution+ExecutionMemory.swift.
-    "WorkshopExecution": ["ChatTurnContracts", "PersistenceCore", "ProviderRouting", "ApprovalInbox", "MemoryV2", "TrustCenter", "Procedures", "Desk", "SwarmRuns", "Privacy", "CognitiveSubstrate"],
+    "WorkshopExecution": ["ChatTurnContracts", "PersistenceCore", "ProviderRouting", "ApprovalInbox", "TrustCenter", "Procedures", "Desk", "SwarmRuns", "Privacy", "CognitiveSubstrate"],
     // 2026-09-01: the workflow RUN engine was retired (User authorized). What is
     // left is the workflow registry (list + create), which reads and writes one
     // JSON file. Every execution-side dependency — ApprovalInbox, TrustCenter,

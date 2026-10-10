@@ -2,7 +2,7 @@ import Foundation
 
 /// Documented stdio entry points, not prompt templates. ACP wire version 1.
 /// https://agentclientprotocol.com/protocol/v1/transports
-public struct AgentHostACP: Sendable, Equatable {
+public struct AgentHostACP: Sendable, Equatable, Codable {
     public let executable: String
     public let arguments: [String]
     public let documentation: String
@@ -11,8 +11,17 @@ public struct AgentHostACP: Sendable, Equatable {
     /// ACP registry pins this integration was written against, not a promise
     /// that arbitrary installed builds have been tested.
     public let referenceVersion: String
-    public static let registrySource = "https://github.com/agentclientprotocol/registry"
-    public var environment: [String: String] { executable == "goose" ? ["GOOSE_MODE": "chat"] : [:] }
+    /// Set over the scrubbed environment the program starts with.
+    public var environment: [String: String] = [:]
+    /// What the agent said at its last dry run (`agent.verify`, a failed
+    /// send's repair), written back as "learned": its ACP version (this app
+    /// speaks 1), the session modes it advertised ([]: no set_mode is sent)
+    /// and whether it reopens a session (neither: a continued conversation
+    /// starts a new one). A send holds the agent to `modes`; nil is not known yet.
+    public var protocolVersion: Int? = nil
+    public var modes: [String]? = nil
+    public var supportsLoad: Bool? = nil
+    public var supportsResume: Bool? = nil
 
     /// Exact installed version whose sandbox launcher was inspected. Do not
     /// infer compatibility for neighbouring releases or bypass its sandbox.
@@ -32,23 +41,26 @@ public struct AgentHostACP: Sendable, Equatable {
             : "Untested version: installed \(reported); written against \(referenceVersion) (ACP registry pin)."
     }
 
-    public static let byHostID: [String: Self] = [
+    /// The recipes' seed, by host id (`AgentHostDirectory.seed`).
+    public static let seed: [String: Self] = [
         "gemini-cli": Self(executable: "gemini", arguments: ["--acp", "--approval-mode=plan", "--sandbox"],
                        documentation: "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md",
-                       permissionMode: "plan", referenceVersion: "0.60.0"),
+                       permissionMode: "plan", referenceVersion: "0.60.0", protocolVersion: 1),
         "goose": Self(executable: "goose", arguments: ["acp"],
                       documentation: "https://block-goose.mintlify.app/advanced/acp-protocol",
-                      permissionMode: "chat", referenceVersion: "1.51.0"),
+                      permissionMode: "chat", referenceVersion: "1.51.0", environment: ["GOOSE_MODE": "chat"], protocolVersion: 1),
         "cursor-cli": Self(executable: "cursor-agent", arguments: ["acp", "--mode=ask", "--sandbox=enabled"],
                              documentation: "https://cursor.com/docs/cli/acp",
-                             permissionMode: "ask", referenceVersion: "2026.09.15"),
+                             permissionMode: "ask", referenceVersion: "2026.09.15", protocolVersion: 1),
         // Read from the installed agent (0.21.3): `hermes acp` is its stdio entry
         // point; its session modes are default ("Ask before edits"),
         // accept_edits and dont_ask, and "default" is the asking one. It takes
         // its own slash commands (/model, /help, /compress) as ordinary
-        // messages, so a model switch is just a message.
+        // messages, so a model switch is just a message. 0.21.5's ACP adapter
+        // advertises the same three modes, session/load and session/resume.
         "hermes": Self(executable: "hermes", arguments: ["acp"],
                        documentation: "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
-                       permissionMode: "default", referenceVersion: "0.21.3")
+                       permissionMode: "default", referenceVersion: "0.21.3", protocolVersion: 1,
+                       modes: ["default", "accept_edits", "dont_ask"], supportsLoad: true, supportsResume: true)
     ]
 }

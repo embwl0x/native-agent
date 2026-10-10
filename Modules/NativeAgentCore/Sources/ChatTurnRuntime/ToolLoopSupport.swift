@@ -744,7 +744,7 @@ struct ToolLoopNoProgressGuard {
             switch ChatToolOutcome.exactResultClass(record.result) {
             case .succeeded:
                 continue
-            case .failed, .timeout:
+            case .failed, .refused, .timeout:
                 // An app call is named by its action: two actions are two tools.
                 let action: String? = if record.name == "app", case .string(let id)? = record.input["action"] { id } else { nil }
                 let current = (name: action.map { "app " + $0 } ?? record.name, error: failureText(record.result))

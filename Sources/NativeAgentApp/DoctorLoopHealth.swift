@@ -89,6 +89,9 @@ enum LoopHealthLevel: String, Sendable {
     case ok
     case warn
     case fail
+    /// Off by config or not needed: neither a fault nor healthy work.
+    case off
+    case notNeeded
 
     /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
     var statusText: String {
@@ -96,8 +99,12 @@ enum LoopHealthLevel: String, Sendable {
         case .ok: "ok"
         case .warn: "warn"
         case .fail: "failed"
+        case .off: "off"
+        case .notNeeded: "not needed"
         }
     }
+
+    var isFault: Bool { self == .warn || self == .fail }
 }
 
 struct LoopHealthVerdict: Equatable, Identifiable, Sendable {
@@ -370,7 +377,8 @@ enum DoctorLoopHealth {
     ///                          never fired)
     /// - overdue past grace   → fail
     /// - overdue past slack   → warn (may still land)
-    /// - otherwise            → ok
+    /// - otherwise            → the last tick's word: worked or nothing to do
+    ///                          (ok), off, not needed
     static func scheduleVerdict(
         for observation: LoopHealthObservation,
         now: Date
@@ -403,18 +411,23 @@ enum DoctorLoopHealth {
 
         let overdueBy = now.timeIntervalSince(nextRun)
         guard overdueBy > overdueTolerance(for: observation) else {
-            if observation.lastRun == nil {
+            guard let lastRun = observation.lastRun else {
                 return verdict(.ok, "First check in \(describeAge(-overdueBy)).")
             }
-            if lastOutcomeWasLegitimateSkip(observation),
-               let reason = observation.lastResult?.dropFirst("skipped: ".count),
-               reason.hasPrefix(unavailableSkipPrefix) {
-                return verdict(.warn, "Unavailable: \(reason.dropFirst(unavailableSkipPrefix.count)).")
+            let changed = observation.lastSuccessfulWorkAt
+            guard lastOutcomeWasLegitimateSkip(observation),
+                  let reason = observation.lastResult?.dropFirst("skipped: ".count) else {
+                let changedPhrase = changed.map { "\(describeAge(now.timeIntervalSince($0))) ago" } ?? "never"
+                return verdict(.ok, "Worked \(describeAge(now.timeIntervalSince(lastRun))) ago; last changed something \(changedPhrase).")
             }
-            if lastOutcomeWasLegitimateSkip(observation) {
-                return verdict(.ok, "Ticking; nothing was due on the last check.")
+            for (prefix, level, word) in [(unavailableSkipPrefix, LoopHealthLevel.warn, "Unavailable"),
+                                          (LoopTickOutcome.offPrefix, .off, "Off"),
+                                          (LoopTickOutcome.notNeededPrefix, .notNeeded, "Not needed")]
+            where reason.hasPrefix(prefix) {
+                return verdict(level, "\(word): \(reason.dropFirst(prefix.count)).")
             }
-            return verdict(.ok, "Healthy.")
+            let since = changed ?? observation.firstSeenAt
+            return verdict(.ok, since.map { "Nothing to do since \(Self.day($0))." } ?? "Nothing to do on the last check.")
         }
         if observation.lastRun == nil {
             return verdict(.fail, "Never ticked and overdue by \(describeAge(overdueBy)): the first tick has not fired.")
@@ -430,8 +443,17 @@ enum DoctorLoopHealth {
         switch level {
         case .fail: 0
         case .warn: 1
-        case .ok: 2
+        case .off: 2
+        case .notNeeded: 3
+        case .ok: 4
         }
+    }
+
+    /// Month-day on this Mac's calendar ("10-09").
+    static func day(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd"
+        return formatter.string(from: date)
     }
 
     static func describeAge(_ seconds: TimeInterval) -> String {
@@ -505,7 +527,8 @@ enum DoctorLoopHealth {
     /// worst offender named, so a flapping fleet lowers the pill.
     ///
     /// Buckets are assigned per loop with precedence failing > dormant >
-    /// degraded > healthy. `dormancyVerdict` is READ, never re-decided: a loop
+    /// degraded > off > not needed > healthy; off and not needed are never
+    /// counted healthy. `dormancyVerdict` is READ, never re-decided: a loop
     /// it flags is reported as dormant unless the schedule/error lanes already
     /// called it failing.
     static func doctorCheck(
@@ -520,7 +543,7 @@ enum DoctorLoopHealth {
             return CheckResult(
                 id: doctorCheckID,
                 title: "Background Loops",
-                status: "warn",
+                status: "unmeasured",
                 detail: "No background loops are registered, so there is nothing to report on. "
                     + "That is a missing signal, not a clean bill of health.",
                 human_action: "Quit and reopen NativeAgent to start background scheduling, then run Doctor again."
@@ -539,7 +562,7 @@ enum DoctorLoopHealth {
         var failing: [LoopHealthVerdict] = []
         var dormantVerdicts: [LoopHealthVerdict] = []
         var degraded: [LoopHealthVerdict] = []
-        var healthy = 0
+        var healthy = 0, off = 0, notNeeded = 0
         for verdict in verdicts {
             switch verdict.level {
             case .fail: failing.append(verdict)
@@ -549,16 +572,20 @@ enum DoctorLoopHealth {
                 } else {
                     degraded.append(verdict)
                 }
+            case .off: off += 1
+            case .notNeeded: notNeeded += 1
             case .ok: healthy += 1
             }
         }
         var counts = ["\(failing.count) failing", "\(dormantVerdicts.count) dormant"]
         if !degraded.isEmpty { counts.append("\(degraded.count) degraded") }
+        if off > 0 { counts.append("\(off) off") }
+        if notNeeded > 0 { counts.append("\(notNeeded) not needed") }
         counts.append("\(healthy) healthy")
         var detail = "\(verdicts.count) background loop(s): \(counts.joined(separator: ", "))."
         // `evaluate` sorts worst-first, so the head of the list IS the worst
         // offender; naming it means the pill's tooltip points somewhere.
-        if let worst = verdicts.first, worst.level != .ok {
+        if let worst = verdicts.first, worst.level.isFault {
             detail += " Worst: \(worst.loopId) — \(worst.detail)"
         }
         let status: String
@@ -576,6 +603,7 @@ enum DoctorLoopHealth {
             title: "Background Loops",
             status: status,
             detail: detail,
+            harm: status == "ok" ? nil : "The named background work is failing or is not being done on schedule.",
             human_action: status == "ok" ? nil : (iCloudDriveOff
                 ? iCloudDriveStep
                 : "Open Doctor → background loops for the named loop's current failure."),

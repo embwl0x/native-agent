@@ -121,37 +121,64 @@ extension SchedulerDueJobRunner {
         return true
     }
 
-    // MARK: - FIX 3 (A4.5): completed oneShot pruning.
-
-    /// A completed oneShot row is retained this long after `completedAt` before
-    /// it is pruned, so recent history stays visible without unbounded growth.
+    /// Keep recent one-shot completion and unknown-outcome history for review.
     static let oneShotRetentionSeconds: Double = 7 * 86_400
 
-    /// Drop completed oneShot rows older than the retention window. A oneShot
-    /// (`oneShot == true`) with a parseable `completedAt` past the window is
-    /// removed; every other row (recurring jobs, recently-completed oneShots,
-    /// oneShots with no completion stamp) is kept untouched. Pure so the test
-    /// net drives it directly.
-    static func pruneCompletedOneShotRows(
+    static func pruneRetiredRows(
         _ rows: [JSONValue],
-        now: Date,
-        retentionSeconds: Double = oneShotRetentionSeconds
-    ) -> (rows: [JSONValue], removed: Int) {
+        now: Date
+    ) -> (rows: [JSONValue], retired: [JSONValue]) {
         var kept: [JSONValue] = []
         kept.reserveCapacity(rows.count)
-        var removed = 0
+        var retired: [JSONValue] = []
+        let nowEpoch = now.timeIntervalSince1970
         for row in rows {
             guard case .object(let obj) = row,
-                  SchedulerJobRuntime.bool(obj["oneShot"], default: false),
-                  let raw = SchedulerJobRuntime.string(obj["completedAt"]),
-                  let completed = parseISODate(raw),
-                  now.timeIntervalSince(completed) > retentionSeconds else {
+                  let id = SchedulerJobRuntime.string(obj["id"]), !id.isEmpty else {
                 kept.append(row)
                 continue
             }
-            removed += 1
+            let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
+            let enabled = SchedulerJobRuntime.bool(obj["enabled"], default: true)
+            let lastRun = SchedulerJobRuntime.string(obj["lastRunAt"]).flatMap(parseISODate)
+            var why: String?
+            if JobKind(rawValue: kind) == nil {
+                why = "job kind is no longer executed"
+            } else if SchedulerJobRuntime.bool(obj["oneShot"], default: false) {
+                if let completed = SchedulerJobRuntime.string(obj["completedAt"]).flatMap(parseISODate) {
+                    if now.timeIntervalSince(completed) > oneShotRetentionSeconds {
+                        why = "completed one-shot past 7-day retention"
+                    }
+                } else if !enabled || SchedulerJobRuntime.string(obj["cancelledAt"]) != nil,
+                          SchedulerJobRuntime.string(obj["pausedAt"]) == nil,
+                          let due = SchedulerJobRuntime.epoch(from: obj["nextRunAt"])
+                            ?? SchedulerJobRuntime.epoch(from: obj["nextRunAtEpoch"]), due < nowEpoch {
+                    if SchedulerJobRuntime.string(obj["lastRunStatus"]) == "unknown" {
+                        if nowEpoch - max(due, lastRun?.timeIntervalSince1970 ?? due) > oneShotRetentionSeconds {
+                            why = "unknown one-shot outcome past 7-day review window"
+                        }
+                    } else {
+                        why = "disabled or cancelled one-shot past its scheduled time"
+                    }
+                }
+            } else if !enabled,
+                      SchedulerJobRuntime.string(obj["pausedAt"]) == nil,
+                      SchedulerJobRuntime.string(obj["cancelledAt"]) == nil,
+                      (SchedulerJobRuntime.string(obj["disabledReason"]) ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let lastActivity = lastRun
+                        ?? SchedulerJobRuntime.string(obj["createdAt"]).flatMap(parseISODate),
+                      now.timeIntervalSince(lastActivity) > 90 * 86_400 {
+                why = "disabled recurring job with no run in 90 days and no owner reason"
+            }
+            if let why {
+                retired.append(.object(["id": .string(id), "kind": .string(kind), "why": .string(why),
+                                        "at": .string(NativeTimestampFormat.fractionalZulu(now))]))
+            } else {
+                kept.append(row)
+            }
         }
-        return (kept, removed)
+        return (kept, retired)
     }
 
     static func nextEpoch(

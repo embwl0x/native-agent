@@ -234,17 +234,9 @@ extension SwiftNativeMemoryV2 {
             disclosureFilteredCount = scored.count - disclosed.count
         }
         // storageTopK is a wider disclosure candidate window, not the result
-        // budget. Reapply the existing skill-hint share AFTER disclosure at
-        // the actual requested size so hints cannot consume the entire answer.
+        // budget: cut AFTER disclosure at the actual requested size.
         let selectionStarted = ProcessInfo.processInfo.systemUptime
-        let sorted = MemoryRecallScoring.selectRecallResults(
-            from: disclosed.sorted { $0.score > $1.score }, limit: topK
-        ) {
-            MemoryRecallScoring.isSkillRecallHint(
-                id: $0.record.id,
-                kind: $0.record.memoryKind ?? MemoryRecallScoring.kind(of: $0.record.extras)
-            )
-        }.sorted { $0.score > $1.score }
+        let sorted = Array(disclosed.sorted { $0.score > $1.score }.prefix(max(0, topK)))
         timings["selection_ms"] = milliseconds(since: selectionStarted)
         timings["results"] = Double(sorted.count)
         // Dead-lane alarm (2026-07-24): `persona` is an exact-equality filter

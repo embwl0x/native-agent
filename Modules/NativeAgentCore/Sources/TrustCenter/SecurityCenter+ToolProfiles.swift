@@ -202,19 +202,6 @@ extension SwiftNativeSecurityCenter {
         // generic safe_read catcher via the unsigned path, and it contains no
         // send/post/message substring, so external_send does not misfire.
         "dream_diary_read",
-        // evolution chat tools (2026-06-11, U2b): the three privileged
-        // self-evolution chat tools. evolution_propose is a critical-risk
-        // evolution-store WRITE, self_install is a critical-risk install-card
-        // TRIGGER (it stages a card a human still approves — it never installs),
-        // evolution_status is a low-risk read. None spawns a Process. Register
-        // explicitly so evaluateTool routes them through the built-in path and
-        // the dedicated profile branches pin their shapes — "propose"/"status"
-        // trip no keyword catcher, and "install" would otherwise mis-tag
-        // self_install as a medium filesystem_write.
-        "evolution_propose",
-        "evolution_status",
-        "evolution_withdraw",
-        "self_install",
         "remote_node_list",
         "remote_node_execute",
         // Both names dispatch to the same built-in transcript reader. Keeping
@@ -413,12 +400,17 @@ extension SwiftNativeSecurityCenter {
     }
 
     /// Domain capabilities not expressed by an action's read/owner flags.
-    static let appActionCapabilities: [String: String] = [
+    static let appActionCapabilities: [String: (capability: String, risk: SecurityRisk)] = [
         // Deny on her own Desk task's waiting step, as workshop_reject.
-        "desk.deny": "workshop_write",
+        "desk.deny": ("workshop_write", .low),
         // Her own memory store, through MemoryCuration.
-        "memory.rewrite": "memory_write",
-        "memory.pin": "memory_write",
+        "memory.rewrite": ("memory_write", .low),
+        "memory.pin": ("memory_write", .low),
+        // A recipe says what this app writes and runs to reach an agent: connect's card below Full Mac.
+        "agent.recipe_write": ("other_app_settings_write", .low),
+        // The app's own layout (ui/layout.json): setting.set's tier. It writes
+        // no other app's settings, so it files no card below Full Mac.
+        "layout.write": ("app_data_write", .medium),
     ]
 
     /// The retired tool each app door action was, by id or by its first
@@ -438,6 +430,8 @@ extension SwiftNativeSecurityCenter {
         "setting.set": "app_setting_set", "page.screenshot": "app_page_screenshot", "card": "interaction_act",
         "chat.list": "chat_conversations",
         "memory.list": "list_memories", "memory.rewrite": "rewrite_memory", "memory.pin": "rewrite_memory",
+        "agent.recipe": "agent_contacts", "agent.recipe_write": "agent_connect", "agent.verify": "agent_message",
+        "layout.read": "app_page_read", "layout.write": "app_setting_set",
     ]
 
     static func appActionOldTool(_ input: [String: JSONValue]) -> String? {
@@ -609,8 +603,8 @@ extension SwiftNativeSecurityCenter {
             // under the tool's own name and is judged there, card and all.
             if acts, appAction?.read == true || ToolNameAliases.isFoldedAction(action) {
                 add("safe_read", .low)
-            } else if acts, let capability = appActionCapabilities[action] {
-                add(capability, .low)
+            } else if acts, let mapped = appActionCapabilities[action] {
+                add(mapped.capability, mapped.risk)
             } else {
                 add(acts ? "app_data_write" : "safe_read", acts ? .medium : .low)
             }
@@ -871,35 +865,6 @@ extension SwiftNativeSecurityCenter {
             add("ledger_write", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
-        // evolution chat tools (2026-06-11, U2b). All three EARLY-RETURN: the
-        // shapes are pinned here and must not fall through to the keyword
-        // classifier below. evolution_propose / self_install are critical (a
-        // self-evolution-store write and an install-card trigger). The early
-        // return on self_install is REQUIRED — the `install` keyword at the
-        // filesystem_write catcher below would otherwise mis-tag it medium.
-        // evolution_status is a pure read. None spawns a Process.
-        if tool == "evolution_propose" {
-            add("evolution_write", .critical)
-            return ToolProfile(capabilities: capabilities, risk: risk)
-        }
-        if tool == "self_install" {
-            add("evolution_apply_trigger", .critical)
-            return ToolProfile(capabilities: capabilities, risk: risk)
-        }
-        if tool == "evolution_status" {
-            add("safe_read", .low)
-            return ToolProfile(capabilities: capabilities, risk: risk)
-        }
-        // evolution_withdraw (2026-09-02) EARLY-RETURNS too. It is an
-        // evolution-store write, so it carries `evolution_write` — but it is
-        // strictly DE-escalating (it can only park one of the agent's OWN
-        // proposals in the terminal denied state; it can never apply, install,
-        // or revert code), so it sits at high rather than critical. The early
-        // return keeps "withdraw" clear of the keyword classifier below.
-        if tool == "evolution_withdraw" {
-            add("evolution_write", .high)
-            return ToolProfile(capabilities: capabilities, risk: risk)
-        }
         if tool == "remote_node_list" {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
@@ -996,10 +961,11 @@ extension SwiftNativeSecurityCenter {
 
     /// Whether an `agent_message` handle names an agent-host contact whose host
     /// actually HAS a command line — the only kind that runs anything. The
-    /// contact's endpoint is `mcp://<host row id>`, and the command-line table
-    /// is the same one the adapter reads. Contacts with no command line run no
-    /// command and keep the ordinary send risk. Read straight off the contact
-    /// file rather than through the chat module, which depends on this one.
+    /// contact's endpoint is `mcp://<host row id>`, and its recipe, as the
+    /// store validated it (`AgentHostLaunches`), is the one the adapter reads.
+    /// Contacts with no command line run no command and keep the ordinary
+    /// send risk. The contact is read straight off its file rather than
+    /// through the chat module, which depends on this one.
     /// Anything unreadable is not shell-class: the run itself is gated again at
     /// dispatch, and a guess here would only misprice the card.
     static func messagesAnAgentHostByCommand(_ handle: JSONValue?, dataRoot: URL) -> Bool {
@@ -1013,8 +979,8 @@ extension SwiftNativeSecurityCenter {
               ["mcpHost", "acp"].contains(transport),
               let endpoint = contact["endpoint"] as? String,
               endpoint.hasPrefix(transport == "acp" ? "acp://" : "mcp://") else { return false }
-        if transport == "acp" { return AgentHostACP.byHostID[String(endpoint.dropFirst("acp://".count))] != nil }
-        return AgentHostCommandLines.byHostID[String(endpoint.dropFirst("mcp://".count))] != nil
+        let launch = AgentHostLaunches.launch(host: String(endpoint.dropFirst("mcp://".count)))
+        return transport == "acp" ? launch.acp != nil : launch.commandLine != nil
     }
 
     /// Pure effect classifier for commands that mutate the host permission

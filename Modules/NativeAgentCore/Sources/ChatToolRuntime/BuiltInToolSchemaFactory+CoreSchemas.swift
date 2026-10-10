@@ -12,6 +12,7 @@ extension BuiltInToolSchemaFactory {
             ("message_id", intSchema("Exact positive inbox message ID from the latest read.")),
             ("expected_message_id", strSchema("Exact RFC message identifier paired with message_id.")),
             ("expected_account", strSchema("expected_account from the same row, when it has one.")),
+            ("expected_account_id", strSchema("expected_account_id from the same row.")),
             ("position", intSchema("position from the same row: finds the message fast.")),
             ("body", strSchema("Reply body (required).")),
             ("sender", strSchema("Optional sender filter — disambiguates when multiple messages share the subject.")),
@@ -23,6 +24,8 @@ extension BuiltInToolSchemaFactory {
                 ("message_id", intSchema("Exact positive message_id from the selected row.")),
                 ("expected_message_id", strSchema("RFC identifier from that row; may be empty only for reads.")),
                 ("expected_account", strSchema("Exact expected_account from that row; required with a locator.")),
+                ("expected_account_id", strSchema(effects ? "expected_account_id from that row, passed along as its identity."
+                    : "expected_account_id from that row; Mail's index checks the account with it.")),
                 ("position", intSchema("Position hint from the same row.")),
                 ("scope", strSchema("Same mailbox scope: inbox or sent for reads; inbox for actions.")),
             ]
@@ -99,7 +102,7 @@ extension BuiltInToolSchemaFactory {
                 description: "List/filter immediate names in an approved folder. sort:size reads allocated disk usage for the folder and its children within a time budget, naming partial paths and lower bounds. Ordinary listings return bounded pages and next arguments; read selected text with file_excerpt. Public/app-only relative paths use the canonical workspace; verified development checkouts also accept repo-relative paths. Use app persona.read or skill.list for persona/skills. Full Mac permits absolute paths except NativeAgent trust/secrets/provider paths.",
                 parametersJSON: params(
                     properties: [
-                        ("path", strSchema("Directory path. In Full Mac mode, /documents/<name> maps to the current user's ~/Documents/<name>; a file_not_found result is a path miss, not a trust denial.")),
+                        ("path", strSchema("Directory path; omitted or empty lists the folder relative paths start from, as '.' does. In Full Mac mode, /documents/<name> maps to the current user's ~/Documents/<name>; a file_not_found result is a path miss, not a trust denial.")),
                         ("name_contains", strSchema("Optional literal filename substring, not glob or regex; empty means all names.")),
                         ("sort", enumStringSchema(["name", "newest", "added", "size"], "Ordering: name (default, folders first), newest (added then modified date), added (date added only to this folder, for install/download recency, including app bundles; rows include added_at; unknown dates sort last), or size (observed allocated bytes descending). Size scans return total allocated_bytes, size_complete, per-child sizes and partial_paths; incomplete sizes are lower bounds. Size scans cannot be paged; narrow path for more detail.")),
                         ("time_budget_seconds", intSchema("Disk usage scan budget for sort:size, default 5, range 1–20 seconds; checked between metadata reads.")),
@@ -108,7 +111,7 @@ extension BuiltInToolSchemaFactory {
                         ("offset", intSchema("Start at 0. For continuation pass the returned next arguments unchanged.")),
                         ("snapshot", strSchema("Omit or empty on first page. Required with positive offset; copied from next. directory_changed means restart at offset 0 without snapshot.")),
                     ],
-                    required: ["path"]
+                    required: []
                 )
             ),
             requestedSchema(
@@ -306,6 +309,11 @@ extension BuiltInToolSchemaFactory {
                         ("kind", strSchema("One of: soul, voice, growth, agents, skill. Do not use user; USER.md is generated from Memories.")),
                         ("content", strSchema("Full replacement document content.")),
                         ("skill_name", strSchema("Required only when kind='skill'.")),
+                        ("retire", obj([
+                            ("type", .string("object")),
+                            ("description", .string("growth only: each REM-approved line this rewrite drops, exactly as written, mapped to why it goes. A retired line is not offered again.")),
+                            ("additionalProperties", strSchema()),
+                        ])),
                     ],
                     required: ["kind", "content"]
                 )
@@ -486,7 +494,7 @@ extension BuiltInToolSchemaFactory {
                         ("limit", intSchema("Maximum events per page, default 10, capped at 50.")),
                         ("offset", intSchema("Continuation event offset; copy from next_call.")),
                         ("before", strSchema("Continuation anchor timestamp; copy from next_call to keep the same window.")),
-                        ("view", enumStringSchema(["receipts", "usage"], "Use receipts for compact tool.dispatch end receipts across all conversations unless session_id is explicit; non-read actions precede reads. usage sums recorded model calls across all conversations, defaults since to today, and reports missing measurements and retention coverage. Omit for all event kinds.")),
+                        ("view", enumStringSchema(["receipts", "usage", "model_calls"], "Use receipts for compact tool.dispatch end receipts across all conversations unless session_id is explicit; non-read actions precede reads. usage sums recorded model calls across all conversations, defaults since to today, and reports missing measurements and retention coverage. Omit for all event kinds.")),
                         ("by", enumStringSchema(["model", "surface", "day"], "Usage grouping; default model. day uses local calendar dates.")),
                         ("effects_only", boolSchema("Successful non-read receipts with bounded target/effect previews; excludes previews and explicit no-effect results. Does not prove effects still persist.")),
                         ("since", strSchema("today (local midnight) or an ISO-8601 timestamp with Z or an offset. Reads the complete retained time window without tail scan limits; response pagination still applies.")),
@@ -1197,7 +1205,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "mail_list_recent",
-                description: "List Apple Mail's inbox or sent metadata and exact mailbox totals; inbox_unread_by_category counts Primary, Transactions, Updates, Promotions and unclassified across the whole inbox. Primary is not proof of a human sender. Filtered or explicitly sorted lists cover all categories. Pass scope + message_id + expected_message_id to read a body and attachments (filename, content_type, size in bytes, 1-based index). Read-only; requires Mail → Read permission.",
+                description: "List Apple Mail's inbox or sent metadata and exact mailbox totals; inbox_unread_by_category counts Primary, Transactions, Updates, Promotions and unclassified across the whole inbox. Primary is not proof of a human sender. Filtered or explicitly sorted lists cover all categories. Pass scope + message_id + expected_message_id + expected_account_id from one row to read a body and attachments (filename, content_type, size in bytes, 1-based index). Read-only; requires Mail → Read permission.",
                 parametersJSON: params(
                     properties: [
                         ("limit", intSchema("Maximum messages to return (1-50, default 10).")),
@@ -1210,6 +1218,7 @@ extension BuiltInToolSchemaFactory {
                         ("body_offset", intSchema("Exact detail continuation offset from body_end, up to 2000000; omit initially.")),
                         ("expected_message_id", strSchema("Exact RFC message identifier paired with message_id in the prior read.")),
                         ("expected_account", strSchema("expected_account from the same row, when it has one.")),
+                        ("expected_account_id", strSchema("expected_account_id from the same row; Mail's index checks the account with it.")),
                         ("position", intSchema("position from the same row: finds the message fast.")),
                     ],
                     required: []
@@ -1223,6 +1232,7 @@ extension BuiltInToolSchemaFactory {
                     ("message_id", intSchema("Exact positive message ID from the Mail read.")),
                     ("expected_message_id", strSchema("Exact RFC message identifier paired with message_id.")),
                     ("expected_account", strSchema("expected_account from the same row, when present.")),
+                    ("expected_account_id", strSchema("expected_account_id from the same row.")),
                     ("scope", enumStringSchema(["inbox", "sent"], "Mailbox scope from the same row; default inbox.")),
                     ("position", intSchema("position from the same row, when present.")),
                     ("index", intSchema("1-based attachment index from the Mail read; index or filename is required.")),
@@ -1232,7 +1242,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "mail_read_batch",
-                description: "Read bodies for 1–10 selected Apple Mail messages in one bounded call. Each item uses an observed workspace name or exact message_id + expected_message_id + expected_account and scope. Returns ordered per-item receipts, up to 4000 body characters each, and body_end for continuation when truncated. No rediscovery or retry; unfinished items are explicit. Requires Mail Read permission.",
+                description: "Read bodies for 1–10 selected Apple Mail messages in one bounded call. Each item uses an observed workspace name or exact message_id + expected_message_id + expected_account + expected_account_id and scope. Returns ordered per-item receipts, up to 4000 body characters each, and body_end for continuation when truncated. No rediscovery or retry; unfinished items are explicit. Requires Mail Read permission.",
                 parametersJSON: params(properties: [("items", mailBatchItemsSchema(effects: false))], required: ["items"])
             ),
             requestedSchema(
@@ -1773,11 +1783,11 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "scheduler_create_job",
-                description: "Run a task every day/morning with kind workshop, or schedule a notification with kind notify. Supply kind, its payload, and either schedule or interval_seconds. kind: notify, connector_action, dream, rem, improve, harness_benchmark, proactive_scan or workshop. notify requires payload.message; connector_action requires payload.actionId; workshop requires payload.objective, including how to deliver the result. Workshop queues a Desk task each time; scheduling is not completion. For a standing helper's recurring job use bot_create or bot_update with schedule or cadence. schedule accepts an ISO-8601 datetime string or a schedule object; repeating intervals have a 60-second floor. A repeating dream reuses the one nightly reflection job, reactivating it if cancelled, instead of adding another; a once schedule adds one extra dream. Requires Scheduler → Write permission (defaults on). Notification example: {\"kind\":\"notify\",\"payload\":{\"title\":\"Reminder\",\"message\":\"Review the notes.\"},\"interval_seconds\":86400}.",
+                description: "Run a task every day/morning with kind workshop, or schedule a notification with kind notify. Supply kind, its payload, and either schedule or interval_seconds. kind: notify, connector_action, dream, rem, harness_benchmark, proactive_scan or workshop. notify requires payload.message; connector_action requires payload.actionId; workshop requires payload.objective, including how to deliver the result. Workshop queues a Desk task each time; scheduling is not completion. For a standing helper's recurring job use bot_create or bot_update with schedule or cadence. schedule accepts an ISO-8601 datetime string or a schedule object; repeating intervals have a 60-second floor. A repeating dream reuses the one nightly reflection job, reactivating it if cancelled, instead of adding another; a once schedule adds one extra dream. Requires Scheduler → Write permission (defaults on). Notification example: {\"kind\":\"notify\",\"payload\":{\"title\":\"Reminder\",\"message\":\"Review the notes.\"},\"interval_seconds\":86400}.",
                 parametersJSON: params(
                     properties: [
-                        ("kind", enumStringSchema(["notify", "connector_action", "dream", "rem", "improve", "harness_benchmark", "proactive_scan", "workshop"], "Use workshop to do work on each run; notify delivers a fixed message.")),
-                        ("payload", nullableRecallField(looseObjectSchema("Per-kind parameters. workshop: {title, objective}; include result delivery instructions in objective. notify: {title, message, delivery}; delivery selects notification channels only. connector_action requires actionId; input is optional. improve/dream/rem accept objective; proactive_scan accepts reason and limit."))),
+                        ("kind", enumStringSchema(["notify", "connector_action", "dream", "rem", "harness_benchmark", "proactive_scan", "workshop"], "Use workshop to do work on each run; notify delivers a fixed message.")),
+                        ("payload", nullableRecallField(looseObjectSchema("Per-kind parameters. workshop: {title, objective}; include result delivery instructions in objective. notify: {title, message, delivery}; delivery selects notification channels only. connector_action requires actionId; input is optional. dream/rem accept objective; proactive_scan accepts reason and limit."))),
                         ("in_minutes", nullableRecallField(numSchema("One-time delay from now in minutes, e.g. 10 for a ten-minute timer. Use kind notify and payload.message. Supply this alone instead of schedule or interval_seconds; no time.now call is needed."))),
                         ("schedule", stringOrLooseObjectSchema("When to fire. Supply this, in_minutes or interval_seconds; omit or null unused fields. ISO-8601 datetime, 'in 10 minutes', or object with type once/every/hourly/daily/weekly/monthly/cron. Cron accepts expression or cron. Calendar schedules persist this Mac's current zone when timezone is omitted. Set another zone only when the person explicitly requested it; never copy a zone from older jobs or context. Example: {\"type\":\"every\",\"interval_seconds\":86400}.")),
                         ("interval_seconds", nullableRecallField(intSchema("Repeating interval in seconds when schedule is omitted or null. Example: 86400.", minimum: 60))),
@@ -1824,7 +1834,7 @@ extension BuiltInToolSchemaFactory {
                     properties: [
                         ("job_id", strSchema("Exact job id from scheduler_list_jobs.")),
                         ("name", nullableRecallField(strSchema("New job name (1-160 characters)."))),
-                        ("kind", nullableEnumStringSchema(["notify", "connector_action", "dream", "rem", "improve", "harness_benchmark", "proactive_scan", "workshop"], "When changing kind, supply the complete payload for that kind. Example: \"notify\".")),
+                        ("kind", nullableEnumStringSchema(["notify", "connector_action", "dream", "rem", "harness_benchmark", "proactive_scan", "workshop"], "When changing kind, supply the complete payload for that kind. Example: \"notify\".")),
                         ("payload", nullableRecallField(looseObjectSchema("Changed per-kind parameters, merged into the existing payload unless kind changes. notify: {title, message, delivery}. connector_action: {actionId, input}. Nested values such as input are replaced in full."))),
                         ("schedule", stringOrLooseObjectSchema("Complete replacement schedule: ISO-8601 datetime string, e.g. '2026-09-29T09:00:00-06:00', or {type:'once', at:'ISO-8601'}, {type:'every', interval_seconds:3600}, {type:'hourly', minute:0}, {type:'daily', at:'09:00'}, {type:'weekly', weekdays:['mon'], at:'09:00'}, {type:'monthly', day:1, at:'09:00'}, or {type:'cron', expression:'0 9 * * mon-fri'}. Optional timezone for object schedules, e.g. America/Denver. Omit interval_seconds when supplying schedule.")),
                         ("interval_seconds", nullableRecallField(intSchema("Replace the schedule with a repeating interval of at least 60 seconds. Supply this or schedule, not both.", minimum: 60))),

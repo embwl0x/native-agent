@@ -15,8 +15,14 @@ public enum DoctorStatusProjection {
         }
         do {
             let measuredAt = ISO8601DateFormatter().string(from: Date())
-            let core = try await runCoreChecks()
-            await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt)
+            let raw = try await runCoreChecks()
+            let executable = DoctorSafeRepairPolicy.executableCoreIDs(for: raw)
+            let core = raw.map { $0.settled(liveAvailable: false, coreAvailable: executable.contains($0.id)) }
+            do {
+                try await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt, inPlace: true)
+            } catch {
+                nativeLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
+            }
             let subs: [HealthCardSubsystem] = (core + liveChecks).map { c in
                 HealthCardSubsystem(
                     id: c.id,
@@ -39,22 +45,33 @@ public enum DoctorStatusProjection {
         }
     }
 
+    /// The one writer of `doctor/latest.json`: `{"checks", "runAt", "measuredAt"}`,
+    /// under the file's lock so a full run and a health-card write never race.
+    /// A full Doctor run replaces the rows; the health card's core-only reading
+    /// updates its rows `inPlace`, keeping the live rows it did not measure, and
+    /// `measuredAt` then stays the oldest reading still in the file. Only a
+    /// missing file starts fresh: one that cannot be read or decoded throws.
     public static func persistDoctorSnapshot(
-        _ results: [CheckResult], to path: URL, runAt: String, measuredAt: String
-    ) async {
-        do {
+        _ results: [CheckResult], to path: URL, runAt: String, measuredAt: String, inPlace: Bool = false
+    ) async throws {
+        let persistence = SwiftNativePersistenceCore()
+        try await persistence.withFileLock(path) {
+            var rows = results
+            var measured = measuredAt
+            if inPlace, FileManager.default.fileExists(atPath: path.path) {
+                let previous = try JSONDecoder().decode(CachedDoctorPayload.self, from: Data(contentsOf: path))
+                let fresh = Dictionary(results.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                let previousIDs = Set(previous.checks.map(\.id))
+                rows = previous.checks.map { fresh[$0.id] ?? $0 } + results.filter { !previousIDs.contains($0.id) }
+                if previous.checks.contains(where: { fresh[$0.id] == nil }), let older = previous.measuredAt {
+                    measured = min(older, measuredAt)
+                }
+            }
             let enc = JSONEncoder()
             enc.outputFormatting = [.sortedKeys]
-            let checksValue = try JSONValue.parse(try enc.encode(results))
-            let payload = JSONValue.object([
-                "checks": checksValue, "runAt": .string(runAt), "measuredAt": .string(measuredAt),
-            ])
-            try FileManager.default.createDirectory(
-                at: path.deletingLastPathComponent(), withIntermediateDirectories: true
-            )
-            try await SwiftNativePersistenceCore().writeJSON(payload, to: path)
-        } catch {
-            nativeLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
+            try await persistence.writeJSON(.object([
+                "checks": try JSONValue.parse(try enc.encode(rows)), "runAt": .string(runAt), "measuredAt": .string(measured),
+            ]), to: path)
         }
     }
 
@@ -97,6 +114,7 @@ public enum DoctorStatusProjection {
     private struct CachedDoctorPayload: Decodable {
         let checks: [CheckResult]
         let runAt: String?
+        let measuredAt: String?
     }
 
     public static func supportSnapshotRollup(_ statuses: [String]) -> String {

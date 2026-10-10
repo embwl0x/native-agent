@@ -1,4 +1,5 @@
 import Foundation
+import CognitiveSubstrate
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
@@ -541,6 +542,9 @@ extension SwiftToolDispatcher {
         for (key, value) in Self.provenanceMetadata(input) {
             meta[key] = value
         }
+        // The turn it was kept in, stamped the way moments are: a correction
+        // knows the exchange that caused it (the miss ledger links it).
+        meta.merge(MemoryMoments.turnMetadata(turnId: TurnTraceContext.turnId, origin: AfterTurnSource.origin)) { current, _ in current }
         // A moment she keeps on purpose (kind "moment") carries how it felt,
         // so the same lanes that serve extracted moments — reminded-of,
         // re-feel on recall, rumination — treat it as one of hers. Valence is
@@ -556,6 +560,10 @@ extension SwiftToolDispatcher {
         // Validated above alongside every other argument fault.
         if let validatedTopics {
             meta["context_topics"] = .array(validatedTopics)
+        }
+        // The miss ledger's lesson, named once, here.
+        if kind == "correction" {
+            meta["lesson"] = .string(MemoryStatusProjection.lesson(metadata: .object(meta), text: text))
         }
 
         let record: MemoryRecord
@@ -666,8 +674,7 @@ extension SwiftToolDispatcher {
                     // Legacy agreements may have declared their subject only
                     // as tags. Exact labels are evidence; similarity is not.
                     guard rowKind == "instruction" || rowKind == "correction" else { return false }
-                    let generic: Set<String> = ["instruction", "correction", "preference", "policy", "user", "agent", "claude", "codex", "nativeagent"]
-                    return topics.isDisjoint(with: generic)
+                    return topics.isDisjoint(with: MemoryStatusProjection.genericSubjects)
                         && topics.isSubset(of: Set((row.tags ?? []).map { $0.lowercased() }))
                 }.sorted {
                     let left = MemoryRecallScoring.parseTimestamp($0.updatedAt ?? $0.createdAt) ?? .distantPast

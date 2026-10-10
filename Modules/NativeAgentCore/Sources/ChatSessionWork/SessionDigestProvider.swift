@@ -529,7 +529,7 @@ public struct SessionDigestProvider: Sendable {
             "new_message": .string(userMessage),
         ]).serialize(pretty: false)
         let response = try await llm.complete(
-            prompt: prompt, system: Self.handoffSystem, model: model, surface: surface)
+            prompt: prompt, system: Self.handoffSystem, model: model, surface: surface, purpose: "digest")
         try Task.checkCancellation()
         guard case .object(let fields) = try JSONValue.parse(Data(response.utf8)),
               Set(fields.keys) == Set(["last_decision", "unresolved_ask", "next_step"]) else {

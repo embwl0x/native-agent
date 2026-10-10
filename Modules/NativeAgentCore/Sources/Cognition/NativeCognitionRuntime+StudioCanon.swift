@@ -28,8 +28,9 @@ extension NativeCognitionRuntime {
         lastStudioCanonTendingAt = at
         studioCanonTask = Task { [weak self] in
             guard let self else { return }
-            if case .allowed = await self.backgroundCognitionGate(reason: "studio_canon:reflection") {
-                await self.runStudioCanonTending()
+            switch await self.backgroundCognitionGate(reason: "studio_canon:reflection") {
+            case .allowed: await self.runStudioCanonTending()
+            case .skipped(let why): OrganPulse.record("studio_canon", .skipped, note: why)
             }
             await self.finishStudioCanonTask()
         }
@@ -55,6 +56,8 @@ extension NativeCognitionRuntime {
             return
         }
         await StudioCanonTending.recordAudit(report.audit, dataRoot: dataRoot, now: now())
+        OrganPulse.record("studio_canon", found: report.stagedApprovalIDs.count,
+                          note: "\(report.stagedApprovalIDs.count) proposed of \(report.evaluatedWorks) works")
         if !report.stagedApprovalIDs.isEmpty {
             await substrate.recordReceipt(
                 kind: "studio.canon_proposed",

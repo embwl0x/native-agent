@@ -56,7 +56,7 @@ import PersistenceCore
 // helper until a product surface chooses to call it; unsupported callers fail
 // closed rather than selecting a second runtime.
 //
-// NativeClient.getImprovementGauntlet() reads this owner directly and
+// RuntimeReadProjection.swiftImprovementGauntlet reads this owner directly and
 // normalizes an absent stored status to the app model's `"ready"` default.
 //
 // NO TRUST GATE on this route in the daemon — `improvement_gauntlet_status()`
@@ -162,7 +162,7 @@ extension SwiftNativeSelfImprovement {
     /// `<root>/improvements/gauntlet/runs.json` — the daemon's
     /// `gauntlet_runs_path`.
     private func gauntletRunsPath() -> URL {
-        trainingPromotionDataRoot()
+        dataRoot
             .appendingPathComponent("improvements", isDirectory: true)
             .appendingPathComponent("gauntlet", isDirectory: true)
             .appendingPathComponent("runs.json")
@@ -180,7 +180,7 @@ extension SwiftNativeSelfImprovement {
     public func improvementGauntletStatusLocal(
         now: @Sendable () -> String = { SwiftNativeSelfImprovement.nowISO8601() }
     ) async throws -> ImprovementGauntletStatus {
-        let raw = try await trainingPromotionPersistence()
+        let raw = try await persistence
             .readJSON(gauntletRunsPath(), ifMissing: .array([]))
 
         // Python: `runs = runs if isinstance(runs, list) else []`. A non-array

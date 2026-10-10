@@ -68,7 +68,7 @@ extension MemoryStorage {
             let rows = try Row.fetchAll(db, sql: """
                 SELECT id, use_count, last_used_at FROM memories
                 WHERE embedding IS NOT NULL AND status = 'active'
-                  AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                 """)
             let usage = Dictionary(uniqueKeysWithValues: rows.map { row in
                 (row["id"] as String, (row["use_count"] as Int64, row["last_used_at"] as String?))
@@ -98,7 +98,7 @@ extension MemoryStorage {
                 SELECT * FROM memories
                 WHERE embedding IS NOT NULL
                   AND status = 'active'
-                  AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
             """
             var arguments: StatementArguments = []
             if let activeEpoch {
@@ -259,7 +259,7 @@ extension MemoryStorage {
             var sql = """
                 SELECT * FROM memories
                 WHERE status = 'active'
-                  AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
             """
             var arguments: [DatabaseValueConvertible] = []
             if let persona {
@@ -363,22 +363,21 @@ extension MemoryStorage {
         let cappedLimit = max(0, limit)
         guard cappedLimit > 0 else { return [] }
         var seen: [String: [MemoryDisclosureClassification?]] = [:]
-        // Lazy uniqueness retains the prior early stop: do not normalize an
-        // entire corpus when the bounded result has already been filled.
-        let unique = scored.lazy.filter { candidate in
+        // One pass with an early stop: `seen` makes this predicate stateful,
+        // so it must never run twice over the same rows (a lazy filter's
+        // `prefix` walks it once for `count` and again to copy — 10-10 crash).
+        var out: [(memory: StoredMemory, similarity: Double)] = []
+        for candidate in scored {
             let key = normalizedRecallContent(candidate.0.content)
             if !key.isEmpty {
                 let scope = MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: candidate.0))
-                guard !(seen[key]?.contains(scope) ?? false) else { return false }
+                if seen[key]?.contains(scope) ?? false { continue }
                 seen[key, default: []].append(scope)
             }
-            return true
+            out.append((memory: candidate.0, similarity: candidate.1))
+            if out.count >= cappedLimit { break }
         }
-        return MemoryRecallScoring.selectRecallResults(from: unique, limit: cappedLimit) {
-            MemoryRecallScoring.isSkillRecallHint(
-                id: $0.0.id, kind: MemoryRecallScoring.kind(of: $0.0.metadata)
-            )
-        }
+        return out
     }
 
     static func normalizedRecallContent(_ content: String) -> String {

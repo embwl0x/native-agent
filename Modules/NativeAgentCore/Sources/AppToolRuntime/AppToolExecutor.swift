@@ -65,16 +65,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
                                             uniquingKeysWith: { first, _ in first }))
         // Register a closure, not a static table dependency: app's schema
         // already reads AppActions during descriptor assembly below.
-        RunawayOutputDetector.registerAppReadOnlyCalls { input in
-            guard input["script"] == nil || input["script"] == .null || input["script"] == .string("") else { return false }
-            let action = Self.doorText(input["action"])
-            if !action.isEmpty {
-                let args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
-                return AppActions.action(action)?.readOnly(args: args) == true
-            }
-            guard !Self.opensHomeItem(input) else { return false }
-            return true // home, page/item reads, and find
-        }
+        RunawayOutputDetector.registerAppReadOnlyCalls(Self.doorReadOnly)
         self.securityCenter = securityCenter
         self.enforceAutonomySecurity = enforceAutonomySecurity
         self.browserActionRunner = browserActionRunner
@@ -95,6 +86,21 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         self.quietHost = quietHost
         self.presentation = presentation
         self.interactions = interactions
+    }
+
+    /// Whether an app call only reads: home, page/item reads, find, a read
+    /// action, or a list of nothing else.
+    static func doorReadOnly(_ input: [String: JSONValue]) -> Bool {
+        guard input["script"] == nil || input["script"] == .null || input["script"] == .string("") else { return false }
+        if case .array(let entries)? = input["actions"], !entries.isEmpty {
+            return entries.allSatisfy { if case .object(let call) = $0 { doorReadOnly(call) } else { false } }
+        }
+        let action = doorText(input["action"])
+        if !action.isEmpty {
+            let args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
+            return AppActions.action(action)?.readOnly(args: args) == true
+        }
+        return !opensHomeItem(input)
     }
 
     /// Core's notification tools, run here with Core's schemas.
@@ -301,11 +307,16 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         // A folded tool runs as itself: the chain is re-entered under its own
         // name, so its gates, Trust key and cards judge it, and what comes
         // back is its own result. A card it files replays that call, not this one.
-        if action.isFold {
+        if action.isFold || action.id == "agent.verify" {
             guard let perform = AppDoorReentry.perform else {
                 return Self.doorRefusal("door_unavailable",
                     "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
                     remedy: "none", "Use app from a chat turn.")
+            }
+            // The contact's own send, dry, under agent_message's own gates.
+            if action.id == "agent.verify" {
+                return try await AgentContactHealth.repair(Self.inputString(input["agent"]) ?? "",
+                    dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(), perform: perform)
             }
             let call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
                                                       sessionId: Self.inputString(input["__session_id"]))
@@ -315,7 +326,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         // A setting and a card hold the posture gate themselves, and say it in
         // their own words (a setting's requested and current values; a card's
         // origin and Full Mac checks).
-        if action.tool == "app_setting_set" { return await runAppSettingSet(input: input, surface: surface) }
+        if action.id == "setting.set" { return await runAppSettingSet(input: input, surface: surface) }
         if action.isCard { return await runCardAction(input: input, surface: surface) }
         if !action.safe, !action.readOnly(args: input), let refusal = await Self.quietChangesRefusal() { return refusal }
         let verb = Self.inputString(action.input["verb"]) ?? ""
@@ -324,6 +335,18 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             return try await runChromeHistory(input: input, surface: surface)
         case "claude_worklog":
             return AgentConversationView.claudeWorklog(input: input)
+        case "agent_contacts" where action.id == "agent.recipe":
+            return AgentRecipeStore.read(host: Self.inputString(input["host"]))
+        case "agent_connect" where action.id == "agent.recipe_write":
+            return AgentRecipeStore.write(host: Self.inputString(input["host"]) ?? "", document: input["recipe"] ?? .null)
+        case "app_page_read" where action.id == "layout.read":
+            return SurfaceLayoutStore.read(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        case "app_setting_set" where action.id == "layout.write":
+            return SurfaceLayoutStore.write(input["layout"] ?? .null, expectedVersion: Self.inputString(input["layout_version"]) ?? "",
+                                            dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        case "agent_discovery_dismiss":
+            return await AgentDiscoverySession.shared.dismiss(name: Self.inputString(input["name"]) ?? "",
+                dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         case "photos_read":
             return await runPhotosRead(verb: verb, input: input)
         case "weather_forecast":
@@ -435,7 +458,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         }
         if action.isFold { return await AppDoorReentry.validate?(action.tool, input) }
         if action.isCard { return await cardRefusal(input: input, surface: surface) }
-        if action.tool == "app_setting_set" { return await settingRefusal(input: input) }
+        if action.id == "setting.set" { return await settingRefusal(input: input) }
         if !action.safe, let refusal = await Self.quietChangesRefusal() { return refusal }
         if action.tool == "rewrite_memory" {
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -469,7 +492,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
                 return .object(would.merging(["status": .string("would"), "detail": .string(asked.detail)]) { $1 })
             }
             return Self.failure(Self.inputString(asked.fields["reason"]) ?? "refused", asked.detail,
-                                extra: would.merging(["would_card": .bool(asked.fields["needs_user"] == .bool(true))]) { $1 })
+                                extra: would.merging(["would_card": .bool(asked.fields["needs_owner"] == .bool(true))]) { $1 })
         }
         guard ["inbox", "chat_session", "interaction_act"].contains(action.tool) else { return nil }
         guard let host = quietHost() else { return Self.unattachedFailure() }

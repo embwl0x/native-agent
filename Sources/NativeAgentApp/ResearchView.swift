@@ -185,7 +185,7 @@ struct ResearchView: View {
         guard !savingSearchConfiguration else { return }
         let url: String
         do {
-            url = try NativeClient.normalizedSearXNGBaseURL(appModel.searxngBaseURL)
+            url = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(appModel.searxngBaseURL)
         } catch {
             searchServiceStatus = .saveFailed(error.localizedDescription)
             return
@@ -243,7 +243,7 @@ enum ResearchSearchServicePresentation {
 }
 
 /// Shared eligibility and explanatory state for the Research surface. The
-/// actual save/search actions remain on their root-scoped NativeClient and
+/// actual save/search actions remain on their root-scoped Research and
 /// AppModel owners; this only projects whether the controls may invite them.
 struct ResearchSearchConfigurationPresentation: Equatable {
     let statusText: String
@@ -256,9 +256,13 @@ struct ResearchSearchConfigurationPresentation: Equatable {
         isSaving: Bool
     ) -> Self {
         let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let validationError = trimmed.isEmpty
-            ? nil
-            : NativeClient.searxngBaseURLValidationMessage(baseURL)
+        let validationError: String?
+        do {
+            if !trimmed.isEmpty { _ = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(baseURL) }
+            validationError = nil
+        } catch {
+            validationError = error.localizedDescription
+        }
         return Self(
             statusText: ResearchSearchServicePresentation.text(baseURL: baseURL, status: status),
             validationError: validationError,

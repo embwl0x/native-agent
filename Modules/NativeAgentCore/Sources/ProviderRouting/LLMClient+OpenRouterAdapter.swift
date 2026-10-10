@@ -38,7 +38,7 @@ public final class OpenRouterAdapter: LLMAdapter {
     }
 
     /// User, 2026-09-06: the model picker advertises low/medium/high/xhigh for
-    /// every OpenRouter row (NativeClient+ProviderTelegramSessions) and the
+    /// every OpenRouter row (the provider catalog) and the
     /// request never carried the choice, so picking an effort did nothing at
     /// all. OpenRouter's unified `reasoning` field is the wire form: `effort`
     /// takes low/medium/high (xhigh and the ceiling efforts map to high), and

@@ -63,10 +63,13 @@ public enum MacInjectionArgRedaction {
     public static let appDoorScriptPlaceholder =
         "[redacted: this script names an action that takes a key or token]"
 
-    /// An `app` call whose args or script could carry a key or token.
+    /// An `app` call whose args, script or listed actions could carry a key or token.
     public static func appDoorCarriesSecret(_ input: [String: JSONValue]) -> Bool {
         if !appDoorSecretKeys(input).isEmpty { return true }
-        if case .string(let script)? = input["script"] { return namesAppDoorSecretAction(script) }
+        if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) { return true }
+        if case .array(let entries)? = input["actions"] {
+            return entries.contains { if case .object(let call) = $0 { appDoorCarriesSecret(call) } else { false } }
+        }
         return false
     }
 
@@ -83,6 +86,9 @@ public enum MacInjectionArgRedaction {
             var out = input
             if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) {
                 out["script"] = .string(appDoorScriptPlaceholder)
+            }
+            if case .array(let entries)? = input["actions"] {
+                out["actions"] = .array(entries.map { if case .object(let call) = $0 { .object(redacted(tool: "app", input: call)) } else { $0 } })
             }
             let keys = appDoorSecretKeys(input)
             if !keys.isEmpty, case .object(let args)? = input["args"] {

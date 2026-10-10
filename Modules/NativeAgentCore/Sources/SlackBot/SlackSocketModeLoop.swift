@@ -190,7 +190,7 @@ public struct SlackSocketModeLoop: LoopRunner {
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
-        guard config.enabled else { return .skipped(reason: "Slack socket mode disabled") }
+        guard config.enabled else { return .off("Socket Mode off") }
         // Recovery and socket admission share the canonical tick owner, but
         // neither waits for the other's chat generation. Register recovery in
         // the existing child set before opening the socket; every return path

@@ -267,25 +267,26 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             try await LLMCallContext.$serviceTier.withValue(resolvedTier) {
             // The compatibility timeout argument cannot establish a stall.
             // Provider/transport completion and caller cancellation own this call.
-                    // Python's _plan_mission does NOT pass a system prompt; the
-                    // planner instructions are embedded in `prompt`.
+                    // The plan's or step's instructions are in `prompt`; this
+                    // only says what the call is.
+                    let system = "This is a Workshop task step. Follow the request exactly and return only what it asks for."
                     if let rootedTraceDataRoot = runLedgerDataRoot {
                         return try await LLMCallContext.$traceDataRootOverride.withValue(
                             rootedTraceDataRoot
                         ) {
                             try await localLLM.complete(
                                 prompt: prompt,
-                                system: nil,
+                                system: system,
                                 model: modelForCall,
-                                surface: routingSurface
+                                surface: routingSurface, purpose: "workshop"
                             )
                         }
                     }
                     return try await localLLM.complete(
                         prompt: prompt,
-                        system: nil,
+                        system: system,
                         model: modelForCall,
-                        surface: routingSurface
+                        surface: routingSurface, purpose: "workshop"
                     )
             }
             }

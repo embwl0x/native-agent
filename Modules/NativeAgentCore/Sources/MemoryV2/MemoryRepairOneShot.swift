@@ -8,7 +8,11 @@
 //       duplicate test residue from old parity probes.
 //
 // HARD CONSTRAINT (u3-memory-quality plan): NOTHING mutates the live store
-// without explicit approval. This file stages ONE inbox approval card per
+// without explicit approval — except the inventory archive below (10-10): the
+// rows the retired skill-pointer and Workshop-execution lanes wrote were never
+// memories, and archiving
+// keeps every row and mints no tombstone, so it runs once with no card.
+// Otherwise this file stages ONE inbox approval card per
 // repair (action `memory.repair`, mirroring the rem.proposal stager /
 // resolveApproval executor shape) and owns the apply-on-approve executors
 // applyResolvedMemoryRepair dispatches to. Every apply path
@@ -18,7 +22,9 @@
 // Staging is idempotent: a stamp file under <dataRoot>/memory/repairs/
 // plus a pending-approval scan (the REM stager's crash-retry shape) prevent
 // double-staging. `canceled` clears the stamp so the next pass re-stages;
-// `denied` keeps it — a refused repair is never re-proposed.
+// `denied` keeps it — a refused repair is never re-proposed. A scan that
+// finds nothing left to repair writes `<kind>.done.json` beside the stamp,
+// and later launches stop there instead of re-reading every notes file.
 
 import Foundation
 import ApprovalInbox
@@ -39,13 +45,49 @@ public enum MemoryRepairOneShot {
     public static let action = "memory.repair"
     static let truncatedRowsKind = "memory.repair.truncated_rows"
     static let legacyNoteDupsKind = "memory.repair.legacy_note_dups"
+    static let inventoryRowsKind = "memory.repair.inventory_rows"
+    /// Sources of the retired inventory lanes (10-10): skill pointers are found
+    /// through `find` and `skill.read`, executions live in Desk and Workshop
+    /// history; neither is recalled as a memory.
+    static let inventorySources = ["skill-index", "workshop:"]
 
     // MARK: - Boot entry point
 
     /// Idempotent: safe to call on every app launch. Stages at most one
-    /// approval card per repair kind, ever (stamp + pending-approval scan).
+    /// approval card per repair kind, ever (stamp + pending-approval scan),
+    /// and does no work once the done receipt exists.
     public static func stageIfNeeded(dataRoot: URL, presentation: any MemoryRepairPresentationPort) async {
+        await archiveInventoryRows(dataRoot: dataRoot)
         _ = await stageLegacyNoteDupPurge(dataRoot: dataRoot, presentation: presentation)
+    }
+
+    // MARK: - Inventory rows: archived once, no card
+
+    /// Archives every active row the retired inventory lanes wrote, through the
+    /// store's own archive (no tombstone, row stays walkable). The done receipt
+    /// is written only after every row archived; a failure leaves it for the
+    /// next launch.
+    static func archiveInventoryRows(dataRoot: URL) async {
+        let done = receiptPath(kind: inventoryRowsKind, name: "done", dataRoot: dataRoot)
+        guard !FileManager.default.fileExists(atPath: done.path) else { return }
+        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+        var archived = 0
+        do {
+            for source in inventorySources {
+                for handle in try await memory.memoryHandles(sourcePrefix: source) {
+                    try await memory.archiveMemory(id: handle.id)
+                    archived += 1
+                }
+            }
+        } catch {
+            nativeLog("[memoryRepair] \(inventoryRowsKind) stopped after \(archived) rows; next launch retries: \(String(describing: error))")
+            return
+        }
+        writeReceipt(
+            kind: inventoryRowsKind, name: "done", status: "complete",
+            detail: "Archived \(archived) rows from \(inventorySources.joined(separator: ", ")); nothing writes them any more.",
+            dataRoot: dataRoot
+        )
     }
 
     // MARK: - Staging: legacy note dup-purge card
@@ -53,7 +95,16 @@ public enum MemoryRepairOneShot {
     @discardableResult
     static func stageLegacyNoteDupPurge(dataRoot: URL, presentation: any MemoryRepairPresentationPort) async -> String? {
         if let stamped = readStamp(kind: legacyNoteDupsKind, dataRoot: dataRoot) { return stamped }
-        guard let candidate = legacyNotesDupCandidate(dataRoot: dataRoot) else { return nil }
+        let done = receiptPath(kind: legacyNoteDupsKind, name: "done", dataRoot: dataRoot)
+        guard !FileManager.default.fileExists(atPath: done.path) else { return nil }
+        let found: DupCandidate?
+        do {
+            found = try legacyNotesDupCandidate(dataRoot: dataRoot)
+        } catch {
+            nativeLog("[memoryRepair] legacy notes could not be inspected; next launch retries: \(String(describing: error))")
+            return nil
+        }
+        guard let candidate = found else { return nil }
 
         let payload: JSONValue = .object([
             "kind": .string(legacyNoteDupsKind),
@@ -112,16 +163,16 @@ public enum MemoryRepairOneShot {
                 localOnly: true
             )
             await applyResolvedMemoryRepair(from: admitted, dataRoot: dataRoot)
-            writeFullMacOutcome(
-                kind: kind, status: "admitted",
+            writeReceipt(
+                kind: kind, name: "full_mac_outcome", status: "admitted",
                 detail: "Executed through the canonical memory repair executor without an approval prompt.",
                 dataRoot: dataRoot
             )
             return nil
         }
         if yolo.state == .explicitlyBlocked {
-            writeFullMacOutcome(
-                kind: kind, status: "refused",
+            writeReceipt(
+                kind: kind, name: "full_mac_outcome", status: "refused",
                 detail: "memory.repair is explicitly blocked; no approval was staged.",
                 dataRoot: dataRoot
             )
@@ -173,15 +224,20 @@ public enum MemoryRepairOneShot {
         }
     }
 
-    private static func writeFullMacOutcome(
+    private static func receiptPath(kind: String, name: String, dataRoot: URL) -> URL {
+        dataRoot
+            .appendingPathComponent("memory/repairs", isDirectory: true)
+            .appendingPathComponent("\(kind).\(name).json")
+    }
+
+    private static func writeReceipt(
         kind: String,
+        name: String,
         status: String,
         detail: String,
         dataRoot: URL
     ) {
-        let path = dataRoot
-            .appendingPathComponent("memory/repairs", isDirectory: true)
-            .appendingPathComponent("\(kind).full_mac_outcome.json")
+        let path = receiptPath(kind: kind, name: name, dataRoot: dataRoot)
         try? FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         let value: JSONValue = .object([
@@ -253,6 +309,10 @@ public enum MemoryRepairOneShot {
                             + " — backup at \(outcome.backupPath)")
                 case MemoryRepairOneShot.legacyNoteDupsKind:
                     let outcome = try await MemoryRepairOneShot.applyLegacyNoteDupPurge(dataRoot: dataRoot, payload: rec.payload)
+                    // Re-scan once so a finished repair writes its done receipt
+                    // now; a Full Mac repair leaves no stamp to stop the next
+                    // launch. A scan that cannot inspect leaves it to that launch.
+                    _ = try? MemoryRepairOneShot.legacyNotesDupCandidate(dataRoot: dataRoot)
                     _ = try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                         rec.id,
                         executedAction: .object([
@@ -417,7 +477,7 @@ public enum MemoryRepairOneShot {
     /// note text. R-M-W under the cross-process flock so a concurrent
     /// commit_memory append can't be clobbered.
     static func applyLegacyNoteDupPurge(dataRoot: URL, payload: JSONValue) async throws -> DupPurgeOutcome {
-        guard let notesPath = notesPath(fromPayload: payload, dataRoot: dataRoot)
+        guard let notesPath = try notesPath(fromPayload: payload, dataRoot: dataRoot)
                 ?? legacyNotesDupCandidate(dataRoot: dataRoot)?.path else {
             return DupPurgeOutcome(kept: 0, purged: 0, backupPath: "")
         }
@@ -504,21 +564,27 @@ public enum MemoryRepairOneShot {
         return path
     }
 
-    private static func legacyNotesDupCandidate(
-        dataRoot: URL
-    ) -> (path: URL, relativePath: String, lines: [String], kept: [String], purged: Int)? {
+    typealias DupCandidate = (path: URL, relativePath: String, lines: [String], kept: [String], purged: Int)
+
+    /// The first legacy notes file still holding duplicate test residue. When
+    /// every file was read and none is left, writes the done receipt. Throws
+    /// when something could not be read, so a failed read never counts as done.
+    private static func legacyNotesDupCandidate(dataRoot: URL) throws -> DupCandidate? {
+        let fm = FileManager.default
         let memoryRoot = dataRoot.appendingPathComponent("memory", isDirectory: true)
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: memoryRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return nil }
+        let entries = fm.fileExists(atPath: memoryRoot.path)
+            ? try fm.contentsOfDirectory(
+                at: memoryRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles])
+            : []
 
         for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            let values = try? entry.resourceValues(forKeys: [.isDirectoryKey])
-            guard values?.isDirectory == true else { continue }
+            guard try entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
             let notesPath = entry.appendingPathComponent("notes.jsonl")
-            guard let lines = try? readNonEmptyLines(notesPath), !lines.isEmpty else { continue }
+            guard fm.fileExists(atPath: notesPath.path) else { continue }
+            let lines = try readNonEmptyLines(notesPath)
+            guard !lines.isEmpty else { continue }
             guard containsTestFixtureLine(lines) else { continue }
             let (kept, purged) = exactDupSplit(lines)
             guard purged > 0 else { continue }
@@ -530,6 +596,13 @@ public enum MemoryRepairOneShot {
                 purged: purged
             )
         }
+        let done = receiptPath(kind: legacyNoteDupsKind, name: "done", dataRoot: dataRoot)
+        writeReceipt(
+            kind: legacyNoteDupsKind, name: "done", status: "complete",
+            detail: "No duplicate legacy note rows remain; the repair is not checked again.",
+            dataRoot: dataRoot
+        )
+        nativeLog("[memoryRepair] \(legacyNoteDupsKind) complete; receipt at \(done.path)")
         return nil
     }
 

@@ -212,7 +212,7 @@ enum AppScriptRunner {
         // A preview that would refuse classifies as that refusal would.
         if fields["status"] == .string("preview") {
             let refused = text("would_refuse")
-            if fields["owner"] == .string("his") { return (.stop, refused.isEmpty ? "users_call" : refused, detail) }
+            if fields["owner"] == .string("his") { return (.stop, refused.isEmpty ? "owners_call" : refused, detail) }
             if fields["would_card"] == .bool(true) { return (.stop, "would_card", detail) }
             return refused.isEmpty ? (.preview, "", detail) : (.failed, refused, detail)
         }
@@ -238,7 +238,7 @@ enum AppScriptRunner {
             let status = AppToolExecutor.doorText(at["status"]).lowercased()
             let reason = AppToolExecutor.doorText(at["reason"])
             let effects = AppToolExecutor.doorText(at["effects"])
-            if [.failed, .timeout, .cancelled].contains(outcome) {
+            if [.failed, .refused, .timeout, .cancelled].contains(outcome) {
                 return reason.isEmpty || reason.contains(" ") ? "failed" : reason
             }
             if ChatToolOutcome.pendingStatuses.contains(status) { return "status_\(status)" }
@@ -1116,14 +1116,14 @@ enum AppScriptRunner {
                 // line is his to do, and the rest may still be hers.
                 let stopReason = stopped.flatMap { AppToolExecutor.inputString($0["reason"]) } ?? ""
                 // The code that ended it on the receipt itself (not_scriptable,
-                // users_screen), so failure_code is that code, not tool_failed.
+                // owners_screen), so failure_code is that code, not tool_failed.
                 let code = stopReason.isEmpty ? error.flatMap { AppToolExecutor.inputString($0["reason"]) } ?? "" : stopReason
                 if !code.isEmpty { out["reason"] = .string(code) }
                 let users = AppToolExecutor.doorFloorReasons.contains(stopReason) || stopReason == "needs_glass"
                 let alone = code == "not_scriptable"
                 let cardPreview = preview && code == "would_card"
-                let cardInstruction = "Preview stopped at a call that would raise User's approval card; no card was filed. "
-                    + "Run the action outside preview when you want to request his approval."
+                let cardInstruction = "Preview stopped at a call that would raise the owner's approval card; no card was filed. "
+                    + "Run the action outside preview when you want to request their approval."
                 let asked = strict && stopReason == "decide"
                 let ask = "It stopped to ask you hand_back.question: decide, then do only what is left."
                 // The call by its number and what it asked, not its line: a
@@ -1132,7 +1132,7 @@ enum AppScriptRunner {
                 let n = at?["n"].flatMap(AppToolExecutor.inputString)
                 let which = n.map { "Call \($0)" + (at?["call"].flatMap(AppToolExecutor.inputString).map { " (\($0))" } ?? "") }
                     ?? "Line \(at?["line"].flatMap(AppToolExecutor.inputString) ?? "?")"
-                let drop = "\(which) is User's (\(stopReason)): drop that call and run the rest if you still want it."
+                let drop = "\(which) is the owner's (\(stopReason)): drop that call and run the rest if you still want it."
                 let own = "\(which) can't run in a script: run it as its own app call, outside the script, "
                     + "and the rest without it."
                 let check = (unknown + unsure).joined(separator: ", ")
@@ -1141,7 +1141,7 @@ enum AppScriptRunner {
                 // Reads that landed changed nothing.
                 let nothing = landed.isEmpty ? "Nothing landed. " : "Nothing changed. "
                 out["remedy"] = .object([
-                    "kind": .string(users ? "drop_users_line" : alone ? "run_alone" : asked ? "decide"
+                    "kind": .string(users ? "drop_owners_line" : alone ? "run_alone" : asked ? "decide"
                         : cardPreview ? "request_approval" : "read_ledger"),
                     "instruction": .string(changed.isEmpty
                         ? (!unknown.isEmpty || !unsure.isEmpty ? check

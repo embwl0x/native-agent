@@ -64,7 +64,6 @@ struct SetupFeatureRows<InnerLife: View>: View {
                 meaningMemoryRow
                 knowledgeGraphRow
                 nightlyConsolidationRow
-                keepConsolidatedRow
                 adaptivePromotionRow
                 hygieneRow
                 crossSessionRecallRow
@@ -278,7 +277,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
         savingEmbeddings = true
         embeddingsOn = value
         do {
-            let result = try await appModel.toggleEmbeddingsBackend(enabled: value)
+            let result = try await AppModel.toggleEmbeddingsBackend(enabled: value, dataRoot: appModel.engine.dataRoot)
             embeddingsStatus = result.status
             embeddingsOn = result.status.requestedEnabled
             if let error = result.error {
@@ -312,24 +311,6 @@ struct SetupFeatureRows<InnerLife: View>: View {
     }
 
     // MARK: - Memory policy (memoryPolicy.*)
-
-    private var keepConsolidatedRow: some View {
-        SetupFeatureSwitchRow(
-            title: "Keep consolidated memories without asking",
-            detail: "What the nightly pass gathers stays on its own; off, I ask you first.",
-            key: "auto_promote_consolidated",
-            isOn: Binding(
-                get: { memoryDraft.auto_promote_consolidated },
-                set: { value in
-                    var next = memoryDraft
-                    next.auto_promote_consolidated = value
-                    memoryDraft = next
-                    Task { await saveMemory(next, expecting: \.auto_promote_consolidated) }
-                }
-            ),
-            disabled: savingMemory || !memoryDraft.consolidation_enabled
-        )
-    }
 
     private var hygieneRow: some View {
         SetupFeatureSwitchRow(
@@ -377,9 +358,6 @@ struct SetupFeatureRows<InnerLife: View>: View {
                 set: { value in
                     var next = memoryDraft
                     next.consolidation_enabled = value
-                    // Same clamp the Trust page makes: auto-promotion cannot
-                    // outlive the consolidation pass that feeds it.
-                    if !value { next.auto_promote_consolidated = false }
                     memoryDraft = next
                     Task { await saveMemory(next, expecting: \.consolidation_enabled) }
                 }
@@ -465,14 +443,14 @@ struct SetupFeatureRows<InnerLife: View>: View {
 
     @MainActor
     private func refreshEmbeddings() async {
-        guard let status = try? await appModel.fetchEmbeddingsStatus() else { return }
+        guard let status = try? await AppModel.embeddingsStatus(dataRoot: appModel.engine.dataRoot) else { return }
         embeddingsStatus = status
         if !savingEmbeddings {
             embeddingsOn = status.requestedEnabled
         }
     }
 
-    /// The three-field memory save. A failure leaves the stored policy alone,
+    /// The two-field memory save. A failure leaves the stored policy alone,
     /// so re-reading it is the revert; the toast says the write did not land.
     @MainActor
     private func saveMemory(
@@ -482,8 +460,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
         savingMemory = true
         await appModel.saveMemoryPolicy(
             consolidationEnabled: next.consolidation_enabled,
-            crossSessionRecall: next.cross_session_recall,
-            autoPromoteConsolidated: next.auto_promote_consolidated
+            crossSessionRecall: next.cross_session_recall
         )
         savingMemory = false
         syncFromTrustPolicy()

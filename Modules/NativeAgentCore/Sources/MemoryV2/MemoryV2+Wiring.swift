@@ -122,6 +122,27 @@ extension SwiftNativeMemoryV2 {
         return out
     }
 
+    /// One event, one moment (10-10): a retelling of `row` joins it as evidence
+    /// — this telling's source, quote and session as duplicate provenance, and
+    /// one more `recall_count` — on the kept memory, or on the proposal still
+    /// waiting on her. The row's own text and quote are untouched.
+    func recordRetelling(
+        of row: MemoryRecord, pending: Bool, source: String, metadata: [String: JSONValue]
+    ) async throws {
+        var patch = Self.duplicateProvenancePatch(existing: row, newSource: source, newMetadata: .object(metadata))
+        patch["recall_count"] = .int(Int64(MemoryMoments.metadataNumber(row.extras, "recall_count") ?? 0) + 1)
+        guard pending else {
+            _ = try await updateMemory(id: row.id, update: .object(patch))
+            return
+        }
+        try await ensureCanonicalAttachment()
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        var merged: [String: JSONValue] = [:]
+        if case .object(let existing)? = row.extras { merged = existing }
+        merged.merge(patch) { _, new in new }
+        _ = try await storage.updateProposalMetadata(id: row.id, metadata: .object(merged))
+    }
+
     /// True when `store` would refuse this content as tombstoned — the exact
     /// denylist hash or a paraphrase of a rejected claim. A caller retrying a
     /// lost write asks first: a rejected claim is settled, not lost.

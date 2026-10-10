@@ -1,4 +1,5 @@
 import SwiftUI
+import ApprovalTransactions
 import NativeAgentShared
 import NotificationInbox
 import WorkshopExecution
@@ -24,7 +25,7 @@ struct MacWorkOverviewDetail: View {
                 if let item = inboxItem {
                     InboxItemDetailSheet(item: item, onAction: { action in
                         await actionFlight.perform {
-                            try await appModel.client.inboxAction(item.id, action: action)
+                            try await InboxCardActions.perform(item.id, action: action, dataRootOverride: appModel.dataRootOverride)
                         }
                     }, onOpenGroup: { group = $0 }, closesOnGroupSelection: false, onClose: onDone)
                 } else {
@@ -88,9 +89,13 @@ struct MacWorkOverviewDetail: View {
             defer { deciding = false }
             do {
                 if approve {
-                    self.execution = try await appModel.client.approveStep(executionId: execution.id, stepId: execution.currentStepId)
+                    self.execution = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
+                        executionId: execution.id, stepId: execution.currentStepId, decision: "approve",
+                        dataRootOverride: appModel.dataRootOverride)
                 } else {
-                    self.execution = try await appModel.client.rejectStep(executionId: execution.id, stepId: execution.currentStepId)
+                    self.execution = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
+                        executionId: execution.id, stepId: execution.currentStepId, decision: "reject",
+                        dataRootOverride: appModel.dataRootOverride)
                 }
                 onDone()
             } catch { self.error = UserFacingError.message(error, action: "\(approve ? "approve" : "reject") that step") }

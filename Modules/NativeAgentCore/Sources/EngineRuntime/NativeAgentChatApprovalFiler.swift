@@ -8,7 +8,7 @@ import PersistenceCore
 
 /// App-owned projection of a chat approval into the canonical ApprovalInbox.
 ///
-/// The inbox remains the authority and `NativeClient+ApprovalExecutors` remains
+/// The inbox remains the authority and `ApprovalTransactionCoordinator` remains
 /// the sole post-resolution executor. This filer only preserves the initiating
 /// conversation identity and returns immediately so Mac, detached, Slack, iOS,
 /// and bridge turns never block while waiting for a person.

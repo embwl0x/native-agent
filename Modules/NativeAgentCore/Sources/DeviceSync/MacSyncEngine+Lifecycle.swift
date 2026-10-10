@@ -68,6 +68,8 @@ extension MacSyncEngine {
                     shouldPublish: { self.snapshotLifecycleGeneration == generation && self.isActive }
                 )
             }
+            // One integrity pass on the fresh snapshot, then its 15-minute clock.
+            await runSnapshotIntegrityPass()
         }
     }
 
@@ -138,8 +140,11 @@ extension MacSyncEngine {
         // Watch inbox for iOS-deposited action files
         startInboxQuery(docsURL: docsURL)
 
-        // Immediate first snapshot
-        Task { await writeSnapshots(forceHeavy: true) }
+        // Immediate first snapshot, then one integrity pass on it.
+        Task {
+            await writeSnapshots(forceHeavy: true)
+            await runSnapshotIntegrityPass()
+        }
 
         // R11-N30: prune at startup, then schedule the exact earliest 7-day
         // retention crossing instead of waking every ten minutes.
@@ -209,11 +214,14 @@ extension MacSyncEngine {
         NotificationCenter.default.removeObserver(self)
     }
 
+    private static let snapshotIntegrityCadence: TimeInterval = 15 * 60
+
     private func startSnapshotIntegrityFallback() {
         snapshotIntegrityTask?.cancel()
+        OrganPulse.recordStarting("snapshot_integrity", cadence: Self.snapshotIntegrityCadence)
         snapshotIntegrityTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(15 * 60))
+                try? await Task.sleep(for: .seconds(Self.snapshotIntegrityCadence))
                 guard !Task.isCancelled, self.isActive else { return }
                 await self.runSnapshotIntegrityPass()
             }
@@ -227,6 +235,7 @@ extension MacSyncEngine {
             while let self, !Task.isCancelled {
                 guard self.isActive else { return }
                 let published = await self.sync.bridge.publishMacPresence()
+                if published { OrganPulse.record("presence_beat", .worked, cadence: NAMacPresence.beat) }
                 delay = published ? NAMacPresence.beat : min(NAMacPresence.phoneWindow, delay * 2)
                 try? await Task.sleep(for: .seconds(delay))
             }
@@ -264,6 +273,9 @@ extension MacSyncEngine {
             snapshotFileDigests = report.retainedDigests
             saveSnapshotDigests()
         }
+        let found = report.integrityFailures + (hasSkippedGroups ? ["skipped groups to republish"] : [])
+        OrganPulse.record("snapshot_integrity", found: found.count, note: found.joined(separator: "; "),
+                          cadence: Self.snapshotIntegrityCadence)
         if report.requiresRepair {
             syncError = "iPhone snapshot integrity check found \(report.integrityFailures.joined(separator: "; ")). Rebuilding the affected mobile snapshot groups."
             // A mismatch can belong to a heavyweight group (catalog, graph,

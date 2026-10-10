@@ -5,15 +5,13 @@ import BackgroundWork
 import PersistenceCore
 import Cognition
 import ChatOrchestration
-import SelfImprovement
 
 // App composition delegates background decisions and receipts to Core.
 extension BackgroundLoopsAssembly {
     static func makeHeartbeatLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        llm: any LLMClient
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> HeartbeatLoop {
-        HeartbeatBackgroundWork(port: AppBackgroundWorkPort()).makeHeartbeatLoop(dataRoot: dataRoot, llm: llm)
+        HeartbeatBackgroundWork(port: AppBackgroundWorkPort()).makeHeartbeatLoop(dataRoot: dataRoot)
     }
 
     static func repairHeartbeatInboxItem(
@@ -23,19 +21,12 @@ extension BackgroundLoopsAssembly {
         try await HeartbeatBackgroundWork(port: AppBackgroundWorkPort()).repairHeartbeatInboxItem(id: id, dataRoot: dataRoot)
     }
 
-    static func stageEvolutionApprovals(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        onlyProposalId: String? = nil
-    ) async {
-        await HeartbeatBackgroundWork(port: AppBackgroundWorkPort()).stageEvolutionApprovals(dataRoot: dataRoot, onlyProposalId: onlyProposalId)
-    }
 
 }
 
 typealias InboxRewriteGuard = BackgroundWork.InboxRewriteGuard
 
 struct AppBackgroundWorkPort: HeartbeatBackgroundWorkPort {
-    var selfEvolutionAction: String { NativeClient.selfEvolutionAction }
 
     func storeAndFileEvents(paths: [URL], loopId: String?) -> AsyncStream<Void> {
         EventDeadlinePhysiology.storeAndFileEvents(paths: paths, loopId: loopId)
@@ -51,13 +42,5 @@ struct AppBackgroundWorkPort: HeartbeatBackgroundWorkPort {
         )
     }
 
-    func applyFullMacAdmittedSelfEvolution(payload: JSONValue, dataRoot: URL) async {
-        await NativeClient.applyFullMacAdmittedSelfEvolution(
-            payload: payload, deps: NativeClient.selfEvolutionDeps(dataRoot: dataRoot)
-        )
-    }
 
-    func evolutionRepoRoot(dataRoot: URL) -> URL {
-        NativeClient.evolutionRepoRoot(dataRoot: dataRoot)
-    }
 }

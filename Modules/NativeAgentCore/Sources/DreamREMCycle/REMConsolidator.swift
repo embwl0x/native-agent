@@ -210,7 +210,7 @@ public actor REMConsolidator {
             let store = REMProposalStore(dataRoot: dataRoot)
             // Validate eviction evidence before import, marker claims, or proposal
             // staging. A malformed log must not leave new rows/cards for a retry.
-            let growthProposalRows = try store.loadAllForGrowthEviction()
+            let growthProposalRows = try store.loadAllStrictly()
             do {
                 let imported = try await store.importLegacyHarnessFileIfNeeded()
                 if imported > 0 {

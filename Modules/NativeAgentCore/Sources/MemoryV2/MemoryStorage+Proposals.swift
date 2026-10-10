@@ -327,7 +327,7 @@ extension MemoryStorage {
                 }
                 subjectPredecessors = try Row.fetchAll(db, sql: """
                     SELECT * FROM memories WHERE persona_id = ? AND status = 'active'
-                      AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                      AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                       AND json_extract(metadata_json, '$.kind') = 'correction'
                       AND json_extract(metadata_json, '$.correction_subject') = ?
                     """, arguments: [proposal.personaId, subject]).map(Self.decodeMemory)
@@ -469,7 +469,7 @@ extension MemoryStorage {
         guard var row = try Row.fetchOne(db, sql: """
             SELECT * FROM memories
             WHERE id = ? AND status = 'active'
-              AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+              AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
         """, arguments: [superseding.targetId]).map(Self.decodeMemory) else {
             throw MemoryV2Error.underlying(
                 "memory this update replaces (\(superseding.targetId)) is gone or already superseded"
@@ -501,7 +501,7 @@ extension MemoryStorage {
         try db.execute(sql: """
             UPDATE memories SET lifecycle = ?, updated_at = ?, metadata_json = ?
             WHERE id = ? AND status = 'active'
-              AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+              AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
         """, arguments: [row.lifecycle, row.updatedAt, Self.encodeMetadata(row.metadata), row.id])
         guard db.changesCount > 0 else {
             throw MemoryV2Error.underlying(

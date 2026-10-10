@@ -178,7 +178,7 @@ extension SwiftNativeTurnEngine {
                         prompt: rendered,
                         system: IntraTurnContextCompaction.workingNotesSystem,
                         model: route.modelId,
-                        surface: compactionSurface
+                        surface: compactionSurface, purpose: "compaction"
                     )
                 }
                 }
@@ -385,6 +385,8 @@ extension SwiftNativeTurnEngine {
             // Sample after steering persistence has spent its wall time.
             try await LLMCallContext.$remainingTurnSeconds
                 .withValue(wholeTurnBudget.remainingSeconds) {
+            try await LLMCallContext.$purpose.withValue(LLMCallContext.purpose == "other"
+                ? (dispatches.isEmpty ? "turn" : "tool_round") : LLMCallContext.purpose) {
             counters.providerAttemptCount += 1
             if callAttempt == 1 {
                 counters.providerRoundCount += 1
@@ -579,6 +581,7 @@ extension SwiftNativeTurnEngine {
                     underlying: ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
                 )
             }
+            } // LLMCallContext.$purpose.withValue
             } // LLMCallContext.$remainingTurnSeconds.withValue
             }
             // Where THIS turn begins. The adapter cannot re-derive it: replayed

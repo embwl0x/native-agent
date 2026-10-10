@@ -72,6 +72,98 @@ public struct CapabilityCatalogSource: Sendable, Codable, Hashable, Identifiable
     }
 }
 
+public struct CapabilityCatalogItem: Sendable, Codable, Hashable, Identifiable {
+    public var id: String
+    public var name: String
+    public var kind: String?
+    public var description: String?
+    public var status: String?
+    public var riskClass: String?
+    public var installed: Bool?
+    public var provenance: String?
+    public var installedAt: String?
+}
+
+public struct CapabilityPackInstall: Sendable, Codable, Hashable, Identifiable {
+    public var id: String
+    public var packId: String
+    public var name: String?
+    public var version: String?
+    public var status: String
+    public var signature: String?
+    public var installedAt: String?
+    public var rolledBackAt: String?
+}
+
+public struct CapabilityUpdateRecord: Sendable, Codable, Hashable, Identifiable {
+    public var id: String
+    public var packId: String?
+    public var installedVersion: String?
+    public var availableVersion: String?
+    public var status: String?
+    public var sourceId: String?
+}
+
+public struct CapabilityUpdateCheck: Sendable, Codable, Hashable {
+    public var status: String
+    public var updates: [CapabilityUpdateRecord]
+    public var sourceCount: Int?
+    public var createdAt: String?
+}
+
+// Checked projections of the catalog owner's rows: a present field of the
+// wrong type makes the row malformed, and a malformed row fails the read.
+extension CapabilityCatalogSource {
+    public init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            id: try row.string("id"), name: try row.string("name"), kind: try row.optionalString("kind"),
+            url: try row.optionalString("url"), status: try row.optionalString("status"),
+            trustedRootId: try row.optionalString("trustedRootId"),
+            lastCheckedAt: try row.optionalString("lastCheckedAt"),
+            createdAt: try row.optionalString("createdAt"), updatedAt: try row.optionalString("updatedAt"))
+    }
+}
+
+extension CapabilityCatalogItem {
+    public init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            id: try row.string("id"), name: try row.string("name"), kind: try row.optionalString("kind"),
+            description: try row.optionalString("description"), status: try row.optionalString("status"),
+            riskClass: try row.optionalString("riskClass"), installed: try row.optionalBool("installed"),
+            provenance: try row.optionalString("provenance"), installedAt: try row.optionalString("installedAt"))
+    }
+}
+
+extension CapabilityPackInstall {
+    public init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            id: try row.string("id"), packId: try row.string("packId"), name: try row.optionalString("name"),
+            version: try row.optionalString("version"), status: try row.string("status"),
+            signature: try row.optionalString("signature"), installedAt: try row.optionalString("installedAt"),
+            rolledBackAt: try row.optionalString("rolledBackAt"))
+    }
+}
+
+extension CapabilityUpdateCheck {
+    public init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            status: try row.string("status"),
+            updates: try row.array("updates").map { value in
+                let update = try JSONRow(value)
+                return CapabilityUpdateRecord(
+                    id: try update.string("id"), packId: try update.optionalString("packId"),
+                    installedVersion: try update.optionalString("installedVersion"),
+                    availableVersion: try update.optionalString("availableVersion"),
+                    status: try update.optionalString("status"), sourceId: try update.optionalString("sourceId"))
+            },
+            sourceCount: try row.optionalInt("sourceCount"), createdAt: try row.optionalString("createdAt"))
+    }
+}
+
 public struct CapabilityTrustRecord: Sendable, Codable, Hashable, Identifiable {
     public var id: String
     public var name: String?

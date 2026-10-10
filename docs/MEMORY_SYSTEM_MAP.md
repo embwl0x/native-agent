@@ -82,7 +82,10 @@ time.
 
 Moments have a separate enablement switch and daily capacity in
 `MemoryV2+AdaptivePromoter.swift`. The shared interpretation can stage at most
-one moment per exchange; it remains pending until review.
+one moment per exchange; it remains pending until review. A moment that says
+what a kept or pending moment already says (the fact lane's near-duplicate
+check, cosine 0.90) is a retelling: its quote and session join that row as
+duplicate provenance and nothing new is staged.
 
 `memory.moments` reads the queue; `lane: "all"` includes other proposal kinds.
 `memory.review` accepts or rejects a pending proposal. An optional `content`
@@ -122,7 +125,11 @@ locator to derived-state consumers. Recall-cache reuse also checks SQLite
 `MemoryV2+UserMDGen.swift` regenerates USER.md under the target file lock from
 canonical memory while preserving its human preamble. It refuses damaged
 existing documents and gates generation on onboarding. USER.md is a projection,
-not an independent place to repair memory facts.
+not an independent place to repair memory facts. It and the per-turn pinned
+core (`userPromptCore`, 3,500 B) carry facts about User only: user_fact,
+user_preference, preference, relationship, identity and attribute. Moments
+and experiences are theirs; they reach a turn through recall, and `memory.pin`
+refuses any kind outside that list.
 
 ## Embeddings
 
@@ -212,7 +219,7 @@ Keys live under `memoryPolicy` in `<dataRoot>/trust/policy.json`.
 | `adaptive_promotion` | Fact proposal lane; moments have their own switch. |
 | `knowledge_graph_enabled` | Graph indexing/read/rebuild admission. |
 | `consolidation_enabled` | Gated consolidation. |
-| `auto_promote_consolidated` | Defaults on. “Keep consolidated memories without asking” controls eligible proposal auto-acceptance during consolidation; it does not bypass approval of the candidate-to-live swap. |
+| `auto_promote_consolidated` | Removed 10-10 with its switch: consolidation never accepts a proposal (they reviews with `memory_moment_review` or on the Memories page). A saved key is ignored on read. |
 | `hygiene_enabled` | Memory hygiene. |
 
 Disabling cross-session recall excludes every MemoryV2 source from ContextFlow,

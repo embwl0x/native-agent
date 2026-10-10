@@ -24,8 +24,9 @@ import PersistenceCore
 ///   decision, action, tool) so a forged in-process record cannot mutate
 ///   live policy, re-checks the tool is STILL at confirm/supervised, and
 ///   stamps `executedAction` so a second tick never double-applies.
-/// - `isEnabled` fails SAFE (false) — autonomy off means no proposals and no
-///   reconciliation.
+/// - `gate` returns the skip that stops the tick — Off when autonomy is off,
+///   Not needed under Full Mac — and nil only when the loop may run: neither
+///   proposals nor reconciliation happen behind a closed gate.
 ///
 /// Dependency-clean: all inbox IO is injected through
 /// `AutonomyPromotionInboxPort` (BackgroundLoops imports neither ApprovalInbox
@@ -37,7 +38,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
     public let loopId: String = "autonomy_promotion_proposals"
     public let interval: TimeInterval
 
-    private let isEnabled: @Sendable () async -> Bool
+    private let gate: @Sendable () async -> LoopTickOutcome?
     private let port: any AutonomyPromotionInboxPort
     /// Reads the RAW saved `toolAutonomy[tool]` tier; nil if absent (absent ⇒
     /// default/auto ⇒ not a candidate).
@@ -51,7 +52,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
 
     public init(
         interval: TimeInterval = 3600,
-        isEnabled: @escaping @Sendable () async -> Bool,
+        gate: @escaping @Sendable () async -> LoopTickOutcome?,
         port: any AutonomyPromotionInboxPort,
         currentTier: @escaping @Sendable (String) async -> String?,
         applyPromotion: @escaping @Sendable (String) async -> Bool,
@@ -59,7 +60,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.interval = interval
-        self.isEnabled = isEnabled
+        self.gate = gate
         self.port = port
         self.currentTier = currentTier
         self.applyPromotion = applyPromotion
@@ -87,17 +88,6 @@ public struct AutonomyPromotionLoop: LoopRunner {
         "swift_build", "swift_test",
         // app/agent control surfaces
         "restart_app", "install_app", "invoke_codex",
-        // U4 Wave D (gpt-5.5 review BLOCKER): the self-evolution chat tools.
-        // evolution_propose files a self-mod proposal, self_install stages the
-        // install card, evolution_status reads. They ship at `confirm` (a
-        // promotable tier), so without this exclusion clean approval history
-        // could let THIS loop propose flipping `self_install` to `auto` —
-        // a "nothing self-grants" violation (the install trigger going
-        // approval-free). Never auto-promote a self-modification surface.
-        // evolution_withdraw joins them (2026-09-02): it is still a
-        // self-modification surface (an evolution-store write), and nothing on
-        // that surface ever self-grants its way to `auto`.
-        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
     ]
     static let minApprovals = 5
     static let minSpanDays = 14
@@ -131,10 +121,6 @@ public struct AutonomyPromotionLoop: LoopRunner {
         if tool.hasSuffix(".write_file") || tool.hasSuffix(".write")
             || tool.hasSuffix(".delete") || tool.hasSuffix(".run_shortcut") { return false }  // fs / exec
         if tool.hasSuffix(".send") || tool.contains(".post_") { return false }  // external send
-        // U4 Wave D (gpt-5.5 review BLOCKER): self-evolution name SHAPES — never
-        // auto-promote a tool that proposes/triggers app self-modification, even
-        // under a future namespaced alias the explicit list misses.
-        if tool.contains("evolution") || tool.contains("self_install") { return false }
         if hardExcludeTiers.contains(tier) { return false }    // external-consequence guard tiers
         return promotableTiers.contains(tier)                  // must be confirm/supervised
     }
@@ -144,7 +130,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
     public func tickOutcome() async -> LoopTickOutcome {
         // Fail-safe: autonomy off ⇒ neither reconcile nor propose. A security
         // loosening must never apply while the master switch is off.
-        guard await isEnabled() else { return .skipped(reason: "autonomy disabled") }
+        if let closed = await gate() { return closed }
         let applied: Int
         let staged: Int
         do {

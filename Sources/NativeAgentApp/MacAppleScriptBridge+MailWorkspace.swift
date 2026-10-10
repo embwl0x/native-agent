@@ -18,10 +18,14 @@ extension MacAppleScriptBridge {
         if input["message_id"] != nil && mailExactLocator(input, allowMissingMessageID: true) == nil {
             return .object(["status": .string("failed"), "integration": .string("mail"),
                 "reason": .string("invalid_message_locator"),
-                "message": .string("Call mail_list_recent without message_id, then copy scope, message_id, expected_message_id, expected_account and position from the same row to read it.")])
+                "message": .string("Call mail_list_recent without message_id, then copy scope, message_id, expected_message_id, expected_account, expected_account_id and position from the same row to read it.")])
         }
         do {
             let local = mailLocalRead(input)
+            if let mismatch = local.accountMismatch {
+                return .object(["status": .string("failed"), "integration": .string("mail"),
+                    "reason": .string("account_mismatch"), "message": .string(mismatch)])
+            }
             if let row = local.row {
                 return .object(["status": .string("completed"), "count": .int(1),
                     "messages": .array([.object(row)]), "scope": .string(scope), "detail": .bool(true)])
@@ -212,13 +216,16 @@ extension MacAppleScriptBridge {
     }
 
     /// The local file read; without a row, the attachments line the Mail read
-    /// after it carries: why the local read failed, in its own words. The
-    /// single and batch reads both use it.
-    static func mailLocalRead(_ input: [String: JSONValue], batch: Bool = false) -> (row: [String: JSONValue]?, attachments: String) {
+    /// after it carries: why the local read failed, in its own words. An
+    /// account id that is invalid or names another account refuses the
+    /// locator, so the read stops there. The single and batch reads both use it.
+    static func mailLocalRead(_ input: [String: JSONValue], batch: Bool = false) -> (row: [String: JSONValue]?, attachments: String, accountMismatch: String?) {
         do {
-            return (try mailFileRead(input: input, batch: batch), "")
+            return (try mailFileRead(input: input, batch: batch), "", nil)
+        } catch let error as NSError where error.domain == "MailFileRead" && error.code == 10 {
+            return (nil, "", error.localizedDescription)
         } catch {
-            return (nil, "Attachments unavailable: \(error.localizedDescription)")
+            return (nil, "Attachments unavailable: \(error.localizedDescription)", nil)
         }
     }
 
@@ -265,8 +272,12 @@ extension MacAppleScriptBridge {
     /// than the locator names, the index or a file unreadable, or no copy on
     /// disk (the only one a download fixes).
     private static func mailFileMessage(input: [String: JSONValue]) throws -> (row: [String: JSONValue], source: Data, attachmentsRoot: URL?) {
-        guard let locator = mailExactLocator(input, allowMissingMessageID: true), !locator.messageID.isEmpty else {
-            throw mailFileError(6, "The local read needs expected_message_id from a mail_list_recent row.")
+        guard let locator = mailExactLocator(input, allowMissingMessageID: true), !locator.messageID.isEmpty, let accountID = locator.accountID else {
+            // A supplied id the locator could not take is refused, never read as absent.
+            if let supplied = input["expected_account_id"], supplied != .null {
+                throw mailFileError(10, "expected_account_id is not a Mail account id; copy it from a fresh mail_list_recent row.")
+            }
+            throw mailFileError(6, "The local read needs expected_message_id and expected_account_id from a mail_list_recent row.")
         }
         let mismatch = mailFileError(7, "Mismatch: message_id \(locator.id) is a different email than expected_message_id names. Use the identifiers from one fresh mail_list_recent row.")
         let indexError = NSError(domain: "MailFileRead", code: 1,
@@ -292,8 +303,13 @@ extension MacAppleScriptBridge {
         guard step == SQLITE_ROW else { throw indexError }
         func text(_ column: Int32) -> String { sqlite3_column_text(statement, column).map { String(cString: $0) } ?? "" }
         func identity(_ value: String) -> String { value.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "<>"))) }
-        guard identity(text(1)) == identity(locator.messageID) else { throw mismatch }
         guard let mailbox = URL(string: text(0)), let indexPath = sqlite3_db_filename(database, "main") else { throw indexError }
+        // The index names an account by its id, the host of the mailbox URL, never by name.
+        let host = mailbox.host ?? ""
+        guard host.caseInsensitiveCompare(accountID) == .orderedSame else {
+            throw mailFileError(10, "Mismatch: Mail's index files message_id \(locator.id) under account id \(host.isEmpty ? "(none)" : host), not expected_account_id \(accountID). Use the identifiers from one fresh mail_list_recent row.")
+        }
+        guard identity(text(1)) == identity(locator.messageID) else { throw mismatch }
         let root = URL(fileURLWithPath: String(cString: indexPath)).deletingLastPathComponent().deletingLastPathComponent()
         let components = mailbox.path.split(separator: "/").map { String($0) + ".mbox" }
         var boxes = [mailbox.isFileURL ? mailbox : components.reduce(root.appendingPathComponent(mailbox.host ?? "")) { $0.appendingPathComponent($1) }]
@@ -337,12 +353,10 @@ extension MacAppleScriptBridge {
                             : iso.string(from: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(statement, 5))))),
                         "unread": .bool(sqlite3_column_int(statement, 6) == 0), "scope": .string(mailReadScope(input) ?? "inbox")]
                     if let account = locator.account { row["expected_account"] = .string(account) }
+                    row["expected_account_id"] = .string(accountID)
                     if let position = locator.position { row["position"] = .int(Int64(position)) }
-                    // Mail's index has no account names and the locator names no
-                    // mailbox, so both are the ones passed in, not checked.
-                    row["verification"] = .string(locator.account == nil
-                        ? "Mailbox not verified by the local read: scope is the one passed in."
-                        : "Account and mailbox not verified by the local read: expected_account and scope are the ones passed in.")
+                    // The locator names no mailbox, so scope is the one passed in.
+                    row["verification"] = .string("Account verified by the local read against Mail's index; scope is the one passed in.")
                     return (row, source, suffix == "partial.emlx"
                         ? directory.deletingLastPathComponent().appendingPathComponent("Attachments/\(locator.id)") : nil)
                 }
@@ -492,6 +506,7 @@ extension MacAppleScriptBridge {
                             "date": .string(received), "unread": .bool(sqlite3_column_int(statement, 7) == 0),
                             "position": .int(sqlite3_column_int64(statement, 9)), "body_status": .string("not_loaded"), "scope": .string(scope)]
                         if !account.name.isEmpty { row["expected_account"] = .string(account.name) }
+                        row["expected_account_id"] = .string(account.id)
                         let category = sqlite3_column_type(statement, 8) == SQLITE_NULL ? 0 : Int(sqlite3_column_int64(statement, 8))
                         if categories.indices.contains(category) { row["category"] = .string(categories[category]) }
                         rows.append(.object(row))

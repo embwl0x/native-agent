@@ -266,4 +266,12 @@ public final class TurnsFacade {
     public nonisolated func inFlightRunIDs() -> Set<String> {
         ChatCancelFlag.inFlightRunIDs()
     }
+
+    /// Every turn in flight on this root's sessions, whichever door started
+    /// it. The Mac chat's own are the ones in `activeTurnIDsBySession`, which
+    /// stays the Mac's alone: Stop, steer, the lifecycle receipt and busy act
+    /// on it, and a turn another door started has none of those here.
+    public nonisolated func inFlightTurns() -> [ChatCancelFlag.InFlightTurn] {
+        ChatCancelFlag.inFlightTurns(dataRoot: dataRoot)
+    }
 }

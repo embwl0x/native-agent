@@ -196,7 +196,7 @@ enum CapabilitiesPlainCopy {
         case "remote_node_list": return "List connected computers."
         case "remote_node_execute": return "Run a task on a connected computer."
         case "restart_app": return "Restart this app."
-        case "install_app", "self_install": return "Build and install an updated app."
+        case "install_app": return "Build and install an updated app."
         case "get_persona_doc": return "Read my personality notes."
         case "delegation_status": return "Check work assigned to other assistants."
         case "forget_memory": return "Remove a saved memory."
@@ -321,7 +321,6 @@ enum CapabilitiesPlainCopy {
         case "task": return "Read or share progress on tasks."
         case "studio": return "Explore ideas and keep creative notes."
         case "memory": return "Review moments to remember."
-        case "evolution": return "Propose and review app improvements."
         default: return catalogDescription ?? "An additional tool I can use for your tasks."
         }
     }

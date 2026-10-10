@@ -41,6 +41,7 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+import TrustPersistence
 
 enum NightlyReflectionJobOutcome: Equatable {
     case added
@@ -132,7 +133,16 @@ extension AppModel {
     @MainActor
     func setSchedulerJobEnabled(id: String, enabled: Bool) async -> SchedulerJobToggleOutcome {
         do {
-            let job = try await client.setSchedulerJobEnabled(id: id, enabled: enabled)
+            // The same flocked `scheduler/jobs.json` writer the create/cancel
+            // paths use; it lands a scheduler activity receipt.
+            let writer = makeSchedulerJobWriter(
+                connectorActionIDs: Set(connectorActionDescriptors().map(\.id)), dataRoot: engine.dataRoot
+            )
+            let result = try await writer.setJobEnabled(jobId: id, enabled: enabled)
+            guard case .object(let object) = result, let row = object["job"] else {
+                throw SchedulerJobsFeedError.unavailable("scheduler pause/resume returned no job")
+            }
+            let job = try ScheduledJob(row: row)
             await refreshSchedulerJobs()
             return .verified(job)
         } catch {
@@ -204,7 +214,7 @@ extension AppModel {
     @MainActor
     func createWorkshopTask(title: String, objective: String) async {
         do {
-            _ = try await client.createWorkshopTask(title: title, objective: objective)
+            _ = try await BackgroundLoopsAssembly.submitDeskTask(title: title, objective: objective)
             statusText = NewDeskTaskPresentation.successStatus
             await refreshAll()
         } catch {
@@ -213,22 +223,14 @@ extension AppModel {
     }
 
     @MainActor
-    func getTriggers() async throws -> [TriggerRecord] {
-        try await client.getTriggers()
-    }
-
-    @MainActor
-    func setTriggerEnabled(name: String, enabled: Bool) async throws -> WorkshopActionResult {
-        try await client.setTriggerEnabled(name: name, enabled: enabled)
-    }
-
-    @MainActor
     func saveWorkshopPolicyToggle(enabled: Bool? = nil, showTimeline: Bool? = nil) async {
         var patch: [String: Any] = [:]
         if let enabled { patch["enabled"] = enabled }
         if let showTimeline { patch["showTimeline"] = showTimeline }
         do {
-            let savedPolicy = try await client.postTrustWrite(body: [WorkshopPolicyBlockVocabulary.wireKey: patch])
+            let savedPolicy = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
+                body: [WorkshopPolicyBlockVocabulary.wireKey: patch], dataRoot: engine.dataRoot
+            )
             applySavedTrustPolicy(savedPolicy, status: "Desk execution policy saved")
         } catch {
             setFailureStatus(error, action: "save the Desk execution policy")
@@ -238,15 +240,14 @@ extension AppModel {
     @MainActor
     // PATCH-2026-05-06: dev-mode added as parameter, forwarded to daemon payload
     @discardableResult
-    func saveTrustPolicy(permissionLevel: String, autonomyDefault: String, requireBackups: Bool, outsideDefault: String, developerMode: Bool = false, autonomousTraining: Bool? = nil, dreamScheduler: Bool? = nil) async -> Bool {
+    func saveTrustPolicy(permissionLevel: String, autonomyDefault: String, requireBackups: Bool, outsideDefault: String, developerMode: Bool = false, dreamScheduler: Bool? = nil) async -> Bool {
         do {
-            let savedPolicy = try await client.saveTrustPolicy(
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveTrustPolicyFull(
                 permissionLevel: permissionLevel,
                 autonomyDefault: autonomyDefault,
                 requireBackups: requireBackups,
                 outsideDefault: outsideDefault,
                 developerMode: developerMode,
-                autonomousTraining: autonomousTraining,
                 dreamScheduler: dreamScheduler
             )
             applySavedTrustPolicy(savedPolicy, status: "Trust policy saved")
@@ -259,12 +260,11 @@ extension AppModel {
     }
 
     @MainActor
-    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool, autoPromoteConsolidated: Bool) async {
+    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async {
         do {
-            let savedPolicy = try await client.saveMemoryPolicy(
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMemoryPolicy(
                 consolidationEnabled: consolidationEnabled,
-                crossSessionRecall: crossSessionRecall,
-                autoPromoteConsolidated: autoPromoteConsolidated
+                crossSessionRecall: crossSessionRecall
             )
             applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
         } catch {
@@ -276,7 +276,7 @@ extension AppModel {
     @discardableResult
     func saveMultimodalPolicy(_ policy: TrustMultimodalPolicy) async -> Bool {
         do {
-            let savedPolicy = try await client.saveMultimodalPolicy(policy)
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMultimodalPolicy(policy)
             applySavedTrustPolicy(savedPolicy, status: "Multimodal policy saved")
             return true
         } catch {
@@ -294,17 +294,13 @@ extension AppModel {
     func patchMemoryPolicy(
         knowledgeGraphEnabled: Bool? = nil,
         adaptivePromotion: Bool? = nil,
-        hygieneEnabled: Bool? = nil,
-        archiveNoisyReflections: Bool? = nil,
-        rejectLowValueProposals: Bool? = nil
+        hygieneEnabled: Bool? = nil
     ) async -> Bool {
         do {
-            let savedPolicy = try await client.patchMemoryPolicy(
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).patchMemoryPolicy(
                 knowledgeGraphEnabled: knowledgeGraphEnabled,
                 adaptivePromotion: adaptivePromotion,
-                hygieneEnabled: hygieneEnabled,
-                archiveNoisyReflections: archiveNoisyReflections,
-                rejectLowValueProposals: rejectLowValueProposals
+                hygieneEnabled: hygieneEnabled
             )
             applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
             return true
@@ -317,7 +313,7 @@ extension AppModel {
     @MainActor
     func saveEnableAutonomy(_ enabled: Bool) async {
         do {
-            let savedPolicy = try await client.saveEnableAutonomy(enabled)
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveEnableAutonomy(enabled)
             applySavedTrustPolicy(savedPolicy, status: enabled ? "Autonomy enabled" : "Autonomy disabled")
         } catch {
             recordTrustActionFailure(UserFacingError.message(error, action: "save autonomy"), cause: error)
@@ -327,7 +323,7 @@ extension AppModel {
     @MainActor
     func saveChromeControlEnabled(_ enabled: Bool) async {
         do {
-            let savedPolicy = try await client.saveChromeControlEnabled(enabled)
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveChromeControlEnabled(enabled)
             applySavedTrustPolicy(
                 savedPolicy,
                 status: enabled ? "Chrome control enabled" : "Chrome control disabled"
@@ -341,7 +337,7 @@ extension AppModel {
     @MainActor
     func saveKillSwitchEnabled(_ enabled: Bool) async -> Bool {
         do {
-            let savedPolicy = try await client.saveKillSwitchEnabled(enabled)
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveKillSwitchEnabled(enabled)
             applySavedTrustPolicy(savedPolicy, status: enabled ? "Everything paused" : "Pause lifted")
             return true
         } catch {
@@ -354,7 +350,8 @@ extension AppModel {
     @discardableResult
     func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async -> Bool {
         do {
-            let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: engine.trust.policy, developerMode: developerMode)
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot)
+                .saveAgentAccessMode(mode, currentPolicy: engine.trust.policy, developerMode: developerMode)
             let status = "Agent access saved: \(Self.agentAccessLabel(mode))"
             applySavedTrustPolicy(savedPolicy, status: status)
             chatFileAccess = Self.normalizedAgentAccessMode(mode)
@@ -445,19 +442,6 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func simulatePolicy(action: String, path: String) async {
-        policySimulation = nil
-        policySimulationFailure = nil
-        do {
-            policySimulation = try await client.simulatePolicy(action: action, path: path)
-            statusText = "Policy simulation complete"
-        } catch {
-            setFailureStatus(error, action: "run the policy simulation")
-            policySimulationFailure = statusText
-        }
-    }
-
     /// The backup, or nil; either way `statusText` carries the receipt.
     @MainActor
     @discardableResult
@@ -466,7 +450,9 @@ extension AppModel {
         var cause: String?
         var created: BackupRecord?
         do {
-            let backup = try await client.createBackup(reason: reason)
+            let backup = try await TrustBackupPersistence.createBackup(
+                reason: reason, dataRoot: PersistenceCore.defaultDataRoot(), host: .app
+            )
             created = backup
             receipt = "Backup created at \(backup.createdAt): \(backup.reason)"
         } catch {
@@ -482,13 +468,15 @@ extension AppModel {
         let receipt: String
         var cause: String?
         do {
-            let result = try await client.restoreBackup(id: backup.id)
+            let result = try await TrustBackupPersistence.restoreBackup(
+                id: backup.id, dataRoot: PersistenceCore.defaultDataRoot(), host: .app
+            )
             if result.requiresRestart {
                 statusText = "Restore validated and staged with safety backup \(result.safetyBackupId ?? "created"). NativeAgent is restarting to restore before any live state owner opens."
                 AppRelauncher.relaunchApp()
                 return
             }
-            let scopes = NativeClient.scopeNames(for: result.restored)
+            let scopes = TrustBackupPersistence.scopeNames(for: result.restored)
             let restoredDescription = scopes.isEmpty ? "no matching data scopes" : scopes.joined(separator: ", ")
             receipt = "Restore completed at \(result.restoredAt): \"\(backup.reason)\" from \(backup.createdAt). Safety backup created first. Restored: \(restoredDescription)."
         } catch {

@@ -20,7 +20,6 @@ public protocol SchedulerExecutionPlatform: Sendable {
     ) async throws -> (id: String, status: String)
     func runDream(force: Bool) async throws -> sending [String: Any]
     func runRem(force: Bool) async throws -> sending [String: Any]
-    func startImprovement(objective: String) async throws -> (id: String, status: String?, phase: String?)
     func runHarnessBenchmark() async throws -> (id: String, status: String?)
     func createWorkshopTask(
         title: String, objective: String, projectSpaceId: String?

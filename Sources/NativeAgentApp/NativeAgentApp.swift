@@ -16,11 +16,13 @@ import ChatOrchestration
 import MCPDispatcher
 import MacControl
 import BackgroundLoops
+import BackgroundWork
 import MemoryV2
 import KnowledgeGraph
 import DreamREMCycle
 import PersistenceCore
 import PersonaEngine
+import TrustPersistence
 import OSLog
 import os
 #if canImport(BackgroundTasks)
@@ -191,8 +193,8 @@ enum NativeAgentAppMain {
             return
         }
         do {
-            _ = try NativeClient.resumeStagedBackupRestoreAtLaunch(
-                dataRoot: NativeAgentPaths.dataRoot
+            _ = try TrustBackupPersistence.resumeStagedBackupRestoreAtLaunch(
+                dataRoot: NativeAgentPaths.dataRoot, host: .app
             )
         } catch {
             AppDelegate.presentBackupRestoreError(error.localizedDescription)
@@ -212,7 +214,7 @@ enum NativeAgentAppMain {
         let dataRoot = NativeAgentPaths.dataRoot
         // Last-gasp diagnostics only: unwinding a damaged process is best effort.
         // Open once at startup; the handler never opens files or calls Swift.
-        let crashLog = dataRoot.appendingPathComponent("logs/crash-breadcrumbs.log")
+        let crashLog = BodyReport.crashBreadcrumbs(dataRoot)
         do {
             try FileManager.default.createDirectory(at: crashLog.deletingLastPathComponent(),
                                                     withIntermediateDirectories: true)
@@ -244,6 +246,8 @@ enum NativeAgentAppMain {
             alert.runModal()
             return
         }
+        // Before any organ can beat: its pulse lands in the loop-state file.
+        BackgroundLoops.BackgroundLoopsManager.shared.receiveOrganPulses()
         // memory.sqlite has one owner: the graph reaches its kg_* tables
         // through MemoryStorage's pool. Installed before any view or loop can
         // read the graph.
@@ -263,8 +267,6 @@ struct NativeAgentApp: App {
     @State private var appearance = AppearanceController.shared
     /// Her haze colour is the app's tint, so every native control wears it.
     @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
-    /// Whether the rail shows Helpers, so the Navigate menu's digits follow it.
-    @AppStorage(BotsShelfPreference.key) private var helpersShown = true
 
     init() {
         // User, 2026-09-03: native text on this app looked heavy next to the
@@ -314,6 +316,8 @@ struct NativeAgentApp: App {
         // DetachedChatWindowController gets below, done here because the tools
         // can be called before any detached chat is restored.
         QuietSelfAdmin.shared.attach(appModel: appModel)
+        // Every surface draws from this host's layout (ui/layout.json under its root).
+        SurfaceLayoutLive.shared.attach(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
 
         // "Take over" from the phone or Telegram reads where User was the same
         // way the Mac chat does.
@@ -378,7 +382,6 @@ struct NativeAgentApp: App {
             let approvalFiler = NativeAgentChatApprovalFiler(dataRoot: dataRoot)
             let gated = makeGatedToolDispatchClient(
                 tools: NativeAgentEngine.live.toolDispatchClient(
-                    includeEvolutionBridge: profile.includesEvolutionBridge,
                     denyExternalMcp: profile.deniesExternalMCP,
                     // The gate below resolves autonomy once, as it does for an
                     // ordinary Mac turn; the inner dispatcher must not re-run
@@ -560,7 +563,7 @@ struct NativeAgentApp: App {
                 Divider()
                 // D7: derived from the rail's own order so ⌘N is whatever the
                 // rail shows in position N. Do not hand-add entries here.
-                ForEach(NavigateMenuPresentation.entries(helpersShown: helpersShown)) { entry in
+                ForEach(NavigateMenuPresentation.entries(SurfaceLayoutLive.shared.layout)) { entry in
                     Button(entry.title) {
                         NativeAgentAppCoordinator.shared.request(.sidebar(entry.item))
                     }
@@ -699,8 +702,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     /// Paired iPhone chat is the same resident mind with its own closed remote
-    /// surface profile. Reuse never crosses into Mac/bridge-only evolution or
-    /// approval policy.
+    /// surface profile and approval policy.
     static let residentIOSChatClient = NativeAgentEngine.live.chatClient(
         profile: .ios
     )

@@ -62,6 +62,44 @@ enum PersonalityDocumentsReloadOutcome: Equatable {
 
 @MainActor
 extension AppModel {
+    /// The persona owner for this model's data root. An injected root reads
+    /// only its own persona, never the process's seed roots.
+    var personaEngine: SwiftNativePersonaEngine {
+        dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? SwiftNativePersonaEngine()
+    }
+
+    /// The saved profile, read and parsed off the main actor.
+    nonisolated static func readPersonality(dataRoot: URL) async throws -> PersonalityProfile {
+        try await Task.detached { try PersonaCompiler.compileProfile(dataRoot: dataRoot).sharedProfile }.value
+    }
+
+    /// The personality growth summary: the chat packet's fingerprint and
+    /// kind, the persona-feedback memory count, and this week's substrate
+    /// changes from the live mind.
+    nonisolated static func readPersonalityGrowth() async throws -> PersonalityGrowthSummary {
+        try await RuntimeReadProjection.swiftPersonalityGrowth {
+            await NativeAgentEngine.liveCognition.substrate.growthWeekLines()
+        }
+    }
+
+    /// `training/artifacts/index.json`; missing reads as `[]`.
+    nonisolated static func readTrainingArtifacts(dataRoot: URL) async throws -> [TrainingArtifact] {
+        let url = dataRoot
+            .appendingPathComponent("training", isDirectory: true)
+            .appendingPathComponent("artifacts", isDirectory: true)
+            .appendingPathComponent("index.json")
+        return try RuntimeReadProjection.readLocalJSON(url, fallbackJSON: "[]")
+    }
+
+    /// `release/checklist.json`; missing reads as an empty checklist (every
+    /// field decodes if present).
+    nonisolated static func readReleaseChecklist(dataRoot: URL) async throws -> ReleaseChecklist {
+        let url = dataRoot
+            .appendingPathComponent("release", isDirectory: true)
+            .appendingPathComponent("checklist.json")
+        return try RuntimeReadProjection.readLocalJSON(url, fallbackJSON: "{}")
+    }
+
     @MainActor
     func savePersonality(_ profile: PersonalityProfile) async {
         // The page shows the failure in `statusText`; a caller that has to
@@ -74,11 +112,11 @@ extension AppModel {
     @MainActor
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
         do {
-            personality = try await client.savePersonality(profile)
+            personality = try await personaEngine.savePersonality(profile).sharedProfile
             teachMemoryHygieneName()
-            compiledPersonality = try? await client.getCompiledPersonality(surface: "chat")
-            if let docsResponse = try? await client.getPersonalityDocs() {
-                personalityDocs = docsResponse.docs
+            compiledPersonality = try? await PersonaCompiler(engine: personaEngine).compiledPacket(surface: "chat")
+            if let listing = try? await personaEngine.listPersonaDocSpecs() {
+                personalityDocs = listing.docs
             }
             statusText = "Personality saved"
             await refreshAll()
@@ -105,7 +143,7 @@ extension AppModel {
             return .refused(detail)
         }
         do {
-            let saved = try await client.savePersonalityName(name)
+            let saved = try await personaEngine.savePersonality(body: ["name": .string(name)]).sharedProfile
             personality = saved
             teachMemoryHygieneName()
             statusText = "Name saved as \(saved.name)"
@@ -150,7 +188,7 @@ extension AppModel {
                 else { return nil }
                 return report
             }()
-            let diagnostics = try await client.getSupportDiagnostics(reusing: reuse)
+            let diagnostics = try await SupportDiagnostics.read(reusing: reuse)
             supportDiagnostics = diagnostics
             statusText = reuse != nil
                 ? "Support diagnostics refreshed (reused recent Doctor result)"
@@ -174,7 +212,7 @@ extension AppModel {
     @discardableResult
     func reloadPersonalityDocuments() async -> PersonalityDocumentsReloadOutcome {
         do {
-            personalityDocs = try await client.getPersonalityDocs().docs
+            personalityDocs = try await personaEngine.listPersonaDocSpecs().docs
             statusText = "Personality documents reloaded"
             return .loaded(documentCount: personalityDocs.count)
         } catch {
@@ -188,13 +226,13 @@ extension AppModel {
     @discardableResult
     func savePersonalityDoc(id: String, content: String) async -> Bool {
         do {
-            let saved = try await client.savePersonalityDoc(id: id, content: content)
+            let saved = try await personaEngine.savePersonalityDoc(id: id, content: content)
             if let index = personalityDocs.firstIndex(where: { $0.id == saved.id }) {
                 personalityDocs[index] = saved
             } else {
                 personalityDocs.append(saved)
             }
-            compiledPersonality = try? await client.getCompiledPersonality(surface: "chat")
+            compiledPersonality = try? await PersonaCompiler(engine: personaEngine).compiledPacket(surface: "chat")
             statusText = "\(saved.filename) saved"
             return true
         } catch {
@@ -203,53 +241,11 @@ extension AppModel {
         }
     }
 
-    // PATCH-2026-05-07: self-improvement-ui AppModel methods for B.1/B.3
-
-    @MainActor
-    @discardableResult
-    func loadAllSelfImprovement() async -> [String] {
-        let api = client
-        let memory = engine.memory
-        async let nextTrust = try? engine.trust.load()
-        async let nextImprovementSummary = try? api.getImprovementSummary()
-        async let nextTrainingRuns = try? api.getTrainingRuns()
-        async let nextTrainingProposals = try? api.getTrainingProposals()
-        async let nextPromotionCandidates = try? api.getPromotionCandidates()
-        async let nextPromotionPending = try? api.getPromotionPending()
-        async let nextMemoryProposals = try? memory.proposals(status: "pending")
-        let (
-            trustRow,
-            improvementRow,
-            trainingRunRows,
-            trainingProposalRows,
-            promotionRows,
-            pendingRows,
-            memoryProposalRows
-        ) = await (
-            nextTrust,
-            nextImprovementSummary,
-            nextTrainingRuns,
-            nextTrainingProposals,
-            nextPromotionCandidates,
-            nextPromotionPending,
-            nextMemoryProposals
-        )
-        var failedEndpoints: [String] = []
-        func fresh<T>(_ endpoint: String, _ value: T?) -> T? {
-            if value == nil { failedEndpoints.append(endpoint) }
-            return value
-        }
-        engine.trust.policy = fresh("trust policy", trustRow) ?? engine.trust.policy
-        improvementSummary = fresh("improvement summary", improvementRow) ?? improvementSummary
-        trainingRuns = fresh("training runs", trainingRunRows) ?? trainingRuns
-        trainingProposals = fresh("training proposals", trainingProposalRows) ?? trainingProposals
-        promotionCandidates = fresh("promotion candidates", promotionRows) ?? promotionCandidates
-        promotionPending = fresh("promotion pending", pendingRows) ?? promotionPending
-        engine.memory.proposals = fresh("memory proposals", memoryProposalRows) ?? engine.memory.proposals
-        if !failedEndpoints.isEmpty {
-            recordPanelRefresh(.autoImprovement, failedEndpoints: failedEndpoints)
-        }
-        return failedEndpoints
+    /// This ISO week's and last week's misses by lesson; nil when the ledger
+    /// could not be read.
+    nonisolated static func readMisses(dataRoot: URL) async -> [MemoryMissLesson]? {
+        try? await MemoryStatusProjection.misses(
+            dataRoot: dataRoot, weeks: [MemoryStatusProjection.isoWeek(), MemoryStatusProjection.isoWeek(ago: 1)])
     }
 
     // PATCH-2026-05-07: living-memory AppModel methods for memory proposals
@@ -284,16 +280,9 @@ extension AppModel {
 
     @MainActor
     func triggerMemoryConsolidation(dryRun: Bool = false) async throws -> [String: Any] {
-        let result = try await client.triggerMemoryConsolidation(dryRun: dryRun)
+        let result = try await Self.runMemoryConsolidation(dataRoot: engine.dataRoot, dryRun: dryRun)
         await loadMemoryProposals()
         return result
-    }
-
-    @MainActor
-    func loadTrainingProposals() async {
-        trainingProposals = await decodeLogged("getTrainingProposals", default: []) {
-            try await client.getTrainingProposals()
-        }
     }
 
     // PATCH-2026-05-29: dreams-tab — Dreams tab data + control methods.
@@ -330,7 +319,7 @@ extension AppModel {
     func runRemPass() async -> DreamsREMActionFeedback {
         dreamError = nil
         do {
-            let feedback = DreamsREMActionFeedback.resolve(response: try await client.runRem())
+            let feedback = DreamsREMActionFeedback.resolve(response: try await BackgroundLoopsAssembly.runRem(dataRoot: engine.dataRoot))
             if feedback.isSuccess {
                 statusText = feedback.message
             } else {
@@ -352,7 +341,13 @@ extension AppModel {
     func setDreamCycleEnabled(_ enabled: Bool) async -> Bool {
         dreamError = nil
         do {
-            let saved = try await client.patchDreamCycleEnabled(enabled)
+            let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
+                body: [
+                    "personalityPolicy": ["dream_cycle_enabled": enabled],
+                    "trainingPolicy": ["dream_scheduler": enabled],
+                ],
+                dataRoot: engine.dataRoot
+            )
             engine.trust.policy = saved
             statusText = enabled ? "Dream cycle enabled" : "Dream cycle disabled"
             return true
@@ -368,7 +363,10 @@ extension AppModel {
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool {
         dreamError = nil
         do {
-            let saved = try await client.patchRemCycleEnabled(enabled)
+            // Change only the REM gate; preserve the dream scheduler.
+            let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
+                body: ["trainingPolicy": ["rem_cycle_enabled": enabled]], dataRoot: engine.dataRoot
+            )
             engine.trust.policy = saved
             statusText = enabled ? "REM cycle enabled" : "REM cycle disabled"
             return true
@@ -435,9 +433,9 @@ extension AppModel {
     func runDreamPassForDreams() async -> Bool {
         dreamError = nil
         do {
-            let result = try await client.runDream(trigger: .manual)
+            let result = try await BackgroundLoopsAssembly.runDream(dataRoot: engine.dataRoot, trigger: .manual)
             let errors = result["errors"] as? [String] ?? []
-            guard NativeClient.boolValue(result["ok"]) == true, errors.isEmpty else {
+            guard DoctorStatusProjection.boolValue(result["ok"]) == true, errors.isEmpty else {
                 let detail = errors.isEmpty ? "The dream run did not complete successfully." : errors.joined(separator: "; ")
                 dreamError = "Dream cycle failed: \(detail)"
                 statusText = "Dream cycle failed"
@@ -453,8 +451,8 @@ extension AppModel {
     }
 
     private static func dreamRunStatusText(_ result: [String: Any]) -> String {
-        let entries = NativeClient.intValue(result["entriesWritten"]) ?? 0
-        let disabled = NativeClient.boolValue(result["disabled"]) ?? false
+        let entries = DoctorStatusProjection.intValue(result["entriesWritten"]) ?? 0
+        let disabled = DoctorStatusProjection.boolValue(result["disabled"]) ?? false
         if disabled { return "Dream cycle disabled" }
         if let reason = result["skipReason"] as? String {
             switch reason {
@@ -468,48 +466,4 @@ extension AppModel {
         return entries == 1 ? "Dream cycle wrote 1 entry" : "Dream cycle wrote \(entries) entries"
     }
 
-    // SUBSYSTEM #17: retired viewmodel wrappers runTrainingSelfTest / runPromotionSelfTest — zero view callers.
-
-    @MainActor
-    func approveTrainingProposal(id: String) async {
-        do {
-            let result = try await client.approveTrainingProposal(id: id)
-            if (result["status"] as? String) == "promotion_staged" {
-                statusText = "Proposal staged for promotion"
-                await loadAllSelfImprovement()
-            } else {
-                statusText = "Proposal approved"
-                await loadTrainingProposals()
-            }
-        } catch {
-            selfImprovementError = UserFacingError.message(error, action: "approve that proposal")
-        }
-    }
-
-    @MainActor
-    func rejectTrainingProposal(id: String, reason: String) async {
-        do {
-            _ = try await client.rejectTrainingProposal(id: id, reason: reason)
-            statusText = "Proposal rejected"
-            await loadTrainingProposals()
-        } catch {
-            selfImprovementError = UserFacingError.message(error, action: "reject that proposal")
-        }
-    }
-
-    @MainActor
-    func patchTrainingAndPromotion(
-        training: [String: Bool] = [:],
-        promotion: [String: Bool] = [:]
-    ) async {
-        do {
-            var body: [String: Any] = [:]
-            if !training.isEmpty { body["trainingPolicy"] = training }
-            if !promotion.isEmpty { body["promotionPolicy"] = promotion }
-            let savedPolicy = try await client.postTrustWrite(body: body)
-            applySavedTrustPolicy(savedPolicy, status: "Trust policy saved")
-        } catch {
-            setFailureStatus(error, action: "save trust settings")
-        }
-    }
 }

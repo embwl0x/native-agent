@@ -131,6 +131,7 @@ public enum MacChatTurnLifecycleReducer {
                 phase: activity.phase,
                 detail: activity.actionSummary,
                 delegateName: activity.delegateDisplayName,
+                outcome: activity.outcome,
                 at: activity.occurredAt,
                 resetStreamLength: activity.phase == .retrying,
                 additionalRedactor: additionalRedactor

@@ -178,8 +178,6 @@ extension UnifiedPolicyDecision {
     static func primaryCapability(from capabilities: [String]) -> String {
         let priority = [
             "destructive",
-            "evolution_apply_trigger",
-            "evolution_write",
             "shell",
             "process_spawn",
             "system_control",

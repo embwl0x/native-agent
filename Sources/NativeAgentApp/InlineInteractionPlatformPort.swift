@@ -27,7 +27,7 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
     }
 
     func connectorRecords(root: URL) async throws -> [InlineInteractionConnectorStatus] {
-        try await NativeClient.readConnectorRecords(root: root).map {
+        try await ConnectorStatusProjection.readConnectorRecords(root: root, platform: AppConnectorStatusPlatform()).map {
             (id: $0.id, authState: $0.authState, healthStatus: $0.healthStatus)
         }
     }

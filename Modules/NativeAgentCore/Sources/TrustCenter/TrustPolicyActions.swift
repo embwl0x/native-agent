@@ -37,10 +37,6 @@ public struct TrustPolicyActions: Sendable {
         ]
     }
 
-    public func saveDeveloperMode(_ enabled: Bool) async throws -> TrustPolicy {
-        try await postTrustWrite(body: Self.developerModePatchBody(enabled: enabled))
-    }
-
     public func saveMultimodalPolicy(_ policy: TrustMultimodalPolicy) async throws -> TrustPolicy {
         let body: [String: Any] = [
             "multimodalPolicy": [
@@ -71,6 +67,33 @@ public struct TrustPolicyActions: Sendable {
         try await postTrustWrite(body: [
             "securityPolicy": ["killSwitchEnabled": enabled]
         ])
+    }
+
+    public func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async throws -> TrustPolicy {
+        try await postTrustWrite(body: [
+            "memoryPolicy": [
+                "consolidation_enabled": consolidationEnabled,
+                "cross_session_recall": crossSessionRecall,
+            ]
+        ])
+    }
+
+    public func patchMemoryPolicy(
+        knowledgeGraphEnabled: Bool? = nil,
+        adaptivePromotion: Bool? = nil,
+        hygieneEnabled: Bool? = nil
+    ) async throws -> TrustPolicy {
+        var memoryPolicy: [String: Any] = [:]
+        if let knowledgeGraphEnabled {
+            memoryPolicy["knowledge_graph_enabled"] = knowledgeGraphEnabled
+        }
+        if let adaptivePromotion {
+            memoryPolicy["adaptive_promotion"] = adaptivePromotion
+        }
+        if let hygieneEnabled {
+            memoryPolicy["hygiene_enabled"] = hygieneEnabled
+        }
+        return try await postTrustWrite(body: ["memoryPolicy": memoryPolicy])
     }
 
     // PATCH-2026-05-07: mac-control-ui-1 POST macControlPolicy block to /v1/trust.
@@ -251,11 +274,7 @@ public struct TrustPolicyActions: Sendable {
         requireBackups: Bool,
         outsideDefault: String,
         developerMode: Bool = false,
-        autonomousTraining: Bool? = nil,
-        dreamScheduler: Bool? = nil,
-        routeThroughPromotion: Bool? = nil,
-        promotionEnabled: Bool? = nil,
-        autoPromoteTierA: Bool? = nil
+        dreamScheduler: Bool? = nil
     ) async throws -> TrustPolicy {
         var body: [String: Any] = [
             "permissionLevel": permissionLevel,
@@ -266,19 +285,7 @@ public struct TrustPolicyActions: Sendable {
                 "outsideWorkspaceDefault": outsideDefault
             ]
         ]
-        if autonomousTraining != nil || dreamScheduler != nil || routeThroughPromotion != nil {
-            var training: [String: Any] = [:]
-            if let v = autonomousTraining { training["autonomous_training"] = v }
-            if let v = dreamScheduler { training["dream_scheduler"] = v }
-            if let v = routeThroughPromotion { training["route_through_promotion"] = v }
-            body["trainingPolicy"] = training
-        }
-        if promotionEnabled != nil || autoPromoteTierA != nil {
-            var promo: [String: Any] = [:]
-            if let v = promotionEnabled { promo["enabled"] = v }
-            if let v = autoPromoteTierA { promo["auto_promote_tier_a"] = v }
-            body["promotionPolicy"] = promo
-        }
+        if let dreamScheduler { body["trainingPolicy"] = ["dream_scheduler": dreamScheduler] }
         return try await postTrustWrite(body: body)
     }
 }

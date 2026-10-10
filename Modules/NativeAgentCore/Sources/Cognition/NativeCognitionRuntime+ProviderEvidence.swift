@@ -10,6 +10,25 @@ import PersistenceCore
 import ProviderRouting
 
 extension NativeCognitionRuntime {
+    public nonisolated static func providerPathEvidence(
+        providerID: String, dataRoot: URL, since: Date, now: Date = Date()
+    ) async throws -> (model: String, observedAt: Date)? {
+        let receipt = try await SwiftNativePersistenceCore().readJSONLReporting(
+            dataRoot.appendingPathComponent("traces/events.jsonl"))
+        guard receipt.report.malformedLineCount == 0 else {
+            throw PersistenceCoreError.ioFailure("Provider evidence is incomplete; repair traces/events.jsonl before checking the provider.")
+        }
+        var newest: (model: String, observedAt: Date)?
+        for row in receipt.rows {
+            guard let decoded = Self.decodeProviderLifecycleEvidence(row),
+                  decoded.provider == providerID, decoded.evidence.outcome == .succeeded,
+                  decoded.evidence.observedAt >= since, decoded.evidence.observedAt <= now,
+                  decoded.evidence.observedAt > (newest?.observedAt ?? .distantPast) else { continue }
+            newest = (decoded.model, decoded.evidence.observedAt)
+        }
+        return newest
+    }
+
     func recordProviderLifecycleEvidence(_ event: LLMCallLifecycleEvent) {
         let outcome: ProviderPathEvidenceOutcome
         switch event.phase {
@@ -55,34 +74,8 @@ extension NativeCognitionRuntime {
         var restored: [String: ProviderPathEvidence] = [:]
         for row in rows.reversed() {
             guard restored.count < Self.maximumProviderLifecycleEvidence else { break }
-            guard case .object(let object) = row,
-                  case .string("llm.call")? = object["kind"],
-                  case .string(let rawDate)? = object["createdAt"],
-                  let date = ISO8601DateFormatter().date(from: rawDate),
-                  case .object(let payload)? = object["payload"],
-                  case .string(let provider)? = payload["provider"],
-                  case .string(let model)? = payload["model"]
-            else { continue }
-            let outcome: ProviderPathEvidenceOutcome = {
-                guard case .string(let status)? = object["status"] else {
-                    return .succeeded // completed rows from before status existed
-                }
-                switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-                case "ok", "succeeded", "completed": return .succeeded
-                case "cancelled", "canceled": return .cancelled
-                default: return .failed
-                }
-            }()
-            let rowID: String = {
-                if case .string(let id)? = object["id"], !id.isEmpty { return id }
-                return "\(provider):\(model):\(rawDate)"
-            }()
-            let identity = "trace-call:\(rowID)"
-            let evidence = ProviderPathEvidence(
-                evidenceID: identity,
-                observedAt: date,
-                outcome: outcome
-            )
+            guard let decoded = Self.decodeProviderLifecycleEvidence(row) else { continue }
+            let evidence = decoded.evidence
             restored[evidence.evidenceID] = evidence
         }
         for (key, value) in restored where providerLifecycleEvidenceByCallID[key] == nil {
@@ -90,6 +83,35 @@ extension NativeCognitionRuntime {
         }
         enforceProviderLifecycleEvidenceCapacity()
         if !restored.isEmpty { cachedBodyRead = nil }
+    }
+
+    private nonisolated static func decodeProviderLifecycleEvidence(
+        _ row: JSONValue
+    ) -> (provider: String, model: String, evidence: ProviderPathEvidence)? {
+        guard case .object(let object) = row,
+              case .string("llm.call")? = object["kind"],
+              case .string(let rawDate)? = object["createdAt"],
+              let date = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(rawDate))
+                ?? (try? Date.ISO8601FormatStyle().parse(rawDate)),
+              case .object(let payload)? = object["payload"],
+              case .string(let provider)? = payload["provider"],
+              case .string(let model)? = payload["model"] else { return nil }
+        let outcome: ProviderPathEvidenceOutcome = {
+            guard case .string(let status)? = object["status"] else {
+                return .succeeded // completed rows from before status existed
+            }
+            switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "ok", "succeeded", "completed": return .succeeded
+            case "cancelled", "canceled": return .cancelled
+            default: return .failed
+            }
+        }()
+        let rowID: String = {
+            if case .string(let id)? = object["id"], !id.isEmpty { return id }
+            return "\(provider):\(model):\(rawDate)"
+        }()
+        return (provider, model, ProviderPathEvidence(
+            evidenceID: "trace-call:\(rowID)", observedAt: date, outcome: outcome))
     }
 
     /// The trace tail is a transient sensor and may be unavailable during the

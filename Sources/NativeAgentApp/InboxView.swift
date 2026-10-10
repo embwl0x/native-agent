@@ -4,6 +4,7 @@ import Observation
 import NativeAgentShared
 import NativeAgentCore
 import NotificationInbox
+import TriggerScheduler
 import DeviceSync
 
 // MARK: - Models
@@ -76,14 +77,8 @@ extension InboxItemRecord {
         if source.hasPrefix("harness_learning") { return "wand.and.stars" }
         if source == "dream_cycle"               { return "moon.stars.fill" }
         if source == "rem_cycle"                 { return "sparkles" }
-        if source.hasPrefix("trigger:file_watch") { return "doc.text.magnifyingglass" }
-        // P2-4: cards already in inbox.jsonl carry `mission_complete:<id>`.
-        if ExecutionEventVocabulary.hasKindPrefix(source, WorkshopCompletionTrigger.canonicalKind) {
-            return "checkmark.circle.fill"
-        }
         if source == "idle_checkin"               { return "clock.fill" }
         if source.hasPrefix("trigger:morning_brief") { return "sun.horizon.fill" }
-        if source.hasPrefix("trigger:stuck_pattern") { return "arrow.trianglehead.2.clockwise" }
         if source == "self_test"                  { return "testtube.2" }
         return "bell.fill"
     }
@@ -140,13 +135,8 @@ enum InboxSourceBadgePresentation {
         if normalized.hasPrefix("harness_learning:") { return "LEARNING" }
         if normalized == "dream_cycle" { return "DREAM" }
         if normalized == "rem_cycle" { return "REM" }
-        if normalized.hasPrefix("trigger:file_watch") { return "FILE-WATCH" }
         if normalized.hasPrefix("trigger:morning_brief") { return "MORNING-BRIEF" }
-        if normalized.hasPrefix("trigger:stuck_pattern") { return "STUCK-PATTERNS" }
         if normalized == "idle_checkin" { return "IDLE-CHECKIN" }
-        if ExecutionEventVocabulary.hasKindPrefix(normalized, WorkshopCompletionTrigger.canonicalKind) {
-            return "WORKSHOP"
-        }
         if normalized == "scheduled_proactive_scan" { return "PROACTIVE SCAN" }
         return boundedHumanizedLabel(normalized)
     }
@@ -217,74 +207,13 @@ enum InboxVisibleActionsPresentation {
     }
 }
 
-struct InboxTriggerConfig: Identifiable, Codable, Hashable {
-    let name: String
-    var enabled: Bool
-    let kind: String?
-    // config is dynamic — stored as [String: String] for watched paths access
-    var config: [String: String]?   // only string-valued keys used in UI
-    let description: String?
-
-    var id: String { name }
-
-    // Custom decoder to tolerate any config value types (arrays, bools, ints)
-    // by only capturing string-valued keys
-    enum CodingKeys: String, CodingKey {
-        case name, enabled, kind, config, description
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        name = try c.decode(String.self, forKey: .name)
-        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
-        kind = try? c.decode(String.self, forKey: .kind)
-        description = try? c.decode(String.self, forKey: .description)
-        // config may have mixed types; use global AnyCodable to capture string-valued keys
-        if let raw = try? c.decode([String: AnyCodable].self, forKey: .config) {
-            var stringMap: [String: String] = [:]
-            for (k, v) in raw {
-                if let s = v.value as? String {
-                    stringMap[k] = s
-                } else if let arr = v.value as? [Any] {
-                    stringMap[k] = arr.compactMap { $0 as? String }.joined(separator: "\n")
-                } else if let i = v.value as? Int {
-                    stringMap[k] = String(i)
-                } else if let b = v.value as? Bool {
-                    stringMap[k] = b ? "true" : "false"
-                }
-            }
-            config = stringMap.isEmpty ? nil : stringMap
-        } else {
-            config = nil
-        }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(name, forKey: .name)
-        try c.encode(enabled, forKey: .enabled)
-        try c.encodeIfPresent(kind, forKey: .kind)
-        try c.encodeIfPresent(description, forKey: .description)
-        try c.encodeIfPresent(config, forKey: .config)
-    }
-
-    // Memberwise initializer for non-Codable paths
-    init(name: String, enabled: Bool, kind: String? = nil, config: [String: String]? = nil, description: String? = nil) {
-        self.name = name
-        self.enabled = enabled
-        self.kind = kind
-        self.config = config
-        self.description = description
-    }
+extension TriggerConfig: @retroactive Identifiable {
+    public var id: String { name }
 
     var displayName: String {
         switch name {
-        case "file_watch":       return "File watcher"
         case "idle_checkin":     return "Idle check-in"
         case "morning_brief":    return "Morning brief"
-        case WorkshopCompletionTrigger.canonicalName,
-             WorkshopCompletionTrigger.legacyName: return "Desk follow-up"
-        case "stuck_pattern":    return "Stuck pattern"
         default:                 return Self.humanized(name)
         }
     }
@@ -300,12 +229,8 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
 
     var systemImage: String {
         switch name {
-        case "file_watch":       return "doc.text.magnifyingglass"
         case "idle_checkin":     return "clock"
         case "morning_brief":    return "sun.horizon"
-        case WorkshopCompletionTrigger.canonicalName,
-             WorkshopCompletionTrigger.legacyName: return "checkmark.circle"
-        case "stuck_pattern":    return "arrow.trianglehead.2.clockwise"
         default:                 return "bolt"
         }
     }
@@ -903,8 +828,6 @@ struct InboxView: View {
     // it is just no longer the thing User's day opens with.
     @State private var lane: InboxLane = InboxLanePresentation.initialLane
 
-    // R22: source the client from AppModel's canonical `client`.
-    private var client: NativeClient { appModel.client }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1021,7 +944,7 @@ struct InboxView: View {
             item: item,
             waiting: waiting,
             allItems: inboxLoadState.items,
-            client: client,
+            dataRootOverride: appModel.dataRootOverride,
             onAction: { Task { await loadAndSync() } },
             onMarkedRead: { markRead(item.id) },
             onSelectGroup: { group in
@@ -1153,7 +1076,7 @@ struct InboxListRow: View {
     let item: InboxItemRecord
     var waiting = false
     let allItems: [InboxItemRecord]
-    let client: NativeClient
+    let dataRootOverride: URL?
     let onAction: () -> Void
     // ui-honesty 2026-06-10: fired after a successful "read" action so the
     // parent can patch the local item instead of doing a full reload.
@@ -1272,7 +1195,7 @@ struct InboxListRow: View {
     /// durable write, so the two surfaces cannot drift on read vs. resolution.
     private func performAction(_ actionID: String) async -> InboxRowActionFlight.Outcome {
         let outcome = await actionFlight.perform {
-            try await client.inboxAction(item.id, action: actionID)
+            try await InboxCardActions.perform(item.id, action: actionID, dataRootOverride: dataRootOverride)
         }
         return InboxRowActionCompletion.apply(
             outcome,

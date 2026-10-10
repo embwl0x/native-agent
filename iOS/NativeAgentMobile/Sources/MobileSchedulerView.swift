@@ -160,7 +160,6 @@ private struct MobileSchedulerCreateView: View {
                     Text("Notification").tag("notify")
                     Text("Reflection").tag("dream")
                     Text("REM consolidation").tag("rem")
-                    Text("Self-improvement").tag("improve")
                 }
                 .aliveRow()
                 TextField("Interval (seconds)", text: $interval)

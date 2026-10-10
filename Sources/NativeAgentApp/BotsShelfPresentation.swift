@@ -5,23 +5,6 @@ import PersistenceCore
 import StandingBots
 import ChatOrchestration
 
-/// Option B groups, preserving callers' filtered destinations and the Bots gate.
-enum BotsShelfRailProposal {
-    /// The rail top to bottom, Helpers included when it shows. The Navigate
-    /// menu's digits and ⌘K's pages read this, so ⌘N is the Nth rail row.
-    static func ordered(_ items: [SidebarItem], enabled: Bool) -> [SidebarItem] {
-        everyday(items) + (enabled ? [.bots] : []) + configuration(items) + items.filter { $0 == .settings }
-    }
-
-    static func everyday(_ items: [SidebarItem]) -> [SidebarItem] {
-        [.chat, .activity, .memories, .desk, .inboxPolicy].filter(items.contains)
-    }
-
-    static func configuration(_ items: [SidebarItem]) -> [SidebarItem] {
-        items.filter { !everyday(items).contains($0) && $0 != .settings }
-    }
-}
-
 /// A bot occurrence that never ran, for the Desk's schedule fold. Read-only.
 struct DeskMissedBot: Identifiable, Equatable, Sendable {
     let id: UUID

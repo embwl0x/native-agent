@@ -724,9 +724,6 @@ extension SwiftNativeMemoryV2 {
                 ))
             }
             await storage.attachSpotlightHook { stored, deleted in
-                // Skill pointers are recall-only rows (skills-recall
-                // rework 2026-07-03): keep them out of Spotlight.
-                if stored.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { return }
                 if deleted {
                     try? await indexer.remove(id: stored.id)
                 } else {
@@ -735,11 +732,6 @@ extension SwiftNativeMemoryV2 {
             }
             do {
                 await storage.attachKnowledgeGraphHook { stored, deleted in
-                    // Recall-only skill pointers never enter the KG —
-                    // entity extraction over "Skill available: ..." rows
-                    // mints junk entities (gpt-5.5 review HIGH,
-                    // 2026-07-03).
-                    if stored.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { return }
                     // Settings ▸ "Knowledge graph": off means no graph is
                     // PRODUCED. A delete still reaches the graph, and a write
                     // while off retires the memory-derived graph, so a rewritten or

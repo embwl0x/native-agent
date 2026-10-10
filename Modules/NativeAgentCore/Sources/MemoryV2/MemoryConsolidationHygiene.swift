@@ -19,7 +19,7 @@
 // (mirroring WeeklySelfImprovementLoop's staging shape — see
 // BackgroundLoopsAssembly.makeWeeklySelfImprovementLoop). Approving the
 // card fires the existing executor
-// (NativeClient.applyApprovedSelfImprovement → runMemoryHygiene), which is
+// (AppApprovalTransactionEffects.runMemoryHygiene), which is
 // the only thing that actually consolidates and writes
 // <dataRoot>/memory/hygiene_last_run.json. Staging is idempotent: a second
 // card is never staged while one is pending.
@@ -27,8 +27,8 @@
 // The direct-consolidate path (runOnce) stays available ONLY behind the
 // explicit `approvedDirectRun` parameter, asserted by the two
 // already-approval-gated callers: the Memories upkeep "Run hygiene"
-// button and the approved `run_memory_hygiene` op (both via
-// NativeClient.runMemoryHygiene).
+// button (AppModel.memoryHygieneReport) and the approved
+// `run_memory_hygiene` op (AppApprovalTransactionEffects.runMemoryHygiene).
 //
 // The retired JSONL loop type and its isolated tests are gone; this runner is
 // the only implementation behind the canonical scheduler slot.
@@ -48,7 +48,7 @@ import TrustCenter
 // MARK: - Shared hygiene implementation
 
 /// One implementation for BOTH the manual hygiene path
-/// (NativeClient.runMemoryHygiene) and the weekly background tick, so the
+/// (AppModel.memoryHygieneReport) and the weekly background tick, so the
 /// two can never drift on report shape or on what a "hygiene run" means.
 public enum MemoryConsolidationHygiene {
 
@@ -70,8 +70,9 @@ public enum MemoryConsolidationHygiene {
     /// `approvedDirectRun` is the review-blocker gate (2026-06-10): this
     /// path MUTATES the store (auto-accept / merge / archive), so the only
     /// legal callers are the ones that already carry an explicit approval —
-    /// NativeClient.runMemoryHygiene (Memories upkeep button + the
-    /// approved run_memory_hygiene op) and, since 2026-09-22, the weekly
+    /// the Memories upkeep button (AppModel.memoryHygieneReport), the
+    /// approved run_memory_hygiene op (AppApprovalTransactionEffects) and,
+    /// since 2026-09-22, the weekly
     /// tick on User's standing word.
     @discardableResult
     public static func runOnce(
@@ -154,7 +155,7 @@ public enum MemoryConsolidationHygiene {
             }
         case .alreadyStaged(let approvalId):
             result = ConsolidationReport(
-                processed: 0, autoAccepted: 0, duplicatesMerged: 0,
+                processed: 0, duplicatesMerged: 0,
                 pendingForReview: 0, staleArchived: 0, errors: [])
             status = "staged"
             if let approval = try? await SwiftNativeApprovalInbox(root: dataRoot).get(approvalId) {
@@ -241,7 +242,6 @@ public enum MemoryConsolidationHygiene {
             // failure leaves the canonical swap's completed work intact.
             archivedDuplicates: status == "failed" ? 0 : result.duplicatesMerged,
             archivedReflections: status == "failed" ? 0 : result.staleArchived,
-            distilledFactsAdded: status == "failed" ? 0 : result.autoAccepted,
             decayedMemories: nil,
             proposalHygiene: MemoryProposalHygiene(
                 rejectedLowValue: nil,

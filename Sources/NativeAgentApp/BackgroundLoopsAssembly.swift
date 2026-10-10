@@ -45,7 +45,7 @@ func makeWorkshopPlannerConnectorActionsProvider(
 // RETIRED 2026-08-31: `rem_cycle` (REMCycleLoop). Weekly REM has exactly one
 // owner, the `nativeagent-weekly-rem` TriggerScheduler job at 04:30
 // America/Chicago on Sundays (SchedulerDueJobRunner.executeREM →
-// NativeClient.runRem → SwiftNativeDreamREMCycle, which resolves the persona
+// BackgroundLoopsAssembly.runRem → SwiftNativeDreamREMCycle, which resolves the persona
 // root through PersistenceCore.defaultPersonaRoot the same way the deleted
 // factory did). Every row in `data/rem_proposals.jsonl` and every
 // `rem.proposal` approval card carries that job's Sunday ~09:30Z stamp; the
@@ -119,9 +119,6 @@ enum BackgroundLoopsAssembly {
             makeAutoDoctorLoop(dataRoot: dataRoot),
             makeTurnTraceRetentionLoop(dataRoot: dataRoot),
             makeOffDiskBackupLoop(dataRoot: dataRoot),
-            // Tightness round 2 P-M2: weekly prune of terminal evolution proposals
-            // (proposals.json had no retention driver). Idempotent.
-            makeEvolutionProposalRetentionLoop(dataRoot: dataRoot),
             // Tightness round 2 item 6: daily disk-hygiene watchdog — detects
             // oversized files / an over-budget data/ tree and files ONE inbox
             // card. Detect-never-delete.
@@ -149,7 +146,7 @@ enum BackgroundLoopsAssembly {
             // absent from production scheduling until it has a live consumer.
             // This avoids both unattended model spend and a dead 10-minute wake.
             // U2b wave 3 lane A: interval health heartbeat.
-            makeHeartbeatLoop(dataRoot: dataRoot, llm: llm),
+            makeHeartbeatLoop(dataRoot: dataRoot),
             // U4 Wave C: autonomy-promotion PROPOSAL loop (cards only; applies
             // human-approved promotions via a re-verifying reconcile).
             makeAutonomyPromotionLoop(dataRoot: dataRoot),
@@ -178,13 +175,7 @@ enum BackgroundLoopsAssembly {
                     reason: telegramUnconfiguredReason
                 )
         )
-        loops.append(
-            makeSlackSocketModeLoopIfConfigured(dataRoot: dataRoot)
-                ?? unconfiguredLanePlaceholder(
-                    loopId: "slack_socket_mode",
-                    reason: slackUnconfiguredReason
-                )
-        )
+        loops.append(makeSlackSocketModeLane(dataRoot: dataRoot))
         return loops
     }
 }

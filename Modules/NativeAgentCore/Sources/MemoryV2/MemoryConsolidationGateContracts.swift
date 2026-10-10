@@ -10,20 +10,18 @@ public struct MemoryConsolidationDiff: Sendable, Equatable {
     public let memoriesActiveAfter: Int
     public let proposalsPendingBefore: Int
     public let proposalsPendingAfter: Int
-    public let accepted: Int
     public let merged: Int
     public let archived: Int
 
     public init(
         memoriesActiveBefore: Int, memoriesActiveAfter: Int,
         proposalsPendingBefore: Int, proposalsPendingAfter: Int,
-        accepted: Int, merged: Int, archived: Int
+        merged: Int, archived: Int
     ) {
         self.memoriesActiveBefore = memoriesActiveBefore
         self.memoriesActiveAfter = memoriesActiveAfter
         self.proposalsPendingBefore = proposalsPendingBefore
         self.proposalsPendingAfter = proposalsPendingAfter
-        self.accepted = accepted
         self.merged = merged
         self.archived = archived
     }
@@ -31,7 +29,7 @@ public struct MemoryConsolidationDiff: Sendable, Equatable {
     public var summary: String {
         "memories \(memoriesActiveBefore)→\(memoriesActiveAfter) active; "
             + "proposals pending \(proposalsPendingBefore)→\(proposalsPendingAfter); "
-            + "\(accepted) accepted, \(merged) merged, \(archived) archived"
+            + "\(merged) merged, \(archived) archived"
     }
 }
 

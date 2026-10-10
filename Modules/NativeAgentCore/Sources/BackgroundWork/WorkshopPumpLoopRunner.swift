@@ -48,7 +48,7 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
     public func tickOutcome() async -> LoopTickOutcome {
         switch await pump.tick() {
         case .disabled:
-            return .skipped(reason: "Desk autonomy disabled")
+            return .off("Desk autonomy disabled")
         case .organismUnavailable:
             return .skipped(reason: "organism posture unavailable")
         case .postureNotNormal:

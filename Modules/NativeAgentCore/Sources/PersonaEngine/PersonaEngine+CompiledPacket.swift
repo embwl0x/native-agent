@@ -14,7 +14,11 @@ public struct CompiledPersonalityWire: Sendable, Equatable, Codable {
 
 extension PersonaCompiler {
     /// Diagnostic projection of the same selected persona used by live turns.
+    /// Missing fixed persona docs are scaffolded first so the packet reflects
+    /// persisted defaults (SOUL.md first, USER.md skipped — MemoryV2 owns it —
+    /// each write locked); scaffold failures propagate.
     public func compiledPacket(surface: String) async throws -> CompiledPersonalityWire {
+        _ = try await engine.scaffoldMissingDocs()
         let packet = try await compile(surface: surface)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]

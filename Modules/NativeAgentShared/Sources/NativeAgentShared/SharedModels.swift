@@ -320,31 +320,6 @@ public struct PersonalityProfile: Codable, Hashable, Sendable {
     }
 }
 
-public struct PersonalityDoc: Identifiable, Codable, Hashable, Sendable {
-    public var id: String
-    public var title: String
-    public var filename: String
-    public var path: String?
-    public var content: String
-    public var updatedAt: String?
-
-    public init(
-        id: String,
-        title: String,
-        filename: String,
-        path: String? = nil,
-        content: String,
-        updatedAt: String? = nil
-    ) {
-        self.id = id
-        self.title = title
-        self.filename = filename
-        self.path = path
-        self.content = content
-        self.updatedAt = updatedAt
-    }
-}
-
 public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var title: String
@@ -373,7 +348,9 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     public var executionOutcome: String?
     public var executionSummary: String?
 
-    public var executionFailed: Bool { executionOutcome == "failed" || executionOutcome == "timeout" }
+    public var executionFailed: Bool {
+        executionOutcome == "failed" || executionOutcome == "refused" || executionOutcome == "timeout"
+    }
     public var isExpired: Bool {
         [status, decision ?? ""].contains { ["orphaned", "expired"].contains($0.lowercased()) }
     }

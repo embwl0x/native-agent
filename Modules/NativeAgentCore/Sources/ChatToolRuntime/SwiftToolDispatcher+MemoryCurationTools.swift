@@ -68,11 +68,12 @@ public struct MemoryCuration: Sendable {
         return b
     }
 
-    /// Retired but recoverable: archived by a merge or a newer fact, or
-    /// demoted by a correction. Contradicted and deleted rows are not offered.
+    /// Retired but recoverable: archived by a merge or a newer fact, demoted
+    /// by a correction, or graduated into GROWTH (the GROWTH line stays hers
+    /// to retire). Contradicted and deleted rows are not offered.
     static func isRecoverable(_ record: MemoryRecord) -> Bool {
         let lifecycle = MemoryLifecycle.normalized(record.lifecycle)
-        return lifecycle == MemoryLifecycle.corrected
+        return lifecycle == MemoryLifecycle.corrected || lifecycle == MemoryLifecycle.graduated
             || (record.status == "archived" && MemoryLifecycle.isRecallEligible(lifecycle))
     }
 
@@ -234,7 +235,11 @@ public struct MemoryCuration: Sendable {
             throw ToolFailureError("No memory with that id is available on this surface; nothing changed.", effects: .none)
         }
         if restore, !Self.isRecoverable(row) {
-            throw ToolFailureError("No archived or corrected memory with that id, so there is nothing to restore. memory.list status archived shows the ones that can come back.", effects: .none)
+            throw ToolFailureError("No archived, corrected or graduated memory with that id, so there is nothing to restore. memory.list status archived shows the ones that can come back.", effects: .none)
+        }
+        // The pin writer refuses the same way; asking first lets a preview say so.
+        if pinned == true, let refusal = UserMDGenerator.pinRefusal(kind: row.memoryKind) {
+            throw ToolFailureError(refusal, effects: .none)
         }
         return row
     }
@@ -257,7 +262,7 @@ public struct MemoryCuration: Sendable {
         if let pinned { update["pinned"] = .bool(pinned) }
         if restore {
             update["status"] = .string("active")
-            if MemoryLifecycle.normalized(row.lifecycle) == MemoryLifecycle.corrected {
+            if !MemoryLifecycle.isRecallEligible(row.lifecycle) {
                 update["lifecycle"] = .string(MemoryLifecycle.confirmed)
             }
             // The hygiene duplicate pass skips a row carrying this, so a

@@ -1,4 +1,5 @@
 import AppToolRuntime
+import ChatOrchestration
 // PATCH-2026-05-08: polish-wave — primary sidebar coach-mark onboarding tour
 import SwiftUI
 
@@ -109,13 +110,12 @@ private let onboardingTourStops: [OnboardingTourStep] = [
     ),
 ]
 
-/// The stops the rail actually has words for. Bots is on the rail only while
-/// the Bots preview is on (`ShellSidebarRail`), so the tour reads the same
-/// preference and drops that stop with it. Stop ids stay fixed, so a stop
-/// keeps its identity whether or not Bots is showing.
-var onboardingTourSteps: [OnboardingTourStep] {
-    guard !BotsShelfPreference.isEnabled() else { return onboardingTourStops }
-    return onboardingTourStops.filter { $0.item != .bots }
+/// The stops the rail actually has words for: a page the layout hides from
+/// the rail (`SidebarItem.rail`) drops its stop. Stop ids stay fixed, so a
+/// stop keeps its identity whether or not its page is showing.
+@MainActor var onboardingTourSteps: [OnboardingTourStep] {
+    let rail = SidebarItem.rail(SurfaceLayoutLive.shared.layout)
+    return onboardingTourStops.filter { rail.contains($0.item) }
 }
 
 // MARK: - Tour interaction state
@@ -136,7 +136,7 @@ enum OnboardingTourEffect: Equatable, Sendable {
     case complete
 }
 
-struct OnboardingTourState: Equatable, Sendable {
+@MainActor struct OnboardingTourState: Equatable, Sendable {
     private(set) var stepIndex = 0
     private(set) var didComplete = false
 
@@ -177,7 +177,7 @@ struct OnboardingTourState: Equatable, Sendable {
 /// All user-visible tour chrome derived from the same state that routes the
 /// sidebar. Keeping this projection pure prevents the label, disabled Back
 /// state, and action target from drifting into separate SwiftUI branches.
-struct OnboardingTourPresentation: Equatable, Sendable {
+@MainActor struct OnboardingTourPresentation: Equatable, Sendable {
     let progressText: String
     let title: String
     let sidebarItem: SidebarItem

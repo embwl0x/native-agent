@@ -45,6 +45,9 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "provider_sign_ins.json",
                 "model_preferences.json",
                 "approvals.json",
+                // How the surfaces are laid out (ui/layout.json); the phone's
+                // More reads its blocks under the layout's phone profile.
+                "ui_layout.json",
                 // Which groups the Mac could NOT rebuild this pass. Rides in
                 // .core because it describes every other group, including the
                 // heavyweight ones the phone may not refresh for hours.
@@ -129,6 +132,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
             "chat_anchor": "Chat", "pinned_chat_sessions": "Chat", "memory_proposals": "Memory proposals",
             "organism_living_status": "Status", "helpers_agents": "Helpers and Agents", "telegram": "Telegram",
             "skills_snapshot": "Skills & Tools", "tools_snapshot": "Skills & Tools", "model_preferences": "Providers",
+            "ui_layout": "Layout",
         ]
         return known[group] ?? group.replacingOccurrences(of: "_", with: " ").capitalized
     }

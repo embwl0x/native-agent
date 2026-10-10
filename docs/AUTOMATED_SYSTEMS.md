@@ -53,6 +53,12 @@ Inspect these together:
 - `eventListener`: listener health for an event-driven lane.
 - `logs/background_loop_state.json` and
   `logs/background_loop_failures.jsonl`: durable clocks and failure evidence.
+- `pulses` in that state file: work that runs outside a loop (iCloud drain,
+  MCP sweeps, launch reconcilers) stamps each pass with `OrganPulse.record`.
+  Doctor's `live.pulses` row lists them; an organ with a declared cadence is
+  overdue once it misses a whole beat since launch. A failed pass leaves no
+  pulse; an organ whose clock stopped on purpose records `off: <reason>` and
+  is never overdue.
 
 A recent attempt is not proof of successful work. An idle lane's skip reason,
 enabled state and next deadline matter more than a blanket freshness threshold.
@@ -98,10 +104,9 @@ event deadlines, backoff and saved configuration determine actual work.
 | `doctor_auto_run` | Launch, ok→adverse health reading, weekly; configured intervals at least 1h | Repair, publish Doctor snapshot, file one sign-in/permission ask. |
 | `turn_trace_retention` | 6h | Prune expired trace data, lock sidecars and excess transcript backups. |
 | `offdisk_backup` | Daily | Create an off-disk backup when due or identity changed; skip alternate roots and unavailable iCloud Drive. |
-| `evolution_proposal_retention` | Weekly | Remove expired terminal evolution proposals. |
 | `data_root_disk_hygiene` | Hourly, with daily reservation | Detect oversized state and file a notice; the scan does not delete it. |
 | `memory_consolidation` | Weekly | Run MemoryV2 consolidation and hygiene. |
-| `self_improvement_sweep` | Weekly | Stage improvement proposals; requires its switch and unattended-work authority. |
+| `self_improvement_sweep` | Weekly | Stage runtime improvement approval cards; requires its switch and unattended-work authority. |
 | `trigger_scheduler_due_work` | Events/deadlines; 6h repair | Run due scheduler jobs. |
 | `mission_executor` | Events/deadlines; daily repair | Drain Workshop executions; this is the registered wire name. |
 | `workshop_pump` | Events/deadlines; daily repair | Admit bounded Workshop work through its policy and posture gates. |

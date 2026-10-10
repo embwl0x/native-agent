@@ -1,7 +1,6 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import MemoryV2
 import MCPDispatcher
 import KnowledgeGraph
 import PersonaEngine
@@ -18,21 +17,6 @@ import ChatTurnContracts
 // MARK: - Skill body tools
 
 extension SwiftToolDispatcher {
-    private var canonicalSkillBodyDirectories: [URL] {
-        [
-            dataRoot.appendingPathComponent("skills/bodies", isDirectory: true),
-            personaRootForTools().appendingPathComponent("skills/bodies", isDirectory: true),
-        ]
-    }
-
-    private var skillRegistryURL: URL {
-        dataRoot.appendingPathComponent("skills/registry.json")
-    }
-
-    private var skillPointerSyncReceiptURL: URL {
-        dataRoot.appendingPathComponent("skills/.pointer_sync_receipt.json")
-    }
-
     func impl_list_skills(input: [String: JSONValue]) async throws -> JSONValue {
         let rows = InstalledSkillInventory.list(
             dataRoot: dataRoot,
@@ -185,30 +169,8 @@ extension SwiftToolDispatcher {
                     "digest": .string(SkillScript.digest(script) ?? ""),
                     "runnable": .bool(SkillScript.isRunnable(record)),
                     "note": .string(SkillScript.isRunnable(record) ? "unchanged and still on"
-                        : "drafted: it runs only once skill.enable turns it on (User's for a peer's or a pack's script, or below Full Mac)"),
+                        : "drafted: it runs only once skill.enable turns it on (the owner's for a peer's or a pack's script, or below Full Mac)"),
                 ])
-            }
-            do {
-                let sync = try await memoryV2.syncSkillPointersRecordingReceipt(
-                    bodiesDirs: canonicalSkillBodyDirectories,
-                    runtimeRegistryURL: skillRegistryURL,
-                    receiptURL: skillPointerSyncReceiptURL
-                )
-                receipt["recall_pointer"] = .string("reconciled")
-                receipt["pointer_sync"] = .object([
-                    "added": .int(Int64(sync.added)),
-                    "updated": .int(Int64(sync.updated)),
-                    "removed": .int(Int64(sync.removed)),
-                    "unchanged": .int(Int64(sync.unchanged)),
-                ])
-            } catch {
-                // The canonical body and registry row are already committed.
-                // Report the partial outcome honestly rather than inviting a
-                // duplicate save retry or pretending automatic recall is live.
-                receipt["recall_pointer"] = .string("reconciliation_failed")
-                receipt["pointer_sync_error"] = .string(
-                    String(String(describing: error).prefix(500))
-                )
             }
             return .object(receipt)
         } catch let error as SkillsError {

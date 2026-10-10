@@ -1,3 +1,4 @@
+import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -22,10 +23,11 @@ import PersistenceCore
 //    returns nil regardless of call volume — no downstream organism ingest.
 //
 // The lifecycle seam is payload-free (start/terminal timings + phase). It
-// therefore feeds `durationMs` (terminal.occurredAt − started.occurredAt) and
-// the error signal. Time-to-first-token and tokens/sec are modelled as first-
-// class EMAs too, but the lifecycle path leaves them nil; a richer producer can
-// supply them through `observe(sample:)` without any change to this actor.
+// therefore feeds `durationMs` (terminal.occurredAt − started.occurredAt), the
+// error signal, and time-to-first-output (terminal.firstOutputAt − started) for
+// a streamed call that produced output. Tokens/sec is modelled as an EMA too,
+// but the lifecycle path leaves it nil; a richer producer can supply it
+// through `observe(sample:)` without any change to this actor.
 
 public enum ProviderVitalsBand: Int, Sendable, Codable, Equatable, Comparable, CaseIterable {
     case nominal = 0
@@ -53,9 +55,9 @@ public enum ProviderVitalsDirection: String, Sendable, Codable, Equatable {
     case recovering
 }
 
-/// One explicit vitals sample. The lifecycle path fills `durationMs` + `isError`
-/// and leaves `ttftMs`/`tokensPerSec` nil; a richer telemetry producer can fill
-/// all four. `isCancelled` samples are ignored by the sensor (a user-cancelled
+/// One explicit vitals sample. The lifecycle path fills `durationMs`, `isError`
+/// and, for a streamed call with output, `ttftMs`; it leaves `tokensPerSec`
+/// nil. `isCancelled` samples are ignored by the sensor (a user-cancelled
 /// call is not provider ill-health).
 public struct ProviderVitalsSample: Sendable, Equatable {
     public var providerId: String
@@ -172,7 +174,7 @@ public struct ProviderVitalsConfiguration: Sendable, Equatable {
 
 // MARK: - Sensor
 
-public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
+public actor ProviderVitalsSensor {
     public struct ProviderVitals: Sendable, Equatable {
         public var providerId: String
         public var band: ProviderVitalsBand
@@ -209,22 +211,29 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
     private var openCallOrder: [String] = []
     private static let maxOpenCalls = 512
 
+    /// First outputs, per provider + model + stream kind: the adapter's
+    /// `ttftMs` (request to first text or tool output) in seconds, oldest first.
+    /// The trace is their durable record: read once at launch, then each live
+    /// call's `ttftMs` joins here under the same definition. Nothing is written.
+    private struct FirstOutputKey: Hashable { let provider, model: String; let streamKind: String? }
+    private var firstOutputs: [FirstOutputKey: [Double]] = [:]
+    /// Lines `traces/events.jsonl` could not decode at launch: their first
+    /// outputs are missing from the sample, and Diagnostics says how many.
+    private var unreadableTraceRows = 0
+    /// Stream-guard cuts per provider id (`provider.noReply`): not first
+    /// outputs, counted beside them.
+    private var noReplyCuts: [String: Int] = [:]
+
     public init(configuration: ProviderVitalsConfiguration = .default) {
         self.configuration = configuration
     }
 
-    // MARK: LLMCallLifecycleObserving (passive hook)
+    // MARK: Lifecycle
 
-    /// Passive lifecycle observation. `started` events only record the call's
-    /// start time; terminal events derive one sample and update the EMAs. This
-    /// is the ONLY per-call work and it is all in-memory.
-    public func observeProviderCall(_ event: LLMCallLifecycleEvent) async {
-        _ = ingest(lifecycle: event)
-    }
-
-    /// Same as `observeProviderCall` but returns the band transition (if any) so
-    /// an owner can route it onward. Kept separate because the protocol method
-    /// is `Void`.
+    /// Passive lifecycle observation: `started` events only record the call's
+    /// start time; terminal events derive one sample, update the EMAs and join
+    /// a first output or a cut, all in memory. Returns the band transition (if
+    /// any) so an owner can route it onward.
     @discardableResult
     public func ingest(lifecycle event: LLMCallLifecycleEvent) -> ProviderVitalsTransition? {
         switch event.phase {
@@ -237,11 +246,16 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
         case .succeeded, .failed:
             let started = takeStart(id: event.id)
             let duration = started.map { max(0, event.occurredAt.timeIntervalSince($0) * 1000) }
+            let ttft = event.firstOutputMs.map(Double.init)
+            if event.streaming, let ttft {
+                joinFirstOutput(firstOutputKey(event.providerId, event.model, event.streamKind), seconds: ttft / 1000)
+            }
+            if event.noReply { noReplyCuts[normalizedProviderId(event.providerId), default: 0] += 1 }
             let sample = ProviderVitalsSample(
                 providerId: event.providerId,
                 occurredAt: event.occurredAt,
                 durationMs: duration,
-                ttftMs: nil,
+                ttftMs: ttft,
                 tokensPerSec: nil,
                 isError: event.phase == .failed
             )
@@ -331,6 +345,71 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
             emaErrorRate: state.emaErrorRate,
             consecutiveFailures: state.consecutiveFailures
         )
+    }
+
+    // MARK: First outputs
+
+    /// Launch-owned, once: the trace's first outputs and cuts into memory.
+    public func readFirstOutputs(
+        dataRoot: URL,
+        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+    ) async throws {
+        let read = try await persistence.readJSONLReporting(dataRoot.appendingPathComponent("traces/events.jsonl"))
+        unreadableTraceRows = read.report.malformedLineCount
+        for case .object(let row) in read.rows {
+            guard case .object(let payload)? = row["payload"], case .string(let provider)? = payload["provider"]
+            else { continue }
+            if row["kind"] == .string("provider.noReply") {
+                noReplyCuts[normalizedProviderId(provider), default: 0] += 1
+            } else if row["kind"] == .string("llm.call"), payload["streaming"] == .bool(true),
+                      case .int(let ms)? = payload["ttftMs"], case .string(let model)? = payload["model"] {
+                let kind: String? = if case .string(let kind)? = payload["streamKind"] { kind } else { nil }
+                joinFirstOutput(firstOutputKey(provider, model, kind), seconds: Double(ms) / 1000)
+            }
+        }
+    }
+
+    /// The stream guard's question at stream start.
+    public func firstOutputDeadline(provider: String, model: String, streamKind: String?) -> FirstOutputDeadline {
+        let seconds = firstOutputs[firstOutputKey(provider, model, streamKind)] ?? []
+        return FirstOutputDeadline(calls: seconds.count, slowest: seconds.max())
+    }
+
+    /// Diagnostics: each provider's first outputs beside its cuts.
+    public func firstOutputReport() -> String {
+        "traces/events.jsonl at launch: \(unreadableTraceRows) rows unreadable\n"
+        + Set(firstOutputs.keys.map(\.provider)).union(noReplyCuts.keys).sorted().map { provider in
+            "\(provider): \(noReplyCuts[provider] ?? 0) no-reply cuts" + firstOutputs.keys
+                .filter { $0.provider == provider }
+                .sorted { ($0.model, $0.streamKind ?? "") < ($1.model, $1.streamKind ?? "") }
+                .map { key in
+                    let sorted = (firstOutputs[key] ?? []).sorted()
+                    func rank(_ q: Double) -> String {
+                        sorted.isEmpty ? "-" : String(format: "%.1f s", sorted[Int((q * Double(sorted.count)).rounded(.up)) - 1])
+                    }
+                    let deadline = FirstOutputDeadline(calls: sorted.count, slowest: sorted.last).seconds
+                        .map { String(format: "%.1f s", $0) }
+                        ?? "unmeasured (\(sorted.count) of \(FirstOutputDeadline.callsNeeded) calls)"
+                    return "\n  \(key.model) \(key.streamKind ?? "stream"): first output p50 \(rank(0.5)), "
+                        + "p99 \(rank(0.99)), slowest \(rank(1)) over \(sorted.count) calls"
+                        + (unreadableTraceRows == 0 ? "" : " (\(unreadableTraceRows) trace rows unreadable)")
+                        + "; deadline \(deadline)"
+                }.joined()
+        }.joined(separator: "\n")
+    }
+
+    private func firstOutputKey(_ provider: String, _ model: String, _ streamKind: String?) -> FirstOutputKey {
+        FirstOutputKey(provider: normalizedProviderId(provider), model: model.lowercased(), streamKind: streamKind)
+    }
+
+    /// The trace's own retention rule, no clock: it keeps its newest
+    /// `JSONLLineCaps.traceEvents` rows, so a key keeps at most that many first
+    /// outputs and one leaves only when a newer one pushes it out. (The trace
+    /// is shared with other rows, so after a relaunch a key may hold fewer.)
+    private func joinFirstOutput(_ key: FirstOutputKey, seconds: Double) {
+        firstOutputs[key, default: []].append(seconds)
+        let over = firstOutputs[key, default: []].count - JSONLLineCaps.traceEvents
+        if over > 0 { firstOutputs[key]?.removeFirst(over) }
     }
 
     // MARK: Read-only introspection / snapshot

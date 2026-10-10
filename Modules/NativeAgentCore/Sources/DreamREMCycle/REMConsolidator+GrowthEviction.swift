@@ -16,7 +16,7 @@ extension REMConsolidator {
     /// that guard we'd chop the file's title + intro. Returns the number
     /// of characters actually evicted (0 when the cap doesn't fire).
     func runGrowthEviction(proposalRows: [REMProposalRow]? = nil) async throws -> Int {
-        let proposalRows = try proposalRows ?? REMProposalStore(dataRoot: dataRoot).loadAllForGrowthEviction()
+        let proposalRows = try proposalRows ?? REMProposalStore(dataRoot: dataRoot).loadAllStrictly()
         let growth = personaRoot.appendingPathComponent("GROWTH.md")
         guard FileManager.default.fileExists(atPath: growth.path) else { return 0 }
 
@@ -70,7 +70,11 @@ extension REMConsolidator {
             .filter { $0.status == "approved" && REMProposalStore.supportsProposalTarget($0.targetDoc) }
         let approvedLessons = approvedRows.map(\.proposalText)
         let lessonStarts = Self.approvedLessonStarts(in: body, lessons: approvedLessons)
-        let evictableStart = min(preambleEnd, lessonStarts.first ?? body.endIndex)
+        // Only REM lessons age out, oldest first: everything she or User
+        // authored above the first approved lesson (Core, Reflexes, Identity)
+        // is preamble whatever its heading, so the file reads top to bottom —
+        // who she is, then what she learned, newest last (User 10-10).
+        let evictableStart = max(preambleEnd, lessonStarts.first ?? body.endIndex)
         guard evictableStart < body.endIndex else { return 0 }
 
         // Walk headings and approved lesson starts from the evictable region until we
@@ -297,7 +301,8 @@ extension REMConsolidator {
         // spent the Work group's account on a memory task (2026-09-13 review).
         let pickedModel = await router.modelStringForSurface("rem")
         let raw = try await llm.complete(
-            prompt: prompt, system: nil, model: pickedModel, surface: "rem"
+            prompt: prompt, system: "This is a weekly memory consolidation step. Follow the request exactly and return only what it asks for.",
+            model: pickedModel, surface: "rem", purpose: "rem"
         )
         let summary = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // User, 2026-09-06: an empty model response is a FAILURE, not a node.

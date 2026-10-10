@@ -47,8 +47,8 @@ public struct MemoryDisclosureClassification: Sendable, Codable, Equatable {
 public enum MemoryRecordDisclosurePolicy {
     /// Carries BOTH spellings of the Workshop surface (P2-3). Nothing that
     /// reaches `permits(surface:)` can still say `missions` — `canonicalSurface`
-    /// folds it first — but these sets are also written verbatim into memory
-    /// rows by `WorkshopExecutionMemory.metadata`, and a row that lists both
+    /// folds it first — but these sets were also written verbatim into memory
+    /// rows by the retired Workshop execution lane, and a row that lists both
     /// stays readable by a 0.3.x build whose `canonicalSurface` folds the other
     /// direction (`workshop` -> `missions`). Never drop `missions`.
     /// `bot` is a standing bot's run (Astra audit 2, finding 3, 2026-09-11): one

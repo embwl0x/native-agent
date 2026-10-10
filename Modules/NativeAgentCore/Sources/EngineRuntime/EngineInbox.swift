@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import NotificationInbox
 import PersistenceCore
+import TriggerScheduler
 
 extension InboxItemRecord {
     public var isUnread: Bool { normalizedStatus == "unread" }
@@ -10,8 +11,8 @@ extension InboxItemRecord {
 /// `NativeAgentEngine.inbox` (S10): the live notification inbox for one data
 /// root, as core `InboxItemRecord`s. Today's notes, the Inbox page, the chat
 /// strip and the badges render `items`; the read is nonisolated so the phone
-/// snapshot uses the same owner. Card actions still run through
-/// `NativeClient.inboxAction`.
+/// snapshot uses the same owner. Card actions run through the app's
+/// `InboxCardActions`.
 @MainActor
 @Observable
 public final class InboxFacade {
@@ -75,6 +76,43 @@ public final class InboxFacade {
     public func markRead(_ id: String) {
         if let idx = items.firstIndex(where: { $0.id == id }), items[idx].isUnread {
             items[idx].status = "read"
+        }
+    }
+}
+
+// MARK: - Proactive triggers
+
+extension InboxFacade {
+    /// The kinds of card she raises unasked (morning brief, idle check-in,
+    /// file watch…), as TriggerScheduler keeps them for this root.
+    public nonisolated func triggers() async throws -> [TriggerConfig] {
+        try await makeTriggerScheduler(dataRoot: dataRoot).listInboxTriggers()
+    }
+
+    /// Turn one trigger on or off. A name the scheduler does not know throws.
+    public nonisolated func setTrigger(_ name: String, enabled: Bool) async throws {
+        let scheduler = makeTriggerScheduler(dataRoot: dataRoot)
+        let status = try await enabled
+            ? scheduler.enableInboxTrigger(name: name)
+            : scheduler.disableInboxTrigger(name: name)
+        try Self.requireTrigger(status, name: name)
+    }
+
+    /// Merge `config` shallowly into a supported trigger's settings.
+    /// A name it does not know throws.
+    public nonisolated func configureTrigger(_ name: String, config: JSONValue) async throws {
+        let status = try await makeTriggerScheduler(dataRoot: dataRoot)
+            .configureInboxTrigger(name: name, config: config)
+        try Self.requireTrigger(status, name: name)
+    }
+
+    private nonisolated static func requireTrigger(_ status: TriggerStatus, name: String) throws {
+        if status.status == "not_found" {
+            throw NSError(
+                domain: "NativeAgent",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "trigger not found: \(name)"]
+            )
         }
     }
 }

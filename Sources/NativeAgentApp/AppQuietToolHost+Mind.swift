@@ -2,6 +2,7 @@ import AppToolRuntime
 import ApprovalInbox
 import BackgroundLoops
 import ChatToolRuntime
+import ChatTurnContracts
 import Cognition
 import Foundation
 import NativeAgentCore
@@ -57,6 +58,25 @@ extension AppQuietToolHost {
             if case .completed? = run.outcome { return (true, run.note, [:]) }
             if run.outcome?.isCoalescedSkip == true { return (true, run.note, [:]) }
             return (false, run.note + Self.retry, [:])
+        case "misses":
+            // The Self-Improvement page's first section, read for her on the
+            // surface she is answering, as mind.why reads it: a correction
+            // that surface may not see counts, without its text. No persona
+            // filter: one store for every persona slot (memoryRecallPersonaFilter).
+            let weeks = [MemoryStatusProjection.isoWeek(), MemoryStatusProjection.isoWeek(ago: 1)]
+            let envelope = TurnEnvelope.current(surface: ChatTurnRuntimeContext.current?.surface ?? "chat")
+            do {
+                let lessons = try await MemoryStatusProjection.misses(
+                    dataRoot: appModel.engine.dataRoot, weeks: weeks,
+                    surface: envelope.agent == nil ? envelope.replyRoute.surface : "bridge")
+                return (true, lessons.isEmpty ? "No corrections this week or last."
+                            : "Your misses by lesson, this week (\(weeks[0])) / last (\(weeks[1])): "
+                                + lessons.map { "\($0.lesson) \($0.count(week: weeks[0]))/\($0.count(week: weeks[1]))" }
+                                    .joined(separator: ", ") + ".",
+                        ["lessons": try JSONValue.fromEncodable(lessons)])
+            } catch {
+                return (false, "The miss ledger could not be read: \(error.localizedDescription)." + Self.retry, [:])
+            }
         default:
             return await runObservatory(verb: verb, input: input)
         }

@@ -4,18 +4,21 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import StandingBots
+import TurnTrace
 
 /// Approval execution retains the original exchange and all ordinary gates.
 public enum AgentConversationApproval {
     // 2026-09-28: persist the exact path at filing; missing held state never proves it.
     @TaskLocal public static var exactProtocol = false
 
+    /// `dispatch` is the replay's gated chain, which a repair's dry run goes through.
     public static func replay(id: String, dataRoot: URL, exactProtocol: Bool = false,
+                              dispatch: @escaping @Sendable (String, [String: JSONValue]) async throws -> JSONValue,
                               perform: @escaping @Sendable () async throws -> JSONValue) async throws -> JSONValue {
         if exactProtocol {
             return try await AgentConversationContext.$isInternalRead.withValue(true) { try await perform() }
         }
-        return try await AgentConversationSession.replayApproval(id, dataRoot: dataRoot, perform: perform)
+        return try await AgentConversationSession.replayApproval(id, dataRoot: dataRoot, dispatch: dispatch, perform: perform)
     }
 }
 
@@ -33,7 +36,7 @@ package enum AgentConversationSession {
         }
     }
 
-    static func replayApproval(_ id: String, dataRoot: URL,
+    static func replayApproval(_ id: String, dataRoot: URL, dispatch: @escaping Dispatch,
                                perform: @escaping @Sendable () async throws -> JSONValue) async throws -> JSONValue {
         let store = AgentConversationStore(dataRoot: dataRoot)
         guard let held = try approvalRow(id, store: store) else {
@@ -69,7 +72,9 @@ package enum AgentConversationSession {
             AgentConversationRunning.shared.end(row: held.id, operation: held.operationID)
             throw error
         }
-        return try await send(row, store: store, peer: peer, reservation: nil, dataRoot: dataRoot) {
+        return try await send(row, store: store, peer: peer, reservation: nil, dataRoot: dataRoot, dispatch: { tool, input in
+            try await AgentConversationContext.$isInternalRead.withValue(true) { try await dispatch(tool, input) }
+        }) {
             try await AgentConversationContext.$isInternalRead.withValue(true) { try await perform() }
         }
     }
@@ -270,8 +275,12 @@ package enum AgentConversationSession {
             // explicit message supersedes it, and the old exchange keeps its
             // own honest status. One that may still act (`unsettledAttention`)
             // is in flight above, so a new message queues behind it instead.
+            // A desktop chat with no conversation id opens a new side chat on
+            // the next send (its missing chat healed, or a relaunch cut the
+            // last one off): nothing to resume, nothing to refuse.
             if row.conversationID == nil, row.receipt != nil, !confirmedNotSent(row),
-               !agent.hasPrefix("bot:"), peer?.transport != .desktop, peer?.transport != .grokBot, !dot {
+               !agent.hasPrefix("bot:"), peer?.transport != .desktop, peer?.transport != .desktopChat,
+               peer?.transport != .grokBot, !dot {
                 return attention(name, label: row.label, "This contact did not confirm a resumable conversation. Start a separate conversation explicitly rather than silently losing its context.")
             }
         }
@@ -305,13 +314,15 @@ package enum AgentConversationSession {
            let task = receipt["task_id"] { args["task_id"] = task }
         // Her inbox row says whether an answer is owed.
         if agent == "claude" { args["expects_reply"] = .bool(row.awaitsReply) }
-        return noting(try await send(row, store: store, peer: peer, reservation: reservation, dataRoot: dataRoot) { [args] in
+        return noting(try await send(row, store: store, peer: peer, reservation: reservation, dataRoot: dataRoot, dispatch: perform) { [args] in
             try await perform(tool, args)
         }, carried: carried)
     }
 
+    /// `perform` is the operation; `dispatch` the chain a repair's dry run
+    /// goes through, so every send heals the same way (`AgentContactHealth.heal`).
     private static func send(_ row: AgentConversationRecord, store: AgentConversationStore, peer: AgentPeerContact?,
-                             reservation: String?, dataRoot: URL,
+                             reservation: String?, dataRoot: URL, dispatch: @escaping Dispatch,
                              perform: @escaping @Sendable () async throws -> JSONValue) async throws -> JSONValue {
         // Every lane feeds one live stream for this send: working from now,
         // partial text where the lane streams it, settled when the call returns.
@@ -323,7 +334,9 @@ package enum AgentConversationSession {
         let (ended, end) = AsyncStream<Void>.makeStream()
         let send = Task {
             defer { end.finish() }
-            return try await AgentConversationLiveContext.$target.withValue(live) { try await perform() }
+            return try await AgentConversationLiveContext.$target.withValue(live) {
+                try await AgentContactHealth.heal(try await perform(), row: row, dataRoot: dataRoot, again: perform, dispatch: dispatch)
+            }
         }
         AgentConversationRunning.shared.begin(row: row.id, operation: row.operationID) { send.cancel() }
         // 2026-09-26 (User): an ACP, command-line or NativeAgent contact never
@@ -583,24 +596,27 @@ package enum AgentConversationSession {
         return receipt["background_send"] == .bool(true)
     }
 
-    /// At launch, before queued follow-ups resume: a background send, or a
-    /// send to those lanes caught mid-way, that the restart ended settles as
-    /// interrupted and unanswered, never waiting forever. Nothing is resent.
+    /// At launch, before queued follow-ups resume: a send no process owns any
+    /// more settles as interrupted and unanswered, never waiting forever. That
+    /// is a background send, any lane's send caught mid-way, or one left with
+    /// an unknown outcome, begun before this process. Nothing is resent.
     static func settleInterrupted(dataRoot: URL) {
         let store = AgentConversationStore(dataRoot: dataRoot)
-        let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
-        let lanes = Set(contacts
-            .filter { [.acp, .mcpHost, .nativeAgent].contains($0.transport) }.map { "peer:" + $0.id })
         let running = AgentConversationRunning.shared
-        for row in (try? store.records()) ?? [] where backgroundSend(row) && !running.routeWatching(row: row.id, operation: row.operationID)
-            || row.phase == "sending" && lanes.contains(row.agent) && !running.live(row: row.id, operation: row.operationID) {
-            _ = try? store.update(id: row.id, operationID: row.operationID) {
-                guard backgroundSend($0) || $0.phase == "sending" else { return }
-                var fields: [String: JSONValue] = ["status": .string("interrupted"), "completed": .bool(false),
-                    "detail": .string("Interrupted by an app restart before \($0.name)'s reply came back, so it was not answered here. Nothing was resent; send it again if it is still wanted.")]
-                if let conversation = $0.conversationID { fields["conversation_id"] = .string(conversation) }
-                absorb(.object(fields), into: &$0)
-                $0.readInput = nil
+        let desktop = Set(((try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []).filter { $0.transport == .desktop }.map { "peer:" + $0.id })
+        func orphaned(_ row: AgentConversationRecord) -> Bool {
+            if backgroundSend(row) { return !running.routeWatching(row: row.id, operation: row.operationID) }
+            guard ownerless(row) else { return false }
+            // Only a desktop answer is watched by the process that pasted it; every
+            // other waiting lane settles on its own evidence after a restart.
+            if row.phase == "waiting" { return desktop.contains(row.agent) && !running.routeWatching(row: row.id, operation: row.operationID) }
+            return row.phase == "sending" || unsettledAttention(row) && !awaitingApproval(row)
+        }
+        // A receipt correction, not news: an old row keeps its time (a phase change still moves it).
+        for row in (try? store.records()) ?? [] where orphaned(row) {
+            _ = try? store.update(id: row.id, operationID: row.operationID, touch: false) {
+                guard orphaned($0) else { return }
+                interrupted(&$0)
             }
         }
         // The restart that cut a reply off may also have marked the agent
@@ -617,6 +633,49 @@ package enum AgentConversationSession {
             guard case .object(let receipt)? = send.row.receipt, receipt["status"] == .string("interrupted") else { continue }
             peers.clearUnavailable(peerID: String(agent.dropFirst(5)), since: send.startedAt)
         }
+    }
+
+    /// Begun before this process and not running in it: no process owns this
+    /// send any more. Never judged by liveness alone (a send of this process
+    /// is briefly not yet registered as live).
+    static func ownerless(_ row: AgentConversationRecord) -> Bool {
+        (row.operationStartedAt ?? row.updatedAt) < AbandonedTurnReconciler.processEpoch
+            && !AgentConversationRunning.shared.live(row: row.id, operation: row.operationID)
+    }
+
+    /// What a send the app's own quit or restart cut off says: its turn ended
+    /// with the process, so it was not answered here and nothing is resent.
+    package static func restartDetail(_ name: String) -> String {
+        "Interrupted by an app restart before \(name)'s reply came back, so it was not answered here. Nothing was resent; send it again if it is still wanted."
+    }
+
+    /// Settles the row's send as one the restart cut off. A send still
+    /// "sending" holds the previous exchange's receipt, so it gets a fresh one;
+    /// any other keeps its ids and read locator. An unknown outcome may still
+    /// finish remotely: only the wait is let go, so a reply that comes can be read back.
+    private static func interrupted(_ row: inout AgentConversationRecord) {
+        guard row.phase != "sending", case .object(var root)? = row.receipt else {
+            var fields: [String: JSONValue] = ["status": .string("interrupted"), "completed": .bool(false),
+                "detail": .string(restartDetail(row.name))]
+            if let conversation = row.conversationID { fields["conversation_id"] = .string(conversation) }
+            absorb(.object(fields), into: &row)
+            return
+        }
+        let detail = row.phase == "attention"
+            ? "An app restart ended this app's wait for \(row.name)'s reply. Nothing was resent; if the reply comes, it still arrives here when this conversation is read, so send again only if it is still wanted."
+            : restartDetail(row.name)
+        func settle(_ fields: inout [String: JSONValue]) {
+            fields["status"] = .string("interrupted")
+            if fields["run_status"] != nil { fields["run_status"] = .string("interrupted") }
+            fields["completed"] = .bool(false)
+            fields["detail"] = .string(detail)
+        }
+        settle(&root)
+        if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(var job) = jobs[0] {
+            settle(&job)
+            root["jobs"] = .array([.object(job)])
+        }
+        absorb(.object(root), into: &row)
     }
 
     /// An attention send that may still act: dispatched with an unknown outcome
@@ -821,7 +880,9 @@ package enum AgentConversationSession {
                             "detail": .string("There is no conversation with \(name) here to stop.")])
         }
         let latest = (try? store.records().first { $0.id == row.id }) ?? row
-        let flying = replyInFlight(latest, peer?.transport, dataRoot: dataRoot)
+        // A send no process owns any more (a restart mid-send) still counts, so it can be released.
+        let orphan = latest.phase == "sending" && ownerless(latest)
+        let flying = orphan || replyInFlight(latest, peer?.transport, dataRoot: dataRoot)
         // Admission first: the lane owner's stop runs through agent_cancel's own
         // gate, and nothing here (queue, stop state) changes unless it clears.
         // With nothing in flight it carries no lane target, so it stops nothing.
@@ -861,6 +922,7 @@ package enum AgentConversationSession {
                     state = $0.phase == "attention" || ["cancelled", "canceled", "interrupted"].contains(status) ? "stopped" : "finished"
                     if state == "stopped" { $0.phase = "ready" }
                 }
+                if orphan, state == "released", $0.phase == "sending" { interrupted(&$0) }
                 $0.stop = AgentConversationStop(state: state, operationID: latest.operationID, at: Date(),
                                                 detail: state == "finished" ? "The reply finished before the stop landed." : detail)
                 if state == "released" { $0.phase = "ready"; $0.automaticRead = false; $0.nextReadAt = nil }
@@ -887,6 +949,9 @@ package enum AgentConversationSession {
             let written = write("stopping", "Stopping \(name)'s reply in progress; the conversation settles as stopped when it ends.")
             _ = AgentConversationRunning.shared.stop(row: latest.id, operation: latest.operationID)
             return written
+        }
+        if orphan {
+            return write("released", "No send to \(name) runs here any more (the app restarted mid-send), so it settled as interrupted; this conversation no longer waits on it, and anything \(name) answers still arrives.")
         }
         if state == "stopped" || state == "stopping" {
             return write(state, string(fields["detail"]) ?? "", receipt: fields["task"])
@@ -1153,6 +1218,8 @@ package enum AgentConversationSession {
         if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
         if let conversation = string(value["conversation_id"]) ?? string(value["conversationId"]) { row.conversationID = conversation }
         else if row.agent == "codex", let thread = string(value["thread_id"]) { row.conversationID = "codex:" + thread }
+        // A route whose saved chat is gone says null (Muse): the next send opens a new one.
+        else if value["conversation_id"] == .null { row.conversationID = nil }
         if case .object(let action)? = root["read_with"], case .object(var read)? = action["input"] {
             read["details"] = .bool(true); row.readInput = read
         } else if let locator = AgentConversationRouting.readLocator(agent: row.agent,
@@ -1327,7 +1394,7 @@ package enum AgentConversationSession {
                 }
             }
         } else if let text = reply(value) { result["reply"] = .string(text) }
-        for key in ["reply_state", "reply_deadline", "automatic_resend", "untrusted_remote_data", "source_availability", "read_error", "completed", "terminal", "needs_input", "needs_authentication", "sent", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "reply_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages"] {
+        for key in ["reply_state", "reply_deadline", "automatic_resend", "untrusted_remote_data", "source_availability", "read_error", "completed", "terminal", "needs_input", "needs_authentication", "sent", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "reply_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages", "healed", "repair", "harness_item"] {
             if let field = value[key] ?? root[key] { result[key] = field }
         }
         // delegation_status.detail is a format selector ("full"), not an

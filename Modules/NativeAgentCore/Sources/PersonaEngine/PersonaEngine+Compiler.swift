@@ -330,16 +330,19 @@ public actor PersonaCompiler {
     /// a subdir under the persona root that contains at least one marker doc,
     /// that subdir wins over the on-disk `active.json` / scan resolution.
     /// Override resolution failures fall through to the normal resolver — a
-    /// typo can't blank the persona.
+    /// typo can't blank the persona. A turn requires the saved name: an
+    /// unreadable profile then throws the repair text instead of omitting it.
     public func compile(
         surface: String,
         personaOverride: String? = nil,
-        userMemoryCore: [String]? = nil
+        userMemoryCore: [String]? = nil,
+        identityRequired: Bool = false
     ) async throws -> PersonalityPacket {
         try await resolvedCompilation(
             surface: surface,
             personaOverride: personaOverride,
-            userMemoryCore: userMemoryCore
+            userMemoryCore: userMemoryCore,
+            identityRequired: identityRequired
         ).packet
     }
 
@@ -355,7 +358,8 @@ public actor PersonaCompiler {
     private func resolvedCompilation(
         surface: String,
         personaOverride: String?,
-        userMemoryCore: [String]? = nil
+        userMemoryCore: [String]? = nil,
+        identityRequired: Bool = false
     ) async throws -> ResolvedCompilation {
         let root = await engine.personaRoot
 
@@ -379,8 +383,11 @@ public actor PersonaCompiler {
         if let surfaceBody = try readSurfaceOverride(root: root, surface: surface) {
             activeDocs["surface:\(surface)"] = surfaceBody
         }
-        // An unreadable profile omits the line; her documents still carry her name.
-        activeDocs["IDENTITY"] = try? Self.identityPrompt(dataRoot: await engine.dataRootURL)
+        // Unless a turn requires it, an unreadable profile omits the line;
+        // her documents still carry her name.
+        do {
+            activeDocs["IDENTITY"] = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
+        } catch where !identityRequired {}
         let compiledSystemPrompt = Self.renderPrompt(
             documents: activeDocs, surface: surface, userMemoryCore: userMemoryCore
         )

@@ -56,6 +56,13 @@ extension SchedulerDueJobRunner {
     ) async throws -> ClaimedDueJobs {
         try await persistence.withFileLock(jobsPath) { () async throws -> ClaimedDueJobs in
             var rows = try Self.readJobRowsChecked(at: jobsPath)
+            var rearmed = false
+            for index in rows.indices {
+                guard case .object(var object) = rows[index],
+                      Self.rearmFutureOneShot(&object, now: now) else { continue }
+                rows[index] = .object(object)
+                rearmed = true
+            }
             let selected = Self.dueJobs(
                 in: rows,
                 nowEpoch: now.timeIntervalSince1970,
@@ -66,8 +73,6 @@ extension SchedulerDueJobRunner {
                 maxJobs: min(max(0, maxJobs), 1),
                 excludingJobIds: excludingJobIds
             )
-            guard !selected.isEmpty else { return ClaimedDueJobs(jobs: [], recoveredUnknown: []) }
-
             var claimed: [DueJob] = []
             var recovered: [OccurrenceRecovery] = []
             for job in selected {
@@ -124,11 +129,33 @@ extension SchedulerDueJobRunner {
             // stale claims changed no row. Rewriting jobs.json anyway rewrote
             // canonical state for nothing and gave a read-only pass a write's
             // failure surface.
-            if !claimed.isEmpty {
+            if rearmed || !claimed.isEmpty {
                 try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
             }
             return ClaimedDueJobs(jobs: claimed, recoveredUnknown: recovered)
         }
+    }
+
+    private static func rearmFutureOneShot(_ object: inout [String: JSONValue], now: Date) -> Bool {
+        guard SchedulerJobRuntime.bool(object["oneShot"], default: false),
+              SchedulerJobRuntime.bool(object["enabled"], default: true),
+              SchedulerJobRuntime.string(object["cancelledAt"]) == nil,
+              case .object(let claim)? = object["activeOccurrence"],
+              Set(claim.keys).isSubset(of: ["key", "dueEpoch", "claimedAt", "state"]),
+              SchedulerJobRuntime.string(claim["key"])?.isEmpty == false,
+              SchedulerJobRuntime.string(claim["state"]) == "claimed",
+              let claimedAt = SchedulerJobRuntime.string(claim["claimedAt"]).flatMap(parseISODate),
+              let claimedDue = SchedulerJobRuntime.epoch(from: claim["dueEpoch"]),
+              claimedDue.isFinite,
+              // A rewind cannot make a due-time claim evidence of non-execution.
+              // Round up to avoid mistaking the stored dueEpoch's rounding for it.
+              claimedDue > claimedAt.timeIntervalSince1970.rounded(.up),
+              let due = SchedulerJobRuntime.epoch(from: object["nextRunAt"])
+                ?? SchedulerJobRuntime.epoch(from: object["nextRunAtEpoch"]),
+              due > now.timeIntervalSince1970 else { return false }
+        object.removeValue(forKey: "activeOccurrence")
+        clearRetryState(&object)
+        return true
     }
 
     /// Release a recovered stale claim and advance the job — ONLY once its
@@ -143,6 +170,11 @@ extension SchedulerDueJobRunner {
                 return SchedulerJobRuntime.string(object["id"]) == recovery.jobId
             }), case .object(var object) = rows[index],
                 let activeValue = object["activeOccurrence"] else { return }
+            if Self.rearmFutureOneShot(&object, now: now) {
+                rows[index] = .object(object)
+                try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
+                return
+            }
             var decodedPriorKey: String?
             if case .object(let active) = activeValue {
                 decodedPriorKey = SchedulerJobRuntime.string(active["key"])

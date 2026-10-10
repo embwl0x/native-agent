@@ -2,7 +2,6 @@ import AppToolRuntime
 import ApprovalInbox
 import ChatOrchestration
 import Foundation
-import MemoryV2
 import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
@@ -81,14 +80,11 @@ public struct CapabilityLifecycleCommands: Sendable {
         let result = await SwiftNativeSkillsClient(root: root).manageSkill(
             verb: verb, name: name, personaRoot: personaRoot, retry: Self.retry, fullMac: fullMac, steer: steer,
             preview: preview, ownerAuthorized: ownerAuthorized
-        ) {
-            try await NativeSkillRegistryActions.reconcileSkillEvolutionRecall(
-                memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root, personaRoot: personaRoot)
-        }
+        )
         var fields = result.fields
         let script = fields.removeValue(forKey: "script")
         if preview { return VerbOutcome(result.ok, result.text, fields) }
-        if fields["needs_user"] == .bool(true) {
+        if fields["needs_owner"] == .bool(true) {
             // User's card, answerable on the Mac and his phone (`askUserToInstallScript`).
             let skill = AppToolExecutor.inputString(fields["name"]) ?? name
             let source = if case .object(let body)? = script { AppToolExecutor.inputString(body["source"]) ?? "" } else { "" }
@@ -99,9 +95,9 @@ public struct CapabilityLifecycleCommands: Sendable {
                     digest: AppToolExecutor.inputString(fields["script_digest"]) ?? "", why: result.text,
                     script: SkillScript.signature(script ?? .null) + "\n\n" + source)
             } catch {
-                return VerbOutcome(false, result.text + " The card asking him did not file (\(String(describing: error))): tell him.", fields)
+                return VerbOutcome(false, result.text + " The card asking the owner did not file (\(String(describing: error))): tell them.", fields)
             }
-            return VerbOutcome(false, result.text + " A card asks him, on the Mac and his phone.",
+            return VerbOutcome(false, result.text + " A card asks the owner, on the Mac and their phone.",
                     fields.merging(["approval_id": .string(card.id)]) { $1 })
         }
         // Restoring an archived skill turns it on, as enable does.
@@ -115,9 +111,9 @@ public struct CapabilityLifecycleCommands: Sendable {
             requester: fields["state_before"] == .string("drafted") ? "install skill" : "re-enable skill",
             tool: skill, sessionID: AppToolExecutor.inputString(input["__session_id"]), dataRoot: root, ran: true)
         guard let decided else {
-            return VerbOutcome(true, result.text + " Your decision did not reach User's Inbox: the Inbox did not write.", fields)
+            return VerbOutcome(true, result.text + " Your decision did not reach the owner's Inbox: the Inbox did not write.", fields)
         }
-        return VerbOutcome(true, result.text + " User sees it in his Inbox"
+        return VerbOutcome(true, result.text + " The owner sees it in their Inbox"
             + (decided.decisions > 1 ? ", decision \(decided.decisions) on that row." : "."),
             fields.merging(["decided_row": .string(decided.id), "decisions_on_row": .int(Int64(decided.decisions))]) { $1 })
     }
@@ -154,14 +150,7 @@ public struct CapabilityLifecycleCommands: Sendable {
                     fields.merging(["would_status": .string("active")]) { $1 })
             }
             do {
-                let proposal = try await SwiftNativeToolExecution(root: dataRoot).promote(id: tool.id, allowRisky: true).toJSON()
-                if let field = ToolRecord.stringFieldProblem(in: proposal) {
-                    throw ToolRegistryError.registryUnreadable(reason: "promoted tool \(tool.id) has no valid \(field)")
-                }
-                guard let updated = ToolRecord(json: proposal) else {
-                    throw ToolRegistryError.registryUnreadable(reason: "promoted tool \(tool.id) has no registry record")
-                }
-                try ToolsFacade.checkAuthored(updated)
+                let updated = try await self.tools.promote(id: tool.id, allowRisky: true)
                 guard try await self.tools.listAuthored().first(where: { $0.id == updated.id })?.status == "active" else {
                     return VerbOutcome(false, "Tool activation could not be confirmed after reloading the registry." + Self.retry, fields,
                         toolStatus: .init(message: "Tool activation could not be confirmed after reloading the registry.", succeeded: false))
@@ -180,10 +169,9 @@ public struct CapabilityLifecycleCommands: Sendable {
                 return VerbOutcome(true, "\(tool.name) is already quarantined.", fields.merging(["changed": .bool(false)]) { $1 })
             }
             do {
-                let updated = try await SwiftNativeToolRegistry(root: dataRoot).quarantine(id: tool.id,
+                let updated = try await self.tools.quarantine(id: tool.id,
                     reason: AppToolExecutor.inputString(input["reason"]).map { "Quarantined by the agent: " + $0 }
                         ?? "Quarantined by the agent.")
-                try ToolsFacade.checkAuthored(updated)
                 guard try await self.tools.listAuthored().first(where: { $0.id == updated.id })?.status == "quarantined" else {
                     return VerbOutcome(false, "Tool quarantine could not be confirmed after reloading the registry." + Self.retry, fields,
                         toolStatus: .init(message: "Tool quarantine could not be confirmed after reloading the registry.", succeeded: false))
@@ -193,7 +181,7 @@ public struct CapabilityLifecycleCommands: Sendable {
                 return VerbOutcome(false, Self.forAgent(message, error) + Self.retry, fields,
                     toolStatus: .init(message: message, succeeded: false, cause: error.localizedDescription))
             }
-            return VerbOutcome(true, "\(tool.name) is quarantined; you won't use it. Approving it again is User's.", fields,
+            return VerbOutcome(true, "\(tool.name) is quarantined; you won't use it. Approving it again is the owner's.", fields,
                 toolStatus: .init(message: "Tool quarantined", succeeded: true))
         }
         let root = dataRoot
@@ -223,9 +211,9 @@ public struct CapabilityLifecycleCommands: Sendable {
                 }
                 let fullMac = await AppToolExecutor.freshQuietPosture(dataRoot: root)?.name == AppToolExecutor.fullMacModeName
                 return VerbOutcome(true, "Would put \(tool.name) back to version \(target), proposed: tool.approve turns it on, "
-                    + (fullMac ? "yours under Full Mac" : "User's on the Tools page")
+                    + (fullMac ? "yours under Full Mac" : "the owner's on the Tools page")
                     + ", once it passes validation; its 30-day unused clock restarts then.",
-                    fields.merging(["would_status": .string("proposed"), "would_admit": .string(fullMac ? "hers" : "users"),
+                    fields.merging(["would_status": .string("proposed"), "would_admit": .string(fullMac ? "hers" : "owners"),
                                     "would_clock": .string("restarts when it is turned on"), "would_land_on": .string(target),
                                     "versions": await execution.versions(id: tool.id)]) { $1 })
             }
@@ -264,7 +252,7 @@ public struct CapabilityLifecycleCommands: Sendable {
             return VerbOutcome(false, "\(id) is filed on the Tools page but failed validation: \(result.errors.joined(separator: "; ")). "
                 + "Fix it and tool.propose again.", filed)
         }
-        return VerbOutcome(true, "\(id) is filed on the Tools page and passed validation. tool.approve activates it (User's "
+        return VerbOutcome(true, "\(id) is filed on the Tools page and passed validation. tool.approve activates it (the owner's "
             + "below Full Mac); then it runs as authored.\(id).", filed)
     }
 

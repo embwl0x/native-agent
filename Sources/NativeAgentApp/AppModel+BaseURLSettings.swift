@@ -1,4 +1,5 @@
 import Foundation
+import Research
 
 @MainActor
 extension AppModel {
@@ -7,8 +8,8 @@ extension AppModel {
     /// or persistence never replaces a working URL in the UI.
     @discardableResult
     func saveSearXNGBaseURL(_ value: String) async throws -> String {
-        let normalized = try NativeClient.normalizedSearXNGBaseURL(value)
-        try await client.configureSearXNG(baseURL: normalized)
+        let normalized = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(value)
+        try await SwiftNativeResearchClient(dataRoot: engine.dataRoot).saveSearXNGBaseURL(normalized)
         searxngBaseURL = normalized
         return normalized
     }
@@ -23,7 +24,7 @@ extension AppModel {
             return false
         }
         do {
-            searxngBaseURL = try NativeClient.normalizedSearXNGBaseURL(value)
+            searxngBaseURL = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(value)
             return true
         } catch {
             statusText = "SearXNG configuration unavailable: \(error.localizedDescription)"

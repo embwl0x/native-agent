@@ -50,7 +50,9 @@ actor NativeAppConnectorProofProvider: ConnectorProofProvider {
         // The status client says email/calendar; the Google rows are gmail/gcal
         // ("calendar" is the EventKit row).
         let id = ["email": "gmail", "calendar": "gcal"][provider] ?? provider
-        if rows == nil { rows = (try? await NativeClient.readConnectorRecords(root: root)) ?? [] }
+        if rows == nil {
+            rows = (try? await ConnectorStatusProjection.readConnectorRecords(root: root, platform: AppConnectorStatusPlatform())) ?? []
+        }
         let row = rows?.first { $0.id == id }
         if row?.healthStatus == "ok" { return ["verified": .bool(true)] }
         if let row, ["connected", "configured", "connected_unverified"].contains(row.authState ?? "") {

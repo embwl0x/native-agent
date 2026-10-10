@@ -53,7 +53,7 @@ enum DoctorLoopRecovery {
         return loopIDs.sorted().map { id in
             let status = byID[id]
             let verdict = verdictByID[id]
-            let level = pending.contains(id) && verdict?.level == .ok ? LoopHealthLevel.warn : verdict?.level ?? .fail
+            let level = verdict?.level ?? .fail
             let state = (verdict?.detail ?? "The app-owned loop is absent from the live manager.")
                 + (pending.contains(id) ? " Restarted; recovery unverified until its next successful run." : "")
             let lastFailure = status?.lastError.map {
@@ -67,12 +67,11 @@ enum DoctorLoopRecovery {
             return CheckResult(
                 id: checkPrefix + id,
                 title: "Background loop: \(id)",
-                status: level == .ok ? "ok" : level == .fail ? "fail" : "warn",
+                status: waiting && level == .ok ? "unmeasured" : level == .fail ? "fail" : level.statusText,
                 detail: detail,
-                human_action: level == .ok ? nil : waiting
-                    ? "Wait for \(id)'s next successful run, then run Diagnostics → Doctor again."
-                    : action.step,
-                ask: level == .ok || waiting ? nil : action.ask
+                harm: level.isFault ? "\(DoctorPlainCopy.friendlyLoopName(id)) is failing or is not being done on schedule." : nil,
+                human_action: !level.isFault ? nil : action.step,
+                ask: !level.isFault ? nil : action.ask
             )
         }
     }
@@ -103,7 +102,7 @@ enum DoctorLoopRecovery {
                 observations: [LoopHealthObservation(status: status)],
                 recentFailureDates: receipts,
                 now: Date()
-            ).first?.level != .ok else { return nil }
+            ).first?.level.isFault != false else { return nil }
         }
         return DoctorExecutableRepair(checkID: checkID) {
             guard await manager.coreManager.isRunning(),

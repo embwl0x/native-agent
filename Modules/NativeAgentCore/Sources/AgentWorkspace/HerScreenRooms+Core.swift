@@ -34,10 +34,6 @@ extension HerScreen {
         "stocks": "markets", "notifications": "notify", "health": "status",
     ]
 
-    /// Home's PLACES row for this slice's families; the other slices' families
-    /// sit on their own rows (and open here by name only if nothing claims them).
-    static let familyLine = ["notify", "status", "activity", "app"].joined(separator: " · ")
-
     /// A family's actions as a text room, or nil when the name is not a family.
     static func familyRoom(_ raw: String, catalog: AgentWorkspace.Catalog) async throws -> String? {
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -120,7 +116,8 @@ extension HerScreen {
         let bad = checks.filter { text($0["status"]) != "ok" }
         let overall = text(row["overall_status"]) ?? text(row["active_path_status"]) ?? text(row["status"]) ?? "unknown"
         let items = (bad + checks.filter { text($0["status"]) == "ok" }).map { check in
-            AgentWorkspaceItem(title: (text(check["title"]) ?? text(check["id"]) ?? "Check") + " · " + (text(check["status"]) ?? "?"),
+            AgentWorkspaceItem(title: (text(check["title"]) ?? text(check["id"]) ?? "Check") + " · " + (text(check["status"]) ?? "?")
+                                   + (text(check["owner"]).map { " · owner " + $0 } ?? ""),
                                content: .object(["summary": check["detail"] ?? .null]), actions: [])
         }
         return .init(title: "Doctor", content: .object(["status": .string("ok"),

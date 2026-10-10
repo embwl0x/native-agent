@@ -1,4 +1,5 @@
 import Foundation
+import MacIntegration
 import PersistenceCore
 
 /// Her comms on her screen (2026-09-24): Mail, Messages, Gmail, AgentMail,
@@ -224,7 +225,7 @@ extension HerScreen {
         switch tool {
         case "mail_list_recent":
             guard let row = rowsOf("messages").first else { return nil }
-            let bound = input.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope", "mailbox"].contains($0.key) }
+            let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
             header += [who(text(row["sender"])), when(text(row["date"]), now: now)] + (row["unread"] == .bool(true) ? ["unread"] : [])
             let (lines, used) = bodyLines(text(row["body"]) ?? "")
             let start = int(row["body_offset"]) ?? 0, total = int(row["body_total"]) ?? 0
@@ -360,7 +361,7 @@ extension HerScreen {
         let parts = raw.split(separator: ".").map(String.init)
         guard parts.count == 3, let n = Int(parts[1]), commsItemVerbs.keys.contains(parts[0]) || ["messages", "gmail", "agentmail"].contains(parts[0]),
               let place = itemPlace(parts[0], n, dataRoot: dataRoot), case .record(let tool, let input, let title) = place else { return nil }
-        let bound = input.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope", "mailbox"].contains($0.key) }
+        let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
         if tool == "mail_list_recent", bound["message_id"] != nil,
            case .string(let expectedID)? = bound["expected_message_id"], !expectedID.isEmpty {
             if parts[2] != "delete", (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) != .string("inbox") { return nil }
@@ -412,7 +413,7 @@ extension HerScreen {
             lines += mailAttachmentLines(row)
             if row["truncated"] == .bool(true), let end = row["body_end"], AgentWorkspaceReadiness.allows(tool: "mail_list_recent") {
                 lines.append("Body continues at " + (text(end) ?? "?"))
-                let bound = row.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope"].contains($0.key) }
+                let bound = row.filter { MailReadLocator.fields.contains($0.key) }
                     .merging(["body_offset": end]) { _, new in new }
                 let more = name + ".more"
                 keep[more] = .open(.record(tool: "mail_list_recent", input: bound, title: text(row["subject"]) ?? "Email"))

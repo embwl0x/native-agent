@@ -16,7 +16,8 @@ import NotificationInbox
 /// runs. The Desk pages, the Schedule and Capabilities render `jobs` and
 /// `researchRuns`; the reads are nonisolated so the phone snapshot and the
 /// phone's desk actions use the same owner. Writes (new tasks, job pause and
-/// cancel, research runs) still run through the executors on `NativeClient`.
+/// cancel, research runs) run through the Workshop submitter, the scheduler
+/// job writer and the research client.
 @MainActor
 @Observable
 public final class DeskFacade {

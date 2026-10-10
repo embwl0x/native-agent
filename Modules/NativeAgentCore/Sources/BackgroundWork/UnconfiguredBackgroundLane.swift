@@ -8,8 +8,8 @@ import BackgroundLoops
 // the honest answer ("Telegram is off because there is no token on disk") is
 // visible nowhere.
 //
-// The placeholder registers the real loop id and skips every tick with the
-// reason, so the lane appears in `status()` and in Doctor. The skip is NOT
+// The placeholder registers the real loop id and reports every tick Off with
+// the reason, so the lane appears in `status()` and in Doctor. The skip is NOT
 // health-neutral: it is a truthful outcome, and clearing a stale error on it is
 // correct.
 //
@@ -29,7 +29,7 @@ public enum UnconfiguredBackgroundLane {
         public var tickTimeoutOverride: TimeInterval? { 5 }
 
         public func tickOutcome() async -> LoopTickOutcome {
-            .skipped(reason: reason)
+            .off(reason)
         }
 
         public func tick() async { _ = await tickOutcome() }
@@ -53,6 +53,4 @@ public enum UnconfiguredBackgroundLane {
 
     public static let telegramUnconfiguredReason =
         "telegram not configured (no enabled bot token in telegram/config.json)"
-    public static let slackUnconfiguredReason =
-        "slack not configured (no enabled Socket Mode config in slack/)"
 }

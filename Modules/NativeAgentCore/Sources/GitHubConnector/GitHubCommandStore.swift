@@ -245,7 +245,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             phase = .verifying
             verification = .pending
             expectedEvidence = "github_verification"
-        case .needsUser:
+        case .needsOwner:
             phase = .awaitingHuman
             verification = .unknown
             expectedEvidence = "user_judgment"
@@ -1169,9 +1169,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             // The event may have cleared in the same observation that carries
             // the decision — record settlement so the old key can never
             // bounce this item back into attention later (review round 2:
-            // verifying → needsUser skipped the quiet-path stamp below).
+            // verifying → needsOwner skipped the quiet-path stamp below).
             if observation.actionableEventKey == nil { recordSettledEventKey(&item) }
-            item.state = .needsUser
+            item.state = .needsOwner
             item.blocker = decision
             return
         }
@@ -1284,8 +1284,8 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     /// A quiet/terminal observation on an item that HOLDS a dispatch receipt
     /// records WHICH eventKey was verified-clear — regardless of the state
     /// the item happened to park in on the way (verifying, codexWorking,
-    /// needsUser, attention: review round 2 found the verifying-only filter
-    /// left needsUser/attention settles unstamped and bounceable). A receipt
+    /// needsOwner, attention: review round 2 found the verifying-only filter
+    /// left needsOwner/attention settles unstamped and bounceable). A receipt
     /// is the guard: needsCodex routing for a NEW key already cleared it,
     /// and receiptless states have nothing dispatched to settle.
     private static func recordSettledEventKey(_ item: inout GitHubCommandItem) {
@@ -1404,7 +1404,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 dedupKey: key, itemId: item.itemId, kind: .success,
                 title: "GitHub resolved", body: Self.bounded(receipt, limit: 220)
             )
-        case .needsUser:
+        case .needsOwner:
             return blockerIntent(for: item, version: version)
         case .attention(let reason):
             // Parked blockers need User; an unreadable verification alone does not.

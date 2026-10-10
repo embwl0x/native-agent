@@ -7,6 +7,7 @@ import MacControl
 import MacIntegration
 import NativeAgentCore
 import PersistenceCore
+import Connectors
 import TrustCenter
 import DeviceSync
 import NativeAgentShared
@@ -62,7 +63,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
     }
 
     func macNotify(input: [String: JSONValue]) async throws -> JSONValue {
-        // Mirror the shape NativeClient.runMacNotify uses so the chat-tool
+        // Mirror the shape ConnectorActions.runMacNotify uses so the chat-tool
         // path returns the same envelope the connector-action path does.
         let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac_notify")
         let result = await NativeAgentNotifications.postMessage(title: title, body: message)
@@ -310,11 +311,10 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
         try await MacContactsAdapter.delete(input: input)
     }
 
-    // Scheduler (delegates to the existing NativeClient SwiftNative path —
-    // promoted from private to internal for this).
+    // Scheduler (delegates to the connector-action scheduler path).
 
     func schedulerListJobs(input: [String: JSONValue]) async throws -> JSONValue {
-        try await NativeClient.runSchedulerListJobs()
+        try await ConnectorActions.runSchedulerListJobs()
     }
 
     func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue {
@@ -326,7 +326,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
            !Self.schedulerOneShot(input) {
             return try await nightlyDreamJob()
         }
-        return try await NativeClient.runSchedulerCreateJob(input: input)
+        return try await ConnectorActions.runSchedulerCreateJob(input: input)
     }
 
     /// The scheduler's own one-shot rule: an ISO-8601 string, type once, or one_shot.
@@ -387,7 +387,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
     }
 
     private func schedulerJobWriter() -> any SchedulerJobWriter {
-        makeSchedulerJobWriter(connectorActionIDs: NativeClient.connectorActionIDSet())
+        makeSchedulerJobWriter(connectorActionIDs: Set(connectorActionDescriptors().map(\.id)))
     }
 
     private func schedulerJobID(_ input: [String: JSONValue]) -> String {
@@ -415,7 +415,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
         // connector-action route uses). gpt-5.5 review BLOCKING fix: thread
         // the TrustCenter policy provider + audit path so the in-process
         // preflight runs and refusals get logged to the shared audit file —
-        // matches NativeClient.runMacSpotlightSearch (~L8644). Bare
+        // matches ConnectorActions.runMacSpotlightSearch. Bare
         // makeMacControl() disabled the policy preflight and was a security
         // regression vs the connector-action route.
         let auditPath = PersistenceCore.defaultDataRoot()

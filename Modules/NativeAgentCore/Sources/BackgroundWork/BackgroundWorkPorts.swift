@@ -15,9 +15,6 @@ public protocol BackgroundWorkNotificationPort: Sendable {
 }
 
 public protocol HeartbeatBackgroundWorkPort: BackgroundWorkEventPort, BackgroundWorkNotificationPort {
-    var selfEvolutionAction: String { get }
-    func applyFullMacAdmittedSelfEvolution(payload: JSONValue, dataRoot: URL) async
-    func evolutionRepoRoot(dataRoot: URL) -> URL
 }
 
 public protocol MaintenanceBackgroundWorkPort: BackgroundWorkNotificationPort {
@@ -27,6 +24,8 @@ public protocol MaintenanceBackgroundWorkPort: BackgroundWorkNotificationPort {
     func offDiskBackupParent() -> URL
     func offDiskAutomaticBackups(in parent: URL) throws -> [(url: URL, date: Date)]
     func createOffDiskBackup(reason: String, dataRoot: URL, parent: URL, now: Date) async throws -> URL
+    /// Skill, tool and sense retirement under the posture that allows it.
+    func capabilityUpkeep(dataRoot: URL) async
 }
 
 public protocol DelegationBackgroundWorkPort: BackgroundWorkEventPort, BackgroundWorkNotificationPort {

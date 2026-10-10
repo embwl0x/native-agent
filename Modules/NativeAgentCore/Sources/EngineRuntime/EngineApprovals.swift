@@ -7,8 +7,8 @@ import ChatOrchestration
 
 /// `NativeAgentEngine.approvals` (S10): the ApprovalInbox for one data root, in
 /// core types. Every surface that shows approvals renders `records`; the read
-/// is nonisolated so the phone lanes use the same owner. Decisions still run
-/// through the approval executors (`NativeClient.resolveApproval`).
+/// is nonisolated so the phone lanes use the same owner. Decisions run
+/// through the approval executors (`ApprovalTransactionCoordinator`).
 @MainActor
 @Observable
 public final class ApprovalsFacade {

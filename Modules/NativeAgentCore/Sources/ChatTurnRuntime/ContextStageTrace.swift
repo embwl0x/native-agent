@@ -251,6 +251,7 @@ struct ContextStageTrace: Sendable {
     private var flags: [String: Bool] = [:]
     private var labels: [String: String] = [:]
     private var memoryRecallOutcome: MemoryRecallTraceOutcome?
+    private var injectedMemoryIDs: [String]?
 
     init() {
         self.startedNs = DispatchTime.now().uptimeNanoseconds
@@ -345,6 +346,15 @@ struct ContextStageTrace: Sendable {
         memoryRecallOutcome = outcome
     }
 
+    /// The memory records that went INTO the turn, counted as
+    /// `memory.recallHits`. Their ids ride the summary, an empty list too, so
+    /// a week of traces can say which rows reach nearly every conversation
+    /// (the weekly sweep's standing lessons).
+    mutating func setInjectedMemoryIDs(_ ids: [String]) {
+        injectedMemoryIDs = ids
+        counts["memory.recallHits"] = Int64(ids.count)
+    }
+
     @discardableResult
     func emit(kind: String, surface: String) -> Int64 {
         var stageObject: [String: JSONValue] = [:]
@@ -373,6 +383,9 @@ struct ContextStageTrace: Sendable {
             "labels": .object(labelObject),
             "stageCount": .int(Int64(timings.count)),
         ]
+        if let injectedMemoryIDs {
+            payload["injectedMemoryIds"] = .array(injectedMemoryIDs.map(JSONValue.string))
+        }
         if let memoryRecallOutcome {
             // `memory.recallHits` is the RESOLVED lane (legacy ∪ packet
             // provenance) since 2026-08-21; `memory.recallHits.legacy` is the

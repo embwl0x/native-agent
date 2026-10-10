@@ -70,13 +70,13 @@ private actor ToolProgressPersistenceBuffer {
 }
 
 extension SwiftNativeChatOrchestrationClient {
-    func emitMetacognitiveTerminalTrace(
+    func metacognitiveTerminalEvent(
         turnId: String,
         sessionId: String,
         surface: String,
         context: TurnContext?,
         result: TurnEngineResult
-    ) {
+    ) -> TurnTraceEvent {
         // User, 2026-09-06: a slot a Stop reached never ran, so it is not a
         // failed dispatch. Its synthetic envelope carries an `error` string for
         // the model to read, which is exactly what `outputLooksSuccessful`
@@ -129,22 +129,22 @@ extension SwiftNativeChatOrchestrationClient {
             payload["contextPacketCharacters"] = .int(Int64(observation.contextPacketCharacters))
             payload["contextExpandablePointerCount"] = .int(Int64(observation.contextExpandablePointerCount))
         }
-        TurnTraceBus.fire(TurnTraceEvent(
+        return TurnTraceEvent(
             turnId: turnId,
             kind: "turn.terminal",
             sessionId: sessionId,
             surface: surface,
             payload: .object(payload)
-        ), on: turnTraceBus)
+        )
     }
 
     // 2026-09-22 WHY: a structured turn that threw (retry ladder spent)
     // left no terminal row, so the trace read as an unexplained hang.
-    func emitTurnFailedTrace(
+    func turnFailedEvent(
         turnId: String, sessionId: String, surface: String, error: Error,
         observation: ToolLoopTraceObservation? = nil,
         terminalReasonOverride: TurnEngineResult.TerminalReason? = nil
-    ) {
+    ) -> TurnTraceEvent {
         let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         let terminalReason: TurnEngineResult.TerminalReason
         if let terminalReasonOverride {
@@ -158,27 +158,27 @@ extension SwiftNativeChatOrchestrationClient {
         payload["status"] = .string(terminalReason.state.rawValue)
         payload["terminalReason"] = .string(terminalReason.rawValue)
         payload["reason"] = .string(String(reason.prefix(200)))
-        TurnTraceBus.fire(TurnTraceEvent(
+        return TurnTraceEvent(
             turnId: turnId,
             kind: "turn.failed",
             sessionId: sessionId,
             surface: surface,
             payload: .object(payload)
-        ), on: turnTraceBus)
+        )
     }
 
-    func emitTurnCancelledTrace(
+    func turnCancelledEvent(
         turnId: String, sessionId: String, surface: String, location: String,
         observation: ToolLoopTraceObservation? = nil
-    ) {
+    ) -> TurnTraceEvent {
         var payload = observation?.tracePayload ?? [:]
         payload["status"] = .string(TurnEngineResult.TerminalState.interrupted.rawValue)
         payload["terminalReason"] = .string(TurnEngineResult.TerminalReason.cancelled.rawValue)
         payload["where"] = .string(location)
-        TurnTraceBus.fire(TurnTraceEvent(
+        return TurnTraceEvent(
             turnId: turnId, kind: "turn.cancelled", sessionId: sessionId,
             surface: surface, payload: .object(payload)
-        ), on: turnTraceBus)
+        )
     }
 
     /// The one structured chat turn. Streaming surfaces consume `progress`
@@ -220,12 +220,21 @@ extension SwiftNativeChatOrchestrationClient {
         let runId = ChatPersistenceContext.pinnedTurnRunID ?? UUID().uuidString
         ChatTurnExecution.current?.bindHistoryRunID(runId)
         var livePartial: String?
+        let boundTurnId = StructuredTurnTraceIdentity.currentOrMint()
+        // The run's one terminal row, published at its one exit after it has
+        // left the run registry (the `finish` defer below runs first), so a
+        // window seeding from the registry either holds the run and gets this
+        // row, or sees neither.
+        var terminal: TurnTraceEvent?
+        defer { if let terminal { TurnTraceBus.fire(terminal, on: turnTraceBus) } }
         do {
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
         // #19 + B7: derive the per-session cancel flag AT TURN ACCEPT, keyed by
         // this run, so a stale flag from a prior turn cannot kill this one and a
-        // Stop naming this run can (ChatCancelFlag).
-        let cancelFlagPath = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: resolvedSession, runId: runId)
+        // Stop naming this run can (ChatCancelFlag). The registry also names the
+        // trace turn, so a window that did not start it can show it working.
+        let cancelFlagPath = ChatCancelFlag.accept(
+            dataRoot: dataRoot, sessionId: resolvedSession, runId: runId, turnId: boundTurnId)
         defer {
             ChatCancelFlag.finish(cancelFlagPath)
         }
@@ -358,13 +367,9 @@ extension SwiftNativeChatOrchestrationClient {
         } catch {
             // Two turns died silently on 2026-09-05 (00:34, 10:12) with no trace
             // after their last tool; a cancellation left nothing on paper.
-            TurnTraceBus.fireFromContext(
-                kind: "turn.cancelled", surface: surface,
-                payload: .object([
-                    "where": .string("structured_chat.\(#line)"),
-                    "status": .string("interrupted"),
-                    "terminalReason": .string(TurnEngineResult.TerminalReason.cancelled.rawValue),
-                ])
+            terminal = turnCancelledEvent(
+                turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
+                location: "structured_chat.\(#line)"
             )
             throw CancellationError()
         }
@@ -372,7 +377,6 @@ extension SwiftNativeChatOrchestrationClient {
         let gated = makeTracedGatedDispatcher(
             fileAccess: fileAccess, verifiedSessionId: resolvedSession
         )
-        let boundTurnId = StructuredTurnTraceIdentity.currentOrMint()
         let workTitle = String(TurnTraceRedactor.redactText(message)
             .split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(96) ?? "".prefix(96))
         TurnTraceBus.fire(TurnTraceEvent(
@@ -435,13 +439,13 @@ extension SwiftNativeChatOrchestrationClient {
         } catch is CancellationError {
             // Two turns died silently on 2026-09-05 (00:34, 10:12) with no trace
             // after their last tool; a cancellation left nothing on paper.
-            emitTurnCancelledTrace(
+            terminal = turnCancelledEvent(
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
                 location: "structured_chat.\(#line)"
             )
             throw CancellationError()
         } catch {
-            emitTurnFailedTrace(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error)
+            terminal = turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error)
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
                 try? await appendFailureMessageIfNeeded(
@@ -661,7 +665,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
             }
         } catch let e as ChatOrchestrationError {
-            emitTurnFailedTrace(
+            terminal = turnFailedEvent(
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: e,
                 observation: loopObservation, terminalReasonOverride: terminalFailureReason
             )
@@ -683,13 +687,13 @@ extension SwiftNativeChatOrchestrationClient {
             // The partial output is already saved. A user stop closes the
             // trace and propagates cancellation without a failure-message row.
             if case .streamCancelled = e {
-                emitTurnCancelledTrace(
+                terminal = turnCancelledEvent(
                     turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
                     location: "structured_chat.\(#line)", observation: loopObservation
                 )
                 throw CancellationError()
             }
-            emitTurnFailedTrace(
+            terminal = turnFailedEvent(
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: e,
                 observation: loopObservation, terminalReasonOverride: terminalFailureReason
             )
@@ -711,13 +715,13 @@ extension SwiftNativeChatOrchestrationClient {
             // persist a "Chat error: CancellationError" row; just propagate
             // (gpt-5.5 review of #19, 2026-06-14). It still needs a terminal
             // row, or the turn reads as an unexplained death (2026-09-06).
-            emitTurnCancelledTrace(
+            terminal = turnCancelledEvent(
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
                 location: "structured_chat.\(#line)", observation: loopObservation
             )
             throw CancellationError()
         } catch {
-            emitTurnFailedTrace(
+            terminal = turnFailedEvent(
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error,
                 observation: loopObservation, terminalReasonOverride: terminalFailureReason
             )
@@ -801,7 +805,7 @@ extension SwiftNativeChatOrchestrationClient {
         // The ticket starts THIS turn's promotion and no other turn's.
         await engine.startDeferredMemoryPromotion(ticket: result.memoryPromotionTicket)
         afterTurnStarted = result.memoryPromotionTicket != nil
-        emitMetacognitiveTerminalTrace(
+        terminal = metacognitiveTerminalEvent(
             turnId: boundTurnId,
             sessionId: resolvedSession,
             surface: surface,
@@ -842,10 +846,16 @@ extension SwiftNativeChatOrchestrationClient {
                              ?? .answered(transcriptRow.text))
         return StructuredChatExecution(response: response, turn: result)
         } catch {
-            let terminal: ChatLiveTap.Kind = error is CancellationError
+            // A run that ended before naming its own terminal (attachments,
+            // the user row, a queued message's pickup, the reply's save).
+            terminal = terminal ?? (error is CancellationError
+                ? turnCancelledEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
+                                     location: "structured_chat.\(#line)")
+                : turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error))
+            let live: ChatLiveTap.Kind = error is CancellationError
                 ? .cancelled
                 : .failed(ProviderFailure.report(error)?.personDescription ?? "The reply could not be completed.")
-            ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId, terminal, savedPartial: livePartial)
+            ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId, live, savedPartial: livePartial)
             throw error
         }
         }

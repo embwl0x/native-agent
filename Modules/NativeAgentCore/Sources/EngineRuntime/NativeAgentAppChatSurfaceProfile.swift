@@ -10,13 +10,6 @@ public enum NativeAgentAppChatSurfaceProfile: String, CaseIterable, Sendable {
     case bridge
     case background
 
-    public var includesEvolutionBridge: Bool {
-        switch self {
-        case .mac, .telegram, .ios, .bridge: true
-        case .slack, .background: false
-        }
-    }
-
     /// No-human-at-trigger execution cannot reach third-party MCP effects.
     /// Native tools still pass through their ordinary TrustCenter/autonomy gates.
     public var deniesExternalMCP: Bool {

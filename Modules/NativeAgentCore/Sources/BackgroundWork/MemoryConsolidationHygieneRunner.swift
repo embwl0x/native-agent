@@ -40,8 +40,7 @@ public struct MemoryConsolidationHygieneRunner: LoopRunner {
         // Settings ▸ "Nightly memory consolidation": off means this tick does
         // not run. Read fresh on the tick, so a flip lands on the next run.
         guard MemoryPolicyGate.consolidationEnabled(dataRoot: dataRoot) else {
-            return .skipped(reason:
-                "Memory consolidation is turned off in Settings, so hygiene did not run.")
+            return .off("Memory consolidation is turned off in Settings, so hygiene did not run.")
         }
         let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .fullMacYoloAuthority(
@@ -88,8 +87,12 @@ public struct MemoryConsolidationHygieneRunner: LoopRunner {
             if report.status == "staged" {
                 return .skipped(reason: report.reason ?? "a consolidation card is already pending")
             }
-            return .completed(result: "memory hygiene \(report.status ?? "done")"
-                + (report.reason.map { ": \($0)" } ?? ""))
+            // Work is a swap the gate applied: past the failed and staged
+            // returns above, only an applied run carries its gate run id. A
+            // no-change plan or a refused candidate changed nothing.
+            let summary = "memory hygiene \(report.status ?? "done")" + (report.reason.map { ": \($0)" } ?? "")
+            return report.consolidationRunId != nil ? .completed(result: summary)
+                : .skipped(reason: "no consolidation swap applied; \(summary)")
         } catch {
             return .failed(error: "memory hygiene failed: \(error)")
         }

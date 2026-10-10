@@ -57,18 +57,11 @@ extension SwiftNativeTrustCenter {
             "tts_openai": .bool(false),
         ])
         policy["trainingPolicy"] = .object([
-            "autonomous_training": .bool(true),
             "dream_scheduler": .bool(true),
-            "route_through_promotion": .bool(true),
             // Was never declared here, so every consumer invented its own
             // default for it and the Dreams page could disagree with the
             // runner. Declared, the normalized policy always carries it.
             "rem_cycle_enabled": .bool(true),
-        ])
-        policy["promotionPolicy"] = .object([
-            "enabled": .bool(true),
-            "auto_promote_tier_a": .bool(false),
-            "run_smoke_in_harness": .bool(true),
         ])
         policy["personalityPolicy"] = .object([
             // Second half of the composite dream gate (with
@@ -76,7 +69,6 @@ extension SwiftNativeTrustCenter {
             // rem_cycle_enabled note above.
             "dream_cycle_enabled": .bool(true),
             "runtime_v2": .bool(true),
-            "session_memory_extraction": .bool(true),
             "confidence_calibration": .bool(false),
             "completion_guard_enabled": .bool(true),
             "completion_guard_max_repairs": .int(2),
@@ -84,13 +76,9 @@ extension SwiftNativeTrustCenter {
         policy["memoryPolicy"] = .object([
             "consolidation_enabled": .bool(true),
             "cross_session_recall": .bool(true),
-            "auto_promote_consolidated": .bool(true),
             "knowledge_graph_enabled": .bool(true),
             "adaptive_promotion": .bool(true),
             "hygiene_enabled": .bool(true),
-            "hygiene_interval_hours": .int(6),
-            "archive_noisy_reflections": .bool(true),
-            "reject_low_value_proposals": .bool(true),
             "vault_enabled": .bool(true),
             "vault_require_encryption": .bool(true),
         ])
@@ -166,19 +154,6 @@ extension SwiftNativeTrustCenter {
     /// `toolAutonomy` defaults. The glob-matched entries are load-bearing for
     /// `autonomyForTool` resolution.
     private static let defaultToolAutonomy: [String: JSONValue] = [
-        // U4 Wave D (gpt-5.5 review NEW-BLOCKER): the self-evolution chat tools
-        // MUST default to `confirm` in SHIPPED CODE, not only in the git-ignored
-        // live policy.json. An absent key falls through to the `default` ("auto")
-        // → a fresh install or a policy reset would AUTO-FIRE the app-self-mod
-        // tools (the exact builder-tools bug class). Pinned here + in
-        // missionsDefaultToolAutonomy (the load-time backfill) so the posture is
-        // effective on every install path; the user can still relax per-tool (saved
-        // wins). evolution_status is read-only and a strong relax-to-auto
-        // candidate — NEEDS-USER.
-        "evolution_propose": .string("confirm"),
-        "evolution_status": .string("confirm"),
-        "evolution_withdraw": .string("confirm"),
-        "self_install": .string("confirm"),
         "remote_node_execute": .string("confirm"),
         "remote_node_list": .string("auto"),
         "search.*": .string("auto"),
@@ -446,15 +421,6 @@ extension SwiftNativeTrustCenter {
     /// Backfilled into `toolAutonomy` at load time so new default keys take
     /// effect without resetting saved policies. Saved values always win.
     static let workshopExecutionsDefaultToolAutonomy: [String: JSONValue] = [
-        // U4 Wave D (gpt-5.5 review NEW-BLOCKER): ship the self-evolution tools'
-        // `confirm` posture in code. This dict is backfilled into toolAutonomy on
-        // EVERY load (saved wins), so adding here makes confirm effective on both
-        // fresh installs AND existing saved policies — closing the absent-key →
-        // default:"auto" auto-fire path. See defaultToolAutonomy for rationale.
-        "evolution_propose": .string("confirm"),
-        "evolution_status": .string("confirm"),
-        "evolution_withdraw": .string("confirm"),
-        "self_install": .string("confirm"),
         "remote_node_execute": .string("confirm"),
         "remote_node_list": .string("auto"),
         "search.*": .string("auto"),

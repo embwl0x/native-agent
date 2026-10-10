@@ -103,7 +103,7 @@ public struct AppAction: Sendable {
     }
 
     public var isHis: Bool { if case .his = owner { true } else { false } }
-    public var isFold: Bool { ToolNameAliases.appAction(tool) == id || ToolNameAliases.authoredTool(id) == tool || (id == "trace.usage" && tool == "recent_trace_summary") }
+    public var isFold: Bool { ToolNameAliases.appAction(tool) == id || ToolNameAliases.authoredTool(id) == tool || (["trace.usage", "trace.model_calls"].contains(id) && tool == "recent_trace_summary") }
     /// One of an inline card's buttons, not the composer
     /// (`AppToolExecutor.runCardAction`).
     public var isCard: Bool { tool == "interaction_act" && input["target"] == nil }
@@ -292,6 +292,12 @@ public enum AppActions {
                   input: composer("set_persona"), rename: ["name": "value"]),
         AppAction("app.check_updates", "settings", "Check for NativeAgent updates only; macOS uses mac.system_info with check_updates:true, App Store apps use App Store → Updates", safe: true, tool: "interaction_act",
                   input: composer("check_updates"), read: true),
+        // How the window lays out each surface (ui/layout.json), hers to read
+        // and rewrite as the person asks; the window changes as a write lands.
+        AppAction("layout.read", "settings", "The window's layout: each surface's blocks in order, hidden and expanded, each view's profile, its version, the previous layout and what every block is",
+                  safe: true, tool: "app_page_read", read: true),
+        AppAction("layout.write", "settings", "Change the layout, passing layout.read's version as layout_version and only what changes (a surface's whole block list, a profile, phone); the window follows at once; writing the previous back undoes it",
+                  ["layout:object", "layout_version"], tool: "app_setting_set", scriptable: false),
         // Settings rows: owner_only rows stay his, lower-only rows move the safe way.
         AppAction("setting.set", "*", "Set", ["setting", "value:any", "because"],
                   warn: "on model turns, because must quote at least 3 words from a person or trusted agent in this conversation; you may restore a switch whose last change was yours",
@@ -391,7 +397,7 @@ public enum AppActions {
                   // another conversation's correction. The supersede demotion
                   // is memory.commit's supersedes, which is.
                   tool: "rewrite_memory"),
-        AppAction("memory.pin", "memories", "Pin a memory to your prompt core, in pin order", ["id"],
+        AppAction("memory.pin", "memories", "Pin a fact about the owner (user fact, preference, relationship, identity, attribute) to your prompt core, in pin order; moments stay in recall", ["id"],
                   tool: "rewrite_memory", input: ["pinned": .bool(true)]),
 
         // Her mind: Dreams (Personality), Self-Improvement and standing views
@@ -400,6 +406,8 @@ public enum AppActions {
         AppAction("mind.rem", "personality", "Run a REM pass", tool: "mind_run", input: verb("rem")),
         AppAction("mind.self_improvement", "today", "Self-Improvement: Run now", tool: "mind_run",
                   input: verb("self_improvement")),
+        AppAction("mind.misses", "today", "Your misses: corrections by lesson, this week against last, each with its history locator",
+                  safe: true, tool: "mind_run", input: verb("misses"), read: true),
         AppAction("mind.decline_view", "today", "Decline a proposed standing view", ["view_id", "reason?"], irreversible: true,
                   tool: "mind_run", input: verb("decline_view")),
         AppAction("mind.approve_view", "today", "Approve a standing view", ["view_id"],
@@ -512,6 +520,8 @@ public enum AppActions {
               ["name", "step?:int"], read: true),
         .fold("recent_trace_summary", "diagnostics", "Read saved traces; receipts span all conversations unless session_id is explicit, with non-read actions first and complete retained since windows",
               ["view?:receipts", "effects_only?:bool", "since?", "limit?:int", "before?", "offset?:int", "completed_turns?:int", "kind?", "name?", "status?", "session_id?", "turn_id?", "fields?:[str]"], read: true),
+        AppAction("trace.model_calls", "diagnostics", "Model calls: per-turn counts by purpose and rounds per turn (p50, p90) for the last 24 hours and 7 days, the top five purposes by total milliseconds, and the week's five heaviest asks with their first six calls; reads retained traces without a model call",
+                  safe: true, tool: "recent_trace_summary", input: ["view": .string("model_calls")], read: true),
         AppAction("trace.usage", "diagnostics", "Recorded model usage: exact retained call, input, cached input, output token and duration sums, grouped by model, surface or local day; since defaults to today (local midnight) or accepts an ISO-8601 timestamp; reports missing measurements and retention coverage",
                   ["since?", "by?:model|surface|day"], safe: true, tool: "recent_trace_summary", input: ["view": .string("usage")], read: true),
 
@@ -598,6 +608,19 @@ public enum AppActions {
                   warn: "since: today or an ISO 8601 timestamp with timezone. limit: 1–50, default 10, newest first. Reads the bounded recent worklog tail; refs are clipped. Reading never sends a message.",
                   tool: "claude_worklog", read: true),
         .fold("agent_connect", "agents"),
+        // How each agent is reached (agents/recipes/<host>.json), hers to read and
+        // fix when an app changes under it. A write is connect-level: below Full
+        // Mac its card is connect's (other_app_settings_write), and it is never scripted.
+        AppAction("agent.recipe", "agents", "How this app reaches an agent: one host's recipe and the version a write replaced, or every host's when host is left out",
+                  ["host?"], safe: true, tool: "agent_contacts", read: true),
+        AppAction("agent.recipe_write", "agents", "Replace one host's whole recipe with agent.recipe's recipe, edited, at the version read; bumps recipeVersion and keeps the previous one for undo",
+                  ["host", "recipe:object"], tool: "agent_connect", scriptable: false),
+        // The "no" to an agent discovery found here; only discovery.json changes.
+        AppAction("agent.discovery_dismiss", "agents", "Decline an agent found on this Mac; it is not offered again until its version changes",
+                  ["name"], safe: true, tool: "agent_discovery_dismiss", scriptable: false),
+        // A failed send runs the same check itself and retries once.
+        AppAction("agent.verify", "agents", "Dry-run how this app reaches a contact, sending nothing: its handshake, window controls or connect probe; what it learns is written to the recipe and a pass is proof",
+                  ["agent"], tool: "agent_message", scriptable: false),
         .fold("agent_cancel", "agents", "Stop the reply an agent is working on in your conversation with it"),
         .fold("delegation_status", "agents", read: true),
         .fold("agent_swarm", "agents", "Run temporary workers on an objective; reasoning_effort sets the run's Think level or each worker's; defaults to Work thinking (providers.work_thinking)"),
@@ -610,7 +633,7 @@ public enum AppActions {
         // change to User's mail, calendar, reminders, notes, contacts or
         // repositories is always her own step (Agent, req 2).
         .fold("mail_list_recent", "mail", "Apple Mail's inbox or sent mailbox; with scope + message_id "
-              + "+ expected_message_id, one message's body", read: true),
+              + "+ expected_message_id + expected_account_id, one message's body", read: true),
         .fold("mail_read_batch", "mail", read: true),
         .fold("mail_search", "mail", read: true),
         .fold("mail_save_attachment", "mail"),
@@ -726,10 +749,6 @@ public enum AppActions {
         .fold("swift_test", "shell"),
         .fold("remote_node_list", "shell", read: true),
         .fold("remote_node_execute", "shell"),
-        .fold("evolution_status", "shell", read: true),
-        .fold("evolution_propose", "shell"),
-        .fold("evolution_withdraw", "shell"),
-        .fold("self_install", "shell"),
         .fold("restart_app", "shell"),
         .fold("install_app", "shell"),
         .fold("read_page", "web", read: true, scriptable: false),
@@ -845,24 +864,6 @@ public enum AppActions {
 
     /// What a tool she wrote can't take back: a shell, a write anywhere, the network.
     static let authoredIrreversible: Set<String> = ["shell", "arbitrary_file_write", "network", "network_public"]
-
-    /// Her installed skills an ask names, best first. A skill read explains
-    /// its guidance or script and the admission needed to run it.
-    /// An archived one is found too, marked archived (`CapabilityLifecycle`).
-    static func skills(_ asked: [String], dataRoot: URL = PersistenceCore.defaultDataRoot()) -> [(name: String, about: String)] {
-        InstalledSkillInventory.list(dataRoot: dataRoot).compactMap { row -> (name: String, about: String, score: Int)? in
-            guard case .object(let skill) = row, case .string(let name)? = skill["name"] else { return nil }
-            let text = { (value: JSONValue?) -> String in if case .string(let s)? = value { s } else { "" } }
-            let archived = skill["status"] == .string(CapabilityLifecycle.archived)
-            guard InstalledSkillInventory.isAvailable(skill) || archived else { return nil }
-            let triggers = if case .array(let list)? = skill["triggers"] { list.map { text($0) } } else { [String]() }
-            // Every skill is a skill: that word alone matches none of them.
-            let score = hits(Set(intentWords(([name, text(skill["description"])] + triggers).joined(separator: " "))),
-                             asked.filter { !["skill", "skills"].contains($0) })
-            return score > 0 ? (name, (archived ? "(archived) " : "") + text(skill["description"]), score) : nil
-        }.enumerated().sorted { $0.element.score != $1.element.score ? $0.element.score > $1.element.score : $0.offset < $1.offset }
-            .map { ($0.element.name, $0.element.about) }
-    }
 
     /// The folded tools' own schemas, built once: a fold's args and label are
     /// its tool's, and its whole description answers a call that went wrong.
@@ -1009,7 +1010,13 @@ public enum AppActions {
         return action
     }
 
-    /// The actions a page read lists: its own, and the ones on every page.
+    /// Every registered action: the app's own, MCP tools, the ones she wrote,
+    /// and senses' verbs. What find ranks and `pages_version` hashes.
+    static func inventory(dataRoot: URL) -> [AppAction] {
+        all + mcp(dataRoot: dataRoot) + authored(dataRoot: dataRoot) + senses()
+    }
+
+    /// A page's actions: its own, and the ones on every page.
     public static func on(page: String) -> [AppAction] {
         all.filter { $0.page == page || $0.page == "*" || (page == "tools" && $0.page == "diagnostics" && $0.id.hasPrefix("tool.")) }
             + (["mcp", "web"].contains(page) ? mcp().filter { $0.page == page } : [])
@@ -1055,7 +1062,8 @@ public enum AppActions {
         pattern: #"(?i)\b(?:no|without|never|avoid|do\s+not|don['’]t|not)(?!\s+only\b)\s+(.+?)(?=[,.;!?\n]|\s+\b(?:but|instead|however|then)\b|$)"#)
 
     /// `degraded` says why the ranking fell back to words alone; nil when the embedder ranked it.
-    static func ranked(_ query: String, titles: [String: String], dataRoot: URL) async -> (actions: [AppAction], degraded: String?) {
+    static func ranked(_ query: String, titles: [String: String], dataRoot: URL)
+        async -> (actions: [AppAction], skills: [(name: String, about: String)], degraded: String?) {
         let range = NSRange(query.startIndex..., in: query)
         let negative = negation.matches(in: query, range: range).compactMap {
             Range($0.range(at: 1), in: query).map { String(query[$0]) }
@@ -1099,7 +1107,7 @@ public enum AppActions {
             : hits(["create", "add", "new", "make"], asked) > 0 ? "reminders.list_create" : "") : ""
         let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list())?.map(\.name) ?? []
         let helpers = (try? BotDefinitionStore(dataRoot: dataRoot).list())?.map(\.name) ?? []
-        let actions = (all + mcp(dataRoot: dataRoot) + authored(dataRoot: dataRoot) + senses())
+        let actions = inventory(dataRoot: dataRoot)
             .filter { window || !(photos || mailContent) || !["mac.look", "mac.go"].contains($0.id) }
             // "open … in chrome" is her own Chrome tab while its link is up, not User's front window (10-08).
             .filter { window || !chromeOpen || $0.id != "mac.go" }
@@ -1113,6 +1121,18 @@ public enum AppActions {
                     action.id.replacingOccurrences(of: ".", with: " "), action.label,
                     titles[action.page] ?? action.page, action.argSpecs.flatMap(\.names).joined(separator: " "),
                     names.joined(separator: ", ")].joined(separator: " ")
+        }
+        // Her installed skills ride the same read and blend (10-10: the memory
+        // rows that recalled them by meaning are gone). A skill read explains its
+        // guidance or script; an archived one is found too, marked archived.
+        let skills: [(name: String, about: String, text: String)] = InstalledSkillInventory.list(dataRoot: dataRoot).compactMap { row in
+            guard case .object(let skill) = row, case .string(let name)? = skill["name"] else { return nil }
+            let text = { (value: JSONValue?) -> String in if case .string(let s)? = value { s } else { "" } }
+            let archived = skill["status"] == .string(CapabilityLifecycle.archived)
+            guard InstalledSkillInventory.isAvailable(skill) || archived else { return nil }
+            let triggers = if case .array(let list)? = skill["triggers"] { list.map { text($0) } } else { [String]() }
+            return (name, (archived ? "(archived) " : "") + text(skill["description"]),
+                    ([name, text(skill["description"])] + triggers).joined(separator: " "))
         }
         let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
         let rejected = negative.map(intentWords)
@@ -1204,18 +1224,19 @@ public enum AppActions {
                 : named.contains(action.id) || routed.contains(action.id) ? 1.0 : 0
         }
         // No embedder (or it changed mid-read): rank by words alone, and say so.
-        var embedding: (asked: [[Float]], actions: [[Float]])?
+        var embedding: (asked: [[Float]], actions: [[Float]], skills: [[Float]])?
         var degraded: String?
         do {
-            let indexed = try await vectors.read(texts, memory: memory)
+            let indexed = try await vectors.read(texts + skills.map(\.text), memory: memory)
             let embedded = try await memory.embedForDerivedContextWithEpoch([positive] + negative)
             if embedded.epoch == indexed.epoch, embedded.vectors.count == negative.count + 1,
-               indexed.vectors.count == actions.count,
+               indexed.vectors.count == actions.count + skills.count,
                (embedded.vectors + indexed.vectors).allSatisfy({
                    $0.count == embedded.vectors[0].count && !$0.isEmpty
                        && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 })
                }) {
-                embedding = (embedded.vectors, indexed.vectors)
+                embedding = (embedded.vectors, Array(indexed.vectors.prefix(actions.count)),
+                             Array(indexed.vectors.dropFirst(actions.count)))
             } else { degraded = "The memory-search model changed or returned unusable vectors during find." }
         } catch { degraded = error.localizedDescription }
         var ranked: [(offset: Int, action: AppAction, score: Double)] = []
@@ -1236,7 +1257,16 @@ public enum AppActions {
             value += boost(action)
             if value > 0 { ranked.append((offset, action, value)) }
         }
-        return (ranked.sorted { $0.score == $1.score ? $0.offset < $1.offset : $0.score > $1.score }.map(\.action), degraded)
+        // Every skill is a skill: that word alone matches none of them.
+        let skillAsked = asked.filter { !["skill", "skills"].contains($0) }
+        let rankedSkills = skills.enumerated().compactMap { offset, skill -> (offset: Int, score: Double)? in
+            let lexical = Double(hits(Set(intentWords(skill.text)), skillAsked))
+            let value = embedding.map { 0.8 * VectorMath.cosine($0.asked[0], $0.skills[offset]) + 0.2 * lexical / (lexical + 12.0) }
+                ?? lexical / (lexical + 12.0)
+            return value > 0 ? (offset, value) : nil
+        }.sorted { $0.score == $1.score ? $0.offset < $1.offset : $0.score > $1.score }
+        return (ranked.sorted { $0.score == $1.score ? $0.offset < $1.offset : $0.score > $1.score }.map(\.action),
+                rankedSkills.map { (skills[$0.offset].name, skills[$0.offset].about) }, degraded)
     }
 
     /// Share in-flight batches too, so concurrent finds embed each action once per model.

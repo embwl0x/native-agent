@@ -1676,11 +1676,13 @@ public actor ChromeControlRuntime {
             await stopLocked()
             guard generation == policyGeneration else { return }
             if manageNativeHostRegistration { try? ChromeNativeHostRegistration.uninstall() }
+            OrganPulse.recordOff("chrome_relay", because: "Chrome control is turned off")
             return
         }
         do {
             try startListenerIfNeeded()
             if manageNativeHostRegistration { try ChromeNativeHostRegistration.install() }
+            OrganPulse.record("chrome_relay", .worked, note: "listening")
         } catch {
             listenerFailure = error.localizedDescription
             await stopLocked()

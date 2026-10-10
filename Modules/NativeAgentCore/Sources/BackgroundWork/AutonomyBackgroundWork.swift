@@ -38,10 +38,10 @@ public enum AutonomyBackgroundWork {
             interval: 24 * 60 * 60,
             // Fail-safe: autonomy OFF ⇒ no proposals, no reconciliation. Read
             // the same enableAutonomy flag the Workshop execution gate uses.
-            isEnabled: {
+            gate: {
                 let policy = await trustCenter.loadTrustPolicy()
                 guard case .bool(true) = policy["enableAutonomy"] ?? .null else {
-                    return false
+                    return .off("autonomy disabled")
                 }
                 // Full Mac already supplies temporary runtime authority. Do
                 // not mint promotion prompts or permanently loosen saved
@@ -54,7 +54,7 @@ public enum AutonomyBackgroundWork {
                         isRemote: false
                     )
                 )
-                return !yolo.admitted
+                return yolo.admitted ? .notNeeded("under Full Mac") : nil
             },
             port: AutonomyPromotionInboxAdapter(inbox: inbox, dataRoot: dataRoot),
             // RAW saved toolAutonomy[tool]; nil if absent (absent ⇒ default/auto

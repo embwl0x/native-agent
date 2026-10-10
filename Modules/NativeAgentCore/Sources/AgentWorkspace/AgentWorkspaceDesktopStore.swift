@@ -140,7 +140,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "task_ledger_list": keys = ["task_id"]; required = []
             case "delegation_status": keys = ["task_id"]; required = []
             case "mail_search": keys = ["query", "scope", "mailbox", "unread", "sort", "from", "since", "category", "attachment"]; required = []
-            case "mail_list_recent": keys = ["expected_message_id", "expected_account", "scope", "mailbox", "all_categories", "unread", "sort", "from", "since", "category"]; required = []
+            case "mail_list_recent": keys = ["expected_message_id", "expected_account", "expected_account_id", "scope", "mailbox", "all_categories", "unread", "sort", "from", "since", "category"]; required = []
             case "messages_recent_threads": keys = ["thread_id", "query", "unread_only", "sort", "from_me", "since"]; required = []
             case "screen": keys = ["app", "part"]; required = []
             case "bot_list": keys = ["id"]; required = []

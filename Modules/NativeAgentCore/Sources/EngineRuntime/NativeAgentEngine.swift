@@ -128,6 +128,7 @@ public final class NativeAgentEngine: Sendable {
         self.deviceSync = deviceSync
         self.sync = SyncFacade(owner: deviceSync)
         let clients = EngineAgentContactClients()
+        AgentHostLaunches.install { AgentRecipeStore.launch($0) }
         self.agents = AgentContacts(dataRoot: dataRoot, clients: clients,
                                     completionSender: ports.completionSender(dataRoot))
         clients.attach(self)
@@ -135,43 +136,24 @@ public final class NativeAgentEngine: Sendable {
 
     /// The app's tool chain.
     ///
-    /// `includeEvolutionBridge` (2026-06-11, U4 Wave D): the self-evolution chat
-    /// tools (evolution_propose / evolution_status / self_install) reach their
-    /// backend only when this is true. FULLY-AUTONOMOUS turns with no human anywhere
-    /// in the loop — the reflection/dream/REM background loops, Slack, and iOS —
-    /// pass `false`, so those clients return a `bridge_not_wired`
-    /// envelope rather than reaching the store/stager. The claude/codex bridge
-    /// `/claude/message` path
-    /// keeps the default `true` as of the user's 2026-06-13 "open the bridges" call: it
-    /// IS Claude/codex collaborating as a team, and self_install there still only
-    /// STAGES a local-only confirm card the user resolves (never auto-installs). Genuine
-    /// local Mac desktop chat also keeps the default `true`. Telegram keeps the
-    /// bridge so authenticated Full Mac YOLO turns can use read-only
-    /// `evolution_status`; mutation tools still cross the ordinary TrustCenter and
-    /// approval floors before this backend can run.
-    ///
     /// `denyExternalMcp` (2026-06-13): on human-OUT-of-the-loop bridge clients the
     /// external MCP namespace (`mcp__*` — third-party connectors, including a wired
     /// real-money brokerage) must stay closed. A bridge turn has no human at the
     /// trigger and those connectors run side effects we cannot gate from here, so
     /// pass `true` to wrap the tool set in `ClaudeBridgeDenyDispatcher` (now an
     /// mcp__-only guard). NativeAgent-NATIVE tools — builder (shell/git/…),
-    /// integration-send, self-evolution — are FULLY available on the bridge per
+    /// integration-send — are FULLY available on the bridge per
     /// the user's 2026-06-13 call ("the bridges should be open"); they stay gated by the
-    /// SAME yolo window / Trust Center / self_install card path as local Mac chat,
+    /// SAME yolo window / Trust Center path as local Mac chat,
     /// not by a bridge-specific fence. Genuine local Mac chat (NativeClient) keeps
     /// the default `false`: MCP tools available, consent-gated, the user present.
     public func toolDispatchClient(
-        includeEvolutionBridge: Bool = true,
         denyExternalMcp: Bool = false,
         enforceAppAutonomy: Bool = true,
         swarmApprovalFiler: (any ApprovalFiler)? = nil,
         innerTools: (any ToolDispatchClient)? = nil
     ) -> any ToolDispatchClient {
         let dataRoot = self.dataRoot
-        let evolutionBridge: (any EvolutionToolBridge)? = includeEvolutionBridge
-            ? ports.evolutionBridge(dataRoot)
-            : nil
         // The app's own tools reach Core's one catalog through this port; a
         // root with no body has none of them.
         let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
@@ -189,7 +171,6 @@ public final class NativeAgentEngine: Sendable {
             // The 5 Phase-1 Mac integration chat tools reach their app-side
             // backends instead of returning `bridge_not_wired`.
             macIntegrationBridge: hasBody ? ports.macIntegration : nil,
-            evolutionBridge: evolutionBridge,
             appTools: appToolExecutor,
             agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
             a2aPushConfiguration: (hasBody ? ports : nil).map { ports in { @Sendable peer in
@@ -292,7 +273,6 @@ public final class NativeAgentEngine: Sendable {
         verifiedSessionId: String? = nil
     ) -> any ToolDispatchClient {
         let tools = toolDispatchClient(
-            includeEvolutionBridge: NativeAgentAppChatSurfaceProfile.bridge.includesEvolutionBridge,
             denyExternalMcp: false,
             innerTools: appInnerTools
         )
@@ -366,7 +346,6 @@ public final class NativeAgentEngine: Sendable {
                 ? NativeAgentChatApprovalFiler(dataRoot: dataRoot)
                 : nil)
         let tools = toolDispatchClient(
-            includeEvolutionBridge: profile.includesEvolutionBridge,
             denyExternalMcp: profile.deniesExternalMCP,
             // The shared ChatOrchestration membrane resolves autonomy once, after
             // SecurityCenter authenticates the exact origin, and owns approval

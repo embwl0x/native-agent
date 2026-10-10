@@ -51,6 +51,10 @@ public enum REMSupportKind: String, Sendable, Codable, Equatable {
     /// The entries behind it carry no provenance, so whether it recurred is
     /// NOT KNOWN. Said plainly instead of being read as support.
     case provenanceUnavailable = "provenance_unavailable"
+    /// Not a dream: a correction recalled in nearly every conversation, which
+    /// the weekly sweep offers to GROWTH. Its one passage cites `memory:<id>`;
+    /// approving graduates that memory.
+    case standing
 }
 
 public struct REMProposal: Sendable, Codable, Equatable {
@@ -386,10 +390,12 @@ public actor SwiftNativeREMConsolidator {
             let raw: String
             if let surface {
                 raw = try await llm.complete(
-                    prompt: prompt, system: system, model: model, surface: surface
+                    prompt: prompt, system: system, model: model, surface: surface, purpose: "rem"
                 )
             } else {
-                raw = try await llm.complete(prompt: prompt, system: system, model: model)
+                raw = try await LLMCallContext.$purpose.withValue("rem") {
+                    try await llm.complete(prompt: prompt, system: system, model: model)
+                }
             }
             proposals.append(contentsOf: parseLLMResponse(raw, target: docName))
         }

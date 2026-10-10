@@ -46,3 +46,53 @@ public protocol WorkflowOrchestrationClient: Sendable {
     /// (unsorted) registry back to disk when it differs from the saved bytes.
     func listWorkflows() async throws -> [JSONValue]
 }
+
+extension WorkflowOrchestrationClient {
+    /// The same list as records, for the Capabilities panel; a malformed row
+    /// fails the read.
+    public func listWorkflowRecords() async throws -> [WorkflowRecord] {
+        try await listWorkflows().map(WorkflowRecord.init(row:))
+    }
+}
+
+public struct WorkflowStep: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var title: String
+    public var kind: String?
+    public var status: String?
+    public var requiresApproval: Bool?
+    public var detail: String?
+}
+
+public struct WorkflowRecord: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var name: String
+    public var description: String?
+    public var status: String?
+    public var trigger: String?
+    public var steps: [WorkflowStep]
+    public var createdAt: String?
+    public var updatedAt: String?
+}
+
+extension WorkflowRecord {
+    init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            id: try row.string("id"), name: try row.string("name"),
+            description: try row.optionalString("description"), status: try row.optionalString("status"),
+            trigger: try row.optionalString("trigger"),
+            steps: try row.array("steps").map(WorkflowStep.init(row:)),
+            createdAt: try row.optionalString("createdAt"), updatedAt: try row.optionalString("updatedAt"))
+    }
+}
+
+extension WorkflowStep {
+    init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            id: try row.string("id"), title: try row.string("title"), kind: try row.optionalString("kind"),
+            status: try row.optionalString("status"), requiresApproval: try row.optionalBool("requiresApproval"),
+            detail: try row.optionalString("detail"))
+    }
+}

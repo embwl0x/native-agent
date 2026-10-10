@@ -18,11 +18,8 @@ import WorkshopExecution
 // Wave 21 (2026-06-01) closes the execution side of the carve once
 // SwiftNativeWorkshopRunner landed:
 //
-//   - Inbox fire_now with `stub=true` is now FULLY Swift-native. The five
-//     CANONICAL trigger kinds (file_watch, idle, time/morning_brief,
-//     execution_complete/execution_followup, session_pattern/stuck_pattern)
-//     each have their stub branch ported byte-for-byte from
-//     proactive_triggers.py `build_inbox_item(is_stub=True)`. A5.2
+//   - Inbox fire_now with `stub=true` builds evidence-backed time and idle
+//     content natively. A5.2
 //     (2026-07-24): the built card lands in `notifications/inbox.jsonl`
 //     via the app-side mirror seam; ProactiveInboxStore only runs the
 //     active-duplicate check (the legacy `<root>/inbox/` silo is retired).
@@ -303,8 +300,7 @@ public protocol TriggerSchedulerClient: Sendable {
 ///
 /// SCOPE NARROWING (WAVE 12 + WAVE 21) — Swift impl now covers fire_now end-to-end:
 ///   - fireInboxTrigger(isStub: true)  — FULLY native. Builds the per-kind
-///     stub InboxItem (file_watch / idle / morning_brief / execution_followup /
-///     stuck_pattern) byte-for-byte against proactive_triggers.py, dedups it
+///     evidence-backed morning brief or idle check-in, dedups it
 ///     via ProactiveInboxStore against the live inbox, and lands the card in
 ///     notifications/inbox.jsonl through the app-side mirror seam (A5.2).
 ///   - fireInboxTrigger(isStub: false) — explicit unsupported envelope unless
@@ -529,17 +525,10 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         defaultValue: [JSONValue]
     ) async throws -> [TriggerConfig] {
         let items = try loadConfigsForMutation(path: path, defaultValue: defaultValue)
-        // P2-4 read seam. `inbox/trigger_config.json` on a 0.3.x install still
-        // carries `{"name":"mission_followup","kind":"mission_complete"}`. Fold
-        // both fields HERE — the single point where the file becomes
-        // TriggerConfig values — so every downstream switch, filter, and label
-        // sees one vocabulary. The file itself is never rewritten; the mutation
-        // paths below match canonically and preserve each row's stored name.
-        return items.compactMap(TriggerConfig.init(json:)).map { cfg in
-            var canonical = cfg
-            canonical.name = ExecutionEventVocabulary.canonicalKind(cfg.name)
-            canonical.kind = cfg.kind.map(ExecutionEventVocabulary.canonicalKind)
-            return canonical
+        // Old inbox rows stay on disk; only kinds with a current owner are exposed.
+        let kinds = Set(defaultValue.compactMap(TriggerConfig.init(json:)).compactMap(\.kind))
+        return items.compactMap(TriggerConfig.init(json:)).filter { cfg in
+            defaultValue != Self._defaultInboxConfigs || cfg.kind.map(kinds.contains) == true
         }
     }
 
@@ -625,9 +614,11 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         // the user's triggers. There is no daemon to be in parity with. Corrupt
         // now quarantines the bytes and throws.
         var items: [JSONValue] = try Self.loadConfigsForMutation(path: path, defaultValue: defaultValue)
+        let kinds = Set(defaultValue.compactMap(TriggerConfig.init(json:)).compactMap(\.kind))
         var found = false
         for (idx, item) in items.enumerated() {
             guard case .object(var obj) = item,
+                  defaultValue != Self._defaultInboxConfigs || TriggerConfig(json: item)?.kind.map(kinds.contains) == true,
                   case .string(let nm) = obj["name"] ?? .null,
                   ExecutionEventVocabulary.matches(nm, name) else { continue }
             obj["enabled"] = .bool(enabled)
@@ -670,9 +661,11 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 var items: [JSONValue] = try Self.loadConfigsForMutation(
                     path: inboxPath, defaultValue: Self._defaultInboxConfigs
                 )
+                let kinds = Set(Self._defaultInboxConfigs.compactMap(TriggerConfig.init(json:)).compactMap(\.kind))
                 var found = false
                 for (idx, item) in items.enumerated() {
                     guard case .object(var obj) = item,
+                          TriggerConfig(json: item)?.kind.map(kinds.contains) == true,
                           case .string(let nm) = obj["name"] ?? .null,
                           ExecutionEventVocabulary.matches(nm, name) else { continue }
                     var existing: [String: JSONValue] = [:]
@@ -706,8 +699,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     // MARK: fire_now — Swift-native
 
     /// Mirrors daemon proactive_triggers.py::ProactiveTriggerScheduler.fire_now.
-    /// - isStub=true  → Time/Idle build evidence-backed InboxItems natively;
-    ///   configured placeholder kinds return an explicit unavailable error.
+    /// - isStub=true  → Time/Idle build evidence-backed InboxItems natively.
     /// - isStub=false → explicit error envelope because the non-stub
     ///   `build_inbox_item` branches invoke codex/connectors/runtime reads
     ///   that are not Swift-native yet.
@@ -753,33 +745,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         // Canonical-kind guard: unknown kinds return not_found (matches Python
         // which would have no per-kind trigger class to fire). Don't fall
         // through to a generic stub.
-        let canonicalKinds: Set<String> = [
-            "file_watch", "idle", "time", WorkshopCompletionTrigger.canonicalKind, "session_pattern",
-        ]
-        // `row.kind` already arrives canonical (`_readList` folds it), but fold
-        // again so a row handed in by a caller that bypassed the list path
-        // still matches. P2-4: 0.3.x configs say `mission_complete`.
-        guard let rowKind = row.kind.map(ExecutionEventVocabulary.canonicalKind),
-              canonicalKinds.contains(rowKind) else {
+        guard let rowKind = row.kind, rowKind == "time" || rowKind == "idle" else {
             return TriggerFireResult(status: "not_found", name: name, stub: true)
-        }
-
-        // Manual or API callers may only surface content grounded in current
-        // runtime evidence. The other canonical kinds remain configured but
-        // dormant until their missing diff/completion/register signals exist.
-        guard rowKind == "time" || rowKind == "idle" else {
-            return TriggerFireResult(
-                status: "error",
-                name: name,
-                stub: false,
-                error: "trigger '\(name)' cannot fire yet because its evidence-backed content path is unavailable"
-            )
         }
 
         // Swift-native fire path. Only `morning_brief` (time) and
         // `idle_checkin` (idle) reach this point, and both carry real content.
         do {
-            let built = try await _buildInboxItem(kind: rowKind, row: row, name: name)
+            let item = try await _buildInboxItem(kind: rowKind)
             guard inboxMasterOn else {
                 return TriggerFireResult(
                     status: "disabled", name: name, stub: isStub,
@@ -790,14 +763,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 root: root,
                 persistence: persistence
             )
-            let id = try await store.surface(built.item)
+            let id = try await store.surface(item)
 
             // `surface` SUPPRESSES an active duplicate (same source+title+summary,
             // still unread/read, within 7 days) and hands back the EXISTING id
             // instead of appending. When that happens no new card appeared, so
             // pushing would notify User about something already sitting in his
             // inbox. Detect it by identity: the id we minted vs the id we got.
-            let deduped = (id != Self.itemId(of: built.item))
+            let deduped = (id != Self.itemId(of: item))
 
             // NOTIFY + RECEIPT: ONE uninterrupted await chain. The push may be
             // suppressed by config or by dedupe; the receipt NEVER is. A fire
@@ -812,7 +785,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 detail += "; suppressed as a duplicate of an active inbox item — no push"
             } else if Self.resolveNotify(row) {
                 if let notifier {
-                    delivery = await notifier(Self.notification(for: built.item, name: name, kind: rowKind))
+                    delivery = await notifier(Self.notification(for: item, name: name, kind: rowKind))
                     // `notified` tracks the notifier's RETURN, not its invocation
                     // (gpt-5.5 review, 2026-07-09): a `.null` return means the
                     // sender handled NOTHING — for the app notifier, the real-inbox
@@ -857,8 +830,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             }
 
             await appendTriggerEvent(
-                item: built.item, itemId: id, name: name, kind: rowKind,
-                notified: notified, placeholder: built.isPlaceholder, deduped: deduped,
+                item: item, itemId: id, name: name, kind: rowKind,
+                notified: notified, placeholder: false, deduped: deduped,
                 delivery: delivery, status: status, detail: detail
             )
 
@@ -867,8 +840,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             // inbox app-side. Deduped fires carry no item: the card they'd
             // mirror is the one already sitting in the inbox (board M18).
             return TriggerFireResult(
-                status: "fired", name: name, itemId: id, stub: built.isPlaceholder,
-                item: deduped ? nil : built.item, notified: notified
+                status: "fired", name: name, itemId: id, stub: false,
+                item: deduped ? nil : item, notified: notified
             )
         } catch {
             return TriggerFireResult(status: "error", name: name, stub: isStub,
@@ -1090,12 +1063,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         // AUDIT 2026-06-09 (live regression, shipped 2026-06-03 as "PATCH T2"):
         // this used to fire EVERY enabled trigger on EVERY 60s tick, storming
         // the inbox with content-free stubs. W3c (2026-07-01) LIGHTS the
-        // periodic path honestly: the tick fires ONLY triggers whose per-kind
-        // condition approves (`scheduledInstantIfDue`). Today that is the `time`
-        // kind (hour/minute reached + not-already-fired-for-this-occurrence).
-        // idle / file_watch / execution_complete / session_pattern stay dark —
-        // see the note on `scheduledInstantIfDue` for why each is not yet a
-        // self-firing condition.
+        // periodic path honestly: the tick fires ONLY time or idle triggers
+        // whose per-kind condition approves (`scheduledInstantIfDue`).
         //
         // ATOMIC CLAIM (W3c review Finding 1, 2026-07-01): dueness and the
         // "I fired this occurrence" stamp are NOT separate steps. Two
@@ -1315,23 +1284,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     ///     `last >= scheduled`, so one fire per idle episode — and a new user
     ///     message advances lastActivity, which advances the next episode's
     ///     instant, which un-holds the claim. No activity signal ⇒ still dark.
-    ///
-    /// The remaining kinds stay DARK, each for an honest reason — NOT laziness:
-    ///
-    ///   - `file_watch` — a cheap mtime check on `config.paths` IS possible,
-    ///     but the Swift-native fire path only emits a content-free STUB ("file
-    ///     watcher trigger is wired"); the real changed-file summary lives in
-    ///     the non-stub branch that isn't Swift-native yet (see
-    ///     fireInboxTrigger isStub:false). Self-firing a stub on every save is
-    ///     noise, not the advertised capability. Light this once the non-stub
-    ///     diff path lands.
-    ///   - `execution_complete` — needs to detect an ACTUAL newly-completed
-    ///     execution; the config is empty and no completion cursor is tracked
-    ///     here, and the fire path is a placeholder "Stub Execution".
-    ///   - `session_pattern` — needs live conversation-register state
-    ///     (`min_turns_in_register`) that the scheduler cannot see.
-    ///
-    /// When a dark kind's real condition lands, add its case here.
     ///
     /// `nonisolated` so `claimIfDue`'s locked RMW body (a `@Sendable` closure)
     /// can recompute it INSIDE the flock — it touches only the immutable
@@ -1634,19 +1586,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     // MARK: InboxItem builder
 
-    /// Build the JSONValue body matching daemon inbox.py::InboxItem.to_dict().
-    ///
-    /// `isPlaceholder` is the honest answer to "is this content fabricated?":
-    ///   - `time` / `idle` → REAL content from `TriggerContentBuilder` (desk,
-    ///     worklog, executions, inbox, last session). `isPlaceholder == false`.
-    ///   - the other three → still placeholders, each with an explicit marker
-    ///     naming the signal that is missing. `isPlaceholder == true`.
-    ///
-    /// `TriggerFireResult.stub` is set from `isPlaceholder`, so the field stops
-    /// claiming that a real morning brief is a stub.
-    private func _buildInboxItem(
-        kind: String, row: TriggerConfig, name: String
-    ) async throws -> (item: JSONValue, isPlaceholder: Bool) {
+    /// Build an inbox item from current runtime evidence.
+    private func _buildInboxItem(kind: String) async throws -> JSONValue {
         let id = uuid()
         let createdAt = Self.isoTimestamp(now())
         let source: String
@@ -1654,43 +1595,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         let title: String
         let summary: String
         let detail: JSONValue
-        var relatedPaths: JSONValue = .null
-        var relatedWorkshopExecutionId: JSONValue = .null
-        var isPlaceholder = true
 
         let content = TriggerContentBuilder(
             root: root, persistence: persistence, now: now, worklogPath: worklogPath
         )
 
         switch kind {
-        case "file_watch":
-            // proactive_triggers.py L261-295 (is_stub branch). Port watched
-            // paths from row.config["paths"][:3] → basename-only source
-            // suffix + count-suffix title + related_paths array.
-            var paths: [String] = []
-            if case .object(let cfg)? = row.config,
-               case .array(let arr) = cfg["paths"] ?? .null {
-                for v in arr.prefix(3) {
-                    if case .string(let s) = v { paths.append(s) }
-                }
-            }
-            let suffix: String
-            if paths.isEmpty {
-                suffix = "stub"
-            } else {
-                suffix = paths.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ",")
-            }
-            source = "trigger:file_watch:\(suffix)"
-            severity = "info"
-            title = "File change detected" + (paths.count > 1 ? " (\(paths.count) files)" : "")
-            // stub: not yet ported — real content needs the CHANGED-FILE DIFF
-            // (which paths changed, and how). Only `config.paths` is knowable
-            // here; no mtime cursor or diff summary is persisted. Declared, not
-            // silent: `stub: true` on the fire result, and the `file_watch` kind
-            // stays dark on the periodic tick for exactly this reason.
-            summary = "Stub: file watcher trigger is wired."
-            detail = .null
-            relatedPaths = paths.isEmpty ? .null : .array(paths.map { .string($0) })
         case "idle":
             // REAL content. Quiet duration from max(updatedAt) over
             // chat/sessions.json + one live fact (open desk count, else the
@@ -1701,7 +1611,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             title = built.title
             summary = built.summary
             detail = built.detail
-            isPlaceholder = false
         case "time":
             // REAL content. Desk + worklog + Workshop executions + unread + last session,
             // every section fail-open. Title keeps its "%A, %B %-d" label.
@@ -1717,38 +1626,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             title = built.title
             summary = built.summary
             detail = built.detail
-            isPlaceholder = false
-        case WorkshopCompletionTrigger.canonicalKind:
-            // stub: not yet ported — real content needs a COMPLETION CURSOR
-            // (which execution newly finished since the last fire). The scheduler
-            // tracks no such cursor, so it cannot name the execution. Declared,
-            // not silent.
-            source = "\(WorkshopCompletionTrigger.canonicalKind):stub"
-            severity = "actionable"
-            title = "Workshop complete: Stub task"
-            summary = "Stub: Workshop task completed. Want to see results?"
-            detail = .null
-            relatedWorkshopExecutionId = .null
-        case "session_pattern":
-            // stub: not yet ported — real content needs the live CONVERSATION
-            // REGISTER (`min_turns_in_register`), which lives in the chat turn
-            // engine, not on disk. The nudge text is generic on purpose; it
-            // cannot cite what we're circling. Declared, not silent.
-            source = "trigger:stuck_pattern"
-            severity = "info"
-            title = "We might be circling"
-            summary = "I notice we've been circling this. Want to step back and look at it differently?"
-            detail = .string("This is a gentle nudge — not a judgment. Sometimes a different angle helps. You can dismiss this.")
         default:
             // Defensive: the caller's canonical-kind guard should make this
             // unreachable, but a guarded fatalError would crash the whole
             // scheduler if that invariant ever breaks. Fail loud + honest
             // instead — the caller's do/catch turns this into an
             // {status:"error"} envelope, never a crash.
-            Self.logger.error("unhandled trigger kind '\(kind, privacy: .public)' reached stub builder — refusing to fabricate an item")
             throw TriggerSchedulerError.invalidRequest("unhandled trigger kind: \(kind)")
         }
-        _ = row // row kept in signature for symmetry with build_inbox_item(runtime, is_stub)
 
         // Match _STANDARD_ACTIONS shape.
         let actions: JSONValue = .array([
@@ -1766,15 +1651,15 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             "title": .string(title),
             "summary": .string(summary),
             "detail": detail,
-            "related_mission_id": relatedWorkshopExecutionId,
+            "related_mission_id": .null,
             "related_approval_id": .null,
-            "related_paths": relatedPaths,
+            "related_paths": .null,
             "related_groups": .null,
             "actions": actions,
             "status": .string("unread"),
             "read_at": .null,
         ])
-        return (item, isPlaceholder)
+        return item
     }
 
     /// Same shape as MCPDispatcher.isoTimestamp / ApprovalInbox stamps.
@@ -1796,24 +1681,13 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         return try await task.value
     }
 
-    // MARK: defaults — must stay byte-equivalent to daemon defaults
+    // MARK: defaults
 
-    /// Mirrors the retired daemon::_DEFAULT_TRIGGER_CONFIGS (L789-L825).
-    /// The file gets seeded with this exact list on first write (daemon
-    /// `_ensure_config`).
-    ///
     /// Every proactive lane ships OFF. Existing installs' `trigger_config.json`
     /// is merged against this list by name, so an install that already wrote
     /// the file keeps whatever the user chose — flipping a seed value here only
     /// ever changes what a FRESH root starts with.
     nonisolated static let _defaultInboxConfigs: [JSONValue] = [
-        .object([
-            "name": .string("file_watch"),
-            "kind": .string("file_watch"),
-            "enabled": .bool(false),
-            "config": .object(["paths": .array([])]),
-            "description": .string("Watch files for changes and summarize what changed."),
-        ]),
         .object([
             "name": .string("idle_checkin"),
             "kind": .string("idle"),
@@ -1847,20 +1721,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 "notify": .bool(true),
             ]),
             "description": .string("Daily morning brief at configured hour."),
-        ]),
-        .object([
-            "name": .string(WorkshopCompletionTrigger.canonicalName),
-            "kind": .string(WorkshopCompletionTrigger.canonicalKind),
-            "enabled": .bool(true),
-            "config": .object([:]),
-            "description": .string("Notify when a Workshop task completes."),
-        ]),
-        .object([
-            "name": .string("stuck_pattern"),
-            "kind": .string("session_pattern"),
-            "enabled": .bool(false),
-            "config": .object(["min_turns_in_register": .int(3)]),
-            "description": .string("Gentle nudge when conversation is circling."),
         ]),
     ]
 

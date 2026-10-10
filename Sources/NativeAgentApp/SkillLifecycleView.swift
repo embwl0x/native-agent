@@ -185,143 +185,11 @@ enum SkillBuildButtonPresentation {
     }
 }
 
-/// The pointer-sync receipt is the only confirmation that skill bodies were
-/// reconciled into recallable memory pointers. Do not infer that outcome from
-/// the currently loaded manifest list: it can be stale, filtered, or reflect
-/// a different source shelf.
-enum SkillPointerSyncReceiptPresentation {
-    struct Receipt: Equatable, Sendable {
-        let at: String
-        let added: Int
-        let updated: Int
-        let removed: Int
-        let unchanged: Int
-
-        var reconciledPointerCount: Int { added + updated + unchanged }
-    }
-
-    enum State: Equatable, Sendable {
-        case loading
-        case current(Receipt)
-        case failed(detail: String)
-        case unavailable(detail: String)
-    }
-
-    /// The sync writer and the Skills surface share this exact data-root
-    /// boundary.  A receipt from another app body must never make the current
-    /// root claim that its skill pointers are reconciled.
-    static func receiptURL(dataRoot: URL) -> URL {
-        dataRoot
-            .standardizedFileURL
-            .appendingPathComponent("skills/.pointer_sync_receipt.json")
-    }
-
-    static func read(dataRoot: URL) -> State {
-        read(at: receiptURL(dataRoot: dataRoot))
-    }
-
-    static func read(at url: URL) -> State {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: url.path) else {
-            return .unavailable(detail: "No memory check has run yet.")
-        }
-        do {
-            let data = try Data(contentsOf: url)
-            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let status = object["status"] as? String else {
-                return .unavailable(detail: "The memory check record could not be read.")
-            }
-            switch status.lowercased() {
-            case "ok":
-                guard let at = nonEmptyString(object["at"]),
-                      let added = nonNegativeInt(object["added"]),
-                      let updated = nonNegativeInt(object["updated"]),
-                      let removed = nonNegativeInt(object["removed"]),
-                      let unchanged = nonNegativeInt(object["unchanged"])
-                else {
-                    return .unavailable(detail: "The memory check record is incomplete.")
-                }
-                return .current(Receipt(
-                    at: at,
-                    added: added,
-                    updated: updated,
-                    removed: removed,
-                    unchanged: unchanged
-                ))
-            case "failed":
-                return .failed(detail: boundedDetail(nonEmptyString(object["error"]) ?? "unknown"))
-            default:
-                return .unavailable(detail: "The memory check record has a status this page does not recognise.")
-            }
-        } catch {
-            return .unavailable(detail: UserFacingError.message(error, action: "read the memory check record"))
-        }
-    }
-
-    static func line(for state: State) -> String {
-        switch state {
-        case .loading:
-            return "Checking that memory knows about every skill…"
-        case .current(let receipt):
-            return "\(receipt.reconciledPointerCount) skills I can find · checked \(friendlyTime(receipt.at))"
-        case .failed(let detail):
-            return "The memory check failed · \(boundedDetail(detail))"
-        case .unavailable(let detail):
-            return "The memory check result is unavailable · \(boundedDetail(detail))"
-        }
-    }
-
-    private static func nonEmptyString(_ value: Any?) -> String? {
-        guard let value = value as? String else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func nonNegativeInt(_ value: Any?) -> Int? {
-        // The writer's durable schema stores every receipt field as a string.
-        // Reject coerced JSON values and implausible counts rather than making
-        // a malformed receipt look like an enormous completed reconciliation.
-        guard let text = value as? String,
-              let integer = Int(text),
-              (0...100_000).contains(integer) else { return nil }
-        return integer
-    }
-
-    private static func boundedDetail(_ detail: String, limit: Int = 240) -> String {
-        let normalized = detail.trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalized.truncated(to: limit)
-    }
-
-    private static func friendlyTime(_ iso: String) -> String {
-        UserDisplayFormatters.relativeISOTimestamp(iso, unitsStyle: .short, fallback: "at an unknown time")
-    }
-}
-
-struct SkillPointerSyncReceiptLine: View {
-    let state: SkillPointerSyncReceiptPresentation.State
-
-    var body: some View {
-        Text(SkillPointerSyncReceiptPresentation.line(for: state))
-            .font(ShellType.caption)
-            .foregroundStyle(color)
-            .lineLimit(1)
-            .help("Every skill gets a one-line note in memory so I can find it. Checked at launch and whenever skills change.")
-    }
-
-    private var color: Color {
-        switch state {
-        case .current, .loading: return NativeAgentShell.secondary
-        case .failed, .unavailable: return NativeAgentShell.trouble
-        }
-    }
-}
-
 struct SkillLifecycleView: View {
     @Environment(AppModel.self) private var appModel
     @State private var searchText = ""
     @State private var reviewTarget: SkillInfo?
     @State private var readerTarget: SkillInfo?
-    @State private var syncReceiptState: SkillPointerSyncReceiptPresentation.State = .loading
     private let loadsOnAppear: Bool
 
     init(initialSearchText: String = "", loadsOnAppear: Bool = true) {
@@ -351,10 +219,7 @@ struct SkillLifecycleView: View {
                 .accessibilityIdentifier("skills.lifecycle.build")
 
                 Button(appModel.isLoadingSkillManifests ? "Refreshing…" : "Refresh") {
-                    Task {
-                        await appModel.loadSkillManifests()
-                        await loadSyncReceipt()
-                    }
+                    Task { await appModel.loadSkillManifests() }
                 }
                 .buttonStyle(.naFeel)
                 .disabled(appModel.isLoadingSkillManifests)
@@ -381,7 +246,6 @@ struct SkillLifecycleView: View {
                     .accessibilityLabel("Clear skill search")
                     .accessibilityIdentifier("skills.lifecycle.search.clear")
                 }
-                SkillPointerSyncReceiptLine(state: syncReceiptState)
                 Spacer(minLength: 8)
             }
 
@@ -452,7 +316,6 @@ struct SkillLifecycleView: View {
         .task {
             guard loadsOnAppear else { return }
             await appModel.loadSkillManifests()
-            await loadSyncReceipt()
         }
         .sheet(item: $reviewTarget) { info in
             SkillReviewSheet(info: info, onDismiss: {
@@ -479,21 +342,6 @@ struct SkillLifecycleView: View {
             ) { readerTarget = nil }
         }
     }
-
-    /// Read the pointer-sync receipt the launch/mutation syncs write. Missing
-    /// or malformed evidence stays visibly unavailable rather than reading as
-    /// an empty successful sync.
-    ///
-    /// Render-cost audit F9: the `Data(contentsOf:)` + `JSONSerialization`
-    /// pair used to run synchronously on the MainActor on every appear. Same
-    /// parse, same resulting line, now off the main thread.
-    private func loadSyncReceipt() async {
-        let dataRoot = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        syncReceiptState = await Task.detached(priority: .utility) {
-            SkillPointerSyncReceiptPresentation.read(dataRoot: dataRoot)
-        }.value
-    }
-
 }
 
 // MARK: - One skill row

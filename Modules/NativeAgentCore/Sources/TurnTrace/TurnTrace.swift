@@ -1391,7 +1391,9 @@ public struct TurnTraceRecentReader: Sendable {
     }
 
     /// Unwindowed history shares a tail budget; since reads the complete retained window.
-    public func read(now: Date = Date(), history: Bool = false, since: Date? = nil) async throws -> Snapshot {
+    /// With `holding`, since parses only the lines holding one of its marks (a
+    /// kind, a turn id) and skips the rest unparsed.
+    public func read(now: Date = Date(), history: Bool = false, since: Date? = nil, holding marks: [String] = []) async throws -> Snapshot {
         let sourceURL = lane.path(for: now)
         let paths: [URL]
         var oldestRetainedDay: Date?
@@ -1426,10 +1428,19 @@ public struct TurnTraceRecentReader: Sendable {
             }
             if let since {
                 sources.append(path)
-                let receipt = try await persistence.readJSONLReporting(path)
-                // A torn line (e.g. a write cut by a crash) marks the window incomplete; it must not hide the rest.
-                if receipt.report.malformedLineCount > 0 { truncated = true }
-                for row in receipt.rows {
+                let rows: [JSONValue]
+                if marks.isEmpty {
+                    let receipt = try await persistence.readJSONLReporting(path)
+                    // A torn line (e.g. a write cut by a crash) marks the window incomplete; it must not hide the rest.
+                    if receipt.report.malformedLineCount > 0 { truncated = true }
+                    rows = receipt.rows
+                } else {
+                    let needles = marks.map { Data($0.utf8) }
+                    let lines = try Data(contentsOf: path).split(separator: 0x0A).filter { line in needles.contains { line.range(of: $0) != nil } }
+                    rows = lines.compactMap { try? JSONValue.parse(Data($0)) }
+                    if rows.count < lines.count { truncated = true }
+                }
+                for row in rows {
                     guard case .object(let object) = row, case .string(let ts)? = object["ts"],
                           let stamp = TurnTraceEvent.parseISO8601(ts),
                           let event = TurnTraceEvent(jsonRow: row) else { truncated = true; continue }
@@ -1446,6 +1457,125 @@ public struct TurnTraceRecentReader: Sendable {
             truncated = truncated || receipt.truncatedToByteWindow || remainingRows <= 0
         }
         return Snapshot(sourceURL: sourceURL, events: events, sourceURLs: sources, truncated: truncated, oldestRetainedDay: oldestRetainedDay)
+    }
+
+    public func modelCalls(now: Date = Date()) async throws -> JSONValue {
+        let path = lane.path(for: now).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("traces/events.jsonl")
+        let receipt = try await persistence.readJSONLReporting(path)
+        var calls: [(Date, String, String, Int64?)] = []
+        var oldest: Date?
+        for row in receipt.rows {
+            guard case .object(let object) = row,
+                  case .string(let rawDate)? = object["createdAt"],
+                  let date = TurnTraceEvent.parseISO8601(rawDate) else {
+                throw PersistenceCoreError.ioFailure("Model calls: a trace row has no readable createdAt; repair traces/events.jsonl.")
+            }
+            oldest = min(oldest ?? date, date)
+            guard object["kind"] == .string("llm.call"), date <= now,
+                  date >= now.addingTimeInterval(-7 * 86_400) else { continue }
+            guard case .object(let payload)? = object["payload"] else {
+                throw PersistenceCoreError.ioFailure("Model calls: a call has no payload; repair traces/events.jsonl.")
+            }
+            let purpose = if case .string(let value)? = payload["purpose"] { value } else { "other" }
+            let turn = if case .string(let value)? = payload["turnId"], !value.isEmpty { value } else { "unknown" }
+            let duration: Int64? = if case .int(let value)? = payload["durationMs"], value >= 0 { value } else { nil }
+            calls.append((date, purpose, turn, duration))
+        }
+        // Rounds come from each turn's terminal row in the turn traces, which
+        // keep the week events.jsonl does not; only those rows are parsed.
+        let weekAgo = now.addingTimeInterval(-7 * 86_400)
+        let week = try await read(now: now, since: weekAgo, holding: ["turn.terminal"])
+        let rounds = Self.rounds(week.events)
+        let windows: [JSONValue] = [("24h", 86_400.0), ("7d", 7 * 86_400.0)].map { label, seconds in
+            let since = now.addingTimeInterval(-seconds)
+            let finished = rounds.filter { $0.at >= since }.map(\.rounds)
+            var turns: [String: [String: Int64]] = [:]
+            var totals: [String: Int64] = [:]
+            var durations: [String: Int64] = [:]
+            var missingDuration: Int64 = 0
+            for (date, purpose, turn, duration) in calls where date >= since {
+                turns[turn, default: [:]][purpose, default: 0] += 1
+                totals[purpose, default: 0] += 1
+                if let duration { durations[purpose, default: 0] += duration }
+                else { missingDuration += 1 }
+            }
+            return .object([
+                "window": .string(label), "since": .string(since.formatted(.iso8601)),
+                "counts_by_purpose": .object(totals.mapValues(JSONValue.int)),
+                "per_turn": .array(turns.keys.sorted().map {
+                    .object(["turn_id": .string($0), "counts_by_purpose": .object(turns[$0]!.mapValues(JSONValue.int))])
+                }),
+                "top_five_by_total_ms": .array(durations.keys.sorted {
+                    durations[$0] == durations[$1] ? $0 < $1 : durations[$0]! > durations[$1]!
+                }.prefix(5).map { .object(["purpose": .string($0), "total_ms": .int(durations[$0]!)]) }),
+                "missing_duration_calls": .int(missingDuration),
+                "predates_retained_rows": .bool(oldest.map { since < $0 } ?? true),
+                "rounds_per_turn": .object(["turns": .int(Int64(finished.count)),
+                    "p50": Self.percentile(finished, 0.5).map { .int(Int64($0)) } ?? .null,
+                    "p90": Self.percentile(finished, 0.9).map { .int(Int64($0)) } ?? .null]),
+            ])
+        }
+        // The week's five heaviest asks and the first six calls each made: her
+        // own, refusals included; a call run inside another names its parent.
+        let top = rounds.sorted { $0.rounds > $1.rounds }.prefix(5)
+        let asks = top.isEmpty ? [] : try await read(now: now, since: weekAgo, holding: top.map(\.turn)).events
+        let heaviest: [JSONValue] = top.map { turn in
+            var ask = "", made: [String] = []
+            for event in asks where event.turnId == turn.turn {
+                guard case .object(let payload) = event.payload else { continue }
+                if event.kind == "work.identified", case .string(let title)? = payload["title"] { ask = String(title.prefix(80)) }
+                guard event.kind == "tool.dispatch", payload["phase"] == .string("end"), payload["parentId"] == nil else { continue }
+                made.append(Self.callLabel(payload) + (payload["status"] == .string("failed") ? "!" : ""))
+            }
+            return .object(["turn_id": .string(turn.turn), "at": .string(turn.at.formatted(.iso8601)),
+                            "rounds": .int(Int64(turn.rounds)), "ask": .string(ask),
+                            "first_six": .array(made.prefix(6).map(JSONValue.string))])
+        }
+        return .object([
+            "status": .string(receipt.report.malformedLineCount == 0 && !receipt.report.trailingPartialLine ? "ok" : "incomplete"),
+            "title": .string("Model calls"), "until": .string(now.formatted(.iso8601)),
+            "measurement": .string("Recorded llm.call rows in traces/events.jsonl, including recorded failures. Unbound calls use turn_id unknown; unlabelled older calls use purpose other. Windows may exceed retained rows. Missing durations are not estimated. rounds_per_turn is each finished turn's model rounds (its first call and one per tool round, from its turn.terminal row in the per-day turn traces), nearest-rank p50/p90; heaviest_asks are the week's five turns with the most rounds, ! marking a call that failed."),
+            "malformed_rows": .int(Int64(receipt.report.malformedLineCount)),
+            "trailing_partial_line": .bool(receipt.report.trailingPartialLine),
+            "windows": .array(windows),
+            "heaviest_asks": .array(heaviest),
+            "turn_traces_incomplete": .bool(week.truncated),
+        ])
+    }
+
+    /// Each finished turn's model rounds: its first call and one per tool
+    /// round, as its terminal row counts them.
+    public static func rounds(_ events: [TurnTraceEvent]) -> [(turn: String, at: Date, rounds: Int)] {
+        events.compactMap { event in
+            guard event.kind == "turn.terminal", case .object(let payload) = event.payload,
+                  case .int(let rounds)? = payload["providerRoundCount"] else { return nil }
+            return (event.turnId, event.ts, Int(rounds))
+        }
+    }
+
+    /// Nearest-rank percentile; nil with nothing to rank.
+    public static func percentile(_ values: [Int], _ p: Double) -> Int? {
+        let sorted = values.sorted()
+        return sorted.isEmpty ? nil : sorted[max(0, Int((Double(sorted.count) * p).rounded(.up)) - 1)]
+    }
+
+    /// An app call as heaviest_asks names it: its action, or what it read.
+    static func callLabel(_ payload: [String: JSONValue]) -> String {
+        if case .object(let receipt)? = payload["receipt"], case .string(let action)? = receipt["action"], action != "app" { return action }
+        let args: [String: JSONValue] = if case .string(let raw)? = payload["args"],
+            case .object(let args)? = try? JSONValue.parse(Data(raw.utf8)) { args } else { [:] }
+        // A long script's args are clipped past parsing; its key names still say what it was.
+        let keys: [JSONValue] = if case .array(let names)? = payload["argKeys"] { names } else { args.keys.map(JSONValue.string) }
+        let blank: [JSONValue] = [.null, .string(""), .array([])]
+        guard let key = ["actions", "script", "find", "page", "item"].first(where: {
+            keys.contains(.string($0)) && !blank.contains(args[$0] ?? .bool(true))
+        }) else { return "home" }
+        switch args[key] {
+        case .array(let list)?: return "\(key)[\(list.count)]"
+        case .string(let text)? where ["page", "item"].contains(key): return key + " " + text
+        default: return key
+        }
     }
 
     public func usage(since: Date, now: Date = Date(), by: String = "model") async throws -> JSONValue {

@@ -68,11 +68,7 @@ public actor BackgroundLoopsManager {
                         reason: BackgroundLoopsAssembly.telegramUnconfiguredReason
                     )
             case "slack_socket_mode":
-                return BackgroundLoopsAssembly.makeSlackSocketModeLoopIfConfigured()
-                    ?? BackgroundLoopsAssembly.unconfiguredLanePlaceholder(
-                        loopId: "slack_socket_mode",
-                        reason: BackgroundLoopsAssembly.slackUnconfiguredReason
-                    )
+                return BackgroundLoopsAssembly.makeSlackSocketModeLane()
             case "doctor_auto_run":
                 return BackgroundLoopsAssembly.makeAutoDoctorLoop()
             default:
@@ -80,7 +76,7 @@ public actor BackgroundLoopsManager {
             }
         },
         runAutoDoctorAtLaunch: @escaping @Sendable () -> Bool = {
-            let config = NativeClient.readAutoDoctorConfig(dataRoot: PersistenceCore.defaultDataRoot())
+            let config = DoctorStatusProjection.readAutoDoctorConfig(dataRoot: PersistenceCore.defaultDataRoot())
             return (config.enabled ?? true) && (config.runOnStartup ?? true)
         },
         // A4.8a: injectable so tests can suppress the fire-and-forget launch
@@ -123,7 +119,7 @@ public actor BackgroundLoopsManager {
         }
         let didStart = await coreManager.start(loops: loops)
         guard didStart else { return }
-        Task { await NativeClient().wakeDoctorForPendingTransitions() }
+        Task { await AppDoctorPort(dataRoot: PersistenceCore.defaultDataRoot()).wakeDoctorForPendingTransitions() }
         // Heartbeat's periodic cadence is intentionally low-noise (twice
         // daily), but the status receipt should refresh after app restart.
         // Run a best-effort one-shot off the actor path so an anomalous
@@ -519,9 +515,7 @@ public actor MemorySpotlightBootstrap {
         #endif
         let client = indexClientOverride ?? defaultClient
         let indexer = SwiftNativeMemoryIndexer(client: client)
-        let batch = memories
-            .filter { !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) }
-            .map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
+        let batch = memories.map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
         do {
             // A generation mismatch is a reconciliation, not an additive
             // refresh. Clear the derived domain first so deleted canonical rows

@@ -8,6 +8,7 @@ import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import MemoryV2
+import AppToolRuntime
 import ToolRegistry
 import KnowledgeGraph
 import XConnector
@@ -91,12 +92,9 @@ extension AppModel {
     @MainActor
     func deleteSkill(_ skill: SkillRecord) async {
         do {
-            _ = try await client.deleteSkill(id: skill.id)
+            try await NativeSkillRegistryActions.deleteSkill(id: skill.id, dataRoot: engine.dataRoot)
             statusText = "Skill deleted"
             await refreshAll()
-        } catch let partial as SkillMutationRecallReconciliationError {
-            await refreshAll()
-            statusText = partial.localizedDescription
         } catch {
             setFailureStatus(error, action: "delete that skill")
         }
@@ -106,9 +104,9 @@ extension AppModel {
     @MainActor
     func loadSkillManifests() async {
         isLoadingSkillManifests = true
-        let api = client
-        async let registryEntriesTask: [SkillRegistryEntry] = try await api.readSkillRegistry()
-        async let learnedSkillsTask: [SkillRecord] = try await api.getSkills()
+        let root = engine.dataRoot
+        async let registryEntriesTask: [SkillRegistryEntry] = try await makeSkillsClient(root: root).listManifestSkillEntries()
+        async let learnedSkillsTask: [SkillRecord] = try await RuntimeReadProjection.skills(dataRoot: engine.dataRoot)
         var failures: [String] = []
         let entries: [SkillRegistryEntry]
         do {
@@ -129,7 +127,6 @@ extension AppModel {
         // mainactor_icloud: the per-skill manifest/README reads below use synchronous
         // Data(contentsOf:)/String(contentsOf:) disk I/O. Run them off the main thread
         // (awaited to preserve ordering), then hop back to @MainActor for state below.
-        let skillClient = client
         let infos: [SkillInfo] = await Task.detached(priority: .utility) {
             var infos: [SkillInfo] = []
             var seenIds = Set<String>()
@@ -142,9 +139,9 @@ extension AppModel {
             for entry in entries {
                 let key = entry.name.lowercased()
                 if seenIds.contains(key) { continue }
-                let manifest = try? skillClient.readSkillManifest(entry: entry)
+                let manifest = try? Self.readSkillManifest(entry: entry, dataRoot: root)
                 if let manifest {
-                    let readme = try? skillClient.readSkillReadme(entry: entry)
+                    let readme = try? Self.readSkillReadme(entry: entry, dataRoot: root)
                     infos.append(SkillInfo(id: entry.name, manifest: manifest, registry: entry, readme: readme))
                     seenIds.insert(entry.name.lowercased())
                 }
@@ -160,6 +157,35 @@ extension AppModel {
         isLoadingSkillManifests = false
     }
 
+    /// A manifest-registry skill's manifest.json, from its directory (v1 fallback).
+    private nonisolated static func readSkillManifest(entry: SkillRegistryEntry, dataRoot: URL) throws -> SkillManifest {
+        let data = try Data(contentsOf: skillDirectory(entry, dataRoot: dataRoot).appendingPathComponent("manifest.json"))
+        return try JSONDecoder.nativeAgent.decode(SkillManifest.self, from: data)
+    }
+
+    /// Its README.md if present, previewed past 64 KB (v1 fallback).
+    private nonisolated static func readSkillReadme(entry: SkillRegistryEntry, dataRoot: URL) throws -> String? {
+        let readmeURL = skillDirectory(entry, dataRoot: dataRoot).appendingPathComponent("README.md")
+        guard FileManager.default.fileExists(atPath: readmeURL.path) else { return nil }
+        let attrs = try FileManager.default.attributesOfItem(atPath: readmeURL.path)
+        let byteCount = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        let previewLimit = 64 * 1024
+        if byteCount <= previewLimit {
+            return try String(contentsOf: readmeURL, encoding: .utf8)
+        }
+        let handle = try FileHandle(forReadingFrom: readmeURL)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: previewLimit) ?? Data()
+        let preview = String(decoding: data, as: UTF8.self)
+        return preview + "\n\n[README preview truncated in the app: \(byteCount) bytes total.]"
+    }
+
+    private nonisolated static func skillDirectory(_ entry: SkillRegistryEntry, dataRoot: URL) -> URL {
+        SwiftNativeSkillsClient(root: dataRoot).manifestDirectory(for: [
+            "name": .string(entry.name), "path": .string(entry.path),
+        ])
+    }
+
     /// `reviewSheet: false` is the agent's `skill_manage enable`, which also
     /// turns a disabled skill back on; the sheet installs drafts only.
     @MainActor
@@ -170,7 +196,10 @@ extension AppModel {
         }
         let requestedName = info.registry.name
         do {
-            try await client.enableSkill(name: requestedName, reviewedDigest: info.scriptDigest)
+            try await NativeSkillRegistryActions.enableSkill(
+                name: requestedName, dataRoot: engine.dataRoot,
+                reviewedDigest: info.scriptDigest, admitScript: true
+            )
             await loadSkillManifests()
             let key = requestedName.lowercased()
             let recovered = skillManifests.first { info in
@@ -191,11 +220,6 @@ extension AppModel {
                 ? "Skill active"
                 : "Skill installed"
             return .installed(receipt)
-        } catch let partial as SkillMutationRecallReconciliationError {
-            await loadSkillManifests()
-            let detail = partial.localizedDescription
-            recordSkillManifestFailure(detail)
-            return .failed(detail: detail)
         } catch {
             let detail = UserFacingError.message(error, action: "install that skill")
             recordSkillManifestFailure(detail)
@@ -206,7 +230,7 @@ extension AppModel {
     @MainActor
     func setToolAutoRun(_ tool: ToolRecord, autoRun: Bool) async {
         do {
-            let updated = try await client.updateTool(id: tool.id, autoRun: autoRun)
+            let updated = try await engine.tools.updateTool(id: tool.id, autoRun: autoRun)
             let reloaded = try await engine.tools.listAuthored()
             guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
                   confirmed.autoRun == autoRun else {
@@ -229,7 +253,7 @@ extension AppModel {
     @MainActor
     func quarantineTool(_ tool: ToolRecord, reason: String = "User quarantined from NativeAgent UI.") async {
         do {
-            let updated = try await client.quarantineTool(id: tool.id, reason: reason)
+            let updated = try await engine.tools.quarantine(id: tool.id, reason: reason)
             let reloaded = try await engine.tools.listAuthored()
             guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
                   confirmed.status == "quarantined" else {
@@ -253,11 +277,7 @@ extension AppModel {
             return
         }
         do {
-            let updated = try await client.promoteTool(
-                id: tool.id,
-                allowRisky: userRequested,
-                userRequested: userRequested
-            )
+            let updated = try await engine.tools.promote(id: tool.id, allowRisky: userRequested)
             let reloaded = try await engine.tools.listAuthored()
             guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
                   confirmed.status == "active" else {
@@ -285,8 +305,10 @@ extension AppModel {
     @MainActor
     func addWorkspaceWithReceipt(name: String, path: String, writable: Bool) async -> WorkspaceAddOutcome {
         do {
-            let added = try await client.addWorkspace(name: name, path: path, permissions: writable ? ["read", "write"] : ["read"])
-            let refreshed = try await client.getWorkspaces()
+            let added = try await ConnectorRegistryActions.addWorkspace(
+                name: name, path: path, permissions: writable ? ["read", "write"] : ["read"], root: engine.dataRoot
+            )
+            let refreshed = try await ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot)
             guard refreshed.contains(where: { $0.id == added.id }) else {
                 let detail = "The workspace registry did not confirm the saved workspace."
                 statusText = "Workspace add failed: \(detail)"
@@ -305,7 +327,7 @@ extension AppModel {
     @MainActor
     func searchWorkspace(_ query: String) async {
         do {
-            let response = try await client.searchWorkspace(query: query)
+            let response = try await ConnectorRegistryActions.searchWorkspace(query: query, root: engine.dataRoot)
             workspaceSearchResults = response.results
             statusText = "Workspace search found \(response.results.count)"
         } catch {
@@ -316,8 +338,10 @@ extension AppModel {
     @MainActor
     func updateConnector(_ connector: ConnectorRecord, enabled: Bool) async -> ConnectorUpdateOutcome {
         do {
-            let updated = try await client.updateConnector(id: connector.id, enabled: enabled)
-            let refreshed = try await client.getConnectors()
+            let updated = try await ConnectorStatusProjection.updateConnector(
+                id: connector.id, enabled: enabled, root: engine.dataRoot, platform: AppConnectorStatusPlatform()
+            )
+            let refreshed = try await ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform())
             guard let confirmed = refreshed.first(where: { $0.id == updated.id }),
                   confirmed.enabled == enabled else {
                 let detail = "The registry did not confirm the requested \(enabled ? "enable" : "disable") change."
@@ -337,7 +361,7 @@ extension AppModel {
     @MainActor
     func autodetectSearXNG() async -> SearXNGAutodetectOutcome {
         do {
-            let detected = try await client.autodetectSearXNG()
+            let detected = try await SwiftNativeResearchClient(dataRoot: engine.dataRoot).autodetectSearXNG()
             return applySearXNGAutodetect(detected)
         } catch {
             return .failed(UserFacingError.cause(error, action: "find a SearXNG server"))
@@ -347,7 +371,7 @@ extension AppModel {
     /// Applies only a usable discovery response. The UI deliberately receives
     /// the typed outcome instead of consulting or replacing `statusText`, which
     /// belongs to cross-app work such as doctor, settings, and tool actions.
-    func applySearXNGAutodetect(_ detected: DetectSearXNGResponse) -> SearXNGAutodetectOutcome {
+    func applySearXNGAutodetect(_ detected: SearXNGAutodetectResult) -> SearXNGAutodetectOutcome {
         guard detected.found else {
             let detail = detected.error?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let detail, !detail.isEmpty {
@@ -360,7 +384,7 @@ extension AppModel {
             return .failed("SearXNG detection returned no usable URL.")
         }
         do {
-            let normalized = try NativeClient.normalizedSearXNGBaseURL(baseURL)
+            let normalized = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(baseURL)
             searxngBaseURL = normalized
             return .found(normalized)
         } catch {
@@ -410,7 +434,7 @@ extension AppModel {
         telegramReasoningEffort = normalizedEffort
         let submittedEnabled = telegramEnabled
         do {
-            try await client.configureTelegram(
+            try await configureTelegram(
                 token: telegramToken,
                 allowedChatIds: chats.canonicalIDs,
                 allowedUserIds: users.canonicalIDs,
@@ -446,7 +470,7 @@ extension AppModel {
         statusText = "Clearing Telegram bot token..."
         defer { isSavingTelegram = false }
         do {
-            try await client.configureTelegram(
+            try await configureTelegram(
                 token: "",
                 allowedChatIds: splitIDs(telegramAllowedChats),
                 allowedUserIds: splitIDs(telegramAllowedUsers),
@@ -477,11 +501,11 @@ extension AppModel {
             let status: TelegramPresentationSnapshot
             var credentialUnavailable = false
             do {
-                status = try await engine.telegram.load(manager: client.backgroundLoopsManager.coreManager)
+                status = try await engine.telegram.load(manager: backgroundLoopsManager.coreManager)
             } catch is DeviceSecretKeychain.Failure {
                 // Keep validated authority fields editable for explicit grant
                 // replacement or disconnect; this is not transport readiness.
-                status = try await engine.telegram.load(manager: client.backgroundLoopsManager.coreManager, credentialUnavailable: true)
+                status = try await engine.telegram.load(manager: backgroundLoopsManager.coreManager, credentialUnavailable: true)
                 credentialUnavailable = true
             }
             guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
@@ -520,7 +544,7 @@ extension AppModel {
 
         do {
             let chatId = splitIDs(telegramAllowedChats).first ?? splitIDs(telegramAllowedUsers).first
-            let result = try await client.testTelegram(chatId: chatId)
+            let result = try await sendTelegramTestReply(chatId: chatId)
             await refreshAll()
             statusText = TelegramTestReplyPresentation.summary(for: result)
         } catch {
@@ -536,7 +560,7 @@ extension AppModel {
         statusText = "Clearing Telegram diagnostics…"
         defer { isClearingTelegramLogs = false }
         do {
-            let receipt = try await client.clearTelegramLogs()
+            let receipt = try await clearTelegramDiagnostics()
             engine.telegram.status = receipt.status
             telegramStatusRefreshError = nil
             telegramClearLogsOutcome = .completed(receipt)
@@ -614,7 +638,8 @@ extension AppModel {
             doctor.runStartedAt = nil
         }
         do {
-            var report = try await client.runDoctor(repair: repair, repairScope: repairScope)
+            var report = try await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
+                .runDoctor(repair: repair, repairScope: repairScope)
             let buttonRepair: Bool
             if case .button = repairScope {
                 buttonRepair = repair && doctor.report?.checks.contains {
@@ -624,7 +649,7 @@ extension AppModel {
                 buttonRepair = false
             }
             let status = await DoctorStatusChecks.run(appModel: self, repairDesk: buttonRepair)
-            report = NativeClient.mergeDoctorReport(report, liveChecks: status.checks)
+            report = AppDoctorPort.mergeReport(report, liveChecks: status.checks)
             report.repaired = report.repaired || status.repaired
             doctor.report = report
             doctor.reportCompletedAt = Date()
@@ -665,11 +690,12 @@ extension AppModel {
     @MainActor
     func refreshLiveDoctorCoverage() async {
         guard let current = engine.doctor.report else { return }
-        let liveChecks = await client.liveDoctorCoverageChecks()
+        let liveChecks = await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
+            .liveDoctorCoverageChecks()
         let statusChecks = await DoctorStatusChecks.run(appModel: self, repairDesk: false).checks
         let withoutRetiredProbe = DoctorReport(status: current.status, repaired: current.repaired,
                                                checks: current.checks.filter { $0.id != "status.app_health" && $0.id != "status.living_sources" })
-        engine.doctor.report = NativeClient.mergeDoctorReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
+        engine.doctor.report = AppDoctorPort.mergeReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
     }
 
     private func splitIDs(_ value: String) -> [String] {

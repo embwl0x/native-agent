@@ -278,13 +278,14 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                             // v5 introduced lifecycle; supported older/minimal
                             // stores mean confirmed when the column is absent.
                             // If it is present, the canonical row remains the
-                            // authority and corrected/contradicted/deleted facts
-                            // stay excluded.
+                            // authority and corrected/contradicted/deleted/graduated
+                            // facts stay excluded (MemoryLifecycle.recallExcluded,
+                            // which this module cannot import).
                             let lifecycle: String = columns.contains("lifecycle")
                                 ? (row["lifecycle"] ?? "confirmed")
                                 : "confirmed"
                             let recallExcludedLifecycle: Set<String> = [
-                                "corrected", "contradicted", "deleted",
+                                "corrected", "contradicted", "deleted", "graduated",
                             ]
                             guard status == "active",
                                   !recallExcludedLifecycle.contains(

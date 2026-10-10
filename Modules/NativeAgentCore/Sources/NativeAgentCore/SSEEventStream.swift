@@ -163,31 +163,3 @@ public struct SSEEventParser: Sendable {
         return SSEEvent(event: eventName, data: dataLines.joined(separator: "\n"))
     }
 }
-
-extension SSEEventParser {
-    /// Synchronously parse a complete SSE body (a non-streamed response
-    /// that arrived as `text/event-stream`). Same state machine as the
-    /// async path, including the EOF flush.
-    public static func parse(data: Data) -> [SSEEvent] {
-        var parser = SSEEventParser()
-        var events: [SSEEvent] = []
-        var lineBuf: [UInt8] = []
-        for byte in data {
-            guard byte == 0x0A else {
-                lineBuf.append(byte)
-                continue
-            }
-            if let event = parser.consume(lineBytes: lineBuf) {
-                events.append(event)
-            }
-            lineBuf.removeAll(keepingCapacity: true)
-        }
-        if !lineBuf.isEmpty, let event = parser.consume(lineBytes: lineBuf) {
-            events.append(event)
-        }
-        if let event = parser.flush() {
-            events.append(event)
-        }
-        return events
-    }
-}

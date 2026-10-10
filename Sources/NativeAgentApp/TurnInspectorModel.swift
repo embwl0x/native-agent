@@ -327,6 +327,7 @@ enum TurnInspectorGrouping {
             }
         case "llm.call":
             add("model", "model")
+            add("purpose", "purpose")
             // Keys match LLMCallTelemetry's bus payload exactly.
             add("cacheRead", "cacheReadInputTokens")
             add("cacheCreation", "cacheCreationInputTokens")

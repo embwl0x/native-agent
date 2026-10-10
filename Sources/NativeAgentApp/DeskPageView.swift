@@ -235,8 +235,9 @@ enum DeskPageContent {
     /// One plain sentence for why a row is stuck. The inspector keeps the
     /// whole stamped reason on every row, which is how twenty-one items became
     /// a wall of the same paragraph; this cuts at a word boundary and never
-    /// carries markdown.
-    static func stuckReason(_ item: DeskItem) -> String {
+    /// carries markdown. Without a written reason, the open items it waits on
+    /// or its latest note say why before "no reason" does.
+    static func stuckReason(_ item: DeskItem, in items: [DeskItem]) -> String {
         if let raw = item.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines),
            !raw.isEmpty {
             return TodayWords.line(raw, limit: 96)
@@ -245,11 +246,18 @@ enum DeskPageContent {
            !waiting.isEmpty {
             return "Waiting on \(TodayWords.line(waiting, limit: 60))."
         }
+        let blockers = items.filter { item.blockedOn.contains($0.handle) && !$0.status.isTerminal }
+        if !blockers.isEmpty {
+            return "Blocked on " + blockers.map { "desk.\($0.alias)" }.joined(separator: ", ") + "."
+        }
+        if let note = item.notes.last?.text.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty {
+            return "Last note: \(TodayWords.line(note, limit: 96))"
+        }
         return "Blocked, with no reason written down."
     }
 
-    static func itemDetail(_ item: DeskItem) -> String {
-        if item.status == .blocked { return stuckReason(item) }
+    static func itemDetail(_ item: DeskItem, in items: [DeskItem]) -> String {
+        if item.status == .blocked { return stuckReason(item, in: items) }
         if let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
            !summary.isEmpty {
             return TodayWords.line(summary, limit: 96)
@@ -272,7 +280,7 @@ enum DeskPageContent {
 
     static func githubNeedsOwner(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
         DeskAttentionStrip.sortedGitHubItems(
-            items.filter { DeskGitHubBucket.bucket(for: $0.state) == .needsUser })
+            items.filter { DeskGitHubBucket.bucket(for: $0.state) == .needsOwner })
     }
 
     static func githubAttention(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
@@ -832,7 +840,6 @@ struct DeskPageView: View {
         static let schedule = "schedule"
         static let parked = "parked"
         static let stale = "stale"
-        static let ideas = "ideas"
         static let other = "other"
         static let history = "history"
     }
@@ -944,13 +951,6 @@ struct DeskPageView: View {
                 label: "\(stale) quiet for a week",
                 title: "\(DeskPageWords.spelled(stale)) \(DeskPageWords.plural(stale, "item hasn't", "items haven't")) moved in a week"))
         }
-        // Evolution proposals filed as prose that nobody has turned into a diff.
-        if !ideas.isEmpty {
-            out.append(FoldCount(
-                id: Fold.ideas,
-                label: "\(ideas.count) \(DeskPageWords.plural(ideas.count, "idea", "ideas")) waiting for a diff",
-                title: "\(DeskPageWords.spelled(ideas.count)) \(DeskPageWords.plural(ideas.count, "idea is", "ideas are")) waiting for a diff"))
-        }
         return out
     }
 
@@ -1053,7 +1053,7 @@ struct DeskPageView: View {
             ForEach(cap(blockedItems, key: key), id: \.handle) { item in
                 DeskPageDetailRow(
                     title: DeskPageContent.title(item),
-                    line: DeskPageContent.itemDetail(item),
+                    line: DeskPageContent.itemDetail(item, in: items),
                     meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
                     .id("desk:\(item.handle)")
                     .contextMenu { Button("Details and actions") { inspect(item.handle) } }
@@ -1083,14 +1083,6 @@ struct DeskPageView: View {
                     .contextMenu { Button("Details and actions") { inspect(item.handle) } }
             }
             overflowLine(staleItems.count, key: key)
-        case Fold.ideas:
-            ForEach(cap(ideas, key: key), id: \.id) { idea in
-                DeskPageDetailRow(
-                    title: TodayWords.line(idea.title, limit: 96),
-                    line: "",
-                    meta: UserDisplayFormatters.relativeISOTimestamp(idea.createdAt, unitsStyle: .abbreviated, fallback: ""))
-            }
-            overflowLine(ideas.count, key: key)
         default:
             EmptyView()
         }
@@ -1231,7 +1223,7 @@ struct DeskPageView: View {
     private func itemDetailRow(_ item: DeskItem) -> some View {
         Button { inspect(item.handle) } label: {
             DeskPageDetailRow(title: DeskPageContent.title(item),
-                              line: DeskPageContent.itemDetail(item),
+                              line: DeskPageContent.itemDetail(item, in: items),
                               meta: "\(item.status.displayLabel) · \(item.project)")
         }
         .buttonStyle(.plain)
@@ -1434,7 +1426,6 @@ struct DeskPageView: View {
             DeskFacade(dataRoot: dataRoot).jobsPath,
             dataRoot.appendingPathComponent("bots/definitions", isDirectory: true),
             dataRoot.appendingPathComponent("bots/runner-jobs.json"),
-            EvolutionProposalStore(dataRoot: dataRoot).storePath,
             DeskNagConfigStore(dataRoot: dataRoot).configPath,
             StudioWanderLane.statePath(dataRoot: dataRoot),
             dataRoot.appendingPathComponent("trust/policy.json"),
@@ -1480,11 +1471,6 @@ struct DeskPageView: View {
                 DeskTimedBot.load(root: PersistenceCore.defaultDataRoot())
             }.value
         }
-        // Agent, 2026-09-02: thirty-five evolution proposals sat in needs_diff
-        // since June and never reached anyone. They are ideas waiting for a
-        // diff; the page says so.
-        let waitingIdeas = (try? await EvolutionProposalStore(dataRoot: PersistenceCore.defaultDataRoot())
-            .list(statuses: [.needsDiff])) ?? []
         let presentationNow = Date()
         let loadedNags = await DeskNagConfigStore(dataRoot: PersistenceCore.defaultDataRoot()).load()
         let loadedHour = await Self.readHerHour(dataRoot: PersistenceCore.defaultDataRoot(), now: presentationNow)
@@ -1529,7 +1515,6 @@ struct DeskPageView: View {
                 + snapshot.executions.items.compactMap(\.lastMovementAt)
                 + githubItems.map { $0.motorUpdatedAt ?? $0.updatedAt }
                 + appModel.engine.desk.jobs.compactMap(\.nextRunAt)
-                + waitingIdeas.map(\.createdAt)
                 + [snapshot.generatedTs].compactMap { $0 }
             let relativeDates = relativeStamps.compactMap(UserDisplayFormatters.parseISOTimestamp)
                 + timed.compactMap(\.nextRun)
@@ -1542,7 +1527,6 @@ struct DeskPageView: View {
                      nowExpiry, parkingExpiry, relativeExpiry, loadedHour.nextRefreshAt]
                     .compactMap { $0 }.filter { $0 > presentationNow }.min())
         }
-        ideas = waitingIdeas
         missedBots = missed
         timedBots = timed
         // A completed publish. A pending banner handle gets another look here.
@@ -1554,7 +1538,6 @@ struct DeskPageView: View {
     /// re-checked against every board that actually lands.
     @State private var loadStamp = 0
 
-    @State private var ideas: [EvolutionProposal] = []
     /// Scheduled bot occurrences that never ran, counted apart from the timers.
     @State private var missedBots: [DeskMissedBot] = []
     /// Unpaused bots on a schedule, counted with the timers.

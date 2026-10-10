@@ -12,6 +12,7 @@ import ProviderRouting
 import SlackBot
 import TelegramBot
 import TrustCenter
+import MCPDispatcher
 
 /// Agent, 2026-10-01, under User's ruling that she is boss below his floor:
 /// the switches she may turn down. Each row calls the setter its page calls;
@@ -163,11 +164,11 @@ extension AppQuietSettingsHost {
             // is NOT restarted here: its shutdown cancels and awaits every
             // running Telegram turn, this one included when she was asked
             // over Telegram. It restarts once every Telegram turn is done.
-            try await appModel.client.configureTelegram(
+            try await appModel.configureTelegram(
                 token: "", allowedChatIds: chats, allowedUserIds: users,
                 requireMention: mention, model: "", reasoningEffort: "", enabled: enabled,
                 restartPollLoop: false)
-            let loops = appModel.client.backgroundLoopsManager
+            let loops = appModel.backgroundLoopsManager
             Task.detached {
                 await TelegramTurnCoordinator.shared.waitUntilAllIdle()
                 _ = await loops.restartLoop(id: "telegram_poll")
@@ -220,7 +221,8 @@ extension AppQuietSettingsHost {
         let saveSlack: @MainActor @Sendable (Set<String>, Set<String>, Bool) async throws -> Void = { channels, users, mention in
             // The wizard's save also marks Slack on, so it may only run while
             // Slack is on already.
-            guard (try? await appModel.client.getConnectors())?.first(where: { $0.id == "slack" })?.enabled == true else {
+            guard (try? await ConnectorStatusProjection.readConnectorRecords(root: appModel.engine.dataRoot, platform: AppConnectorStatusPlatform()))?
+                .first(where: { $0.id == "slack" })?.enabled == true else {
                 throw QuietSettingError.unavailable(
                     "Slack is off, so it reaches nobody and there is nothing to narrow. Turning it on is the owner's.")
             }
@@ -299,7 +301,9 @@ extension AppQuietToolHost {
             // On is User's below Full Mac; the door refuses it there.
             let on = verb == "connector_on"
             let wanted = text("id").lowercased()
-            let connectors = (try? await appModel.client.getConnectors()) ?? appModel.connectors
+            let connectors = (try? await ConnectorStatusProjection.readConnectorRecords(
+                root: appModel.engine.dataRoot, platform: AppConnectorStatusPlatform()
+            )) ?? appModel.connectors
             guard let connector = connectors.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) else {
                 return AppToolExecutor.failure("unknown_connector",
                     "No connector is called \(wanted.isEmpty ? "that" : wanted). Pass id, one of the ids below.",
@@ -331,7 +335,9 @@ extension AppQuietToolHost {
         case "connector_disconnect":
             // The phone's Connectors → Disconnect: the credential is revoked.
             let wanted = text("id").lowercased()
-            let connectors = (try? await appModel.client.getConnectors()) ?? appModel.connectors
+            let connectors = (try? await ConnectorStatusProjection.readConnectorRecords(
+                root: appModel.engine.dataRoot, platform: AppConnectorStatusPlatform()
+            )) ?? appModel.connectors
             guard let connector = connectors.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) else {
                 return AppToolExecutor.failure("unknown_connector",
                     "No connector is called \(wanted.isEmpty ? "that" : wanted). Pass id, one of the ids below.",
@@ -353,7 +359,7 @@ extension AppQuietToolHost {
                 return AppToolExecutor.failure("telegram_disconnect_failed", "Telegram didn't read; nothing was removed.")
             }
             await appModel.clearTelegramToken(restartPollLoop: false)
-            let loops = appModel.client.backgroundLoopsManager
+            let loops = appModel.backgroundLoopsManager
             Task.detached {
                 await TelegramTurnCoordinator.shared.waitUntilAllIdle()
                 _ = await loops.restartLoop(id: "telegram_poll")
@@ -383,7 +389,8 @@ extension AppQuietToolHost {
                             "detail": .string("Removed the phone: it no longer decides approvals. Pairing it again is the owner's.")])
         case "mcp_revoke_consent":
             // Connectors → MCP → Revoke, on a granted consent.
-            appModel.mcpConsent = (try? await appModel.client.getMCPConsent()) ?? appModel.mcpConsent
+            appModel.mcpConsent = (try? await appModel.engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent))
+                ?? appModel.mcpConsent
             let granted = appModel.mcpConsent.filter { $0.status == "granted" }
             guard let consent = granted.first(where: { $0.id == text("id") }) else {
                 return AppToolExecutor.failure("unknown_consent",

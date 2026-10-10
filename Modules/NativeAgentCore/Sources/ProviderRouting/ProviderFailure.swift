@@ -10,9 +10,11 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     case overloaded
     case contextTooLong
     case network
-    /// The stream guard cut a request after its idle or wall time. `events`
-    /// counts wire activity; admission rides on the `Diagnostic`.
-    case noReply(provider: String, seconds: Int, events: Int)
+    /// The stream guard cut a request after `seconds` of waiting. `events`
+    /// counts wire activity; `account` is the guard's sentence for which cut
+    /// it was and on what evidence (absent from older peers). Admission rides
+    /// on the `Diagnostic`.
+    case noReply(provider: String, seconds: Int, events: Int, account: String? = nil)
     case refused
     case malformedResponse
     case routingUnavailable
@@ -26,8 +28,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         case .overloaded: return "The model is busy; try again in a moment."
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
         case .network: return "The connection was interrupted; check your internet connection and try again."
-        case .noReply(let provider, let seconds, let events):
-            return "No reply from \(provider) in \(seconds) s (\(events) events). Say continue to pick it up."
+        case .noReply(let provider, let seconds, let events, let account):
+            return (account ?? "No reply from \(provider) in \(seconds) s (\(events) events).") + " Say continue to pick it up."
         case .refused: return "The model turned this request down. Try again, or pick another model in Settings."
         case .malformedResponse: return "The model returned an unreadable response; try again."
         case .routingUnavailable: return "Your model settings could not be loaded; check your model connection in Settings."

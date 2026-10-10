@@ -325,6 +325,7 @@ extension SwiftToolDispatcher {
                 return need
             }
         case "list_dir":
+            input = Self.listDirInput(input)
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return try await impl_full_mac_list_dir(input: input, surface: surface)
             }
@@ -368,7 +369,10 @@ extension SwiftToolDispatcher {
         // claude/codex wake-job stores. No write, no spawn, no network.
         case "delegation_status": return try await impl_delegation_status(input: input)
         case "agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel":
-            return try await impl_agentCommunication(tool: tool, input: input, surface: surface)
+            let result = try await impl_agentCommunication(tool: tool, input: input, surface: surface)
+            // A connection ends discovery's offer of it in the same call.
+            if tool == "agent_connect" { await AgentDiscoverySession.shared.settle(dataRoot: dataRoot) }
+            return result
         case "desk_read": return try await impl_desk_read(input: input)
         case "desk_add_item": return try await impl_desk_add_item(input: input)
         case "desk_set_status": return try await impl_desk_set_status(input: input)
@@ -508,45 +512,6 @@ extension SwiftToolDispatcher {
                 reason: reason,
                 source: "chat:\(surface)"
             )
-        // ── self-evolution chat tools (2026-06-11, U2b) ──
-        // Same Full-Mac policy gate as the builder tools; the store mutation /
-        // card-stage backends live in the app target (EvolutionProposalStore +
-        // BackgroundLoopsAssembly.stageEvolutionApprovals) and are reached via
-        // the injected EvolutionToolBridge. A nil bridge returns a
-        // `bridge_not_wired` envelope rather than throwing. self_install only
-        // STAGES a card a human still approves — it never installs.
-        case "evolution_propose":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "evolution_propose")
-            }
-            guard let bridge = evolutionBridge else {
-                return Self.evolutionBridgeNotWiredEnvelope(tool: "evolution_propose")
-            }
-            return try await bridge.evolutionPropose(input: input)
-        case "evolution_status":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "evolution_status")
-            }
-            guard let bridge = evolutionBridge else {
-                return Self.evolutionBridgeNotWiredEnvelope(tool: "evolution_status")
-            }
-            return try await bridge.evolutionStatus(input: input)
-        case "evolution_withdraw":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "evolution_withdraw")
-            }
-            guard let bridge = evolutionBridge else {
-                return Self.evolutionBridgeNotWiredEnvelope(tool: "evolution_withdraw")
-            }
-            return try await bridge.evolutionWithdraw(input: input)
-        case "self_install":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "self_install")
-            }
-            guard let bridge = evolutionBridge else {
-                return Self.evolutionBridgeNotWiredEnvelope(tool: "self_install")
-            }
-            return try await bridge.evolutionStageInstall(input: input)
         case "agent_swarm": return try await impl_agent_swarm(input: input, surface: surface)
         case "market_status": return try await impl_market_status(input: input)
         case "market_watchlists": return try await impl_market_watchlists(input: input)

@@ -115,7 +115,7 @@ enum QuietPages {
         QuietPage(id: "pairing", title: "iPhone pairing", item: .connectors,
                   summary: "Paired phones and the iCloud pairing status.", tab: "iphone"),
         QuietPage(id: "agents", title: "Agents", item: .connectors,
-                  summary: "Agent contacts and coding helpers: message, read, connect, stop, and bridge jobs.", tab: "agents"),
+                  summary: "Agent contacts and coding helpers: message, read, connect, stop, each one's recipe (how it is reached, to read and rewrite), and bridge jobs.", tab: "agents"),
         // Each Mac app and connector her actions reach is a page of its own:
         // its access or connection, and its actions. A Mac app's page is
         // where User sets its access (Trust → Mac integration).
@@ -142,7 +142,7 @@ enum QuietPages {
         QuietPage(id: "files", title: "Files", item: .trust,
                   summary: "Read, list, search, excerpt and write files; apply a patch; Spotlight."),
         QuietPage(id: "shell", title: "Shell", item: .trust,
-                  summary: "Shell commands, git, Swift builds and tests, remote nodes, self-evolution, and restarting or installing the app."),
+                  summary: "Shell commands, git, Swift builds and tests, remote nodes, and restarting or installing the app."),
         QuietPage(id: "web", title: "Web", item: .mcp,
                   summary: "Read a public page privately, and search or fetch the web with SearXNG."),
         QuietPage(id: "browser", title: "Browser", item: .trust,

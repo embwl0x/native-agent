@@ -128,6 +128,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private var monitor: ContextSourceMonitor?
     private var coalescer: ContextSourceEventCoalescer?
     private var started = false
+    /// Embedding models already reported as having no semantic floor.
+    private var floorlessEmbeddingModels: Set<String> = []
     private var lastReconciledAt: Date?
     private var lastError: String?
     // 2026-07-21 audit: context.sqlite grew unbounded because store.prune()
@@ -755,6 +757,11 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                let line = precoverageReporter.message(for: generationDerived.userPrecoverage) {
                 diagnostics(line)
             }
+            if request.queryEmbedding != nil, let model = request.queryEmbeddingModelID,
+               selector.configuration.memorySemanticFloors[model] == nil,
+               floorlessEmbeddingModels.insert(model).inserted {
+                diagnostics("[context] no memory semantic floor for embedding model \(model); memories ride only by explicit match, working set or pins")
+            }
             let feedback = feedbackSnapshot(for: generation)
             let feedbackByAtom = Dictionary(uniqueKeysWithValues: feedback.states.map {
                 ($0.atomID, $0)
@@ -801,6 +808,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     queryEmbedding: request.queryEmbedding,
                     alternateQueryEmbedding: request.alternateQueryEmbedding,
                     queryEmbeddingModelFingerprint: request.queryEmbeddingModelFingerprint,
+                    queryEmbeddingModelID: request.queryEmbeddingModelID,
                     availableGenerationID: generation.generation.id,
                     characterBudget: characterBudget,
                     packetAtomExpandThresholdChars: request.packetAtomExpandThresholdChars,

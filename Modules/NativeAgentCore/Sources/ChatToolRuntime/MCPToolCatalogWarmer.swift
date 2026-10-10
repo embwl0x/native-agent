@@ -60,7 +60,16 @@ package actor MCPToolCatalogWarmer {
     }
 
     static let liveSweep: Sweep = { root in
-        _ = await MCPWarmSweepLedger.shared.sweep(root: root)
+        let report = await MCPWarmSweepLedger.shared.sweep(root: root)
+        let refreshed = report.values.filter { $0 != "skipped" && !$0.hasPrefix("error") }.count
+        let failed = report.values.filter { $0.hasPrefix("error") }.count
+        let note = "\(refreshed) refreshed, \(failed) failed, \(report.count - refreshed - failed) unchanged"
+        // Every handshake it tried failed: evidence, never a healthy pulse.
+        if refreshed == 0, failed > 0 {
+            OrganPulse.record("mcp_warm_sweep", .skipped, note: note)
+        } else {
+            OrganPulse.record("mcp_warm_sweep", found: refreshed, note: note)
+        }
     }
 
     /// Synchronous, allocation-cheap entry point for the tool-catalog build.

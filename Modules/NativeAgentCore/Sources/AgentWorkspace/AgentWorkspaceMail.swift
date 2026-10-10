@@ -28,7 +28,7 @@ extension AgentWorkspace {
                     : "A workspace name cannot be combined with exact locator fields. Omit name to use message_id, expected_message_id and expected_account, or use only the observed mail.N name plus edits.")
                 return .object(refused)
             }
-            var selected = locator.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope"].contains($0.key) }
+            var selected = locator.filter { MailReadLocator.fields.contains($0.key) }
             selected["scope"] = locator["scope"] ?? locator["mailbox"] ?? .string("inbox")
             selected.merge(row) { _, new in new }
             return .object(selected)
@@ -116,6 +116,7 @@ enum AgentWorkspaceMail {
                 bound["scope"] = object["scope"] ?? content["scope"] ?? .string("inbox")
                 // Its account too: the same email in another account's inbox is never the target.
                 if let account = locator.account { bound["expected_account"] = .string(account) }
+                if let accountID = locator.accountID { bound["expected_account_id"] = .string(accountID) }
                 // Its place in that inbox: the fast way back to it (a hint; identity still decides).
                 if let position = locator.position { bound["position"] = .int(Int64(position)) }
                 if input["message_id"] == .int(locator.id), input["expected_message_id"] == .string(locator.messageID), content["detail"] == .bool(true) {

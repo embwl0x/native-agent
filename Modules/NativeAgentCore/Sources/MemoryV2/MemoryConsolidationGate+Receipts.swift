@@ -220,7 +220,6 @@ extension MemoryConsolidationGate {
                     "memories_active_after": .int(Int64(diff.memoriesActiveAfter)),
                     "proposals_pending_before": .int(Int64(diff.proposalsPendingBefore)),
                     "proposals_pending_after": .int(Int64(diff.proposalsPendingAfter)),
-                    "accepted": .int(Int64(diff.accepted)),
                     "merged": .int(Int64(diff.merged)),
                     "archived": .int(Int64(diff.archived)),
                 ]),

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// Bounded terminal reconciliation: once at launch, and after a completed turn
@@ -54,6 +55,12 @@ public enum AbandonedTurnReconciliationHook {
             await TurnTraceBus.shared.drainForProcessExit()
             let outcome = await AbandonedTurnReconciler().sweep()
             await MainActor.run { running = false }
+            if let failure = outcome.failure {
+                OrganPulse.record("abandoned_turns", .skipped, note: failure)
+            } else {
+                OrganPulse.record("abandoned_turns", found: outcome.reconciled.count,
+                                  note: "\(outcome.reconciled.count) closed of \(outcome.acceptedScanned) accepted")
+            }
             guard !outcome.reconciled.isEmpty else { return }
             await noteInterruptedTurns(outcome.interruptedSessions)
             FileHandle.standardError.write(

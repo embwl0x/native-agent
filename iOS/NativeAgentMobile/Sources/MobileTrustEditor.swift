@@ -105,7 +105,6 @@ struct MobileTrustEditor: View {
         }
         .disabled(isSaving || !pairingStore.isPaired)
         AliveSection("Training") {
-            toggle("Autonomous training", field: .autonomousTraining, value: current.trainingPolicy?.autonomousTraining)
             AliveDivider()
             toggle("Dream scheduler", field: .dreamScheduler, value: current.trainingPolicy?.dreamScheduler)
         }

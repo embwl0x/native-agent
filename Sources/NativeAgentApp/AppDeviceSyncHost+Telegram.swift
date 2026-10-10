@@ -5,23 +5,22 @@ import ProviderRouting
 import TelegramBot
 import NativeAgentCore
 
+// The phone's Telegram row: its snapshot and its one change (disconnect),
+// on the live root and the live poll loop.
 extension AppDeviceSyncHost {
     func telegramSnapshot() async throws -> MobileTelegramSnapshot {
-        try await NativeClient().mobileTelegramSnapshot()
+        try await mobileTelegramSnapshot()
     }
 
     func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot {
-        let client = NativeClient()
-        try await client.changeTelegramSettings(change)
-        return try await client.mobileTelegramSnapshot()
+        try await changeTelegramSettings(change)
+        return try await mobileTelegramSnapshot()
     }
-}
 
-extension NativeClient {
     private enum TelegramReloadError: Error { case pollerUnavailable }
 
-    func changeTelegramSettings(_ change: MobileTelegramChange) async throws {
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+    private func changeTelegramSettings(_ change: MobileTelegramChange) async throws {
+        let root = PersistenceCore.defaultDataRoot()
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(root.appendingPathComponent("telegram/config.json")) {
             try Self.validateMobileTelegramConfiguration(at: root)
@@ -52,7 +51,7 @@ extension NativeClient {
         }
         // A draining turn must not hold the settings lock; reload from latest disk state.
         try await persistence.withFileLock(root.appendingPathComponent("telegram/poll_reload")) {
-            guard await backgroundLoopsManager.restartLoop(id: "telegram_poll").didRestart else {
+            guard await BackgroundLoopsManager.shared.restartLoop(id: "telegram_poll").didRestart else {
                 throw TelegramReloadError.pollerUnavailable
             }
         }
@@ -135,8 +134,8 @@ extension NativeClient {
         }
     }
 
-    func mobileTelegramSnapshot() async throws -> MobileTelegramSnapshot {
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+    private func mobileTelegramSnapshot() async throws -> MobileTelegramSnapshot {
+        let root = PersistenceCore.defaultDataRoot()
         let url = root.appendingPathComponent("telegram/config.json")
         return try await SwiftNativePersistenceCore().withFileLock(url) {
             let observedAt = Date().timeIntervalSince1970
@@ -148,7 +147,7 @@ extension NativeClient {
                 throw TelegramConfigurationError.existingConfigurationUnreadable
             }
             let status = try await TelegramFacade(dataRoot: root).loadStatus(
-                manager: backgroundLoopsManager.coreManager, routingSnapshot: routing
+                manager: BackgroundLoopsManager.shared.coreManager, routingSnapshot: routing
             )
             let enabled = status.tokenConfigured && status.enabled
             return MobileTelegramSnapshot(

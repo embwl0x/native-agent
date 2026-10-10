@@ -270,10 +270,10 @@ extension AppToolExecutor {
         if action != "decline", posture.name != Self.fullMacModeName,
            current.kind == .permission || current.kind == .capability {
             return refuse(Self.interactionFailure(
-                "users_call",
-                "\(current.kind == .permission ? "Granting Mac access" : "Turning on a Trust capability") is User's "
+                "owners_call",
+                "\(current.kind == .permission ? "Granting Mac access" : "Turning on a Trust capability") is the owner's "
                 + "call below Full Mac, and this Mac is in \(posture.name). Nothing was changed and the card still "
-                + "waits for him: leave it for him. Not now still declines it.",
+                + "waits for them: leave it for them. Not now still declines it.",
                 extra: ["interaction_id": .string(id)]
             ))
         }
@@ -914,7 +914,7 @@ extension AppToolExecutor {
         guard SwiftNativeSecurityCenter.isInsideTrustedWorkspace(file, policy: policy, dataRoot: dataRoot) else {
             return .failure(.init(reason: "attachment_outside_workspace",
                 detail: "\(file.path) is outside your Trust workspace folders, the same fence app files.read keeps. "
-                + "Ask User to attach it himself, or to add its folder to the workspace roots in Trust."))
+                + "Ask the owner to attach it themselves, or to add its folder to the workspace roots in Trust."))
         }
         return .success(file)
     }

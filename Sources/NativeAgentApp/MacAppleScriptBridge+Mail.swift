@@ -114,7 +114,7 @@ extension MacAppleScriptBridge {
         }
         let deadline = Date().addingTimeInterval(45)
         var receipts: [JSONValue] = [], seen: Set<[String]> = [], stopped = false
-        let identityKeys: Set<String> = ["name", "message_id", "expected_message_id", "expected_account", "position", "scope"]
+        let identityKeys = MailLocator.fields.union(["name"])
         let allowed = identityKeys.union(effects ? ["mark_read", "flagged", "archive"] : ["body_offset"])
         for (index, item) in items.enumerated() {
             var receipt: [String: JSONValue] = ["index": .int(Int64(index))]
@@ -193,6 +193,10 @@ extension MacAppleScriptBridge {
             } else {
                 do {
                     let local = mailLocalRead(row, batch: true)
+                    if let mismatch = local.accountMismatch {
+                        receipt["status"] = .string("failed"); receipt["reason"] = .string("account_mismatch"); receipt["detail"] = .string(mismatch)
+                        receipts.append(.object(receipt)); continue
+                    }
                     if let body = local.row {
                         receipt.merge(body) { _, new in new }; receipt["status"] = .string("completed")
                         receipts.append(.object(receipt)); continue

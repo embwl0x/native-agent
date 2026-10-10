@@ -7,9 +7,10 @@ import Browser
 import TrustPersistence
 
 public enum NativeActionRoutes {
+    /// `dataRoot` nil keeps the established persona/workspace resolver; only
+    /// an explicit isolated root overrides those reads.
     public static func runNativeAction(
-        id: String, dryRun: Bool, input: [String: Any], dataRoot: URL?,
-        browser: (NativeActionRecord, Bool, [String: Any]) async throws -> NativeActionReceipt
+        id: String, dryRun: Bool, input: [String: Any], dataRoot: URL?, browser: BrowserActionRoutes
     ) async throws -> NativeActionReceipt {
         let actionId = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !actionId.isEmpty else {
@@ -27,7 +28,10 @@ public enum NativeActionRoutes {
             )
         }
         if actionId.hasPrefix("browser.") {
-            return try await browser(action, dryRun, input)
+            return try await browser.runBrowserNativeAction(
+                action: action, dryRun: dryRun, input: input,
+                dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
+            )
         }
         let result = try await NativeActionDispatch.dispatchNativeAction(
             tool: actionId,

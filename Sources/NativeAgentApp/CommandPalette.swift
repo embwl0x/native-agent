@@ -1,4 +1,5 @@
 import AppToolRuntime
+import ChatOrchestration
 import NativeAgentCore
 import SwiftUI
 import AppKit
@@ -124,7 +125,7 @@ enum CommandPalettePresentation {
     /// `confirmed` are rows already matched elsewhere (a chat's words, found
     /// by the message index): listed after the pool's matches, never
     /// re-matched against what they display.
-    static func filteredItems(pool: [PaletteItem], query: String, confirmed: [PaletteItem] = []) -> [PaletteItem] {
+    @MainActor static func filteredItems(pool: [PaletteItem], query: String, confirmed: [PaletteItem] = []) -> [PaletteItem] {
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !cleanQuery.isEmpty else {
             let rail = railItems()
@@ -157,8 +158,8 @@ enum CommandPalettePresentation {
     }
 
     /// The rail top to bottom, in its own words — the Navigate menu's order.
-    static func railItems() -> [SidebarItem] {
-        BotsShelfRailProposal.ordered(SidebarItem.primaryItems, enabled: BotsShelfPreference.isEnabled())
+    @MainActor static func railItems() -> [SidebarItem] {
+        SidebarItem.rail(SurfaceLayoutLive.shared.layout).compactMap { $0 }
     }
 
     @MainActor

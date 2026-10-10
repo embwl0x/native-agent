@@ -3,6 +3,7 @@ import Research
 import SwiftUI
 import TrustCenter
 import ApprovalInbox
+import WorkflowOrchestration
 
 
 enum CapabilitiesDisclosurePreference {
@@ -559,7 +560,7 @@ struct CapabilitiesView: View {
         var seen = Set<String>()
         let combined = (appModel.nextGenSummary?.actions ?? []) + nextGenLoadedPhases.flatMap { $0.actions ?? [] }
         return combined
-            .filter { NativeClient.isNextGenActionBacked($0.id) }
+            .filter { AppModel.isNextGenActionBacked($0.id) }
             .filter { seen.insert($0.id).inserted }
     }
 
@@ -1402,7 +1403,7 @@ struct NextGenPhaseRow: View {
             // L3#6: a phase's primaryDryRunActionId comes from the catalog data
             // file and may name an id the read-only executor has no case for.
             // Render the probe only when an executor backs it.
-            if let actionId = phase.primaryDryRunActionId, NativeClient.isNextGenActionBacked(actionId) {
+            if let actionId = phase.primaryDryRunActionId, AppModel.isNextGenActionBacked(actionId) {
                 Button("Preview") {
                     runProbe(actionId)
                 }

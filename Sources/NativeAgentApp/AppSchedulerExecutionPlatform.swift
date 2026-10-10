@@ -3,8 +3,10 @@ import AppToolRuntime
 import AttentionRouting
 import NativeAgentCore
 import PersistenceCore
+import Connectors
 import SchedulerExecution
 import TelegramBot
+import SelfImprovement
 
 extension SchedulerDueJobRunner {
     static let shared = SchedulerDueJobRunner()
@@ -39,7 +41,9 @@ struct AppSchedulerExecutionPlatform: SchedulerExecutionPlatform {
         id: String, dryRun: Bool, input: [String: JSONValue],
         externalSendIdempotencyKey: String
     ) async throws -> (id: String, status: String) {
-        let receipt = try await NativeClient().runConnectorAction(
+        let receipt = try await ConnectorActions(
+            platform: AppConnectorActionPlatform(dataRoot: PersistenceCore.defaultDataRoot())
+        ).runConnectorAction(
             id: id, dryRun: dryRun, input: input,
             externalSendIdempotencyKey: externalSendIdempotencyKey
         )
@@ -47,29 +51,24 @@ struct AppSchedulerExecutionPlatform: SchedulerExecutionPlatform {
     }
 
     func runDream(force: Bool) async throws -> sending [String: Any] {
-        try await NativeClient().runDream(force: force)
+        try await BackgroundLoopsAssembly.runDream(dataRoot: PersistenceCore.defaultDataRoot(), force: force)
     }
 
     func runRem(force: Bool) async throws -> sending [String: Any] {
-        try await NativeClient().runRem(force: force)
-    }
-
-    func startImprovement(objective: String) async throws -> (id: String, status: String?, phase: String?) {
-        let run = try await NativeClient().startImprovement(objective: objective)
-        return (run.id, run.status, run.phase)
+        try await BackgroundLoopsAssembly.runRem(dataRoot: PersistenceCore.defaultDataRoot(), force: force)
     }
 
     func runHarnessBenchmark() async throws -> (id: String, status: String?) {
-        let run = try await NativeClient().runHarnessBenchmark()
+        let run = await HarnessBenchmarkRun.run(dataRoot: PersistenceCore.defaultDataRoot())
         return (run.id, run.status)
     }
 
     func createWorkshopTask(
         title: String, objective: String, projectSpaceId: String?
     ) async throws -> (id: String, status: String) {
-        let execution = try await NativeClient().createWorkshopTask(
+        let execution = try await BackgroundLoopsAssembly.submitDeskTask(
             title: title, objective: objective, projectSpaceId: projectSpaceId
-        )
+        ).execution
         return (execution.id, execution.status)
     }
 }

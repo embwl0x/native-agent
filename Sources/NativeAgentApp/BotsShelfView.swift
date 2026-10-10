@@ -939,13 +939,3 @@ private struct BotsShelfArtifactLink: View {
         }
     }
 }
-
-struct BotsShelfPreviewPage: View {
-    @AppStorage(BotsShelfPreference.key) private var enabled = true
-    var onContinue: (NativeAgentNavigationDestination) -> Void = { _ in }
-    var isVisible = true
-    var body: some View {
-        if enabled { BotsShelfView(onContinue: onContinue, isVisible: isVisible) }
-        else { ShellRailPage(title: "Helpers", subtitle: SidebarItem.bots.shellPageSubtitle) { Text("Helpers preview is turned off.") } }
-    }
-}

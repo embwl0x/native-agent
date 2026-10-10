@@ -108,17 +108,17 @@ extension SchedulerDueJobRunner {
         }
     }
 
-    /// FIX 3 (A4.5): prune completed oneShot rows past the retention window.
-    /// Runs each due-job pass under the same jobs lock; a no-op write is
-    /// avoided when nothing crossed the window. Returns the number removed.
+    /// Record retirement durably before removing rows under the jobs lock.
     @discardableResult
-    func pruneCompletedOneShotJobs(now: Date) async throws -> Int {
+    func pruneRetiredJobs(now: Date) async throws -> Int {
         try await persistence.withFileLock(jobsPath) { () async throws -> Int in
             let rows = try Self.readJobRowsChecked(at: jobsPath)
-            let result = Self.pruneCompletedOneShotRows(rows, now: now)
-            guard result.removed > 0 else { return 0 }
+            let result = Self.pruneRetiredRows(rows, now: now)
+            guard !result.retired.isEmpty else { return 0 }
+            try await persistence.appendJSONLDurable(result.retired, to: jobsPath.deletingLastPathComponent()
+                .appendingPathComponent("retired.jsonl"))
             try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(result.rows), to: jobsPath)
-            return result.removed
+            return result.retired.count
         }
     }
 

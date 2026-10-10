@@ -37,9 +37,10 @@ public enum MemoryApprovalTransactions {
     /// stale-skip when already applied); denied records just gain their
     /// annotation; canceled records clear the stamp so the following
     /// stageIfNeeded re-stages.
+    @discardableResult
     public static func reconcileUnappliedMemoryRepairs(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
+    ) async -> Int {
         await ApprovalTransactionCoordinator.reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, kinds: [
             ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind(
                 action: MemoryRepairOneShot.action,
@@ -126,9 +127,10 @@ public enum MemoryApprovalTransactions {
     /// Crash-window reconciliation for memory.kind_backfill (same shape as
     /// reconcileUnappliedMemoryRepairs): resolved records lacking an
     /// execution annotation get the idempotent executor re-run on launch.
+    @discardableResult
     public static func reconcileUnappliedKindBackfills(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
+    ) async -> Int {
         await ApprovalTransactionCoordinator.reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, kinds: [
             ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind(
                 action: MemoryKindBackfill.action,
@@ -214,11 +216,11 @@ public enum MemoryApprovalTransactions {
             // while chat runs on the Codex CLI or the OpenAI API.
             let surface = await routerForPins.surfaceHasOwnRouting("memory") ? "memory" : "chat"
             let model = await routerForPins.modelStringForSurface(surface)
-            let system = "You classify one memory snippet into exactly one of these kinds: "
+            let system = "# Background Personality Context\nYou classify one memory snippet into exactly one of these kinds: "
                 + taxonomy.joined(separator: ", ")
                 + ". Reply with ONLY the kind word, lowercase, nothing else."
             let raw = try await llm.complete(
-                prompt: content, system: system, model: model, surface: surface)
+                prompt: content, system: system, model: model, surface: surface, purpose: "kind_backfill")
             // EXACT match only (gpt-5.5 review blocker): a substring branch
             // fabricates kinds from noncompliant replies ("not a preference"
             // → preference). Trim trailing punctuation, then exact-or-drop —

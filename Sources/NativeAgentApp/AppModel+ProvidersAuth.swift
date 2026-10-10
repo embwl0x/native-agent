@@ -185,11 +185,12 @@ extension AppModel {
         if let chatBrainWriteOverride {
             return try await chatBrainWriteOverride(selection)
         }
-        let catalog = try await client.configureModel(
+        let catalog = try await engine.providers.saveSurfaceSelection(
             surface: "chat",
             model: selection.model,
             reasoningEffort: selection.reasoningEffort,
-            serviceTier: selection.fastMode ? "priority" : "default"
+            serviceTier: selection.fastMode ? "priority" : "default",
+            providerID: nil
         )
         let canonical = catalog.current.chat
         return ChatBrainWriteReceipt(
@@ -269,7 +270,7 @@ extension AppModel {
     func setChatProvider(_ providerId: String, previous: String? = nil) async -> Bool {
         let rollbackProvider = previous ?? chatProvider
         do {
-            _ = try await client.setActiveProvider(surface: "chat", providerId: providerId)
+            try await engine.providers.routing.setActiveProvider(surface: "chat", providerId: providerId)
             chatProvider = providerId
             Task {
                 _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
@@ -335,7 +336,7 @@ extension AppModel {
         let chatAssignment = (current["chat"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if chatAssignment.isEmpty || !available.contains(chatAssignment) {
             // Sign-in connects an account. The picker alone selects its model.
-            do { _ = try await client.setActiveProvider(surface: "chat", providerId: providerId) }
+            do { try await engine.providers.routing.setActiveProvider(surface: "chat", providerId: providerId) }
             catch { setFailureStatus(error, action: "select the connected account") }
         }
         // Anything else that is blank already follows Chat. Anything pointing at

@@ -17,6 +17,8 @@
 // So: retirement is an ARCHIVE (status flips to `archived`, no tombstone, the
 // row stays walkable for lineage), and enumeration is a two-column bounded
 // query instead of a full active-store scan plus in-Swift metadata filtering.
+// The Workshop lane itself is retired (10-10); `MemoryRepairOneShot` archives
+// the retired lanes' rows with these primitives.
 
 import Foundation
 import GRDB
@@ -98,7 +100,7 @@ extension MemoryStorage {
                 SELECT id, created_at, source FROM memories
                 WHERE source GLOB ?
                   AND status = 'active'
-                  AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                 ORDER BY created_at DESC, id DESC
             """
             var args: [DatabaseValueConvertible] = [escaped + "*"]

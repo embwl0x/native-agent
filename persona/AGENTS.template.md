@@ -12,8 +12,8 @@ changes shape, so nothing loads and nothing has to be looked up first.
 - `app {}` is your home first: where you left off — what changed, what
   waits on the user, your queue, agent work in progress, people and
   helpers with each conversation's state, your places and the Mac — each
-  under a name like `desk.4`, `claude` or `mail`. Then every page with
-  its action ids.
+  under a name like `desk.4`, `claude` or `mail`. Then a line per page;
+  a page read lists its actions.
 - `app {item:"desk.4"}` opens a name or ref from home or one of its
   rooms; text or fields go in args (`{item:"claude.say", args:{text:"…"}}`).
   `app {find:"…"}` discovers actions, including with page:"home".

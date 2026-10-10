@@ -204,7 +204,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     private static func validTool(_ value: ResponseOutcomeToolReference) -> Bool {
         closedToken(value.callID, maximum: 128) != nil
             && closedToken(value.tool, maximum: 128) != nil
-            && ["succeeded", "failed", "cancelled", "timeout", "unknown"].contains(value.resultClass)
+            && ["succeeded", "failed", "refused", "cancelled", "timeout", "unknown"].contains(value.resultClass)
     }
 
     private static func validMotor(_ value: ResponseOutcomeMotorReference) -> Bool {

@@ -113,11 +113,11 @@ extension CognitiveSubstrate {
     func rejectionRefusal(_ source: String) -> String? {
         if source.hasPrefix("view:"), let id = UUID(uuidString: String(source.dropFirst(5))),
            standingViews[id]?.status == .active {
-            return "User signed that view; it is his to retire, not yours to suppress"
+            return "The owner signed that view; it is theirs to retire, not yours to suppress"
         }
         if source.hasPrefix("seed:"), let id = UUID(uuidString: String(source.dropFirst(5))),
            thoughtSeeds[id]?.text.hasPrefix("Pinned concern:") == true {
-            return "User pinned that concern; it is not yours to suppress"
+            return "The owner pinned that concern; it is not yours to suppress"
         }
         return nil
     }

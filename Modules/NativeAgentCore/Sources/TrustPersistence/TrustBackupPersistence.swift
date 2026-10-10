@@ -241,6 +241,14 @@ public enum TrustBackupPersistence {
         return formatter
     }
 
+    /// `~/Library/Mobile Documents/com~apple~CloudDocs/NativeAgent-Backups` —
+    /// iCloud Drive, so a lost or wiped Mac does not take Agent with it.
+    public static func offDiskBackupParent() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs", isDirectory: true)
+            .appendingPathComponent("NativeAgent-Backups", isDirectory: true)
+    }
+
     /// Automatic folders only (`auto-YYYY-MM-DD-HHmmss`, UTC), newest first. Any
     /// other folder in the parent — a hand-made copy — is never listed, so it
     /// is never pruned.

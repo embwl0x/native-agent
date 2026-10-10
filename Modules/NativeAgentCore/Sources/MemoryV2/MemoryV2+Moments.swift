@@ -23,7 +23,11 @@ import FeedPolicy
 //   • BOUNDED: salience floor, 8 per calendar day, 240-char content, 160-char
 //     quote. The existing near-duplicate + tombstone gates in `propose(...)`
 //     apply unchanged.
+//   • ONE EVENT, ONE MOMENT (10-10): a telling that says what a kept or
+//     waiting moment says (the fact lane's 0.90 check) joins that row as
+//     evidence instead of staging another.
 
+import CognitiveSubstrate
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -32,7 +36,7 @@ import PersistenceCore
 
 /// One lived moment, as the shared interpreter returned it (after cleaning).
 public struct MomentCandidate: Sendable, Equatable {
-    /// First person, in HER voice: what happened and what it meant.
+    /// First person, in HER voice: what happened. What it meant is REM's.
     public let content: String
     /// -1…1. Negative moments are what the rumination lane carries.
     public let valence: Double
@@ -277,6 +281,22 @@ public enum MemoryMoments {
         return meta
     }
 
+    /// The turn a memory was kept in: turn, run and session ids, and the
+    /// transcript locator the recent_receipts strip renders (`history:` and the
+    /// id of the message that opened the turn) and when. Moments, standing
+    /// corrections and committed memories stamp it alike, so a correction knows
+    /// its miss — and a repeat that collapses into it keeps its own turn.
+    public static func turnMetadata(turnId: String?, origin: AfterTurnOrigin?) -> [String: JSONValue] {
+        var meta: [String: JSONValue] = [:]
+        if let turnId { meta["turn_id"] = .string(turnId) }
+        guard let origin else { return meta }
+        meta["session_id"] = .string(origin.sessionId)
+        if let runId = origin.runId { meta["run_id"] = .string(runId) }
+        meta["history"] = .string("history:" + origin.messageId)
+        meta["turn_at"] = .string((origin.occurredAt ?? Date()).ISO8601Format())
+        return meta
+    }
+
     /// True when a proposal/memory row belongs to this lane.
     public static func isMoment(_ metadata: JSONValue?) -> Bool {
         laneName(metadata) == lane
@@ -387,7 +407,7 @@ public enum MemoryMoments {
         // it. Fewer than six words is not a narration either.
         let narrationWords = content.split { !$0.isLetter && !$0.isNumber }
         if narrationWords.count < 6 {
-            return "moment is \(narrationWords.count) word(s); a narration names who, what, and what it meant"
+            return "moment is \(narrationWords.count) word(s); a narration names who and what"
         }
         let body = wordFold(content)
             .replacingOccurrences(of: "^(i|we) ", with: "", options: .regularExpression)
@@ -436,7 +456,7 @@ public enum MemoryMoments {
         contentKey(narration(ofStored: content, metadata: metadata))
     }
 
-    static func narration(ofStored content: String, metadata: JSONValue?) -> String {
+    public static func narration(ofStored content: String, metadata: JSONValue?) -> String {
         guard let quote = metadataString(metadata, "quote"), !quote.isEmpty else { return content }
         let suffix = " — \"\(quote)\""
         guard content.hasSuffix(suffix) else { return content }

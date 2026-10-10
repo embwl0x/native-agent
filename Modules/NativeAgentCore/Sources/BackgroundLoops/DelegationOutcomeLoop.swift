@@ -42,7 +42,6 @@ import PersistenceCore
 // into BackgroundLoops). The store read is an injected closure that yields
 // `DelegationJobSnapshot` values — a field-for-field mirror of the card-relevant
 // half of `DelegationJobProjection` — and the app assembly does the mapping.
-// Same seam as `EvolutionProposalRetentionLoop.sweep`.
 
 // MARK: - Snapshot input
 

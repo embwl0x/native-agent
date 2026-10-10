@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 
 // MARK: - Persona writes
@@ -657,3 +658,80 @@ extension JSONValue {
         }
     }
 }
+
+// MARK: - The shared (Mac and phone) profile shape
+
+extension SwiftNativePersonaEngine {
+    /// The Personality tab's full-profile save. The body goes through the
+    /// same JSONSerialization normalization a wire body had, so the merge sees
+    /// the leaf types it always did.
+    public func savePersonality(_ profile: PersonalityProfile) async throws -> CompiledPersonalityProfile {
+        var body: [String: Any] = [
+            "name": profile.name,
+            "personaKind": profile.personaKind,
+            "essence": profile.essence,
+            "voice": profile.voice,
+            "customDirective": profile.customDirective ?? "",
+            "traits": [
+                "warmth": profile.traits.warmth,
+                "directness": profile.traits.directness,
+                "humor": profile.traits.humor,
+                "proactivity": profile.traits.proactivity,
+                "rigor": profile.traits.rigor,
+                "autonomy": profile.traits.autonomy,
+                "creativity": profile.traits.creativity,
+                "brevity": profile.traits.brevity
+            ]
+        ]
+        if let instincts = profile.instincts {
+            body["instincts"] = instincts
+        }
+        if let boundaries = profile.boundaries {
+            body["boundaries"] = boundaries
+        }
+        if let examples = profile.examples {
+            body["examples"] = examples
+        }
+        if let forbiddenPatterns = profile.forbiddenPatterns {
+            body["forbiddenPatterns"] = forbiddenPatterns
+        }
+        if let surfaceOverrides = profile.surfaceOverrides {
+            body["surfaceOverrides"] = surfaceOverrides
+        }
+        return try await savePersonality(body: NativeActionRouteSupport.jsonValueBody(body))
+    }
+}
+
+extension CompiledPersonalityProfile {
+    /// Field-for-field the profile the Personality tab and the phone read,
+    /// on load and on save alike.
+    public var sharedProfile: PersonalityProfile {
+        PersonalityProfile(
+            schemaVersion: schemaVersion,
+            personaEngineVersion: personaEngineVersion,
+            name: name,
+            personaKind: personaKind,
+            essence: essence,
+            voice: voice,
+            customDirective: customDirective.isEmpty ? nil : customDirective,
+            traits: PersonalityTraits(
+                warmth: traits.warmth,
+                directness: traits.directness,
+                humor: traits.humor,
+                proactivity: traits.proactivity,
+                rigor: traits.rigor,
+                autonomy: traits.autonomy,
+                creativity: traits.creativity,
+                brevity: traits.brevity
+            ),
+            examples: examples,
+            forbiddenPatterns: forbiddenPatterns,
+            instincts: instincts,
+            boundaries: boundaries,
+            surfaceOverrides: surfaceOverrides,
+            updatedAt: updatedAt.isEmpty ? nil : updatedAt
+        )
+    }
+}
+
+extension PersonaDocSpec: Identifiable {}

@@ -44,6 +44,34 @@ import Connectors
 import Browser
 import DeviceSync
 
+/// The two Mac chat entry points share their provider-facing tier setting.
+/// Core resolves the installation's persona for every door.
+struct NativeChatTurnOptions: Sendable, Equatable {
+    let serviceTier: String?
+
+    static func resolve(
+        fastModeEnabled: Bool,
+        surface: String
+    ) -> NativeChatTurnOptions {
+        return NativeChatTurnOptions(
+            serviceTier: surface == "chat" && fastModeEnabled ? "priority" : nil
+        )
+    }
+
+    /// The picker displays the same normalized value Core compiles.
+    static func normalizedPickerPersona(_ raw: String?, fallback: String = "AI") -> String {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    static func current(surface: String, defaults: UserDefaults = .standard) -> NativeChatTurnOptions {
+        resolve(
+            fastModeEnabled: defaults.bool(forKey: "chatFastMode"),
+            surface: surface
+        )
+    }
+}
+
 struct AppMutationResult: Equatable, Sendable {
     let succeeded: Bool
     let userMessage: String
@@ -70,7 +98,7 @@ extension AppModel {
         }
         let sessionID = activeChatSessionId
         do {
-            let outcome = try await client.compactSession(
+            let outcome = try await compactSession(
                 sessionId: sessionID,
                 model: chatModel,
                 providerID: chatProvider,
@@ -270,16 +298,20 @@ extension AppModel {
                     try await TurnRequest(message: priorText, sessionID: sessionId, surface: "chat",
                         envelope: .some(nil), verifiedSessionID: .some(nil), verifiedChatID: .some(nil),
                         verifiedUserID: .some(nil), origin: .some(retrySnapshot.priorUserOrigin)).bind {
-                        try await client.chat(
+                        try await TurnRequest(
                             message: priorText,
-                            sessionId: sessionId,
+                            sessionID: sessionId,
                             // Ordinary retries use the checked saved Chat choice.
                             model: "",
                             reasoningEffort: "",
                             fileAccess: chatFileAccess,
+                            attachments: [],
+                            persona: nil,
+                            surface: "chat",
                             suppressUserAppend: suppressUserRow,
-                            replacementAssistantMessageId: isSyntheticNotice ? nil : message.id
-                        )
+                            replacementAssistantMessageID: isSyntheticNotice ? nil : message.id,
+                            serviceTier: NativeChatTurnOptions.current(surface: "chat").serviceTier
+                        ).chat(on: macChatClient)
                     }
                 }
                 try Task.checkCancellation()
@@ -394,7 +426,7 @@ extension AppModel {
     @MainActor
     func addMemoryFact(_ text: String) async -> AppMutationResult {
         do {
-            _ = try await client.addMemory(text: text)
+            try await engine.memory.store(content: text, source: "mac.slash-remember", metadata: nil)
             statusText = "Memory saved"
             return .success(statusText)
         } catch {
@@ -408,7 +440,23 @@ extension AppModel {
     // Same execution path as the agent calling commit_memory as a tool.
     func addNote(_ text: String) async -> AppMutationResult {
         do {
-            _ = try await client.postNote(text: text, kind: "user_note")
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw NSError(domain: "NativeAgentNotes", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "text is required"])
+            }
+            try await engine.memory.store(
+                content: trimmed,
+                source: "mac.note",
+                metadata: .object([
+                    "note_kind": .string("user_note"),
+                    "tags": .array([]),
+                    "confidence": .double(0.8),
+                    "importance": .double(0.5),
+                    "surface": .string("mac"),
+                    "command": .string("/note"),
+                ])
+            )
             statusText = "Note committed"
             return .success(statusText)
         } catch {
@@ -423,15 +471,30 @@ extension AppModel {
     func writeScratch(key: String, value: String, sessionId: String? = nil) async -> AppMutationResult {
         do {
             let sessionId = sessionId ?? (activeChatSessionId.isEmpty ? nil : activeChatSessionId)
-            let body = try await client.postScratch(key: key, value: value, sessionId: sessionId)
-            // FIX 5a (2026-06-10 audit): postScratch reports refusals as
-            // {ok:false, error} WITHOUT throwing (no-session, bad sid).
-            // Ignoring the body toasted "Scratch set" over a write that never
-            // happened.
-            guard (body["ok"] as? Bool) == true else {
-                let reason = (body["error"] as? String) ?? "scratch write rejected"
-                statusText = "Scratch write failed: \(reason)"
+            // A missing session refuses the write rather than creating a
+            // throwaway namespace, and the session directory is normalized the
+            // same way the other session writers normalize it (FIX 5a,
+            // 2026-06-10: a refusal never toasts "Scratch set").
+            guard let sessionId, !sessionId.isEmpty else {
+                statusText = "Scratch write failed: scratch requires a session"
                 return .failure(statusText, cause: statusCause)
+            }
+            guard let safeSid = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+                statusText = "Scratch write failed: invalid session id for scratch"
+                return .failure(statusText, cause: statusCause)
+            }
+            let path = engine.dataRoot
+                .appendingPathComponent("chat", isDirectory: true)
+                .appendingPathComponent("sessions", isDirectory: true)
+                .appendingPathComponent(safeSid, isDirectory: true)
+                .appendingPathComponent("scratch.json")
+            let persistence = SwiftNativePersistenceCore()
+            try await persistence.withFileLock(path) {
+                let current = try await persistence.readJSON(path, ifMissing: .object([:]))
+                var root: [String: JSONValue]
+                if case .object(let obj) = current { root = obj } else { root = [:] }
+                root[key] = .string(value)
+                try await persistence.writeJSON(.object(root), to: path)
             }
             statusText = "Scratch \(key) set"
             return .success(statusText)
@@ -810,36 +873,53 @@ extension AppModel {
             engine.turns.streamingUserTurnTexts[requestSessionId] = nil
         }
 
-        let metaBox = NativeClient.MetaBox()
+        let metaBox = MacChatStreamAdapter.MetaBox()
         do {
             // S.5: use lock-guarded MetaBox for safe cross-isolation metadata passing
-            // A bot session continued in Chat keeps the bot's own execution
-            // contract — its model, its effort, its surface — instead of
-            // inheriting the Chat picker (lane1 finding 4).
-            let stream = client.chatStream(
-                message: trimmed.isEmpty ? "(see attachments)" : trimmed,
-                sessionId: requestSessionId,
-                // Empty overrides leave the current saved tuple to core admission.
-                model: "",
-                reasoningEffort: "",
-                fileAccess: chatFileAccess,
-                attachments: attachments,
+            let chatClient = macChatClient
+            let streamSessionId = requestSessionId
+            let message = trimmed.isEmpty ? "(see attachments)" : trimmed
+            let fileAccess = chatFileAccess
+            let turnAttachments = attachments.map {
+                ChatOrchestration.MultimodalAttachment(id: $0.id, type: $0.type, base64: $0.base64, mime: $0.mime,
+                                                       name: $0.name, byteSize: $0.byteSize, path: $0.path)
+            }
+            let stream = MacChatStreamAdapter.stream(
+                sessionId: streamSessionId,
                 metaBox: metaBox,
-                suppressUserAppend: hideUserBubble,
-                surface: "chat",
                 activityIdentity: activityIdentity,
                 onTurnActivity: { [weak self] activity in
                     await self?.receiveChatTurnActivity(activity)
                 },
                 onScreenPreview: { [weak self] update in
                     await self?.receiveMacScreenPreview(update, identity: activityIdentity)
-                },
-                // This turn's deltas render in a mounted Mac chat transcript,
-                // which draws the card itself — so a turn parked on a card does
-                // not restate it in prose here. Nothing else that consumes a
-                // core stream may claim this (2026-09-13).
-                consumerRendersInlineCards: true
-            )
+                }
+            ) {
+                // The service tier travels as a parameter so the facade binds
+                // it inside its own producer task for that producer's whole
+                // life; a synchronous binding here pops the moment the
+                // execution is constructed, before the producer reads it
+                // (swift_task_dealloc_specific).
+                chatClient.chatStreamExecution(
+                    message: message,
+                    sessionId: streamSessionId,
+                    // Empty overrides leave the current saved tuple to core admission.
+                    model: "",
+                    reasoningEffort: "",
+                    fileAccess: fileAccess,
+                    attachments: turnAttachments,
+                    persona: nil,
+                    surface: "chat",
+                    suppressUserAppend: hideUserBubble,
+                    choice: nil,
+                    serviceTier: NativeChatTurnOptions.current(surface: "chat").serviceTier,
+                    // This turn's deltas render in a mounted Mac chat transcript,
+                    // which draws the card itself — so a turn parked on a card does
+                    // not restate it in prose here. Nothing else that consumes a
+                    // core stream may claim this (2026-09-13).
+                    consumerRendersInlineCards: true
+                )
+            }
             // Previously only append ran on the accumulator: the for-await
             // loop still resumed MainActor for every token. Publish only a
             // changed frame to the main window and any detached viewers.
@@ -1059,7 +1139,7 @@ extension AppModel {
                 }
             }
             engine.transcripts.sessions = (try? await engine.transcripts.list()) ?? engine.transcripts.sessions
-            compiledPersonality = try? await client.getCompiledPersonality(surface: "chat")
+            compiledPersonality = try? await PersonaCompiler(engine: personaEngine).compiledPacket(surface: "chat")
         } catch {
             guard await joinFailedMacChatStream(
                 metaBox: metaBox, sessionId: requestSessionId, generation: generation

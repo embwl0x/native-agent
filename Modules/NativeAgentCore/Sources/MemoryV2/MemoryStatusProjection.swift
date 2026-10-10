@@ -139,7 +139,6 @@ public enum MemoryStatusProjection {
                 memories: memCount,
                 active: activeCount,
                 pinned: pinnedCount,
-                noisyReflections: nil,
                 pendingProposals: pendingProposals
             ),
             hygiene: hygieneReport,
@@ -194,6 +193,94 @@ public enum MemoryStatusProjection {
                 ?? (obj["consolidation_run_id"] as? String),
             nextScheduled: nextScheduled
         )
+    }
+
+    /// The miss ledger for the ISO `weeks` asked: every time she was given a
+    /// correction in them (graduated ones too — a lesson now kept in GROWTH was
+    /// still missed), grouped by the lesson it teaches, the most recently
+    /// missed lesson first. Weekly counts per lesson are the growth metric.
+    /// A correction given again collapses into its row; each turn-stamped
+    /// repeat in `duplicate_occurrences` is a miss of its own, at its turn.
+    /// Read for a `surface`, a row its disclosure keeps from that surface still
+    /// counts but shows no text (nil: the Mac's own page, which sees all).
+    public static func misses(dataRoot: URL, weeks: [String], surface: String? = nil) async throws -> [MemoryMissLesson] {
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        var lessons: [MemoryMissLesson] = []
+        for m in try await storage.listMemories(persona: nil, status: nil, limit: nil)
+        where m.status != "deleted" && MemoryMoments.metadataString(m.metadata, "kind") == "correction" {
+            let session = MemoryMoments.metadataString(m.metadata, "session_id")
+            // Dated by the turn that gave it (a held or recovered correction is
+            // kept later); rows kept before turns were stamped, by their insert.
+            var occurrences = [(at: MemoryMoments.metadataString(m.metadata, "turn_at") ?? m.createdAt, session: session,
+                                history: MemoryMoments.metadataString(m.metadata, "history"))]
+            if case .object(let meta)? = m.metadata, case .array(let repeats)? = meta["duplicate_occurrences"] {
+                for case .object(let repeated) in repeats {
+                    guard case .string(let at)? = repeated["turn_at"] else { continue }
+                    // A key the repeat shares with the row is left out of it.
+                    occurrences.append((at, MemoryMoments.metadataString(.object(repeated), "session_id") ?? session,
+                                        MemoryMoments.metadataString(.object(repeated), "history")))
+                }
+            }
+            // Scope only: a graduated or archived miss is history, not hidden.
+            // A hidden one counts under one name and shows neither its words
+            // nor the lesson named from them.
+            let record = MemoryRecord(stored: m)
+            let shown = surface == nil || MemoryRecordDisclosurePolicy.classify(
+                personaID: record.personaId, status: "active", lifecycle: nil, tags: record.tags, metadata: record.extras
+            )?.permits(surface: surface, personaID: nil) == true
+            let name = !shown ? "not shown on this surface"
+                : MemoryMoments.metadataString(m.metadata, "lesson") ?? lesson(metadata: m.metadata, text: m.content)
+            let text = shown ? m.content : ""
+            for occurrence in occurrences {
+                let week = isoWeek(MemoryMoments.parseTimestamp(occurrence.at) ?? .distantPast)
+                guard weeks.contains(week) else { continue }
+                let miss = MemoryMiss(memoryId: m.id, text: text, at: occurrence.at, week: week,
+                                      sessionId: occurrence.session, history: occurrence.history)
+                if let index = lessons.firstIndex(where: { $0.lesson == name }) {
+                    lessons[index].misses.append(miss)
+                } else {
+                    lessons.append(MemoryMissLesson(lesson: name, misses: [miss]))
+                }
+            }
+        }
+        // Newest first, each lesson's misses and the lessons themselves.
+        func newest(_ miss: MemoryMiss) -> Date { MemoryMoments.parseTimestamp(miss.at) ?? .distantPast }
+        for index in lessons.indices { lessons[index].misses.sort { newest($0) > newest($1) } }
+        return lessons.sorted { newest($0.misses[0]) > newest($1.misses[0]) }
+    }
+
+    /// "2026-W41": the ISO week `date` falls in, on this Mac's clock. `ago`
+    /// whole weeks back from it.
+    public static func isoWeek(_ date: Date = Date(), ago: Int = 0) -> String {
+        let date = date.addingTimeInterval(-Double(ago) * 7 * 86_400)
+        let parts = Calendar(identifier: .iso8601).dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
+        return String(format: "%04d-W%02d", parts.yearForWeekOfYear ?? 0, parts.weekOfYear ?? 0)
+    }
+
+    /// Labels too broad to say what an agreement or a correction is about.
+    public static let genericSubjects: Set<String> = [
+        "instruction", "correction", "preference", "policy", "user", "agent", "claude", "codex", "nativeagent",
+    ]
+
+    /// The lesson a correction teaches, as one short tag, stamped once when it
+    /// is kept (`lesson`): the memory manager's subject, else her first
+    /// specific tag or topic, else the first words of its first clause. Rows
+    /// kept before the stamp are named the same way when read.
+    public static func lesson(metadata: JSONValue?, text: String) -> String {
+        func tag(_ text: String) -> String {
+            text.lowercased().split { !$0.isLetter && !$0.isNumber }.prefix(4).joined(separator: "-")
+        }
+        var labels = [MemoryMoments.metadataString(metadata, "correction_subject")].compactMap { $0 }
+        if case .object(let meta)? = metadata {
+            for key in ["tags", "context_topics"] {
+                guard case .array(let values)? = meta[key] else { continue }
+                labels += values.compactMap { if case .string(let label) = $0 { label } else { nil } }
+            }
+        }
+        if let label = labels.map(tag).first(where: { !$0.isEmpty && !genericSubjects.contains($0) }) {
+            return label
+        }
+        return tag(text.split { ".,;:—(".contains($0) }.first.map(String.init) ?? text)
     }
 
     private static func statusDecoder() -> JSONDecoder {

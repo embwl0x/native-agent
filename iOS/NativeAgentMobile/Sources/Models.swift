@@ -111,7 +111,7 @@ struct WorkshopTaskRecord: Identifiable, Codable, Hashable, Sendable {
 // Command-summary count and policy models live in NativeAgentShared.
 
 // MultimodalAttachment, ChatSession, RuntimeHealth, RunRecord, MemoryRecord,
-// PersonalityTraits, PersonalityProfile, PersonalityDoc moved to NativeAgentShared.
+// PersonalityTraits and PersonalityProfile moved to NativeAgentShared.
 
 // Note: iOS ChatView.swift defines its own local ChatMessage for display; this Codable version
 // is used for the iCloud snapshot transport layer.
@@ -270,32 +270,25 @@ struct TrustProviderPolicy: Codable, Hashable, Sendable {
 }
 
 struct TrustTrainingPolicy: Codable, Hashable, Sendable {
-    var autonomousTraining: Bool?
     var dreamScheduler: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case autonomousTraining
         case dreamScheduler
-        case autonomous_training
         case dream_scheduler
     }
 
-    init(autonomousTraining: Bool? = nil, dreamScheduler: Bool? = nil) {
-        self.autonomousTraining = autonomousTraining
+    init(dreamScheduler: Bool? = nil) {
         self.dreamScheduler = dreamScheduler
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        autonomousTraining = try c.decodeIfPresent(Bool.self, forKey: .autonomousTraining)
-            ?? c.decodeIfPresent(Bool.self, forKey: .autonomous_training)
         dreamScheduler = try c.decodeIfPresent(Bool.self, forKey: .dreamScheduler)
             ?? c.decodeIfPresent(Bool.self, forKey: .dream_scheduler)
     }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encodeIfPresent(autonomousTraining, forKey: .autonomousTraining)
         try c.encodeIfPresent(dreamScheduler, forKey: .dreamScheduler)
     }
 }

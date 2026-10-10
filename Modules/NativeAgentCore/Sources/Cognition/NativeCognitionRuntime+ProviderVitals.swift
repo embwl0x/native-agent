@@ -20,13 +20,32 @@ import ProviderRouting
 
 extension NativeCognitionRuntime {
     /// Bootstrap-owned restore. Snapshot age and row validity are enforced by
-    /// the sensor; a missing or stale file is a normal cold start.
+    /// the sensor; a missing or stale file is a normal cold start. First
+    /// outputs come from the trace, read once here.
     func restoreProviderVitalsSnapshot() async {
         do {
             _ = try await providerVitalsSensor.restoreSnapshot(dataRoot: dataRoot, now: now())
         } catch {
             nativeLog("Provider vitals snapshot unavailable: %@", error.localizedDescription)
         }
+        do {
+            try await providerVitalsSensor.readFirstOutputs(dataRoot: dataRoot)
+        } catch {
+            nativeLog("Provider first outputs unreadable from traces/events.jsonl (first-output deadlines learn from this run's calls only): %@",
+                      error.localizedDescription)
+        }
+    }
+
+    /// The stream guard's read port: the sensor is a `let`, so no hop onto
+    /// this actor. The router's lifecycle start has already awaited bootstrap.
+    public nonisolated func firstOutputDeadline(provider: String, model: String,
+                                                streamKind: String?) async -> FirstOutputDeadline {
+        await providerVitalsSensor.firstOutputDeadline(provider: provider, model: model, streamKind: streamKind)
+    }
+
+    /// Diagnostics: each provider's first outputs and cuts, as the guard sees them.
+    public nonisolated func providerFirstOutputs() async -> String {
+        await providerVitalsSensor.firstOutputReport()
     }
 
     /// Termination-owned snapshot persistence (the ONLY disk write in the

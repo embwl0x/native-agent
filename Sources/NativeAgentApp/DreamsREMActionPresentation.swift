@@ -33,7 +33,7 @@ enum DreamsREMRunAvailability: Equatable {
 }
 
 /// Bounded, user-visible completion for the same response returned by
-/// `NativeClient.runRem()`. A synchronous manual run has already completed;
+/// `BackgroundLoopsAssembly.runRem`. A synchronous manual run has already completed;
 /// calling it "started" hides both no-op weeks and malformed responses.
 enum DreamsREMActionFeedback: Equatable {
     case completed(proposals: Int, archivedEntries: Int)

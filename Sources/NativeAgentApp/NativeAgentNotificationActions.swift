@@ -152,13 +152,15 @@ enum NativeAgentNotificationActions {
         }
     }
 
+    /// Opens the conversation; with `messageID`, lands on that message.
     @MainActor
-    private static func openConversation(_ sessionID: String) async {
+    static func openConversation(_ sessionID: String, messageID: String? = nil) async {
         _ = NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
         guard let appModel = QuietSelfAdmin.shared.appModel else { return }
         await appModel.refreshChatSessionIndex()
         if let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionID }) {
             await appModel.selectChatSession(session)
+            appModel.pendingChatMessageID = messageID
         }
     }
 

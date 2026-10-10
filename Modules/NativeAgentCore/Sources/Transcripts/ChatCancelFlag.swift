@@ -19,13 +19,24 @@ public enum ChatCancelFlag {
             .appendingPathComponent("cancelled.flag")
     }
 
-    /// Registers `runId` as in flight on the session; pair with `finish`.
-    public static func accept(dataRoot: URL, sessionId: String, runId: String) -> URL {
+    /// One accepted run, whichever door started it: its session, the trace
+    /// turn its milestones carry, and when it was accepted.
+    public struct InFlightTurn: Sendable {
+        let runId: String
+        public let sessionId: String
+        public let turnId: String
+        public let acceptedAt: Date
+    }
+
+    /// Registers `runId` (trace turn `turnId`) as in flight on the session;
+    /// pair with `finish`.
+    public static func accept(dataRoot: URL, sessionId: String, runId: String, turnId: String) -> URL {
         let file = path(dataRoot: dataRoot, sessionId: sessionId)
         let key = file.standardizedFileURL.path
         registry.withLock { runs in
             runs.completed.removeAll { $0 == key }
-            runs.inFlight[key, default: []].append(runId)
+            runs.inFlight[key, default: []].append(
+                InFlightTurn(runId: runId, sessionId: sessionId, turnId: turnId, acceptedAt: Date()))
             runs.latest[key] = runId
         }
         guard var parts = URLComponents(url: file, resolvingAgainstBaseURL: false) else { return file }
@@ -37,7 +48,7 @@ public enum ChatCancelFlag {
         guard let runId = flag.fragment else { return }
         let key = URL(fileURLWithPath: flag.path).standardizedFileURL.path
         registry.withLock { runs in
-            guard var ids = runs.inFlight[key], let i = ids.firstIndex(of: runId) else { return }
+            guard var ids = runs.inFlight[key], let i = ids.firstIndex(where: { $0.runId == runId }) else { return }
             ids.remove(at: i)
             runs.inFlight[key] = ids.isEmpty ? nil : ids
             if ids.isEmpty {
@@ -52,7 +63,17 @@ public enum ChatCancelFlag {
     /// Every run accepted and not yet finished, on any session. The app's quit
     /// waits for these so a Quit mid-turn lets the turn land.
     public static func inFlightRunIDs() -> Set<String> {
-        registry.withLock { runs in Set(runs.inFlight.values.joined()) }
+        registry.withLock { runs in Set(runs.inFlight.values.joined().map(\.runId)) }
+    }
+
+    /// The turns in flight on `dataRoot`'s sessions, whichever door started
+    /// them.
+    public static func inFlightTurns(dataRoot: URL) -> [InFlightTurn] {
+        registry.withLock { runs in
+            runs.inFlight.flatMap { key, turns in
+                turns.filter { path(dataRoot: dataRoot, sessionId: $0.sessionId).standardizedFileURL.path == key }
+            }
+        }
     }
 
     /// What a Stop writes: the runs in flight on this marker's session, else
@@ -60,7 +81,7 @@ public enum ChatCancelFlag {
     public static func stopContent(forFlagAt flag: URL) -> String {
         let key = flag.standardizedFileURL.path
         return registry.withLock { runs in
-            if let ids = runs.inFlight[key], !ids.isEmpty { return ids.joined(separator: "\n") }
+            if let ids = runs.inFlight[key], !ids.isEmpty { return ids.map(\.runId).joined(separator: "\n") }
             return runs.latest[key] ?? "none"
         }
     }
@@ -76,7 +97,7 @@ public enum ChatCancelFlag {
     }
 
     private struct Runs {
-        var inFlight: [String: [String]] = [:]
+        var inFlight: [String: [InFlightTurn]] = [:]
         var latest: [String: String] = [:]
         // Keep up to 256 completed sessions for Stop; in-flight sessions stay retained.
         var completed: [String] = []

@@ -89,7 +89,7 @@ public actor GitHubCommandRuntime {
                 switch $0.state {
                 case .detected, .needsCodex, .codexWorking, .verifying, .attention:
                     return true
-                case .needsUser, .waitingUpstream, .resolved:
+                case .needsOwner, .waitingUpstream, .resolved:
                     return false
                 }
             }

@@ -102,13 +102,48 @@ extension BackgroundLoopsAssembly {
     ///
     /// gpt-5.5 executor-port blocker #1 (2026-06-10): the ASSEMBLED executor
     /// instance is also published to WorkshopExecutorRef.shared here, so
-    /// NativeClient.startWorkshopExecution can route explicit "Start execution" requests
-    /// through the SAME actor (same injected LLM/tool/stager closures, same
-    /// actor serialization) the background drain loop runs — mirror of the
-    /// AppRestartCoordinator.shared.configure app-boot wiring pattern.
-    /// assembleAllLoops → BackgroundLoopsManager.start() calls this once at
-    /// app launch; until then the ref is unconfigured and startWorkshopExecution
-    /// throws an honest "executor not running" error.
+    /// approval continuations reach the SAME actor (same injected LLM/tool/
+    /// stager closures, same actor serialization) the background drain loop
+    /// runs — mirror of the AppRestartCoordinator.shared.configure app-boot
+    /// wiring pattern. assembleAllLoops → BackgroundLoopsManager.start() calls
+    /// this once at app launch; until then the ref is unconfigured.
+    /// The Workshop runner the Desk's submit, step approvals and the agent's
+    /// step decisions share: a fresh, side-effect-free actor per call (no
+    /// cached state), whose planner sees the real tool catalog so a submitted
+    /// execution can plan and run actual tools, not only chat.synthesize.
+    /// Another root gets a planner routed and ledgered at that root.
+    static func makeWorkshopExecutionRunner(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> WorkshopExecution.SwiftNativeWorkshopRunner {
+        let connectorActions = makeWorkshopPlannerConnectorActionsProvider(dataRoot: dataRoot)
+        let cognition = cognitionRuntime(for: dataRoot)
+        let isLiveRoot = dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
+        return WorkshopExecution.SwiftNativeWorkshopRunner(
+            root: dataRoot,
+            planner: isLiveRoot
+                ? SwiftNativeWorkshopPlannerLLM(connectorActionsProvider: connectorActions, lifecycleObserver: cognition)
+                : SwiftNativeWorkshopPlannerLLM(dataRoot: dataRoot, connectorActionsProvider: connectorActions,
+                                                lifecycleObserver: cognition))
+    }
+
+    /// A person-directed Desk task (the Desk, the iPhone, Siri, the
+    /// scheduler): queued through the Workshop with trust "none". Nothing
+    /// starts here; the executor loop claims it on its next drain pass.
+    static func submitDeskTask(
+        title: String, objective: String, projectSpaceId: String? = nil
+    ) async throws -> WorkshopDirectedTaskResult {
+        try await WorkshopDirectedTaskSubmitter(
+            dataRoot: PersistenceCore.defaultDataRoot(),
+            runner: makeWorkshopExecutionRunner()
+        ).submit(spec: WorkshopExecutionSpec(
+            title: title,
+            objective: objective,
+            triggerSource: "manual",
+            trustRequired: "none",
+            projectSpaceId: projectSpaceId
+        ))
+    }
+
     static func makeWorkshopExecutorLoopRunner(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         cognitionRuntime: NativeCognitionRuntime? = nil
@@ -127,10 +162,9 @@ extension BackgroundLoopsAssembly {
 /// Process-wide handle to the ASSEMBLED WorkshopExecutorLoop (gpt-5.5
 /// executor-port blocker #1, 2026-06-10). The executor actor is constructed
 /// with injected closures in BackgroundLoopsAssembly.makeMissionExecutor and
-/// registered as a background loop at app boot; NativeClient.startWorkshopExecution
-/// needs that SAME instance to serve the UI "Start execution" path (the
-/// WorkshopRunnerClient protocol's start() deliberately throws — the runner
-/// holds no executor closures). Same shared-singleton wiring shape as
+/// registered as a background loop at app boot; an approved step's
+/// continuation needs that SAME instance (the WorkshopRunnerClient protocol's
+/// start() deliberately throws — the runner holds no executor closures). Same shared-singleton wiring shape as
 /// AppRestartCoordinator.shared.configure: the app layer configures it at
 /// boot, and an UNCONFIGURED ref makes callers throw an honest "executor
 /// not running" error — never a silent no-op (headless/test builds).

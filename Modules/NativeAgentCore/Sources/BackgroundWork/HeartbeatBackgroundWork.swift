@@ -7,7 +7,6 @@ import Desk
 import ApprovalInbox
 import WorkshopExecution
 import TrustCenter
-import SelfImprovement
 import NotificationInbox
 import Privacy
 
@@ -22,39 +21,34 @@ public struct HeartbeatBackgroundWork: Sendable {
 
     /// Interval health heartbeat (U2b wave 3, plan design #6). Reads
     /// `HEARTBEAT.md` from the persona dir, gathers a compact live signal
-    /// block (pending evolution / stuck executions / Full-Mac expiry / Doctor),
+    /// block (stuck executions / Full-Mac expiry / Doctor),
     /// and surfaces deterministic anomalies as stable inbox cards. Clean
-    /// assessments skip the LLM; anomalous assessments use the app's own LLM
-    /// (heartbeat surface picker) only to phrase the alert. The checklist read,
+    /// assessments make no notice; anomalies use their per-condition template. The checklist read,
     /// assessment gather, and notice surface are injected so the BackgroundLoops
     /// module stays dependency-clean (same rule as makeWeeklySelfImprovementLoop).
     public func makeHeartbeatLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        llm: any LLMClient
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> HeartbeatLoop {
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
         // Live-verify hook: a terminal-launched bundle can shrink the interval
         // (NATIVE_AGENT_HEARTBEAT_INTERVAL_SECONDS=60) to watch a real tick.
         // The normal `open`-launched app never has this set → twice daily.
         // Floor at 1s: interval ≤ 0 reaches Task.sleep(0) in the scheduler —
-        // a tight busy loop hammering the LLM (gpt-5.5 review catch).
+        // a tight busy loop.
         let interval = ProcessInfo.processInfo
             .environment["NATIVE_AGENT_HEARTBEAT_INTERVAL_SECONDS"]
             .flatMap(TimeInterval.init)
             .flatMap { $0.isFinite && $0 >= 1 ? $0 : nil } ?? HeartbeatLoop.defaultInterval
         return HeartbeatLoop(
             interval: interval,
-            llm: llm,
             loadChecklist: {
                 let path = personaRoot.appendingPathComponent("HEARTBEAT.md")
                 return try? String(contentsOf: path, encoding: .utf8)
             },
             gatherAssessment: {
-                let closed = await closeResolvedDoctorSelfHealProposals(dataRoot: dataRoot)
-                return await gatherHeartbeatAssessment(
+                await gatherHeartbeatAssessment(
                     dataRoot: dataRoot,
-                    interval: interval,
-                    closedResolvedDoctorProposals: closed
+                    interval: interval
                 )
             },
             surfaceNotice: { notice in
@@ -63,53 +57,6 @@ public struct HeartbeatBackgroundWork: Sendable {
                 try await upsertHeartbeatNoticeCard(dataRoot: dataRoot, notice: notice)
             }
         )
-    }
-
-    /// Closes unresolved Doctor-failure self-heal proposals once the current
-    /// Doctor snapshot is green again. This keeps the proposal queue honest
-    /// after restarts: a no-longer-reproducing Doctor failure should not stay
-    /// in `needs_diff` and keep feeding heartbeat alerts.
-    @discardableResult
-    public func closeResolvedDoctorSelfHealProposals(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async -> Int {
-        guard currentDoctorSnapshotHealthy(dataRoot: dataRoot) == true else { return 0 }
-
-        let store = EvolutionProposalStore(dataRoot: dataRoot)
-        let active: [EvolutionProposal]
-        do {
-            active = try await store.list(statuses: [.needsDiff])
-        } catch {
-            FileHandle.standardError.write(Data(
-                "HeartbeatLoop: resolved Doctor proposal scan failed: \(error)\n".utf8))
-            return 0
-        }
-
-        let staleDoctorProposals = active.filter(isResolvedDoctorSelfHealProposal)
-        guard !staleDoctorProposals.isEmpty else { return 0 }
-
-        var closed = 0
-        for proposal in staleDoctorProposals {
-            do {
-                let result = try await store.transition(
-                    id: proposal.id,
-                    to: .denied,
-                    require: [.needsDiff],
-                    receipt: "closed automatically: Doctor currently reports healthy and the original failure no longer reproduces",
-                    denyReason: "superseded: Doctor is currently healthy before a diff was attached"
-                )
-                if result.applied { closed += 1 }
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "HeartbeatLoop: resolved Doctor proposal close failed for \(proposal.id): \(error)\n".utf8))
-            }
-        }
-
-        if closed > 0 {
-            FileHandle.standardError.write(Data(
-                "HeartbeatLoop: closed \(closed) resolved Doctor self-heal proposal(s)\n".utf8))
-        }
-        return closed
     }
 
     /// Drop the rows an UNATTENDED sweep is not allowed to judge.
@@ -132,34 +79,6 @@ public struct HeartbeatBackgroundWork: Sendable {
             return DoctorHeartbeatPolicy.isEligible(id)
         }
         return (eligible, rows.count - eligible.count)
-    }
-
-    private func currentDoctorSnapshotHealthy(dataRoot: URL) -> Bool? {
-        let doctorPath = dataRoot.appendingPathComponent("doctor", isDirectory: true)
-            .appendingPathComponent("latest.json")
-        guard let data = try? Data(contentsOf: doctorPath),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        // Malformed shape = unknown, not healthy (gpt-5.5 wave-1 NEEDS_FIX).
-        guard let checks = obj["checks"] as? [[String: Any]] else {
-            return nil
-        }
-        // Self-heal decisions are unattended too: a Doctor-only row must not
-        // hold a resolved proposal open, exactly as it must not raise an alert.
-        let judged = heartbeatEligibleDoctorRows(checks).eligible
-        // Every row excluded ⇒ nothing was judged. Unknown, not healthy.
-        guard !judged.isEmpty else { return nil }
-        return !judged.contains { ($0["status"] as? String) == "fail" }
-    }
-
-    private func isResolvedDoctorSelfHealProposal(_ proposal: EvolutionProposal) -> Bool {
-        guard proposal.source == .selfHeal, proposal.status == .needsDiff else { return false }
-        let title = proposal.title.lowercased()
-        let evidence = proposal.evidence.lowercased()
-        return title.contains("doctor failure")
-            || evidence.contains("doctor health transitioned healthy")
-            || evidence.contains("doctor snapshot (failing)")
     }
 
     private struct HeartbeatIssue: Sendable {
@@ -216,33 +135,35 @@ public struct HeartbeatBackgroundWork: Sendable {
     /// correction, but it is otherwise easy to leave indefinitely in the one
     /// proposal array. Name that stalled branch before it becomes invisible
     /// behind later, healthy proposals.
-    private let heartbeatCandidateFailedAge: TimeInterval = 6 * 60 * 60
-    private let heartbeatInstalledUnverifiedAge: TimeInterval = 60 * 60
 
     /// Composes the heartbeat's live signal block and deterministic verdict.
     /// Clean facts return `.clean` so the loop does not spend an LLM call.
     public func gatherHeartbeatAssessment(
         dataRoot: URL,
         interval: TimeInterval = HeartbeatLoop.defaultInterval,
-        closedResolvedDoctorProposals: Int = 0,
         now: Date = Date(),
         bridgeConfigRoot: URL? = nil
     ) async -> HeartbeatAssessment {
         var sections: [String] = []
         var issues: [HeartbeatIssue] = []
 
-        let doctor = heartbeatDoctorSection(dataRoot: dataRoot)
+        var doctorOwners: [DoctorOwner: [String]]?
+        do {
+            let body = try await BodyReport.read(dataRoot: dataRoot, now: now)
+            doctorOwners = body.doctorOwners
+            let owners = [DoctorOwner.app, .owner, .agent, .builder].compactMap { owner in
+                body.doctorOwners[owner].map { "\(owner.rawValue) [\($0.joined(separator: ", "))]" }
+            }
+            sections.append("Body: \(body.organsLine); harness open \(body.openHarness.count)"
+                + (body.openHarness.first.map { ", newest \"\($0.title)\"" } ?? "")
+                + (owners.isEmpty ? "" : "; Doctor findings by owner: " + owners.joined(separator: ", ")) + ".")
+        } catch {
+            sections.append("Body: the body report could not be read (\(error.localizedDescription)).")
+        }
+
+        let doctor = heartbeatDoctorSection(dataRoot: dataRoot, doctorOwners: doctorOwners)
         sections.append(doctor.line)
         if let issue = doctor.issue { issues.append(issue) }
-
-        let evolution = await heartbeatEvolutionSection(
-            dataRoot: dataRoot,
-            now: now,
-            currentDoctorHealthy: doctor.healthy,
-            closedResolvedDoctorProposals: closedResolvedDoctorProposals
-        )
-        sections.append(evolution.line)
-        issues.append(contentsOf: evolution.issues)
 
         let executions = heartbeatExecutionsSection(dataRoot: dataRoot, now: now)
         sections.append(executions.line)
@@ -259,6 +180,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         let staleTasks = await heartbeatStaleTaskSection(dataRoot: dataRoot)
         sections.append(staleTasks.line)
         if let issue = staleTasks.issue { issues.append(issue) }
+
 
         let residue = await heartbeatDurableResidueSummary(
             dataRoot: dataRoot,
@@ -308,7 +230,7 @@ public struct HeartbeatBackgroundWork: Sendable {
     }
 
     private func heartbeatDoctorSection(
-        dataRoot: URL
+        dataRoot: URL, doctorOwners: [DoctorOwner: [String]]?
     ) -> (line: String, healthy: Bool?, issue: HeartbeatIssue?) {
         let doctorPath = dataRoot.appendingPathComponent("doctor", isDirectory: true)
             .appendingPathComponent("latest.json")
@@ -351,6 +273,19 @@ public struct HeartbeatBackgroundWork: Sendable {
             ? " \(skipped) Doctor-only row(s) excluded from the heartbeat by design."
             : ""
 
+        guard let doctorOwners else {
+            return (
+                "Doctor: finding owners are unavailable; resolve the body report read error above before judging failures.",
+                nil,
+                HeartbeatIssue(
+                    id: "doctor-malformed",
+                    summary: "Doctor finding ownership is unavailable.",
+                    detail: "The body report could not be read, so heartbeat cannot verify the health checklist. Resolve the body report read error before judging failures.",
+                    priority: 20,
+                    actions: []
+                )
+            )
+        }
         // Nothing left to judge is UNVERIFIABLE, not "healthy" — the same rule
         // the malformed-snapshot branch above follows.
         guard !judged.isEmpty else {
@@ -361,9 +296,9 @@ public struct HeartbeatBackgroundWork: Sendable {
                 nil
             )
         }
-
-        let fails = judged.filter { ($0["status"] as? String) == "fail" }
-        let warns = judged.filter { ($0["status"] as? String) == "warn" }
+        let owned = Set(doctorOwners.values.flatMap { $0 })
+        let fails = judged.filter { ($0["status"] as? String) == "fail" && owned.contains($0["id"] as? String ?? "") }
+        let warns = judged.filter { ($0["status"] as? String) == "warn" && owned.contains($0["id"] as? String ?? "") }
         var line = "Doctor: \(fails.count) failing, \(warns.count) warning, \(judged.count) total."
         if !fails.isEmpty {
             line += " Failing: " + fails.compactMap { $0["id"] as? String }.joined(separator: ", ") + "."
@@ -384,88 +319,6 @@ public struct HeartbeatBackgroundWork: Sendable {
                 actions: []
             )
         )
-    }
-
-    private func heartbeatEvolutionSection(
-        dataRoot: URL,
-        now: Date,
-        currentDoctorHealthy: Bool?,
-        closedResolvedDoctorProposals: Int
-    ) async -> (line: String, issues: [HeartbeatIssue]) {
-        let store = EvolutionProposalStore(dataRoot: dataRoot)
-        guard let active = try? await store.list(statuses: [
-            .needsDiff, .proposed, .building, .candidateGreen, .candidateFailed,
-            .staged, .approved, .installed,
-        ]) else {
-            return ("Pending evolution: unreadable proposal store.", [
-                HeartbeatIssue(
-                    id: "evolution-store-unreadable",
-                    summary: "Evolution proposal store could not be read.",
-                    detail: "Heartbeat could not read data/evolution/proposals.json, so it cannot verify self-evolution state.",
-                    priority: 30,
-                    actions: []
-                )
-            ])
-        }
-
-        var line: String
-        if active.isEmpty {
-            line = "Pending evolution: none in flight."
-        } else {
-            let titles = active.prefix(5).map { "\($0.status.rawValue): \($0.title)" }
-            line = "Pending evolution (\(active.count)): " + titles.joined(separator: "; ")
-        }
-        if closedResolvedDoctorProposals > 0 {
-            line += " Closed \(closedResolvedDoctorProposals) resolved Doctor self-heal proposal(s) before assessment."
-        }
-
-        var issues: [HeartbeatIssue] = []
-        let selfHealNeedsDiff = active.filter { $0.source == .selfHeal && $0.status == .needsDiff }
-        let resolvedDoctorSelfHeal = selfHealNeedsDiff.filter(isResolvedDoctorSelfHealProposal)
-        if currentDoctorHealthy == true, !resolvedDoctorSelfHeal.isEmpty {
-            issues.append(HeartbeatIssue(
-                id: "doctor-self-heal-stale",
-                summary: "\(resolvedDoctorSelfHeal.count) resolved Doctor self-heal proposal(s) still need closure.",
-                detail: "Doctor is currently healthy, but \(resolvedDoctorSelfHeal.count) Doctor-failure self-heal proposal(s) are still in needs_diff.",
-                priority: 15,
-                actions: [
-                    HeartbeatCardAction.repair.noticeAction
-                ]
-            ))
-        }
-
-        let failedCandidates = active.filter {
-            $0.status == .candidateFailed
-                && (heartbeatAgeSeconds(updatedAt: $0.updatedAt, createdAt: $0.createdAt, now: now)
-                    .map { $0 >= heartbeatCandidateFailedAge } ?? false)
-        }
-        if !failedCandidates.isEmpty {
-            let titles = failedCandidates.prefix(3).map(\.title).joined(separator: "; ")
-            issues.append(HeartbeatIssue(
-                id: "evolution-candidate-failed",
-                summary: "\(failedCandidates.count) evolution candidate(s) failed and need a new diff.",
-                detail: "Candidate build failures have remained unresolved for over \(Int(heartbeatCandidateFailedAge / 3600))h: \(titles).",
-                priority: 18,
-                actions: []
-            ))
-        }
-
-        let unverifiedInstalls = active.filter {
-            $0.status == .installed
-                && (heartbeatAgeSeconds(updatedAt: $0.updatedAt, createdAt: $0.createdAt, now: now)
-                    .map { $0 >= heartbeatInstalledUnverifiedAge } ?? false)
-        }
-        if !unverifiedInstalls.isEmpty {
-            issues.append(HeartbeatIssue(
-                id: "evolution-installed-unverified",
-                summary: "\(unverifiedInstalls.count) installed evolution run(s) need verification.",
-                detail: "Installed evolution run(s) have not reached verified after \(Int(heartbeatInstalledUnverifiedAge / 60))m.",
-                priority: 20,
-                actions: []
-            ))
-        }
-
-        return (line, issues)
     }
 
     private func heartbeatExecutionsSection(
@@ -1079,17 +932,6 @@ public struct HeartbeatBackgroundWork: Sendable {
             ? String(id.dropFirst("heartbeat-".count))
             : id
         switch conditionID {
-        case "doctor-self-heal-stale":
-            let closed = await closeResolvedDoctorSelfHealProposals(dataRoot: dataRoot)
-            guard closed > 0 else {
-                throw NSError(
-                    domain: "NativeAgentSwiftOnly",
-                    code: -430,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "No resolved Doctor self-heal proposal could be closed. Doctor may still be failing or the proposal was already handled."]
-                )
-            }
-            return "Closed \(closed) resolved Doctor self-heal proposal(s)."
         default:
             throw NSError(
                 domain: "NativeAgentSwiftOnly",
@@ -1100,225 +942,4 @@ public struct HeartbeatBackgroundWork: Sendable {
         }
     }
 
-    // MARK: - U2b wave 2: evolution approval staging glue
-
-    /// Applies GREEN evolution candidates under admitted Full Mac authority;
-    /// otherwise stages human approval cards. For every proposal at candidate_green/staged:
-    ///   • a pending self_evolution.apply approval already exists → ensure
-    ///     the visible card + heal the staged status (crash retry path);
-    ///   • the newest matching approval was approved/denied → the executor's
-    ///     lane, skip;
-    ///   • canceled (or no approval yet) → stage a fresh card.
-    /// Idempotency is the REM ensure-not-create shape: the dedupe list FAILS
-    /// CLOSED (an unreadable inbox stages nothing rather than risking a
-    /// duplicate), and card id == approval id so resolve retires the card.
-    ///
-    /// SAFETY: admitted Full Mac authority permits automatic promotion and
-    /// installation, subject to the rebuild gate. Outside that authority,
-    /// risk is pinned "critical" and a PENDING card requires human approval.
-    /// `onlyProposalId` (U4 Wave D, gpt-5.5 review SHOULD-FIX): when set, stage
-    /// ONLY that proposal (the `self_install` chat trigger names one explicit
-    /// id — staging unrelated green candidates B/C because the caller asked for
-    /// A is least-surprise-violating). The background reconcile loop passes nil
-    /// → stage all eligible, as before.
-    public func stageEvolutionApprovals(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        onlyProposalId: String? = nil
-    ) async {
-        let store = EvolutionProposalStore(dataRoot: dataRoot)
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        var stageable: [EvolutionProposal]
-        do {
-            // `.approved` is the non-prompt Full Mac deferred-install resume
-            // state: promotion succeeded, but the rebuild gate was closed.
-            stageable = try await store.list(statuses: [.candidateGreen, .staged, .approved])
-        } catch {
-            FileHandle.standardError.write(Data(
-                "EvolutionStager: proposal scan failed: \(error)\n".utf8))
-            return
-        }
-        if let onlyProposalId {
-            stageable = stageable.filter { $0.id == onlyProposalId }
-        }
-        guard !stageable.isEmpty else { return }
-        let approvals: [ApprovalRecord]
-        do {
-            approvals = try await inbox.list(
-                filter: ApprovalFilter(action: port.selfEvolutionAction))
-        } catch {
-            FileHandle.standardError.write(Data(
-                "EvolutionStager: dedupe list failed — staging skipped: \(error)\n".utf8))
-            return
-        }
-        for proposal in stageable {
-            guard let runId = proposal.candidateRunId,
-                  let diffSha = proposal.diffSHA256 else { continue }
-            let payload: JSONValue = .object([
-                "kind": .string("self_evolution"),
-                "proposalId": .string(proposal.id),
-                "runId": .string(runId),
-                "diffSHA256": .string(diffSha),
-                "expectedHead": .string(proposal.expectedHead ?? ""),
-                "evidence": .string(await candidateEvidenceSummary(
-                    dataRoot: dataRoot, runId: runId)),
-                "source": .string(proposal.source.rawValue),
-            ])
-            let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-                .fullMacYoloAuthority(
-                    tool: port.selfEvolutionAction,
-                    origin: SecurityOriginContext(
-                        surface: "desk",
-                        source: "background_evolution_stager",
-                        isRemote: false
-                    )
-                )
-            if yolo.admitted {
-                await port.applyFullMacAdmittedSelfEvolution(
-                    payload: payload,
-                    dataRoot: dataRoot
-                )
-                continue
-            }
-            if yolo.state == .explicitlyBlocked {
-                try? await store.appendReceipt(
-                    id: proposal.id,
-                    kind: "full_mac_refused",
-                    detail: "self_evolution.apply is explicitly blocked; no approval was staged"
-                )
-                continue
-            }
-            if proposal.status == .approved {
-                // Only the Full Mac admitted lane creates this approval-free
-                // deferred state. Outside that grant, leave it deferred and
-                // never translate it back into a prompt.
-                continue
-            }
-            let matching = approvals
-                .filter { rec in
-                    guard case .object(let p) = rec.payload,
-                          case .string(let pid)? = p["proposalId"] else { return false }
-                    return pid == proposal.id
-                }
-                .sorted { $0.createdAt > $1.createdAt }
-            if let pending = matching.first(where: { $0.status == "pending" }) {
-                // Heal the crash window between approval-create and the
-                // staged transition / card append.
-                try? await ensureEvolutionApprovalCard(
-                    dataRoot: dataRoot, approvalId: pending.id, proposal: proposal)
-                if proposal.status == .candidateGreen {
-                    _ = try? await store.transition(
-                        id: proposal.id, to: .staged, require: [.candidateGreen],
-                        receipt: "staged under approval \(pending.id) (healed)")
-                }
-                continue
-            }
-            if let latest = matching.first, latest.decision != "canceled" {
-                // approved/denied → the executor owns the next move.
-                continue
-            }
-            // Fresh card (first staging, or re-stage after a canceled card).
-            let evidence = await candidateEvidenceSummary(
-                dataRoot: dataRoot, runId: runId)
-            let body: JSONValue = .object([
-                "title": .string("Self-evolution install: \(proposal.title)"),
-                "action": .string(port.selfEvolutionAction),
-                "risk": .string(EvolutionProposal.pinnedRisk),
-                "reason": .string(
-                    "A self-evolution candidate built GREEN in an isolated worktree. "
-                    + "Approving commits the change to the live repo"
-                    + " and stages a self-install (which only fires once systemRebuild.enabled is on). "
-                    + "Denying retires it permanently."),
-                "payload": payload,
-                "payloadPreview": .string(
-                    "\(String(proposal.title.prefix(140))) — \(evidence)"),
-            ])
-            do {
-                let rec = try await inbox.create(body)
-                try await ensureEvolutionApprovalCard(
-                    dataRoot: dataRoot, approvalId: rec.id, proposal: proposal)
-                if proposal.status == .candidateGreen {
-                    _ = try? await store.transition(
-                        id: proposal.id, to: .staged, require: [.candidateGreen],
-                        receipt: "staged under approval \(rec.id)")
-                } else {
-                    try? await store.appendReceipt(
-                        id: proposal.id, kind: "re_staged",
-                        detail: "fresh card \(rec.id) after cancel")
-                }
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "EvolutionStager: stage failed for \(proposal.id): \(error)\n".utf8))
-            }
-        }
-    }
-
-    /// Build evidence one-liner from the candidate's persisted verdict.
-    private func candidateEvidenceSummary(dataRoot: URL, runId: String) async -> String {
-        let repoRoot = port.evolutionRepoRoot(dataRoot: dataRoot)
-        let builder = EvolutionCandidateBuilder(repoRoot: repoRoot, dataRoot: dataRoot)
-        guard let result = try? await builder.loadResult(runId: runId) else {
-            return "candidate result unavailable"
-        }
-        return "build exit \(result.buildExit.map(String.init) ?? "-"), "
-            + "\(result.touchedPaths.count) file(s) touched"
-    }
-
-    /// Card id == approval id (InboxView routes approve/reject through
-    /// inboxAction(id) → resolveApproval(id)). Same scan-before-append-
-    /// under-flock mechanics as the REM card helper; throws on IO failure so
-    /// the stager's caller treats it as stage-failed and retries next pass.
-    private func ensureEvolutionApprovalCard(
-        dataRoot: URL,
-        approvalId: String,
-        proposal: EvolutionProposal
-    ) async throws {
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let card: JSONValue = .object([
-            "id": .string(approvalId),
-            "created_at": .string(fmt.string(from: Date())),
-            "source": .string("self_evolution"),
-            "severity": .string("actionable"),
-            "title": .string("Self-evolution install: \(proposal.title)"),
-            "summary": .string(String(proposal.evidence.prefix(500))),
-            "detail": .string(
-                "Approve to commit this verified change to the live repo and stage a "
-                + "self-install (fires only once systemRebuild.enabled is on). "
-                + "Deny to retire it permanently.\n\nrun: \(proposal.candidateRunId ?? "?")"
-                + "\ndiff sha256: \(proposal.diffSHA256 ?? "?")"),
-            "related_mission_id": .null,
-            "related_approval_id": .string(approvalId),
-            "related_paths": .array([
-                .string(dataRoot.appendingPathComponent("evolution/proposals.json").path),
-            ]),
-            "related_groups": .array([]),
-            "actions": .array([
-                .object(["id": .string("view"), "label": .string("View"),
-                         "description": .string("See full detail")]),
-                .object(["id": .string("approve"), "label": .string("Approve"),
-                         "description": .string("Commit the change and stage the self-install")]),
-                .object(["id": .string("reject"), "label": .string("Deny"),
-                         "description": .string("Retire this proposal permanently")]),
-                .object(["id": .string("dismiss"), "label": .string("Dismiss"),
-                         "description": .string("Dismiss this card")]),
-            ]),
-            "status": .string("unread"),
-            "read_at": .null,
-        ])
-        let inserted = try await LiveNotificationInbox(path: inboxPath)
-            .appendUnique(card, id: approvalId)
-        if inserted {
-            await port.notifyIfAttentionWorthy(
-                dataRoot: dataRoot,
-                itemId: approvalId,
-                title: "Self-evolution install: \(proposal.title)",
-                summary: String(proposal.evidence.prefix(500)),
-                source: "self_evolution",
-                severity: "actionable"
-            )
-        }
-    }
 }

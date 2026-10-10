@@ -40,6 +40,7 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+import AppToolRuntime
 
 /// A production export is successful only after the archive and its persisted
 /// registry receipt agree. Creating an archive alone is not enough for the UI
@@ -56,7 +57,7 @@ extension AppModel {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
-            graphSearchResults = try await client.searchGraph(query: trimmed).results
+            graphSearchResults = try await engine.memory.searchGraph(query: trimmed).results
             statusText = "Graph search found \(graphSearchResults.count)"
         } catch {
             setFailureStatus(error, action: "search the knowledge graph")
@@ -66,7 +67,7 @@ extension AppModel {
     @MainActor
     func refreshGraph() async {
         do {
-            let read = try await client.getKnowledgeGraphViewRead()
+            let read = try await engine.memory.graphView()
             agentGraph = read.agentGraph
             graphEntities = read.entities
             graphStatus = read.status
@@ -89,7 +90,7 @@ extension AppModel {
             return outcome
         }
         do {
-            let run = try await client.runResearchLab(objective: trimmed)
+            let run = try await makeResearchClient(dataRoot: engine.dataRoot).runResearchLab(objective: trimmed, maxResults: 5)
             engine.desk.researchRuns.removeAll { $0.id == run.id }
             engine.desk.researchRuns.insert(run, at: 0)
             let outcome = ResearchLabActionOutcome.recorded(run)
@@ -164,13 +165,13 @@ extension AppModel {
         capabilityCatalogSourceSaveInFlight = true
         defer { capabilityCatalogSourceSaveInFlight = false }
         do {
-            let source = try await client.upsertCatalogSource(
+            let source = try await engine.trust.saveCatalogSource(
                 name: trimmedName.isEmpty ? "Capability Source" : trimmedName,
                 url: trimmedURL,
                 kind: "local"
             )
             do {
-                capabilityCatalogSources = try await client.getCapabilityCatalogSources()
+                capabilityCatalogSources = try await engine.trust.catalogSources()
             } catch {
                 let detail = UserFacingError.cause(error, action: "reload the catalog")
                 setFailureStatus("Capability source saved, but the catalog couldn't reload. \(detail)", cause: error)
@@ -188,8 +189,8 @@ extension AppModel {
     @MainActor
     func checkCapabilityUpdates() async {
         do {
-            latestCapabilityUpdateCheck = try await client.checkCapabilityUpdates()
-            capabilityCatalogSources = (try? await client.getCapabilityCatalogSources()) ?? capabilityCatalogSources
+            latestCapabilityUpdateCheck = try await engine.trust.checkCapabilityUpdates()
+            capabilityCatalogSources = (try? await engine.trust.catalogSources()) ?? capabilityCatalogSources
             statusText = latestCapabilityUpdateCheck?.status == "unavailable"
                 ? "Capability update checking is unavailable; source versions are not compared."
                 : "Capability updates checked"
@@ -212,8 +213,11 @@ extension AppModel {
     @MainActor
     func runNativeAction(_ action: NativeActionRecord, dryRun: Bool = true) async {
         do {
-            _ = try await client.runNativeAction(id: action.id, dryRun: dryRun)
-            nativeActionReceipts = (try? await client.getNativeActionReceipts()) ?? nativeActionReceipts
+            _ = try await NativeActionRoutes.runNativeAction(
+                id: action.id, dryRun: dryRun, input: [:], dataRoot: dataRootOverride, browser: .app
+            )
+            nativeActionReceipts = await RuntimeReadProjection.tailJSONL(
+                path: NativeActionRoutes.nativeActionReceiptsPath(dataRoot: engine.dataRoot), limit: 50)
             engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
             statusText = "Native action recorded"
         } catch {
@@ -231,24 +235,25 @@ extension AppModel {
         defer { isRunningNextGenAction = false }
 
         do {
-            let result = try await client.runNextGenAction(id: id, dryRun: dryRun)
+            let result = try await nextGenActionResponse(id: id, dryRun: dryRun)
             latestNextGenReceipt = result.displayReceipt
             // U5 W-A item 1 (:2944): the post-action refresh fell back
             // stale-then-empty via bare `try?` — a failed refresh rendered
             // as healthy receipts with no signal. decodeLogged keeps the
             // stale fallback but records the real error.
+            let root = engine.dataRoot
             nextGenSummary = await decodeLogged("getNextGenSummary") {
-                try await client.getNextGenSummary()
+                try await NextGenStatusProjection(dataRoot: root).getNextGenSummary()
             } ?? nextGenSummary
             nextGenPhases = await decodeLogged(
                 "getNextGenPhases", default: nextGenSummary?.phases ?? nextGenPhases
             ) {
-                try await client.getNextGenPhases()
+                try await NextGenStatusProjection(dataRoot: root).getNextGenPhases()
             }
             let refreshedReceipts = await decodeLogged(
                 "getNextGenReceipts", default: nextGenSummary?.displayReceipts ?? []
             ) {
-                try await client.getNextGenReceipts()
+                try await NextGenStatusProjection(dataRoot: root).getNextGenReceipts()
             }
             mergeNextGenReceipts([result.displayReceipt] + refreshedReceipts)
             let label = dryRun ? "Next-gen dry run" : "Next-gen action"
@@ -274,8 +279,10 @@ extension AppModel {
     @MainActor
     func runBrowserDryRun(url: String = "https://example.com") async {
         do {
-            latestBrowserRun = try await client.runBrowser(url: url, dryRun: true)
-            browserRuntimeStatus = try? await client.getBrowserStatus()
+            latestBrowserRun = try await BrowserActionRoutes.app.runBrowser(
+                url: url, dryRun: true, captureSource: false, captureScreenshot: false, dataRoot: engine.dataRoot
+            )
+            browserRuntimeStatus = try? await RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot)
             statusText = "Browser dry run: \(latestBrowserRun?.status ?? "recorded")"
         } catch {
             setFailureStatus("Browser run failed: " + UserFacingError.cause(error, action: "run the browser"), cause: error)
@@ -285,8 +292,8 @@ extension AppModel {
     @MainActor
     func cancelBrowserRun() async {
         do {
-            latestBrowserRun = try await client.cancelBrowserRun(id: latestBrowserRun?.id)
-            browserRuntimeStatus = try? await client.getBrowserStatus()
+            latestBrowserRun = try await BrowserActionRoutes.app.cancelBrowserRun(id: latestBrowserRun?.id, dataRoot: engine.dataRoot)
+            browserRuntimeStatus = try? await RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot)
             statusText = "Browser run \(latestBrowserRun?.status ?? "canceled")"
         } catch {
             setFailureStatus(error, action: "cancel the browser run")
@@ -296,15 +303,16 @@ extension AppModel {
     @MainActor
     func showVisibleBrowser() async {
         BrowserWindowController.shared.showWindow()
-        browserRuntimeStatus = try? await client.getBrowserStatus()
+        browserRuntimeStatus = try? await RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot)
         statusText = "Visible Browser opened."
     }
 
     @MainActor
     func runConnectorAction(_ action: ConnectorActionRecord) async {
         do {
-            latestConnectorActionReceipt = try await client.runConnectorAction(id: action.id, dryRun: true)
-            connectorActionRegistry = try? await client.getConnectorActions()
+            latestConnectorActionReceipt = try await ConnectorActions(platform: AppConnectorActionPlatform(dataRoot: engine.dataRoot))
+                .runConnectorAction(id: action.id, dryRun: true)
+            connectorActionRegistry = try? await ConnectorActionRegistry.read(dataRoot: engine.dataRoot)
             statusText = "Connector action: \(latestConnectorActionReceipt?.status ?? "recorded")"
         } catch {
             setFailureStatus(error, action: "run that connector action")
@@ -314,8 +322,8 @@ extension AppModel {
     @MainActor
     func runImprovementGauntlet() async {
         do {
-            latestGauntletRun = try await client.runImprovementGauntlet()
-            improvementGauntletStatus = try? await client.getImprovementGauntlet()
+            latestGauntletRun = try await ImprovementGauntletRun.run(dataRoot: engine.dataRoot)
+            improvementGauntletStatus = try? await RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: engine.dataRoot)
             statusText = "Gauntlet: \(latestGauntletRun?.status ?? "recorded")"
         } catch {
             setFailureStatus("Gauntlet failed: " + UserFacingError.cause(error, action: "run the gauntlet"), cause: error)
@@ -328,7 +336,7 @@ extension AppModel {
         isInstallingDemoCapabilityPack = true
         defer { isInstallingDemoCapabilityPack = false }
         do {
-            let receipt = try await client.installDemoCapabilityPack()
+            let receipt = try await CapabilityPackInstall.installDemo(dataRoot: engine.dataRoot)
             let signature = receipt.signature?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard receipt.status == "installed", !signature.isEmpty else {
                 throw NSError(domain: "NativeAgent.CapabilityPack", code: -422, userInfo: [
@@ -355,7 +363,7 @@ extension AppModel {
     @MainActor
     func rollbackCapabilityPack(_ install: CapabilityPackInstall) async {
         do {
-            _ = try await client.rollbackCapabilityPack(id: install.id)
+            _ = try await CapabilityPackInstall.rollback(id: install.id, dataRoot: engine.dataRoot)
             statusText = "Rolled back \(install.name ?? install.packId)"
             await refreshAll()
         } catch {
@@ -367,7 +375,9 @@ extension AppModel {
     func createProductionExport(support: Bool = false) async -> ProductionExportCreationOutcome {
         let label = support ? "Support bundle" : "Export"
         do {
-            let export = support ? try await client.createSupportBundle() : try await client.createProductionExport()
+            let export = support
+                ? try await ProductionExport.createSupportBundle(dataRoot: engine.dataRoot)
+                : try await ProductionExport.createArchive(dataRoot: engine.dataRoot)
             let attributes = try FileManager.default.attributesOfItem(atPath: export.path)
             let actualBytes = (attributes[.size] as? NSNumber)?.intValue ?? 0
             guard actualBytes > 0 else {
@@ -381,7 +391,7 @@ extension AppModel {
                 return .failed(support: support, detail: detail)
             }
 
-            let persisted = try await client.getProductionExports()
+            let persisted = try await ProductionExport.list(dataRoot: engine.dataRoot)
             guard persisted.contains(where: { $0.id == export.id && $0.path == export.path && $0.sizeBytes == actualBytes }) else {
                 let detail = "the export registry did not confirm the created archive"
                 statusText = "\(label) failed verification: \(detail)"
@@ -398,82 +408,11 @@ extension AppModel {
     }
 
     @MainActor
-    func startImprovement(objective: String) async {
-        let trimmed = objective.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        do {
-            _ = try await client.startImprovement(objective: trimmed)
-            statusText = "Improvement started"
-            await refreshAll()
-        } catch {
-            setFailureStatus(error, action: "run the improvement")
-        }
-    }
-
-    @MainActor
-    func createRecurringImprovement(objective: String, intervalSeconds: Int) async {
-        let trimmed = objective.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        do {
-            _ = try await client.createRecurringImprovement(objective: trimmed, intervalSeconds: intervalSeconds)
-            statusText = "Continuous self-improvement scheduled"
-            await refreshAll()
-        } catch {
-            setFailureStatus(error, action: "set up the recurring improvement")
-        }
-    }
-
-    @MainActor
     func runHarnessBenchmark() async {
-        do {
-            let result = try await client.runHarnessBenchmark()
-            let passed = result.checks?.filter { $0.passed == true }.count ?? 0
-            let total = result.checks?.count ?? 0
-            statusText = "Harness benchmark \(result.status ?? "completed"): \(passed)/\(total) checks"
-            improvementSummary = try? await client.getImprovementSummary()
-        } catch {
-            setFailureStatus(error, action: "run the harness benchmark")
-        }
+        let result = await HarnessBenchmarkRun.run(dataRoot: engine.dataRoot)
+        let passed = result.checks?.filter { $0.passed == true }.count ?? 0
+        let total = result.checks?.count ?? 0
+        statusText = "Harness benchmark \(result.status ?? "completed"): \(passed)/\(total) checks"
     }
-
-    @MainActor
-    func promoteImprovement(runId: String) async throws -> PromoteOpResult {
-        let result = try await client.promoteImprovement(runId: runId)
-        if result.ok {
-            statusText = "Promoted run \(runId.prefix(8)) — commit \(result.commitSha?.prefix(8) ?? "?")"
-        } else {
-            statusText = "Promote failed: \(result.error ?? "unknown error")"
-        }
-        improvements = (try? await client.getImprovements()) ?? improvements
-        improvementSummary = try? await client.getImprovementSummary()
-        return result
-    }
-
-    @MainActor
-    func discardImprovement(runId: String) async throws -> RevertOpResult {
-        let result = try await client.discardImprovement(runId: runId)
-        if result.ok {
-            statusText = "Run \(runId.prefix(8)) discarded"
-        } else {
-            statusText = "Discard failed: \(result.error ?? "unknown error")"
-        }
-        improvements = (try? await client.getImprovements()) ?? improvements
-        improvementSummary = try? await client.getImprovementSummary()
-        return result
-    }
-
-    @MainActor
-    func revertImprovement(runId: String) async throws -> RevertOpResult {
-        let result = try await client.revertImprovement(runId: runId)
-        if result.ok {
-            statusText = "Reverted run \(runId.prefix(8)) — revert commit ?"
-        } else {
-            statusText = "Revert failed: \(result.error ?? "unknown error")"
-        }
-        improvements = (try? await client.getImprovements()) ?? improvements
-        improvementSummary = try? await client.getImprovementSummary()
-        return result
-    }
-
 
 }

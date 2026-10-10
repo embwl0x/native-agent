@@ -219,38 +219,41 @@ public enum WorkshopProcedureExactActivationQualifier {
 /// It stages at most one card for the exact evidence digest and stops doing
 /// work once the exact procedure is active. It never resolves the card.
 public enum WorkshopProcedureExactActivationCoordinator {
+    /// Returns how many activation-review cards it staged (zero or one).
+    @discardableResult
     public static func reconcileLocalFileCopyIfQualified(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
+    ) async -> Int {
         await reconcileLocalFileCopyIfQualified(
             dataRoot: dataRoot,
             canonicalDataRoot: PersistenceCore.defaultDataRoot()
         )
     }
 
+    @discardableResult
     static func reconcileLocalFileCopyIfQualified(
         dataRoot: URL,
         canonicalDataRoot: URL
-    ) async {
+    ) async -> Int {
         let canonical = canonicalDataRoot.standardizedFileURL
-        guard dataRoot.standardizedFileURL == canonical else { return }
+        guard dataRoot.standardizedFileURL == canonical else { return 0 }
         let store = ProcedureArtifactStore(dataRoot: dataRoot)
         if (try? await store.loadActiveExactProcedure(
             procedureID: WorkshopCompiledLocalFileCopyPlanner.procedureID,
             implementationIdentity: WorkshopCompiledLocalFileCopyPlanner.implementationIdentity
-        )) != nil { return }
+        )) != nil { return 0 }
         guard let artifacts = try? await store.loadInstalledArtifacts(
             domain: "workshop_execution"
         ).filter(WorkshopCompiledLocalFileCopyPlanner.isEligibleArtifact),
               artifacts.count == 1,
               let artifact = artifacts.first,
               let proposal = try? await WorkshopProcedureExactActivationQualifier
-                .localFileCopyProposal(dataRoot: dataRoot, artifact: artifact) else { return }
+                .localFileCopyProposal(dataRoot: dataRoot, artifact: artifact) else { return 0 }
 
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         guard let prior = try? await inbox.list(filter: ApprovalFilter(
             action: SwiftNativeApprovalInbox.procedureExactActivationApprovalAction
-        )) else { return }
+        )) else { return 0 }
         // One card per question. A pending card is the question. An answer
         // (approved or denied) for the same artifact and implementation
         // sticks until a further full qualifying set of executions exists;
@@ -272,8 +275,8 @@ public enum WorkshopProcedureExactActivationCoordinator {
             return proposal.verifiedExecutionCount < min(asked.verifiedExecutionCount
                 + ProcedureExactActivationProposal.minimumVerifiedExecutions, 64)
         }
-        guard !alreadyAsked else { return }
-        _ = try? await inbox.stageProcedureExactActivationApproval(proposal)
+        guard !alreadyAsked else { return 0 }
+        return (try? await inbox.stageProcedureExactActivationApproval(proposal)) == nil ? 0 : 1
     }
 }
 

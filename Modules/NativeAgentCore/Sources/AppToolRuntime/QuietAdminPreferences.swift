@@ -46,15 +46,6 @@ public enum MoodTintPreference {
     }
 }
 
-/// Defaults-backed design experiment.
-public enum BotsShelfPreference {
-    public static let key = "uiBotsShelfPreview"
-    /// On unless the person switched it off (User: fresh installs turn everything on).
-    public static func isEnabled(_ defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: key) == nil ? true : defaults.bool(forKey: key)
-    }
-}
-
 /// "simple", "advanced" or "agent", in `nativeagent.viewMode` (the agent can
 /// switch it: `settings.view_mode` in QuietSelfAdminSettings). Agent is User's
 /// window into hers (AgentScreenView.swift) and never the unset default.
@@ -72,11 +63,11 @@ public enum SimpleViewMode {
 
     public static func resolved(_ raw: String) -> String { choices.contains(raw) ? raw : unsetDefault }
 
+    /// The view the window shows now, and so the layout profile it draws with.
+    public static var current: String { resolved(UserDefaults.standard.string(forKey: key) ?? "") }
+
     /// What the window shows now: Simple has no pages to send anyone to.
-    public static var isShowing: Bool {
-        let defaults = UserDefaults.standard
-        return resolved(defaults.string(forKey: key) ?? "") == simple
-    }
+    public static var isShowing: Bool { current == simple }
     public static let noPagesNote = "Simple view is on screen and has no pages: this switches it to Advanced, so use it only when asked to see a page; otherwise say where it is."
 
     /// Write the first-launch answer down, so the chats a new install goes on

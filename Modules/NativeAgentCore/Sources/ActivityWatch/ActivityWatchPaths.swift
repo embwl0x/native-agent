@@ -8,7 +8,7 @@ import PersistenceCore
 /// *events* feed (`activity/events.jsonl`, traces, receipts, runtime audit
 /// rows). It is declared `exportable: true` in the Trust Center privacy map, it
 /// is copied verbatim into support bundles
-/// (`NativeClient+TrustBackupOps.supportBundleRelativePaths`), and a user
+/// (`ProductionExport.supportBundleRelativePaths`), and a user
 /// clicking "export my data" gets it. Dropping a record of every window the
 /// human looked at into that directory would have opted the whole feature into
 /// three egress paths W6 explicitly forbids, silently, by filename collision.

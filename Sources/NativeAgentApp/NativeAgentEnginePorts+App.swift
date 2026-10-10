@@ -3,6 +3,7 @@ import ApprovalTransactions
 import Privacy
 import SchedulerExecution
 import Foundation
+import NativeAgentShared
 import TriggerScheduler
 import AttentionRouting
 import Agents
@@ -26,6 +27,12 @@ import WorkshopExecution
 
 // Preserve the app transcript type when ChatOrchestration is also imported.
 typealias ChatMessage = EngineRuntime.ChatMessage
+// NativeAgentShared and Core both ship a `MemoryRecord` (MemoryV2), a
+// `MultimodalAttachment` and a `ChatSession` (ChatOrchestration's wire
+// mirrors); the app's UI and decoding use the NativeAgentShared ones.
+typealias MemoryRecord = NativeAgentShared.MemoryRecord
+typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
+typealias ChatSession = NativeAgentShared.ChatSession
 
 extension ToolsFacade {
     nonisolated convenience init(dataRoot: URL) {
@@ -56,8 +63,7 @@ extension NativeAgentEnginePorts {
                 desktopChat: { await DesktopChatRoute.perform(plan: $0, dataRoot: $1) },
                 desktop: { await NativeAgentEngine.live.agents.desktop.run(plan: $0, inner: $1, surface: $2) }
             ),
-            evolutionBridge: { EvolutionToolBridgeImpl(dataRoot: $0) },
-            connectorActionStatuses: { try await NativeClient.checkedConnectorActionStatuses(root: dataRoot) }
+            connectorActionStatuses: { try await ConnectorActionRecord.checkedStatuses(root: dataRoot) }
         )
     }
 }
@@ -72,6 +78,12 @@ extension NativeAgentEngine {
     /// The running app's device sync; the live root is built with a body.
     static var liveDeviceSync: DeviceSync { live.deviceSync! }
 
+    /// The engine for one root: the live one at the default root, otherwise a
+    /// bodiless engine that reads and writes only that root.
+    static func forRoot(_ dataRoot: URL) -> NativeAgentEngine {
+        dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
+            ? live : NativeAgentEngine(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot), hasBody: false)
+    }
 }
 
 private struct AppAgentBridgePort: EngineAgentBridgePort {

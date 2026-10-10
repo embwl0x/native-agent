@@ -4,6 +4,7 @@ import SwiftUI
 import Context
 import NativeAgentShared
 import NativeAgentCore
+import TurnTrace
 
 // MARK: - Diagnostics (Advanced tab)
 
@@ -45,6 +46,8 @@ struct DiagnosticsView: View {
     @State private var mode: DiagnosticsMode
     @State private var refreshCoalescer = DiagnosticsRefreshCoalescer()
     @State private var isRefreshingSnapshot = false
+    @State private var showsModelCalls = false
+    @State private var modelCalls = ""
 
     /// Landing segment. The retired Cognition and Inspector tabs alias into
     /// Diagnostics (fence-A routing) by opening on their own segment:
@@ -133,6 +136,13 @@ struct DiagnosticsView: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
+            DisclosureGroup("Model calls", isExpanded: $showsModelCalls) {
+                Text(modelCalls).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                Button("Refresh") { Task { await readModelCalls() } }
+            }
+            .onChange(of: showsModelCalls) { _, expanded in
+                if expanded { Task { await readModelCalls() } }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .alivePageLine(Self.headerLine(appModel), id: "diagnostics.line")
@@ -145,6 +155,12 @@ struct DiagnosticsView: View {
             guard nextMode == .status || nextMode == .runs else { return }
             Task { await refreshSnapshot() }
         }
+    }
+
+    private func readModelCalls() async {
+        let firstOutputs = await appModel.engine.cognitionView.runtime?.providerFirstOutputs() ?? "First outputs: cognition is not running."
+        do { modelCalls = firstOutputs + "\n\n" + (try await TurnTraceRecentReader(dataRootOverride: appModel.dataRootOverride).modelCalls().serialize(pretty: true)) }
+        catch { modelCalls = UserFacingError.cause(error, action: "read model calls") }
     }
 
     /// The header's one sentence, from the last health check. Nil before one

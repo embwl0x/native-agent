@@ -24,6 +24,7 @@ public enum LLMCallContext {
     /// Remaining output ceiling for the current provider request.
     @TaskLocal public static var botOutputTokenLimit: Int?
     @TaskLocal public static var surface: String?
+    @TaskLocal public static var purpose: String = "other"
     @TaskLocal public static var sessionId: String?
     /// Exact model admitted with the provider/effort/tier tuple at the outer
     /// turn boundary. A downstream adapter may reread canonical routing to
@@ -103,6 +104,14 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
     public let reasoningEffort: String?
     public let streaming: Bool
     public let occurredAt: Date
+    /// A terminal call's first text or tool output in milliseconds from its
+    /// request, as the adapter stamped it on the call's `llm.call` row.
+    public let firstOutputMs: Int?
+    /// A terminal streamed call's `LLMMessagesStreamKind` raw value; nil when
+    /// it did not come through `streamMessages`.
+    public let streamKind: String?
+    /// The stream guard cut this call (`ProviderFailure.noReply`).
+    public let noReply: Bool
 
     public init(
         id: String,
@@ -114,7 +123,10 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
         turnId: String?,
         reasoningEffort: String? = nil,
         streaming: Bool,
-        occurredAt: Date = Date()
+        occurredAt: Date = Date(),
+        firstOutputMs: Int? = nil,
+        streamKind: String? = nil,
+        noReply: Bool = false
     ) {
         self.id = String(id.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
         self.phase = phase
@@ -128,9 +140,13 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
         }.flatMap { $0.isEmpty ? nil : $0 }
         self.streaming = streaming
         self.occurredAt = occurredAt
+        self.firstOutputMs = firstOutputMs
+        self.streamKind = streamKind
+        self.noReply = noReply
     }
 
-    public func terminal(_ phase: LLMCallLifecyclePhase, at date: Date = Date()) -> Self {
+    public func terminal(_ phase: LLMCallLifecyclePhase, at date: Date = Date(), firstOutputMs: Int? = nil,
+                         streamKind: String? = nil, noReply: Bool = false) -> Self {
         precondition(phase != .started)
         return Self(
             id: id,
@@ -142,13 +158,39 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
             turnId: turnId,
             reasoningEffort: reasoningEffort,
             streaming: streaming,
-            occurredAt: date
+            occurredAt: date,
+            firstOutputMs: firstOutputMs,
+            streamKind: streamKind,
+            noReply: noReply
         )
     }
 }
 
 public protocol LLMCallLifecycleObserving: Sendable {
     func observeProviderCall(_ event: LLMCallLifecycleEvent) async
+    /// Asked once as a stream starts: how long this provider has taken to its
+    /// first output on this model and stream kind.
+    func firstOutputDeadline(provider: String, model: String, streamKind: String?) async -> FirstOutputDeadline
+}
+
+/// A provider's slowest first output (text or tool, the adapter's `ttftMs`)
+/// over its retained streamed calls. Below `callsNeeded` calls the slowest is
+/// not yet evidence and the deadline is unmeasured.
+public struct FirstOutputDeadline: Sendable, Equatable {
+    public static let callsNeeded = 100
+    public let calls: Int
+    public let slowest: TimeInterval?
+
+    public init(calls: Int, slowest: TimeInterval?) {
+        self.calls = calls
+        self.slowest = slowest
+    }
+
+    /// The slowest, deliberately not a p99: a cut ends the turn (an admitted
+    /// request is never re-sent) while waiting longer costs seconds. On her
+    /// trace 10-10 a p99 deadline would have cut 13 real replies in 37 h
+    /// (12 gpt-6-luna, 1 claude-opus-5-5); the slowest cut none.
+    public var seconds: TimeInterval? { calls >= Self.callsNeeded ? slowest : nil }
 }
 
 /// Stable/dynamic split of an assembled system prompt (U1 step 2b/3b).
@@ -282,6 +324,13 @@ public protocol LLMClient: Sendable {
 }
 
 extension LLMClient {
+    public func complete(prompt: String, system: String?, model: String?,
+                         surface: String, purpose: String) async throws -> String {
+        try await LLMCallContext.$purpose.withValue(purpose) {
+            try await complete(prompt: prompt, system: system, model: model, surface: surface)
+        }
+    }
+
     /// Clients that do not route to provider adapters serve no provider.
     public func servingProviderID(model: String?, surface: String) async -> String? {
         nil

@@ -43,11 +43,6 @@ the existing skill, retaining its safe stable id. New guidance-only skills
 are active and marked agent-authored. A new or changed script lands drafted;
 an unchanged script can retain its activation for the same digest.
 
-The receipt distinguishes a saved body from recall-pointer reconciliation.
-If pointer sync fails after the save, `recall_pointer` is
-`reconciliation_failed`; the saved change remains. Do not repeat the save
-merely to repair recall.
-
 ## Script input and activation
 
 The optional `script` object accepts only these keys:
@@ -204,7 +199,7 @@ merges runtime records and body shelves for discovery.
 [Skills.swift](../Modules/NativeAgentCore/Sources/Skills/Skills.swift)
 owns locked mutations, body-path confinement, hygiene checks and versions.
 [SwiftToolDispatcher+SkillTools.swift](../Modules/NativeAgentCore/Sources/ChatToolRuntime/SwiftToolDispatcher+SkillTools.swift)
-owns the conversational list/read/save operations and post-save recall sync.
+owns the conversational list/read/save operations.
 
 ## Manifest registry compatibility
 
@@ -246,7 +241,7 @@ These are display/registry shapes, not a universal plugin execution contract
 or a promise that declared permissions are granted.
 [SkillsJSON.swift](../Modules/NativeAgentCore/Sources/Skills/SkillsJSON.swift)
 defines the merge and list projection;
-[NativeClient+SkillActions.swift](../Sources/NativeAgentApp/NativeClient+SkillActions.swift)
+[AppModel+SkillsIntegrations.swift](../Sources/NativeAgentApp/AppModel+SkillsIntegrations.swift)
 and [ConfigProviderDoctorModels.swift](../Sources/NativeAgentApp/Models/ConfigProviderDoctorModels.swift)
 own the Mac reader and decoded fields.
 

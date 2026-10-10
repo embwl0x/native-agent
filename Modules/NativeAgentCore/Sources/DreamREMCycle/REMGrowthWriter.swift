@@ -31,7 +31,7 @@ public enum REMGrowthWriter {
     /// bounded by line breaks (or document edges), never a substring of a
     /// longer paragraph (gpt-5.5 review MED: containment alone would
     /// false-positive skip a shorter lesson embedded in an existing entry).
-    static func containsEntryParagraph(_ body: String, _ text: String) -> Bool {
+    public static func containsEntryParagraph(_ body: String, _ text: String) -> Bool {
         if body == text { return true }
         if body.hasPrefix(text + "\n") { return true }
         if body.hasSuffix("\n" + text) { return true }

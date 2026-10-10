@@ -272,9 +272,14 @@ struct DoctorView: View {
             "Autonomy", "Release",
         ]
         let grouped = Dictionary(grouping: checks, by: category)
+        let statusOrder = ["failing", "warning", "healthy", "reading", "off", "not needed", "unclear"]
         return order.compactMap { key in
             guard let values = grouped[key], !values.isEmpty else { return nil }
-            return (key, values)
+            return (key, values.sorted {
+                let lhs = statusOrder.firstIndex(of: DoctorPlainCopy.bucket(for: $0.status)) ?? statusOrder.count
+                let rhs = statusOrder.firstIndex(of: DoctorPlainCopy.bucket(for: $1.status)) ?? statusOrder.count
+                return lhs == rhs ? $0.title < $1.title : lhs < rhs
+            })
         }
     }
 
@@ -589,21 +594,23 @@ enum DoctorPlainCopy {
         var warning = 0
         var failing = 0
         var unclear = 0
+        var reading = 0
+        var off = 0
+        var notNeeded = 0
 
-        var total: Int { healthy + warning + failing + unclear }
+        var total: Int { healthy + warning + failing + unclear + reading + off + notNeeded }
 
         /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
         var statusText: String {
             if failing > 0 { return "failed" }
             if warning > 0 { return "warn" }
             if total == 0 { return "unknown" }
+            if reading > 0 { return "info" }
             return "ok"
         }
     }
 
-    /// Bucket a raw doctor check status into the three words a person can act
-    /// on. Mirrors the NativeAgentTheme.statusColor vocabulary so the dot next
-    /// to the sentence never disagrees with the sentence.
+    /// Readings stay distinct from health verdicts and use the info tint.
     static func bucket(for status: String) -> String {
         switch status.lowercased() {
         case "ok", "done", "passed", "succeeded", "active", "valid", "ready", "scheduled":
@@ -612,6 +619,11 @@ enum DoctorPlainCopy {
             return "warning"
         case "fail", "failed", "error", "timeout", "quarantined":
             return "failing"
+        case "unmeasured":
+            return "reading"
+        // Off by config or not needed: no fault, and no healthy work either.
+        case "off", "not needed":
+            return status.lowercased()
         default:
             return "unclear"
         }
@@ -624,6 +636,9 @@ enum DoctorPlainCopy {
             case "healthy": summary.healthy += 1
             case "warning": summary.warning += 1
             case "failing": summary.failing += 1
+            case "off": summary.off += 1
+            case "not needed": summary.notNeeded += 1
+            case "reading": summary.reading += 1
             default: summary.unclear += 1
             }
         }
@@ -635,7 +650,11 @@ enum DoctorPlainCopy {
         if summary.failing > 0 { return "Some parts of the app are not working." }
         if summary.warning > 0 { return "The app is running, but some parts need attention." }
         if summary.unclear > 0 { return "The app is running. Some checks came back unclear." }
-        return "Everything looks healthy."
+        if summary.reading > 0 { return "The app is running. Some checks are readings." }
+        // Off and not needed are not faults, but they are not "everything" either.
+        let inactive = [(summary.off, "off"), (summary.notNeeded, "not needed")]
+            .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+        return inactive.isEmpty ? "Everything looks healthy." : "Healthy; " + inactive.joined(separator: ", ") + "."
     }
 
     static func detail(for summary: Summary) -> String {
@@ -646,6 +665,9 @@ enum DoctorPlainCopy {
         if summary.warning > 0 { parts.append("\(summary.warning) need attention") }
         if summary.failing > 0 { parts.append("\(summary.failing) not working") }
         if summary.unclear > 0 { parts.append("\(summary.unclear) unclear") }
+        if summary.reading > 0 { parts.append("\(summary.reading) readings") }
+        if summary.off > 0 { parts.append("\(summary.off) off") }
+        if summary.notNeeded > 0 { parts.append("\(summary.notNeeded) not needed") }
         let checked = summary.total == 1 ? "1 area checked" : "\(summary.total) areas checked"
         return "\(checked): " + parts.joined(separator: ", ") + "."
     }
@@ -654,6 +676,7 @@ enum DoctorPlainCopy {
         if summary.failing > 0 { return .red }
         if summary.warning > 0 { return .orange }
         if summary.total == 0 { return .secondary }
+        if summary.reading > 0 { return NativeAgentTheme.info }
         return .green
     }
 
@@ -709,12 +732,17 @@ struct DoctorCheckRow: View {
                 Text(check.title.withoutStaleNextGenPhaseCopy)
                     .font(NativeAgentFont.section)
                 Spacer()
-                StatusBadge(text: check.status.uppercased(), status: check.status)
+                StatusBadge(text: check.status == "unmeasured" ? "READING" : check.status.uppercased(), status: check.status)
             }
             Text(check.detail.withoutStaleNextGenPhaseCopy)
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
+            if DoctorSafeRepairPolicy.isAdverse(check.status), let harm = check.harm, !harm.isEmpty {
+                Text(harm)
+                    .font(NativeAgentFont.body)
+                    .textSelection(.enabled)
+            }
             if let repair = check.repair, !repair.isEmpty {
                 Text(repair.withoutStaleNextGenPhaseCopy)
                     .font(NativeAgentFont.label)
@@ -722,6 +750,11 @@ struct DoctorCheckRow: View {
             }
             if let action = check.human_action, !action.isEmpty {
                 Text(action.withoutStaleNextGenPhaseCopy)
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            if let owner = check.owner {
+                Text("Owner: \(owner.rawValue)")
                     .font(NativeAgentFont.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             }

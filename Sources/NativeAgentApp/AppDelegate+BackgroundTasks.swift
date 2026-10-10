@@ -11,7 +11,7 @@ extension AppDelegate {
     //
     // RETIRED 2026-08-31: `rem_cycle`. Weekly REM has exactly one owner, the
     // `nativeagent-weekly-rem` TriggerScheduler job (Sun 04:30 America/Chicago
-    // → NativeClient.runRem). Live evidence: every row in
+    // → BackgroundLoopsAssembly.runRem). Live evidence: every row in
     // `data/rem_proposals.jsonl` and every `rem.proposal` approval card carries
     // a Sunday ~09:30Z stamp — the scheduler job's minute. The duplicate loop's
     // own weekly tick (last 2026-08-28T14:43:32Z) has never produced a single

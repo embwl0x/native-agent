@@ -96,11 +96,6 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         // Defense in depth: even if a refactor ever moves its schema out of
         // the Full-Mac block, fileAccess=none keeps it unreachable.
         "restart_app", "install_app",
-        // evolution chat tools (2026-06-11, U2b) — defense in depth. The
-        // propose/withdraw/install tools mutate the EvolutionProposalStore +
-        // stage an install card; even the read-only status tool stays denied
-        // here so fileAccess=none keeps the whole evolution surface unreachable.
-        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
         // 2026-07-31 audit fix: the Full-Mac file/git read tools
         // (SwiftToolDispatcher.fullMacFileToolNames + the git group) matched
         // neither blockedExact nor any blockedPrefix, so fileAccess=none was
@@ -143,10 +138,6 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         "shell", "bash", "git",
         // restart_app (2026-06-10) — read_only must never bounce the app.
         "restart_app", "install_app",
-        // evolution chat tools (2026-06-11, U2b) — even in read_only mode the
-        // proposal-store mutators and the install-card stager stay denied.
-        // status is read-only but listed for parity / catalog-drift defense.
-        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
         // USER YOLO 2026-08-12: legacy app focus tool / legacy app quit tool freed too.
         // (was: "legacy app focus tool", "legacy app quit tool",)
         // W1b/W3.5 — legacy AX status tool / legacy AX tree tool / legacy AX find tool / mac_view are
@@ -410,9 +401,8 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // Preserve the exact disclosed path on replay, even when it was absent.
             if namedConnect, approvedReplay == nil {
                 bound.removeValue(forKey: "executable_path")
-                if case .string(let name)? = input["name"],
-                   let line = AgentHostDirectory.row(named: name)?.commandLine,
-                   let path = AgentHostCommandLines.resolveExecutable(line.executable) {
+                if case .string(let name)? = input["name"], let row = AgentHostDirectory.row(named: name),
+                   let line = row.commandLine, let path = row.resolveExecutable(line.executable) {
                     bound["executable_path"] = .string(path)
                 }
             }

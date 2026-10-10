@@ -44,7 +44,7 @@ public protocol QuietSettingsHost: AnyObject {
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws
     func patchMemoryPolicy(knowledgeGraphEnabled: Bool?, adaptivePromotion: Bool?, hygieneEnabled: Bool?) async -> Bool
-    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool, autoPromoteConsolidated: Bool) async
+    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async
 
     // The Settings page's live switches. Each stores its key AND tells the
     // running app, which is what the page's own control does; a bare write to
@@ -65,7 +65,6 @@ public protocol QuietSettingsHost: AnyObject {
     func findSearchService() async throws -> String
     func inboxTriggers() async throws -> [QuietInboxTrigger]
     func setInboxTrigger(_ name: String, enabled: Bool) async throws
-    func saveWatchedFolders(_ paths: [String]) async throws
     /// The lower-only switches whose state lives where only the app reaches
     /// (Chrome, Pause everything, activity capture, Mac integration, Telegram,
     /// Slack, connected agents), built with `QuietSettings.lowerOnly` and
@@ -85,13 +84,9 @@ public enum QuietCognitionLane: Sendable {
 public struct QuietInboxTrigger: Sendable {
     public let name: String
     public let enabled: Bool
-    /// The folders `file_watch` watches; empty for every other trigger.
-    public let paths: [String]
-
-    public init(name: String, enabled: Bool, paths: [String]) {
+    public init(name: String, enabled: Bool) {
         self.name = name
         self.enabled = enabled
-        self.paths = paths
     }
 }
 

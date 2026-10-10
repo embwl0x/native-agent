@@ -10,7 +10,7 @@ enum DoctorEmbeddingDownloadCheck {
 
     static func read(dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> CheckResult {
         guard let runtime = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot() else {
-            return CheckResult(id: id, title: title, status: "warn",
+            return CheckResult(id: id, title: title, status: "unmeasured",
                                detail: "The embedding runtime is unavailable, so the need for a model download cannot be checked.",
                                human_action: "Restart NativeAgent, then run Doctor again to check the memory model download.")
         }
@@ -28,6 +28,7 @@ enum DoctorEmbeddingDownloadCheck {
               let descriptor = try? EmbeddingModelDownload.Descriptor.parse(data) else {
             return CheckResult(id: id, title: title, status: "fail",
                                detail: "The bundled memory model download descriptor is unreadable or invalid.",
+                               harm: "The required memory model cannot be downloaded.",
                                human_action: "Reinstall NativeAgent to restore embedding-download.json in the app bundle.")
         }
         guard descriptor.distribution == "separate-download" else {
@@ -44,16 +45,19 @@ enum DoctorEmbeddingDownloadCheck {
                 guard let epoch = await SwiftNativeMemoryV2.shared.embeddingEpoch() else {
                     return CheckResult(id: id, title: title, status: "warn",
                                        detail: "The installed memory model's embedding epoch is unavailable.",
+                                       harm: "She cannot verify that memory search uses the installed model.",
                                        human_action: "Restart NativeAgent, then run Doctor again to check memory search.")
                 }
                 if state.activeEpoch != epoch.rawValue {
                     return CheckResult(id: id, title: title, status: "warn",
                                        detail: "The installed memory model and memory search have different embedding epochs.",
+                                       harm: "She cannot reliably find memories using the installed model.",
                                        human_action: "Open Diagnostics → Doctor and press Repair to retry memory search reconciliation.")
                 }
             } catch {
                 return CheckResult(id: id, title: title, status: "warn",
                                    detail: "The installed memory model's memory search epoch could not be checked: \(error.localizedDescription)",
+                                   harm: "She cannot verify that memory search uses the installed model.",
                                    human_action: "Restart NativeAgent, then run Doctor again to check memory search.")
             }
             return CheckResult(id: id, title: title, status: "ok",
@@ -69,7 +73,8 @@ enum DoctorEmbeddingDownloadCheck {
         if FileManager.default.fileExists(atPath: work.appendingPathComponent("invalid-parts").path) {
             return CheckResult(id: id, title: title, status: "fail",
                                detail: "The saved memory model parts failed the release digest check and were preserved.",
-                               human_action: "Open Diagnostics and report the digest mismatch to support; keep data/extras/.coreml-download unchanged.")
+                               harm: "The required memory model cannot be installed from these saved parts.",
+                               human_action: "Keep data/extras/.coreml-download unchanged.", owner: .builder)
         }
         let userPaused = await EmbeddingModelDownloadController.shared.doctorUserPaused()
         if phase == "Download paused" || userPaused {
@@ -89,19 +94,22 @@ enum DoctorEmbeddingDownloadCheck {
         if invalid {
             return CheckResult(id: id, title: title, status: "fail",
                                detail: "A saved memory model part has an invalid byte length; the transfer cannot be resumed safely.",
-                               human_action: "Open Diagnostics and report the memory model download failure to support; keep data/extras/.coreml-download unchanged.")
+                               harm: "The required memory model cannot be installed from these saved parts.",
+                               human_action: "Keep data/extras/.coreml-download unchanged.", owner: .builder)
         }
         if bytes > 0, bytes < descriptor.byteLength {
             return CheckResult(id: id, title: title, status: "warn",
                                detail: "A resumable memory model transfer has \(bytes) of \(descriptor.byteLength) bytes saved; the owner will verify the final digest before installation.",
+                               harm: "Memory search cannot use the required model until its transfer finishes.",
                                human_action: "Open Diagnostics → Doctor and press Repair to resume the saved transfer.")
         }
         if bytes == descriptor.byteLength {
             return CheckResult(id: id, title: title, status: "warn",
                                detail: "The memory model archive is fully downloaded but has not been installed. \(phase).",
+                               harm: "Memory search cannot use the required model until it is installed.",
                                human_action: "Open Diagnostics and choose Check / resume on the Memory model download row to verify and install it.")
         }
-        return CheckResult(id: id, title: title, status: "warn",
+        return CheckResult(id: id, title: title, status: "unmeasured",
                            detail: "The required separate memory model has not been downloaded. \(phase).",
                            human_action: "Open Diagnostics and choose Check / resume on the Memory model download row.")
     }

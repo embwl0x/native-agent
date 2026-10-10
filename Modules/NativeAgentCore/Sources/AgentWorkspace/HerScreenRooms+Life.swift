@@ -305,7 +305,7 @@ extension HerScreen {
             switch outcome {
             case .succeeded:
                 label = "DONE"; said = "✓ " + (what.map { "done: " + $0 } ?? "done")
-            case .failed, .cancelled, .timeout:
+            case .failed, .refused, .cancelled, .timeout:
                 label = "RESULT"; said = "✗ " + (AgentWorkspaceLife.problem(row) ?? outcome.rawValue)
             case .unknown:
                 label = "STATUS"
@@ -322,9 +322,6 @@ extension HerScreen {
         }
         return lines.joined(separator: "\n")
     }
-
-    /// Home's names for these rooms (the last PLACES row).
-    static let lifePlaces = "music · markets · x · slack · notion · gcal"
 
     /// "calendar: 2 today · 3h" from the latest read today, else the bare name.
     static func lifePulse(_ name: String, now: Date = Date()) -> String {

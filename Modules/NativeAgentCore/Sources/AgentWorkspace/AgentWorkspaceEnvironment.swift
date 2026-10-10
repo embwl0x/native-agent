@@ -89,7 +89,7 @@ package enum AgentWorkspaceEnvironment {
         }
         if tool == "mail_reply", let id = input["message_id"], let expected = input["expected_message_id"] {
             return .record(tool: "mail_list_recent", input: ["message_id": id, "expected_message_id": expected].merging(
-                input.filter { ["expected_account", "position"].contains($0.key) }) { a, _ in a }, title: "Email conversation")
+                input.filter { ["expected_account", "expected_account_id", "position"].contains($0.key) }) { a, _ in a }, title: "Email conversation")
         }
         if tool == "save_skill", let name = input["name"] {
             return .record(tool: "read_skill", input: ["name": name], title: "Saved skill")

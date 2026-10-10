@@ -334,7 +334,6 @@ extension MemoryConsolidationGate {
             memoriesActiveAfter: cand.activeMemories,
             proposalsPendingBefore: live.pendingProposals,
             proposalsPendingAfter: cand.pendingProposals,
-            accepted: plan.autoAccepted,
             merged: plan.duplicatesMerged,
             archived: plan.staleArchived
         )

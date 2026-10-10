@@ -25,9 +25,21 @@ public final class OpenAIAdapter: LLMAdapter {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
+    /// api.openai.com, or the loopback stub a stream-guard proof runs against
+    /// (`script/manual-fixtures/sse_pings_only.py`) when
+    /// NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT names one. Only a loopback host is
+    /// honored, so the key never leaves for anywhere but OpenAI or this Mac.
+    public static var defaultEndpoint: URL {
+        if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT"],
+           let url = URL(string: raw), ["127.0.0.1", "localhost"].contains(url.host ?? "") {
+            return url
+        }
+        return URL(string: "https://api.openai.com/v1/chat/completions")!
+    }
+
     public init(
         session: URLSession = .shared,
-        endpoint: URL = URL(string: "https://api.openai.com/v1/chat/completions")!,
+        endpoint: URL = OpenAIAdapter.defaultEndpoint,
         apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
@@ -368,19 +380,9 @@ public final class OpenAIAdapter: LLMAdapter {
     private func completeResponses(
         messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
     ) async throws -> String {
-        var text = ""
-        var markers: [String] = []
-        for try await event in streamResponses(messages: messages, system: system, model: model, tools: tools) {
-            switch event {
-            case .textDelta(let delta): text += delta
-            case .toolCall(let call):
-                let arguments = String(decoding: call.inputJSON, as: UTF8.self)
-                markers.append("<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(arguments)</tool_use>")
-            case .keepAlive, .replyTextSettled, .toolBoundary: break
-            }
-        }
-        return ([text.trimmingCharacters(in: .whitespacesAndNewlines)] + markers)
-            .filter { !$0.isEmpty }.joined(separator: "\n")
+        try await OpenAIOAuthDirectAdapter.collectResponsesReply(
+            streamResponses(messages: messages, system: system, model: model, tools: tools)
+        )
     }
 
     private func responsesRequest(
@@ -409,8 +411,6 @@ public final class OpenAIAdapter: LLMAdapter {
         var body = OpenAIOAuthDirectAdapter.buildResponsesBodyFromMessages(
             model: model, messages: messages, system: system, tools: tools, transport: .publicAPI
         )
-        // The API-key lane has never supplied a default system instruction.
-        if system?.isEmpty != false { body.removeValue(forKey: "instructions") }
         body["prompt_cache_options"] = ["ttl": "30m"]
         if let limit = LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit {
             body["max_output_tokens"] = limit

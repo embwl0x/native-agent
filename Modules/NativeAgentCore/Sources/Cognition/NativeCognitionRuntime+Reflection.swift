@@ -1,6 +1,7 @@
 // Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
 
 import Foundation
+import BackgroundLoops
 import ChatOrchestration
 import CognitiveSubstrate
 import Context
@@ -134,7 +135,8 @@ extension NativeCognitionRuntime {
         case .refused(let admission):
             // Honest skip: which fence stopped it, and the load reading behind it.
             _ = await lease.releaseUnused(holder: "reflection", window: window)
-            return .skipped(admission.detail)
+            return .skipped(admission.reason == CognitiveSubstrate.reflectionRefusalDisabled
+                ? LoopTickOutcome.offPrefix + "reflection disabled" : admission.detail)
         }
         let reflectionOutcome = await executeReflection(request: request, llm: llm)
         if case .skipped(let why) = reflectionOutcome, why != "reflection cancelled" {
@@ -360,7 +362,7 @@ extension NativeCognitionRuntime {
                 prompt: request.prompt,
                 system: system,
                 model: routedModel,
-                surface: request.surface
+                surface: request.surface, purpose: "reflection"
             )
         } catch let error as CognitiveReflectionPersonaError {
             await substrate.recordReceipt(

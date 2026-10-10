@@ -9,7 +9,7 @@ import TrustCenter
 /// types. The Trust Center pages, Setup, chat and the badges render `policy`;
 /// Backups render `backups`; Capabilities renders `capabilityNetwork`. Reads
 /// are nonisolated so the phone lanes use the same owner. Policy writes still
-/// run through the one trust-write chokepoint (`NativeClient.postTrustWrite`)
+/// run through the one trust-write chokepoint (`TrustPolicyToolWriter`)
 /// and backups through the backup executors.
 @MainActor
 @Observable
@@ -120,5 +120,49 @@ public final class TrustFacade {
                 try await listMCPServersAsDicts(dataRoot: dataRoot)
             }
         )
+    }
+}
+
+// MARK: - Capability catalog
+
+extension TrustFacade {
+    /// The capability catalog: saved rows merged with the built-in defaults.
+    /// Read-only; the merge is never written back.
+    public nonisolated func catalog() async throws -> [CapabilityCatalogItem] {
+        try await listCapabilityCatalog(
+            dataRoot: dataRoot, nowISO: SwiftNativeManifestSigner.isoTimestamp(Date())
+        ).map { try CapabilityCatalogItem(row: .object($0)) }
+    }
+
+    /// Catalog sources, defaults overlaid on the saved store. Missing state
+    /// reads as the defaults; a damaged store throws and is never rewritten.
+    public nonisolated func catalogSources() async throws -> [CapabilityCatalogSource] {
+        try await SwiftNativeCatalogSources(
+            dataRoot: dataRoot, persistence: SwiftNativePersistenceCore()
+        ).catalogSources().map { try CapabilityCatalogSource(row: .object($0)) }
+    }
+
+    /// Installed capability packs, newest first.
+    public nonisolated func packInstalls() async throws -> [CapabilityPackInstall] {
+        try await catalogWrites.listCapabilityPackInstalls().map { try CapabilityPackInstall(row: .object($0)) }
+    }
+
+    /// Add or update one catalog source under the sources lock, with its trace.
+    public nonisolated func saveCatalogSource(name: String, url: String, kind: String) async throws -> CapabilityCatalogSource {
+        try CapabilityCatalogSource(row: .object(try await catalogWrites.upsertCatalogSource([
+            "name": .string(name),
+            "url": .string(url),
+            "kind": .string(kind),
+        ])))
+    }
+
+    /// The catalog owner reports update checking as unavailable until it can
+    /// compare source versions; this request does not stamp source check times.
+    public nonisolated func checkCapabilityUpdates() async throws -> CapabilityUpdateCheck {
+        try CapabilityUpdateCheck(row: .object(try await catalogWrites.checkCapabilityUpdates()))
+    }
+
+    nonisolated private var catalogWrites: SwiftNativeCatalogWrites {
+        SwiftNativeCatalogWrites(dataRoot: dataRoot, persistence: SwiftNativePersistenceCore())
     }
 }

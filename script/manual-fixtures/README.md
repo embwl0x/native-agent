@@ -24,3 +24,17 @@ development. Nothing in the build or test suite runs them automatically.
   run by any automated suite.
   Some OS file-open handlers discard the query: use the browser address bar
   with the full `file:///...` URL and verify the visible mode before acting.
+
+- `sse_pings_only.py` is a loopback SSE stub for the provider stream guard's
+  first-output deadline: every POST gets `200 text/event-stream` headers and
+  then pings only, never a reply; it logs each hang-up with the pings sent.
+  Never the resident app (`~/Applications/NativeAgent.app`, root
+  `~/Projects/NativeAgent/data`). Only the public-shaped test install at
+  `/Applications/NativeAgent.app`, staged without `Contents/Resources/REPO_PATH`
+  so it runs on its own root, `~/Library/Application Support/NativeAgent`;
+  confirm that file is absent before writing anything. In that root: route
+  chat to the `openai` API-key provider with a throwaway key and a `gpt-` model,
+  and seed 100+ streamed `llm.call` rows with `ttftMs` for that provider, model
+  and `streamKind` `incremental` into its `traces/events.jsonl`. Launch it with
+  `open -n --env NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT=http://127.0.0.1:8799/v1/chat/completions /Applications/NativeAgent.app`;
+  only a loopback host is honored.

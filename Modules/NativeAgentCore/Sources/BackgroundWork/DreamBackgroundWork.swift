@@ -11,12 +11,7 @@ import TrustCenter
 import NotificationInbox
 
 /// The app's notification delivery, after the Core-owned REM card is durable.
-public protocol REMProposalNotificationPort: Sendable {
-    func notifyIfAttentionWorthy(
-        dataRoot: URL, itemId: String, title: String, summary: String,
-        source: String, severity: String
-    ) async
-}
+public typealias REMProposalNotificationPort = BackgroundWorkNotificationPort
 
 // MARK: - Dreams and Memory Loops
 
@@ -25,7 +20,7 @@ public enum DreamBackgroundWork {
     //
     // Weekly REM has exactly one owner — the `nativeagent-weekly-rem`
     // TriggerScheduler job (Sun 04:30 America/Chicago) →
-    // SchedulerDueJobRunner.executeREM → NativeClient.runRem →
+    // SchedulerDueJobRunner.executeREM → BackgroundLoopsAssembly.runRem →
     // SwiftNativeDreamREMCycle. That path resolves the persona root through
     // PersistenceCore.defaultPersonaRoot (DreamREMCycle.swift:486), so the
     // BUG-C phantom-persona-dir guard the deleted factory carried still holds,
@@ -39,7 +34,7 @@ public enum DreamBackgroundWork {
     // (~2026-09-18) and slander a healthy capability.
 
     /// rem.proposal approval stager: ONE ApprovalInbox record per pending
-    /// proposal (NativeClient.resolveApproval's rem.proposal executor applies
+    /// proposal (ApprovalTransactionCoordinator.resolveApproval's rem.proposal executor applies
     /// approve/deny) plus a card in notifications/inbox.jsonl — the store the
     /// Inbox UI actually reads (NOT the dead inbox/items.jsonl). Returns the
     /// approval id; the proposal store stamps it onto the row so a pipeline
@@ -228,7 +223,7 @@ public enum DreamBackgroundWork {
                 + ", " + nights(max(lived.count, 1))
         case .provenanceUnavailable:
             return "provenance unavailable · whether it recurred is not known"
-        case nil:
+        case .standing, nil:
             return nil
         }
     }
@@ -237,6 +232,12 @@ public enum DreamBackgroundWork {
     /// above her words, so the label travels with the proposal wherever the row
     /// is shown instead of living in one view's formatting.
     public static func remProposalPreview(_ row: REMProposalRow) -> String {
+        // A standing lesson says what it is before it quotes the line: the
+        // card moves a correction into GROWTH, it is not a dream's lesson.
+        if row.support == .standing {
+            return "Standing lesson, recalled in nearly every conversation. Approve to keep it in GROWTH "
+                + "and retire the memory:\n“\(row.proposalText)”"
+        }
         // Her words first: a card shows its first line, and the lesson is the point.
         guard let label = remSupportLabel(row) else { return row.proposalText }
         return row.proposalText + "\n" + label
@@ -335,7 +336,7 @@ public enum DreamBackgroundWork {
     /// `_DREAM_DELTA_COUNT_LIMIT` caps internally.
     ///
     /// Exposed as `static` (not `private`) so the scheduler-driven path
-    /// (NativeClient.runDream → SwiftNativeDreamREMCycle) can wire the
+    /// (BackgroundLoopsAssembly.runDream → SwiftNativeDreamREMCycle) can wire the
     /// same provider; otherwise the scheduled nightly bypasses this
     /// assembly entirely and the Self-half is permanently empty.
     public static func makeDreamMemoryDeltaProvider(
@@ -377,10 +378,6 @@ public enum DreamBackgroundWork {
                 var tagged: [String] = []
                 var general: [String] = []
                 for rec in sorted {
-                    // Skill pointers are recall-only rows — a launch sync
-                    // must not read as "35 new memories" in tonight's dream
-                    // (gpt-5.5 review HIGH, 2026-07-03).
-                    if rec.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { continue }
                     let text = rec.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     if text.isEmpty { continue }
                     // Recency cutoff — only material absorbed within the
@@ -422,7 +419,7 @@ public enum DreamBackgroundWork {
     /// existing nightly dream call — no new LLM call.
     ///
     /// Exposed as `static` (not `private`) so the scheduler-driven path
-    /// (NativeClient.runDream → SwiftNativeDreamREMCycle) can wire the same
+    /// (BackgroundLoopsAssembly.runDream → SwiftNativeDreamREMCycle) can wire the same
     /// provider, mirroring makeDreamMemoryDeltaProvider — otherwise the scheduled
     /// nightly bypasses this assembly and the felt tone is permanently absent.
     public static func makeDreamFeltSummaryProvider(
@@ -490,7 +487,7 @@ public enum DreamBackgroundWork {
     /// (one dream per day) and only after the diary entry committed.
     ///
     /// Exposed as `static` (not `private`) for the same reason as the two providers
-    /// above: the scheduler-driven path (NativeClient.runDream →
+    /// above: the scheduler-driven path (BackgroundLoopsAssembly.runDream →
     /// SwiftNativeDreamREMCycle) builds its own runner and must wire the same sink,
     /// or the scheduled nightly dream never reaches her disposition.
     public static func makeDreamMoodSink(

@@ -172,6 +172,7 @@ extension NativeCognitionRuntime {
         await bootstrap()
         // A nil export is a disabled organism. Nothing to hold a horizon in.
         guard let before = await organismKernel.exportPersistentState()?.predictionLedger else {
+            OrganPulse.recordOff("horizon_expectations", because: "organism disabled")
             return
         }
         let at = now()
@@ -181,7 +182,10 @@ extension NativeCognitionRuntime {
         // Nothing open, nothing settled, nothing to expect: send no signal at
         // all. This is the ordinary state of a quiet machine and it must stay
         // free.
-        guard !settled.isEmpty || !open.isEmpty || !composed.tokens.isEmpty else { return }
+        let facing = !settled.isEmpty || !open.isEmpty || !composed.tokens.isEmpty
+        OrganPulse.record("horizon_expectations", facing ? .worked : .nothing,
+                          note: "\(open.count) open, \(settled.count) settled, \(composed.tokens.count) expected")
+        guard facing else { return }
 
         // A scheduled job no longer opens a horizon, so one still open from
         // before settles silently: no relief, no "still waiting" on a cron row.

@@ -1,5 +1,8 @@
+import AppToolRuntime
+import ChatOrchestration
 import SwiftUI
 import NativeAgentShared
+import PersistenceCore
 
 // ui-simplify 2026-09-02 (Lane A): the conversations column.
 //
@@ -149,27 +152,34 @@ extension ChatView {
                     .foregroundStyle(NativeAgentShell.secondary)
                     .selectionDisabled()
                 }
-                ForEach(sections.rows) { session in
-                    shellSessionRow(session).tag(session.id)
-                }
-                if !sections.briefs.isEmpty {
-                    Section(isExpanded: $shellBriefsExpanded) {
-                        ForEach(sections.briefs) { session in
+                // The column's blocks in the layout's order (ui/layout.json,
+                // chat); whether a fold is open is saved there too.
+                ForEach(shellColumnBlocks, id: \.self) { block in
+                    switch block {
+                    case "rows":
+                        ForEach(sections.rows) { session in
                             shellSessionRow(session).tag(session.id)
                         }
-                    } header: {
-                        Text("\(ChatShellCopy.briefsRowTitle)  \(sections.briefs.count)")
-                            .foregroundStyle(NativeAgentShell.secondary)
-                    }
-                }
-                if !sections.working.isEmpty {
-                    Section(isExpanded: $shellWorkingExpanded) {
-                        ForEach(sections.working) { session in
-                            shellSessionRow(session).tag(session.id)
+                    case "briefs" where !sections.briefs.isEmpty:
+                        Section(isExpanded: shellFold("briefs")) {
+                            ForEach(sections.briefs) { session in
+                                shellSessionRow(session).tag(session.id)
+                            }
+                        } header: {
+                            Text("\(ChatShellCopy.briefsRowTitle)  \(sections.briefs.count)")
+                                .foregroundStyle(NativeAgentShell.secondary)
                         }
-                    } header: {
-                        Text("\(ChatShellCopy.workingRowTitle)  \(sections.working.count)")
-                            .foregroundStyle(NativeAgentShell.secondary)
+                    case "working" where !sections.working.isEmpty:
+                        Section(isExpanded: shellFold("working")) {
+                            ForEach(sections.working) { session in
+                                shellSessionRow(session).tag(session.id)
+                            }
+                        } header: {
+                            Text("\(ChatShellCopy.workingRowTitle)  \(sections.working.count)")
+                                .foregroundStyle(NativeAgentShell.secondary)
+                        }
+                    default:
+                        EmptyView()
                     }
                 }
             }
@@ -196,6 +206,19 @@ extension ChatView {
         // it. Alive glass, 2026-09-23: the trailing hairline is gone too — the
         // haze stopped at it and the list read as a slab. Its gutter is the
         // only separation from the room; the rail is the one plate.
+    }
+
+    /// The conversations column's blocks as this chat's view shows them;
+    /// none shown, no column (Simple's profile, as seeded).
+    var shellColumnBlocks: [String] {
+        SurfaceLayoutLive.shared.layout.shown("chat", profile: layoutProfile).map(\.name)
+    }
+
+    /// A fold the person opens or closes: the layout's, written as theirs.
+    func shellFold(_ block: String) -> Binding<Bool> {
+        let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        return Binding(get: { SurfaceLayoutLive.shared.layout.expanded("chat", block) },
+                       set: { open in Task.detached { SurfaceLayoutStore.setExpanded(open, surface: "chat", block: block, dataRoot: root) } })
     }
 
     /// One row. While a rename is in flight the classic `SessionRow` renders

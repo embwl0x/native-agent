@@ -461,10 +461,17 @@ public enum ToolContractWeight {
 // Recording is non-fatal: an IO failure logs to stderr and the provider
 // call's result reaches the caller unchanged.
 public final class LLMCallTraceRecorder: @unchecked Sendable {
-    /// One `llm.call` row per provider request. The router binds a fresh flag
-    /// as the request's identity; the first row written under it (the adapter's
-    /// receipt or the router's failure row) claims it and any later row drops.
-    @TaskLocal public static var requestRecorded: OSAllocatedUnfairLock<Bool>?
+    /// One `llm.call` row per provider request. The router binds a fresh
+    /// receipt as the request's identity; the first row written under it (the
+    /// adapter's or the router's failure row) claims it, leaves its `ttftMs`
+    /// there for the router's lifecycle, and any later row drops.
+    @TaskLocal public static var requestRecorded: OSAllocatedUnfairLock<Receipt>?
+
+    public struct Receipt: Sendable {
+        public var recorded = false
+        public var ttftMs: Int?
+        public init() {}
+    }
 
     /// Test injection. Production leaves nil and the path resolves through
     /// `PersistenceCore.defaultDataRoot()` at append time (so the env-var /
@@ -614,11 +621,20 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         stopReason: String? = nil,
         errorDetail: String? = nil
     ) async {
-        if let claim = Self.requestRecorded, claim.withLock({ recorded in
-            defer { recorded = true }
-            return recorded
+        if let claim = Self.requestRecorded, claim.withLock({ receipt in
+            defer { receipt.recorded = true }
+            if !receipt.recorded { receipt.ttftMs = ttftMs }
+            return receipt.recorded
         }) { return }
-        let surface = LLMCallContext.surface ?? "unknown"
+        let purpose = LLMCallContext.purpose
+        let routedSurface = LLMCallContext.surface ?? "unknown"
+        let surface: String = {
+            switch purpose {
+            case "memory_interpret", "memory_held", "recall_judge", "kind_backfill": return "memory"
+            case "digest", "probe": return purpose
+            default: return routedSurface
+            }
+        }()
         // Turn Inspector W1: tag with the per-turn trace id so the Inspector
         // can join this llm.call to the rest of the turn's story. Unbound
         // (non-turn caller — a background loop's LLM call) → "unknown".
@@ -630,6 +646,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             "provider": .string(provider),
             "model": .string(model),
             "surface": .string(surface),
+            "purpose": .string(purpose),
             "streaming": .bool(streaming),
             "durationMs": .int(Int64(durationMs)),
             "turnId": .string(turnId),
@@ -748,6 +765,30 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                 recordedAtEpochMicros: receiptOrder
             )
         }()
+        await write(row, provider: provider, model: model, usageReceipt: usageReceipt)
+    }
+
+    /// The stream guard's no-reply cut as its own `provider.noReply` row in the
+    /// call ledger, bound to a turn or not (a background call's cut counts
+    /// too), mirrored onto the turn's trace when one is bound.
+    public func recordNoReply(provider: String, seconds: Int, events: Int, surface: String) async {
+        let payload: [String: JSONValue] = [
+            "provider": .string(provider), "seconds": .int(Int64(seconds)), "events": .int(Int64(events)),
+            "surface": .string(surface), "turnId": .string(TurnTraceContext.turnId ?? "unknown"),
+        ]
+        TurnTraceBus.fireFromContext(kind: "provider.noReply", surface: surface, payload: .object(payload))
+        await write(.object([
+            "id": .string(UUID().uuidString.lowercased()),
+            "kind": .string("provider.noReply"),
+            "title": .string(provider),
+            "status": .string("failed"),
+            "payload": .object(payload),
+            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
+        ]), provider: provider, model: "", usageReceipt: nil)
+    }
+
+    private func write(_ row: JSONValue, provider: String, model: String,
+                       usageReceipt: SessionUsageReceiptWrite?) async {
         let path = tracesPath
         if synchronousWrites {
             await Self.performWrite(

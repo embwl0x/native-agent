@@ -26,12 +26,14 @@ private struct NativeSwarmChatClient: SwarmChatClient {
     func runSwarmToolTurn(message: String, model: String, reasoningEffort: String,
                          providerID: String?, serviceTier: String,
                          sessionID: String?, surface: String) async throws -> String {
-        let response = try await client.runEphemeralToolTurn(
+        let response = try await LLMCallContext.$purpose.withValue("swarm") {
+        try await client.runEphemeralToolTurn(
             message: message, model: model, reasoningEffort: reasoningEffort,
             fileAccess: "auto", providerID: providerID,
             serviceTierOverride: serviceTier, verifiedSessionId: sessionID,
             requireCompleted: true, surface: surface
         )
+        }
         return response.output
     }
 }

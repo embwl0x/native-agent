@@ -150,7 +150,8 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 detail: "\(summary.unreadableDays.count) turn-trace day file(s) exist but could"
                     + " not be read (\(summary.unreadableDays.joined(separator: ", ")))."
                     + " Her subconscious vitals are UNMEASURED \(window.describedAs) — this"
-                    + " row is not reporting healthy, it is reporting that it could not look."
+                    + " row is not reporting healthy, it is reporting that it could not look.",
+                harm: "Her subconscious behavior cannot be checked from the saved turns."
             )
         }
 
@@ -160,7 +161,8 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 id: id, title: title, status: "fail",
                 detail: "data/cognition/organism_state.json exists but \(reason)."
                     + " Her chemistry is UNMEASURED, which is a finding about this row's"
-                    + " coverage, not a clean reading."
+                    + " coverage, not a clean reading.",
+                harm: "Her saved body state cannot be read."
             )
         }
 
@@ -177,12 +179,9 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         }
         let coverageDetail = coverageParts.isEmpty ? "" : " " + coverageParts.joined(separator: "; ") + "."
 
-        // No graded turns yet: a fresh mind at rest is not a stuck rail, so only a fail shows.
-        let ungradedChemLevel = chemistryLine(chemistry).level.flatMap { $0 == "fail" ? $0 : nil }
         if summary.isEmptyFeed {
-            let level = ungradedChemLevel
             return CheckResult(
-                id: id, title: title, status: level ?? "ok",
+                id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
                     + " data/turn_traces. "
                     + chemistryLine(chemistry).sentence,
@@ -190,11 +189,9 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             )
         }
         guard !eligibleTurns.isEmpty else {
-            let level = ungradedChemLevel ?? (summary.malformedLines > 0 ? "warn" : "ok")
             return CheckResult(
                 id: id, title: title,
-                // Keep actual observation faults visible; tailing alone is not one yet.
-                status: level,
+                status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
                     + " trace day(s) read and \(summary.matchedRows) context.snapshot row(s)"
                     + " in window, but none on a capsule surface"
@@ -207,9 +204,12 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
 
         var status = "ok"
         var repairs: [String] = []
-        func raise(_ level: String) {
+        var harms: [String] = []
+        func raise(_ level: String, harm: String? = nil) {
             if level == "fail" { status = "fail" }
             else if level == "warn", status != "fail" { status = "warn" }
+            else if level == "unmeasured", status == "ok" { status = "unmeasured" }
+            if let harm { harms.append(harm) }
         }
 
         var parts: [String] = [window.describedAs]
@@ -261,13 +261,13 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             if feltTurns < minimumRateTurns {
                 // Reported above, deliberately ungraded.
             } else if share > feltFailPercent {
-                raise("fail")
+                raise("fail", harm: "Her felt vocabulary has collapsed onto one word.")
                 repairs.append(
                     "\"\(top.key)\" carries \(Int(share.rounded()))% of her felt vocabulary."
                         + " The felt lane has collapsed onto one word."
                 )
             } else if share > feltWarnPercent {
-                raise("warn")
+                raise("warn", harm: "Her felt vocabulary is narrowing.")
                 repairs.append(
                     "\"\(top.key)\" is over \(Int(feltWarnPercent))% of her felt vocabulary —"
                         + " range is narrowing."
@@ -289,14 +289,14 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             if soundTurns < minimumRateTurns {
                 // Reported above, deliberately ungraded.
             } else if percent > rutFailPercent {
-                raise("fail")
+                raise("fail", harm: "Her Sound channel reports persistent echoing in her phrasing.")
                 repairs.append(
                     "Her own Sound channel says the phrasing is echoing on"
                         + " \(Int(percent.rounded()))% of turns. The rut is the steady state,"
                         + " not an occasional nudge."
                 )
             } else if percent > rutWarnPercent {
-                raise("warn")
+                raise("warn", harm: "Her Sound channel reports recurring echoing in her phrasing.")
             }
         } else {
             parts.append("Sound line UNMEASURED — no turn yielded a readable Sound line")
@@ -306,7 +306,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         if innerTurns >= innerVarietyMinimumTurns {
             parts.append("\(innerLines.count) distinct Inner line(s) over \(innerTurns) turn(s)")
             if innerLines.count < innerVarietyFloor {
-                raise("warn")
+                raise("warn", harm: "Her inner voice is repeating instead of responding to the conversation.")
                 repairs.append(
                     "Only \(innerLines.count) distinct Inner line(s) across \(innerTurns) turns —"
                         + " the inner voice is repeating rather than responding."
@@ -339,6 +339,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         return CheckResult(
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",
+            harm: harms.isEmpty ? nil : harms.joined(separator: " "),
             repair: repairs.isEmpty ? nil : repairs.joined(separator: " ")
         )
     }
@@ -411,13 +412,13 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             if !missing.isEmpty {
                 sentence += " (\(missing.joined(separator: "/")) absent from the file, unjudged)"
             }
-            guard !pinned.isEmpty else { return (sentence, missing.isEmpty ? nil : "warn", nil) }
+            guard !pinned.isEmpty else { return (sentence, missing.isEmpty ? nil : "unmeasured", nil) }
             let named = pinned
                 .map { String(format: "%@=%.3f", $0.key, $0.value) }
                 .joined(separator: ", ")
             return (
                 sentence + "; PINNED at a rail: \(named)",
-                "warn",
+                "unmeasured",
                 "A chemical dimension parked at 0 or 1 has stopped carrying information."
                     + " Pinned: \(named)."
             )

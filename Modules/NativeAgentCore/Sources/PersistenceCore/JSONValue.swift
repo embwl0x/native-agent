@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Darwin
 import NativeAgentCore
@@ -372,5 +373,167 @@ extension JSONValue: Codable {
         case .array(let a): try c.encode(a)
         case .object(let o): try c.encode(o)
         }
+    }
+}
+
+/// Checked reads of one stored JSON object row, for owners that hand out
+/// typed records without a byte round trip: a required field must be present
+/// with its type, an optional one may be absent or null, and a present field
+/// of the wrong type makes the row malformed.
+public struct JSONRow {
+    public enum Malformed: Error, LocalizedError {
+        case notAnObject
+        case field(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notAnObject: return "row is not a JSON object"
+            case .field(let key): return "row has no valid \(key)"
+            }
+        }
+    }
+
+    public let fields: [String: JSONValue]
+
+    public init(_ value: JSONValue) throws {
+        guard case .object(let fields) = value else { throw Malformed.notAnObject }
+        self.fields = fields
+    }
+
+    public func string(_ key: String) throws -> String { try required(key, Self.string) }
+    public func optionalString(_ key: String) throws -> String? { try optional(key, Self.string) }
+    public func strings(_ key: String) throws -> [String] { try required(key, Self.strings) }
+    public func array(_ key: String) throws -> [JSONValue] {
+        try required(key) { if case .array(let values) = $0 { return values }; return nil }
+    }
+    public func optionalBool(_ key: String) throws -> Bool? {
+        try optional(key) { if case .bool(let value) = $0 { return value }; return nil }
+    }
+    public func optionalInt(_ key: String) throws -> Int? {
+        try optional(key) {
+            switch $0 {
+            case .int(let value): return Int(exactly: value)
+            case .double(let value): return Int(exactly: value)
+            default: return nil
+            }
+        }
+    }
+    /// Any value but null.
+    public func optionalValue(_ key: String) -> JSONValue? {
+        fields[key].flatMap { $0 == .null ? nil : $0 }
+    }
+
+    public func optional<T>(_ key: String, _ read: (JSONValue) -> T?) throws -> T? {
+        guard let raw = fields[key], raw != .null else { return nil }
+        guard let value = read(raw) else { throw Malformed.field(key) }
+        return value
+    }
+
+    private func required<T>(_ key: String, _ read: (JSONValue) -> T?) throws -> T {
+        guard let value = try optional(key, read) else { throw Malformed.field(key) }
+        return value
+    }
+
+    private static func string(_ value: JSONValue) -> String? {
+        if case .string(let string) = value { return string }
+        return nil
+    }
+
+    private static func strings(_ value: JSONValue) -> [String]? {
+        guard case .array(let values) = value else { return nil }
+        let strings = values.compactMap(string)
+        return strings.count == values.count ? strings : nil
+    }
+}
+
+// MARK: - A store's document
+
+extension JSONValue {
+    public struct ShapeError: Error, CustomStringConvertible {
+        public let description: String
+        public init(description: String) { self.description = description }
+    }
+
+    /// THE ONE SHAPE CHECK for a document a store reads or is handed: every
+    /// field `T` has, and none it lacks, so a misspelt field never silently
+    /// drops. The error names the field.
+    public func decodedExactly<T: Codable>(as _: T.Type) throws -> T {
+        let value: T
+        do { value = try JSONDecoder().decode(T.self, from: serializedData(pretty: false)) }
+        catch { throw ShapeError(description: Self.describe(error)) }
+        if let stray = Self.unknownField(self, (try? JSONValue.fromEncodable(value)) ?? .null, value) {
+            throw ShapeError(description: "it has no field \(stray)")
+        }
+        return value
+    }
+
+    /// The first field `given` names that the value it decoded to does not
+    /// have: one the decoder skipped. A field is the value's when the value
+    /// encodes it, or when it is one of the value's own optional properties
+    /// left nil, so a null is checked by name like any other value
+    /// (`colour: null` is refused; a nil optional's `null` is not).
+    private static func unknownField(_ given: JSONValue, _ decoded: JSONValue, _ value: Any?, path: String = "") -> String? {
+        switch (given, decoded) {
+        case (.object(let fields), _):
+            let known: [String: JSONValue] = if case .object(let known) = decoded { known } else { [:] }
+            for (key, field) in fields.sorted(by: { $0.key < $1.key }) {
+                let property = member(value, key)
+                guard let match = known[key] ?? (field == .null && isNilOptional(property) ? .null : nil) else { return path + key }
+                if let stray = unknownField(field, match, property, path: path + key + ".") { return stray }
+            }
+        case (.array(let items), .array(let known)):
+            let elements = unwrapped(value) as? [Any]
+            for (index, item) in items.enumerated() where index < known.count {
+                let element = elements.flatMap { index < $0.count ? $0[index] : nil }
+                if let stray = unknownField(item, known[index], element, path: String(path.dropLast()) + "[\(index)].") { return stray }
+            }
+        default: break
+        }
+        return nil
+    }
+
+    /// A decoded value's `key`: a dictionary's entry or a stored property, through any Optional.
+    private static func member(_ value: Any?, _ key: String) -> Any? {
+        guard let value = unwrapped(value) else { return nil }
+        if let entries = value as? [String: Any] { return entries[key] }
+        return Mirror(reflecting: value).children.first { $0.label == key }?.value
+    }
+
+    private static func unwrapped(_ value: Any?) -> Any? {
+        guard let value else { return nil }
+        let mirror = Mirror(reflecting: value)
+        guard mirror.displayStyle == .optional else { return value }
+        return mirror.children.first.flatMap { unwrapped($0.value) }
+    }
+
+    private static func isNilOptional(_ value: Any?) -> Bool {
+        guard let value else { return false }
+        let mirror = Mirror(reflecting: value)
+        return mirror.displayStyle == .optional && mirror.children.isEmpty
+    }
+
+    /// A decoding failure as the field it names, so the fix is plain.
+    public static func describe(_ error: Error) -> String {
+        guard let error = error as? DecodingError else { return error.localizedDescription }
+        func path(_ context: DecodingError.Context, _ key: CodingKey? = nil) -> String {
+            (context.codingPath + (key.map { [$0] } ?? [])).map { $0.intValue.map { "[\($0)]" } ?? $0.stringValue }.joined(separator: ".")
+        }
+        switch error {
+        case .keyNotFound(let key, let context): return "missing " + path(context, key)
+        case .typeMismatch(_, let context), .valueNotFound(_, let context): return path(context) + " has the wrong type"
+        case .dataCorrupted(let context): return context.codingPath.isEmpty ? "not JSON" : path(context) + ": " + context.debugDescription
+        @unknown default: return error.localizedDescription
+        }
+    }
+
+    /// The first 8 bytes of the compact form's SHA-256, as hex.
+    public var digest: String {
+        SHA256.hash(data: (try? serializedData(pretty: false)) ?? Data()).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The dotted fields whose values differ, for a write's receipt.
+    public static func differences(_ old: JSONValue, _ new: JSONValue, path: String = "") -> [String] {
+        guard case .object(let before) = old, case .object(let after) = new else { return old == new ? [] : [String(path.dropLast())] }
+        return Set(before.keys).union(after.keys).sorted().flatMap { differences(before[$0] ?? .null, after[$0] ?? .null, path: path + $0 + ".") }
     }
 }

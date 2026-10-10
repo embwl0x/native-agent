@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 
 /// User's window into hers (her-screen Phase 8, 2026-09-24): the glance line
@@ -9,14 +10,14 @@ import PersistenceCore
 /// runs: a place that opens with an owner read shows the copy she was last
 /// shown, or says what it would read.
 package enum AgentWorkspaceScreenPreview {
-    /// Home, then every name on home's PLACES rows in order, then the rooms
-    /// home's own sections and footer open.
-    public static let tabs: [String] = {
+    /// Home, then every place home's PLACES rows show, in order, then the
+    /// rooms home's own sections and footer open.
+    public static func tabs(_ layout: SurfaceLayout, profile: String?) -> [String] {
         var names = ["home"]
-        for name in HerScreen.placeRows.joined() + ["people", "helpers", "mac", "conversations", "windows", "arrivals", "work"]
+        for name in layout.shown("places", profile: profile).map(\.name) + ["people", "helpers", "mac", "conversations", "windows", "arrivals", "work"]
             where !names.contains(name) { names.append(name) }
         return names
-    }()
+    }
 
     /// What home, rooms and the glance read, relative to the data root.
     public static let watchedPaths = [
@@ -25,6 +26,8 @@ package enum AgentWorkspaceScreenPreview {
         "bots/shelf-index.json", "bots/run-queue.json", "workflows/approvals/requests.json",
         "memory/memory.sqlite", "memory/memory.sqlite-wal", "memory/profile.json", "swarms/live.json", "swarms/runs.json",
         "connectors/github/tracking_snapshot.json", "her_screen/last_seen.json", "her_screen/touched.json",
+        // Home's sections and places in the layout's order.
+        "ui/layout.json",
     ]
 
     /// The glance as a turn renders it, without a turn's pin or budget.

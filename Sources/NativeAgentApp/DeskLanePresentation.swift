@@ -149,7 +149,7 @@ enum DeskAttentionStrip {
 enum DeskGitHubBucket: String, CaseIterable, Sendable {
     case actionNeeded = "Action needed"
     case legacyWork = "Finishing prior work"
-    case needsUser = "Needs you"
+    case needsOwner = "Needs you"
     case waiting = "Waiting upstream"
     case attention = "Attention"
     case resolved = "Recently resolved"
@@ -158,7 +158,7 @@ enum DeskGitHubBucket: String, CaseIterable, Sendable {
         switch state {
         case .detected, .needsCodex: return .actionNeeded
         case .codexWorking, .verifying: return .legacyWork
-        case .needsUser: return .needsUser
+        case .needsOwner: return .needsOwner
         case .waitingUpstream: return .waiting
         case .attention: return .attention
         case .resolved: return .resolved

@@ -23,7 +23,8 @@ struct AppWorkshopSessionEffects: WorkshopSessionEffects {
     ) -> @Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String) {
         return { request, tools in
             let client = NativeAgentEngine.live.chatClient(tools: tools)
-            let response = try await client.runEphemeralToolTurn(
+            let response = try await LLMCallContext.$purpose.withValue("workshop") {
+            try await client.runEphemeralToolTurn(
                 message: request.promptSeed,
                 fileAccess: "read_only",
                 autonomyResolver: WorkshopAutonomyResolver(
@@ -32,6 +33,7 @@ struct AppWorkshopSessionEffects: WorkshopSessionEffects {
                 requireCompleted: true,
                 surface: WorkshopSurfaceVocabulary.canonical
             )
+            }
             return (response.model, response.output)
         }
     }

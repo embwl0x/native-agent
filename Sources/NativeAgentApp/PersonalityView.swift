@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import NativeAgentShared
+import PersonaEngine
 
 // MARK: - PersonalityView (redesigned 2026-07-03, User's direction)
 //
@@ -31,11 +32,11 @@ struct PersonalityDocumentDraftState: Equatable {
 
     var hasUnsavedDrafts: Bool { !unsavedDrafts.isEmpty }
 
-    static func usableDocuments(in documents: [PersonalityDoc]) -> [PersonalityDoc] {
+    static func usableDocuments(in documents: [PersonaDocSpec]) -> [PersonaDocSpec] {
         documents.filter { !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
-    mutating func select(_ requestedID: String, documents: [PersonalityDoc]) -> String {
+    mutating func select(_ requestedID: String, documents: [PersonaDocSpec]) -> String {
         selectedDocumentID = requestedID
         return reconcile(documents: documents)
     }
@@ -43,7 +44,7 @@ struct PersonalityDocumentDraftState: Equatable {
     /// Reconcile after a load/reload. A missing selection moves to the first
     /// usable document; an empty or malformed catalog has no selected id and
     /// no editable-looking empty fallback.
-    mutating func reconcile(documents: [PersonalityDoc]) -> String {
+    mutating func reconcile(documents: [PersonaDocSpec]) -> String {
         let documents = Self.usableDocuments(in: documents)
         guard let selected = documents.first(where: { $0.id == selectedDocumentID })
             ?? documents.first else {
@@ -54,7 +55,7 @@ struct PersonalityDocumentDraftState: Equatable {
         return unsavedDrafts[selected.id] ?? selected.content
     }
 
-    mutating func recordEdit(_ content: String, documents: [PersonalityDoc]) {
+    mutating func recordEdit(_ content: String, documents: [PersonaDocSpec]) {
         guard let selected = Self.usableDocuments(in: documents)
             .first(where: { $0.id == selectedDocumentID }) else {
             return
@@ -481,7 +482,7 @@ struct PersonalityView: View {
         syncPersonalityDocDraft()
     }
 
-    private var selectedPersonalityDoc: PersonalityDoc? {
+    private var selectedPersonalityDoc: PersonaDocSpec? {
         PersonalityDocumentDraftState.usableDocuments(in: appModel.personalityDocs)
             .first { $0.id == documentDraftState.selectedDocumentID }
     }
@@ -572,7 +573,7 @@ enum PersonalityDocumentsReloadPresentation: Equatable {
     case retainedStale(documentCount: Int, detail: String)
     case unavailable(String)
 
-    static func resolve(documents: [PersonalityDoc], errorDetail: String?) -> Self {
+    static func resolve(documents: [PersonaDocSpec], errorDetail: String?) -> Self {
         resolve(retainedDocumentCount: documents.count, errorDetail: errorDetail)
     }
 

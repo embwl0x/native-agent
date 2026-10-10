@@ -715,8 +715,7 @@ enum TrustPolicyPresetAction {
 
         let policy: TrustPolicy
         do {
-            policy = try await NativeClient.saveTrustPreset(
-                preset,
+            policy = try await preset.save(
                 dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
                 fullMacConfirmed: fullMacConfirmed,
                 guardedByLockedPolicy: guardedByLockedPolicy

@@ -16,16 +16,16 @@ extension AppDeviceSyncHost {
             guard let canonical = TrustPolicyPreset.allCases.first(where: { $0.quietID == preset.rawValue }) else {
                 throw MobileTrustActionError.invalidRequest
             }
-            saved = try await NativeClient.saveTrustPreset(
-                canonical, dataRoot: PersistenceCore.defaultDataRoot(), fullMacConfirmed: confirmed
+            saved = try await canonical.save(
+                dataRoot: PersistenceCore.defaultDataRoot(), fullMacConfirmed: confirmed
             )
         case .policy(.permissionLevel, let value, _):
             guard let preset = MobileTrustAction.Preset(permissionLevel: value),
                   let canonical = TrustPolicyPreset.allCases.first(where: { $0.quietID == preset.rawValue }) else {
                 throw MobileTrustActionError.invalidRequest
             }
-            saved = try await NativeClient.saveTrustPreset(
-                canonical, dataRoot: PersistenceCore.defaultDataRoot(), fullMacConfirmed: false
+            saved = try await canonical.save(
+                dataRoot: PersistenceCore.defaultDataRoot(), fullMacConfirmed: false
             )
         case .policy(let field, let value, _):
             let body: [String: Any]
@@ -35,13 +35,13 @@ extension AppDeviceSyncHost {
             case .requireBackups: body = ["filePolicy": ["requireBackupBeforeWrite": value == "true"]]
             case .outsideDefault: body = ["filePolicy": ["outsideWorkspaceDefault": value]]
             case .developerMode:
-                body = NativeClient.developerModePatchBody(enabled: value == "true")
+                body = TrustPolicyActions.developerModePatchBody(enabled: value == "true")
             case .workshopEnabled: body = ["missionPolicy": ["enabled": value == "true"]]
             case .showTimeline: body = ["missionPolicy": ["showTimeline": value == "true"]]
-            case .autonomousTraining: body = ["trainingPolicy": ["autonomous_training": value == "true"]]
+            case .autonomousTraining: throw MobileTrustActionError.trainingUnavailable
             case .dreamScheduler: body = ["trainingPolicy": ["dream_scheduler": value == "true"]]
             }
-            saved = try await NativeClient.applyTrustPolicyPatch(
+            saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
                 body: body, dataRoot: PersistenceCore.defaultDataRoot(),
                 guardedByLockedPolicy: { locked in
                     if field == .outsideDefault,
@@ -60,9 +60,11 @@ extension AppDeviceSyncHost {
 
 private enum MobileTrustActionError: LocalizedError {
     case invalidRequest
+    case trainingUnavailable
     case outsideFullMac
     var errorDescription: String? {
         switch self {
+        case .trainingUnavailable: "Autonomous training is no longer available."
         case .invalidRequest: "Invalid or unconfirmed trust change."
         case .outsideFullMac: MobileTrustAction.outsideFullMacRefusal
         }

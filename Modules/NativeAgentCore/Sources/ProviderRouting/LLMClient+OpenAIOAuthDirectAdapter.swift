@@ -250,108 +250,19 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// function_call_output). Without these structured items the model can't
     /// see its own prior tool calls as PAIRED with their results — the loop
     /// re-emits the same tool call every iteration and never converges.
+    ///
+    /// Whole-reply callers (Telegram, the bridge, background work) ride the
+    /// same SSE request and decoder as the chat surface, so the stream guard
+    /// sees wire activity as it arrives and one llm.call row is written.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        let coercedModel = try coerceToGPTModel(model)
-        let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
-        var forceTokenRefresh = false
-        // User, 2026-09-06: the token the last attempt actually sent, handed to
-        // the forced refresh so a rotation another caller already performed is
-        // taken instead of burning a second single-use refresh_token.
-        let requestAccount = OAuthRequestAccount()
-        var lastSentAccessToken: String?
-        for attempt in 0...1 {
-            try Task.checkCancellation()
-            let access: String
-            do {
-                access = try await ensureFreshAccessToken(
-                    forceRefresh: forceTokenRefresh,
-                    staleToken: lastSentAccessToken, requestAccount: requestAccount
-                )
-                forceTokenRefresh = false
-                lastSentAccessToken = access
-            } catch is CancellationError { throw CancellationError() }
-            catch let err as LLMError { throw err }
-            catch let err as any ProviderFailureWrapping { throw err }
-            catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
-            var req = try responsesRequest(accessToken: access)
-
-            let bodyDict = Self.buildResponsesBodyFromMessages(
-                model: coercedModel, messages: messages, system: system, tools: tools,
-                supportedEfforts: accountSupportedEfforts(model: coercedModel)
-            )
-            do {
-                req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
-            } catch {
-                throw LLMError.underlying(message: "encode body: \(error)")
-            }
-
-            let requestStartNs = DispatchTime.now().uptimeNanoseconds
-            let data: Data
-            let response: URLResponse
-            do {
-                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                (data, response) = try await session.data(for: req)
-            } catch {
-                throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "completeMessages"))
-            }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if status == 401 {
-                if attempt == 0 {
-                    forceTokenRefresh = true
-                    continue
-                }
-                throw exhaustedCredentialError()
-            }
-            try throwIfChatCompletionsError(status: status, data: data, response: response)
-            let parsed = Self.parseResponsesSSEDetailed(from: data)
-            // User, 2026-09-06: a buffered SSE body that ends without a
-            // terminal event is a truncated response, not a complete one.
-            // Returning its text flushed half-arrived function calls with
-            // `{}` arguments and the tool loop dispatched them. Throw the
-            // same error the streaming sibling throws so the reconnect
-            // ladder retries the identical call.
-            if !parsed.sawTerminal {
-                throw LLMError.streamTruncated(
-                    message: "openai oauth response ended without terminal event"
-                )
-            }
-            switch parsed.result {
-            case .text(let s):
-                // U1 step 1: usage telemetry (whole SSE buffer arrived at
-                // once here, so no meaningful TTFT on this path).
-                let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                await telemetry.record(
-                    requestBody: req.httpBody,
-                    provider: providerId,
-                    model: coercedModel,
-                    streaming: false,
-                    usage: parsed.usage,
-                    ttftMs: nil,
-                    durationMs: durationMs,
-                    status: parsed.incompleteReason == nil ? "ok" : "incomplete",
-                    substitutedFrom: substitutedFrom,
-                    stopReason: parsed.incompleteReason
-                )
-                if let reason = parsed.incompleteReason {
-                    if reason == "max_output_tokens" {
-                        throw LLMError.outputLengthLimit(partial: s)
-                    }
-                    throw LLMError.providerError(message: Self.incompleteNote(reason))
-                }
-                guard !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw LLMError.streamTruncated(message: "openai oauth response produced no content (terminal event, empty)")
-                }
-                return s
-            case .providerError(let message):
-                throw Self.classifiedBackendError(message)
-            }
-        }
-        throw LLMError.notConfigured(provider: "openai_oauth_direct")
+        try await Self.collectResponsesReply(
+            streamMessages(messages: messages, system: system, model: model, tools: tools)
+        )
     }
 
     public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
@@ -468,7 +379,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     ///   - toolUse (assistant)     → {type:"function_call",name,arguments:<jsonString>,call_id}
     ///   - toolResult (user)       → {type:"function_call_output",call_id,output:<string>}
     ///   - text system message     → {type:"message",role:"developer",content:[{type:"input_text",text}]}
-    /// `instructions` carries the system prompt (same shape as buildResponsesBody).
+    /// `instructions` carries the system prompt. The single-prompt `complete`
+    /// is one user message through this same builder.
     ///
     /// MID-CONVERSATION SYSTEM (`LLMMessage.Role.system`): a Responses `input`
     /// message item takes role `user`, `assistant`, `system` or `developer`.
@@ -583,8 +495,14 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             "text": ["verbosity": "medium"],
             "tool_choice": "auto",
             "parallel_tool_calls": true,
-            "instructions": (system?.isEmpty == false ? system! : "You are a helpful assistant."),
         ]
+        // The OAuth endpoint returns 400 "Instructions are required" without
+        // this field, and a blank one counts as missing: every caller says
+        // what it is, and none is given a stand-in. `max_output_tokens` is
+        // left out because the chatgpt.com backend rejects it.
+        if let system, !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["instructions"] = system
+        }
         OpenAIExecutionControls.applyResponsesControls(
             to: &body,
             model: model,
@@ -623,137 +541,10 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        // Two-attempt loop mirroring Python's `for attempt in (0, 1)` at L967.
-        // Attempt 0 uses whatever token is fresh (refreshing first if expired).
-        // On HTTP 401 with attempt==0 we DO NOT refresh inline here — we just
-        // invalidate-and-loop. The next iteration's
-        // `ensureFreshAccessToken(forceRefresh: true)` does the single refresh.
-        // Earlier draft did BOTH (inline refresh + forceRefresh in the loop),
-        // which burned the single-use refresh_token by rotating twice.
-        // (gpt-5.5 review BLOCKING: "double-refreshes after a first 401".)
-        //
-        // Coerce non-`gpt-` model ids to the GPT-default. The chatgpt.com
-        // backend routes by model id and rejects unknown ids — `openai/...`
-        // namespace prefixes need stripping (gpt-5.5 review NON-BLOCKING).
-        let coercedModel = try coerceToGPTModel(model)
-        let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
-        var forceTokenRefresh = false
-        // User, 2026-09-06: the token the last attempt actually sent, handed to
-        // the forced refresh so a rotation another caller already performed is
-        // taken instead of burning a second single-use refresh_token.
-        let requestAccount = OAuthRequestAccount()
-        var lastSentAccessToken: String?
-        for attempt in 0...1 {
-            try Task.checkCancellation()
-            let access: String
-            do {
-                access = try await ensureFreshAccessToken(
-                    forceRefresh: forceTokenRefresh,
-                    staleToken: lastSentAccessToken, requestAccount: requestAccount
-                )
-                forceTokenRefresh = false
-                lastSentAccessToken = access
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch let err as LLMError {
-                // notConfigured surfaces clean (no tokens, refresh failed
-                // with no-creds path, etc).
-                throw err
-            } catch let err as any ProviderFailureWrapping {
-                throw err
-            } catch {
-                throw LLMError.notConfigured(provider: "openai_oauth_direct")
-            }
-            var req = try responsesRequest(accessToken: access)
-
-            let bodyDict = buildResponsesBody(
-                model: coercedModel, prompt: prompt, system: system, tools: tools
-            )
-            do {
-                req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
-            } catch {
-                throw LLMError.underlying(message: "encode body: \(error)")
-            }
-
-            let requestStartNs = DispatchTime.now().uptimeNanoseconds
-            let data: Data
-            let response: URLResponse
-            do {
-                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                (data, response) = try await session.data(for: req)
-            } catch {
-                // Cancellation MUST propagate as CancellationError (R-M2). Without
-                // this, a cancelled Workshop execution task can be misclassified as an
-                // auth problem instead of a real cancellation. A network failure with
-                // VALID tokens isn't a credentials issue; surface as .transient so
-                // callers can retry.
-                throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "complete"))
-            }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-
-            if status == 401 {
-                if attempt == 0 {
-                    // Do NOT refresh inline here. Just loop — the next
-                    // iteration's `ensureFreshAccessToken(forceRefresh: true)`
-                    // does the single refresh, exactly once per call.
-                    forceTokenRefresh = true
-                    continue
-                }
-                // Exhausted — Python raises a structured RuntimeError carrying
-                // the "oauth_direct_exhausted" string. We surface as
-                // .underlying with the same marker. Surface NOT as
-                // notConfigured, which would mask the real "tokens revoked,
-                // re-sign-in required" signal.
-                throw exhaustedCredentialError()
-            }
-            try throwIfChatCompletionsError(status: status, data: data, response: response)
-            // Parse the SSE bytes. Surface mid-stream `response.failed` /
-            // `error` events as .providerError so a 200 with an error body
-            // doesn't return empty text as success (gpt-5.5 review BLOCKING).
-            let parsed = Self.parseResponsesSSEDetailed(from: data)
-            // User, 2026-09-06: a buffered SSE body that ends without a
-            // terminal event is a truncated response, not a complete one.
-            // Returning its text flushed half-arrived function calls with
-            // `{}` arguments and the tool loop dispatched them. Throw the
-            // same error the streaming sibling throws so the reconnect
-            // ladder retries the identical call.
-            if !parsed.sawTerminal {
-                throw LLMError.streamTruncated(
-                    message: "openai oauth response ended without terminal event"
-                )
-            }
-            switch parsed.result {
-            case .text(let s):
-                // U1 step 1: usage telemetry.
-                let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                await telemetry.record(
-                    requestBody: req.httpBody,
-                    provider: providerId,
-                    model: coercedModel,
-                    streaming: false,
-                    usage: parsed.usage,
-                    ttftMs: nil,
-                    durationMs: durationMs,
-                    status: parsed.incompleteReason == nil ? "ok" : "incomplete",
-                    substitutedFrom: substitutedFrom,
-                    stopReason: parsed.incompleteReason
-                )
-                if let reason = parsed.incompleteReason {
-                    if reason == "max_output_tokens" {
-                        throw LLMError.outputLengthLimit(partial: s)
-                    }
-                    throw LLMError.providerError(message: Self.incompleteNote(reason))
-                }
-                guard !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw LLMError.streamTruncated(message: "openai oauth response produced no content (terminal event, empty)")
-                }
-                return s
-            case .providerError(let message):
-                throw Self.classifiedBackendError(message)
-            }
-        }
-        // Unreachable — the loop body always either returns or throws.
-        throw LLMError.notConfigured(provider: "openai_oauth_direct")
+        try await completeMessages(
+            messages: [LLMMessage(role: .user, content: [.text(prompt)])],
+            system: system, model: model, tools: tools
+        )
     }
 
     private func transientNetworkError(_ error: Error, endpoint: URL, operation: String) -> LLMError {
@@ -779,16 +570,6 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             }
         }
         return .transient(message: "openai_oauth_direct \(operation) network error for \(host): \(error)")
-    }
-
-    private static func boundedBodyString(_ data: Data, maxBytes: Int = 4_096) -> String {
-        guard !data.isEmpty else { return "empty error body" }
-        let prefix = data.prefix(maxBytes)
-        let text = String(decoding: prefix, as: UTF8.self)
-        if data.count > maxBytes {
-            return text + "\n...(truncated \(data.count - maxBytes) bytes)"
-        }
-        return text
     }
 
     private static func boundedBodyString(
@@ -928,87 +709,6 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             return nil
         }
         return r == coerced ? nil : r
-    }
-
-
-    // MARK: - Body shape (responses-API)
-
-    /// Build the responses-API request body. Mirrors `_build_responses_body`
-    /// at L873-L909, narrowed to the prompt+system signature the
-    /// LLMAdapter contract exposes. The responses endpoint REJECTS `messages`
-    /// — it takes `instructions` (system role) + `input` (message items).
-    private func buildResponsesBody(
-        model: String,
-        prompt: String,
-        system: String?,
-        tools: [LLMToolSchema]? = nil
-    ) -> [String: Any] {
-        let inputItems: [[String: Any]] = [
-            [
-                "type": "message",
-                "role": "user",
-                "content": [["type": "input_text", "text": prompt]],
-            ]
-        ]
-        var body: [String: Any] = [
-            "model": model,
-            "store": false,
-            "stream": true,
-            "input": inputItems,
-            "text": ["verbosity": "medium"],
-            "tool_choice": "auto",
-            "parallel_tool_calls": true,
-            // The endpoint returns 400 "Instructions are required" when this
-            // field is missing — Python uses the same default literal.
-            "instructions": (system?.isEmpty == false ? system! : "You are a helpful assistant."),
-        ]
-        OpenAIExecutionControls.applyResponsesControls(
-            to: &body,
-            model: model,
-            transport: .chatGPTOAuth,
-            supportedEfforts: CodexAccountModelCatalog.load(
-                providerID: "openai_oauth_direct",
-                cacheURL: CodexAccountModelCatalog.matchingCacheCandidate(
-                    oauthAuthURL: resolveAuthPath(),
-                    fallbackCacheURL: CodexAccountModelCatalog.cacheCandidate()
-                ),
-                useDefaultCacheWhenNil: false
-            ).first { $0.id == model }?.supportedReasoningEfforts
-        )
-        // U1 step 4: stable per-session prompt-cache routing. Absent when no
-        // session id is bound (byte-identical body to pre-U1).
-        if let cacheKey = Self.currentPromptCacheKey() {
-            body["prompt_cache_key"] = cacheKey
-        }
-        // Tools field: Responses-API shape is FLAT
-        // ({"type":"function","name":...,"description":...,"parameters":...}),
-        // NOT the Chat Completions wrap. Only add the key when non-empty so a
-        // nil/empty tools arg produces byte-identical body to the no-tools
-        // call.
-        if let tools, !tools.isEmpty {
-            var toolList: [[String: Any]] = []
-            for t in tools {
-                var entry: [String: Any] = [
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                ]
-                if let params = try? JSONSerialization.jsonObject(with: t.parametersJSON) {
-                    entry["parameters"] = params
-                } else {
-                    // Defensive: malformed schema bytes degrade to an empty
-                    // object schema rather than throwing and silently killing
-                    // the chat turn.
-                    entry["parameters"] = ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
-                }
-                toolList.append(entry)
-            }
-            body["tools"] = toolList
-        }
-        // Note: `max_output_tokens` is INTENTIONALLY omitted — the comment in
-        // the Python source (L897-L900) calls out that the chatgpt.com
-        // backend rejects it even though the public Responses API accepts it.
-        return body
     }
 
     // MARK: - Credential path

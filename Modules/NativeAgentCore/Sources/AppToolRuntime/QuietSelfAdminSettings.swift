@@ -16,7 +16,7 @@ public typealias QuietSettingsHostProvider = @MainActor @Sendable () -> (any Qui
 public enum QuietSettingError: Error, LocalizedError {
     case badValue(String)
     case unavailable(String)
-    /// The value would raise Trust: User's call, refused as `users_call`.
+    /// The value would raise Trust: User's call, refused as `owners_call`.
     case users(String)
 
     public var errorDescription: String? {
@@ -458,22 +458,9 @@ public enum QuietSettings {
         field: String, enabled: Bool,
         expecting expected: KeyPath<TrustMemoryPolicy, Bool>
     ) async throws {
-        var patch = [field: enabled]
-        if field == "consolidation_enabled", !enabled {
-            patch["auto_promote_consolidated"] = false
-        }
         let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
-            body: ["memoryPolicy": patch],
-            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-            guardedByLockedPolicy: { locked in
-                if field == "auto_promote_consolidated", enabled,
-                   case .object(let memory)? = locked["memoryPolicy"],
-                   memory["consolidation_enabled"] == .bool(false) {
-                    throw QuietSettingError.unavailable(
-                        "Keeping consolidated memories needs consolidation, which is off. Turn on "
-                        + "memories.consolidation first.")
-                }
-            })
+            body: ["memoryPolicy": [field: enabled]],
+            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         appModel.applySavedTrustPolicy(saved, status: "Memory policy saved")
         guard saved.memoryPolicy?[keyPath: expected] == enabled else {
             throw QuietSettingError.unavailable(
@@ -1453,10 +1440,7 @@ public enum QuietSettings {
         }
 
         // ── Notifications ───────────────────────────────────────────────────
-        rows.append(defaultsBool(
-            id: "notifications.bots_on_rail", page: "bots",
-            label: "Show Bots on the rail", key: BotsShelfPreference.key, defaultOn: true
-        ))
+        // Helpers on the rail is the layout's (layout.write, rail's bots block).
         rows.append(defaultsBool(
             id: "notifications.channel_push", page: "notifications",
             label: "Deliver to the phone", key: NotificationChannelPreference.pushKey,
@@ -1616,30 +1600,13 @@ public enum QuietSettings {
             id: "memories.consolidation", page: "settings", label: "Memory consolidation",
             kind: .boolean,
             note: "Once a week, what keeps coming up is gathered into fewer, stronger memories offered "
-                + "for review. Off also stops keeping consolidated memories without asking, as on the page.",
+                + "for review.",
             read: { appModel in .bool((appModel.trustPolicy?.memoryPolicy ?? TrustMemoryPolicy()).consolidation_enabled) },
             write: { appModel, value in
                 let enabled = try boolValue(value, "Memory consolidation")
                 try await saveMemoryPolicy(
                     appModel, "Memory consolidation", field: "consolidation_enabled", enabled: enabled,
                     expecting: \.consolidation_enabled)
-            }
-        ))
-        rows.append(QuietSetting(
-            id: "memories.auto_keep_consolidated", page: "settings",
-            label: "Keep consolidated memories without asking", kind: .boolean,
-            note: "What the consolidation pass gathers goes in without asking first. A merge only "
-                + "archives the memories it replaces, never deletes them, and the whole pass waits "
-                + "for the person's approval card. Needs memories.consolidation on.",
-            read: { appModel in
-                .bool((appModel.trustPolicy?.memoryPolicy ?? TrustMemoryPolicy()).auto_promote_consolidated)
-            },
-            write: { appModel, value in
-                let enabled = try boolValue(value, "Keep consolidated memories without asking")
-                try await saveMemoryPolicy(
-                    appModel, "Keep consolidated memories without asking",
-                    field: "auto_promote_consolidated", enabled: enabled,
-                    expecting: \.auto_promote_consolidated)
             }
         ))
         rows.append(QuietSetting(
@@ -1944,27 +1911,6 @@ public enum QuietSettings {
                 }
             }
         ))
-        rows.append(QuietSetting(
-            id: "notifications.watched_folders", page: "notifications",
-            label: "Folders watched", kind: .list,
-            note: "The folders the file_watch trigger watches, one path each. Send the whole list.",
-            read: { appModel in
-                guard let triggers = try? await appModel.inboxTriggers() else { return .null }
-                let paths = triggers.first { $0.name == "file_watch" }?.paths ?? []
-                return .array(paths.map { .string($0) })
-            },
-            write: { appModel, value in
-                let paths = try listValue(value, "Folders watched")
-                do {
-                    try await appModel.saveWatchedFolders(paths)
-                } catch {
-                    throw QuietSettingError.unavailable(
-                        "The watched folders were not saved: \(error.localizedDescription). Check each "
-                        + "path is a folder that exists.")
-                }
-            }
-        ))
-
         // ── Bots ────────────────────────────────────────────────────────────
         rows.append(QuietSetting(
             id: "bots.minimum_interval_minutes", page: "bots",

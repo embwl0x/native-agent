@@ -2,9 +2,8 @@
 //
 // Ports the retired daemon (deleted in earlier waves). Walks
 // pending proposals in the MemoryV2 SQLite store, dedups against active
-// memories by embedding cosine similarity, auto-accepts high-durability
-// proposals, archives stale/low-quality active memories, and leaves marginal
-// proposals pending for inbox review.
+// memories by embedding cosine similarity, archives stale/low-quality active
+// memories, and leaves every other proposal pending for her review.
 //
 // Runs weekly (Sun 3am local) under NSBackgroundActivityScheduler from
 // NativeAgentApp; can also be invoked inline from the debug menu.
@@ -15,7 +14,7 @@
 // runs against a CANDIDATE copy of the store; the live store changes only
 // when the staged `memory.consolidation.swap` approval card is approved
 // and the gate's swap executor applies it. Every legacy caller
-// (NativeClient.runMemoryHygiene, MemoryConsolidationHygiene.runOnce, the
+// (AppModel.memoryHygieneReport, MemoryConsolidationHygiene.runOnce, the
 // debug menu) inherits the probe-set gate through this seam with no
 // signature change — the ConsolidationReport they receive now describes
 // the PLANNED ops carried on the staged card, not applied mutations.
@@ -30,7 +29,6 @@ import PersistenceCore
 
 public struct ConsolidationReport: Sendable, Equatable {
     public let processed: Int
-    public let autoAccepted: Int
     public let duplicatesMerged: Int
     public let pendingForReview: Int
     public let staleArchived: Int
@@ -46,7 +44,6 @@ public struct ConsolidationReport: Sendable, Equatable {
 
     public init(
         processed: Int,
-        autoAccepted: Int,
         duplicatesMerged: Int,
         pendingForReview: Int,
         staleArchived: Int,
@@ -56,7 +53,6 @@ public struct ConsolidationReport: Sendable, Equatable {
         fragmentProtectedByUsage: Int = 0
     ) {
         self.processed = processed
-        self.autoAccepted = autoAccepted
         self.duplicatesMerged = duplicatesMerged
         self.pendingForReview = pendingForReview
         self.staleArchived = staleArchived
@@ -73,11 +69,6 @@ public struct ConsolidationReport: Sendable, Equatable {
 /// existing active memory. Match the original Python (0.92) so behavior is
 /// preserved across the port.
 public let memoryConsolidationDuplicateThreshold: Double = 0.92
-
-/// Above this durability score (read from proposal.metadata.durability_score
-/// when present, otherwise inferred from proposal.metadata or omitted), the
-/// proposal auto-promotes to an active memory.
-public let memoryConsolidationAutoAcceptThreshold: Double = 0.85
 
 /// Active memories older than this with zero recall hits get archived.
 public let memoryConsolidationStaleAgeSeconds: TimeInterval = 365 * 24 * 60 * 60
@@ -174,7 +165,7 @@ public actor MemoryConsolidator {
         switch try await consolidateGated() {
         case .alreadyStaged(let approvalId):
             return ConsolidationReport(
-                processed: 0, autoAccepted: 0, duplicatesMerged: 0,
+                processed: 0, duplicatesMerged: 0,
                 pendingForReview: 0, staleArchived: 0,
                 errors: ["consolidation already staged for approval (card \(approvalId)) — no new run"]
             )
@@ -183,7 +174,6 @@ public actor MemoryConsolidator {
         case .refusedRegression(let scores, let plan):
             return ConsolidationReport(
                 processed: plan.processed,
-                autoAccepted: plan.autoAccepted,
                 duplicatesMerged: plan.duplicatesMerged,
                 pendingForReview: plan.pendingForReview,
                 staleArchived: plan.staleArchived,
@@ -212,12 +202,10 @@ public actor MemoryConsolidator {
     /// candidate copy — never the live store.
     func consolidateDestructively() async throws -> ConsolidationReport {
         var processed = 0
-        var autoAccepted = 0
         var duplicatesMerged = 0
         var pendingForReview = 0
         var errors: [String] = []
 
-        // Settings ▸ "Keep consolidated memories without asking" and
         // Settings ▸ "Memory hygiene". Read ONCE, fresh, at the start of the
         // run so every step of this pass agrees on one policy generation; the
         // next run re-reads, so a flip lands on the next run.
@@ -227,19 +215,17 @@ public actor MemoryConsolidator {
         // KNOWS the root — the consolidation gate, which runs this against a
         // candidate copy under memory/consolidation/candidates/<runId>/ — that
         // root wins. Deriving it from the candidate path looked for a
-        // trust/policy.json that is never copied there, so both switches
+        // trust/policy.json that is never copied there, so the switch
         // silently fell back to true no matter what Settings said.
         let derivedPolicyRoot = storage.path
             .deletingLastPathComponent().deletingLastPathComponent()
         let policyRoot = self.policyRoot ?? derivedPolicyRoot
-        let autoPromote = MemoryPolicyGate.autoPromoteConsolidatedEnabled(dataRoot: policyRoot)
         let hygiene = MemoryPolicyGate.hygieneEnabled(dataRoot: policyRoot)
 
         let pending = try await storage.listProposals(status: "pending")
         // Cache active memories with embeddings once per run so we don't
-        // re-fetch on every proposal. Updated as we accept new proposals so
-        // back-to-back near-duplicates also dedup against each other.
-        var actives = try await storage.listMemories(persona: nil, status: "active", limit: nil)
+        // re-fetch on every proposal.
+        let actives = try await storage.listMemories(persona: nil, status: "active", limit: nil)
 
         for proposal in pending {
             processed += 1
@@ -283,19 +269,8 @@ public actor MemoryConsolidator {
                     continue
                 }
 
-                // 4) durability_score >= 0.85 → auto-accept.
-                // Settings ▸ "Keep consolidated memories without asking": off
-                // suppresses this branch, so a durable proposal falls through
-                // to (5) and waits for review instead of going straight in.
-                let durability = durabilityScore(proposal)
-                if autoPromote, let d = durability, d >= memoryConsolidationAutoAcceptThreshold {
-                    let accepted = try await storage.acceptProposal(id: proposal.id)
-                    actives.append(accepted)
-                    autoAccepted += 1
-                    continue
-                }
-
-                // 5) Below threshold (or no score): leave pending for inbox.
+                // 4) Everything else waits for her review (`memory_moment_review`)
+                //    or the Memories page; nothing here accepts a proposal.
                 pendingForReview += 1
             } catch {
                 errors.append("proposal \(proposal.id): \(error.localizedDescription)")
@@ -368,7 +343,6 @@ public actor MemoryConsolidator {
 
         let report = ConsolidationReport(
             processed: processed,
-            autoAccepted: autoAccepted,
             duplicatesMerged: duplicatesMerged,
             pendingForReview: pendingForReview,
             staleArchived: staleArchived,
@@ -378,7 +352,7 @@ public actor MemoryConsolidator {
             fragmentProtectedByUsage: fragmentProtectedByUsage
         )
         logger.info(
-            "MemoryConsolidator: processed=\(processed, privacy: .public) autoAccepted=\(autoAccepted, privacy: .public) duplicatesMerged=\(duplicatesMerged, privacy: .public) pendingForReview=\(pendingForReview, privacy: .public) staleArchived=\(staleArchived, privacy: .public) supersessions=\(supersessionsApplied, privacy: .public) supersessionsAmbiguous=\(supersessionsAmbiguous, privacy: .public) fragmentProtectedByUsage=\(fragmentProtectedByUsage, privacy: .public) errors=\(errors.count, privacy: .public)"
+            "MemoryConsolidator: processed=\(processed, privacy: .public) duplicatesMerged=\(duplicatesMerged, privacy: .public) pendingForReview=\(pendingForReview, privacy: .public) staleArchived=\(staleArchived, privacy: .public) supersessions=\(supersessionsApplied, privacy: .public) supersessionsAmbiguous=\(supersessionsAmbiguous, privacy: .public) fragmentProtectedByUsage=\(fragmentProtectedByUsage, privacy: .public) errors=\(errors.count, privacy: .public)"
         )
         return report
     }
@@ -427,15 +401,6 @@ public actor MemoryConsolidator {
             intoMemoryID: intoMemoryId,
             resolvedAt: Self.iso8601(now())
         )
-    }
-
-    // MARK: - durability score
-
-    private func durabilityScore(_ proposal: StoredProposal) -> Double? {
-        guard case .object(let obj)? = proposal.metadata else { return nil }
-        if case .double(let d)? = obj["durability_score"] { return d }
-        if case .int(let i)? = obj["durability_score"] { return Double(i) }
-        return nil
     }
 
     // MARK: - supersession (wave1 S-lane)

@@ -7,6 +7,7 @@ import PersistenceCore
 import MemoryV2
 import TrustCenter
 import TelegramBot
+import Skills
 
 struct AppConfig: Equatable {
     var searxngBaseURL: String?
@@ -26,7 +27,7 @@ struct TelegramTestResponse: Codable, Hashable {
     var receipt: TelegramReceipt?
     /// A successful outgoing reply proves the saved credential can send, but
     /// it does not prove the inbound long-poll lane is alive.  These fields
-    /// are attached by NativeClient after the transport reply, from the live
+    /// are attached by AppModel.sendTelegramTestReply after the transport reply, from the live
     /// BackgroundLoops owner.
     var tokenConfigured: Bool?
     var pollerRegistered: Bool?
@@ -118,13 +119,6 @@ private struct TelegramReplyFields {
     }
 }
 
-struct DetectSearXNGResponse: Codable, Hashable {
-    var found: Bool
-    var baseURL: String?
-    var source: String?
-    var error: String?
-}
-
 // PATCH-2026-05-06: skill-ui Models — skill manifest + registry types for lifecycle UI
 struct SkillManifest: Codable, Identifiable {
     var id: String { name }
@@ -157,16 +151,6 @@ struct SkillTool: Codable, Identifiable {
     var id: String { name }
     let name: String
     let description: String
-}
-
-struct SkillRegistryEntry: Codable, Identifiable {
-    var id: String { name }
-    let name: String
-    let state: String     // "drafted" | "installed" | "active" | "dormant" | "quarantined"
-    let version: String
-    let type: String
-    let installedAt: String?
-    let path: String
 }
 
 struct SkillInfo: Identifiable {
@@ -245,123 +229,6 @@ struct MemoryProposalRecord: Codable, Identifiable, Hashable {
         staged_at = proposal.createdAt
         resolved_at = nil
         rejection_reason = proposal.rejectionReason
-    }
-}
-
-// Extend TrustTrainingPolicy with route_through_promotion
-extension TrustTrainingPolicy {
-    // route_through_promotion added via CodingKeys-free approach below
-}
-
-// Perf wave 2 (render-cost audit F11 follow-up): `Equatable` so `refreshAll`
-// can route these through `setIfChanged`. All stored properties are
-// String/Int/Bool/optionals or already-`Hashable` nested types, so the
-// conformance is synthesized — no behavior of its own.
-struct TrainingRunSummary: Codable, Identifiable, Equatable {
-    var id: String { run_id }
-    var run_id: String
-    var started_at: String?
-    var completed_at: String?
-    var surface: String?
-    var score: Int?
-    var max_score: Int?
-    var drift_summary: String?
-    var proposals_staged: Int?
-    var verdict: String?  // "PASS" / "REGRESSION" / "RUNNING"
-}
-
-struct TrainingProposalSummary: Codable, Identifiable, Equatable {
-    var id: String { proposal_id }
-    var proposal_id: String
-    var staged_at: String?
-    var source_run_id: String?
-    var target_doc: String    // "SOUL.md" | "VOICE.md"
-    var change_type: String   // "append" | "edit"
-    var current: String
-    var proposed: String
-    var rationale: String
-    var expected_drift_addressed: String?
-    var status: String        // "pending" | "approved" | "rejected"
-    var reviewed_at: String?
-    /// The persisted training proposal schema uses `rejection_reason`.
-    /// Keep the app-facing spelling while decoding the canonical record key,
-    /// otherwise a successfully rejected proposal reloads without the reason
-    /// that justified the decision.
-    var reject_reason: String?
-
-    enum CodingKeys: String, CodingKey {
-        case proposal_id, staged_at, source_run_id, target_doc, change_type
-        case current, proposed, rationale, expected_drift_addressed, status, reviewed_at
-        case reject_reason = "rejection_reason"
-    }
-}
-
-struct PromotionHarnessResult: Codable, Hashable {
-    var eval_score: Double?
-    var eval_baseline: Double?
-    var eval_delta: Double?
-    var test_passed: Bool?
-    var smoke_passed: Bool?
-    var error: String?
-}
-
-struct PromotionPatch: Codable, Hashable {
-    var file: String
-    var before_sha: String?
-    var after_sha: String?
-}
-
-struct PromotionCandidateSummary: Codable, Identifiable, Equatable {
-    var id: String { candidate_id }
-    var candidate_id: String
-    var submitted_at: String?
-    var created_at: String?
-    var source: String          // "manual" | "training_b1" | "skill_builder"
-    var tier: String?           // "A" | "B" | "C"
-    var decision: String?       // "AUTO_PROMOTE" | "STAGE_FOR_HUMAN" | "REVERT" | "BLOCK" | nil
-    var status: String          // "running" | "complete" | "done" | "error"
-    var harness: PromotionHarnessResult?
-    var reason: String?
-    var patches: [PromotionPatch]?
-    var merged_commit_sha: String?
-
-    enum CodingKeys: String, CodingKey {
-        case candidate_id, candidateId, submitted_at, submittedAt, created_at, createdAt
-        case source, tier, decision, status, harness, reason, patches, merged_commit_sha
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        candidate_id = try c.decodeIfPresent(String.self, forKey: .candidate_id)
-            ?? c.decodeIfPresent(String.self, forKey: .candidateId)
-            ?? ""
-        submitted_at = try c.decodeIfPresent(String.self, forKey: .submitted_at)
-            ?? c.decodeIfPresent(String.self, forKey: .submittedAt)
-        created_at = try c.decodeIfPresent(String.self, forKey: .created_at)
-            ?? c.decodeIfPresent(String.self, forKey: .createdAt)
-        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "promotion_stage"
-        tier = try c.decodeIfPresent(String.self, forKey: .tier)
-        decision = try c.decodeIfPresent(String.self, forKey: .decision)
-        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
-        harness = try c.decodeIfPresent(PromotionHarnessResult.self, forKey: .harness)
-        reason = try c.decodeIfPresent(String.self, forKey: .reason)
-        patches = try c.decodeIfPresent([PromotionPatch].self, forKey: .patches)
-        merged_commit_sha = try c.decodeIfPresent(String.self, forKey: .merged_commit_sha)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(candidate_id, forKey: .candidate_id)
-        try c.encodeIfPresent(submitted_at, forKey: .submitted_at)
-        try c.encodeIfPresent(created_at, forKey: .created_at)
-        try c.encode(source, forKey: .source)
-        try c.encodeIfPresent(tier, forKey: .tier)
-        try c.encodeIfPresent(decision, forKey: .decision)
-        try c.encode(status, forKey: .status)
-        try c.encodeIfPresent(harness, forKey: .harness)
-        try c.encodeIfPresent(reason, forKey: .reason)
-        try c.encodeIfPresent(patches, forKey: .patches)
-        try c.encodeIfPresent(merged_commit_sha, forKey: .merged_commit_sha)
     }
 }
 

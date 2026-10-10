@@ -64,11 +64,12 @@ extension AppModel {
     @MainActor
     func search(_ query: String) async -> Result<[ResearchSearchResult], ResearchSearchFailure> {
         let configuredBaseURL = searxngBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        return await search(query) { [client] trimmed in
+        let research = SwiftNativeResearchClient(dataRoot: engine.dataRoot)
+        return await search(query) { trimmed in
             if !configuredBaseURL.isEmpty {
-                try await client.configureSearXNG(baseURL: configuredBaseURL)
+                try await research.saveSearXNGBaseURL(configuredBaseURL)
             }
-            return try await client.search(query: trimmed)
+            return try await research.search(query: trimmed).results
         }
     }
 
@@ -89,12 +90,11 @@ extension AppModel {
 
     @MainActor
     func routeIntent(_ message: String) async {
-        let client = client
         let didRoute = await routeIntent(message, using: { message in
-            try await client.planRoute(message: message)
+            try IntentRoutePlan(await makeRouterPlanClient().planRoute(message: message))
         })
         guard didRoute else { return }
-        let traceTimeline = client.getCapabilityTraceTimeline()
+        let traceTimeline = CapabilityTraceFeed.read(dataRoot: engine.dataRoot)
         capabilityTraceTimeline = traceTimeline
         traces = traceTimeline.traces
     }
@@ -132,7 +132,7 @@ extension AppModel {
         }
     }
 
-    /// W3: returns true if an NSError thrown by the NativeClient layer is a
+    /// W3: returns true if an NSError thrown by an app action is a
     /// `notImplemented` envelope (panelDisabled feature, unavailable Swift impl).
     static func isNotImplemented(_ err: NSError) -> Bool {
         return (err.userInfo["code"] as? String) == "not_implemented"
@@ -194,7 +194,7 @@ extension AppModel {
     }
 
     @MainActor
-    func loadMCPDetails(_ server: MCPServerRecord) async {
+    func loadMCPDetails(_ server: MCPServer) async {
         // gpt-5.5 review: race-safe load. User can tap server A then tap
         // server B before A's fetch returns; without this check, A's late
         // result would overwrite B's. Tag the request with the target id
@@ -208,8 +208,8 @@ extension AppModel {
         mcpResourceReadState = .loading
         let pendingId = server.id
         do {
-            let toolsResult = try await client.getMCPTools(serverId: pendingId).tools
-            let resourcesResult = try await client.getMCPResources(serverId: pendingId).resources
+            let toolsResult = try await MCPUIActions.listTools(serverId: pendingId, dispatcher: engine.tools.mcp)
+            let resourcesResult = try await MCPUIActions.listResources(serverId: pendingId, dispatcher: engine.tools.mcp)
             // Late-arrival guard: discard if user has moved on.
             guard selectedMCPServerId == pendingId else { return }
             mcpTools = toolsResult
@@ -227,7 +227,7 @@ extension AppModel {
     }
 
     @MainActor
-    func warmMCPServer(_ server: MCPServerRecord) async {
+    func warmMCPServer(_ server: MCPServer) async {
         // gpt-5.5 review-2 race-safety: same late-arrival guard as
         // loadMCPDetails. Warm A then tap B before A's awaits return would
         // otherwise overwrite B's inventories with A's. Capture pendingId
@@ -236,14 +236,14 @@ extension AppModel {
         let pendingId = server.id
         do {
             selectedMCPServerId = pendingId
-            _ = try await client.warmMCPServer(serverId: pendingId)
+            _ = try await MCPUIActions.warmMCPServer(serverId: pendingId, dispatcher: engine.tools.mcp)
             let fetchedSessions = (try? await engine.tools.listMCPSessions())
             if selectedMCPServerId == pendingId {
                 mcpToolReadState = .loading
             }
-            let fetchedTools: [MCPToolRecord]?
+            let fetchedTools: [MCPTool]?
             do {
-                fetchedTools = try await client.getMCPTools(serverId: pendingId).tools
+                fetchedTools = try await MCPUIActions.listTools(serverId: pendingId, dispatcher: engine.tools.mcp)
             } catch {
                 fetchedTools = nil
                 if selectedMCPServerId == pendingId {
@@ -253,9 +253,9 @@ extension AppModel {
             if selectedMCPServerId == pendingId {
                 mcpResourceReadState = .loading
             }
-            let fetchedResources: [MCPResourceRecord]?
+            let fetchedResources: [MCPResource]?
             do {
-                fetchedResources = try await client.getMCPResources(serverId: pendingId).resources
+                fetchedResources = try await MCPUIActions.listResources(serverId: pendingId, dispatcher: engine.tools.mcp)
             } catch {
                 fetchedResources = nil
                 if selectedMCPServerId == pendingId {
@@ -293,11 +293,11 @@ extension AppModel {
     }
 
     @MainActor
-    func restartMCPServer(_ server: MCPServerRecord) async {
+    func restartMCPServer(_ server: MCPServer) async {
         let pendingId = server.id
         do {
             selectedMCPServerId = pendingId
-            _ = try await client.restartMCPServer(serverId: pendingId)
+            _ = try await MCPUIActions.restartMCPServer(serverId: pendingId, dispatcher: engine.tools.mcp)
             engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
             // Restart replaces the live child. Refresh the selected inventory
             // through the same owner before declaring completion; otherwise
@@ -317,7 +317,7 @@ extension AppModel {
     }
 
     @MainActor
-    func refreshMCPCache(_ server: MCPServerRecord) async {
+    func refreshMCPCache(_ server: MCPServer) async {
         let pendingId = server.id
         selectedMCPServerId = pendingId
         mcpTools = []
@@ -325,7 +325,7 @@ extension AppModel {
         mcpResources = []
         mcpResourceReadState = .loading
         do {
-            _ = try await client.refreshMCPCache(serverId: pendingId)
+            _ = try await MCPUIActions.refreshMCPCache(serverId: pendingId, dispatcher: engine.tools.mcp)
             engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
             guard selectedMCPServerId == pendingId else { return }
             await loadMCPDetails(server)
@@ -351,23 +351,24 @@ extension AppModel {
     }
 
     @MainActor
-    func mcpConsentRisk(server: MCPServerRecord, toolName: String) -> String {
+    func mcpConsentRisk(server: MCPServer, toolName: String) -> String {
         MCPToolBridge.effectiveRiskClass(
             serverId: server.id,
             toolName: toolName,
-            serverRiskClass: server.riskClass ?? "network_read",
-            dataRoot: client.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            serverRiskClass: server.riskClass,
+            dataRoot: engine.dataRoot
         )
     }
 
     @MainActor
-    func grantMCPConsent(server: MCPServerRecord, toolName: String, risk: String? = nil) async {
+    func grantMCPConsent(server: MCPServer, toolName: String, risk: String? = nil) async {
         do {
-            let granted = try await client.grantMCPConsent(
+            let granted = try await MCPUIActions.grantConsent(
                 serverId: server.id, toolName: toolName,
-                risk: risk ?? mcpConsentRisk(server: server, toolName: toolName)
+                risk: risk ?? mcpConsentRisk(server: server, toolName: toolName),
+                dispatcher: engine.tools.mcp, dataRoot: engine.dataRoot
             )
-            mcpConsent = (try? await client.getMCPConsent()) ?? mcpConsent
+            mcpConsent = (try? await engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)) ?? mcpConsent
             statusText = "MCP consent granted (\(granted.risk ?? "unknown"))"
         } catch {
             setFailureStatus(error, action: "grant that MCP consent")
@@ -377,8 +378,10 @@ extension AppModel {
     @MainActor
     func revokeMCPConsent(_ consent: MCPConsentRecord) async {
         do {
-            _ = try await client.revokeMCPConsent(id: consent.id, serverId: consent.serverId, toolName: consent.toolName)
-            mcpConsent = (try? await client.getMCPConsent()) ?? mcpConsent
+            _ = try await MCPUIActions.revokeConsent(
+                id: consent.id, serverId: consent.serverId, toolName: consent.toolName, dispatcher: engine.tools.mcp
+            )
+            mcpConsent = (try? await engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)) ?? mcpConsent
             statusText = "MCP consent revoked"
         } catch {
             setFailureStatus("Revoking MCP consent failed. " + UserFacingError.cause(error, action: "revoke MCP consent"), cause: error)
@@ -386,9 +389,12 @@ extension AppModel {
     }
 
     @MainActor
-    func callMCPTool(server: MCPServerRecord, tool: MCPToolRecord, query: String) async {
+    func callMCPTool(server: MCPServer, tool: MCPTool, query: String) async {
         do {
-            latestMCPCall = try await client.callMCPTool(serverId: server.id, toolName: tool.name, input: ["query": query])
+            latestMCPCall = try await MCPUIActions.callMCPTool(
+                serverId: server.id, toolName: tool.name, input: ["query": query],
+                dataRoot: engine.dataRoot, authority: .runtime(dataRoot: engine.dataRoot)
+            )
             if latestMCPCall?.evidenceStatus == "recorded" {
                 refreshMCPHubRecentCall()
             } else if let latestMCPCall {
@@ -403,7 +409,7 @@ extension AppModel {
     }
 
     @MainActor
-    func callMCPToolWithInput(server: MCPServerRecord, tool: MCPToolRecord, input: [String: JSONValue]) async {
+    func callMCPToolWithInput(server: MCPServer, tool: MCPTool, input: [String: JSONValue]) async {
         if let validation = MCPInputSchemaForm.validationMessage(
             schema: tool.inputSchema,
             values: input
@@ -414,11 +420,14 @@ extension AppModel {
         do {
             // Mirror the shape of the v1 callMCPTool(server:tool:query:) above:
             // convert and await on the main actor. The original v1 path passes
-            // a [String: Any] dict to client.callMCPTool synchronously without
+            // a [String: Any] dict to MCPUIActions.callMCPTool synchronously without
             // a detached Task; the gpt-5.5 review correctly flagged the
             // first-cut Task.detached wrapper as over-structured.
             let foundationInput = MCPInputSchemaForm.toFoundationDict(input)
-            latestMCPCall = try await client.callMCPTool(serverId: server.id, toolName: tool.name, input: foundationInput)
+            latestMCPCall = try await MCPUIActions.callMCPTool(
+                serverId: server.id, toolName: tool.name, input: foundationInput,
+                dataRoot: engine.dataRoot, authority: .runtime(dataRoot: engine.dataRoot)
+            )
             if latestMCPCall?.evidenceStatus == "recorded" {
                 refreshMCPHubRecentCall()
             } else if let latestMCPCall {

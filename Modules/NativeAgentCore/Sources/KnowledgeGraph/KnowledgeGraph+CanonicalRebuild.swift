@@ -54,8 +54,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 WHERE status = 'active'
                   AND TRIM(COALESCE(content, '')) <> ''
                   AND lower(COALESCE(NULLIF(TRIM(lifecycle), ''), 'confirmed'))
-                        NOT IN ('corrected', 'contradicted', 'deleted')
-                  AND id NOT LIKE 'skill-pointer:%'
+                        NOT IN ('corrected', 'contradicted', 'deleted', 'graduated')
                   AND (? IS NULL OR id <> ?)
                 ORDER BY id ASC
                 """, arguments: [excludingMemoryID, excludingMemoryID])
@@ -226,8 +225,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 WHERE m.status = 'active'
                   AND TRIM(COALESCE(m.content, '')) <> ''
                   AND lower(COALESCE(NULLIF(TRIM(m.lifecycle), ''), 'confirmed'))
-                        NOT IN ('corrected', 'contradicted', 'deleted')
-                  AND m.id NOT LIKE 'skill-pointer:%'
+                        NOT IN ('corrected', 'contradicted', 'deleted', 'graduated')
                 ORDER BY m.id
                 """)
             let indexCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM kg_memory_index") ?? 0

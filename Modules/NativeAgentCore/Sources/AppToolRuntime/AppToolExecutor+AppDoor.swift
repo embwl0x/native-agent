@@ -14,7 +14,7 @@ import Skills
 ///
 /// `{}` is her home (where she left off) and then the pages, `{page[, item]}`
 /// a read with a version and the page's actions, `{action, args}` one action,
-/// `{find}` actions by intent, `{item}` a name or ref from home. Every
+/// `{actions}` many, `{find}` actions by intent, `{item}` a name or ref from home. Every
 /// action and read runs in process (`runFolded`), so the `app` call is its
 /// one pass through the gates, classified by the action's registry flags,
 /// and a block User saved on a retired tool's name
@@ -52,7 +52,7 @@ extension AppToolExecutor {
     public static let doorDoctor = "Doctor (app {page:\"diagnostics\", item:\"doctor\"})"
 
     /// The keys app takes. One starting "__" is the chain's own (`__session_id`).
-    static let doorKeys: Set<String> = ["page", "item", "action", "args", "preview", "expected_version", "find", "script"]
+    static let doorKeys: Set<String> = ["page", "item", "action", "args", "actions", "preview", "expected_version", "find", "script"]
 
     static func doorText(_ value: JSONValue?) -> String {
         inputString(value)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -126,8 +126,8 @@ extension AppToolExecutor {
     /// Refusals that are User's or his posture's, from the door or the code
     /// it ran: nothing ran, and retrying changes nothing.
     static let doorFloorReasons: Set<String> = [
-        "users_call", "owner_only", "trust_mode_read_only", "trust_mode_unreadable", "users_screen", "user_is_in_it",
-        "trust_posture_needs_full_mac", "full_mac_only", "opens_for_user", "blocked_in_trust", "users_ears", "users_draft",
+        "owners_call", "owner_only", "trust_mode_read_only", "trust_mode_unreadable", "owners_screen", "owner_is_in_it",
+        "trust_posture_needs_full_mac", "full_mac_only", "opens_for_owner", "blocked_in_trust", "owners_ears", "owners_draft",
         // A card asked of User on another surface, or whose origin is unknown.
         "not_yours_to_answer", "origin_unverifiable",
         // Needs User himself, Full Mac or not (a browser sign-in).
@@ -181,7 +181,9 @@ extension AppToolExecutor {
     @MainActor
     func runAppDoor(input rawInput: [String: JSONValue], surface: String, inProcess: Bool = false) async throws -> JSONValue {
         var input = rawInput
-        let action = Self.doorText(input["action"])
+        // A model that copies the catalog's id(args) line writes the id with
+        // its parentheses; the id is the part before them.
+        let action = Self.doorText(input["action"]).replacingOccurrences(of: #"\s*\(.*\)\s*$"#, with: "", options: .regularExpression)
         var corrections: [String] = []
         let names = Set(AppActions.action(action)?.argSpecs.flatMap(\.names) ?? [])
         for key in ["status", "ok", "effects", "execution", "read_only", "irreversible", "argument_notes"]
@@ -281,11 +283,24 @@ extension AppToolExecutor {
                 return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess)
             }
             return Self.doorRefusal("unknown_key",
-                "app takes no \(stray.joined(separator: ", ")). Its keys are page, item, action, args, preview, "
+                "app takes no \(stray.joined(separator: ", ")). Its keys are page, item, action, args, actions, preview, "
                 + "expected_version, find and script; an action's own arguments go inside args. Nothing was read or done.",
                 remedy: "correct_arguments", "Call app again with only those keys; {} lists the pages.",
                 next: [:], extra: ["unrecognised": .array(stray.map(JSONValue.string)),
                                    "valid": .array(Self.doorKeys.sorted().map(JSONValue.string))])
+        }
+        // Blank fills ("", {}, []) are absent, as everywhere: a model that fills
+        // every field sends actions:[] beside its one action.
+        let blank: [JSONValue] = [.null, .string(""), .object([:]), .array([])]
+        if let entries = input["actions"], !blank.contains(entries) {
+            let beside = input.filter { $0.key != "actions" && !blank.contains($0.value) }
+            guard case .array(let list) = entries,
+                  beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version"].contains($0) }) else {
+                return Self.doorRefusal("invalid_actions",
+                    "actions is a list of app calls ({action, args}, {page}, {item}) and takes only preview and expected_version beside it. Nothing was run.",
+                    remedy: "correct_arguments", "Move the other keys into the entries.")
+            }
+            return try await doorMany(list, base: beside)
         }
         if let value = input["script"], value != .null, value != .string("") {
             // One call is one thing: the gates and the plan judge it by its
@@ -310,6 +325,14 @@ extension AppToolExecutor {
             var item = input.filter { !["action", "page", "item"].contains($0.key) }
             item["item"] = .string(action)
             return try await runAppDoor(input: item, surface: surface, inProcess: inProcess)
+        }
+        // desk.archive {handle:[…]} runs once per handle. Only where this call
+        // was judged a read or is a folded tool's, whose own gate judges each
+        // value; any other action is judged with its args, so a list waits for actions.
+        if let target = AppActions.action(action), case .object(let args)? = input["args"],
+           target.isFold || target.readOnly(args: args), let (key, values) = Self.doorPlural(target, args) {
+            return try await doorMany(values.map { .object(["args": .object(args.merging([key: $0]) { $1 })]) },
+                                      base: input.filter { $0.key != "args" })
         }
         if !action.isEmpty {
             var value = try await doorDo(action, input: input, surface: surface, inProcess: inProcess)
@@ -461,7 +484,8 @@ extension AppToolExecutor {
         let hasSettings = if case .array(let rows)? = read["settings"] { !rows.isEmpty } else { false }
         let unready = AgentWorkspaceReadiness.unreadyTools(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let actions = Self.doorPageActions(resolved.id, hasSettings: hasSettings)
-        let compact = actions.count > 12 && !catalog
+        // Over 8 reads compact, as over 12 did with the four every-page actions.
+        let compact = actions.count > 8 && !catalog
         read["actions"] = .array(actions.map { .string(compact
             ? $0.id + (unready[$0.tool].map { " (unavailable: " + $0 + ")" } ?? "")
             : Self.doorActionLine($0, unready: unready)) })
@@ -486,8 +510,10 @@ extension AppToolExecutor {
 
     // MARK: - Reads
 
+    /// The page's own actions; the ones on every page are named once, on `{}`,
+    /// except setting.set where the page has settings to set.
     private static func doorPageActions(_ page: String, hasSettings: Bool) -> [AppAction] {
-        AppActions.on(page: page).filter { $0.id != "setting.set" || hasSettings }
+        AppActions.on(page: page).filter { $0.page != "*" || ($0.id == "setting.set" && hasSettings) }
     }
 
     private static func doorActionLine(_ action: AppAction, unready: [String: String]) -> String {
@@ -495,33 +521,42 @@ extension AppToolExecutor {
     }
 
     /// Home first: open agent windows, what is in progress, what waits and
-    /// what arrived (`home`, which sorts first), then every page.
+    /// what arrived (`home`, which sorts first), then a line per page. A page
+    /// read lists its actions; the index names only what blocks some of them.
     @MainActor
     private func doorIndex(_ input: [String: JSONValue]) async -> JSONValue {
         let posture = await Self.freshQuietPosture()
-        let unready = AgentWorkspaceReadiness.unreadyTools(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let unready = AgentWorkspaceReadiness.unreadyTools(dataRoot: root)
+        let everyPage = AppActions.all.filter { $0.page == "*" }.map(\.id)
+        // pages_version: the lines, every registered action (senses' corners
+        // included) and readiness, so a changed index tells from a repeat.
+        var shape = AppActions.inventory(dataRoot: root).map { $0.page + "/" + $0.id }.sorted()
+            + unready.sorted { $0.key < $1.key }.map { $0.key + "=" + $0.value }
+        let pages: [JSONValue] = doorPages.map { page in
+            let blockers = Set(AppActions.on(page: page.id).compactMap { $0.page == "*" ? nil : unready[$0.tool] }).sorted()
+            // The title only when it says more than the id ("inbox: Inbox." is dead weight — Agent 10-10).
+            let title = page.title.lowercased() == page.id.lowercased() ? "" : "\(page.title). "
+            let line = "\(page.id): \(title)\(page.summary)"
+                + (blockers.isEmpty ? "" : " (unavailable: " + blockers.joined(separator: " ") + ")")
+            shape.append(line)
+            return .string(line)
+        }
         return .object([
             "home": await doorHome([:], input: input),
             "status": .string("ok"),
-            "pages": .array(doorPages.map { page in
-                let hasSettings = !QuietSettings.settings(forPage: page.id, host: quietHost()).isEmpty
-                let ids = Self.doorPageActions(page.id, hasSettings: hasSettings)
-                    .filter { $0.page != "*" }.map {
-                        $0.id + (unready[$0.tool].map { " (unavailable: " + $0 + ")" } ?? "")
-                    }
-                return .string("\(page.id): \(page.title). \(page.summary)"
-                    + (ids.isEmpty ? "" : " Actions: " + ids.joined(separator: ", ")))
-            }),
-            "on_every_page": .array(AppActions.all.filter { $0.page == "*" }.map {
-                .string(Self.doorActionLine($0, unready: unready))
-            }),
+            "pages": .array(pages),
+            "pages_version": .string(SHA256.hash(data: Data(shape.joined(separator: "\n").utf8))
+                .prefix(6).map { String(format: "%02x", $0) }.joined()),
+            "on_every_page": .string(everyPage.joined(separator: ", ") + ": on any page; find gives their args."),
             "trust_mode": .string(posture?.name ?? "unreadable"),
-            "note": .string("home is where you left off; any name on it opens with item. "
-                + "Read a page for what it shows, its version, and each action's args. "
+            "note": .string("Read a page for its actions and their args; "
                 + (posture?.name == Self.fullMacModeName
-                    ? "Full Mac is on: actions marked the owner's below Full Mac are yours too, and the owner sees each one you run. Actions needing the owner in person remain theirs. "
-                    : "The owner's actions refuse with why and where they do them. ")
-                + "preview:true says what an action would do and does nothing."),
+                    ? "under Full Mac the owner's are yours too (they see each one you run) except those needing them in person, "
+                    : "the owner's refuse with why and where they do them, ")
+                + "and preview:true says what one would do without doing it. "
+                + "Do many: one call, many actions: actions:[{action, args}, {page}, {item}], or args.handle:[…] "
+                + "where an action takes one value; each runs and reports itself, in order."),
         ])
     }
 
@@ -675,12 +710,12 @@ extension AppToolExecutor {
         catch { sensesError = error.localizedDescription }
         let active = Set(senses.filter { $0.status == .on }.map(\.id))
         let unready = AgentWorkspaceReadiness.unreadyTools(dataRoot: root)
-        let (ranked, degraded) = await AppActions.ranked(query, titles: titles, dataRoot: root)
+        let (ranked, rankedSkills, degraded) = await AppActions.ranked(query, titles: titles, dataRoot: root)
         let actions = ranked.prefix(5)
         let pages = doorPages.map { page in
             (page, AppActions.hits(Set(AppActions.intentWords(page.id + " " + page.title + " " + page.summary)), asked))
         }.filter { $0.1 > 0 }.sorted { $0.1 > $1.1 }.prefix(3)
-        let skills = AppActions.skills(asked, dataRoot: root).prefix(3)
+        let skills = rankedSkills.prefix(3)
         let archived = AppActions.archivedTools(asked, dataRoot: root).prefix(2)
         let reads: [JSONValue] = ["crews", "delegations", "workshop", "tasks", "helper"].filter { word in
             AppActions.words(query).contains { $0 == word || $0 == word + "s" } }.map {
@@ -800,6 +835,90 @@ extension AppToolExecutor {
         }
     }
 
+    /// Many in one call: each entry is its own app call, re-entering the whole
+    /// chain as a script's calls do, in order, and every one runs and reports
+    /// itself. A version given once guards each write on its page in turn,
+    /// each taking the version the one before it left. A Stop ends it there.
+    /// A send written beside the step's other calls comes back unsent, as it
+    /// would beside them in the reply (`AppDoorReentry.heldSend`), and the
+    /// first entry waiting on the person is the call's own envelope, so the
+    /// turn waits and the card shows as for one action.
+    @MainActor
+    private func doorMany(_ entries: [JSONValue], base: [String: JSONValue]) async throws -> JSONValue {
+        guard let perform = AppDoorReentry.perform else {
+            return Self.doorRefusal("door_unavailable",
+                "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
+                remedy: "none", "Use app from a chat turn.")
+        }
+        guard (1...AppScriptRunner.actionLimit).contains(entries.count) else {
+            return Self.doorRefusal("invalid_actions",
+                "One call runs 1 to \(AppScriptRunner.actionLimit) actions; this one has \(entries.count). Nothing ran.",
+                remedy: "correct_arguments", "Split it into calls of at most \(AppScriptRunner.actionLimit).")
+        }
+        var versions: [String: JSONValue] = [:]
+        let given = Self.doorText(base["expected_version"])
+        if let scope = given.split(separator: "@").first?.split(separator: "/").first.map(String.init) {
+            versions[doorPage(scope)?.id ?? scope] = .string(given)
+        }
+        var receipts: [JSONValue] = []
+        // One inbox read per action, after itself, as in a script.
+        try await DoorNotesSnapshot.$current.withValue(DoorNotesSnapshot.current ?? DoorNotesSnapshot()) {
+            for entry in entries {
+                try Task.checkCancellation()
+                guard case .object(let fields) = entry else {
+                    receipts.append(Self.doorRefusal("invalid_actions", "Each entry is one app call, an object. Nothing ran.",
+                        remedy: "correct_arguments", "Write it as {action, args}, {page} or {item}."))
+                    continue
+                }
+                var call = base.filter { $0.key != "expected_version" }.merging(fields) { $1 }
+                // A previewed list previews every entry; an entry's own preview:false never runs one.
+                if base["preview"] == .bool(true) { call["preview"] = .bool(true) }
+                if let held = AppDoorReentry.heldSend,
+                   SwiftNativeTurnEngine.outboundMessageTools.contains(ToolNameAliases.ranTool("app", input: call)) {
+                    receipts.append(held)
+                    continue
+                }
+                let page = AppActions.action(Self.doorText(call["action"]))?.page ?? ""
+                if call["expected_version"] == nil { call["expected_version"] = versions[page] }
+                let receipt: JSONValue
+                do { receipt = try await perform("app", call) } catch { receipt = ChatToolOutcome.failure(error: error, tool: "app") }
+                if call["expected_version"] != nil, case .object(let fields) = receipt, let after = fields["page_version"] { versions[page] = after }
+                receipts.append(receipt)
+            }
+        }
+        if case .object(var waiting)? = receipts.first(where: ChatToolOutcome.isWaitingOnPerson) {
+            waiting["receipts"] = .array(receipts)
+            return .object(waiting)
+        }
+        let landed = receipts.count(where: ChatToolOutcome.outputLooksSuccessful)
+        var result: [String: JSONValue] = [
+            "status": .string(landed == receipts.count ? "ok" : landed == 0 ? "failed" : "partial"),
+            "detail": .string("\(landed) of \(receipts.count) landed; each receipt, in order, says what happened."),
+            "receipts": .array(receipts),
+        ]
+        if landed == 0 {
+            result["remedy"] = .object(["kind": .string("per_receipt"),
+                "instruction": .string("Each receipt says why it did not land and what to do next."), "next_call": .null])
+        }
+        return .object(result)
+    }
+
+    /// The one argument given a list where the action takes a single value,
+    /// and its values; nil when there is none, or more than one. A key or
+    /// token never fans out.
+    static func doorPlural(_ action: AppAction, _ args: [String: JSONValue]) -> (String, [JSONValue])? {
+        guard case .object(let discovery) = AppActions.discovery(action), case .object(let schema)? = discovery["args_schema"],
+              case .object(let properties)? = schema["properties"] else { return nil }
+        let plural = args.compactMap { key, value -> (String, [JSONValue])? in
+            guard case .array(let values) = value, !values.isEmpty, !action.secretArgs.contains(key),
+                  let property = properties[key], doorTypeProblem(value, schema: property, path: key) != nil,
+                  values.allSatisfy({ if case .array = $0 { false } else if case .object = $0 { false } else { true } })
+            else { return nil }
+            return (key, values)
+        }
+        return plural.count == 1 ? plural[0] : nil
+    }
+
     // MARK: - Do
 
     @MainActor
@@ -874,7 +993,7 @@ extension AppToolExecutor {
             receipt["owner"] = .string("his")
             return Self.doorRefusal("needs_person",
                 "Under Full Mac \(action.id) is yours, but it needs the owner in person: \(why). Nothing was done.",
-                remedy: "ask_user", "Ask the owner to do it at the Mac; nothing to retry until they have.", extra: receipt)
+                remedy: "ask_owner", "Ask the owner to do it at the Mac; nothing to retry until they have.", extra: receipt)
         }
         if !fullMac, case .his(let why, let instead) = action.owner {
             receipt["why"] = .string(why)
@@ -885,7 +1004,7 @@ extension AppToolExecutor {
                 receipt["detail"] = .string("Would refuse: that's the owner's, \(why). Nothing was done.")
                 return .object(receipt)
             }
-            return Self.doorRefusal("users_call", "That's the owner's: \(why). Nothing was done.",
+            return Self.doorRefusal("owners_call", "That's the owner's: \(why). Nothing was done.",
                 remedy: instead == nil ? "none" : "use_instead",
                 instead.map { "Leave it for the owner, or if it is what you need: \($0)." }
                     ?? "Nothing to retry: it is the owner's. Leave it for them.",
@@ -1000,9 +1119,7 @@ extension AppToolExecutor {
             if let blocked = await doorSavedBlock(action.tool) { return blocked }
             return Self.actionResult(Self.skillStepRead(Self.doorText(args["name"]), step: args["step"], root: root), action: action, args: args)
         }
-        if action.id == "skill.list", await Self.freshQuietPosture(dataRoot: root)?.changesAllowed == true {
-            await Self.skillUpkeep(root: root)
-        }
+        if action.id == "skill.list" { await Self.skillUpkeep(root: root) }
         // A folded tool answers as its direct call did: its own result, its
         // own gates (User's saved level on it among them) and its own card.
         if action.isFold || action.id == "chat.list" {
@@ -1060,7 +1177,7 @@ extension AppToolExecutor {
            !ChatToolOutcome.outputLooksSuccessful(result) || ChatToolOutcome.isWaitingOnPerson(result) {
             let reason = Self.doorText(fields["reason"])
             let waiting = Self.doorText(fields["not_run_status"])
-            // The refusal's own code on the receipt itself (users_screen, not
+            // The refusal's own code on the receipt itself (owners_screen, not
             // tool_failed); a sentence stays where it is.
             if !reason.isEmpty, !reason.contains(" ") { receipt["reason"] = .string(reason) }
             if !waiting.isEmpty || Self.doorFloorReasons.contains(reason) {
@@ -1074,12 +1191,13 @@ extension AppToolExecutor {
                 ])
             } else {
                 receipt["effects"] = fields["effects"] ?? .string(read ? "none" : "unknown")
+                // A read that failed changed nothing, so reading the page again is a round spent.
                 receipt["remedy"] = fields["remedy"] ?? .object([
                     "kind": .string("inspect"),
                     "instruction": .string(read
-                        ? "Nothing changed. Resolve the reported prerequisite before reading again."
+                        ? "Nothing changed. Do what the reason names, or tell the person why."
                         : "Read \(action.page) to see what took effect, then decide; don't replay it blindly."),
-                    "next_call": .object(["tool": .string("app"), "input": .object(["page": .string(action.page)])]),
+                    "next_call": read ? .null : .object(["tool": .string("app"), "input": .object(["page": .string(action.page)])]),
                 ])
             }
         }
@@ -1190,7 +1308,7 @@ extension AppToolExecutor {
         fields["outcome"] = .string("unmet")
         if fields["remedy"] == nil { fields["remedy"] = .object([
             "kind": .string("inspect"),
-            "instruction": .string("Nothing changed. Resolve the reported prerequisite before reading again."),
+            "instruction": .string("Nothing changed. Do what the reason names, or tell the person why."),
             "next_call": .null,
         ]) }
         return .object(fields)

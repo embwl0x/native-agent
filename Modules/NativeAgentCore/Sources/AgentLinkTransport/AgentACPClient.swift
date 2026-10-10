@@ -26,7 +26,7 @@ public actor AgentACPClient {
         package var completed: Bool { stopReason == "end_turn" }
     }
     public enum Failure: String, Error, LocalizedError {
-        case unavailable, executableChanged, interrupted, invalidResponse, incompatibleVersion, timedOut, tooLarge, busy, sessionUnavailable
+        case unavailable, executableChanged, interrupted, appQuit, invalidResponse, timedOut, tooLarge, busy, sessionUnavailable
         case initializationTimedOut, sessionStartupTimedOut, modeSetupTimedOut
         public var errorDescription: String? {
             switch self {
@@ -35,8 +35,8 @@ public actor AgentACPClient {
             case .unavailable: "The other agent could not start. Check its installation and sign-in."
             case .executableChanged: "The approved program changed or is missing. Review a fresh connection approval. Nothing ran."
             case .interrupted: "The other agent stopped before finishing. Do not resend automatically."
+            case .appQuit: "The app quit before the other agent finished, which ended its turn. Nothing was resent."
             case .invalidResponse: "The other agent sent an unreadable answer. Completion is not confirmed."
-            case .incompatibleVersion: "The other agent uses a conversation version this app cannot read."
             case .timedOut: "The other agent did not finish after prompt delivery began. Delivery and completion are unconfirmed. Do not resend automatically."
             case .initializationTimedOut: "The other agent timed out during connection initialization. Your message was not sent. Check that its CLI starts and is signed in before explicitly reconnecting."
             case .sessionStartupTimedOut: "The other agent timed out while opening or restoring its conversation. Your message was not sent. Check its session startup, model availability, and MCP connections before explicitly reconnecting."
@@ -44,6 +44,14 @@ public actor AgentACPClient {
             case .tooLarge: "The other agent's answer exceeded the size limit. Completion is not confirmed."
             }
         }
+    }
+
+    /// Before any prompt write, the agent and its recipe disagreed at `method`
+    /// (its JSON-RPC error, or what it advertised): nothing was sent.
+    package struct Mismatch: Error {
+        package let method: String
+        package let code: Int64?
+        package let detail: String
     }
 
     /// Only startup timeouts can prove that no prompt write was attempted.
@@ -91,6 +99,8 @@ public actor AgentACPClient {
     private var active = false
     private var restoredHistory = false
     private var initialized: JSONValue?
+    /// The mode ids the agent advertised when this session opened.
+    private var advertised: [String]?
 
     /// The peer said at initialize it can reopen a session by id.
     var canRestoreSession: Bool {
@@ -99,9 +109,12 @@ public actor AgentACPClient {
             || capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil
     }
 
+    /// The recipe (`line`) drives the handshake. With no `message` it is a
+    /// dry run: the handshake and mode, held to what the agent advertises now
+    /// rather than to the recipe (`learned` reads it back), and no prompt.
     package func turn(executable: String, arguments: [String], directory: URL,
-              environment: [String: String], message: String, peerCredential: String, mcpServers: [JSONValue] = [],
-              permissionMode: String? = nil,
+              environment: [String: String], message: String?, peerCredential: String, mcpServers: [JSONValue] = [],
+              line: AgentHostACP,
               conversationID: String? = nil,
               approvedExecutable: AgentACPExecutable? = nil,
               keepAlive: Bool = false, requireVerifiedRestore: Bool = false,
@@ -112,12 +125,11 @@ public actor AgentACPClient {
         if started { guard conversationID == sessionID else { throw Failure.sessionUnavailable } }
         active = true
         defer { active = false; prompting = false; self.permission = nil; self.update = nil; self.peerCredential = nil }
-        text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false
+        text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false; requiredMode = nil
         startupTimeout = .initializationTimedOut
         self.permission = permission
         self.update = update
         self.peerCredential = peerCredential
-        self.requiredMode = permissionMode
         do {
         let reply = try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -184,17 +196,26 @@ public actor AgentACPClient {
                 await self?.expire(replyDeadline)
             }
             guard let initialized else { throw Failure.invalidResponse }
-            guard initialized.objectValue?["protocolVersion"] == .int(1) else { throw Failure.incompatibleVersion }
+            guard initialized.objectValue?["protocolVersion"] == .int(1) else {
+                throw Mismatch(method: "initialize", code: nil, detail: "it speaks ACP version "
+                    + ((try? initialized.objectValue?["protocolVersion"]?.serialize(pretty: false)) ?? "none") + "; this app speaks 1")
+            }
             startupTimeout = .sessionStartupTimedOut
             let params: [String: JSONValue] = ["cwd": .string(directory.path), "mcpServers": .array(mcpServers)]
             var restored: JSONValue? = sessionID != nil && conversationID == sessionID ? .object([:]) : nil
+            var opened = "session/new"
             if let conversationID, restored == nil {
                 guard !conversationID.isEmpty, conversationID.utf8.count <= 1024 else { throw Failure.invalidResponse }
                 let capabilities = initialized.objectValue?["agentCapabilities"]?.objectValue
                 let method = requireVerifiedRestore && capabilities?["loadSession"] == .bool(true) ? "session/load"
                     : capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil
                     ? "session/resume" : capabilities?["loadSession"] == .bool(true) ? "session/load" : nil
+                // The recipe's downgrade: an agent learned to reopen nothing gets a new session.
+                if method == nil, line.supportsLoad != false || line.supportsResume != false {
+                    throw Mismatch(method: "session/resume", code: nil, detail: "it no longer advertises session/load or session/resume")
+                }
                 if let method {
+                    opened = method
                     // History can arrive before the load/resume response, including from Hermes resume.
                     sessionID = conversationID
                     do {
@@ -210,11 +231,14 @@ public actor AgentACPClient {
                     } catch {
                         try Task.checkCancellation()
                         if let failure { throw failure }
+                        // -32601 method not found and -32602 invalid params: the agent's
+                        // load/resume no longer takes this call, a mismatch. Any other
+                        // error is a real restoration failure: session unavailable.
+                        if let refused = error as? Mismatch, [-32601, -32602].contains(refused.code) { throw refused }
                         throw Failure.sessionUnavailable
                     }
                 }
             }
-            if conversationID != nil && restored == nil { throw Failure.sessionUnavailable }
             let continued = restored != nil
             let session: JSONValue
             let id: String
@@ -231,16 +255,33 @@ public actor AgentACPClient {
                 throw Failure.invalidResponse
             }
             sessionID = id
-            if let permissionMode {
-                startupTimeout = .modeSetupTimedOut
-                let available = session.objectValue?["modes"]?.objectValue?["availableModes"]
-                if !continued || available != nil {
-                    guard case .array(let modes)? = available,
-                          modes.contains(where: { $0.objectValue?["id"] == .string(permissionMode) }) else {
-                        throw Failure.incompatibleVersion
-                    }
+            startupTimeout = .modeSetupTimedOut
+            let available = session.objectValue?["modes"]?.objectValue?["availableModes"]
+            // A continued session that does not restate its modes keeps the recipe's.
+            let now: [String]? = continued && available == nil ? nil : {
+                guard case .array(let modes)? = available else { return [] }
+                return modes.compactMap { if case .string(let mode)? = $0.objectValue?["id"] { mode } else { nil } }
+            }()
+            if let now {
+                advertised = now
+                func named(_ modes: [String]) -> String { modes.isEmpty ? "none" : modes.joined(separator: ", ") }
+                if message != nil, let recipe = line.modes, Set(recipe) != Set(now) {
+                    throw Mismatch(method: opened, code: nil, detail: "it advertises modes \(named(now)); the recipe says \(named(recipe))")
                 }
-                _ = try await request("session/set_mode", ["sessionId": .string(id), "modeId": .string(permissionMode)])
+                if message != nil, line.modes == nil, now.isEmpty {
+                    throw Mismatch(method: "session/set_mode", code: nil, detail: "it advertises no modes, so permissionMode \(line.permissionMode) cannot be set")
+                }
+                guard now.isEmpty || now.contains(line.permissionMode) else {
+                    throw Mismatch(method: "session/set_mode", code: nil, detail: "the recipe's permissionMode \(line.permissionMode) is not one of its modes \(named(now))")
+                }
+            }
+            // An agent with no modes (learned: modes []) gets no set_mode.
+            if (now ?? line.modes)?.isEmpty != true {
+                requiredMode = line.permissionMode
+                _ = try await request("session/set_mode", ["sessionId": .string(id), "modeId": .string(line.permissionMode)])
+            }
+            guard let message else {
+                return Reply(sessionID: id, text: "", stopReason: "dry_run", continued: continued, detail: nil)
             }
             // Conservative boundary: any attempted prompt write makes delivery uncertain.
             prompting = true
@@ -267,8 +308,22 @@ public actor AgentACPClient {
         }
     }
 
-    func close() async {
-        cancel(error: Failure.interrupted)
+    /// The recipe as this handshake found the agent, for a dry run to write back.
+    package func learned(_ line: AgentHostACP) -> AgentHostACP {
+        var line = line
+        let capabilities = initialized?.objectValue?["agentCapabilities"]?.objectValue
+        if case .int(let version)? = initialized?.objectValue?["protocolVersion"] { line.protocolVersion = Int(version) }
+        if let advertised, line.modes.map(Set.init) != Set(advertised) { line.modes = advertised }
+        if initialized != nil {
+            line.supportsLoad = capabilities?["loadSession"] == .bool(true)
+            line.supportsResume = capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil
+        }
+        return line
+    }
+
+    /// `appQuit` only from `closeAll`: the send it cuts off carries that origin.
+    func close(_ error: Failure = .interrupted) async {
+        cancel(error: error)
         shutdown()
         await cleanup?.value
         reader?.cancel()
@@ -281,12 +336,14 @@ public actor AgentACPClient {
         nextID += 1
         let id = nextID
         if method == "session/new" { newSessionRequestID = id }
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            do { try write(.object(["jsonrpc": .string("2.0"), "id": .int(id),
-                                   "method": .string(method), "params": .object(params)])) }
-            catch { fail(error) }
-        }
+        do {
+            return try await withCheckedThrowingContinuation { continuation in
+                pending[id] = continuation
+                do { try write(.object(["jsonrpc": .string("2.0"), "id": .int(id),
+                                       "method": .string(method), "params": .object(params)])) }
+                catch { fail(error) }
+            }
+        } catch let refused as Mismatch { throw Mismatch(method: method, code: refused.code, detail: refused.detail) }
     }
 
     private func write(_ value: JSONValue) throws {
@@ -356,6 +413,13 @@ public actor AgentACPClient {
             }
             if let error = object["error"] {
                 let detail = (try? error.serialize(pretty: false)) ?? ""
+                // Refused before any prompt write: a step of its recipe, and nothing was sent.
+                if !prompting {
+                    let code: Int64? = if case .int(let code)? = error.objectValue?["code"] { code } else { nil }
+                    let said: String = if case .string(let said)? = error.objectValue?["message"] { said } else { detail }
+                    continuation.resume(throwing: Mismatch(method: "", code: code, detail: said + (code.map { " (\($0))" } ?? "")))
+                    return
+                }
                 continuation.resume(throwing: ProviderFailure.Report(cause: .wire(detail), work: .outcomeUnknown))
             } else if let result = object["result"], result.objectValue != nil {
                 if id == newSessionRequestID, case .string(let session)? = result.objectValue?["sessionId"] {
@@ -662,7 +726,7 @@ package actor AgentACPConnections {
         let owned = entries.values
         entries.removeAll()
         await withTaskGroup(of: Void.self) { group in
-            for entry in owned { entry.expiry?.cancel(); group.addTask { await entry.client.close() } }
+            for entry in owned { entry.expiry?.cancel(); group.addTask { await entry.client.close(.appQuit) } }
         }
     }
 

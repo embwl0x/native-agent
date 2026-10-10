@@ -33,7 +33,7 @@ import PersistenceCore
 //      subsequent Act on that same brief's card from both landing.
 //
 // WHAT IS WIRED, DECLARED NOT SILENT: two call sites.
-// `NativeClient.postSpokenInboxMessage`, the morning-brief card's Act handler,
+// `InboxCardActions.postSpokenInboxMessage`, the morning-brief card's Act handler,
 // on the `.userRequested` route (L5 G6); and since Phase 5 E1 (2026-10-03)
 // `NativeCognitionRuntime.deliverReach`, `.reachOut` on the `.scheduled`
 // route — her own message, written on her resident-wake turn, at most once a

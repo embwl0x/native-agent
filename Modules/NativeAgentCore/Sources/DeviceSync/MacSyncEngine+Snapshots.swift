@@ -11,6 +11,7 @@ import Foundation
 import DeviceSyncState
 import NativeAgentShared
 import NativeAgentCore
+import ChatOrchestration
 import CognitiveSubstrate
 import KnowledgeGraph
 import MemoryV2
@@ -737,6 +738,7 @@ extension MacSyncEngine {
             } catch {
                 recordFetchFailure("mac_integration_permissions", error)
             }
+            await write(SurfaceLayoutStore.layout(dataRoot: sync.dataRoot), to: "ui_layout.json")
             if let personalityProfile {
                 await write(personalityProfile, to: "personality.json")
             } else {

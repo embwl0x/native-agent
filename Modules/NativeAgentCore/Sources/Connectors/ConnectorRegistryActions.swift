@@ -143,13 +143,32 @@ public enum ConnectorRegistryActions {
         NSError(domain: "NativeAgentWorkspace", code: 422, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
-    public static func searchWorkspace(query: String, root: URL) async throws -> JSONValue {
-        let impl = makeConnectorsClient(root: root)
-        if let envelope = try await impl.searchWorkspaces(query: query) {
-            return envelope
-        }
-        return .object(["query": .string(query), "results": .array([])])
+    public static func listWorkspaces(root: URL) async throws -> [WorkspaceRecord] {
+        let rows = try await makeConnectorsClient(root: root).listWorkspaces()
+        return try JSONDecoder().decode([WorkspaceRecord].self, from: JSONValue.array(rows).serializedData(pretty: false))
     }
+
+    public static func searchWorkspace(query: String, root: URL) async throws -> WorkspaceSearchResponse {
+        let impl = makeConnectorsClient(root: root)
+        let envelope = try await impl.searchWorkspaces(query: query)
+            ?? .object(["query": .string(query), "results": .array([])])
+        return try JSONDecoder().decode(WorkspaceSearchResponse.self, from: envelope.serializedData(pretty: false))
+    }
+}
+
+public struct WorkspaceSearchResult: Identifiable, Codable, Hashable, Sendable {
+    public var workspaceId: String?
+    public var workspaceName: String?
+    public var path: String
+    public var relativePath: String
+    public var reason: String
+
+    public var id: String { path }
+}
+
+public struct WorkspaceSearchResponse: Codable, Hashable, Sendable {
+    public var query: String
+    public var results: [WorkspaceSearchResult]
 }
 
 public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {

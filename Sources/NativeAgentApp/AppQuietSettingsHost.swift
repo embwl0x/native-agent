@@ -6,6 +6,7 @@ import PersistenceCore
 import NativeAgentShared
 import ProviderRouting
 import TrustCenter
+import TriggerScheduler
 
 /// Adapts the settings catalog to the same observed model actions as the UI.
 @MainActor
@@ -127,11 +128,10 @@ class AppQuietSettingsHost: QuietSettingsHost {
             adaptivePromotion: adaptivePromotion,
             hygieneEnabled: hygieneEnabled)
     }
-    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool, autoPromoteConsolidated: Bool) async {
+    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async {
         await appModel.saveMemoryPolicy(
             consolidationEnabled: consolidationEnabled,
-            crossSessionRecall: crossSessionRecall,
-            autoPromoteConsolidated: autoPromoteConsolidated)
+            crossSessionRecall: crossSessionRecall)
     }
 
     func setInnerLifeEnabled(_ enabled: Bool) async -> (enabled: Bool, problem: String?) {
@@ -164,10 +164,10 @@ class AppQuietSettingsHost: QuietSettingsHost {
     }
 
     func memoryMode() async throws -> String {
-        EmbeddingsSettingsStatusPresentation(status: try await appModel.fetchEmbeddingsStatus()).memoryMode
+        EmbeddingsSettingsStatusPresentation(status: try await AppModel.embeddingsStatus(dataRoot: appModel.engine.dataRoot)).memoryMode
     }
     func setMemoryMode(_ mode: String) async throws {
-        let result = try await appModel.setEmbeddingsMemoryMode(mode: mode)
+        let result = try await AppModel.setEmbeddingsMemoryMode(mode, dataRoot: appModel.engine.dataRoot)
         if let error = result.error {
             throw QuietSettingError.unavailable(result.detail.map { "\(error): \($0)" } ?? error)
         }
@@ -194,16 +194,12 @@ class AppQuietSettingsHost: QuietSettingsHost {
 
     // The Notifications page's own reads and writes (InboxSettingsView).
     func inboxTriggers() async throws -> [QuietInboxTrigger] {
-        try await appModel.client.getInboxTriggers().map {
+        try await appModel.engine.inbox.triggers().map {
             QuietInboxTrigger(
-                name: $0.name, enabled: $0.enabled,
-                paths: ($0.config?["paths"] ?? "").components(separatedBy: "\n").filter { !$0.isEmpty })
+                name: $0.name, enabled: $0.enabled)
         }
     }
     func setInboxTrigger(_ name: String, enabled: Bool) async throws {
-        try await appModel.client.inboxTriggerEnable(name, enabled: enabled)
-    }
-    func saveWatchedFolders(_ paths: [String]) async throws {
-        try await appModel.client.inboxTriggerConfigure("file_watch", body: ["paths": paths])
+        try await appModel.engine.inbox.setTrigger(name, enabled: enabled)
     }
 }

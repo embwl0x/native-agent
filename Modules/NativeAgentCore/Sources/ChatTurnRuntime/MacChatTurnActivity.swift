@@ -1,4 +1,5 @@
 import Privacy
+import ChatSessionWork
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -38,13 +39,15 @@ public struct MacChatTurnActivity: Sendable, Equatable {
     /// shared detail limit.
     public let userVisibleNoticeText: String?
     public let delegateDisplayName: String?
+    public let outcome: TurnPresentationActivity.Outcome?
     public let occurredAt: Date
 }
 
 /// Converts the existing ChatOrchestration stream vocabulary at the Mac
 /// boundary. Raw JSON input/output is discarded in this switch before an
 /// activity value can be constructed; only the progress phrase's plain names
-/// (an app, an agent, a page, a web host) pass, inside its words.
+/// (an app, an agent, a page, a web host) pass, inside its words, and a
+/// result passes only as its exact outcome class.
 public enum MacChatTurnActivityBoundary {
     /// `shown` is the turn's own: an `app` call reads as the action it ran.
     public static func activity(
@@ -57,8 +60,13 @@ public enum MacChatTurnActivityBoundary {
         case .toolUse(let name, let input):
             let call = shown.use(name, input: input)
             return toolUse(name: call.name, args: call.input.stringFields, identity: identity, at: instant)
-        case .toolResult(let name, _):
-            return toolResult(name: shown.result(name).name, identity: identity, at: instant)
+        case .toolResult(let name, let output):
+            return toolResult(
+                name: shown.result(name).name,
+                result: ChatToolOutcome.exactResultClass(output),
+                identity: identity,
+                at: instant
+            )
         case .notice(let kind, let text):
             return notice(kind: kind, text: text, identity: identity, at: instant)
         case .delta, .final, .error, .replyTextSettled:
@@ -82,6 +90,7 @@ public enum MacChatTurnActivityBoundary {
             actionSummary: safeText,
             userVisibleNoticeText: boundedNoticeText(text),
             delegateDisplayName: delegateName(forNoticeKind: kind, text: text),
+            outcome: nil,
             occurredAt: instant
         )
     }
@@ -101,24 +110,35 @@ public enum MacChatTurnActivityBoundary {
             actionSummary: sanitized(ToolActivityPresentation.progress(name, args: args)),
             userVisibleNoticeText: nil,
             delegateDisplayName: delegateName(forTool: name),
+            outcome: nil,
             occurredAt: instant
         )
     }
 
+    /// Stopped and unconfirmed results carry no outcome: neither is a success
+    /// nor a failure, and their words already say which they are.
     private static func toolResult(
         name: String,
+        result: ChatToolOutcome.ExactResultClass,
         identity: MacChatTurnIdentity,
         at instant: Date
     ) -> MacChatTurnActivity {
         let safeName = sanitized(ToolActivityPresentation.title(name)) ?? "Tool"
+        let outcome: TurnPresentationActivity.Outcome? = switch result {
+        case .succeeded: .ok
+        case .refused: .refused
+        case .failed, .timeout: .failed
+        case .cancelled, .unknown: nil
+        }
         return MacChatTurnActivity(
             identity: identity,
             source: .toolResult,
             phase: .working,
             toolDisplayName: safeName,
-            actionSummary: sanitized(ToolActivityPresentation.finished(name)),
+            actionSummary: sanitized(ToolActivityPresentation.finished(name, outcome: result.rawValue)),
             userVisibleNoticeText: nil,
             delegateDisplayName: nil,
+            outcome: outcome,
             occurredAt: instant
         )
     }

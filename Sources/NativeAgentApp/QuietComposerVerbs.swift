@@ -182,14 +182,14 @@ enum QuietComposerVerbs {
     ) -> (session: String, refusal: Outcome?) {
         if !reachesUser, usersScreenVerbs.contains(verb) {
             return ("", .refuse(
-                verb, "users_screen",
+                verb, "owners_screen",
                 "That moves the person's screen, and they did not start this turn. Ask them, or tell them "
                 + "where it is (app {page} reads any page without showing it)."
             ))
         }
         if !reachesUser, verb == "speak" {
             return ("", .refuse(
-                "read aloud", "users_ears",
+                "read aloud", "owners_ears",
                 "Speaking out loud interrupts the person, and they did not start this turn. Ask them, "
                 + "or say it in your reply."
             ))
@@ -199,7 +199,7 @@ enum QuietComposerVerbs {
             // User closing the pane wins for the rest of that turn.
             let turnID = appModel.engine.turns.activeTurnIDsBySession[turnSessionId]
             if WorkPaneState.shared.userClosed(turnID: turnID) {
-                return ("", .refuse("Work pane", "user_closed_pane", "The person closed the Work pane this turn, so it stays closed."))
+                return ("", .refuse("Work pane", "owner_closed_pane", "The person closed the Work pane this turn, so it stays closed."))
             }
             return ("", nil)
         case "set_draft", "send":
@@ -221,7 +221,7 @@ enum QuietComposerVerbs {
             if !reachesUser, QuietChatSessionVerbs.userIsIn(sessionID, appModel),
                verb == "set_draft" || value.isEmpty {
                 return (sessionID, .refuse(
-                    element, "users_draft",
+                    element, "owners_draft",
                     "The person is in that conversation, so its draft and attached files are theirs. "
                     + (verb == "send" ? "Pass your own text in value." : "Ask them first, or send your own text with send and value.")
                 ))
@@ -244,7 +244,7 @@ enum QuietComposerVerbs {
             }
             if !reachesUser, QuietChatSessionVerbs.userIsIn(sessionID, appModel) {
                 return (sessionID, .refuse(
-                    "/scratch", "users_draft",
+                    "/scratch", "owners_draft",
                     "The person is in that conversation, so its scratch is theirs. Ask them first, or write in a conversation they are not in."
                 ))
             }

@@ -3,6 +3,7 @@ import Connectors
 import ProviderRouting
 import AppToolRuntime
 import Foundation
+import ApprovalTransactions
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -318,7 +319,7 @@ extension AppQuietToolHost {
                     "That approval is \(record.status), not waiting, so there is nothing to withdraw. Archive the note with a reason if it is stale."))
             }
             if case .object(let payload) = record.payload, payload["peer_id"] != nil {
-                return refuse(AppToolExecutor.failure("users_call",
+                return refuse(AppToolExecutor.failure("owners_call",
                     "That approval is another agent's ask, not yours, so answering it is the owner's. Leave it for them."))
             }
             target.approval = (approvalID, record.title)
@@ -355,7 +356,7 @@ extension AppQuietToolHost {
                 dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())?.name == AppToolExecutor.fullMacModeName
             let opensForUser = item.source == InteractionCardDelivery.source && action == "act"
             if !fullMac, opensForUser {
-                return refuse(AppToolExecutor.failure("opens_for_user",
+                return refuse(AppToolExecutor.failure("opens_for_owner",
                     "That card's Open on Mac only opens it for the person at the Mac (inbox.open_on_mac is theirs). inbox.not_now declines it; if it is stale, inbox.archive or inbox.dismiss it with a reason.",
                     extra: ["id": .string(item.id)]))
             }
@@ -364,12 +365,12 @@ extension AppQuietToolHost {
             if action == "approve", let approvalID = item.related_approval_id, (try? await SwiftNativeApprovalInbox(
                 root: appModel.dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()).get(approvalID))?.action
                 == SwiftNativeApprovalInbox.skillScriptInstallAction {
-                return refuse(AppToolExecutor.failure("users_call",
+                return refuse(AppToolExecutor.failure("owners_call",
                     "That's the owner's even under Full Mac: approving installs the script as theirs. Leave it for them; "
                     + "inbox.withdraw takes back your ask.", extra: ["id": .string(item.id), "action": .string(action)]))
             }
             if !fullMac, let fence {
-                return refuse(AppToolExecutor.failure("users_call",
+                return refuse(AppToolExecutor.failure("owners_call",
                     "That's the owner's — leave it for them (\(fence)). If it is stale, archive or dismiss it with a reason.",
                     extra: ["id": .string(item.id), "action": .string(action)]))
             }
@@ -405,9 +406,9 @@ extension AppQuietToolHost {
                     continue
                 }
                 do {
-                    try await appModel.client.inboxAction(id, action: action, metadata: [
+                    try await InboxCardActions.perform(id, action: action, metadata: [
                         "settled_by": .string("agent"), "settled_reason": .string(reason),
-                    ])
+                    ], dataRootOverride: appModel.dataRootOverride)
                     done.append(.object(["id": .string(id), "was": .string(byID[id]!.status)]))
                 } catch {
                     await refreshInboxSurfaces()
@@ -445,7 +446,7 @@ extension AppQuietToolHost {
         case "withdraw":
             let (approvalID, title) = target.approval!
             do {
-                _ = try await appModel.client.resolveApproval(
+                _ = try await ApprovalTransactionCoordinator.app(dataRootOverride: appModel.dataRootOverride).resolveApproval(
                     id: approvalID, decision: "cancel", provenance: .local(decidedBy: "agent_withdraw"))
             } catch {
                 return AppToolExecutor.failure("withdraw_failed",
@@ -458,7 +459,7 @@ extension AppQuietToolHost {
         default: // act, repair
             let (item, action) = target.press!
             do {
-                try await appModel.client.inboxAction(item.id, action: action, quiet: true)
+                try await InboxCardActions.perform(item.id, action: action, quiet: true, dataRootOverride: appModel.dataRootOverride)
             } catch {
                 return AppToolExecutor.failure("act_failed", error.localizedDescription,
                     extra: ["id": .string(item.id), "action": .string(action)])
@@ -561,7 +562,7 @@ extension AppQuietToolHost {
             default: return "Selected the card's choice: \(item.effectiveActions.first { $0.id == action }?.label ?? action)."
             }
         }
-        switch NativeClient.resolveInboxPrimaryAction(for: item) {
+        switch InboxCardActions.resolvePrimaryAction(for: item) {
         case .openApprovals: return "Marked the note read; its approvals wait on the Approvals page. The person's screen was not moved."
         case .openDeskExecution: return "Marked the note read; its work is on the Desk. The person's screen was not moved."
         case .chatDraft: return "Marked the note read. Its action only drafts a chat message for the person, so nothing was put in their composer."
@@ -661,7 +662,7 @@ extension AppQuietToolHost {
             }
             let old = account.default_model ?? ""
             do {
-                _ = try await appModel.configureProvider(id, apiKey: nil, authMode: mode.selectedMode, defaultModel: model)
+                try await appModel.configureProvider(id, apiKey: nil, authMode: mode.selectedMode, defaultModel: model)
             } catch {
                 return AppToolExecutor.failure("save_failed", "\(name)'s fallback model was not saved: \(error.localizedDescription)." + retry)
             }

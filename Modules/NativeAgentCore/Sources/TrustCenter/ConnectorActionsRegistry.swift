@@ -658,7 +658,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                     "type": .string("string"),
                     "enum": .array([
                         .string("notify"), .string("connector_action"),
-                        .string("dream"), .string("rem"), .string("improve"),
+                        .string("dream"), .string("rem"),
                         .string("harness_benchmark"), .string("proactive_scan"),
                     ]),
                 ])),
@@ -668,14 +668,14 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ])),
                 ("payload", .object([
                     "type": .string("object"),
-                    "description": .string("Job payload. notify: title/message plus delivery:['push','telegram','mac','chat','inbox','activity'] and optional deliveryOptions per channel. connector_action: actionId/input. improve/dream/rem: objective. proactive_scan: reason/limit/surfaceLimit."),
+                    "description": .string("Job payload. notify: title/message plus delivery:['push','telegram','mac','chat','inbox','activity'] and optional deliveryOptions per channel. connector_action: actionId/input. dream/rem: objective. proactive_scan: reason/limit/surfaceLimit."),
                 ])),
             ], required: ["name", "kind", "schedule"])
         ),
         ConnectorActionDescriptor(
             id: "scheduler.create_job", connectorId: "scheduler", connector: "scheduler",
             name: "Create Scheduled Job",
-            description: "Create a lightweight app-owned recurring or one-shot job. Use for reminders, recurring iPhone notifications, safe connector checks, dreams, self-improvement loops, or proactive idea scans.",
+            description: "Create a lightweight app-owned recurring or one-shot job. Use for reminders, recurring iPhone notifications, safe connector checks, dreams, REM cycles, or proactive idea scans.",
             risk: "medium", dryRunAvailable: true, requiresApproval: false,
             category: "scheduler",
             inputSchema: schema([
@@ -684,7 +684,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                     "type": .string("string"),
                     "enum": .array([
                         .string("notify"), .string("connector_action"),
-                        .string("dream"), .string("rem"), .string("improve"),
+                        .string("dream"), .string("rem"),
                         .string("harness_benchmark"), .string("proactive_scan"),
                     ]),
                 ])),
@@ -693,7 +693,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("one_shot", prop("boolean")),
                 ("payload", .object([
                     "type": .string("object"),
-                    "description": .string("For notify: title/message. For connector_action: actionId/input. For improve/dream/rem: objective. For proactive_scan: reason/limit/surfaceLimit."),
+                    "description": .string("For notify: title/message. For connector_action: actionId/input. For dream/rem: objective. For proactive_scan: reason/limit/surfaceLimit."),
                 ])),
             ], required: ["name", "kind"])
         ),

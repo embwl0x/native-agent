@@ -1,13 +1,17 @@
 import Foundation
+import ApprovalTransactions
 import AttentionRouting
 import ApprovalInbox
 import Desk
 import DeviceSync
+import KnowledgeGraph
 import MemoryV2
 import NativeAgentShared
 import NotificationInbox
 import PersistenceCore
+import PersonaEngine
 import ProviderRouting
+import SelfImprovement
 import ToolRegistry
 import Transcripts
 
@@ -81,15 +85,14 @@ extension NAProviderCatalogProvider {
     }
 }
 
-/// Device sync's reads and actions through the app's NativeClient, the live
-/// engine's facades, remote Mac control and the attention router.
+/// Device sync's reads and actions through the live engine's facades and the
+/// app's owners, remote Mac control and the attention router.
 struct AppDeviceSyncHost: DeviceSyncHost {
     func retryRequestedResults() async {
         do { try await AttentionRouter.shared.retryRequestedResults(dataRoot: PersistenceCore.defaultDataRoot()) }
         catch { nativeLog("requested_result: publication retry failed: %@", error.localizedDescription) }
     }
 
-    private var api: NativeClient { NativeClient() }
     private var engine: NativeAgentEngine { NativeAgentEngine.live }
 
     func getWorkshopExecutions() async throws -> DeviceSyncSnapshotRows { try await engine.desk.taskRows() }
@@ -128,9 +131,9 @@ struct AppDeviceSyncHost: DeviceSyncHost {
     func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows {
         try await engine.memory.proposals(status: "pending").map(MemoryProposalRecord.init)
     }
-    func getTrainingProposals() async throws -> DeviceSyncSnapshotRows { try await api.getTrainingProposals() }
-    func getPromotionPending() async throws -> DeviceSyncSnapshotRows { try await api.getPromotionPending() }
-    func getSkills() async throws -> DeviceSyncSnapshotRows { try await api.getSkills() }
+    func getTrainingProposals() async throws -> DeviceSyncSnapshotRows { [JSONValue]() }
+    func getPromotionPending() async throws -> DeviceSyncSnapshotRows { [JSONValue]() }
+    func getSkills() async throws -> DeviceSyncSnapshotRows { try await RuntimeReadProjection.skills(dataRoot: engine.dataRoot) }
     func activeMemories() async throws -> [MemoryV2.MemoryRecord] { try await engine.memory.activeMemories() }
     func getConnectors() async throws -> DeviceSyncSnapshotRows { try await mobileConnectors() }
     func mobileToolCatalog() async throws -> [MobileToolCatalogRecord] {
@@ -142,13 +145,15 @@ struct AppDeviceSyncHost: DeviceSyncHost {
         return (try ProvidersFacade.connections(from: snapshot).map(NAProviderCatalogProvider.init), snapshot.routing)
     }
     func trustSnapshotData() async throws -> Data { try await engine.trust.snapshotData() }
-    func getPersonality() async throws -> PersonalityProfile { try await api.getPersonality() }
+    func getPersonality() async throws -> PersonalityProfile {
+        try PersonaCompiler.compileProfile(dataRoot: engine.dataRoot).sharedProfile
+    }
     func approvals() async throws -> [ApprovalRequest] {
         try await engine.approvals.list().map(ApprovalRequest.init(record:))
     }
     func inboxItems() async throws -> [InboxItemRecord] { try await engine.inbox.list() }
-    func knowledgeGraphSnapshotData() async throws -> Data { try await NativeClient.canonicalKnowledgeGraphSnapshotData() }
-    func getRunsStrict() async -> [RunRecord]? { await api.getRunsStrict() }
+    func knowledgeGraphSnapshotData() async throws -> Data { try await KnowledgeGraphReadProjection.canonicalKnowledgeGraphSnapshotData() }
+    func getRunsStrict() async -> [RunRecord]? { await RuntimeReadProjection.runs(dataRoot: engine.dataRoot) }
     func turnSummariesSnapshotData(root: URL?, now: Date) async -> Data? {
         let root = root ?? TurnSummarySource.liveRoot()
         return await Task.detached(priority: .utility) { () -> Data? in
@@ -160,15 +165,17 @@ struct AppDeviceSyncHost: DeviceSyncHost {
     }
 
     func submitWorkshopExecution(title: String, objective: String) async throws -> DeviceSyncWorkshopSubmission {
-        let result = try await api.submitWorkshopExecution(title: title, objective: objective)
-        return DeviceSyncWorkshopSubmission(executionId: result.executionId, id: result.id,
-                                            desk_handle: result.desk_handle, desk_alias: result.desk_alias)
+        let result = try await BackgroundLoopsAssembly.submitDeskTask(title: title, objective: objective)
+        return DeviceSyncWorkshopSubmission(executionId: result.executionId, id: result.executionId,
+                                            desk_handle: result.deskItem.handle, desk_alias: result.deskItem.alias)
     }
     func approveStep(executionId: String, stepId: String, provenance: ApprovalResolutionProvenance) async throws {
-        _ = try await api.approveStep(executionId: executionId, stepId: stepId, provenance: provenance)
+        _ = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
+            executionId: executionId, stepId: stepId, decision: "approve", provenance: provenance)
     }
     func rejectStep(executionId: String, stepId: String, provenance: ApprovalResolutionProvenance) async throws {
-        _ = try await api.rejectStep(executionId: executionId, stepId: stepId, provenance: provenance)
+        _ = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
+            executionId: executionId, stepId: stepId, decision: "reject", provenance: provenance)
     }
     func acceptMemoryProposal(proposalID: String) async throws -> MemoryV2.MemoryRecord {
         try await engine.memory.accept(proposalID: proposalID)
@@ -177,14 +184,12 @@ struct AppDeviceSyncHost: DeviceSyncHost {
         try await engine.memory.reject(proposalID: proposalID, reason: reason)
     }
     func deleteMemory(id: String) async throws { try await engine.memory.delete(id: id) }
-    func approvePromotionPending(id: String) async throws { _ = try await api.approvePromotionPending(id: id) }
-    func rejectPromotionPending(id: String, reason: String) async throws {
-        _ = try await api.rejectPromotionPending(id: id, reason: reason)
-    }
     func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord {
-        try await api.resolveApproval(id: id, decision: decision, provenance: provenance)
+        try await ApprovalTransactionCoordinator.app().resolveApproval(id: id, decision: decision, provenance: provenance)
     }
-    func inboxAction(_ id: String, action: String) async throws { try await api.inboxAction(id, action: action) }
+    func inboxAction(_ id: String, action: String) async throws {
+        try await InboxCardActions.perform(id, action: action, dataRootOverride: nil)
+    }
     @MainActor
     func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String] {
         try await InteractionCardDelivery.answer(payload: payload, actionID: actionID, clientID: clientID,
@@ -192,29 +197,32 @@ struct AppDeviceSyncHost: DeviceSyncHost {
     }
     func cancelChatSession(sessionId: String) async throws { try await engine.turns.stop(sessionId: sessionId) }
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws {
-        _ = try await api.configureProvider(id, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
+        try await engine.providers.configureProvider(id: id, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
         await QuietSelfAdmin.shared.appModel?.adoptProviderForBlankSurfaces(id)
     }
-    func testProvider(_ id: String) async throws -> NativeAgentShared.ProviderTestResult { try await api.testProvider(id) }
-    func clearProvider(_ id: String) async throws { _ = try await api.clearProvider(id) }
+    func testProvider(_ id: String) async throws -> NativeAgentShared.ProviderTestResult { try await engine.providers.testProvider(id) }
+    func clearProvider(_ id: String) async throws { try await engine.providers.clearProvider(id) }
     func setActiveProvider(surface: String, providerId: String) async throws {
-        _ = try await api.setActiveProvider(surface: surface, providerId: providerId)
+        try await engine.providers.routing.setActiveProvider(surface: surface, providerId: providerId)
     }
     func configureModel(surface: String, model: String, reasoningEffort: String, serviceTier: String?, inferProvider: Bool) async throws {
-        _ = try await api.configureModel(surface: surface, model: model, reasoningEffort: reasoningEffort,
-                                         serviceTier: serviceTier, inferProvider: inferProvider)
+        _ = try await engine.providers.saveSurfaceSelection(
+            surface: surface, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier,
+            providerID: inferProvider ? SwiftNativeProviderRouting.inferredProviderID(forModel: model) : nil)
     }
     func setSurfaceModel(surface: String, model: String, inferProvider: Bool) async throws {
-        _ = try await api.setSurfaceModel(surface: surface, model: model, inferProvider: inferProvider)
+        _ = try await engine.providers.saveSurfaceSelection(
+            surface: surface, model: model, reasoningEffort: nil, serviceTier: nil,
+            providerID: inferProvider ? SwiftNativeProviderRouting.inferredProviderID(forModel: model) : nil)
     }
     func configureSurfaceSelection(surface: String, providerID: String, model: String, reasoningEffort: String, serviceTier: String?) async throws {
-        _ = try await api.configureSurfaceSelection(surface: surface, providerID: providerID, model: model,
-                                                    reasoningEffort: reasoningEffort, serviceTier: serviceTier)
+        _ = try await engine.providers.saveSurfaceSelection(
+            surface: surface, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier, providerID: providerID)
     }
     @MainActor func pinnedChatSessionIDs() -> [String] { MacPinnedChatSessionStore.load() }
     @MainActor func savePinnedChatSessionIDs(_ ids: [String]) throws { try MacPinnedChatSessionStore.save(ids) }
     func remoteMacControl(payload: [String: String]) async throws -> [String: String] {
-        try await MacSyncRemoteMacControl(port: AppMacSyncRemoteMacControlPort(api: api)).dispatch(payload: payload)
+        try await MacSyncRemoteMacControl(port: AppMacSyncRemoteMacControlPort()).dispatch(payload: payload)
     }
 
     func knockNeedsUser(title: String, body: String, userInfo: [String: String]) async throws {

@@ -24,38 +24,6 @@ public protocol PureToolArgumentValidating: Sendable {
 // If the bridge is nil (e.g. headless ChatDrive, or app-side init forgot to
 // wire it), the tool returns a `bridge_not_wired` error envelope rather than
 // throwing — keeping the chat turn intact for the LLM to recover from.
-// MARK: - EvolutionToolBridge
-//
-// 2026-06-11 (U2b) — the three privileged self-evolution chat tools
-// (evolution_propose / evolution_status / self_install) manipulate the
-// EvolutionProposalStore and stage a self_evolution.apply approval card. The
-// store lives in the SelfImprovement module and the stager in the
-// NativeAgentApp target; ChatOrchestration is a leaf module that does NOT
-// depend on SelfImprovement (verified — adding it would invert the module
-// graph). So the seam mirrors MacIntegrationToolBridge: the app injects a
-// conforming bridge at SwiftToolDispatcher init time, the dispatch cases
-// gate on Full-Mac file_ops_allowed and then forward to the bridge, and a
-// nil bridge returns a `bridge_not_wired` envelope (never throws — keep the
-// turn intact for the LLM to recover).
-//
-// These tools do NOT spawn a Process (unlike the builder tools / restart_app):
-// they are store mutations + an approval-card stage. self_install only STAGES
-// a card a human still approves — it never calls systemRebuild or applies.
-public protocol EvolutionToolBridge: Sendable {
-    /// File a new evolution proposal into the store. Write.
-    func evolutionPropose(input: [String: JSONValue]) async throws -> JSONValue
-    /// Read a single proposal or list in-flight proposals. Read-only.
-    func evolutionStatus(input: [String: JSONValue]) async throws -> JSONValue
-    /// Withdraw one of the agent's OWN proposals (source=chat) to the terminal
-    /// denied state. Write, but strictly de-escalating: it cancels a pending
-    /// self-change, never applies one. Refuses terminal records, records with a
-    /// candidate run in flight, and anything the agent did not file itself.
-    func evolutionWithdraw(input: [String: JSONValue]) async throws -> JSONValue
-    /// Validate a candidate_green proposal and STAGE its self_evolution.apply
-    /// approval card (idempotent). Never installs — a human still approves.
-    func evolutionStageInstall(input: [String: JSONValue]) async throws -> JSONValue
-}
-
 public protocol MacIntegrationToolBridge: Sendable {
     func calendarListUpcoming(input: [String: JSONValue]) async throws -> JSONValue
     func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue

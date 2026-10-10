@@ -940,3 +940,105 @@ public func makeDispatcher(
         autonomyResolver: autonomyResolver
     )
 }
+
+/// A chat slash command dispatched straight to the read-only local actions:
+/// persona_read, workspace_list, time_now, persona_list_skills, read_file,
+/// file_excerpt and system_info. Every other tool fails closed inside
+/// `SwiftNativeDispatcher` with `native_handler_missing`; there is no daemon
+/// or HTTP fallback.
+public func dispatchSlashCommand(
+    tool: String,
+    input: [String: JSONValue],
+    sessionId: String?,
+    dataRoot: URL
+) async throws -> DispatchResult {
+    // The registries are disjoint, so the union order is immaterial.
+    var handlers: [String: ConnectorActionHandler] = [:]
+    var sideEffecting: Set<String> = []
+    var trivialVerify: Set<String> = []
+    for registry in [
+        LocalConnectorActions.personaReadOnly, .workspaceListReadOnly, .timeNowReadOnly,
+        .personaListSkillsReadOnly, .readFileReadOnly, .fileExcerptReadOnly, .systemInfoReadOnly,
+    ] {
+        for name in registry.toolNames {
+            handlers[name] = { input, ctx in registry.run(name, input: input, ctx: ctx) ?? .null }
+            if registry.isSideEffecting(name) { sideEffecting.insert(name) }
+            if registry.isTrivialVerify(name) { trivialVerify.insert(name) }
+        }
+    }
+    let dispatcher = makeDispatcher(localActions: LocalConnectorActions(
+        handlers: handlers, sideEffecting: sideEffecting, trivialVerify: trivialVerify
+    ))
+    let ctx: DispatchContext
+    // Only the two file reads get the sandbox context. An empty repo root
+    // would leave `FileSystemActions.allowedRoots` empty and skip the sandbox
+    // guard, so an absolute path like /etc/passwd would read; the other
+    // actions derive their persona root from `_na_data_root` in test mode
+    // only, so handing them this context would move their persona root.
+    if tool == "read_file" || tool == "file_excerpt" {
+        // A repo root only when the data root's parent carries every repo
+        // marker: a bare Application Support root's parent is the whole
+        // Application Support tree. Without one the read is refused locally.
+        guard let repoRootURL = PersistenceCore.resolveSandboxRepoRoot(dataRoot: dataRoot) else {
+            return missingNativeHandler(tool: tool)
+        }
+        let repoRoot = repoRootURL.path
+        var extra: [String: JSONValue] = [
+            "file_access": .object([
+                "mode": .string("read_only"),
+                "sandbox": .string("read_only"),
+            ]),
+        ]
+        // The data root lets `isSensitiveDataPath` block OAuth tokens, pairing
+        // secrets and provider credentials that live under the repo root.
+        if !dataRoot.path.isEmpty {
+            extra["_na_data_root"] = .string(dataRoot.path)
+        }
+        ctx = DispatchContext(
+            repoRoot: repoRoot,
+            cwd: repoRoot,
+            surface: "chat",
+            sessionId: sessionId ?? "",
+            persona: "",
+            activeProvider: "",
+            extra: extra
+        )
+    } else {
+        ctx = DispatchContext.defaultForSurface("chat", sessionId: sessionId ?? "")
+    }
+    do {
+        return try await dispatcher.dispatch(tool: tool, input: input, ctx: ctx, dryRun: false)
+    } catch let err as DispatcherError {
+        throw NSError(domain: "NativeAgentDispatcher", code: -1,
+                      userInfo: [NSLocalizedDescriptionKey: err.localizedDescription])
+    }
+}
+
+/// The failed receipt for a tool with no Swift-native handler here.
+private func missingNativeHandler(tool: String) -> DispatchResult {
+    FileHandle.standardError.write(Data("dispatchSlashCommand: no native handler for tool=\(tool)\n".utf8))
+    return DispatchResult(
+        ok: false,
+        tool: tool,
+        status: "failed",
+        output: nil,
+        error: DispatchError(
+            code: "native_handler_missing",
+            message: "No Swift-native handler is available for tool '\(tool)'",
+            tool: tool.isEmpty ? nil : tool,
+            argsHash: nil,
+            recoverable: false
+        ),
+        executed: false,
+        verifyPassed: nil,
+        durationUs: 0,
+        durationMs: 0,
+        argsHash: "",
+        effectiveAutonomy: "",
+        autonomySource: "",
+        providerMatch: false,
+        traceEventId: "",
+        runId: UUID().uuidString.lowercased(),
+        startedAt: dispatcherNowISO(Date())
+    )
+}

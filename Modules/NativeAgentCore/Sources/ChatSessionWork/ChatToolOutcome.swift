@@ -39,6 +39,9 @@ public enum ChatToolOutcome {
     public enum ExactResultClass: String, Sendable, Equatable {
         case succeeded
         case failed
+        /// A failure that names itself: denied, rejected or refused. Every
+        /// reader that grades failure counts it as one.
+        case refused
         case cancelled
         case timeout
         case unknown
@@ -100,8 +103,15 @@ public enum ChatToolOutcome {
         guard case .object(let object) = output else {
             return output == .null ? .unknown : .succeeded
         }
+        let status: String? = {
+            guard case .string(let raw)? = object["status"] else { return nil }
+            return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }()
         // Explicit failure/refusal/timeout evidence outranks pending states,
-        // dry runs, and even an otherwise completed operation record.
+        // dry runs, and even an otherwise completed operation record. A
+        // refusal says why it failed, so it outranks the generic markers.
+        if case .bool(true)? = object["refused"] { return .refused }
+        if let status, ["denied", "rejected", "refused"].contains(status) { return .refused }
         if let error = object["error"], error != .null { return .failed }
         if object["outcome"] == .string("unmet") { return .failed }
         if case .bool(false)? = object["ok"] { return .failed }
@@ -109,13 +119,8 @@ public enum ChatToolOutcome {
         if case .bool(true)? = object["isError"] { return .failed }
         if case .bool(true)? = object["is_error"] { return .failed }
         if case .bool(true)? = object["failed"] { return .failed }
-        if case .bool(true)? = object["refused"] { return .failed }
         if case .bool(true)? = object["timed_out"] { return .timeout }
         if case .bool(true)? = object["timeout"] { return .timeout }
-        let status: String? = {
-            guard case .string(let raw)? = object["status"] else { return nil }
-            return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }()
         if let status, failureStatuses.contains(status) { return .failed }
         if let status, ["timeout", "timed_out"].contains(status) { return .timeout }
         if let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 { return .failed }
@@ -124,7 +129,8 @@ public enum ChatToolOutcome {
         if let projected = MacControlReceiptOutcome.projecting(envelope: output) {
             switch projected {
             case .succeeded: break // Explicit failure markers still veto success.
-            case .failed, .refused: return .failed
+            case .failed: return .failed
+            case .refused: return .refused
             case .cancelled: return .cancelled
             case .timedOut: return .timeout
             case .running, .effectUnconfirmed: return .unknown

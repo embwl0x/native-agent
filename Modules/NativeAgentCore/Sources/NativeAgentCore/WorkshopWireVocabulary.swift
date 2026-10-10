@@ -106,7 +106,6 @@ public enum ExecutionEventVocabulary {
     public static let renames: [(legacy: String, canonical: String)] = [
         ("mission.step", "execution.step"),
         ("mission_complete", "execution_complete"),
-        ("mission_followup", "execution_followup"),
         ("mission_cancelled", "execution_cancelled"),
     ]
 
@@ -180,15 +179,6 @@ public enum WorkshopStepApprovalPayload {
         }
         return nil
     }
-}
-
-/// The TriggerScheduler trigger that fires when a Workshop execution finishes:
-/// row `name` + row `kind` + the `<kind>:<id>` inbox-card source prefix.
-public enum WorkshopCompletionTrigger {
-    public static let canonicalName = "execution_followup"
-    public static let legacyName = "mission_followup"
-    public static let canonicalKind = "execution_complete"
-    public static let legacyKind = "mission_complete"
 }
 
 // MARK: - Wave 4: cross-device keys, READ-BOTH ONLY (phase A)

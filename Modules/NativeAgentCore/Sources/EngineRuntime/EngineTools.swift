@@ -6,14 +6,15 @@ import Observation
 import ChatOrchestration
 import PersistenceCore
 import ToolRegistry
+import ToolExecution
 import MCPDispatcher
 
 /// `NativeAgentEngine.tools` (S10): the tool catalog and the authored-tool
 /// registry for one data root, in core types. The Tools page renders
 /// `catalog` (every tool, its load state and its trust here) and `authored`;
 /// the reads are nonisolated so the phone snapshot and Doctor use the same
-/// owner. Registry writes (auto-run, promote, quarantine) still run through
-/// the tool executors on `NativeClient`.
+/// owner. Registry writes (auto-run, promote, quarantine) read back through
+/// the same authored-field check.
 @MainActor
 @Observable
 public final class ToolsFacade {
@@ -34,9 +35,12 @@ public final class ToolsFacade {
         self.ports = ports
     }
 
+    /// The MCP registry, consent ledger and live sessions for this data root.
+    public nonisolated var mcp: SwiftNativeMCPDispatcher { SwiftNativeMCPDispatcher(root: dataRoot) }
+
     /// Core session rows, including the subprocess pool's live state.
     public nonisolated func listMCPSessions() async throws -> [MCPSessionStatus] {
-        try await SwiftNativeMCPDispatcher(root: dataRoot).listSessions()
+        try await mcp.listSessions()
     }
 
     /// The trust-aware tool manifest, through the same dispatcher composition
@@ -94,6 +98,33 @@ public final class ToolsFacade {
                 reason: "tool \(record.id) has no valid \(field)"
             )
         }
+    }
+
+    /// Promote a proposal. The promoted record carries the registry's typed
+    /// slots plus every extras key the promote engine merges in, and reads
+    /// back through the same authored-field check as the list.
+    public nonisolated func promote(id: String, allowRisky: Bool) async throws -> ToolRecord {
+        let proposal = try await SwiftNativeToolExecution(root: dataRoot)
+            .promote(id: id, allowRisky: allowRisky).toJSON()
+        if let field = ToolRecord.stringFieldProblem(in: proposal) {
+            throw ToolRegistryError.registryUnreadable(reason: "promoted tool \(id) has no valid \(field)")
+        }
+        guard let record = ToolRecord(json: proposal) else {
+            throw ToolRegistryError.registryUnreadable(reason: "promoted tool \(id) has no registry record")
+        }
+        try Self.checkAuthored(record)
+        return record
+    }
+
+    public nonisolated func quarantine(id: String, reason: String) async throws -> ToolRecord {
+        let record = try await SwiftNativeToolRegistry(root: dataRoot).quarantine(id: id, reason: reason)
+        try Self.checkAuthored(record)
+        return record
+    }
+
+    /// The registry refuses `autoRun`: it has no execution consumer.
+    public nonisolated func updateTool(id: String, autoRun: Bool) async throws -> ToolRecord {
+        try await ToolRegistryActions.updateTool(id: id, autoRun: autoRun, dataRoot: dataRoot, validate: Self.checkAuthored)
     }
 
     /// Loads the catalog into `catalog`, recording a failure instead of

@@ -419,7 +419,7 @@ struct TrustGuardrailSummaryPanel: View {
 }
 
 extension TrustGuardrailSummaryPanel {
-    /// What `NativeClient.createBackup` copies: the app's own data under its
+    /// What `TrustBackupPersistence.createBackup` copies: the app's own data under its
     /// data root (settings, memory, chats, skills, tools, connectors, jobs,
     /// persona), never files in the person's folders.
     fileprivate var backupNowButton: some View {

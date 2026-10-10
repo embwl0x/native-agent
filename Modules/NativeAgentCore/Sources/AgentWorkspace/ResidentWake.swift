@@ -75,23 +75,31 @@ package final class ResidentWake: @unchecked Sendable {
         (try? Data(contentsOf: url(root))).flatMap { try? JSONDecoder().decode(Ledger.self, from: $0) } ?? Ledger()
     }
 
-    private func update<T>(_ root: URL, _ edit: (inout Ledger) -> T) -> T {
+    private func update<T>(_ root: URL, _ edit: (inout Ledger) -> T) -> T { kept(root, edit).result }
+
+    /// `saved` is false when the changed ledger could not be written.
+    private func kept<T>(_ root: URL, _ edit: (inout Ledger) -> T) -> (result: T, saved: Bool) {
         lock.withLock {
             var ledger = Self.read(root)
             let before = ledger
             let result = edit(&ledger)
             ledger.recent = Array(ledger.recent.filter { Date().timeIntervalSince($0.at) < 86_400 }.suffix(128))
-            if ledger != before {
-                do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(ledger), to: Self.url(root)) }
-                catch { nativeLog("ResidentWake: could not keep arrivals: %@", error.localizedDescription) }
+            guard ledger != before else { return (result, true) }
+            do {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(ledger), to: Self.url(root))
+                return (result, true)
+            } catch {
+                nativeLog("ResidentWake: could not keep arrivals: %@", error.localizedDescription)
+                return (result, false)
             }
-            return result
         }
     }
 
-    /// Keep these arrivals; the wake follows on its own terms.
-    package func request(dataRoot: URL, reason: String, items: [Item]) {
-        update(dataRoot) { ledger in
+    /// Keep these arrivals; the wake follows on its own terms. False when
+    /// they could not be kept.
+    @discardableResult
+    package func request(dataRoot: URL, reason: String, items: [Item]) -> Bool {
+        kept(dataRoot) { ledger in
             var known = Set((ledger.pending + ledger.recent).map(\.id))
             for var item in items where known.insert(item.id).inserted {
                 item.reason = reason
@@ -99,7 +107,7 @@ package final class ResidentWake: @unchecked Sendable {
                 ledger.pending.append(item)
             }
             ledger.pending = Array(ledger.pending.suffix(64))
-        }
+        }.saved
     }
 
     /// Takes back a pending item on `key` that has not reached her (it flapped).
@@ -108,6 +116,16 @@ package final class ResidentWake: @unchecked Sendable {
             let count = ledger.pending.count
             ledger.pending.removeAll { $0.key == key }
             return ledger.pending.count != count
+        }
+    }
+
+    /// Takes back every arrival on `key`, pending or already hers today: what
+    /// it said is no longer true, so its home line goes and a recurrence is a
+    /// new arrival.
+    package func clear(dataRoot: URL, key: String) {
+        update(dataRoot) { ledger in
+            ledger.pending.removeAll { $0.key == key }
+            ledger.recent.removeAll { $0.key == key }
         }
     }
 

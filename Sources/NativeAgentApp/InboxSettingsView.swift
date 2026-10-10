@@ -3,6 +3,8 @@ import SwiftUI
 import NotificationInbox
 import Observation
 import TrustCenter
+import TriggerScheduler
+import PersistenceCore
 
 /// A visible Inbox Policy outcome carries its own severity. Status text is
 /// user-facing copy and must never be treated as an error protocol.
@@ -19,8 +21,6 @@ struct InboxPolicyStatus: Equatable {
         case masterSaveFailed(String)
         case triggerSaved(name: String, enabled: Bool)
         case triggerSaveFailed(String)
-        case pathsSaved(count: Int)
-        case pathsSaveFailed(String)
     }
 
     let text: String
@@ -46,12 +46,6 @@ struct InboxPolicyStatus: Equatable {
         case let .triggerSaveFailed(detail):
             text = detail
             tone = .failure
-        case let .pathsSaved(count):
-            text = "Paths saved (\(count) entries)."
-            tone = .success
-        case let .pathsSaveFailed(detail):
-            text = detail
-            tone = .failure
         }
     }
 }
@@ -65,7 +59,6 @@ struct InboxPolicyStatusSlot: Equatable {
         case triggersRead
         case masterToggle
         case triggerToggle(String)
-        case watchedPaths
 
         private var order: String {
             switch self {
@@ -73,7 +66,6 @@ struct InboxPolicyStatusSlot: Equatable {
             case .triggersRead: return "1-triggers"
             case .masterToggle: return "2-master"
             case .triggerToggle(let name): return "3-toggle-\(name)"
-            case .watchedPaths: return "5-paths"
             }
         }
 
@@ -211,21 +203,15 @@ struct InboxSettingsView: View {
 
     @State private var masterEnabled: Bool = false
     @State private var suppressMasterSave = false
-    @State private var triggers: [InboxTriggerConfig] = []
+    @State private var triggers: [TriggerConfig] = []
     @State private var isLoading = false
     @State private var isSaving = false
-    @State private var isSavingPaths = false
     @State private var statusSlot = InboxPolicyStatusSlot()
     @State private var trustReadState: InboxPolicyTrustReadState = .loading
     @State private var inboxHistoryRoute = InboxHistoryRoute()
     /// The trigger read has come back once, either way: the header may speak.
     @State private var triggersRead = false
 
-    // File watcher watched paths (comma-separated editing)
-    @State private var watchedPaths: String = ""
-
-    // Source the client from AppModel's canonical root and shared runtime.
-    private var client: NativeClient { appModel.client }
     private var triggersPanelGate: InboxPolicyTriggersPanelGate {
         InboxPolicyTriggersPanelGate.resolve(trustRead: trustReadState)
     }
@@ -327,7 +313,6 @@ struct InboxSettingsView: View {
                                     .padding(.vertical, AliveMetrics.rowInsetV)
                                 TriggerRowView(
                                     trigger: trigger,
-                                    watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
                                     onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) }
                                 )
                             }
@@ -380,43 +365,9 @@ struct InboxSettingsView: View {
                 .buttonStyle(.plain)
                 .disabled(inboxHistoryRoute.isLoading)
             }
-
-            if triggersPanelGate == .enabled,
-               triggers.first(where: { $0.name == "file_watch" })?.enabled == true {
-                VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-                    AliveEyebrow("Folders \(agentDisplayName) watches")
-                    AliveGroupCard {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("One folder path per line.")
-                                .font(.system(size: 13))
-                                .foregroundStyle(NativeAgentShell.secondary)
-                            watchedPathsEditor
-                            HStack(spacing: 8) {
-                                Button(isSavingPaths ? "Saving paths…" : "Save paths") {
-                                    Task { await saveWatchedPaths() }
-                                }
-                                .disabled(isSavingPaths)
-                                if isSavingPaths { ProgressView().controlSize(.small) }
-                            }
-                        }
-                    }
-                }
-                .transition(NativeAgentMotion.arrivalFade)
-            }
         }
         .padding(.bottom, 32)
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var watchedPathsEditor: some View {
-        TextEditor(text: $watchedPaths)
-            .accessibilityLabel("Folders the agent watches")
-            .accessibilityHint("Enter one folder path per line.")
-            .font(ShellType.code)
-            .scrollContentBackground(.hidden)
-            .frame(minHeight: 80)
-            .padding(8)
-            .houseInset(in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     // ── Data loading ──────────────────────────────────────────────────────
@@ -465,18 +416,13 @@ struct InboxSettingsView: View {
         // signal. Keep last-known rows and surface the real error in the
         // panel's status line instead.
         do {
-            let loadedTriggers = try await client.getInboxTriggers()
+            let loadedTriggers = try await appModel.engine.inbox.triggers()
             withAnimation(foldAnimation) { triggers = loadedTriggers }
             statusSlot.clear(source: .triggersRead)
         } catch {
             statusSlot.record(InboxPolicyStatus(.triggersLoadFailed(UserFacingError.message(error, action: "load triggers"))), from: .triggersRead)
         }
         triggersRead = true
-        // Load watched paths for file_watch trigger
-        if let fw = triggers.first(where: { $0.name == "file_watch" }),
-           let paths = fw.config?["paths"] {
-            watchedPaths = paths
-        }
     }
 
     func saveMaster(enabled: Bool) async {
@@ -488,9 +434,9 @@ struct InboxSettingsView: View {
             return !enabled
         }()
         do {
-            _ = try await client.postRaw("/v1/trust", body: [
-                "inboxPolicy": ["enabled": enabled]
-            ])
+            _ = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
+                body: ["inboxPolicy": ["enabled": enabled]], dataRoot: appModel.engine.dataRoot
+            )
             withAnimation(foldAnimation) { trustReadState = .loaded(enabled: enabled) }
             statusSlot.record(InboxPolicyStatus(.masterSaved(enabled: enabled)), from: .masterToggle)
         } catch {
@@ -509,31 +455,13 @@ struct InboxSettingsView: View {
     // in a position the server never accepted.
     func setTriggerEnabled(_ name: String, enabled: Bool) async -> Bool {
         do {
-            try await client.inboxTriggerEnable(name, enabled: enabled)
+            try await appModel.engine.inbox.setTrigger(name, enabled: enabled)
             statusSlot.record(InboxPolicyStatus(.triggerSaved(name: name, enabled: enabled)), from: .triggerToggle(name))
             await load()
             return true
         } catch {
             statusSlot.record(InboxPolicyStatus(.triggerSaveFailed(UserFacingError.message(error, action: "change that trigger"))), from: .triggerToggle(name))
             return false
-        }
-    }
-
-    func saveWatchedPaths() async {
-        guard !isSavingPaths else { return }
-        isSavingPaths = true
-        defer { isSavingPaths = false }
-        let paths = watchedPaths
-            .components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        do {
-            // Keep configuration on the typed NativeClient path so validation
-            // and persistence remain owned by TriggerScheduler.
-            try await client.inboxTriggerConfigure("file_watch", body: ["paths": paths])
-            statusSlot.record(InboxPolicyStatus(.pathsSaved(count: paths.count)), from: .watchedPaths)
-        } catch {
-            statusSlot.record(InboxPolicyStatus(.pathsSaveFailed(UserFacingError.message(error, action: "save the watched paths"))), from: .watchedPaths)
         }
     }
 
@@ -721,17 +649,15 @@ struct InboxTriggerToggleStateMachine: Equatable {
 }
 
 struct TriggerRowView: View {
-    let trigger: InboxTriggerConfig
-    @Binding var watchedPaths: String
+    let trigger: TriggerConfig
     // ui-honesty 2026-06-10: async + Bool result so the row can revert the
     // visual toggle when the server write fails.
     let onToggle: (Bool) async -> Bool
 
     @State private var toggleState: InboxTriggerToggleStateMachine
 
-    init(trigger: InboxTriggerConfig, watchedPaths: Binding<String>, onToggle: @escaping (Bool) async -> Bool) {
+    init(trigger: TriggerConfig, onToggle: @escaping (Bool) async -> Bool) {
         self.trigger = trigger
-        self._watchedPaths = watchedPaths
         self.onToggle = onToggle
         self._toggleState = State(initialValue: InboxTriggerToggleStateMachine(serverEnabled: trigger.enabled))
     }

@@ -215,58 +215,6 @@ extension BuiltInToolSchemaFactory {
                         required: ["reason"]
                     )
                 ),
-                // Evolution tools require Full Mac file access. Standard modes retain
-                // approval; admitted YOLO uses the same candidate/CAS/backup/rollback executor.
-                requestedSchema(
-                    name: "evolution_propose",
-                    description: "File a self-evolution proposal into the evolution store (data/evolution/proposals.json). Use when you have identified a concrete improvement to your own codebase. With a diff it lands as 'proposed'; without one it lands as 'needs_diff'. This records a proposal without editing the live repo, building, or installing it. Automatic candidate builds are unavailable. Requires Trust Center Full Mac file_ops_allowed; queues an approval unless toolAutonomy=auto for 'evolution_propose'.",
-                    parametersJSON: params(
-                        properties: [
-                            ("title", strSchema("Required. Short one-line description of the proposed change.")),
-                            ("evidence", strSchema("Required. Why this change is warranted — the usage/error/observation that motivates it.")),
-                            ("diff_text", strSchema("Optional. A unified diff. If given the proposal is 'proposed'; if omitted it is 'needs_diff'.")),
-                            ("expected_head", strSchema("Optional. The git HEAD sha the diff was authored against (staleness guard).")),
-                        ],
-                        required: ["title", "evidence"]
-                    )
-                ),
-                requestedSchema(
-                    name: "evolution_status",
-                    description: "Read the self-evolution proposal store. With proposal_id, return that one proposal's status + receipts; without it, list the in-flight proposals (proposed / building / candidate_green / staged). Read-only.",
-                    parametersJSON: params(
-                        properties: [
-                            ("proposal_id", strSchema("Optional. The evolution proposal id (evo_…). Omit to list in-flight proposals.")),
-                        ],
-                        required: []
-                    )
-                ),
-                // evolution_withdraw (2026-09-02): the queue was write-only
-                // from the agent's side — she could file a proposal and read
-                // status, but had no way to take back one filed by mistake.
-                // This is the only tool that walks a proposal BACKWARD, and it
-                // only ever lands on the terminal `denied` state the legal
-                // transition table already permits.
-                requestedSchema(
-                    name: "evolution_withdraw",
-                    description: "Withdraw one of your own self-evolution proposals — the one you filed by mistake. Moves it to the terminal 'denied' state with deny_reason 'withdrawn by agent: …' and an audit receipt. Refuses: proposals already in a terminal state (verified/reverted/denied), proposals recorded as 'building' (ask User to review this state), proposals past the withdrawal point (approved/installed — those need a revert, not a withdrawal), and any proposal you did not file yourself (only source='chat' records are yours; weekly / self_heal / external proposals are not withdrawable here). This never edits the live repo, never touches an installed change, and never withdraws anything on someone else's behalf. Requires Trust Center Full Mac file_ops_allowed; queues an approval unless toolAutonomy=auto for 'evolution_withdraw'; under the Everything (full run) trust posture the approval passes straight through and no card is shown.",
-                    parametersJSON: params(
-                        properties: [
-                            ("id", strSchema("Required. The evolution proposal id (evo_…) to withdraw. Must be one you filed (source='chat').")),
-                            ("reason", strSchema("Optional. Why you are withdrawing it. Recorded as the proposal's deny_reason, prefixed 'withdrawn by agent: '. Max 500 characters.")),
-                        ],
-                        required: ["id"]
-                    )
-                ),
-                requestedSchema(
-                    name: "self_install",
-                    description: "Advance a self-evolution proposal that has already built green (status candidate_green). Standard modes stage a self_evolution.apply approval card. Admitted Full Mac YOLO enters the same candidate/CAS/backup/rollback executor directly without a per-call prompt; installation still requires Trust Center systemRebuild to be enabled. Returns an honest 'not installable yet' envelope if the proposal is not candidate_green. Requires Trust Center Full Mac file_ops_allowed.",
-                    parametersJSON: params(
-                        properties: [
-                            ("proposal_id", strSchema("Required. The evolution proposal id (evo_…) to stage for install. Must be status candidate_green.")),
-                        ],
-                        required: ["proposal_id"]
-                    )
-                ),
             ])
         }
         if includeFullMacSystemTools {

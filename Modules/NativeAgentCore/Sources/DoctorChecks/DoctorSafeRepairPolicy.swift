@@ -66,6 +66,15 @@ public enum DoctorSafeRepairPolicy {
         }.count
     }
 
+    /// Core checks still return legacy repair copy. Only an advertised,
+    /// registered handler may survive in the report's executable field.
+    public static func executableCoreIDs(for checks: [CheckResult]) -> Set<String> {
+        let handlers = Set(SwiftNativeDoctorChecks.defaultChecks.compactMap {
+            $0 is any RepairingDoctorCheck ? $0.id : nil
+        })
+        return Set(checkIDs(for: checks)).intersection(handlers)
+    }
+
     /// Sign-ins and permissions are the only steps Doctor hands to User; they
     /// are gathered into one inbox ask.
     public static func isUserAsk(_ check: CheckResult) -> Bool {

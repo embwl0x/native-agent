@@ -13,7 +13,7 @@ public typealias WorkshopInboxNotification = @Sendable (URL, String, String, Str
 
 public enum WorkshopBackgroundWork {
     /// Build the fully wired executor. ONE construction point: the
-    /// background drain loop AND NativeClient's execution.step
+    /// background drain loop AND ApprovalTransactionCoordinator's execution.step
     /// resume-on-approve executor both come through here so resume runs
     /// with the exact closures the original drain ran with.
     public static func makeWorkshopExecutor(
@@ -62,12 +62,14 @@ public enum WorkshopBackgroundWork {
             // A test-root executor gets its own bodiless engine, as its planner
             // gets the unavailable LLM above.
             let client = chatClient(restricted)
-            let response = try await client.runEphemeralToolTurn(
+            let response = try await LLMCallContext.$purpose.withValue("workshop") {
+            try await client.runEphemeralToolTurn(
                 message: prompt,
                 fileAccess: "read_only",
                 requireCompleted: true,
                 surface: WorkshopSurfaceVocabulary.canonical
             )
+            }
             guard let providerCallCount = response.providerCallCount else {
                 throw NSError(domain: "WorkshopExecutor", code: 500, userInfo: [
                     NSLocalizedDescriptionKey: "Desk task synthesis completed without exact provider accounting",
@@ -239,7 +241,7 @@ public enum WorkshopBackgroundWork {
     }
 
     /// execution.step approval stager: ONE ApprovalInbox record per blocked
-    /// step (NativeClient.resolveApproval's "execution.step" executor resumes
+    /// step (ApprovalTransactionCoordinator.resolveApproval's "execution.step" executor resumes
     /// the Workshop execution on approve/deny) plus a card in
     /// notifications/inbox.jsonl with card id == approval id — the exact
     /// REM-stager contract. Dedupe: an existing PENDING execution.step

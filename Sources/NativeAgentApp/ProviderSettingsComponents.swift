@@ -66,7 +66,7 @@ struct ProviderRowView: View {
 
 // FIRSTRUN-2 (2026-08-01): Save writes a key to disk and used to report a flat
 // "Saved." Readiness everywhere downstream is inferred from file presence
-// (NativeClient+Providers.swift synthesizes `hasToken` from the file), so a
+// (provider readiness synthesizes `hasToken` from the file), so a
 // typo'd or revoked key read as a working provider until the first chat failed.
 //
 // Writing a key is not proof the key works. Save now moves the sheet into
@@ -523,7 +523,7 @@ struct ProviderConfigSheet: View {
         let savedInput = apiKey
         let savedAuthMode = authMode
         do {
-            _ = try await appModel.configureProvider(
+            try await appModel.configureProvider(
                 provider.provider_id,
                 apiKey: savedAuthMode == "api_key" ? savedInput : nil,
                 authMode: savedAuthMode,

@@ -44,7 +44,7 @@ public enum GitHubCommandStateName: String, Codable, Sendable, CaseIterable {
     case needsCodex = "needs_codex"
     case codexWorking = "codex_working"
     case verifying
-    case needsUser = "needs_user"
+    case needsOwner = "needs_user"
     case waitingUpstream = "waiting_upstream"
     case attention
     case resolved
@@ -55,7 +55,7 @@ public enum GitHubCommandItemState: Codable, Sendable, Equatable {
     case needsCodex
     case codexWorking
     case verifying
-    case needsUser
+    case needsOwner
     case waitingUpstream(GitHubCommandWaitingKind)
     case attention(GitHubCommandAttentionReason)
     case resolved
@@ -66,7 +66,7 @@ public enum GitHubCommandItemState: Codable, Sendable, Equatable {
         case .needsCodex: return .needsCodex
         case .codexWorking: return .codexWorking
         case .verifying: return .verifying
-        case .needsUser: return .needsUser
+        case .needsOwner: return .needsOwner
         case .waitingUpstream: return .waitingUpstream
         case .attention: return .attention
         case .resolved: return .resolved
@@ -96,7 +96,7 @@ public enum GitHubCommandItemState: Codable, Sendable, Equatable {
         case .needsCodex: self = .needsCodex
         case .codexWorking: self = .codexWorking
         case .verifying: self = .verifying
-        case .needsUser: self = .needsUser
+        case .needsOwner: self = .needsOwner
         case .waitingUpstream:
             self = .waitingUpstream(try box.decode(GitHubCommandWaitingKind.self, forKey: .kind))
         case .attention:

@@ -712,7 +712,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             ticket.publish(
                 cached.values,
                 alternate: cached.alternateValues,
-                modelFingerprint: cached.modelFingerprint
+                modelFingerprint: cached.modelFingerprint,
+                modelID: cached.modelID
             )
             return ticket
         }
@@ -724,6 +725,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         guard semanticQueryTickets.count < Self.maximumConcurrentSemanticQueries else { return nil }
         let ticket = ContextQueryEmbeddingTicket()
         semanticQueryTickets[key] = ticket
+        let modelID = runtime.modelId
         semanticQueryTasks[key] = Task(priority: .utility) { [weak self, memory] in
             let value: ContextQueryEmbeddingValue?
             do {
@@ -733,7 +735,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                     ContextQueryEmbeddingValue(
                         values: $0,
                         alternateValues: batch.vectors.count > 1 ? batch.vectors[1] : nil,
-                        modelFingerprint: batch.epoch.rawValue
+                        modelFingerprint: batch.epoch.rawValue,
+                        modelID: modelID
                     )
                 }
             } catch {
@@ -778,7 +781,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         ticket?.publish(
             value.values,
             alternate: value.alternateValues,
-            modelFingerprint: value.modelFingerprint
+            modelFingerprint: value.modelFingerprint,
+            modelID: value.modelID
         )
     }
 

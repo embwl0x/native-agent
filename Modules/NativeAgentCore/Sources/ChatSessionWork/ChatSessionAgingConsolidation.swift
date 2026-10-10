@@ -362,7 +362,7 @@ public struct ChatSessionAgingConsolidation: Sendable {
                     prompt: prompt,
                     system: ChatCompactionDistiller.distillSystem,
                     model: model,
-                    surface: ChatCompactionDistiller.distillSurface
+                    surface: ChatCompactionDistiller.distillSurface, purpose: "compaction"
                 )
             },
             now: now

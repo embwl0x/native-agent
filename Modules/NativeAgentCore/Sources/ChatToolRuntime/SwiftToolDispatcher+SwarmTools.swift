@@ -190,7 +190,7 @@ struct AgentSwarmInheritedToolScope: ToolDispatchClient {
         "agent_swarm",
         "invoke_codex",
         "codex_message", "claude_message", "omp_message",
-        "install_app", "restart_app", "self_install",
+        "install_app", "restart_app",
     ]
 
     /// A worker sees Core's own catalog, as it did before the app's tools

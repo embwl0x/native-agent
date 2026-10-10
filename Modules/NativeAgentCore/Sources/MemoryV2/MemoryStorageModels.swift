@@ -20,8 +20,13 @@ public enum MemoryLifecycle {
     public static let corrected = "corrected"
     public static let contradicted = "contradicted"
     public static let deleted = "deleted"
+    /// A standing lesson approved into GROWTH: kept as history (and in the
+    /// miss ledger), no longer recalled — the prefix carries it now.
+    public static let graduated = "graduated"
 
-    public static let recallExcluded: Set<String> = [corrected, contradicted, deleted]
+    public static let recallExcluded: Set<String> = [corrected, contradicted, deleted, graduated]
+    /// `recallExcluded` as the SQL list every store query filters with.
+    public static let recallExcludedSQL = "(" + recallExcluded.sorted().map { "'\($0)'" }.joined(separator: ", ") + ")"
 
     public static func normalized(_ value: String?) -> String {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
@@ -38,7 +43,7 @@ public enum MemoryLifecycle {
             return 0.85
         case stale:
             return 0.5
-        case corrected, contradicted, deleted:
+        case corrected, contradicted, deleted, graduated:
             return 0.0
         default:
             return 1.0

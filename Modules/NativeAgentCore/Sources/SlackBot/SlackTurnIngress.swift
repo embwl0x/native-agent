@@ -4,6 +4,13 @@ import PersistenceCore
 import PersonaEngine
 
 extension SlackSocketModeLoop {
+    /// Why `ifConfigured` built nothing, said as the lane's Off reason: Socket
+    /// Mode switched off in the saved Slack config, or Slack not connected.
+    public static func offReason(dataRoot: URL) -> String {
+        SlackSocketModeConfig.socketModeSwitchedOff(dataRoot: dataRoot)
+            ? "Socket Mode off" : "Slack not connected (no bot and app token)"
+    }
+
     /// The Slack surface, built only when Socket Mode is configured and
     /// enabled. The host supplies the engine's Slack-profiled chat client
     /// (built only past the config check) and a transcript-completion signal

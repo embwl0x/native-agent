@@ -447,7 +447,7 @@ extension AppToolExecutor {
     }
 
     /// A write the row refused or that failed, with what was asked and what
-    /// it reads now. A value that would raise Trust is User's: `users_call`.
+    /// it reads now. A value that would raise Trust is User's: `owners_call`.
     @MainActor
     private static func settingWriteFailure(
         _ error: Error, _ setting: QuietSetting, _ requestedValue: JSONValue, host: any QuietToolHost,
@@ -460,7 +460,7 @@ extension AppToolExecutor {
             "current_value": await setting.read(host),
         ]
         for (key, value) in detail { extra[key] = value }
-        let code = if case QuietSettingError.users = error { "users_call" } else { "write_refused" }
+        let code = if case QuietSettingError.users = error { "owners_call" } else { "write_refused" }
         return failure(code, error.localizedDescription, extra: extra)
     }
 

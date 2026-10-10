@@ -2,17 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-public struct BrowserRouteDecodedRun<Value> {
-    public let value: Value
-    public let id: String
-    public let status: String
-    public init(value: Value, id: String, status: String) {
-        self.value = value
-        self.id = id
-        self.status = status
-    }
-}
-
 /// Physical browser work and app integration; route decisions belong to Browser.
 public protocol BrowserRouteEffects: Sendable {
     @MainActor func acquireBrowser(runID: String) throws
@@ -26,9 +15,10 @@ public protocol BrowserRouteEffects: Sendable {
     @MainActor func finishNavigation(runID: String, token: UUID)
     func cancelNavigation(runID: String) async
     func observeMotorAction(_ model: MotorActionReadModel) async
-    func annotateApprovalExecution(id: String, executedAction: JSONValue, detail: String) async throws
+    func annotateApprovalExecution(id: String, executedAction: JSONValue, detail: String, dataRoot: URL) async throws
     func showProducedImage(at path: URL, name: String) -> (shown: Bool, note: String)
-    func appendNativeActionReceipt(action: NativeActionRecord, status: String, dryRun: Bool, output: JSONValue) async throws -> NativeActionReceipt
+    func appendNativeActionReceipt(action: NativeActionRecord, status: String, dryRun: Bool, output: JSONValue,
+                                   dataRoot: URL) async throws -> NativeActionReceipt
 }
 
 public struct BrowserNavigationTask: Sendable {

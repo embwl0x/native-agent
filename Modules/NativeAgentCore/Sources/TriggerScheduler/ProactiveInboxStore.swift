@@ -109,8 +109,6 @@ public actor ProactiveInboxStore {
         let s = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return s == "idle_checkin"
             || s.hasPrefix("trigger:")
-            || s.hasPrefix("\(WorkshopCompletionTrigger.canonicalKind):")
-            || s.hasPrefix("\(WorkshopCompletionTrigger.legacyKind):")
             || s.hasPrefix("proactive_autonomy:")
     }
 

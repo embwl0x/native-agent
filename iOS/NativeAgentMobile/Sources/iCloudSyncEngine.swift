@@ -205,6 +205,8 @@ final class iCloudSyncEngine: ObservableObject {
     }
     @Published var sessions: [ChatSession] = []
     @Published var helpersSnapshot: MobileHelpersSnapshot?
+    /// The Mac's layout (ui/layout.json, in the core snapshot); More draws its sections from it.
+    @Published var surfaceLayout: SurfaceLayout?
     @Published var pinnedChatSessions: [ChatSession] = []
     /// The Mac window's current chat, published beside `sessions.json`.
     /// Main follows it; explicitly opened history keeps its own destination.

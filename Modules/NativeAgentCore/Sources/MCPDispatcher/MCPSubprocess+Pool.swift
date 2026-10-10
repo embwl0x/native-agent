@@ -485,6 +485,7 @@ public actor MCPSubprocessPool {
         for proc in reapedProcs {
             await proc.stop()
         }
+        OrganPulse.record("mcp_idle_reaper", found: reapedIds.count, note: reapedIds.sorted().joined(separator: ", "))
         if !reapedIds.isEmpty {
             nativeLog("MCPSubprocessPool: reaped %d idle stdio child(ren): %@",
                   reapedIds.count, reapedIds.joined(separator: ", "))

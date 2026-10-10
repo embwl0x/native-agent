@@ -447,6 +447,7 @@ public final class iCloudBridge: ObservableObject {
             available = false
             syncStatus = "iCloud container unavailable — sign into iCloud in System Settings"
             doctorTransportHealth = .unavailable(syncStatus)
+            OrganPulse.recordOff("snapshot_integrity", because: "iCloud Drive unavailable")
             return
         }
 
@@ -518,9 +519,14 @@ public final class iCloudBridge: ObservableObject {
             role: .mac,
             containerIdentifier: containerID
         ) else {
+            recordTransportOrgansOff("no CloudKit transport")
             return
         }
         deviceTransport = transport
+        // The drain and the presence beat run over this transport: their
+        // clocks start here (and stop in `recordTransportOrgansOff`).
+        OrganPulse.recordStarting("icloud_drain", cadence: drainPolicy.idleInterval)
+        OrganPulse.recordStarting("presence_beat", cadence: NAMacPresence.beat)
         (transport as? CloudKitDeviceTransport)?.useAssetSecret {
             guard let encoded = try? PairingSecretManager.existingSecretBase64() else { return nil }
             return Data(base64Encoded: encoded)
@@ -573,6 +579,7 @@ public final class iCloudBridge: ObservableObject {
         deviceDrainTimerTask?.cancel()
         guard deviceTransport != nil else {
             deviceDrainTimerTask = nil
+            recordTransportOrgansOff("iPhone transport gone")
             return
         }
         let now = Date()
@@ -590,6 +597,12 @@ public final class iCloudBridge: ObservableObject {
             self.deviceDrainTimerTask = nil
             await self.drainDeviceTransport(trigger: .fallbackTimer)
         }
+    }
+
+    /// The drain and the presence beat run only over the transport: without it
+    /// they are off, not overdue.
+    private func recordTransportOrgansOff(_ reason: String) {
+        for organ in ["icloud_drain", "presence_beat"] { OrganPulse.recordOff(organ, because: reason) }
     }
 
     /// APNs registration is a runtime capability, not per-message delivery
@@ -1541,10 +1554,12 @@ public final class iCloudBridge: ObservableObject {
         let result = await ck.drainIncoming()
         if doctorGeneration == setupGeneration {
             switch result {
-            case .success:
+            case .success(let count):
                 doctorTransportHealth = .available
                 onTransportSucceeded?()
-            case .skipped: break
+                OrganPulse.record("icloud_drain", found: count, note: "\(count) drained", cadence: drainPolicy.idleInterval)
+            case .skipped: OrganPulse.record("icloud_drain", .skipped, cadence: drainPolicy.idleInterval)
+            // No pulse: a drain that keeps failing goes overdue.
             case .failure(let error, _): doctorTransportHealth = Self.transportHealth(error)
             }
         }

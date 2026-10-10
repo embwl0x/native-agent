@@ -555,7 +555,7 @@ enum DeskGitHubStatePillPresentation {
             return Pill(label: "Codex working", tone: .info)
         case .verifying:
             return Pill(label: "Verifying", tone: .info)
-        case .needsUser:
+        case .needsOwner:
             return Pill(label: "Needs you", tone: .warning)
         case let .waitingUpstream(kind):
             return Pill(label: waitingLabel(for: kind), tone: .neutral)

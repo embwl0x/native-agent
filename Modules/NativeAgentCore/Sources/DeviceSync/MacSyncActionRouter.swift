@@ -361,15 +361,8 @@ struct MacSyncActionRouter {
                 try await api.deleteMemory(id: memoryId)
                 return observed(stringifyResponse(["status": "ok"], fallbackStatus: "ok"))
 
-            case "approvePromotion":
-                let candidateId = payload["candidateId"] ?? ""
-                _ = try await api.approvePromotionPending(id: candidateId)
-                return ["status": "ok"]
-
-            case "rejectPromotion":
-                let candidateId = payload["candidateId"] ?? ""
-                _ = try await api.rejectPromotionPending(id: candidateId, reason: "Rejected via iOS")
-                return observed(["status": "ok"])
+            case "approvePromotion", "rejectPromotion":
+                return observed(["status": "error", "message": "Training promotion is no longer available."])
 
             case "approveApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""

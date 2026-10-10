@@ -11,12 +11,14 @@ import StandingBots
 import WorkshopExecution
 import Senses
 import SwarmRuns
+import NativeAgentShared
 
 /// Her home screen (2026-09-23, her-screen plan Phase 1): the agent's own
 /// world as one laid-out text page, the way a desktop is a picture for a
-/// person. Fixed sections in a fixed order, one line per thing, a state on
-/// every line. Everything is read from the owners' own files on demand: no
-/// watcher, no network, no transcript, never the chat she is in.
+/// person. Sections in the layout's order (ui/layout.json), one line per
+/// thing, a state on every line. Everything is read from the owners' own
+/// files on demand: no watcher, no network, no transcript, never the chat
+/// she is in.
 package enum HerScreen {
     enum Target { case action(AgentWorkspaceAction), page(String) }
 
@@ -292,58 +294,69 @@ package enum HerScreen {
         let desk = deskRows(world, person: person, now: now)
         let (people, peopleNeeds, peopleMore) = peopleRows(world, dataRoot: dataRoot, now: now, scope: scope)
         let (helpers, helpersMore) = helperRows(world, dataRoot: dataRoot, person: person, now: now)
-        let crews = crewRows(world, dataRoot: dataRoot, now: now)
 
-        let rule = String(repeating: "─", count: 61)
-        var lines = [header.joined(separator: " · "), rule]
-        if let notable { lines.append(pad("NOTABLE TODAY", 14) + notable) }
-        if !changed.isEmpty {
-            lines += section("CHANGED", changed.prefix(5).map { "● " + clip($0, 70) } + (changed.count > 5 ? ["+\(changed.count - 5) more"] : []))
-        }
-        lines += section(person.uppercased() + " WAITS", desk.needs
-            + (desk.more > 0 ? ["+\(desk.more) more waiting on \(person) · item \"desk\""] : []) + ownerRows(world, now: now))
-        lines += section("MY QUEUE", queueRows(world, dataRoot: dataRoot, person: person, now: now)
-            + (world.moments > 0 ? [pad("moments", 10) + "\(world.moments) waiting for my review · app memory.moments"] : [])
-            + (world.reviews.count > 0 ? [pad("memories", 10) + "\(world.reviews.count)\(world.reviews.capped ? "+" : "") to review"] : [])
-            + peopleNeeds)
-        lines += section("WORKING", crews)
-        // Where she left off in this chat: its open windows, unfinished first.
-        lines += section("OPEN", windows.isEmpty ? [] : [windows.prefix(3).map { clip($0, 40) }.joined(separator: " · ")
-            + (windows.count > 3 ? " +\(windows.count - 3)" : "") + " · item \"windows\""])
-        if lines.count > 2 { lines.append(rule) }
-        let fixed = lines.count
-        lines += section("PEOPLE", columns(people) + (peopleMore > 0 ? ["+\(peopleMore) more · item \"people\""] : []))
-        lines += section("HELPERS", columns(helpers) + (helpersMore > 0 ? ["+\(helpersMore) more · item \"helpers\""] : []))
-        lines += section("MY SENSES", await sensesRows(now: now))
-        lines += section("ELSEWHERE", elsewhereRows(dataRoot: dataRoot, scope: scope, person: person, now: now))
-
-        // Places always show: pulse where an owner has a cheap number, the bare
-        // name otherwise (mail has no cached status; calendar and reminders
-        // show their latest read today, HerLifePulse).
-        // The Chrome link's state as its runtime last published it (nothing
-        // published yet means it never connected); no tool call.
-        var browser = connected ? "browser: \(person)'s Chrome connected" : "browser: not connected"
-        if let tab = webTabCell(dataRoot: dataRoot, scope: scope, now: now) { browser += " · " + tab }
-        else if !browserPages.isEmpty {
-            // Only this chat's pages resolve as tabs here; they are its live set.
-            let open = Set(browserPages.compactMap(AgentWorkspaceNavigation.placeIdentity))
-            let tabs = withNames(dataRoot) { book in
-                browserPages.prefix(3).compactMap { page -> String? in
-                    guard let id = AgentWorkspaceNavigation.placeIdentity(page) else { return nil }
-                    return "browser.tab\(book.number("browser.tab", id: id, existing: { open })) \"\(clip(page.title, 24))\""
+        // Her home's sections in the layout's order, as the window's view
+        // shows them (ui/layout.json); a hidden one is not read.
+        let layout = SurfaceLayoutStore.layout(dataRoot: dataRoot), profile = SurfaceLayoutStore.profile
+        let blocks = layout.shown("home", profile: profile).map(\.name)
+        var rows: [String: [String]] = [:]
+        for name in blocks {
+            switch name {
+            case "notable": rows[name] = notable.map { [pad("NOTABLE TODAY", 14) + $0] } ?? []
+            case "changed":
+                rows[name] = section("CHANGED", changed.prefix(5).map { "● " + clip($0, 70) } + (changed.count > 5 ? ["+\(changed.count - 5) more"] : []))
+            case "waits":
+                rows[name] = section(person.uppercased() + " WAITS", desk.needs
+                    + (desk.more > 0 ? ["+\(desk.more) more waiting on \(person) · item \"desk\""] : []) + ownerRows(world, now: now))
+            case "queue":
+                rows[name] = section("MY QUEUE", queueRows(world, dataRoot: dataRoot, person: person, now: now)
+                    + (world.moments > 0 ? [pad("moments", 10) + "\(world.moments) waiting for my review · app memory.moments"] : [])
+                    + (world.reviews.count > 0 ? [pad("memories", 10) + "\(world.reviews.count)\(world.reviews.capped ? "+" : "") to review"] : [])
+                    + harnessRow(world)
+                    + peopleNeeds)
+            case "working": rows[name] = section("WORKING", crewRows(world, dataRoot: dataRoot, now: now))
+            case "open":
+                // Where she left off in this chat: its open windows, unfinished first.
+                rows[name] = section("OPEN", windows.isEmpty ? [] : [windows.prefix(3).map { clip($0, 40) }.joined(separator: " · ")
+                    + (windows.count > 3 ? " +\(windows.count - 3)" : "") + " · item \"windows\""])
+            case "people": rows[name] = section("PEOPLE", columns(people) + (peopleMore > 0 ? ["+\(peopleMore) more · item \"people\""] : []) + world.found)
+            case "helpers": rows[name] = section("HELPERS", columns(helpers) + (helpersMore > 0 ? ["+\(helpersMore) more · item \"helpers\""] : []))
+            case "senses": rows[name] = section("MY SENSES", await sensesRows(now: now))
+            case "elsewhere": rows[name] = section("ELSEWHERE", elsewhereRows(dataRoot: dataRoot, scope: scope, person: person, now: now))
+            case "places":
+                // Places always show: pulse where an owner has a cheap number, the bare
+                // name otherwise (mail has no cached status; calendar and reminders
+                // show their latest read today, HerLifePulse).
+                // The Chrome link's state as its runtime last published it (nothing
+                // published yet means it never connected); no tool call.
+                var browser = connected ? "browser: \(person)'s Chrome connected" : "browser: not connected"
+                if let tab = webTabCell(dataRoot: dataRoot, scope: scope, now: now) { browser += " · " + tab }
+                else if !browserPages.isEmpty {
+                    // Only this chat's pages resolve as tabs here; they are its live set.
+                    let open = Set(browserPages.compactMap(AgentWorkspaceNavigation.placeIdentity))
+                    let tabs = withNames(dataRoot) { book in
+                        browserPages.prefix(3).compactMap { page -> String? in
+                            guard let id = AgentWorkspaceNavigation.placeIdentity(page) else { return nil }
+                            return "browser.tab\(book.number("browser.tab", id: id, existing: { open })) \"\(clip(page.title, 24))\""
+                        }
+                    }
+                    browser += " \(browserPages.count) tab\(browserPages.count == 1 ? "" : "s"): " + tabs.joined(separator: ", ")
                 }
+                let pulses = ["mail": mailPulse(now: now), "calendar": lifePulse("calendar", now: now), "desk": desk.pulse,
+                              "browser": browser, "reminders": lifePulse("reminders", now: now)]
+                // Gmail shows once it is connected (User's Gmail is read through Apple Mail).
+                let places = layout.shown("places", profile: profile).map(\.name).filter { $0 != "gmail" || AgentWorkspaceReadiness.ready(tool: "gmail_search") }
+                rows[name] = section("PLACES", placeLines(places).map { $0.map { pulses[$0] ?? $0 }.joined(separator: " · ") })
+            case "mac":
+                let mine = touched(dataRoot: dataRoot, now: now)
+                rows[name] = section("MAC", [await macFront(person) + " · Mac apps I acted in: "
+                    + (mine.isEmpty ? "none" : mine.prefix(4).map { clip($0.app, 30) + ($0.readout.map { " · " + clip($0, 20) } ?? "") }
+                        .joined(separator: ", "))])
+            default: break
             }
-            browser += " \(browserPages.count) tab\(browserPages.count == 1 ? "" : "s"): " + tabs.joined(separator: ", ")
         }
-        let pulses = ["mail": mailPulse(now: now), "calendar": lifePulse("calendar", now: now), "desk": desk.pulse,
-                      "browser": browser, "reminders": lifePulse("reminders", now: now)]
-        // Gmail shows once it is connected (User's Gmail is read through Apple Mail).
-        lines += section("PLACES", placeRows.map { $0.filter { $0 != "gmail" || AgentWorkspaceReadiness.ready(tool: "gmail_search") }
-            .map { pulses[$0] ?? $0 }.joined(separator: " · ") })
-        let mine = touched(dataRoot: dataRoot, now: now)
-        lines += section("MAC", [await macFront(person) + " · Mac apps I acted in: "
-            + (mine.isEmpty ? "none" : mine.prefix(4).map { clip($0.app, 30) + ($0.readout.map { " · " + clip($0, 20) } ?? "") }
-                .joined(separator: ", "))])
+        // Her world (people to Mac) is parted from what is happening now by a rule.
+        let outside: Set<String> = ["people", "helpers", "senses", "elsewhere", "places", "mac"]
         // Home again within two minutes, nothing changed and these rows the
         // same but for ages: they are the ones she just read, so they are not
         // repeated (walk 3: 51 homes of ~750 tokens, nearly all identical).
@@ -354,27 +367,38 @@ package enum HerScreen {
                       "interrupted ", "approval ", "· ", "(", "\" ", person + " "].map(NSRegularExpression.escapedPattern(for:))
         let ages = try? NSRegularExpression(pattern: "(?<=" + before.joined(separator: "|") + #")\d+[smhd](?:\d+[smh])?(?= in chat| "| ago\)| ·|  |$)"#,
                                             options: .anchorsMatchLines)
-        let aged = lines[fixed..<(lines.count - 1)].joined(separator: "\n")
-        let rows = (ages?.stringByReplacingMatches(in: aged, range: NSRange(aged.startIndex..., in: aged), withTemplate: "·") ?? aged)
-            + "\n" + (lines.last ?? "")
-        if markSeen, changed.isEmpty,
-           let whole = HerMemo.shared.shownHome(scope, rows: rows, now: now.timeIntervalSince1970, within: 120) {
-            lines.removeSubrange(fixed...)
-            lines.append(pad("SAME", 10) + "people, helpers, places and Mac as on the home you saw "
-                + age(now.timeIntervalSince1970 - whole) + " ago")
+        let aged = blocks.filter { outside.contains($0) && $0 != "mac" }.flatMap { rows[$0] ?? [] }.joined(separator: "\n")
+        let compared = (ages?.stringByReplacingMatches(in: aged, range: NSRange(aged.startIndex..., in: aged), withTemplate: "·") ?? aged)
+            + "\n" + (rows["mac"] ?? []).joined(separator: "\n")
+        if markSeen, changed.isEmpty, let first = blocks.first(where: outside.contains),
+           let whole = HerMemo.shared.shownHome(scope, rows: compared, now: now.timeIntervalSince1970, within: 120) {
+            for name in outside { rows[name] = [] }
+            rows[first] = [pad("SAME", 10) + "people, helpers, places and Mac as on the home you saw "
+                + age(now.timeIntervalSince1970 - whole) + " ago"]
+        }
+
+        let rule = String(repeating: "─", count: 61)
+        var lines = [header.joined(separator: " · "), rule]
+        var inWorld: Bool?
+        for name in blocks {
+            guard let block = rows[name], !block.isEmpty else { continue }
+            if let was = inWorld, was != outside.contains(name) { lines.append(rule) }
+            inWorld = outside.contains(name)
+            lines += block
         }
         lines.append(rule)
         lines.append("Open any name: app {item:\"desk.4\"} / \"claude\" / \"mail\"; text or fields go in args. Also: windows, people, conversations, arrivals, work, mac. Find here: app {page:\"home\", find:\"…\"}.")
         return lines.joined(separator: "\n")
     }
 
-    /// Home's PLACES rows by name, in order; mail, calendar, desk, browser
-    /// and reminders show with their pulse.
-    static let placeRows: [[String]] = [
-        ["mail", "calendar", "desk", "files", "browser"],
-        ["memory", "skills", "research", "messages", "reminders", "today", "replies", "create", "connections", "crews", "delegations", "code", "github"],
-        ["gmail", "agentmail", "notes", "contacts"] + lifePlaces.components(separatedBy: " · ") + familyLine.components(separatedBy: " · "),
-    ]
+    /// Home's PLACES rows: the places shown, in order, a row breaking where
+    /// the seed's rows break (`SurfaceLayout.placeRows`).
+    static func placeLines(_ names: [String]) -> [[String]] {
+        let row = Dictionary(SurfaceLayout.placeRows.enumerated().flatMap { index, names in names.map { ($0, index) } }, uniquingKeysWith: { first, _ in first })
+        return names.reduce(into: [[String]]()) { lines, name in
+            if let last = lines.last?.last, row[last] == row[name] { lines[lines.count - 1].append(name) } else { lines.append([name]) }
+        }
+    }
 
     static func section(_ label: String, _ rows: [String]) -> [String] {
         let width = max(10, label.count + 1)
@@ -413,6 +437,14 @@ package enum HerScreen {
         rows.more = max(0, waiting.count - 3)
         rows.pulse = "desk: \(split.active.count) active · \(split.parked.count) parked · \(split.waiting.count) waiting on \(person) · \(split.open) of \(split.total) top-level items open (MY QUEUE separate)"
         return rows
+    }
+
+    /// What the app filed for itself (HarnessQueue): the open count and the newest.
+    private static func harnessRow(_ world: HerWorld) -> [String] {
+        let open = world.desk.map(HarnessQueue.open) ?? []
+        guard let newest = open.first else { return [] }
+        return [pad("harness", 10) + "\(open.count) open, newest \"\(clip(newest.title, 46))\""
+            + (newest.assignee.map { " for the " + $0 } ?? "") + " · item \"desk\""]
     }
 
     /// Open top-level work in the Desk page's groups: waiting on the owner,

@@ -301,7 +301,7 @@ actor DesktopConversationTools: ToolDispatchClient {
             // the front moved): that typing attempt never happened, so it may be tried again.
             if typing, case .object(let detail)? = reply["detail"],
                case .string(let code)? = detail["error"],
-               ["no_match", "ambiguous", "target_disabled", "front_window_changed", "user_changed_apps"].contains(code) {
+               ["no_match", "ambiguous", "target_disabled", "front_window_changed", "owner_changed_apps"].contains(code) {
                 typed = false; stage = "selecting the conversation"
             }
         }

@@ -218,8 +218,9 @@ public struct REMProposalStore: Sendable {
         return Self.fold(feedRows: feedRows, baseRows: baseRows)
     }
 
-    /// Eviction cannot consume the week without reading the approval evidence.
-    func loadAllForGrowthEviction() throws -> [REMProposalRow] {
+    /// Every row, or a throw: GROWTH eviction and a GROWTH rewrite cannot
+    /// drop approved lessons without reading the approval evidence.
+    public func loadAllStrictly() throws -> [REMProposalRow] {
         func readIfPresent(_ url: URL) throws -> Data? {
             do { return try Data(contentsOf: url) }
             catch CocoaError.fileReadNoSuchFile { return nil }
@@ -577,9 +578,10 @@ public struct REMProposalStore: Sendable {
 
     /// Deny: tombstone FIRST (a denied text must never be re-proposed, even
     /// if the flip below fails — the caller's FAILED annotation surfaces
-    /// that), then flip pending→denied, then rebuild the pins index.
+    /// that), then flip pending→denied, then rebuild the pins index. A stale
+    /// card is closed with `tombstone: false`: its lesson was not refused.
     @discardableResult
-    public func applyDenial(proposalId: String, reason: String) async throws -> REMProposalRow {
+    public func applyDenial(proposalId: String, reason: String, tombstone: Bool = true) async throws -> REMProposalRow {
         _ = try requireReadableBaseRows()
         guard let current = loadAll().first(where: { $0.id == proposalId }) else {
             throw REMProposalStoreError.notFound(proposalId)
@@ -588,8 +590,9 @@ public struct REMProposalStore: Sendable {
         guard current.status == "pending" else {
             throw REMProposalStoreError.conflict(id: proposalId, status: current.status)
         }
-        let tombstones = REMTombstoneStore(dataRoot: dataRoot)
-        try await tombstones.record(current.asREMProposal, reason: reason)
+        if tombstone {
+            try await REMTombstoneStore(dataRoot: dataRoot).record(current.asREMProposal, reason: reason)
+        }
         let row = try await setStatus(proposalId: proposalId, to: "denied")
         try REMConsolidator.emitREMPinsIndex(dataRoot: dataRoot)
         return row

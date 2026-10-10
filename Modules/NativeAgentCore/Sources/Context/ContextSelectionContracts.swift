@@ -90,6 +90,9 @@ public struct NeedSignal: Codable, Equatable, Sendable {
     /// See `ContextQueryEmbeddingValue.alternateValues`.
     public let alternateQueryEmbedding: [Float]?
     public let queryEmbeddingModelFingerprint: String?
+    /// The embedder's model id; picks the semantic floor
+    /// (`ContextSelectionConfiguration.memorySemanticFloors`).
+    public let queryEmbeddingModelID: String?
     public let availableGenerationID: Int64?
     public let characterBudget: Int
     public let mandatoryCharacterBudget: Int
@@ -115,7 +118,7 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         case cognitiveActivation, feedbackUtilityOverrides, feedbackDecayOverrides
         case workingAtomIDs, precoveredSourceIDs, mandatoryAtomIDs, deletedAtomIDs, tombstonedAtomIDs
         case staleRuntimeAtomIDs, secretBearingAtomIDs, queryEmbedding, alternateQueryEmbedding
-        case queryEmbeddingModelFingerprint, availableGenerationID
+        case queryEmbeddingModelFingerprint, queryEmbeddingModelID, availableGenerationID
         case characterBudget, mandatoryCharacterBudget
         case packetAtomExpandThresholdChars, memoryAtomRowLimit
         case selectionTimeBucket, timeBucketSeconds
@@ -150,6 +153,7 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         queryEmbedding: [Float]? = nil,
         alternateQueryEmbedding: [Float]? = nil,
         queryEmbeddingModelFingerprint: String? = nil,
+        queryEmbeddingModelID: String? = nil,
         availableGenerationID: Int64? = nil,
         characterBudget: Int = 6_000,
         mandatoryCharacterBudget: Int? = nil,
@@ -197,6 +201,7 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         self.queryEmbeddingModelFingerprint = queryEmbedding == nil
             ? nil
             : ((embeddingFingerprint?.isEmpty == false) ? embeddingFingerprint : nil)
+        self.queryEmbeddingModelID = queryEmbedding == nil ? nil : queryEmbeddingModelID
         self.availableGenerationID = availableGenerationID
         self.characterBudget = max(0, characterBudget)
         self.mandatoryCharacterBudget = max(0, mandatoryCharacterBudget ?? characterBudget)
@@ -633,14 +638,10 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
     /// provenance existed. Readers must treat nil as unavailable, never zero.
     public let selectionLatencyProvenance: ContextSelectionLatencyProvenance?
     /// How many ranked `.memory` candidates the semantic floor refused this
-    /// turn (`configuration.memorySemanticFloor`). Absent in receipts persisted
+    /// turn (`configuration.memorySemanticFloors`). Absent in receipts persisted
     /// before 2026-09-02, so decoding tolerates a missing key as 0 — the same
     /// contract `messageCoverage` got.
     public let memoryFloorDroppedCount: Int
-    /// Correction atoms this turn's per-turn correction cap kept OUT of the
-    /// packet. Zero on receipts written before the cap existed, which is the
-    /// truth for those turns: nothing was dropped by a rule that did not run.
-    public let correctionCapDropped: Int
 
     private enum CodingKeys: String, CodingKey {
         case id, needFingerprint, generationID, sourceFingerprint, selectionTimeBucket
@@ -649,7 +650,6 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
         case conflicts, budget, degradedSources, cacheState
         case measuredSelectionMicroseconds, selectionLatencyProvenance
         case memoryFloorDroppedCount
-        case correctionCapDropped
     }
 
     public init(
@@ -671,8 +671,7 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
         cacheState: ContextSelectionCacheState,
         measuredSelectionMicroseconds: Int?,
         selectionLatencyProvenance: ContextSelectionLatencyProvenance? = nil,
-        memoryFloorDroppedCount: Int = 0,
-        correctionCapDropped: Int = 0
+        memoryFloorDroppedCount: Int = 0
     ) {
         self.id = id
         self.needFingerprint = needFingerprint
@@ -693,7 +692,6 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
         self.measuredSelectionMicroseconds = measuredSelectionMicroseconds
         self.selectionLatencyProvenance = selectionLatencyProvenance
         self.memoryFloorDroppedCount = memoryFloorDroppedCount
-        self.correctionCapDropped = max(0, correctionCapDropped)
     }
 
     public init(from decoder: any Decoder) throws {
@@ -723,8 +721,7 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
             memoryFloorDroppedCount: try values.decodeIfPresent(
                 Int.self,
                 forKey: .memoryFloorDroppedCount
-            ) ?? 0,
-            correctionCapDropped: try values.decodeIfPresent(Int.self, forKey: .correctionCapDropped) ?? 0
+            ) ?? 0
         )
     }
 
@@ -752,9 +749,6 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
         // from a turn it never touched stays byte-identical to a pre-floor one.
         if memoryFloorDroppedCount != 0 {
             try values.encode(memoryFloorDroppedCount, forKey: .memoryFloorDroppedCount)
-        }
-        if correctionCapDropped != 0 {
-            try values.encode(correctionCapDropped, forKey: .correctionCapDropped)
         }
     }
 }
@@ -908,48 +902,6 @@ public struct ContextScoreWeights: Equatable, Sendable {
     }
 }
 
-/// A floor for one content role inside one atom kind's budget.
-///
-/// Skills-as-recall (2026-07-03) dissolved the skill library into memory
-/// pointer rows so craft would arrive the way remembering does. The legacy
-/// recall lane honours that by sharing its result budget with skill hints
-/// (`MemoryRecallScoring.selectRecallResults`, max(1, k/3)); the ContextFlow
-/// lane had no equivalent, so 36 skill pointers competed against 177 other
-/// memory atoms inside one 8-slot quota. Live arena generation 3046: the memory
-/// quota saturated on 7 of 8 real skill-shaped queries, and the right skill for
-/// the message lost on two of them at ranks 32 and 54.
-///
-/// The reservation has two halves, and needs both:
-///   - a CAP on other roles, so the reserved slots stay free; and
-///   - a PROMOTION, so a qualifying atom actually takes one — capping alone
-///     just hands the freed slot to whatever ranks next.
-/// It reallocates the quota and never widens it: the dynamic atom budget,
-/// per-source cap and character budget all still apply unchanged. With no
-/// qualifying candidate in the turn, selection is byte-identical to having no
-/// reservation configured at all.
-public struct ContextRoleReservation: Equatable, Sendable {
-    public let role: ContextContentRole
-    public let slots: Int
-    /// Merit gate on the floor. A reserved slot is not a lottery: the atom has
-    /// to be about THIS message, not merely above the global relevance floor.
-    /// `messageCoverage` is the one score feature that cannot be diluted by
-    /// carried context, so it is the honest predicate for "this skill is what
-    /// the user just asked about".
-    ///
-    /// 0.35 is evidenced, not guessed. Live arena generation 3046 (36 skill
-    /// pointers among 213 memory atoms, 8 real queries): the correct skill for
-    /// a message scored messageCoverage 0.47-0.63 and every off-topic pointer
-    /// scored <= 0.19 — a 2.4x gap with nothing inside it. Below the gate the
-    /// reservation is inert and selection is byte-identical to having none.
-    public let minimumMessageCoverage: Double
-
-    public init(role: ContextContentRole, slots: Int, minimumMessageCoverage: Double = 0.35) {
-        self.role = role
-        self.slots = max(0, slots)
-        self.minimumMessageCoverage = max(0, minimumMessageCoverage)
-    }
-}
-
 public struct ContextSelectionConfiguration: Equatable, Sendable {
     public let maximumCandidates: Int
     public let maximumDynamicAtoms: Int
@@ -960,30 +912,19 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// larger quota by default so high-scoring memories are not crowded out
     /// of the 12-atom dynamic budget by the uniform per-kind cap.
     public let maximumAtomsPerKindOverrides: [ContextAtomKind: Int]
-    /// Reserved share of a kind's budget for one content role. Keyed by atom
-    /// kind; the reservation is clamped at init so a reserve can never claim a
-    /// kind's whole quota.
-    public let reservedRoleSlotsPerKind: [ContextAtomKind: ContextRoleReservation]
-    /// Per-turn ceiling on `.correction` atoms that are NOT about this message.
-    ///
-    /// Her store is nine-tenths corrections (live 2026-09-01: recall for
-    /// "memory" returned twelve correction rows and two facts), so the ordinary
-    /// per-kind quota let the packet describe her as mostly someone who got
-    /// things wrong. A correction the CURRENT message is actually about is
-    /// exempt (see `correctionIsAboutMessage`) and so are mandatory/pinned
-    /// corrections, which never reach the dynamic quota at all — this caps the
-    /// ambient ones only.
-    public let maximumCorrectionAtomsPerTurn: Int
     public let minimumRelevance: Double
-    /// Cosine below which a `.memory` or `.correction` atom is refused ADMISSION to the packet,
-    /// however well it ranked on everything else. `0` is the kill switch for
-    /// the whole 2026-09-02 precision pass — this floor AND
-    /// `shortMessageMemoryRowCap` — and restores the pre-floor selector
-    /// byte-for-byte, receipts included.
+    /// Per embedding model (`model_id`): cosine below which a `.memory` or
+    /// `.correction` atom is refused ADMISSION to the packet, however well it
+    /// ranked on everything else. `0` turns off the whole 2026-09-02 precision
+    /// pass — this floor AND `shortMessageMemoryRowCap` — and restores the
+    /// pre-floor selector byte-for-byte, receipts included. Cosines are not
+    /// comparable across models, so one number cannot serve two of them: a
+    /// model with no entry admits no memory by meaning alone, only by the
+    /// exemptions below (explicit lexical match, shared identifier, working
+    /// set) and pins, and the coordinator logs the model once.
     ///
-    /// The measured problem (live chat, 2026-09-01): on the short warm message
-    /// "My days bright and fuckin shiny with you in it" the best memory hit
-    /// scored cosine 0.41 and the selector still filled the whole 12-row memory
+    /// The measured problem (live chat, 2026-09-01): on a short warm message
+    /// the best memory hit scored cosine 0.41 and the selector still filled the whole 12-row memory
     /// quota down to 0.24 — 18 lead+pointer rows of noise riding a turn that
     /// asked for none of it. Targeted queries rank fine, so this is a PRECISION
     /// problem on small talk, and a rank threshold is the honest instrument.
@@ -1003,15 +944,30 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     ///     Differ` is the same distinction one layer down.
     ///   - Four exemptions carry an atom over the floor regardless of cosine:
     ///     a whole-message lexical hit, a shared identifier, message coverage
-    ///     >= 0.5, or activation >= 0.5 (attention/working set; for a
-    ///     correction, the working set only).
-    public let memorySemanticFloor: Double
+    ///     >= 0.5, or the atom being in the turn's working set. Not
+    ///     `activation`: it carries the record's own importance (0.5-0.95 on
+    ///     half the store), which exempted those rows on every turn.
+    ///
+    /// Both values are from one replay (10-10: 987 turns of 10-03…10-10 with
+    /// their query text, every memory atom of the live generation embedded by
+    /// each model), set where a topical turn keeps its one relevant row.
+    /// bge-large 0.55: its median query-to-memory cosine is 0.52, so the
+    /// MiniLM-era 0.30 never fired; at 0.55 a turn carries 8.0 memory rows
+    /// instead of 11.6 (5.3 instead of 10.7 on User's own turns, 18% of them
+    /// none), a timezone question keeps its one relevant row (0.58), an
+    /// unrelated design rule on a strategy question (0.54) stays out, and the
+    /// recalls the 10-09 drive checked (0.75-0.81, rank 1) land. 0.60 also cut
+    /// the topical row. MiniLM 0.25, the matching mark: 7.7 rows instead of
+    /// 10.2 (4.9 on User's turns, 20% none), acknowledgements (0.19-0.22) and
+    /// the unrelated design and greeting rules (0.07, 0.22) stay out, drive
+    /// recalls 0.64-0.80 land (and 0.34 carried by message coverage).
+    public let memorySemanticFloors: [String: Double]
     /// Effective `.memory` row cap on a message of at most
     /// `shortMessageTokenCount` content tokens — the same token set (and the
     /// same "4") the `messageCoverage` length damp already uses, so a message
     /// too short to evidence coverage is also too short to earn a full memory
     /// lane. Applied as `min(cap, shortMessageMemoryRowCap)`. `0` disables the
-    /// cap on its own, and `memorySemanticFloor == 0` disables it too.
+    /// cap on its own, and a zero semantic floor disables it too.
     public let shortMessageMemoryRowCap: Int
     /// Phase 5 C3: `.personal` atoms leave the ordinary competition and get
     /// their own lane — the ONE with the highest lift (cosine minus the
@@ -1038,12 +994,8 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         maximumAtomsPerSource: Int = 2,
         maximumAtomsPerKind: Int = 4,
         maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8, .relationship: 4],
-        reservedRoleSlotsPerKind: [ContextAtomKind: ContextRoleReservation] = [
-            .memory: ContextRoleReservation(role: .procedure, slots: 2),
-        ],
-        maximumCorrectionAtomsPerTurn: Int = 3,
         minimumRelevance: Double = 0.05,
-        memorySemanticFloor: Double = 0.30,
+        memorySemanticFloors: [String: Double] = ["bge-large-en-v1.5": 0.55, "all-MiniLM-L6-v2": 0.25],
         shortMessageMemoryRowCap: Int = 6,
         personalRecallFloor: Double = 0.20,
         weights: ContextScoreWeights = ContextScoreWeights()
@@ -1054,29 +1006,19 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         self.maximumPointers = max(0, maximumPointers)
         self.maximumAtomsPerSource = max(1, maximumAtomsPerSource)
         self.maximumAtomsPerKind = max(1, maximumAtomsPerKind)
-        let overrides = maximumAtomsPerKindOverrides.mapValues { max(1, $0) }
-        self.maximumAtomsPerKindOverrides = overrides
-        // A reserve that could consume a kind's entire quota would turn a floor
-        // for one role into a ceiling of zero for every other one.
-        self.reservedRoleSlotsPerKind = Dictionary(
-            uniqueKeysWithValues: reservedRoleSlotsPerKind.compactMap { kind, reservation in
-                let cap = overrides[kind] ?? max(1, maximumAtomsPerKind)
-                let slots = min(reservation.slots, cap - 1)
-                guard slots > 0 else { return nil }
-                return (kind, ContextRoleReservation(
-                    role: reservation.role,
-                    slots: slots,
-                    minimumMessageCoverage: reservation.minimumMessageCoverage
-                ))
-            }
-        )
-        self.maximumCorrectionAtomsPerTurn = max(0, maximumCorrectionAtomsPerTurn)
+        self.maximumAtomsPerKindOverrides = maximumAtomsPerKindOverrides.mapValues { max(1, $0) }
         self.minimumRelevance = max(0, minimumRelevance)
-        self.memorySemanticFloor = max(0, memorySemanticFloor)
+        self.memorySemanticFloors = memorySemanticFloors.mapValues { max(0, $0) }
         // 0 is OFF, not "no memories at all": a short message is a reason to
         // carry fewer rows, never a reason to empty the lane.
         self.shortMessageMemoryRowCap = max(0, shortMessageMemoryRowCap)
         self.weights = weights
+    }
+
+    /// The semantic floor for vectors from `modelID`; nil for a model with no
+    /// entry, which no cosine clears.
+    public func memorySemanticFloor(forModel modelID: String?) -> Double? {
+        modelID.flatMap { memorySemanticFloors[$0] }
     }
 
     /// Effective per-kind cap: the override for `kind` when present, else the

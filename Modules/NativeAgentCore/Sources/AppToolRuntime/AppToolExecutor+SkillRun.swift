@@ -3,7 +3,6 @@ import CryptoKit
 import Desk
 import Dispatcher
 import Foundation
-import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Skills
@@ -59,10 +58,12 @@ extension AppToolExecutor {
         return status != "ok" && skillFaults.contains(reason) ? reason : nil
     }
 
-    /// The upkeep a turn that lists or runs skills does (PR 5), for every kind
-    /// (`CapabilityLifecycle`): one MY QUEUE line for each skill suspended for
-    /// an action gone, and each skill or tool she wrote archived unused.
-    static func skillUpkeep(root: URL) async {
+    /// The upkeep a turn that lists or runs skills does (PR 5), and the weekly
+    /// self-improvement pass, for every kind (`CapabilityLifecycle`): one MY
+    /// QUEUE line for each skill suspended for an action gone, and each skill
+    /// or tool she wrote archived unused. Only with write authority.
+    public static func skillUpkeep(root: URL) async {
+        guard await freshQuietPosture(dataRoot: root)?.changesAllowed == true else { return }
         await queueSkillLines(((try? await SwiftNativeSkillsClient(root: root).upkeep(missing: { AppActions.action($0) == nil })) ?? [])
                               + ((try? await ToolRegistryActions.upkeep(dataRoot: root)) ?? []).map { ($0, []) }, root: root)
         if let registry = SensesHub.shared.registry as? any SenseRegistryManaging {
@@ -73,7 +74,7 @@ extension AppToolExecutor {
 
     /// One quiet MY QUEUE line each for what upkeep did to skills and tools,
     /// and their upgrade signals (`when: quiet`: shown on her next ordinary
-    /// turn, never waking her), and recall reconciled; whether every line queued.
+    /// turn, never waking her); whether every line queued.
     @discardableResult
     static func queueSkillLines(_ lines: [SkillLine], root: URL) async -> Bool {
         guard !lines.isEmpty else { return false }
@@ -83,9 +84,6 @@ extension AppToolExecutor {
         for line in lines where (try? await MyQueue.add(DeskStep(words: line.words, when: "quiet", peers: line.peers), store: store)) == nil {
             queued = false
         }
-        try? await NativeSkillRegistryActions.reconcileSkillEvolutionRecall(
-            memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root,
-            personaRoot: defaultPersonaRoot(dataRoot: root))
         return queued
     }
 
@@ -125,7 +123,7 @@ extension AppToolExecutor {
         guard action?.irreversible != false || action?.isHis == true else { return nil }
         let why = action?.isHis == true ? "users_step" : "irreversible"
         let detail = why == "users_step"
-            ? "\(key) is User's, so a skill hands it back to you before it runs: it was not run."
+            ? "\(key) is the owner's, so a skill hands it back to you before it runs: it was not run."
             : "\(key) can't be taken back, so a skill hands it back to you before it runs: it was not run."
         if preview {
             return .object(["status": .string("preview"), "action": .string(key), "would_hand_back": .string(why),
@@ -209,9 +207,7 @@ extension AppToolExecutor {
             return Self.doorRefusal("invalid_args", "args is an object, the skill's params by name. Nothing ran.",
                 remedy: "correct_arguments", "Call skill.run again with args as an object.")
         }
-        if !preview, await Self.freshQuietPosture(dataRoot: root)?.changesAllowed == true {
-            await Self.skillUpkeep(root: root)
-        }
+        if !preview { await Self.skillUpkeep(root: root) }
         let loaded = await loadSkillScript(Self.doorText(args["name"]), preview: preview, root: root)
         guard let skill = loaded.skill else { return loaded.refusal ?? .null }
         if let mismatch = Self.paramsMismatch(skill.params, given) {
@@ -271,7 +267,7 @@ extension AppToolExecutor {
             }
             guard preview, status == "draft" || InstalledSkillInventory.isAvailable(entry.row) else {
                 return refuse("not_runnable", "\(entry.name) is \(why), so it doesn't run.",
-                    "skill.enable turns it on for its exact script: yours for your own script under Full Mac, else User's on the Skills page.")
+                    "skill.enable turns it on for its exact script: yours for your own script under Full Mac, else the owner's on the Skills page.")
             }
             off = why
         }

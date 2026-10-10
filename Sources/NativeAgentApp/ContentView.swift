@@ -8,6 +8,7 @@ import Speech
 import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
+import ChatOrchestration
 import MemoryV2
 import PersistenceCore
 #if canImport(CoreSpotlight)
@@ -130,7 +131,7 @@ struct ContentView: View {
                 ShellSidebarRail(
                     selection: selection,
                     needsYou: Set(
-                        SidebarItem.primaryItems
+                        SidebarItem.rail(SurfaceLayoutLive.shared.layout).compactMap { $0 }
                             // Agent, 2026-09-02: a rail dot is a promise about the
                             // page under it. Today's dot reads what Today's header
                             // reads: the one Needs you count.
@@ -201,7 +202,7 @@ struct ContentView: View {
                 // AppKit leaks AX observer arrays when these text controls are torn
                 // down. Hidden work is cancelled inside the shelf.
                 if hasMountedBots || isShowingBots {
-                    BotsShelfPreviewPage(onContinue: applyNavigationDestination, isVisible: isShowingBots)
+                    BotsShelfView(onContinue: applyNavigationDestination, isVisible: isShowingBots)
                         .animation(isShowingBots ? NativeAgentMotion.crossfade : nil) {
                             $0.opacity(isShowingBots ? 1 : 0)
                         }
@@ -422,6 +423,9 @@ struct ContentView: View {
             await appModel.reloadPersonality()
             await checkFirstRunOnboardingIfNeeded()
         }
+        // Every surface's order, visibility and folds (ui/layout.json),
+        // re-drawn the moment a write or a hand edit lands.
+        .task { await SurfaceLayoutLive.shared.watch() }
         // All Mac projections of chat sessions share AppModel's one canonical
         // list: Chat, detached-window titles, Status, command search, and the
         // optional project/session lineage page. Keep it current from the
@@ -551,9 +555,9 @@ struct ContentView: View {
                 // and sentinel are real), so it has to be checked before the
                 // `hasExisting` early return below or the repair lane is
                 // unreachable and only Doctor ever names the condition.
-                if start.pendingRecovery == true
-                    || start.resetRequired == true
-                    || start.profileRepairRequired == true {
+                if start.pendingRecovery
+                    || start.resetRequired
+                    || start.profileRepairRequired {
                     selectionRaw = SidebarItem.chat.rawValue
                     showTour = false
                     showFirstRunOnboarding = true

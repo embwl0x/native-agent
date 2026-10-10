@@ -31,7 +31,6 @@ public struct NativeAgentEnginePorts: Sendable {
     public let appTools: @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor
     public let interactions: any ToolInteractionResolving
     public let chatPlatform: ChatToolPlatformPort
-    public let evolutionBridge: @Sendable (URL) -> any EvolutionToolBridge
     public let connectorActionStatuses: @Sendable () async throws -> [String: String]
 
     public init(
@@ -44,7 +43,6 @@ public struct NativeAgentEnginePorts: Sendable {
         appTools: @escaping @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor,
         interactions: any ToolInteractionResolving,
         chatPlatform: ChatToolPlatformPort,
-        evolutionBridge: @escaping @Sendable (URL) -> any EvolutionToolBridge,
         connectorActionStatuses: @escaping @Sendable () async throws -> [String: String]
     ) {
         self.cognitionHost = cognitionHost
@@ -56,7 +54,6 @@ public struct NativeAgentEnginePorts: Sendable {
         self.appTools = appTools
         self.interactions = interactions
         self.chatPlatform = chatPlatform
-        self.evolutionBridge = evolutionBridge
         self.connectorActionStatuses = connectorActionStatuses
     }
 }

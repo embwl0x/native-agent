@@ -1,5 +1,7 @@
 import Foundation
+import Connectors
 import DeviceSync
+import PersistenceCore
 
 /// Credential-free rows shared by the existing snapshot and mutation receipts.
 struct MobileConnectorSnapshot: Encodable, Sendable {
@@ -33,15 +35,18 @@ struct MobileConnectorSnapshot: Encodable, Sendable {
 
 extension AppDeviceSyncHost {
     func mobileConnectors() async throws -> [MobileConnectorSnapshot] {
-        try await NativeClient().getConnectors().map(MobileConnectorSnapshot.init)
+        try await ConnectorStatusProjection.readConnectorRecords(
+            root: PersistenceCore.defaultDataRoot(), platform: AppConnectorStatusPlatform()
+        ).map(MobileConnectorSnapshot.init)
     }
 
     func setConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows {
-        let api = NativeClient()
         guard let current = try await mobileConnectors().first(where: { $0.id == id }), current.canToggle else {
             throw connectorFailure("This connector is controlled by its setup on the Mac.")
         }
-        _ = try await api.updateConnector(id: id, enabled: enabled)
+        _ = try await ConnectorStatusProjection.updateConnector(
+            id: id, enabled: enabled, root: PersistenceCore.defaultDataRoot(), platform: AppConnectorStatusPlatform()
+        )
         guard let recovered = try await mobileConnectors().first(where: { $0.id == id }),
               recovered.enabled == enabled else {
             throw connectorFailure("The Mac could not confirm the connector change. Refresh before trying again.")
@@ -54,7 +59,7 @@ extension AppDeviceSyncHost {
               try await mobileConnectors().contains(where: { $0.id == id }) else {
             throw connectorFailure("This connector cannot be disconnected here.")
         }
-        try await NativeClient().revokeConnector(provider: id)
+        _ = try await makeConnectorAuthClient(root: PersistenceCore.defaultDataRoot()).revokeConnector(provider: id)
         guard let recovered = try await mobileConnectors().first(where: { $0.id == id }),
               !recovered.enabled, recovered.authState == "not_connected" else {
             throw connectorFailure("The Mac could not confirm disconnection. Refresh before trying again.")

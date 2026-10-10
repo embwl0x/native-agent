@@ -166,7 +166,7 @@ public enum RuntimeReadProjection {
         )
     }
 
-    public static func getPersonalOS<Failure: Error>(dataRoot: URL, unreadableFeed: (String) -> Failure) async throws -> PersonalOSSummary {
+    public static func getPersonalOS(dataRoot: URL) async throws -> PersonalOSSummary {
         /// HONEST MINIMAL: NativeAgent ships a single active persona today
         /// (persona/profile.json), so the PersonalOS summary surfaces exactly
         /// one space derived from that file's `name`/`active` key. The daemon
@@ -181,20 +181,20 @@ public enum RuntimeReadProjection {
             do {
                 let data = try Data(contentsOf: path)
                 guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    throw unreadableFeed(
+                    throw RuntimeReadError.unreadableFeed(
                         "Persona profile is not a JSON object"
                     )
                 }
                 if let name = object["name"] {
                     guard let string = name as? String else {
-                        throw unreadableFeed(
+                        throw RuntimeReadError.unreadableFeed(
                             "Persona profile name is not text"
                         )
                     }
                     primaryName = string
                 } else if let active = object["active"] {
                     guard let string = active as? String else {
-                        throw unreadableFeed(
+                        throw RuntimeReadError.unreadableFeed(
                             "Persona profile active name is not text"
                         )
                     }
@@ -202,10 +202,10 @@ public enum RuntimeReadProjection {
                 } else {
                     primaryName = nil
                 }
-            } catch let error as Failure {
+            } catch let error as RuntimeReadError {
                 throw error
             } catch {
-                throw unreadableFeed(
+                throw RuntimeReadError.unreadableFeed(
                     "Persona profile is unreadable: \(error.localizedDescription)"
                 )
             }
@@ -224,18 +224,12 @@ public enum RuntimeReadProjection {
         )
     }
 
-    public static func getAutonomyKernel(dataRoot: URL, improvements: () async throws -> [ImprovementRun]) async throws -> AutonomyKernelSummary {
+    public static func getAutonomyKernel(dataRoot: URL) async throws -> AutonomyKernelSummary {
         // DAEMON-DEAD PORT (2026-06-03): summarize the Swift-owned autonomy
-        // gates from Trust policy plus local improvement run state. This is a
+        // gates from Trust policy. This is a
         // status surface only; action execution remains guarded by its own
         // native engines.
         let policy = try await TrustFacade(dataRoot: dataRoot).load()
-        // U5 W-A item 1 (:5156): propagate — a failed improvements read
-        // previously rendered as "0 running improvements" (healthy-empty).
-        let improvements = try await improvements()
-        let runningImprovements = improvements.filter {
-            ["running", "queued", "planning", "executing"].contains(($0.status ?? "").lowercased())
-        }.count
         let processEnabled = true
         let trustEnabled = policy.enableAutonomy
         let enabled = processEnabled && trustEnabled
@@ -248,8 +242,6 @@ public enum RuntimeReadProjection {
 
         let outside = policy.filePolicy?.outsideWorkspaceDefault ?? "deny"
         let backupRequired = policy.filePolicy?.requireBackupBeforeWrite ?? true
-        let trainingEnabled = policy.trainingPolicy?.autonomous_training ?? false
-        let promotionEnabled = policy.promotionPolicy?.enabled ?? false
         let memoryHygiene = policy.memoryPolicy?.hygiene_enabled ?? true
 
         return AutonomyKernelSummary(
@@ -276,16 +268,6 @@ public enum RuntimeReadProjection {
                     status: backupRequired ? "ok" : "warn"
                 ),
                 KernelGuardrail(
-                    id: "training.autonomous_training",
-                    title: "Autonomous training",
-                    status: trainingEnabled ? "ok" : "off"
-                ),
-                KernelGuardrail(
-                    id: "promotion.enabled",
-                    title: "Promotion engine",
-                    status: promotionEnabled ? "ok" : "off"
-                ),
-                KernelGuardrail(
                     id: "memory.hygiene_enabled",
                     title: "Memory hygiene",
                     status: memoryHygiene ? "ok" : "off"
@@ -297,7 +279,6 @@ public enum RuntimeReadProjection {
                 ApprovalClass(id: "system_change", title: "System changes", requiresApproval: true),
                 ApprovalClass(id: "safe_read", title: "Safe reads", requiresApproval: false),
             ],
-            runningImprovements: runningImprovements,
             createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
         )
     }

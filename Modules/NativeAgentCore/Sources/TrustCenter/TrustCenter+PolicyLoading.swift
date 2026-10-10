@@ -122,7 +122,6 @@ extension SwiftNativeTrustCenter {
             ["connectorPolicy"],
             ["multimodalPolicy"],
             ["trainingPolicy"],
-            ["promotionPolicy"],
             ["personalityPolicy"],
             ["memoryPolicy"],
             ["skillBuilderPolicy"],
@@ -433,24 +432,14 @@ extension SwiftNativeTrustCenter {
             "showTimeline": .bool(true),
         ])
         policy["trainingPolicy"] = .object([
-            "autonomous_training": .bool(false),
             "dream_scheduler": .bool(false),
-            "route_through_promotion": .bool(true),
-        ])
-        policy["promotionPolicy"] = .object([
-            "enabled": .bool(false),
-            "auto_promote_tier_a": .bool(false),
-            "run_smoke_in_harness": .bool(true),
         ])
         policy["memoryPolicy"] = .object([
             "consolidation_enabled": .bool(false),
             "cross_session_recall": .bool(false),
-            "auto_promote_consolidated": .bool(false),
             "knowledge_graph_enabled": .bool(false),
             "adaptive_promotion": .bool(false),
             "hygiene_enabled": .bool(false),
-            "archive_noisy_reflections": .bool(false),
-            "reject_low_value_proposals": .bool(true),
             "vault_enabled": .bool(false),
             "vault_require_encryption": .bool(true),
         ])

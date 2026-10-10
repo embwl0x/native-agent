@@ -1,4 +1,5 @@
 import AppToolRuntime
+import ChatOrchestration
 import Dispatcher
 import Foundation
 import NativeAgentCore
@@ -8,7 +9,16 @@ import PersistenceCore
     private static func pageValue(_ page: QuietPage) -> QuietToolPage {
         QuietToolPage(id: page.id, title: page.title, summary: page.summary)
     }
-    var pages: [QuietToolPage] { QuietPages.all.map(Self.pageValue) }
+    /// The page index as the window shows it: a page whose rail row or place
+    /// the layout hides (ui/layout.json) leaves it, and still reads by name.
+    var pages: [QuietToolPage] {
+        let appModel = QuietSelfAdmin.shared.appModel
+        let layout = SurfaceLayoutStore.layout(dataRoot: appModel?.dataRootOverride ?? PersistenceCore.defaultDataRoot()), profile = SimpleViewMode.current
+        let hidden = Set(["rail", "places"].flatMap { surface in
+            (layout.surfaces[surface] ?? []).map(\.name).filter { !layout.isShown(surface, $0, profile: profile) }
+        })
+        return QuietPages.all.filter { !hidden.contains($0.id) }.map(Self.pageValue)
+    }
     var currentPage: QuietToolPage? { NativeAgentAppCoordinator.shared.currentPage.map(Self.pageValue) }
     func page(named raw: String) -> QuietToolPage? { QuietPages.page(named: raw).map(Self.pageValue) }
     /// `app {page: "context", item: session_id}`: the composer's context

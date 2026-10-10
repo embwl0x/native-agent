@@ -43,8 +43,8 @@ public struct DeviceSyncWorkshopSubmission: Sendable {
     }
 }
 
-/// What device sync reaches that the app still owns: its NativeClient reads and
-/// actions, the engine facades, remote Mac control and the attention router.
+/// What device sync reaches that the app still owns: its reads and actions,
+/// the engine facades, remote Mac control and the attention router.
 public protocol DeviceSyncHost: Sendable {
     func helpersSnapshot() async throws -> MobileHelpersSnapshot
     func helperAction(action: String, payload: [String: String]) async throws -> [String: String]
@@ -92,8 +92,6 @@ public protocol DeviceSyncHost: Sendable {
     func acceptMemoryProposal(proposalID: String) async throws -> MemoryV2.MemoryRecord
     func rejectMemoryProposal(proposalID: String, reason: String) async throws
     func deleteMemory(id: String) async throws
-    func approvePromotionPending(id: String) async throws
-    func rejectPromotionPending(id: String, reason: String) async throws
     func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord
     func inboxAction(_ id: String, action: String) async throws
     @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String]

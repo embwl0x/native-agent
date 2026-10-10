@@ -80,15 +80,6 @@ public actor WorkshopExecutorLoop {
     /// domain block, and an admitted Full Mac grant has already answered it.
     private let stepApprovalEnforced: @Sendable () async -> Bool
     private let terminalEventSink: WorkshopTerminalEventSink?
-    /// Resolves the execution→memory recorder LAZILY, on the first terminal event.
-    /// Lazy because the production writer touches `SwiftNativeMemoryV2.shared`,
-    /// which opens the SQLite store on first access — constructing an executor
-    /// must not have that side effect. See `defaultExecutionMemoryProvider`.
-    private let executionMemoryProvider: @Sendable () -> WorkshopExecutionMemoryRecorder?
-    /// The write queue, built on first terminal event from the resolved
-    /// recorder. Terminal transitions HAND OFF to this and return; they never
-    /// wait on the memory store. See ``WorkshopExecutionMemoryQueue``.
-    private var executionMemoryQueue: WorkshopExecutionMemoryQueue?
     private let now: @Sendable () -> Date
     private let approvedToolDispatch: WorkshopStepApprovedToolDispatch?
     private var beforeApprovalTimeoutClaimForTesting: (@Sendable () async -> Void)?
@@ -134,7 +125,6 @@ public actor WorkshopExecutorLoop {
         approvalTimeoutInterval: TimeInterval? = nil,
         stepApprovalEnforced: @escaping @Sendable () async -> Bool = { true },
         terminalEventSink: WorkshopTerminalEventSink? = nil,
-        executionMemory: WorkshopExecutionMemoryRecorder? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.root = root
@@ -178,57 +168,7 @@ public actor WorkshopExecutorLoop {
         self.approvedToolDispatch = approvedToolDispatch
         self.stepApprovalEnforced = stepApprovalEnforced
         self.terminalEventSink = terminalEventSink
-        self.executionMemoryProvider = Self.executionMemoryProvider(
-            injected: executionMemory,
-            root: root
-        )
         self.now = now
-    }
-
-    /// Execution→memory wiring rule, in one place.
-    ///
-    /// An INJECTED recorder always wins (tests, and any future caller that wants
-    /// a different store). Otherwise the default writer is used ONLY when this
-    /// executor is running against the process's default data root — the same
-    /// root `SwiftNativeMemoryV2.shared` is rooted at. An executor on a temp root
-    /// (every test, every fixture) gets no recorder rather than silently writing
-    /// fixture executions into User's real memory store.
-    ///
-    /// This is why the plug needs no app-assembly wiring: production builds its
-    /// executor on the default root, so it is on by default, in-module, and any
-    /// future executor construction inherits it.
-    private static func executionMemoryProvider(
-        injected: WorkshopExecutionMemoryRecorder?,
-        root: URL
-    ) -> @Sendable () -> WorkshopExecutionMemoryRecorder? {
-        if let injected {
-            return { injected }
-        }
-        guard root.standardizedFileURL.path
-            == PersistenceCore.defaultDataRoot().standardizedFileURL.path else {
-            return { nil }
-        }
-        return {
-            WorkshopExecutionMemoryRecorder(
-                writer: SwiftNativeWorkshopExecutionMemoryWriter(),
-                log: { level, message in
-                    // A failed write must be findable (gpt-5.5 review A1): the
-                    // whole sink used to go through `.info`, which is exactly
-                    // where a "she can't remember this execution" line goes to
-                    // die at default log level.
-                    switch level {
-                    case .error: Self.logger.error("\(message, privacy: .public)")
-                    case .info: Self.logger.info("\(message, privacy: .public)")
-                    }
-                },
-                markTombstoned: { id in
-                    WorkshopExecutionMemory.markTombstoned(executionDirectory: root
-                        .appendingPathComponent("workshop", isDirectory: true)
-                        .appendingPathComponent("executions", isDirectory: true)
-                        .appendingPathComponent(id, isDirectory: true))
-                }
-            )
-        }
     }
 
     /// `NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS` (P2-5), or the deprecated
@@ -1748,180 +1688,7 @@ public actor WorkshopExecutorLoop {
 
     private func emitTerminalEvent(_ record: WorkshopExecutionRecord?, reason: String?) async {
         guard let record, ["completed", "failed", "cancelled"].contains(record.status) else { return }
-        let reason = record.terminalReason ?? reason
-        await terminalEventSink?(record, reason)
-        // Receipts first, memory second — and the memory write is HANDED OFF,
-        // never awaited (gpt-5.5 review A1, BLOCKING). `recorder.record` embeds,
-        // inserts, then sweeps retention; awaiting it here meant a busy SQLite
-        // or a stalled embedder held the terminal path and the executor did not
-        // advance to the next queued execution. The queue preserves order, keeps
-        // the write, and logs its own failures at `.error`.
-        // `waitForExecutionMemoryWrites()` is the seam for anyone who needs the
-        // tail (shutdown, tests).
-        await resolvedExecutionMemoryQueue(building: true)?.enqueue(record, reason: reason)
-    }
-
-    /// Resolve — and on first use, build — the execution-memory queue.
-    /// `building: false` never constructs one, so the wait seam cannot create a
-    /// queue (and thus touch `SwiftNativeMemoryV2.shared`) as a side effect.
-    private func resolvedExecutionMemoryQueue(building: Bool) -> WorkshopExecutionMemoryQueue? {
-        if let executionMemoryQueue { return executionMemoryQueue }
-        guard building, let recorder = executionMemoryProvider() else { return nil }
-        let queue = WorkshopExecutionMemoryQueue(recorder: recorder)
-        executionMemoryQueue = queue
-        return queue
-    }
-
-    /// Await every execution-memory write handed off so far. Nothing on the
-    /// execution path calls this — it exists so shutdown and tests can observe
-    /// a lane that is deliberately off the hot path.
-    ///
-    /// `timeout` is the SHUTDOWN CONTRACT (gpt-5.5 review, BLOCKING 1,
-    /// 2026-08-02). Production quit stops loops, MCP, context and cognition
-    /// under a 3s budget and never drained this queue, so a terminal execution
-    /// whose write was still in embed/SQLite left `mission.json` on disk with
-    /// no memory behind it — silently. Draining fixes that; draining
-    /// UNBOUNDED would trade a lost memory for a hung quit, so an unfinished
-    /// drain is ABANDONED at the deadline and says so at `.error`.
-    ///
-    /// Returns true when the tail actually drained. `nil` timeout = wait
-    /// forever (tests).
-    @discardableResult
-    public func waitForExecutionMemoryWrites(timeout: TimeInterval? = nil) async -> Bool {
-        guard let queue = resolvedExecutionMemoryQueue(building: false) else { return true }
-        guard let timeout, timeout.isFinite, timeout > 0 else {
-            await queue.drain()
-            return true
-        }
-        let gate = WorkshopExecutionMemoryGate()
-        let drain = Task.detached(priority: .utility) {
-            await queue.drain()
-            gate.signal(true)
-        }
-        let timer = Task.detached(priority: .utility) {
-            try? await Task.sleep(nanoseconds: UInt64(min(timeout, 3600) * 1_000_000_000))
-            gate.signal(false)
-        }
-        let drained = await gate.wait()
-        // The drain task is deliberately NOT cancelled on timeout: the write may
-        // still land before the process actually exits, and cancelling it could
-        // only make the loss more certain.
-        timer.cancel()
-        if !drained {
-            let pending = await queue.pendingCount()
-            Self.logger.error(
-                """
-                [workshop-memory] shutdown drain ABANDONED after \(timeout, privacy: .public)s with \
-                \(pending, privacy: .public) execution-memory write(s) still pending — those executions are on \
-                disk and she will not remember them.
-                """
-            )
-        }
-        _ = drain
-        return drained
-    }
-
-    /// CRASH RECONCILIATION — the other half of BLOCKING 1.
-    ///
-    /// A bounded drain covers a clean quit. A crash (or a kill inside the
-    /// shutdown budget) still ends with a terminal `mission.json` and no memory
-    /// row, and nothing ever went back for it. This does, at launch.
-    ///
-    /// BOUNDED, TWICE, and here is the choice: only executions whose record was
-    /// last written inside `within` (default 7 days) are considered, and at most
-    /// `maxRecords` (default 100) of them, newest first. 7 days because the loss
-    /// window it repairs is "the last time this app was killed", not "all of
-    /// history", and because the store's own execution lane only keeps
-    /// `retentionCap` (200) rows anyway — rescanning a year of executions on
-    /// every launch would read hundreds of files to re-mint memories retention
-    /// is about to archive. The scan reads directory MODIFICATION DATES first
-    /// and only opens `mission.json` for the survivors, so the file reads are
-    /// bounded by `maxRecords`, not by the size of the history.
-    ///
-    /// Returns the number of executions handed to the write queue.
-    @discardableResult
-    public func reconcileMissedExecutionMemories(
-        within: TimeInterval = 7 * 24 * 3600,
-        maxRecords: Int = 100
-    ) async -> Int {
-        guard maxRecords > 0 else { return 0 }
-        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return 0 }
-        let cutoff = now().addingTimeInterval(-max(0, within))
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(
-            at: executionRecordsRoot,
-            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return 0 }
-
-        // Cheap pass: dates only, no JSON reads.
-        let recent: [(url: URL, modified: Date)] = entries.compactMap { url in
-            guard let values = try? url.resourceValues(
-                forKeys: [.isDirectoryKey, .contentModificationDateKey]
-            ), values.isDirectory == true else { return nil }
-            guard let modified = values.contentModificationDate, modified >= cutoff else { return nil }
-            return (url, modified)
-        }
-        .sorted { $0.modified > $1.modified }
-        .prefix(maxRecords)
-        .map { $0 }
-        // Resolve the queue only once there is something to reconcile: on the
-        // production root, building it opens the MemoryV2 SQLite store, and a
-        // launch with no recent executions should not pay for that here.
-        guard !recent.isEmpty, let queue = resolvedExecutionMemoryQueue(building: true) else { return 0 }
-
-        // KNOWN EDGE, deliberately accepted: `recordedSources` sees ACTIVE rows
-        // only, so an execution whose memory retention already ARCHIVED reads as
-        // missing and gets re-written. It costs one duplicate narrative at
-        // worst (`store()` collapses byte-identical content), and it only
-        // reaches a row that is both inside the 7-day window AND already past
-        // the 200-row cap — i.e. 200+ executions in a week. Widening the read to
-        // archived rows would trade that for re-reading retired history on
-        // every launch, which is the cost this window exists to avoid.
-        guard let known = await queue.recordedSources() else { return 0 }
-        var reconciled = 0
-        for entry in recent {
-            // A memory refused as a rejected claim is settled for good.
-            guard !fm.fileExists(atPath: entry.url
-                .appendingPathComponent(WorkshopExecutionMemory.tombstonedMarkerName).path) else { continue }
-            // A corrupt record is logged and quarantined by readJSON; the scan skips it.
-            guard let raw = try? await persistence.readJSON(
-                ExecutionRecordFile.resolve(in: entry.url), ifMissing: .null
-            ) else { continue }
-            guard case .object(let object) = raw,
-                  case .string(let id)? = object["id"], !id.isEmpty else { continue }
-            let record = SwiftNativeWorkshopRunner.recordFromJSON(object)
-            guard ["completed", "failed", "cancelled"].contains(record.status) else { continue }
-            guard case .remember = WorkshopExecutionMemory.decide(record) else { continue }
-            guard !known.contains(WorkshopExecutionMemory.source(for: record)) else { continue }
-            // Ask once, then mark: a rejected claim was never lost to a crash.
-            // A failed lookup (logged by the recorder) skips this launch rather
-            // than reading as "not tombstoned".
-            switch await queue.isRefusedAsTombstoned(record, reason: record.terminalReason) {
-            case false?: break
-            case true?:
-                if !WorkshopExecutionMemory.markTombstoned(executionDirectory: entry.url) {
-                    Self.logger.error("[workshop-memory] ERROR marking execution \(id, privacy: .public) tombstoned")
-                }
-                continue
-            case nil: continue
-            }
-            Self.logger.info(
-                """
-                [workshop-memory] reconcile: terminal execution \(id, privacy: .public) \
-                (status \(record.status, privacy: .public)) has no memory — re-queuing the write \
-                that a crash or a killed shutdown lost.
-                """
-            )
-            await queue.enqueue(record, reason: record.terminalReason)
-            reconciled += 1
-        }
-        if reconciled > 0 {
-            Self.logger.info(
-                "[workshop-memory] reconcile: re-queued \(reconciled, privacy: .public) missed execution memories"
-            )
-        }
-        return reconciled
+        await terminalEventSink?(record, record.terminalReason ?? reason)
     }
 
     private func scanQueue() async -> [WorkshopExecutionRecord] {

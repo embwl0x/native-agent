@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import DreamREMCycle
 
 /// Weekly, app-owned, data-driven self-improvement pass.
 ///
@@ -19,9 +20,8 @@ import ProviderRouting
 ///   with any provider configured gets it.
 /// - Honest split: runtime-class findings (skills / prompts / config / memory)
 ///   are stageable for one-tap apply; code-class findings flow into the
-///   injected `fileCodeFinding` lane (U2b: filed as `needs_diff` evolution
-///   proposals on repo-stamped installs) and fall back to digest-only when
-///   that lane is not wired (non-repo installs).
+///   injected `fileCodeFinding` lane (the harness queue, for the builder)
+///   and stay digest-only when that lane is not wired.
 /// - Dependency-clean: staging + the enable-gate are injected closures, so
 ///   this loop needs no new module deps. BackgroundLoopsAssembly wires the real
 ///   ApprovalInbox + trust policy.
@@ -54,14 +54,14 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     /// silent proposal drop. A throw now propagates to the outer catch, which
     /// rolls back the weekly marker (retry next tick) and returns `.failed`,
     /// tripping the manager's background_loop_failures.jsonl receipt net.
-    private let stageProposal: @Sendable (SelfImprovementProposal) async throws -> Void
+    /// Returns the id of the approval card that carries it, for the digest.
+    private let stageProposal: @Sendable (SelfImprovementProposal) async throws -> String
     /// U2b wave 2: code-class findings used to die in the digest ("a signed
     /// app can't recompile itself" — no longer true on a repo-stamped
     /// install). When wired, every code finding is ALSO handed here; the
-    /// assembly files it into the EvolutionProposalStore as a `needs_diff`
-    /// proposal. Injected closure so this module gains no SelfImprovement
-    /// dep (same dependency-clean rule as stageProposal). nil → digest-only
-    /// (the pre-U2b behavior, and the honest default for non-repo installs).
+    /// assembly files it on the harness queue for the builder. Injected
+    /// closure so this module gains no Desk dep (same dependency-clean rule
+    /// as stageProposal). nil → digest-only.
     private let fileCodeFinding: (@Sendable (SelfImprovementProposal) async throws -> Void)?
     /// MEASURE leg (north-star, 2026-06-15): a compact week-over-week
     /// execution-outcome summary so the self-improvement brain reasons over REAL
@@ -71,6 +71,17 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     /// `SwiftNativeWorkshopRunner.weeklyOutcomeStats()`. Default "" → the signal
     /// is omitted (pre-MEASURE behavior, honest for installs with no executions).
     private let workshopOutcomes: @Sendable () async -> String
+    /// What the pass learns from (2026-10-10), given the cards its previous
+    /// digest recorded: misses by lesson, what became of those cards, and the
+    /// standing corrections ready to graduate. Injected like
+    /// `workshopOutcomes`; the default learns nothing.
+    private let learning: @Sendable (_ previousCards: [String]?) async -> SelfImprovementLearning
+    /// Stages the standing lessons the analyst wrote (memory id → GROWTH line)
+    /// as REM cards and returns their REM proposal ids. Throws like `stageProposal`.
+    private let stageStandingLessons: @Sendable ([String: String]) async throws -> [String]
+    /// Skill, tool and sense retirement (`CapabilityLifecycle`), run on this
+    /// clock as well as on the turns that list or run skills.
+    private let capabilityUpkeep: @Sendable () async -> Void
 
     public init(
         interval: TimeInterval = 7 * 24 * 60 * 60,
@@ -79,9 +90,12 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         clock: @escaping @Sendable () -> Date = { Date() },
         isEnabled: @escaping @Sendable () async -> Bool,
-        stageProposal: @escaping @Sendable (SelfImprovementProposal) async throws -> Void,
+        stageProposal: @escaping @Sendable (SelfImprovementProposal) async throws -> String,
         fileCodeFinding: (@Sendable (SelfImprovementProposal) async throws -> Void)? = nil,
-        workshopOutcomes: @escaping @Sendable () async -> String = { "" }
+        workshopOutcomes: @escaping @Sendable () async -> String = { "" },
+        learning: @escaping @Sendable (_ previousCards: [String]?) async -> SelfImprovementLearning = { _ in SelfImprovementLearning() },
+        stageStandingLessons: @escaping @Sendable ([String: String]) async throws -> [String] = { _ in [] },
+        capabilityUpkeep: @escaping @Sendable () async -> Void = {}
     ) {
         self.interval = interval
         self.llm = llm
@@ -92,6 +106,9 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         self.stageProposal = stageProposal
         self.fileCodeFinding = fileCodeFinding
         self.workshopOutcomes = workshopOutcomes
+        self.learning = learning
+        self.stageStandingLessons = stageStandingLessons
+        self.capabilityUpkeep = capabilityUpkeep
     }
 
     /// Requests one cadence-bypassing pass without deleting the canonical
@@ -132,7 +149,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             FileHandle.standardError.write(Data(
                 "WeeklySelfImprovementLoop: disabled (enableAutonomy off)\n".utf8
             ))
-            return .skipped(reason: "autonomy disabled")
+            return .off("self-improvement or unattended work switched off")
         }
         do {
             try Task.checkCancellation()
@@ -183,6 +200,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             // so the next tick retries; cancellation after staging keeps it.
             do {
             try Task.checkCancellation()
+            await capabilityUpkeep()
             var signals = try gatherSignals(now: now)
             // MEASURE leg: fold in the real Workshop execution-outcome trend (async — reads
             // mission.json off disk). Empty when there's no history, so the
@@ -190,29 +208,39 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             let outcomes = await workshopOutcomes()
             try Task.checkCancellation()
             if !outcomes.isEmpty { signals += "\n\n" + outcomes }
+            let learned = await learning(previousPassCards())
+            try Task.checkCancellation()
+            if !learned.signals.isEmpty { signals += "\n\n" + learned.signals }
+            if !learned.standing.isEmpty {
+                signals += "\n\n## Standing lessons (recalled in nearly every conversation this week)\n"
+                    + learned.standing.sorted { $0.key < $1.key }
+                        .map { "- [\($0.key)] " + TurnSecretRedactor.redactText($0.value) }.joined(separator: "\n")
+            }
             let pickedModel = await router.modelStringForSurface("self_improvement")
             try Task.checkCancellation()
             let raw = try await llm.complete(
                 prompt: Self.analysisPrompt(signals: signals, now: now),
                 system: Self.systemPrompt,
                 model: pickedModel,
-                surface: "self_improvement"
+                surface: "self_improvement", purpose: "self_improvement"
             )
             try Task.checkCancellation()
             // Non-JSON output is a FAILED pass, not "nothing found" — the old
             // collapse to (summary: prefix, proposals: []) consumed the weekly
             // window on garbage. Throwing here lets the restore-marker catch
             // below rerun the pass next tick.
-            guard let result = Self.parseResult(raw) else {
+            guard var result = Self.parseResult(raw) else {
                 throw NSError(domain: "WeeklySelfImprovementLoop", code: 1, userInfo: [
                     NSLocalizedDescriptionKey:
                         "no parseable JSON object in LLM output (first 200 chars: \(raw.prefix(200)))"
                 ])
             }
+            // The cards this pass leaves, by id: the next pass follows them up.
+            var cards: [String] = []
             for proposal in result.proposals where proposal.kind == .runtime {
                 try Task.checkCancellation()
                 stagingStarted = true
-                try await stageProposal(proposal)
+                cards.append("approval:" + (try await stageProposal(proposal)))
                 try Task.checkCancellation()
             }
             // U2b wave 2: code findings get a lane instead of a dead end.
@@ -226,6 +254,12 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
                     try Task.checkCancellation()
                 }
             }
+            // Only lessons it was offered; an invented id stages nothing.
+            result.standing = result.standing.filter { learned.standing[$0.key] != nil }
+            if !result.standing.isEmpty {
+                stagingStarted = true
+                cards += try await stageStandingLessons(result.standing).map { "rem:" + $0 }
+            }
             try Task.checkCancellation()
             // The pass IS the staging — mark success BEFORE the digest write.
             // A digest throw after staging used to restore the marker, so the
@@ -233,7 +267,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             // proposal. The digest is reporting, not the work: log-and-go.
             passSucceeded = true
             do {
-                try writeDigest(result: result, outcomes: outcomes, now: now)
+                try writeDigest(result: result, outcomes: outcomes, cards: cards, now: now)
             } catch {
                 FileHandle.standardError.write(Data(
                     "WeeklySelfImprovementLoop: digest write failed (proposals already staged): \(error)\n".utf8
@@ -539,6 +573,16 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     A "code" finding needs a source change (or is a good idea with no applicable \
     op above). These are report-only — a shipped app cannot recompile itself.
 
+    Under "Standing lessons" you may be given corrections she is reminded of in \
+    nearly every conversation. For each one you can state as a rule, write it \
+    for her GROWTH.md in the first person, \(REMProposalStore.growthPassageBoundSentence), \
+    and return it in "standing" with its memory_id. Never invent ids.
+
+    "Misses by lesson" counts the corrections she was given this week, last \
+    week's in brackets: a lesson that keeps coming back is a finding. "The last \
+    pass" shows what became of the previous proposals: build on what was \
+    approved, and do not propose again what was denied.
+
     Respond with ONLY a JSON object, no prose:
     {
       "summary": "<2-3 sentence overview of the week>",
@@ -556,7 +600,8 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
           "evidence": "<evidence>",
           "proposedChange": "<what a developer should change>"
         }
-      ]
+      ],
+      "standing": [{"memory_id": "<id under Standing lessons>", "line": "<one GROWTH line>"}]
     }
     """
 
@@ -579,6 +624,8 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     struct Result: Sendable {
         var summary: String
         var proposals: [SelfImprovementProposal]
+        /// Memory id → the GROWTH line the analyst wrote for it.
+        var standing: [String: String] = [:]
     }
 
     /// Returns nil when the raw output contains NO parseable JSON object —
@@ -624,14 +671,21 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
                 return nil   // unknown/missing class
             }
         }
-        return Result(summary: summary, proposals: proposals)
+        var standing: [String: String] = [:]
+        for row in obj["standing"] as? [[String: Any]] ?? [] {
+            guard let id = row["memory_id"] as? String,
+                  let line = (row["line"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !line.isEmpty else { continue }
+            standing[id] = line
+        }
+        return Result(summary: summary, proposals: proposals, standing: standing)
     }
 
     // MARK: - Digest
 
     /// Writes the weekly digest (summary + every finding, runtime and code) to
     /// `<dataRoot>/self_improvement/digests/YYYY-MM-DD.md` for the UI/report.
-    private func writeDigest(result: Result, outcomes: String, now: Date) throws {
+    private func writeDigest(result: Result, outcomes: String, cards: [String], now: Date) throws {
         let dir = dataRoot.appendingPathComponent("self_improvement", isDirectory: true)
             .appendingPathComponent("digests", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -654,11 +708,29 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             md += "\n## Code findings (report only — needs a developer)\n"
             for p in code { md += "- **\(p.title)** — \(p.proposedChange)\n  - evidence: \(p.evidence)\n" }
         }
+        if !result.standing.isEmpty {
+            md += "\n## Standing lessons offered to GROWTH (REM cards)\n"
+            for line in result.standing.values.sorted() { md += "- \(line)\n" }
+        }
+        if !cards.isEmpty {
+            md += "\n## Cards (the next pass follows these up)\n" + cards.map { "- card \($0)\n" }.joined()
+        }
         let target = dir.appendingPathComponent("\(Self.todayString(now)).md")
         try md.data(using: .utf8)?.write(to: target, options: .atomic)
     }
 
     // MARK: - Helpers
+
+    /// The cards the newest digest already written recorded — the previous
+    /// pass's. Nil when there is no earlier digest.
+    private func previousPassCards() -> [String]? {
+        let dir = dataRoot.appendingPathComponent("self_improvement", isDirectory: true)
+            .appendingPathComponent("digests", isDirectory: true)
+        guard let newest = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+                .filter({ $0.hasSuffix(".md") }).max(),
+              let text = try? String(contentsOf: dir.appendingPathComponent(newest), encoding: .utf8) else { return nil }
+        return text.split(separator: "\n").filter { $0.hasPrefix("- card ") }.map { String($0.dropFirst("- card ".count)) }
+    }
 
     static func parseISO(_ s: String) -> Date? {
         NativeTimestampFormat.parseISO8601(s)
@@ -666,6 +738,18 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
 
     static func todayString(_ date: Date) -> String {
         NativeTimestampFormat.utcDay(date)
+    }
+}
+
+/// What a weekly pass learns from: prompt sections already rendered, and the
+/// standing corrections it may graduate (memory id → text).
+public struct SelfImprovementLearning: Sendable {
+    public var signals: String
+    public var standing: [String: String]
+
+    public init(signals: String = "", standing: [String: String] = [:]) {
+        self.signals = signals
+        self.standing = standing
     }
 }
 

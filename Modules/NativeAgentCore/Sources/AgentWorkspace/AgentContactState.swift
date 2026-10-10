@@ -63,14 +63,20 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         guard let data = try? Data(contentsOf: url(root)) else { return [:] }
         return (try? JSONDecoder().decode([String: Self].self, from: data)) ?? [:]
     }
-    public var current: Bool { brokenSince != nil || status == "unverified" || Date().timeIntervalSince(checkedAt) < 600 }
+    /// Said until a newer observation replaces it, not only while fresh.
+    public var sticky: Bool { brokenSince != nil || ["unverified", "interrupted"].contains(status) }
+    public var current: Bool { sticky || Date().timeIntervalSince(checkedAt) < 600 }
     public var word: String? {
         guard current else { return nil }
         let text = status.replacingOccurrences(of: "_", with: " ")
         return text.prefix(1).uppercased() + text.dropFirst()
     }
+    /// A reply path that is broken, as Doctor and the body report count it. An
+    /// unverified one (its app, program or recipe changed since the proof) is
+    /// not: the next send proves it again.
+    public var isBroken: Bool { problem != nil && ["broken", "signed_out", "unavailable"].contains(status) }
     public var problem: String? {
-        current && !["ready", "live", "unchecked"].contains(status)
+        current && !["ready", "installed", "live", "unchecked"].contains(status)
             ? detail + (repairDetail.map { " " + $0 } ?? "") : nil
     }
 
@@ -105,9 +111,45 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
 
     public static func nextRefresh(_ root: URL, now: Date) -> Date {
         let observations = read(root).values
-        let last = observations.filter { $0.brokenSince == nil && $0.status != "unverified" }.map(\.checkedAt).min()
+        let last = observations.filter { !$0.sticky }.map(\.checkedAt).min()
             ?? (observations.isEmpty ? .distantPast : now)
         return max(now.addingTimeInterval(30), last.addingTimeInterval(300))
+    }
+}
+
+/// An agent discovery found on this Mac and offered once (agents/discovery.json,
+/// by candidate id). A decline holds until its version changes; a connection
+/// ends the offer for good. AgentDiscoverySession is the one writer.
+public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
+    public var name: String
+    public var version: String?
+    public var offeredAt: Date?
+    public var declinedAt: Date?
+    public var connectedAt: Date?
+
+    public init(name: String) { self.name = name }
+
+    public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/discovery.json") }
+    /// Empty only when the file is missing; nil when it is there but does not
+    /// read, so a damaged file is never written over.
+    public static func read(_ root: URL) -> [String: Self]? {
+        guard FileManager.default.fileExists(atPath: url(root).path) else { return [:] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? Data(contentsOf: url(root))).flatMap { try? decoder.decode([String: Self].self, from: $0) }
+    }
+    public static func write(_ offers: [String: Self], _ root: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(offers), to: url(root))
+    }
+
+    /// Open: offered, and neither declined nor connected since.
+    public var open: Bool { offeredAt != nil && declinedAt == nil && connectedAt == nil }
+    /// Home's PEOPLE line. An `app:` id is an app no recipe knows: nothing to connect.
+    public static func line(id: String, name: String) -> String {
+        id.hasPrefix("app:") ? "Found \(name) (no recipe yet) — want me to look?" : "Found \(name) — connect?"
     }
 }
 

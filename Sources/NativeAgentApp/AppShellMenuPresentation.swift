@@ -2,9 +2,9 @@ import SwiftUI
 import NativeAgentShared
 
 /// D7: the Navigate menu is a PROJECTION of the rail, not a second list kept
-/// by hand. It numbered `primaryItems`, which lacks the Helpers row the rail
+/// by hand. It numbered the old primary list, which lacked the Helpers row the rail
 /// adds at six, so ⌘6–⌘9 each opened the page one below. It reads the rail's
-/// own order and words now (`BotsShelfRailProposal.ordered`).
+/// own order and words now (`SidebarItem.rail`).
 enum NavigateMenuPresentation {
     struct Entry: Equatable, Identifiable {
         let item: SidebarItem
@@ -16,8 +16,8 @@ enum NavigateMenuPresentation {
         var title: String { item.shellRailTitle }
     }
 
-    static func entries(helpersShown: Bool) -> [Entry] {
-        BotsShelfRailProposal.ordered(SidebarItem.primaryItems, enabled: helpersShown).enumerated().map { index, item in
+    static func entries(_ layout: SurfaceLayout) -> [Entry] {
+        SidebarItem.rail(layout).compactMap { $0 }.enumerated().map { index, item in
             Entry(item: item, shortcut: index < 9 ? Character("\(index + 1)") : nil)
         }
     }

@@ -70,11 +70,6 @@ public enum MemoryPolicyGate {
         isEnabled("adaptive_promotion", default: true, dataRoot: dataRoot)
     }
 
-    /// Settings ▸ "Keep consolidated memories without asking".
-    public static func autoPromoteConsolidatedEnabled(dataRoot: URL? = nil) -> Bool {
-        isEnabled("auto_promote_consolidated", default: true, dataRoot: dataRoot)
-    }
-
     /// Settings ▸ "Memory hygiene".
     public static func hygieneEnabled(dataRoot: URL? = nil) -> Bool {
         isEnabled("hygiene_enabled", default: true, dataRoot: dataRoot)

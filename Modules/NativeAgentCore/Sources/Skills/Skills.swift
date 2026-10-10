@@ -15,6 +15,79 @@ import PersistenceCore
 /// (`SkillScript.voices`): none for her own.
 public typealias SkillLine = (words: String, peers: [String])
 
+/// One learned-skills registry row, as the Capabilities page and the phone
+/// snapshot carry it.
+public struct SkillRecord: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var name: String
+    public var description: String
+    public var triggers: [String]
+    public var kind: String?
+    public var status: String?
+    public var autoCreated: Bool?
+    public var sourceRunId: String?
+    public var bodyPath: String?
+    public var createdAt: String?
+    public var updatedAt: String?
+    public var useCount: Int?
+    public var lastUsedAt: String?
+    /// "runtime_registry" (default for in-registry rows), "runtime_body" (a
+    /// markdown body under data/skills/bodies/ with no registry entry yet),
+    /// or "persona_body" (a markdown body under persona/skills/bodies/). UI
+    /// uses this to gate destructive actions — Disable/Delete only make sense
+    /// for registry rows; body-only rows have no entry to mutate.
+    public var source: String?
+    /// A repeatable skill's script and the line generated from its header.
+    public var script: Script?
+    public var signature: String?
+    public var scriptDigest: String?
+
+    public struct Script: Codable, Hashable, Sendable { public var source: String }
+}
+
+extension SkillRecord {
+    /// One registry row; a present field of the wrong type makes it malformed.
+    public init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            id: try row.string("id"), name: try row.string("name"), description: try row.string("description"),
+            triggers: try row.strings("triggers"), kind: try row.optionalString("kind"),
+            status: try row.optionalString("status"), autoCreated: try row.optionalBool("autoCreated"),
+            sourceRunId: try row.optionalString("sourceRunId"), bodyPath: try row.optionalString("bodyPath"),
+            createdAt: try row.optionalString("createdAt"), updatedAt: try row.optionalString("updatedAt"),
+            useCount: try row.optionalInt("useCount"), lastUsedAt: try row.optionalString("lastUsedAt"),
+            source: try row.optionalString("source"),
+            script: try row.optional("script") { value in
+                guard case .object(let script) = value, case .string(let source)? = script["source"] else { return nil }
+                return Script(source: source)
+            },
+            signature: try row.optionalString("signature"), scriptDigest: try row.optionalString("scriptDigest"))
+    }
+}
+
+/// One merged CLI manifest-registry row, as the Skills page lists it.
+public struct SkillRegistryEntry: Codable, Identifiable, Sendable {
+    public var id: String { name }
+    public let name: String
+    public let state: String     // "drafted" | "installed" | "active" | "dormant" | "quarantined"
+    public let version: String
+    public let type: String
+    public let installedAt: String?
+    public let path: String
+
+    public init(name: String, state: String, version: String, type: String, installedAt: String?, path: String) {
+        self.name = name; self.state = state; self.version = version
+        self.type = type; self.installedAt = installedAt; self.path = path
+    }
+
+    init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(name: try row.string("name"), state: try row.string("state"), version: try row.string("version"),
+                  type: try row.string("type"), installedAt: try row.optionalString("installedAt"),
+                  path: try row.string("path"))
+    }
+}
+
 // MARK: - Client protocol
 
 public protocol SkillsClient: Sendable {
@@ -80,6 +153,11 @@ public protocol SkillsClient: Sendable {
 }
 
 public extension SkillsClient {
+    /// The merged manifest registry as entries; a malformed row fails the read.
+    func listManifestSkillEntries() async throws -> [SkillRegistryEntry] {
+        try await listManifestSkills().map(SkillRegistryEntry.init(row:))
+    }
+
     func listSkillVersions(id: String) async throws -> [JSONValue] { [] }
     func archiveSkill(id: String) async throws -> JSONValue {
         throw SkillsError.historyUnavailable("skill archive is unavailable")
@@ -883,10 +961,11 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         }
     }
 
-    /// Upkeep on a turn that lists or runs skills (skills-as-code PR 5), no
-    /// timer of its own: a script declaring an action `missing` says the app
-    /// no longer has is suspended, and any skill that is on but unused for
-    /// 30 days is archived, never deleted (`CapabilityLifecycle`).
+    /// Upkeep on a turn that lists or runs skills (skills-as-code PR 5) and on
+    /// the weekly self-improvement pass, no timer of its own: a script
+    /// declaring an action `missing` says the app no longer has is suspended,
+    /// and any skill that is on but unused for 30 days is archived, never
+    /// deleted (`CapabilityLifecycle`).
     /// Returns one MY QUEUE line per skill it changed.
     public func upkeep(missing: @escaping @Sendable (String) -> Bool,
                        unusedDays: Int = CapabilityLifecycle.unusedDays) async throws -> [SkillLine] {
@@ -1077,17 +1156,17 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         let peers = (origin["peers"].flatMap { if case .array(let peers) = $0 { peers } else { nil } } ?? [])
             .map { SkillMutation.pyStr($0) }
         let users: String? = if !ownerAuthorized, !steer.isEmpty {
-            "This turn was steered by \(steer.joined(separator: ", ")), so turning \(skill)'s script on is User's"
+            "This turn was steered by \(steer.joined(separator: ", ")), so turning \(skill)'s script on is the owner's"
         } else if kind == "peer", !ownerAuthorized {
             "\(skill)'s script was steered by "
                 + peers.joined(separator: ", ")
-                + ", so turning it on is User's"
+                + ", so turning it on is the owner's"
         } else if kind == "pack" || origin["pack"] != nil {
-            "\(skill)'s script came with the \(SkillMutation.pyStr(origin["pack"] ?? .null)) pack, so turning it on is User's"
+            "\(skill)'s script came with the \(SkillMutation.pyStr(origin["pack"] ?? .null)) pack, so turning it on is the owner's"
         } else if kind == nil {
-            "\(skill)'s script has no attested origin, so turning it on is User's"
+            "\(skill)'s script has no attested origin, so turning it on is the owner's"
         } else if !fullMac {
-            "Below Full Mac turning a script on is User's"
+            "Below Full Mac turning a script on is the owner's"
         } else { nil }
         return users
     }
@@ -1098,8 +1177,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     /// `preview` (enable, restore, rollback) makes every check the real call makes, writes nothing and says what it would leave.
     public func manageSkill(
         verb asked: String, name: String, personaRoot: URL, retry: String, fullMac: Bool, steer: [String],
-        preview: Bool = false, ownerAuthorized: Bool = false,
-        reconcile: @Sendable () async throws -> Void
+        preview: Bool = false, ownerAuthorized: Bool = false
     ) async -> (ok: Bool, text: String, fields: [String: JSONValue]) {
         if preview, !["enable", "restore", "rollback"].contains(asked) {
             return (false, "Only enable, restore and rollback preview here; nothing was done.", [:])
@@ -1156,7 +1234,6 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             do {
                 _ = try await markSkill(
                     name: registeredName, legacyStatus: legacy, manifestState: manifest, marks: marks)
-                try await reconcile()
             } catch {
                 return (false, "\(verb) failed: \(error.localizedDescription)." + retry, fields)
             }
@@ -1167,13 +1244,13 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         let builtIn = source == "persona_body"
             || (SkillMutation.pyStrOptional(row["bodyPath"])?.hasPrefix(personaBodies) ?? false)
         if verb != "enable", builtIn {
-            return (false, "\(skill) is built in: it ships with the app in persona/skills, so switching it off or deleting it is User's. Ask him.", fields)
+            return (false, "\(skill) is built in: it ships with the app in persona/skills, so switching it off or deleting it is the owner's. Ask them.", fields)
         }
         // Her version of a built-in stands in for it, so switching it off or
         // trashing it stays User's; rollback drops hers and the built-in shows again.
         let override = row["overrides"] == .string("built_in")
         if override, ["disable", "delete"].contains(verb) {
-            return (false, "\(skill) is your version of a built-in, so switching it off or deleting it is User's. Ask him. "
+            return (false, "\(skill) is your version of a built-in, so switching it off or deleting it is the owner's. Ask them. "
                 + "skill.rollback drops your version and the built-in shows again.", fields)
         }
         func dropOverride() async -> (ok: Bool, text: String, fields: [String: JSONValue]) {
@@ -1190,7 +1267,6 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                     return (false, "Dropping your version did not finish: its body did not delete, so it stays in the trash "
                         + "(skill.restore brings it back). The built-in is in use again." + retry, fields)
                 }
-                try await reconcile()
             } catch {
                 return (false, "Dropping your version failed: \(error.localizedDescription)." + retry, fields)
             }
@@ -1212,12 +1288,12 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 return (false, "\(skill) is in the trash. skill.restore brings it back (off); then skill.enable turns it on.", fields)
             }
             if state != "drafted", !hers {
-                return (false, "User turned \(skill) off; he turns it back on. Ask him.",
-                        fields.merging(["reason": .string("users_call")]) { $1 })
+                return (false, "The owner turned \(skill) off; they turn it back on. Ask them.",
+                        fields.merging(["reason": .string("owners_call")]) { $1 })
             }
             if let reach = Self.reachPastGuidance(selected.manifest) {
-                return (false, "\(skill) declares \(reach), which reaches past guidance. Installing it is User's: ask him to Install it on the Skills page.",
-                        fields.merging(["reason": .string("users_call")]) { $1 })
+                return (false, "\(skill) declares \(reach), which reaches past guidance. Installing it is the owner's: ask them to Install it on the Skills page.",
+                        fields.merging(["reason": .string("owners_call")]) { $1 })
             }
             // A script runs only under an admission of its exact digest: hers
             // to give for her own script under Full Mac on her own turn, and
@@ -1230,10 +1306,10 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 let digest = SkillScript.digest(script) ?? ""
                 if let users = Self.usersAdmission(row, skill: skill, steer: steer, fullMac: fullMac, ownerAuthorized: ownerAuthorized) {
                     // `skill_id` and `script` are for the host's card; it strips the script.
-                    return (false, users + ": he reads the script and installs it. Nothing changed.",
-                            fields.merging(["needs_user": .bool(true), "reason": .string("users_call"),
+                    return (false, users + ": they read the script and install it. Nothing changed.",
+                            fields.merging(["needs_owner": .bool(true), "reason": .string("owners_call"),
                                            "script_digest": .string(digest), "skill_id": .string(registeredName),
-                                           "script": script]) { $1 }.merging(would("active", "users_card", now: false)) { $1 })
+                                           "script": script]) { $1 }.merging(would("active", "owners_card", now: false)) { $1 })
                 }
                 admit = "agent"
                 reviewed = digest
@@ -1245,11 +1321,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                     + "; its 30-day unused clock restarts.", fields.merging(would("active", "hers", now: true)) { $1 })
             }
             do {
-                let result = try await enableSkill(name: registeredName, admittedBy: admit, reviewedDigest: reviewed)
-                if result.objectValue?["status"] == .string("active") {
-                    do { try await reconcile() }
-                    catch { return (false, error.localizedDescription + " app skill.list shows its state now.", fields) }
-                }
+                _ = try await enableSkill(name: registeredName, admittedBy: admit, reviewedDigest: reviewed)
                 let refreshed = try await listSkills() + listManifestSkills()
                 let saved = refreshed.first {
                     [$0.objectValue?["id"], $0.objectValue?["name"]].contains(.string(registeredName))
@@ -1268,7 +1340,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 return (true, "\(skill) is not on (\(state)); nothing to disable.", fields.merging(["changed": .bool(false)]) { $1 })
             }
             return await mark("disabled", "dormant", ["disabledBy": .string("agent")],
-                              "Disabled \(skill); it is out of recall, and skill.enable turns it back on.")
+                              "Disabled \(skill); it is out of find, and skill.enable turns it back on.")
         case "delete":
             if state == "trashed" {
                 return (true, "\(skill) is already in the trash.", fields.merging(["changed": .bool(false)]) { $1 })
@@ -1277,8 +1349,8 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             var marks: [String: JSONValue] = ["trashedAt": .string(ISO8601DateFormatter().string(from: Date()))]
             if on || state == "drafted" || hers { marks["disabledBy"] = .string("agent") }
             return await mark("trashed", "trashed", marks,
-                              "Moved \(skill) to the trash: it is off and out of recall, body and entry kept. "
-                              + "skill.restore brings it back. Nothing empties the trash; erasing for good is User's.")
+                              "Moved \(skill) to the trash: it is off and out of find, body and entry kept. "
+                              + "skill.restore brings it back. Nothing empties the trash; erasing for good is the owner's.")
         case "rollback":
             guard row["state"] == nil else {
                 return (false, "\(skill) is a manifest skill; it carries no script to roll back.", fields)
@@ -1297,7 +1369,6 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                     }
                     let restored = try await restoreSkill(id: registeredName, versionId: versionId,
                         steer: SkillScript.origin(steeredBy: steer), guidanceOnly: true)
-                    try await reconcile()
                     return (true, "Restored \(skill) to its previous guidance version. Its permissions did not change.",
                             resultFields.merging(["state": restored.objectValue?["status"] ?? .null]) { $1 })
                 } catch {
@@ -1310,12 +1381,11 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                     let digest = String((SkillScript.digest(rolled.objectValue?["script"]) ?? "").prefix(12))
                     let users = Self.usersAdmission(rolled.objectValue ?? [:], skill: skill, steer: steer, fullMac: fullMac, ownerAuthorized: ownerAuthorized)
                     return (true, "Would roll \(skill) back to script \(digest), drafted: turning it on is "
-                        + (users.map { "User's card (\($0))" } ?? "yours, by skill.enable")
+                        + (users.map { "the owner's card (\($0))" } ?? "yours, by skill.enable")
                         + "; its 30-day unused clock restarts when it is turned on.",
                         fields.merging(["would_land_on": .string(digest)]) { $1 }
-                            .merging(would("drafted", users == nil ? "hers" : "users_card", now: false)) { $1 })
+                            .merging(would("drafted", users == nil ? "hers" : "owners_card", now: false)) { $1 })
                 }
-                try await reconcile()
                 let digest = SkillScript.digest(rolled.objectValue?["script"]) ?? ""
                 return (true, "Rolled \(skill) back to the script it had before this one (digest \(digest.prefix(12))). "
                     + "It is drafted: it runs again only once skill.enable turns it on.",
@@ -1334,12 +1404,12 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             if row["script"] != nil, !SkillScript.admitted(row) {
                 return await mark("draft", "drafted", hers ? ["disabledBy": .string("agent")] : [:],
                                   "Restored \(skill) from the trash as a draft: its script was never turned on. skill.enable asks for it.",
-                                  admit: Self.usersAdmission(row, skill: skill, steer: steer, fullMac: fullMac, ownerAuthorized: ownerAuthorized) == nil ? "hers" : "users_card")
+                                  admit: Self.usersAdmission(row, skill: skill, steer: steer, fullMac: fullMac, ownerAuthorized: ownerAuthorized) == nil ? "hers" : "owners_card")
             }
             return await mark("disabled", "dormant", hers ? ["disabledBy": .string("agent")] : [:],
                               "Restored \(skill) from the trash, switched off. "
-                              + (hers ? "skill.enable turns it on." : "User had turned it off, so turning it on is his."),
-                              admit: hers ? "hers" : "users")
+                              + (hers ? "skill.enable turns it on." : "The owner had turned it off, so turning it on is theirs."),
+                              admit: hers ? "hers" : "owners")
         default:
             return (false, "No skill_manage verb is called \(verb).", [:])
         }

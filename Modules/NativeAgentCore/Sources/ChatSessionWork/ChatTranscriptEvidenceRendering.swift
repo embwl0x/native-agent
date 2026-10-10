@@ -70,7 +70,7 @@ package enum ChatTranscriptEvidenceRendering {
             return "completion unconfirmed"
         case .cancelled: return "cancelled"
         case .timeout: return "timed out"
-        case .failed: return "failed"
+        case .failed, .refused: return "failed"
         case .succeeded:
             // Successful queueing is not a claim that the queued work ran.
             if case .string(let recorded)? = metadata?["resultStatus"] {

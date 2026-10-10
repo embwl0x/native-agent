@@ -20,7 +20,7 @@ public enum SkillRunContext {
     }
 
     static func detail(_ why: String) -> String {
-        "This step would ask User (\(why)), and a skill never files a card: it was not run "
+        "This step would ask the owner (\(why)), and a skill never files a card: it was not run "
             + "and nothing was filed. Do it yourself as its own app call if you still want it."
     }
 }

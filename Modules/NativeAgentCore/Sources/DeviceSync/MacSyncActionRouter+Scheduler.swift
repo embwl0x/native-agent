@@ -5,12 +5,15 @@ import TriggerScheduler
 
 extension MacSyncActionRouter {
     func schedulerAction(_ action: String, payload: [String: String]) async throws -> [String: String] {
+        if action == "create_scheduler_job", payload["kind"] == "improve" {
+            return ["status": "error", "message": "Code improvement jobs are no longer available."]
+        }
         let writer = makeSchedulerJobWriter()
         let jobID: String
         if action == "create_scheduler_job" {
             let name = (payload["name"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty, name.count <= 160,
-                  let kind = payload["kind"], ["notify", "dream", "rem", "improve"].contains(kind),
+                  let kind = payload["kind"], ["notify", "dream", "rem"].contains(kind),
                   let seconds = Int64(payload["interval_seconds"] ?? ""), seconds >= 60,
                   seconds <= 315_360_000 else {
                 return ["status": "error", "message": "Enter a name, a supported job kind, and an interval from 60 to 315360000 seconds."]

@@ -26,6 +26,21 @@ public struct MCPConsentRecord: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+extension MCPServer: Identifiable {}
+
+/// A tool name is unique within the one server whose list it came from.
+extension MCPTool: Identifiable {
+    public var id: String { name }
+}
+
+public struct MCPResource: Identifiable, Hashable, Sendable {
+    public var uri: String
+    public var name: String?
+    public var mimeType: String?
+
+    public var id: String { uri }
+}
+
 public struct MCPCallResult: Identifiable, Codable, Sendable {
     public var id: String
     public var serverId: String

@@ -692,7 +692,6 @@ struct SimpleShellView: View {
                 // conversation list is gone. Mounted for the life of the view
                 // like ContentView's, so a thread visit never rebuilds it.
                 ChatView()
-                    .environment(\.chatHidesConversationList, true)
                     .environment(\.chatPageIsVisible, showingChat)
                     .opacity(showingChat ? 1 : 0)
                     .allowsHitTesting(showingChat)
@@ -729,6 +728,7 @@ struct SimpleShellView: View {
         .quietReadTask(live: false) {
             while !store.loaded, !Task.isCancelled { try? await Task.sleep(nanoseconds: 50_000_000) }
         }
+        .environment(\.layoutProfile, SimpleViewMode.simple)
     }
 }
 
@@ -827,8 +827,9 @@ struct AgentThreadsTab: View {
     }
 }
 
-/// The agent's card, then Agents, then Helpers, on the room's one sheet
-/// (Sidebar C, User 10-04): no plate; a hairline parts it from the chat.
+/// The agent's card, then Agents and Helpers in her home's order
+/// (ui/layout.json), on the room's one sheet (Sidebar C, User 10-04): no
+/// plate; a hairline parts it from the chat.
 /// Embedded in Advanced's Agents tab, a Connections row stands in for the
 /// card and the settings menu stays with Simple.
 private struct SimpleSidebar: View {
@@ -837,6 +838,7 @@ private struct SimpleSidebar: View {
     var embedded = false
     @Environment(AppModel.self) private var appModel
     @Environment(\.controlActiveState) private var activeState
+    @Environment(\.layoutProfile) private var layoutProfile
     @State private var showQuiet = false
     @State private var showCrews = false
     /// "last ran … ago" is measured from this, re-stamped when the plate
@@ -876,50 +878,10 @@ private struct SimpleSidebar: View {
             .selectionDisabled()
                 .padding(.bottom, Self.sectionGap)
             }
-            Section {
-                if let error = store.refreshError { quiet(error) }
-                if store.loaded && store.contacts.isEmpty {
-                    quiet("None connected yet. Ask \(agentName) to connect one.")
-                }
-                ForEach(talked) { contactRow($0) }
-                if !unheard.isEmpty {
-                    DisclosureGroup(isExpanded: $showQuiet) {
-                        ForEach(unheard) { contactRow($0) }
-                    } label: {
-                        foldLabel("Not talked to yet", count: unheard.count)
-                    }
-                }
-            } header: {
-                sectionTitle("Agents", "Other AIs I work with.")
-            }
-            Section {
-                // Crews at work lead the section, and leave it when they finish.
-                ForEach(store.crews.filter(\.live)) { crewRow($0) }
-                if store.loaded && store.helpers.isEmpty {
-                    quiet("None yet. Ask \(agentName) to make one.")
-                }
-                ForEach(store.helpers) { helper in
-                    let selected = pane == .helper(helper.id)
-                    let timing = Self.timing(helper, now: now)
-                    let working = store.running.contains(helper.id) || store.waiting.contains(SimpleViewStore.key(helper.id))
-                    row(.helper(helper.id)) {
-                        HStack(spacing: 10) {
-                            SimpleClockTile(size: 30, working: working)
-                            rowText(helper.definition.name, timing, selected: selected)
-                        }
-                    }
-                    .accessibilityLabel("\(helper.definition.name), \(working ? "working now, " : "")\(timing)")
-                }
-                let finished = store.crews.filter { !$0.live }
-                if !finished.isEmpty {
-                    DisclosureGroup(isExpanded: $showCrews) {
-                        ForEach(finished) { crewRow($0) }
-                    } label: {
-                        foldLabel("Recent crews", count: finished.count)
-                    }
-                }
-            } header: {
-                sectionTitle("Helpers", "Bots I made that can do real work for you. Talk to any of them here.")
+            // Her home's people and helpers, in its order: the two sections.
+            ForEach(SurfaceLayoutLive.shared.layout.shown("home", profile: layoutProfile).filter { ["people", "helpers"].contains($0.name) },
+                    id: \.name) { block in
+                if block.name == "people" { agentsSection(talked: talked, unheard: unheard) } else { helpersSection }
             }
         }
         .listStyle(.sidebar)
@@ -948,6 +910,57 @@ private struct SimpleSidebar: View {
         .onHover { if $0 { now = Date() } }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(agentName), agents and helpers")
+    }
+
+    private func agentsSection(talked: [SimpleContact], unheard: [SimpleContact]) -> some View {
+        Section {
+            if let error = store.refreshError { quiet(error) }
+            if store.loaded && store.contacts.isEmpty {
+                quiet("None connected yet. Ask \(agentName) to connect one.")
+            }
+            ForEach(talked) { contactRow($0) }
+            if !unheard.isEmpty {
+                DisclosureGroup(isExpanded: $showQuiet) {
+                    ForEach(unheard) { contactRow($0) }
+                } label: {
+                    foldLabel("Not talked to yet", count: unheard.count)
+                }
+            }
+        } header: {
+            sectionTitle("Agents", "Other AIs I work with.")
+        }
+    }
+
+    private var helpersSection: some View {
+        Section {
+            // Crews at work lead the section, and leave it when they finish.
+            ForEach(store.crews.filter(\.live)) { crewRow($0) }
+            if store.loaded && store.helpers.isEmpty {
+                quiet("None yet. Ask \(agentName) to make one.")
+            }
+            ForEach(store.helpers) { helper in
+                let selected = pane == .helper(helper.id)
+                let timing = Self.timing(helper, now: now)
+                let working = store.running.contains(helper.id) || store.waiting.contains(SimpleViewStore.key(helper.id))
+                row(.helper(helper.id)) {
+                    HStack(spacing: 10) {
+                        SimpleClockTile(size: 30, working: working)
+                        rowText(helper.definition.name, timing, selected: selected)
+                    }
+                }
+                .accessibilityLabel("\(helper.definition.name), \(working ? "working now, " : "")\(timing)")
+            }
+            let finished = store.crews.filter { !$0.live }
+            if !finished.isEmpty {
+                DisclosureGroup(isExpanded: $showCrews) {
+                    ForEach(finished) { crewRow($0) }
+                } label: {
+                    foldLabel("Recent crews", count: finished.count)
+                }
+            }
+        } header: {
+            sectionTitle("Helpers", "Bots I made that can do real work for you. Talk to any of them here.")
+        }
     }
 
     /// A little gear and the word, at the plate's foot (User, 09-24: "just a

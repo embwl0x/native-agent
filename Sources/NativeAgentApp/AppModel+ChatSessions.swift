@@ -78,6 +78,9 @@ extension Notification.Name {
     /// See `AppModel.flushLiveChatDrafts()`. Posted before a chat surface
     /// reads a stored draft; every mounted composer commits its live text.
     static let chatFlushLiveDrafts = Notification.Name("nativeagent.chat.flushLiveDrafts")
+    /// A turn's user-visible notice (retry, timeout, advisory); ChatView
+    /// places it in the turn's lane or as a toast.
+    static let nativeAgentTurnNotice = Notification.Name("nativeagent.turn.notice")
 }
 
 @MainActor
@@ -87,7 +90,7 @@ extension AppModel {
         // Keeps the UserDefaults-backed settings block live so a bridge or
         // out-of-process write is picked up without a relaunch.
         installDefaultsBackedSettingsObserver()
-        await loadChatState(api: client)
+        await reloadChatState()
     }
 
     @MainActor
@@ -166,7 +169,7 @@ extension AppModel {
         }
     }
 
-    // M12 (2026-07-09): every `try? await api.getX() ?? existingValue` below
+    // M12 (2026-07-09): every `try? await <read>() ?? existingValue` below
     // silently substitutes the LAST-KNOWN value when the backend is down, so a
     // dead runtime renders a full, confident-looking panel of stale data.
     // `fresh(_:_:)` records which endpoints came back nil; `recordPanelRefresh`
@@ -183,7 +186,7 @@ extension AppModel {
             if remaining == 0 { panelRefreshCounts.removeValue(forKey: item) }
             else { panelRefreshCounts[item] = remaining }
         }
-        let api = client
+        let persona = personaEngine
         let memory = engine.memory
         let approvalStore = engine.approvals
         let inbox = engine.inbox
@@ -220,9 +223,9 @@ extension AppModel {
         case .chat:
             if !(await loadProvidersForChat()) { failedEndpoints.append("providers") }
             engine.providers.catalog = fresh("model catalog", try? await engine.providers.modelCatalog(refresh: false))
-            await loadChatState(api: api)
+            await reloadChatState()
             if chatStateLoadFailed { failedEndpoints.append("chat messages") }
-            compiledPersonality = fresh("personality", try? await api.getCompiledPersonality(surface: "chat"))
+            compiledPersonality = fresh("personality", try? await PersonaCompiler(engine: persona).compiledPacket(surface: "chat"))
             // The chat header, composer placeholder, and turn cards all read
             // `agentDisplayName`, which resolves from `personality?.name`
             // first. That profile was only ever loaded by the Memory and
@@ -231,7 +234,7 @@ extension AppModel {
             // those screens had been visited. Load it once here; the name is
             // the profile's, never a literal.
             if personality == nil {
-                if let next = fresh("personality profile", try? await api.getPersonality()), next != personality { personality = next }
+                if let next = fresh("personality profile", try? await Self.readPersonality(dataRoot: engine.dataRoot)), next != personality { personality = next }
                 teachMemoryHygieneName()
             }
         case .legacyWorkshop:
@@ -243,7 +246,7 @@ extension AppModel {
             // a double re-layout that shifted the scroll position. Approvals
             // have their own refresh in the .activity case and the sidebar's
             // own 30s poll; they don't need to ride along with the execution lane.
-            runs = fresh("runs", try? await api.getRuns()) ?? runs
+            runs = fresh("runs", await RuntimeReadProjection.runs(dataRoot: engine.dataRoot) ?? []) ?? runs
         case .desk, .workshop, .work, .command, .bots:
             // Nothing is read here, so nothing is said about freshness below.
             performedRead = false
@@ -254,21 +257,17 @@ extension AppModel {
         case .memory, .memories, .knowledge:
             async let nextMemories = try? memory.activeMemories()
             async let nextMemoryProposals = try? memory.proposals(status: "pending")
-            async let nextVectorStatus = try? api.getMemoryVectorStatus()
-            async let nextMemoryV2Status = try? api.getMemoryV2Status()
-            async let nextAgentGraph = try? api.getAgentGraph()
-            async let nextGraphEntities = try? api.getGraphEntities()
-            async let nextGraphStatus = try? api.getGraphStatus()
-            async let nextPersonality = try? api.getPersonality()
+            async let nextVectorStatus = try? MemoryStatusProjection.getMemoryVectorStatus(dataRoot: engine.dataRoot)
+            async let nextMemoryV2Status = try? MemoryStatusProjection.getMemoryV2Status(dataRoot: engine.dataRoot)
+            async let nextGraph = try? memory.graphView()
+            async let nextPersonality = try? PersonaCompiler.compileProfile(dataRoot: engine.dataRoot).sharedProfile
             async let nextTrustPolicy = try? engine.trust.load()
-            let (memoryRows, proposalRows, vectorRow, memoryV2Row, agentGraphRow, graphRows, graphStatusRow, personalityRow, trustRow) = await (
+            let (memoryRows, proposalRows, vectorRow, memoryV2Row, graphRow, personalityRow, trustRow) = await (
                 nextMemories,
                 nextMemoryProposals,
                 nextVectorStatus,
                 nextMemoryV2Status,
-                nextAgentGraph,
-                nextGraphEntities,
-                nextGraphStatus,
+                nextGraph,
                 nextPersonality,
                 nextTrustPolicy
             )
@@ -281,16 +280,16 @@ extension AppModel {
             memory.proposals = fresh("memory proposals", proposalRows) ?? memory.proposals
             memoryVectorStatus = fresh("vector status", vectorRow) ?? memoryVectorStatus
             memoryV2Status = fresh("memory v2 status", memoryV2Row) ?? memoryV2Status
-            agentGraph = fresh("agent graph", agentGraphRow) ?? agentGraph
-            graphEntities = fresh("graph entities", graphRows) ?? graphEntities
-            graphStatus = fresh("graph status", graphStatusRow) ?? graphStatus
+            agentGraph = fresh("agent graph", graphRow?.agentGraph) ?? agentGraph
+            graphEntities = fresh("graph entities", graphRow?.entities) ?? graphEntities
+            graphStatus = fresh("graph status", graphRow?.status) ?? graphStatus
             if let next = fresh("personality", personalityRow), next != personality { personality = next }
             teachMemoryHygieneName()
             if let next = fresh("trust policy", trustRow), next != engine.trust.policy { engine.trust.policy = next }
         case .settingsHub, .settings, .connectors, .providers, .telegram, .inboxPolicy, .macIntegration:
-            async let nextConfig = try? api.getConfig()
-            async let nextTelegramStatus = try? engine.telegram.load(manager: api.backgroundLoopsManager.coreManager)
-            async let nextConnectors = try? api.getConnectors()
+            async let nextConfig = try? Self.readConfig(dataRoot: engine.dataRoot)
+            async let nextTelegramStatus = try? engine.telegram.load(manager: backgroundLoopsManager.coreManager)
+            async let nextConnectors = try? ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform())
             let (configRow, telegramRow, connectorRows) = await (
                 nextConfig,
                 nextTelegramStatus,
@@ -303,65 +302,54 @@ extension AppModel {
             engine.telegram.status = fresh("telegram status", telegramRow) ?? engine.telegram.status
             connectors = fresh("connectors", connectorRows) ?? connectors
             if item == .connectors {
-                workspaces = fresh("shared folders", try? await api.getWorkspaces()) ?? workspaces
+                workspaces = fresh("shared folders", try? await ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot)) ?? workspaces
             }
         case .approvals, .activity:
             async let nextApprovals = try? approvalStore.list()
             async let nextInbox = try? inbox.list()
             async let nextMemoryProposals = try? memory.proposals(status: "pending")
-            async let nextImprovementSummary = try? api.getImprovementSummary()
-            async let nextTrainingProposals = try? api.getTrainingProposals()
-            async let nextPromotionCandidates = try? api.getPromotionCandidates()
-            async let nextPromotionPending = try? api.getPromotionPending()
-            let (approvalRows, inboxRows, proposalRows, improvementRow, trainingRows, promotionRows, pendingRows) = await (
+            async let nextMisses = Self.readMisses(dataRoot: engine.dataRoot)
+            let (approvalRows, inboxRows, proposalRows) = await (
                 nextApprovals,
                 nextInbox,
-                nextMemoryProposals,
-                nextImprovementSummary,
-                nextTrainingProposals,
-                nextPromotionCandidates,
-                nextPromotionPending
+                nextMemoryProposals
             )
             if let next = fresh("approvals", approvalRows), next != approvalStore.records { approvalStore.records = next }
             inbox.items = fresh("inbox", inboxRows) ?? inbox.items
             memory.proposals = fresh("memory proposals", proposalRows) ?? memory.proposals
-            improvementSummary = fresh("improvement summary", improvementRow) ?? improvementSummary
-            trainingProposals = fresh("training proposals", trainingRows) ?? trainingProposals
-            promotionCandidates = fresh("promotion candidates", promotionRows) ?? promotionCandidates
-            promotionPending = fresh("promotion pending", pendingRows) ?? promotionPending
+            missLessons = fresh("misses", await nextMisses) ?? missLessons
         case .capabilities:
-            async let nextSkills = try? api.getSkills()
+            async let nextSkills = try? RuntimeReadProjection.skills(dataRoot: engine.dataRoot)
             async let nextTools = try? toolStore.listAuthored()
             async let nextCapabilitySummary = try? engine.trust.loadCapabilities()
             async let nextApprovals = try? approvalStore.list()
-            async let nextWorkflows = try? api.getWorkflows()
-            async let nextMCPServers = try? api.getMCPServers()
+            async let nextWorkflows = try? makeWorkflowOrchestrationClient(root: engine.dataRoot).listWorkflowRecords()
+            async let nextMCPServers = try? engine.tools.mcp.listServers()
             // The compact MCP Builder is mounted in Capabilities too. Its
             // server controls render live session and consent evidence, so
             // refresh all three authorities together rather than leaving
             // those rows stale/empty until someone opens the separate MCP tab.
             async let nextMCPSessions = try? engine.tools.listMCPSessions()
-            async let nextMCPConsent = try? api.getMCPConsent()
+            async let nextMCPConsent = try? engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)
             // Native macOS Power is part of the Capabilities hardening view.
             // Refresh each live tile and action registry here so that view
             // never inherits a stale launch snapshot from another surface.
-            async let nextNotificationStatus = try? api.getNotificationStatus()
-            async let nextBrowserRuntimeStatus = try? api.getBrowserStatus()
-            async let nextMemoryVectorStatus = try? api.getMemoryVectorStatus()
-            async let nextNativeActions = try? api.getNativeActionRegistry().actions
-            async let nextNativeActionReceipts = try? api.getNativeActionReceipts()
-            async let nextConnectorActionRegistry = try? api.getConnectorActions()
-            async let nextImprovementGauntletStatus = try? api.getImprovementGauntlet()
-            async let nextCatalog = try? api.getCapabilityCatalog()
-            async let nextCatalogSources = try? api.getCapabilityCatalogSources()
-            async let nextPackInstalls = try? api.getCapabilityPackInstalls()
+            async let nextNotificationStatus = try? RuntimeReadProjection.getNotificationStatus(dataRoot: engine.dataRoot)
+            async let nextBrowserRuntimeStatus = try? RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot)
+            async let nextMemoryVectorStatus = try? MemoryStatusProjection.getMemoryVectorStatus(dataRoot: engine.dataRoot)
+            async let nextNativeActions = NativeActionRoutes.swiftNativeActionRecords()
+            async let nextNativeActionReceipts: [NativeActionReceipt] = RuntimeReadProjection.tailJSONL(
+                path: NativeActionRoutes.nativeActionReceiptsPath(dataRoot: engine.dataRoot), limit: 50)
+            async let nextConnectorActionRegistry = try? ConnectorActionRegistry.read(dataRoot: engine.dataRoot)
+            async let nextImprovementGauntletStatus = try? RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: engine.dataRoot)
+            async let nextCatalog = try? engine.trust.catalog()
+            async let nextCatalogSources = try? engine.trust.catalogSources()
+            async let nextPackInstalls = try? engine.trust.packInstalls()
             async let nextCapabilityTrust = try? engine.trust.loadCapabilityNetwork()
-            async let nextSummary = try? api.getNextGenSummary()
-            async let nextPhases = try? api.getNextGenPhases()
-            async let nextReceipts = try? api.getNextGenReceipts()
-            async let nextAgentGraph = try? api.getAgentGraph()
-            async let nextGraphEntities = try? api.getGraphEntities()
-            async let nextGraphStatus = try? api.getGraphStatus()
+            async let nextSummary = try? NextGenStatusProjection(dataRoot: engine.dataRoot).getNextGenSummary()
+            async let nextPhases = try? NextGenStatusProjection(dataRoot: engine.dataRoot).getNextGenPhases()
+            async let nextReceipts = try? NextGenStatusProjection(dataRoot: engine.dataRoot).getNextGenReceipts()
+            async let nextGraph = try? engine.memory.graphView()
             let (
                 skillRows,
                 toolRows,
@@ -385,9 +373,7 @@ extension AppModel {
                 summaryRow,
                 phaseRows,
                 receiptRows,
-                agentGraphRow,
-                graphRows,
-                graphStatusRow
+                graphRow
             ) = await (
                 nextSkills,
                 nextTools,
@@ -411,9 +397,7 @@ extension AppModel {
                 nextSummary,
                 nextPhases,
                 nextReceipts,
-                nextAgentGraph,
-                nextGraphEntities,
-                nextGraphStatus
+                nextGraph
             )
             skills = fresh("skills", skillRows) ?? skills
             toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
@@ -448,10 +432,10 @@ extension AppModel {
             capabilityPackInstalls = fresh("pack installs", installRows) ?? capabilityPackInstalls
             engine.trust.capabilityNetwork = fresh("capability trust", trustRow) ?? engine.trust.capabilityNetwork
             nextGenSummary = fresh("nextgen summary", summaryRow) ?? nextGenSummary
-            agentGraph = fresh("skill memory graph", agentGraphRow) ?? agentGraph
-            graphEntities = fresh("skill memory graph entities", graphRows) ?? graphEntities
-            graphStatus = fresh("skill memory graph status", graphStatusRow) ?? graphStatus
-            if agentGraphRow != nil, graphRows != nil, graphStatusRow != nil {
+            agentGraph = fresh("skill memory graph", graphRow?.agentGraph) ?? agentGraph
+            graphEntities = fresh("skill memory graph entities", graphRow?.entities) ?? graphEntities
+            graphStatus = fresh("skill memory graph status", graphRow?.status) ?? graphStatus
+            if graphRow != nil {
                 graphLoadError = nil
             } else {
                 graphLoadError = "The graph could not be loaded for Capabilities. Refresh Graph to retry."
@@ -461,19 +445,13 @@ extension AppModel {
             nextGenPhases = phaseRows ?? fresh("nextgen phases", summaryRow?.phases) ?? nextGenPhases
             nextGenReceipts = fresh("nextgen receipts", receiptRows) ?? nextGenReceipts
         case .autoImprovement:
-            failedEndpoints.append(contentsOf: await loadAllSelfImprovement())
-            async let nextImprovementSummary = try? api.getImprovementSummary()
-            async let nextImprovements = try? api.getImprovements()
+            // The weekly pass reads its digest directly.
             async let nextJobs = try? desk.listJobs()
-            async let nextTrainingArtifacts = try? api.getTrainingArtifacts()
-            let (improvementRow, improvementRows, jobRows, artifactRows) = await (
-                nextImprovementSummary,
-                nextImprovements,
+            async let nextTrainingArtifacts = try? Self.readTrainingArtifacts(dataRoot: engine.dataRoot)
+            let (jobRows, artifactRows) = await (
                 nextJobs,
                 nextTrainingArtifacts
             )
-            improvementSummary = fresh("improvement summary", improvementRow) ?? improvementSummary
-            improvements = fresh("improvements", improvementRows) ?? improvements
             desk.jobs = fresh("jobs", jobRows) ?? desk.jobs
             trainingArtifacts = fresh("training artifacts", artifactRows) ?? trainingArtifacts
         case .dreams:
@@ -484,7 +462,7 @@ extension AppModel {
         case .cognition:
             performedRead = false
         case .skills, .skillLifecycle:
-            skills = fresh("skills", try? await api.getSkills()) ?? skills
+            skills = fresh("skills", try? await RuntimeReadProjection.skills(dataRoot: engine.dataRoot)) ?? skills
         case .diagnostics:
             // B2.1 (2026-07-23): the Diagnostics tab is now only Doctor / Status /
             // Runs (DiagnosticsView). Its views read exactly activityEvents, runs,
@@ -498,9 +476,9 @@ extension AppModel {
             // getBrowserStatus + getProductionHardening (CapabilitiesView). All of
             // them are also refreshed by refreshAll() (launch + post-action), so no
             // consumer is starved. See prerelease-upgrade-campaign.md B2.1 [W7#1].
-            async let nextActivity = try? api.getActivity()
-            async let nextRuns = api.getRunsStrict()
-            async let nextWatchdog = engine.doctor.readWatchdog(manager: api.backgroundLoopsManager.coreManager)
+            async let nextActivity = try? RuntimeReadProjection.getActivity(root: engine.dataRoot)
+            async let nextRuns = RuntimeReadProjection.runs(dataRoot: engine.dataRoot)
+            async let nextWatchdog = engine.doctor.readWatchdog(manager: backgroundLoopsManager.coreManager)
             // Health used to be fetched unconditionally for every page above;
             // Status is the page that actually reads it, so it reads it here.
             let healthRow: RuntimeHealth? = engine.doctor.readHealth()
@@ -519,10 +497,10 @@ extension AppModel {
             engine.doctor.healthProbeFailed = healthProbeFailed
             engine.doctor.health = fresh("health", healthRow) ?? engine.doctor.health
         case .personality:
-            async let nextPersonality = try? api.getPersonality()
-            async let nextDocs = try? api.getPersonalityDocs()
-            async let nextCompiled = try? api.getCompiledPersonality(surface: "chat")
-            async let nextGrowth = try? api.getPersonalityGrowth()
+            async let nextPersonality = try? PersonaCompiler.compileProfile(dataRoot: engine.dataRoot).sharedProfile
+            async let nextDocs = try? persona.listPersonaDocSpecs()
+            async let nextCompiled = try? PersonaCompiler(engine: persona).compiledPacket(surface: "chat")
+            async let nextGrowth = try? Self.readPersonalityGrowth()
             let (personalityRow, docsResponse, compiledRow, growthRow) = await (
                 nextPersonality,
                 nextDocs,
@@ -538,8 +516,8 @@ extension AppModel {
             personalityGrowth = fresh("personality growth", growthRow) ?? personalityGrowth
         case .trust:
             async let nextTrust = try? engine.trust.load()
-            async let nextConnectors = try? api.getConnectors()
-            async let nextWorkspaces = try? api.getWorkspaces()
+            async let nextConnectors = try? ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform())
+            async let nextWorkspaces = try? ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot)
             async let nextBackups = try? engine.trust.listBackups()
             let (trustRow, connectorRows, workspaceRows, backupRows) = await (
                 nextTrust,
@@ -552,15 +530,15 @@ extension AppModel {
             workspaces = fresh("workspaces", workspaceRows) ?? workspaces
             engine.trust.backups = fresh("backups", backupRows) ?? engine.trust.backups
         case .panels:
-            async let nextSkills = try? api.getSkills()
+            async let nextSkills = try? RuntimeReadProjection.skills(dataRoot: engine.dataRoot)
             async let nextTools = try? toolStore.listAuthored()
             let (skillRows, toolRows) = await (nextSkills, nextTools)
             skills = fresh("skills", skillRows) ?? skills
             toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
         case .tools:
             async let nextTools = try? toolStore.listAuthored()
-            async let nextConnectorActions = try? api.getConnectorActions()
-            async let nextMCPServers = try? api.getMCPServers()
+            async let nextConnectorActions = try? ConnectorActionRegistry.read(dataRoot: engine.dataRoot)
+            async let nextMCPServers = try? engine.tools.mcp.listServers()
             // Tools renders the current catalog *and* its Full Mac lifecycle
             // explanation. Refresh the Trust policy in the same pass so an
             // expired/unreadable window is never flattened into "off".
@@ -579,9 +557,9 @@ extension AppModel {
                 failedEndpoints.append("tool catalog")
             }
         case .mcp:
-            async let nextMCPServers = try? api.getMCPServers()
+            async let nextMCPServers = try? engine.tools.mcp.listServers()
             async let nextMCPSessions = try? engine.tools.listMCPSessions()
-            async let nextMCPConsent = try? api.getMCPConsent()
+            async let nextMCPConsent = try? engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)
             let (mcpRows, sessionRows, consentRows) = await (nextMCPServers, nextMCPSessions, nextMCPConsent)
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
             engine.tools.mcpSessions = fresh("mcp sessions", sessionRows) ?? engine.tools.mcpSessions
@@ -611,9 +589,9 @@ extension AppModel {
                 // user's selection didn't change while we were awaiting.
                 let pendingId = server.id
                 mcpToolReadState = .loading
-                let fetchedTools: [MCPToolRecord]?
+                let fetchedTools: [MCPTool]?
                 do {
-                    fetchedTools = try await api.getMCPTools(serverId: pendingId).tools
+                    fetchedTools = try await MCPUIActions.listTools(serverId: pendingId, dispatcher: engine.tools.mcp)
                 } catch {
                     fetchedTools = nil
                     failedEndpoints.append("mcp tools")
@@ -624,9 +602,9 @@ extension AppModel {
                 if selectedMCPServerId == pendingId {
                     mcpResourceReadState = .loading
                 }
-                let fetchedResources: [MCPResourceRecord]?
+                let fetchedResources: [MCPResource]?
                 do {
-                    fetchedResources = try await api.getMCPResources(serverId: pendingId).resources
+                    fetchedResources = try await MCPUIActions.listResources(serverId: pendingId, dispatcher: engine.tools.mcp)
                 } catch {
                     fetchedResources = nil
                     failedEndpoints.append("mcp resources")
@@ -768,8 +746,8 @@ extension AppModel {
     /// The privacy map, walked now off the main actor (seconds for a whole
     /// data root). Trust asks for it whenever it shows the map.
     func refreshPrivacyMap() async {
-        let api = client
-        privacyMap = await Task.detached(priority: .utility) { try? await api.getPrivacyMap() }.value ?? privacyMap
+        let root = engine.dataRoot
+        privacyMap = await Task.detached(priority: .utility) { PrivacyMap(dataRoot: root) }.value
     }
 
     /// One user-facing sentence naming what could not be reached and how old
@@ -965,13 +943,13 @@ extension AppModel {
     }
 
     @MainActor
-    func loadChatState(api: NativeClient) async {
+    func reloadChatState() async {
         if chatStateLoadInFlight {
             await waitForChatStateLoad()
             return
         }
         chatStateLoadInFlight = true
-        await performLoadChatState(api: api)
+        await performLoadChatState()
         finishChatStateLoad()
     }
 
@@ -1049,7 +1027,7 @@ extension AppModel {
     }
 
     @MainActor
-    private func performLoadChatState(api: NativeClient) async {
+    private func performLoadChatState() async {
         let activeAtStart = activeChatSessionId
         let selectionGenerationAtStart = chatSelectionGeneration
         do {
@@ -1362,8 +1340,8 @@ extension AppModel {
 /// door fires the same trace milestones as a Mac turn, so this reads them into
 /// the same lifecycle the card, the thinking glow and Work read. Display only:
 /// no task, no Stop, no durable receipt, and a Mac turn in the session always
-/// wins. It keeps every session's open turn, seeded from the persisted trace
-/// when it starts, so a turn already running when a chat is opened or
+/// wins. It keeps every session's open turn, seeded from the engine's run
+/// registry when it starts, so a turn already running when a chat is opened or
 /// returned to shows too.
 @MainActor
 final class OtherDoorTurns {
@@ -1371,9 +1349,6 @@ final class OtherDoorTurns {
     /// Each session's other-door turn that began and has not ended.
     private var open: [String: MacChatTurnLifecycleState] = [:]
     private var started = false
-    /// A start this old with no end in the trace is a turn that died
-    /// unrecorded, not one still working.
-    static let seedWindow: TimeInterval = 30 * 60
     /// Her words reaching the surface: movement, and the card reads "replying".
     private static let outputKinds: Set<String> = [
         TurnLifecycleMilestone.providerFirstDelta.rawValue,
@@ -1398,12 +1373,8 @@ final class OtherDoorTurns {
 
     private func run(_ appModel: AppModel) async {
         let subscription = await TurnTraceBus.shared.subscribe(capacity: 256)
-        let reader = TurnTraceRecentReader(dataRootOverride: appModel.engine.turns.dataRoot)
-        let yesterday = (try? await reader.read(now: Date().addingTimeInterval(-86400)))?.events ?? []
-        let today = (try? await reader.read())?.events ?? []
-        for event in (yesterday + today).sorted(by: { $0.ts < $1.ts })
-        where Date().timeIntervalSince(event.ts) < Self.seedWindow {
-            _ = reduce(event, appModel)
+        for turn in appModel.engine.turns.inFlightTurns() {
+            admit(MacChatTurnIdentity(sessionId: turn.sessionId, turnId: turn.turnId), at: turn.acceptedAt, appModel)
         }
         for sessionId in open.keys { show(sessionId, appModel) }
         for await event in subscription.stream {
@@ -1418,6 +1389,21 @@ final class OtherDoorTurns {
         }
     }
 
+    /// Opens a turn another door started: false when it is already open or
+    /// the Mac holds it.
+    @discardableResult
+    private func admit(_ identity: MacChatTurnIdentity, at startedAt: Date, _ appModel: AppModel) -> Bool {
+        let sessionId = identity.sessionId
+        let turns = appModel.engine.turns
+        guard open[sessionId]?.identity != identity,
+              !turns.busySessions.contains(sessionId),
+              turns.activeTurnIDsBySession[sessionId] != identity.turnId,
+              turns.lifecycle(for: sessionId)?.identity.turnId != identity.turnId
+        else { return false }
+        open[sessionId] = MacChatTurnLifecycleState(identity: identity, startedAt: startedAt)
+        return true
+    }
+
     /// Folds one event in: nil when it is not an other-door turn's, else
     /// whether that turn ended.
     private func reduce(_ event: TurnTraceEvent, _ appModel: AppModel) -> Bool? {
@@ -1425,13 +1411,7 @@ final class OtherDoorTurns {
         let turns = appModel.engine.turns
         let identity = MacChatTurnIdentity(sessionId: sessionId, turnId: event.turnId)
         if event.kind == TurnLifecycleMilestone.turnAccepted.rawValue {
-            guard open[sessionId]?.identity != identity,
-                  !turns.busySessions.contains(sessionId),
-                  turns.activeTurnIDsBySession[sessionId] != event.turnId,
-                  turns.lifecycle(for: sessionId)?.identity.turnId != event.turnId
-            else { return nil }
-            open[sessionId] = MacChatTurnLifecycleState(identity: identity, startedAt: event.ts)
-            return false
+            return admit(identity, at: event.ts, appModel) ? false : nil
         }
         guard let state = open[sessionId], state.identity == identity else { return nil }
         let kind: MacChatTurnLifecycleInput.Kind

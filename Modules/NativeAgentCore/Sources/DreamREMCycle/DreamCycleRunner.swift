@@ -241,7 +241,7 @@ public actor DreamCycleRunner {
                 prompt: prompt,
                 system: dreamSystem,
                 model: pickedModel,
-                surface: "dream"
+                surface: "dream", purpose: "dream"
             )
         } catch {
             report.errors.append("llm error: \(error)")

@@ -210,7 +210,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         let ok: Any
         switch outcome {
         case .succeeded: ok = true
-        case .failed, .cancelled, .timeout: ok = false
+        case .failed, .refused, .cancelled, .timeout: ok = false
         case .unknown: ok = NSNull()
         }
         publishEvent(kind: "tool", payload: [
@@ -583,6 +583,18 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             return
         case .authorized:
             break
+        }
+        // Any authenticated call on her lane is Claude live — a chat message,
+        // a tool read, a state check — not only an agent_message. The contact
+        // health reads `claude-live` beside her inbox (10 minutes); the home
+        // PEOPLE row said her messages waited for a next session mid-conversation.
+        if path.hasPrefix("/claude/") {
+            let live = configDir.appendingPathComponent("claude-live").path
+            if !FileManager.default.fileExists(atPath: live) {
+                FileManager.default.createFile(atPath: live, contents: nil)
+            } else {
+                try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: live)
+            }
         }
         if routeAgentContact(conn: conn, method: method, path: path, headers: headers, body: body) { return }
 
@@ -995,9 +1007,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // The bridge `/claude/message` path runs the full chat client with
         // surface "chat" — the bridge IS Claude/codex working with Agent as a
         // team, so per the user's 2026-06-13 call it gets the SAME tool surface as
-        // local Mac chat: builder tools (yolo-window gated), self-evolution
-        // (includeEvolutionBridge default true → real backend; self_install
-        // still only STAGES a card the user approves), and integration tools.
+        // local Mac chat: builder tools (yolo-window gated) and integration tools.
         //
         // The ONE thing held back is the external MCP namespace
         // (denyExternalMcp:true): `mcp__*` third-party connectors — including a

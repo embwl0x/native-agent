@@ -34,7 +34,8 @@ enum DoctorStatusChecks {
                     .filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }.count
             } catch {
                 return (CheckResult(id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
-                                    detail: "Approvals could not be read: \(NativeClient.safeDoctorDetail(error.localizedDescription)).",
+                                    detail: "Approvals could not be read: \(AppDoctorPort.safeDetail(error.localizedDescription)).",
+                                    harm: "Pending decisions cannot be read or safely settled.",
                                     human_action: "Open Approvals and refresh its pending list; inspect the approval store before changing any saved request."), repaired)
             }
             let id = "status.desk_attention"
@@ -46,7 +47,7 @@ enum DoctorStatusChecks {
             var parts: [String] = []
             if !waiting.isEmpty { parts.append("\(waiting.count) item(s) wait on your decision: " + labels(waiting)) }
             if pendingApprovals > 0 { parts.append("\(pendingApprovals) pending approval(s) wait for your decision.") }
-            if !blocked.isEmpty { parts.append("\(blocked.count) blocked item(s): " + blockedDetails(blocked)) }
+            if !blocked.isEmpty { parts.append("\(blocked.count) blocked item(s): " + blockedDetails(blocked, in: items)) }
             if !contradictions.isEmpty { parts.append("\(contradictions.count) terminal parent(s) contain open descendants: " + labels(contradictions)) }
             var actions: [String] = []
             if !waiting.isEmpty { actions.append("Open Desk and decide items \(labels(waiting)) marked waiting on you.") }
@@ -55,11 +56,13 @@ enum DoctorStatusChecks {
             if !contradictions.isEmpty { actions.append("Open Desk and inspect terminal parents \(labels(contradictions)) if Repair Safe Issues cannot reconcile them.") }
             let severity = contradictions.isEmpty && blocked.isEmpty ? "ok" : "warn"
             return (CheckResult(id: id, title: title, status: severity, detail: parts.joined(separator: " "),
+                                harm: severity == "warn" ? "The named Desk work cannot move forward or is marked finished while work remains." : nil,
                                 repair: contradictions.isEmpty ? nil : "Run Repair Safe Issues to reconcile terminal Desk parents with open descendants.",
                                 human_action: actions.joined(separator: " "), repair_available: !contradictions.isEmpty), repaired)
         } catch {
             return (CheckResult(id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
-                                detail: "Desk's canonical state could not be read: \(NativeClient.safeDoctorDetail(error.localizedDescription)).",
+                                detail: "Desk's canonical state could not be read: \(AppDoctorPort.safeDetail(error.localizedDescription)).",
+                                harm: "Saved work cannot be read or safely advanced.",
                                 human_action: "Open Desk and inspect its unavailable-state detail; restore its canonical feed from a verified backup if the owner reports corruption."), false)
         }
     }
@@ -84,24 +87,16 @@ enum DoctorStatusChecks {
             + (items.count > 5 ? " and \(items.count - 5) more" : "")
     }
 
-    private static func blockedDetails(_ items: [DeskItem]) -> String {
-        items.prefix(5).map { item in
-            var details: [String] = []
-            if let reason = item.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
-                details.append(NativeClient.safeDoctorDetail(reason))
-            }
-            if let waiting = item.waitingOn?.trimmingCharacters(in: .whitespacesAndNewlines), !waiting.isEmpty {
-                details.append("waiting on \(NativeClient.safeDoctorDetail(waiting))")
-            }
-            return "#\(item.alias): " + (details.isEmpty ? "no reason recorded" : details.joined(separator: "; "))
-        }.joined(separator: "; ") + (items.count > 5 ? "; and \(items.count - 5) more" : "")
+    private static func blockedDetails(_ items: [DeskItem], in all: [DeskItem]) -> String {
+        items.prefix(5).map { "#\($0.alias): " + AppDoctorPort.safeDetail(DeskPageContent.stuckReason($0, in: all)) }
+            .joined(separator: "; ") + (items.count > 5 ? "; and \(items.count - 5) more" : "")
     }
 
     private static func activityCheck(appModel: AppModel, root: URL) async -> CheckResult {
         let id = "status.activity"
         let title = "Recent activity"
         do {
-            let readout = try await appModel.client.getActivityReadout(root: root)
+            let readout = try await RuntimeReadProjection.getActivityReadout(root: root)
             let cutoff = Date().addingTimeInterval(-15 * 60)
             let formatter = ISO8601DateFormatter()
             let fractionalFormatter = ISO8601DateFormatter()
@@ -133,6 +128,7 @@ enum DoctorStatusChecks {
                 if malformed > 0 {
                     return CheckResult(id: id, title: title, status: readout.records.isEmpty ? "fail" : "warn",
                                        detail: partial + (readout.records.isEmpty ? "" : "No current actionable failure or reconciliation receipt was found in its bounded tail."),
+                                       harm: "Parts of the activity history cannot be reviewed.",
                                        human_action: "Open Status and refresh Recent activity once; if rows remain malformed, inspect activity/events.jsonl without replacing its bytes.")
                 }
                 return CheckResult(id: id, title: title, status: "ok",
@@ -140,13 +136,15 @@ enum DoctorStatusChecks {
             }
             let owners = Set(current.map { owner(for: $0.kind) }).sorted()
             let latestTitles = current.sorted { $0.createdAt > $1.createdAt }.prefix(3)
-                .map { NativeClient.safeDoctorDetail($0.title) }.joined(separator: "; ")
+                .map { AppDoctorPort.safeDetail($0.title) }.joined(separator: "; ")
             return CheckResult(id: id, title: title, status: "warn",
                                detail: partial + "\(current.count) current adverse activity receipt(s), owner(s): \(owners.joined(separator: ", ")). Latest: \(latestTitles).",
+                               harm: "The recorded work may still be incomplete or need reconciliation.",
                                human_action: "Open Activity and inspect the latest \(owners.joined(separator: ", ")) receipt; use its current owner state before taking action. Do not rerun the recorded action." + (malformed > 0 ? " " + inspectLog : ""))
         } catch {
             return CheckResult(id: id, title: title, status: "fail",
-                               detail: "The activity log could not be read: \(NativeClient.safeDoctorDetail(error.localizedDescription)).",
+                               detail: "The activity log could not be read: \(AppDoctorPort.safeDetail(error.localizedDescription)).",
+                               harm: "Recent work and its outcomes cannot be reviewed.",
                                human_action: "Open Status and refresh Recent activity once; if the log is still unavailable, inspect activity/events.jsonl without replacing its bytes.")
         }
     }

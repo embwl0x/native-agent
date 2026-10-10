@@ -9,9 +9,9 @@ import ProviderRouting
 /// The chat picker, Setup, Telegram and the Providers page render
 /// `connections` (each provider's auth state and models) and `catalog` (the
 /// selectable models plus each surface's saved pick); the Providers page reads
-/// the per-surface rows from core `routing`. Reads are nonisolated so the phone
-/// lanes use the same owner. Writes still run through the provider executors
-/// (`NativeClient.configureProvider`, `setActiveProvider`, `configureModel`…).
+/// the per-surface rows from core `routing`. Reads and writes are nonisolated
+/// so the phone lanes use the same owner: `configureProvider`,
+/// `saveSurfaceSelection`, and `routing` for the active-provider pin.
 @MainActor
 @Observable
 public final class ProvidersFacade {
@@ -383,5 +383,59 @@ extension ProvidersFacade {
             codexHome: codexHome,
             detail: detail
         )
+    }
+}
+
+// MARK: - Writes
+
+extension ProvidersFacade {
+    /// Save one provider's sign-in mode, key and default model. The mode must
+    /// be one the provider advertises; an omitted mode takes its first.
+    public nonisolated func configureProvider(
+        id: String, apiKey: String?, authMode: String, defaultModel: String? = nil
+    ) async throws {
+        let provider = try await provider(id: id)
+        let supportedModes = provider.auth_modes.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let requestedMode = authMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // The sheet always supplies a selected mode. Keep the existing
+        // programmatic/iCloud compatibility behavior for omitted values by
+        // selecting the provider's first advertised mode, never an invented
+        // generic fallback.
+        let normalizedMode = requestedMode.isEmpty ? (supportedModes.first ?? "") : requestedMode
+        guard supportedModes.contains(normalizedMode) else {
+            throw NSError(domain: "NativeAgentProvider", code: 400, userInfo: [
+                NSLocalizedDescriptionKey: "\(provider.display_name) does not support the \(normalizedMode.isEmpty ? "requested" : normalizedMode) authentication method"
+            ])
+        }
+        var config: [String: JSONValue] = ["auth_mode": .string(normalizedMode)]
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            config["api_key"] = .string(key)
+        }
+        if let model = defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            config["default_model"] = .string(model)
+        }
+        _ = try await routing.configureProvider(id: id, config: .object(config))
+    }
+
+    /// Save one surface's pick, admitted by the same served catalog the Mac
+    /// and phone pickers show (the routing owner checks it inside its
+    /// transaction lock), and return the fresh catalog. A nil `providerID`
+    /// leaves the surface's active-provider pin alone.
+    public nonisolated func saveSurfaceSelection(
+        surface: String, model: String, reasoningEffort: String?, serviceTier: String?, providerID: String?
+    ) async throws -> ModelCatalogResponse {
+        let validateSelection = try await routing.selectionValidator()
+        try await routing.saveSurfaceConfiguration(
+            surface: surface,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            providerId: providerID,
+            seedMissingControls: true,
+            selectionValidator: validateSelection
+        )
+        return try await modelCatalog(refresh: false)
     }
 }

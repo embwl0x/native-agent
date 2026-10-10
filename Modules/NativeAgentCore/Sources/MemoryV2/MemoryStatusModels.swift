@@ -82,13 +82,11 @@ public struct MemoryV2Counts: Codable, Hashable {
     public var memories: Int?
     public var active: Int?
     public var pinned: Int?
-    public var noisyReflections: Int?
     public var pendingProposals: Int?
-    public init(memories: Int? = nil, active: Int? = nil, pinned: Int? = nil, noisyReflections: Int? = nil, pendingProposals: Int? = nil) {
+    public init(memories: Int? = nil, active: Int? = nil, pinned: Int? = nil, pendingProposals: Int? = nil) {
         self.memories = memories
         self.active = active
         self.pinned = pinned
-        self.noisyReflections = noisyReflections
         self.pendingProposals = pendingProposals
     }
 }
@@ -104,4 +102,27 @@ public struct MemoryVaultStatus: Codable, Hashable {
         self.itemCount = itemCount
         self.detail = detail
     }
+}
+
+/// One time she was given a correction, in the miss ledger
+/// (`MemoryStatusProjection.misses`).
+public struct MemoryMiss: Codable, Hashable, Sendable, Identifiable {
+    public var memoryId: String
+    public var text: String
+    /// When, and the ISO week that falls in ("2026-W41").
+    public var at: String
+    public var week: String
+    public var sessionId: String?
+    /// `history:<message id>` in that session; nil on rows kept before turns were stamped.
+    public var history: String?
+    public var id: String { memoryId + "@" + at }
+}
+
+/// The corrections that teach one lesson, newest first.
+public struct MemoryMissLesson: Codable, Hashable, Sendable, Identifiable {
+    public var lesson: String
+    public var misses: [MemoryMiss]
+    public var id: String { lesson }
+
+    public func count(week: String) -> Int { misses.filter { $0.week == week }.count }
 }

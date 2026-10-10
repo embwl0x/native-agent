@@ -302,12 +302,14 @@ extension iCloudSyncEngine {
         let schedulerLoaded = await refreshSchedulerSnapshot()
         let bundle = await Self.loadAllSnapshots(snapshotDir: snapshotDir)
         let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
+        let layout: SurfaceLayout? = await Self.loadSnapshotObjectOnly(named: "ui_layout.json", in: snapshotDir)
         // Resumption of an @MainActor async func is back on the main actor.
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         let transcriptsCurrent = transcriptsGeneration == chatTranscriptsRefreshGeneration
         let sessionsCurrent = sessionsGeneration == chatSessionListRefreshGeneration
         if let workActivity { PhoneTurnActivity.shared.receive(workActivity) }
+        if var layout { layout.addMissing(); surfaceLayout = layout }
         if activityGeneration == targetedRefreshGeneration {
             if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
             if let v = bundle.memories { memories = v }
@@ -431,10 +433,12 @@ extension iCloudSyncEngine {
         await settleUnobservedActionResponses()
         let bundle = await Self.loadLightweightSnapshots(snapshotDir: snapshotDir)
         let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
+        let layout: SurfaceLayout? = await Self.loadSnapshotObjectOnly(named: "ui_layout.json", in: snapshotDir)
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let workActivity { PhoneTurnActivity.shared.receive(workActivity) }
+        if var layout { layout.addMissing(); surfaceLayout = layout }
         if let v = bundle.personality { applyPersonality(v, pairing: personalityPairing) }
         if let v = bundle.health { health = v }
         organismLivingStatus = bundle.organismLivingStatus

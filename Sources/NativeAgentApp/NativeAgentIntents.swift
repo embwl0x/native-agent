@@ -1,5 +1,6 @@
 import AppIntents
 import Foundation
+import PersistenceCore
 import NativeAgentCore
 import ChatOrchestration
 import MacControl
@@ -81,10 +82,6 @@ struct AskResidentAgentIntent: AppIntent {
     }
 }
 
-private func intentClient() -> NativeClient {
-    NativeClient()
-}
-
 struct NativeAgentStatusIntent: AppIntent {
     @available(macOS 27, *)
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
@@ -149,13 +146,19 @@ struct NativeAgentChatIntent: AppIntent {
         let takeover = await MacWorkContinuation.admit(message)
         let reply = try await MacWorkContinuation.$current.withValue(takeover) {
             try await TurnAdmission.shared.run(sessionID: sessionID) {
-                try await intentClient().chat(
+                try await TurnRequest(
                     message: message,
-                    sessionId: sessionID,
+                    sessionID: sessionID,
                     model: model,
                     reasoningEffort: reasoningEffort,
-                    fileAccess: fileAccess
-                )
+                    fileAccess: fileAccess,
+                    attachments: [],
+                    persona: nil,
+                    surface: "chat",
+                    suppressUserAppend: false,
+                    replacementAssistantMessageID: nil,
+                    serviceTier: NativeChatTurnOptions.current(surface: "chat").serviceTier
+                ).chat(on: NativeAgentEngine.live.chatClient(profile: .mac))
             }
         }
         return reply.output
@@ -177,7 +180,7 @@ struct NativeAgentDoctorIntent: AppIntent {
     static let openAppWhenRun = true
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let report = try await intentClient().runDoctor()
+        let report = try await AppDoctorPort(dataRoot: PersistenceCore.defaultDataRoot()).runDoctor()
         return .result(dialog: "Doctor finished with status \(report.status). \(report.checks.count) checks ran.")
     }
 }
@@ -201,7 +204,7 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let task = try await intentClient().createWorkshopTask(title: title, objective: objective)
+        let task = try await BackgroundLoopsAssembly.submitDeskTask(title: title, objective: objective).execution
         return .result(dialog: "Desk task created: \(task.title).")
     }
 }

@@ -576,6 +576,11 @@ extension SwiftToolDispatcher {
         }
         let blockedReason = reasons.first
         let waitingOn = optionalString(input, "waiting_on")
+        // A blocked row with nothing written down reads "blocked" forever and
+        // says nothing to whoever could unblock it.
+        if status == .blocked, blockedReason == nil, waitingOn == nil {
+            throw AutonomyGateError.toolDenied(reason: "desk_set_status: blocked needs a reason; send blocked_reason, reason, or status 'blocked: reason', and/or waiting_on. Nothing was changed.")
+        }
         let progress = try deskProgress(input)
         let assignee = try deskMetadataString(input, "assignee")
         let laneRaw = try deskMetadataString(input, "lane_of")

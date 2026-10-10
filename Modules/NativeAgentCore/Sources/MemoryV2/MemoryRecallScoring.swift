@@ -55,14 +55,6 @@ public let memoryBM25LexicalBoost: Double = 0.25
 
 /// Pure decay math, separated for testability.
 public enum MemoryRecallScoring {
-    private static let preferredSkillLimit = 1
-
-    /// A fully judged ranking prefix can settle the answer only when later
-    /// facts cannot replace deferred skill hints in the final selection.
-    public static func hasEnoughPreferredRecallResults(facts: Int, skills: Int, limit: Int) -> Bool {
-        limit > 0 && facts + min(skills, preferredSkillLimit) >= limit
-    }
-
     // Cached formatters — this runs per-candidate inside the recall hot loop;
     // allocating ISO8601DateFormatter per call is the only real cost there
     // (gpt-5.5 wave1 finding 5). Configured once, never mutated, and only
@@ -106,47 +98,6 @@ public enum MemoryRecallScoring {
     public static func kind(of metadata: JSONValue?) -> String? {
         guard case .object(let obj)? = metadata, case .string(let k)? = obj["kind"] else { return nil }
         return k.isEmpty ? nil : k
-    }
-
-    /// The same bounded hint-share policy serves the storage candidate window
-    /// and the final post-disclosure result window. A widened retrieval window
-    /// is not the user's requested top-K, so the latter must enforce it again.
-    static func selectRecallResults<Candidates: Sequence>(
-        from candidates: Candidates,
-        limit: Int,
-        isSkillHint: (Candidates.Element) -> Bool
-    ) -> [Candidates.Element] {
-        let cappedLimit = max(0, limit)
-        guard cappedLimit > 0 else { return [] }
-        // Skills are discovery hints, not the answer corpus. One preferred
-        // slot (2026-09-22: a third took 4 of 12 recall slots); scarce-fact /
-        // skill-only results still fill from deferred hints.
-        var out: [Candidates.Element] = []
-        var deferredSkills: [Candidates.Element] = []
-        var skillCount = 0
-        for candidate in candidates {
-            let skill = isSkillHint(candidate)
-            if skill, skillCount >= preferredSkillLimit {
-                deferredSkills.append(candidate)
-                continue
-            }
-            out.append(candidate)
-            if skill { skillCount += 1 }
-            if out.count >= cappedLimit { break }
-        }
-        if out.count < cappedLimit {
-            out.append(contentsOf: deferredSkills.prefix(cappedLimit - out.count))
-        }
-        return out
-    }
-
-    /// The single definition of "this row is a skill pointer, not a memory".
-    /// Public because the ContextFlow lane must reserve the SAME rows the
-    /// legacy recall lane shares its budget with — two spellings of "is a
-    /// skill" would drift the moment either lane changed.
-    public static func isSkillRecallHint(id: String, kind: String?) -> Bool {
-        id.hasPrefix("skill-pointer:")
-            || kind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "skill"
     }
 
     public static func lexicalTokens(_ text: String) -> [String] {

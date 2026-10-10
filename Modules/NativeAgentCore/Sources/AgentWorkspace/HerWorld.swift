@@ -40,6 +40,8 @@ struct HerWorld: @unchecked Sendable {
     var phonePlaces: [PhonePlaceEvent] = []
     /// Arrivals no other home line names (a failed wake, a recovery).
     var arrivals: [ResidentWake.Item] = []
+    /// Agents discovery found and offered, still unanswered: one PEOPLE line each.
+    var found: [String] = []
     /// Some part is older than its files, or missing.
     var stale = false
     /// Parts with no value at all yet (never read), by key.
@@ -205,6 +207,9 @@ extension HerScreen {
         if let arrivals: [ResidentWake.Item] = await part("arrivals", [stamp(ResidentWake.url(dataRoot))], {
             ResidentWake.homeItems(dataRoot)
         }) { world.arrivals = arrivals }
+        if let found: [String] = await part("found", [stamp(AgentDiscoveryOffer.url(dataRoot))], {
+            (AgentDiscoveryOffer.read(dataRoot) ?? [:]).filter(\.value.open).map { AgentDiscoveryOffer.line(id: $0.key, name: $0.value.name) }.sorted()
+        }) { world.found = found }
 
         typealias People = (records: [AgentConversationRecord], chats: [BridgeChat], contacts: [Contact], answered: [String: Date],
                             handed: Set<String>)

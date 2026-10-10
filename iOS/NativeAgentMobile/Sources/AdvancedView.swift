@@ -55,6 +55,8 @@ struct AdvancedView: View {
     @StateObject private var store = AdvancedStore()
     @State private var showPairingRecovery = false
     @State private var showDesignScreen = MobileDesignSamples.screen != nil
+    /// The Mac's layout (ui/layout.json, in the core snapshot); its seed until one arrives.
+    @State private var layout = SurfaceLayout.seed(from: "", at: "")
     #if DEBUG
     @StateObject private var designApprovals = ApprovalsStore()
     @StateObject private var designInbox = InboxStore()
@@ -76,46 +78,55 @@ struct AdvancedView: View {
                     }
                 }
 
-                AliveSection("Rooms") {
-                    link("Scheduler", "Things set to happen later") { MobileSchedulerView() }
-                    AliveDivider()
-                    link("Helpers", "Run and manage helpers") { MobileHelpersView() }
-                    AliveDivider()
-                    link("Agents", "Conversations with other agents") { MobileAgentsView() }
-                    AliveDivider()
-                    link("Desk tasks", "Work I'm doing for you") {
-                        WorkshopView(embedInNavigationStack: false)
+                // More's sections in the layout's order, as the phone's
+                // profile shows them.
+                ForEach(layout.shown("more", profile: layout.phone).map(\.name), id: \.self) { block in
+                    switch block {
+                    case "rooms":
+                        AliveSection("Rooms") {
+                            link("Scheduler", "Things set to happen later") { MobileSchedulerView() }
+                            AliveDivider()
+                            link("Helpers", "Run and manage helpers") { MobileHelpersView() }
+                            AliveDivider()
+                            link("Agents", "Conversations with other agents") { MobileAgentsView() }
+                            AliveDivider()
+                            link("Desk tasks", "Work I'm doing for you") {
+                                WorkshopView(embedInNavigationStack: false)
+                            }
+                            AliveDivider()
+                            link("Skills & Tools", "What I know how to do") {
+                                SkillsToolsView(embedInNavigationStack: false)
+                            }
+                            AliveDivider()
+                            link("Personality", "How I think and sound") { PersonalityDetailHostView() }
+                            AliveDivider()
+                            link("Connectors", "The services I can reach") { ConnectorsHostView() }
+                            AliveDivider()
+                            link("Trust", "What I may do on my own") { TrustHostView() }
+                        }
+                    case "setup":
+                        // One door: Telegram, Providers and every Mac setting
+                        // (Mac Integration among them) are inside it.
+                        AliveSection("Setup") {
+                            link("Settings", "This iPhone, the Mac link and every Mac setting") { SettingsViewFull() }
+                        }
+                    case "power":
+                        // Opt-in deep surfaces and diagnostics: lower and quieter.
+                        AliveSection("Power user", footer: MoreAboutPresentation.text) {
+                            ForEach(Array(MorePowerUserDestination.allCases.enumerated()), id: \.element.id) { index, destination in
+                                if index > 0 { AliveDivider() }
+                                quietLink(destination.title) { powerUserDestination(destination) }
+                            }
+                            AliveDivider()
+                            quietLink("Status") { StatusDetailView(store: store) }
+                            AliveDivider()
+                            quietLink("Runs Log") { RunsLogView(store: store) }
+                        }
+                        .padding(.top, 12)
+                    default:
+                        EmptyView()
                     }
-                    AliveDivider()
-                    link("Skills & Tools", "What I know how to do") {
-                        SkillsToolsView(embedInNavigationStack: false)
-                    }
-                    AliveDivider()
-                    link("Personality", "How I think and sound") { PersonalityDetailHostView() }
-                    AliveDivider()
-                    link("Connectors", "The services I can reach") { ConnectorsHostView() }
-                    AliveDivider()
-                    link("Trust", "What I may do on my own") { TrustHostView() }
                 }
-
-                // One door: Telegram, Providers and every Mac setting
-                // (Mac Integration among them) are inside it.
-                AliveSection("Setup") {
-                    link("Settings", "This iPhone, the Mac link and every Mac setting") { SettingsViewFull() }
-                }
-
-                // Opt-in deep surfaces and diagnostics: lower and quieter.
-                AliveSection("Power user", footer: MoreAboutPresentation.text) {
-                    ForEach(Array(MorePowerUserDestination.allCases.enumerated()), id: \.element.id) { index, destination in
-                        if index > 0 { AliveDivider() }
-                        quietLink(destination.title) { powerUserDestination(destination) }
-                    }
-                    AliveDivider()
-                    quietLink("Status") { StatusDetailView(store: store) }
-                    AliveDivider()
-                    quietLink("Runs Log") { RunsLogView(store: store) }
-                }
-                .padding(.top, 12)
             }
             .navigationDestination(item: $deskTaskNavigationTarget) { intent in
                 WorkshopView(embedInNavigationStack: false, notifiedTaskID: intent.taskID)
@@ -138,6 +149,8 @@ struct AdvancedView: View {
             }
         }
         .macSyncErrorBanner()
+        // Each snapshot pass that carries the layout redraws More's order.
+        .onReceive(iCloudSyncEngine.shared.$surfaceLayout) { if let next = $0 { layout = next } }
     }
 
     private func link<Destination: View>(_ title: String, _ detail: String,
@@ -205,7 +218,7 @@ struct AdvancedView: View {
             permissionLevel: "Standard", autonomyDefault: "Ask first", requireBackups: true,
             outsideDefault: "Read only", developerMode: false,
             workshopPolicy: TrustWorkshopPolicy(enabled: true, showTimeline: true),
-            trainingPolicy: TrustTrainingPolicy(autonomousTraining: false, dreamScheduler: true))
+            trainingPolicy: TrustTrainingPolicy(dreamScheduler: true))
         store.connectors = [
             ConnectorRecord(id: "calendar", name: "Calendar", kind: "Calendar", enabled: true, healthStatus: "ok"),
             ConnectorRecord(id: "github", name: "GitHub", kind: "Code", enabled: true, healthStatus: "connected"),

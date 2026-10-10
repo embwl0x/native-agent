@@ -485,22 +485,10 @@ private extension NativeMemoryContextProjection {
             ? .explicitCorrection
             : (pinned ? .canonical : .inferred)
         let atomKind: ContextAtomKind = correction ? .correction : .memory
-        // Skills-as-recall (2026-07-03) dissolved the skill library into memory
-        // pointer rows. The legacy recall lane still shares its budget with
-        // them (`selectRecallResults`); the ContextFlow lane cannot, because
-        // every pointer arrives as an ordinary `.memory` atom competing on
-        // cosine against 200+ real memories inside one 8-slot kind quota.
-        // Stamping the PROCEDURAL content role is what makes them findable to
-        // the selector's reservation without minting a second atom kind — the
-        // row is still a memory record, its content is still a skill.
-        let skillPointer = !correction && MemoryRecallScoring.isSkillRecallHint(
-            id: recordID,
-            kind: record.memoryKind ?? MemoryRecallScoring.kind(of: record.extras)
-        )
         // Phase 5 C3: what happened between them rides its own lane.
         let personal = !correction && Self.personalKinds.contains(
             (record.memoryKind ?? MemoryRecallScoring.kind(of: record.extras) ?? "").lowercased())
-        let contentRole: ContextContentRole = skillPointer ? .procedure : (personal ? .personal : .memory)
+        let contentRole: ContextContentRole = personal ? .personal : .memory
         guard let disclosure = MemoryRecordDisclosurePolicy.classify(
             personaID: record.personaId,
             status: record.status,

@@ -22,10 +22,8 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
     // PATCH-2026-05-06: dev-mode bypass Auto false-negatives, autonomy env var
     public var developerMode: Bool = false
     public var enableAutonomy: Bool = false
-    // PATCH-2026-05-07: training-b1 ui Training-loop trust gates exposed to UI.
+    // Persisted trainingPolicy retains the dream and REM gates.
     public var trainingPolicy: TrustTrainingPolicy?
-    // PATCH-2026-05-07: self-improvement-ui Promotion engine trust gates.
-    public var promotionPolicy: TrustPromotionPolicy?
     // PATCH-2026-05-07: living-memory Trust gates for living memory system.
     public var memoryPolicy: TrustMemoryPolicy?
     // PATCH-2026-05-07: mac-control-ui-1 Mac Control trust gates (20 endpoints, iOS remote gate).
@@ -35,7 +33,7 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         case permissionLevel, autonomyDefault, updatedAt, appDataRoot
         case workshopPolicy = "missionPolicy" // compatibility wire ID
         case toolPolicy, filePolicy, connectorPolicy, chromeControlPolicy, multimodalPolicy
-        case developerMode, enableAutonomy, trainingPolicy, promotionPolicy, memoryPolicy, macControlPolicy
+        case developerMode, enableAutonomy, trainingPolicy, memoryPolicy, macControlPolicy
     }
 
     /// Wave 4 (phase A) read-both: accept the FUTURE `workshopPolicy` spelling
@@ -60,7 +58,6 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         developerMode: Bool = false,
         enableAutonomy: Bool = false,
         trainingPolicy: TrustTrainingPolicy? = nil,
-        promotionPolicy: TrustPromotionPolicy? = nil,
         memoryPolicy: TrustMemoryPolicy? = nil,
         macControlPolicy: TrustMacControlPolicy? = nil
     ) {
@@ -77,7 +74,6 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         self.developerMode = developerMode
         self.enableAutonomy = enableAutonomy
         self.trainingPolicy = trainingPolicy
-        self.promotionPolicy = promotionPolicy
         self.memoryPolicy = memoryPolicy
         self.macControlPolicy = macControlPolicy
     }
@@ -112,7 +108,6 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         developerMode = try c.decodeIfPresent(Bool.self, forKey: .developerMode) ?? false
         enableAutonomy = try c.decodeIfPresent(Bool.self, forKey: .enableAutonomy) ?? false
         trainingPolicy = try c.decodeIfPresent(TrustTrainingPolicy.self, forKey: .trainingPolicy)
-        promotionPolicy = try c.decodeIfPresent(TrustPromotionPolicy.self, forKey: .promotionPolicy)
         memoryPolicy = try c.decodeIfPresent(TrustMemoryPolicy.self, forKey: .memoryPolicy)
         macControlPolicy = try c.decodeIfPresent(TrustMacControlPolicy.self, forKey: .macControlPolicy)
     }
@@ -238,14 +233,11 @@ public struct TrustMultimodalPolicy: Sendable, Codable, Hashable {
     }
 }
 
-// PATCH-2026-05-07: training-b1 ui Trust toggles for Beyond B.1 autonomous training loop.
+// Dream and REM gates retain their persisted trainingPolicy block.
 public struct TrustTrainingPolicy: Sendable, Codable, Hashable {
-    public var autonomous_training: Bool = false
     // TrustCenter+Defaults ships dream_scheduler TRUE; a policy that never
     // wrote the key must read as enabled, not silently off.
     public var dream_scheduler: Bool = true
-    // PATCH-2026-05-07: self-improvement-ui route proposals through promotion engine
-    public var route_through_promotion: Bool = false
     // PATCH-2026-05-29: dreams-tab weekly REM consolidation kill switch
     // (trainingPolicy.rem_cycle_enabled — the second gate for /v1/rem/run).
     // Daemon default is true; mirror that here so a policy that has never
@@ -253,36 +245,17 @@ public struct TrustTrainingPolicy: Sendable, Codable, Hashable {
     public var rem_cycle_enabled: Bool = true
 
     public init(
-        autonomous_training: Bool = false,
         dream_scheduler: Bool = true,
-        route_through_promotion: Bool = false,
         rem_cycle_enabled: Bool = true
     ) {
-        self.autonomous_training = autonomous_training
         self.dream_scheduler = dream_scheduler
-        self.route_through_promotion = route_through_promotion
         self.rem_cycle_enabled = rem_cycle_enabled
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        autonomous_training = try c.decodeIfPresent(Bool.self, forKey: .autonomous_training) ?? false
         dream_scheduler = try c.decodeIfPresent(Bool.self, forKey: .dream_scheduler) ?? true
-        route_through_promotion = try c.decodeIfPresent(Bool.self, forKey: .route_through_promotion) ?? false
         rem_cycle_enabled = try c.decodeIfPresent(Bool.self, forKey: .rem_cycle_enabled) ?? true
-    }
-}
-
-// PATCH-2026-05-07: self-improvement-ui Beyond B.1/B.3 — training + promotion models
-public struct TrustPromotionPolicy: Sendable, Codable, Hashable {
-    public var enabled: Bool = false
-    public var auto_promote_tier_a: Bool = false
-    public var run_smoke_in_harness: Bool = true
-
-    public init(enabled: Bool = false, auto_promote_tier_a: Bool = false, run_smoke_in_harness: Bool = true) {
-        self.enabled = enabled
-        self.auto_promote_tier_a = auto_promote_tier_a
-        self.run_smoke_in_harness = run_smoke_in_harness
     }
 }
 
@@ -290,47 +263,31 @@ public struct TrustPromotionPolicy: Sendable, Codable, Hashable {
 public struct TrustMemoryPolicy: Sendable, Codable, Hashable {
     public var consolidation_enabled: Bool = false
     public var cross_session_recall: Bool = true
-    public var auto_promote_consolidated: Bool = false
     public var knowledge_graph_enabled: Bool = true
     public var adaptive_promotion: Bool = false
     public var hygiene_enabled: Bool = true
-    public var hygiene_interval_hours: Double = 6
-    public var archive_noisy_reflections: Bool = true
-    public var reject_low_value_proposals: Bool = true
 
     public init(
         consolidation_enabled: Bool = false,
         cross_session_recall: Bool = true,
-        auto_promote_consolidated: Bool = false,
         knowledge_graph_enabled: Bool = true,
         adaptive_promotion: Bool = false,
-        hygiene_enabled: Bool = true,
-        hygiene_interval_hours: Double = 6,
-        archive_noisy_reflections: Bool = true,
-        reject_low_value_proposals: Bool = true
+        hygiene_enabled: Bool = true
     ) {
         self.consolidation_enabled = consolidation_enabled
         self.cross_session_recall = cross_session_recall
-        self.auto_promote_consolidated = auto_promote_consolidated
         self.knowledge_graph_enabled = knowledge_graph_enabled
         self.adaptive_promotion = adaptive_promotion
         self.hygiene_enabled = hygiene_enabled
-        self.hygiene_interval_hours = hygiene_interval_hours
-        self.archive_noisy_reflections = archive_noisy_reflections
-        self.reject_low_value_proposals = reject_low_value_proposals
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         consolidation_enabled = try c.decodeIfPresent(Bool.self, forKey: .consolidation_enabled) ?? false
         cross_session_recall = try c.decodeIfPresent(Bool.self, forKey: .cross_session_recall) ?? true
-        auto_promote_consolidated = try c.decodeIfPresent(Bool.self, forKey: .auto_promote_consolidated) ?? false
         knowledge_graph_enabled = try c.decodeIfPresent(Bool.self, forKey: .knowledge_graph_enabled) ?? true
         adaptive_promotion = try c.decodeIfPresent(Bool.self, forKey: .adaptive_promotion) ?? false
         hygiene_enabled = try c.decodeIfPresent(Bool.self, forKey: .hygiene_enabled) ?? true
-        hygiene_interval_hours = try c.decodeIfPresent(Double.self, forKey: .hygiene_interval_hours) ?? 6
-        archive_noisy_reflections = try c.decodeIfPresent(Bool.self, forKey: .archive_noisy_reflections) ?? true
-        reject_low_value_proposals = try c.decodeIfPresent(Bool.self, forKey: .reject_low_value_proposals) ?? true
     }
 }
 

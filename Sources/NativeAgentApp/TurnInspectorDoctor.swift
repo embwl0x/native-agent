@@ -14,13 +14,14 @@ enum TurnInspectorDoctor {
         case .unavailable:
             return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "fail",
                 detail: "The Inspector live sink ended; its drop count is unavailable. Events since termination cannot be recovered.",
+                harm: "New live turn events are no longer reaching Inspector.",
                 human_action: "Open Diagnostics → Inspector after repair and inspect saved traces for the missing interval.")
         case .measured(let count) where count > 0:
-            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "warn",
+            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "unmeasured",
                 detail: "Inspector dropped \(count) live event(s) under page backpressure; those live events cannot be recovered.",
                 human_action: "Open Diagnostics → Inspector → Replay and inspect today's saved trace for the affected turn.")
         case .measured:
-            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "ok",
+            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: store.liveSinkActive ? "ok" : "unmeasured",
                 detail: store.liveSinkActive
                     ? "Inspector live sink is active with no measured drops."
                     : "Inspector live sink is starting; no drop count is available yet.")
@@ -37,7 +38,7 @@ enum TurnInspectorDoctor {
     }
 }
 
-extension NativeClient {
+extension AppDoctorPort {
     func doctorInspectorCheck() async -> CheckResult {
         await TurnInspectorDoctor.check()
     }

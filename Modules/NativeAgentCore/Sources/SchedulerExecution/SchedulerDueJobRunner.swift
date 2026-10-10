@@ -23,7 +23,6 @@ public actor SchedulerDueJobRunner {
         case connectorAction = "connector_action"
         case dream
         case rem
-        case improve
         case harnessBenchmark = "harness_benchmark"
         case proactiveScan = "proactive_scan"
         case workshop
@@ -212,18 +211,15 @@ public actor SchedulerDueJobRunner {
                     payload: .object(["inboxItemId": .string(backfilled)])
                 )
             }
-            // FIX 3 (A4.5): bound completed oneShot rows — they previously only
-            // gained enabled=false + completedAt and were never removed, so
-            // jobs.json grew without limit.
-            let prunedOneShots = try await pruneCompletedOneShotJobs(now: now)
-            if prunedOneShots > 0 {
+            let retiredJobs = try await pruneRetiredJobs(now: now)
+            if retiredJobs > 0 {
                 try await appendActivity(
                     jobId: nil,
                     kind: "scheduler",
-                    title: "Completed one-shot jobs pruned",
-                    detail: "Removed \(prunedOneShots) completed one-shot job row(s) past the retention window",
+                    title: "Scheduled jobs retired",
+                    detail: "Retired \(retiredJobs) job row(s); reasons recorded in scheduler/retired.jsonl",
                     status: "ok",
-                    payload: .object(["removed": .int(Int64(prunedOneShots))])
+                    payload: .object(["removed": .int(Int64(retiredJobs))])
                 )
             }
         } catch {

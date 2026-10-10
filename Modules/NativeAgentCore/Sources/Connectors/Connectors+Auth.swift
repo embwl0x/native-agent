@@ -1,4 +1,5 @@
 import Foundation
+import GitHubConnector
 import NativeAgentCore
 import PersistenceCore
 import SlackConnector
@@ -78,6 +79,7 @@ public final class SwiftNativeConnectorAuthClient: ConnectorAuthClient {
         }
         if provider == "slack" { try SlackCredentials.recoverPendingSave(dataRoot: root) }
         try await updateRegistry(provider: provider, connected: false)
+        if provider == "github" { try await GitHubCredentialStore.shared.deleteCredential(dataRoot: root) }
 
         return .object([
             "ok": .bool(true),

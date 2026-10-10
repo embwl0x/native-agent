@@ -432,7 +432,7 @@ public let macControlDispatchableActions: Set<String> =
         .union(macControlAccessibilityActActions)
         .union(macControlAppNavigationActions)
         // W7 — `nudge` must be here or the HTTP/iOS-remote bridge route in
-        // NativeClient+CutoverSeams 404s it as an unknown action.
+        // `MacControlActionRoutes.run` 404s it as an unknown action.
         .union(macControlAccessibilityNudgeActions)
         // fable51 item 30 — the clipboard organ, for the same reason.
         .union(macControlClipboardActions)

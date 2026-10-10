@@ -289,7 +289,8 @@ extension NativeCognitionRuntime {
         let response: ChatOrchestration.ChatResponse
         do {
             let client = engine.chatClient(tools: witness)
-            response = try await client.runEphemeralToolTurn(
+            response = try await LLMCallContext.$purpose.withValue("studio_wander") {
+            try await client.runEphemeralToolTurn(
                 message: StudioWanderLane.prompt(material),
                 // Reads and her own studio lane; no shell, no writes. The
                 // browser/vision organs and the local file readers are what an
@@ -300,6 +301,7 @@ extension NativeCognitionRuntime {
                     guard await self?.studioWanderStillEligible() == true else { throw CancellationError() }
                 }
             )
+            }
         } catch {
             // Admission remains durable: a provider failure can occur after
             // a journal write and must not silently replay the hour.
@@ -694,7 +696,7 @@ actor StudioWanderToolWitness: ToolDispatchClient {
     ///
     /// Read from the real terminal payload. The browser organs return a native
     /// action receipt — `{"status": "completed" | "dry_run", "dryRun": Bool, …}`
-    /// (NativeClient+NativeActions `appendNativeActionReceipt`) — so a dry run
+    /// (`NativeActionRoutes.appendNativeActionReceipt`) — so a dry run
     /// reports success in the ordinary sense while having read nothing at all.
     /// Counting that as an encounter is precisely the dishonesty her veto is
     /// about, so `dry_run` and `dryRun: true` are both non-deliveries, as are

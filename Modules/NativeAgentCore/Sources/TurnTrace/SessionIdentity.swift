@@ -404,9 +404,18 @@ public enum SessionIdentityLedger {
                 .appendingPathComponent("chat", isDirectory: true)
                 .appendingPathComponent("messages", isDirectory: true)
                 .appendingPathComponent("\(safeId).jsonl")
+            let size = (try? FileManager.default.attributesOfItem(atPath: transcript.path))
+                .flatMap { ($0[FileAttributeKey.size] as? NSNumber)?.intValue }
+            // A session the index says has no messages has no transcript to
+            // judge: a fresh chat, or a pinned empty one retention leaves hot,
+            // is EMPTY, not unread. Only a confirmed absence or a measured
+            // zero qualifies; a file whose metadata cannot be read stays
+            // unread. Unread is a transcript the index says has content
+            // that cannot be scanned.
+            let absent = !FileManager.default.fileExists(atPath: transcript.path)
+            if absent || size == 0, indexMessageCount(object) <= 0 { continue }
             guard scanned < maximumTotalScanBytes,
-                  let attrs = try? FileManager.default.attributesOfItem(atPath: transcript.path),
-                  let size = (attrs[FileAttributeKey.size] as? NSNumber)?.intValue,
+                  let size,
                   size > 0,
                   size <= maximumTranscriptBytes,
                   let raw = try? String(contentsOf: transcript, encoding: .utf8) else {
@@ -499,6 +508,15 @@ public enum SessionIdentityLedger {
     /// files are written by different writers moments apart, so a few seconds
     /// of skew is normal; days are not.
     static let creationRowSkewSeconds: TimeInterval = 120
+
+    /// The index row's own message count; absent or malformed reads as 0.
+    static func indexMessageCount(_ row: [String: JSONValue]) -> Int {
+        switch row["messageCount"] {
+        case .int(let value)?: return Int(value)
+        case .double(let value)?: return Int(value)
+        default: return 0
+        }
+    }
 
     static func iso8601Instant(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)

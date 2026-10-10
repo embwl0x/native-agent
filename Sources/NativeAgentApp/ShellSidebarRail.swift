@@ -1,4 +1,5 @@
 import AppToolRuntime
+import ChatOrchestration
 import SwiftUI
 
 // ui-simplify 2026-09-02 (Lane A): the rail.
@@ -118,17 +119,13 @@ struct ShellRailFocusRing: View {
     }
 }
 
-/// Two quiet groups on a floating glass plate, with Settings at the foot.
+/// Quiet groups on a floating glass plate, as the layout orders them, with
+/// the last (Settings, as seeded) at the foot.
 struct ShellSidebarRail: View {
     @Binding var selection: SidebarItem
-    /// Every item except the last renders at the top; the last (Settings) is
-    /// pushed to the bottom so the setup door is never mistaken for a place to
-    /// work.
-    var items: [SidebarItem] = SidebarItem.primaryItems
     /// The places that have something waiting on him. A dot, never a count —
     /// the caller does the counting and this rail only says whether.
     var needsYou: Set<SidebarItem> = []
-    @AppStorage(BotsShelfPreference.key) private var botsPreviewEnabled = true
 
     /// The one id the travelling selection bar is known by.
     static let selectionBarID = "shell.rail.selection-bar"
@@ -137,30 +134,13 @@ struct ShellSidebarRail: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
+        // Every row but the last renders at the top; the last is pushed to the
+        // bottom, so the setup door is never mistaken for a place to work.
+        let rail = SidebarItem.rail(SurfaceLayoutLive.shared.layout)
         VStack(spacing: 4) {
-            ForEach(BotsShelfRailProposal.everyday(Array(items.dropLast()))) { item in proposalItem(item) }
-            if botsPreviewEnabled { proposalItem(.bots) }
-            Rectangle()
-                .fill(NativeAgentShell.hairline)
-                .frame(height: 1)
-                .padding(.horizontal, NativeAgentShellLayout.railWordInset)
-                .padding(.vertical, 6)
-                .allowsHitTesting(false)
-                .focusable(false)
-                .accessibilityHidden(true)
-            ForEach(BotsShelfRailProposal.configuration(Array(items.dropLast()))) { item in
-                proposalItem(item)
-            }
+            ForEach(rail.dropLast(), id: \.self) { row(item: $0) }
             Spacer(minLength: 8)
-            if let last = items.last {
-                ShellRailItem(
-                    item: last,
-                    isSelected: selection.normalized == last.normalized,
-                    needsYou: needsYou.contains(last.normalized),
-                    onSelect: { selection = last },
-                    barNamespace: selectionBar
-                )
-            }
+            if let last = rail.last { row(item: last) }
         }
         // The bar's travel is one transaction over the whole rail, so both the
         // leaving and the arriving row read the same animation.
@@ -210,9 +190,22 @@ struct ShellSidebarRail: View {
         .accessibilityLabel("Places")
     }
 
-    private func proposalItem(_ item: SidebarItem) -> some View {
-        ShellRailItem(item: item, isSelected: selection.normalized == item.normalized,
-                      needsYou: needsYou.contains(item.normalized), onSelect: { selection = item },
-                      barNamespace: selectionBar)
+    /// A page, or (nil) the hairline between the rail's groups.
+    @ViewBuilder
+    private func row(item: SidebarItem?) -> some View {
+        if let item {
+            ShellRailItem(item: item, isSelected: selection.normalized == item.normalized,
+                          needsYou: needsYou.contains(item.normalized), onSelect: { selection = item },
+                          barNamespace: selectionBar)
+        } else {
+            Rectangle()
+                .fill(NativeAgentShell.hairline)
+                .frame(height: 1)
+                .padding(.horizontal, NativeAgentShellLayout.railWordInset)
+                .padding(.vertical, 6)
+                .allowsHitTesting(false)
+                .focusable(false)
+                .accessibilityHidden(true)
+        }
     }
 }

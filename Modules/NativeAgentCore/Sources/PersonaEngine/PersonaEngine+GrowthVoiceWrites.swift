@@ -56,9 +56,11 @@ extension SwiftNativePersonaEngine {
     /// Full-doc REPLACE: back up the prior content (if any) to a timestamped
     /// `<file>.pre-<ts>-<uid>.bak`, then atomically write `content`. The backup
     /// + write run under ONE flock on the target (the daemon's
-    /// `with _persona_write_lock, file_lock(target)`).
+    /// `with _persona_write_lock, file_lock(target)`). `keeping` sees the
+    /// document being replaced under that lock and throws to refuse the write.
     @discardableResult
-    public func personaWrite(kind: String, content: String, skillName: String?) async throws -> PersonaToolWriteResult {
+    public func personaWrite(kind: String, content: String, skillName: String?,
+                             keeping: (@Sendable (_ current: String) throws -> Void)? = nil) async throws -> PersonaToolWriteResult {
         let canon = Self.canonicalizeKind(kind)
         if canon == "user" {
             throw PersonaWriteError.invalidInput(Self.memoryOwnedUserDocMessage)
@@ -113,6 +115,9 @@ extension SwiftNativePersonaEngine {
         let contentBytes = Array(content.utf8)
         let persistence = SwiftNativePersistenceCore()
         let backupPath: String? = try await persistence.withFileLock(target) {
+            if let keeping, FileManager.default.fileExists(atPath: target.path) {
+                try keeping(try String(contentsOf: target, encoding: .utf8))
+            }
             let backup = try Self.backupIfExists(target)
             try Self.atomicWriteText(content, to: target)
             return backup

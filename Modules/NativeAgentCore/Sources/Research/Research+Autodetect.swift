@@ -93,6 +93,42 @@ extension SwiftNativeResearchClient {
         return out
     }
 
+    /// A complete http or https SearXNG base URL with no query or fragment:
+    /// scheme and host lowercased, no trailing slash.
+    public static func normalizedSearXNGBaseURL(_ value: String) throws -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.isEmpty,
+              components.query == nil,
+              components.fragment == nil else {
+            throw NSError(domain: "NativeAgent.Research", code: -422, userInfo: [
+                NSLocalizedDescriptionKey: "Enter a complete http:// or https:// SearXNG base URL without a query or fragment."
+            ])
+        }
+
+        var normalized = components
+        normalized.scheme = scheme
+        normalized.host = host.lowercased()
+        let path = normalized.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        normalized.path = path.isEmpty ? "" : "/\(path)"
+        let base = normalized.string.map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 } ?? ""
+        guard !base.isEmpty else {
+            throw NSError(domain: "NativeAgent.Research", code: -422, userInfo: [
+                NSLocalizedDescriptionKey: "Enter a complete http:// or https:// SearXNG base URL."
+            ])
+        }
+        return base
+    }
+
+    /// Save a person-entered SearXNG base URL, normalized, under the same
+    /// config lock autodetect writes through.
+    public func saveSearXNGBaseURL(_ value: String) async throws {
+        try await persistSearXNGBaseURL(Self.normalizedSearXNGBaseURL(value))
+    }
+
     /// Read `data/research/config.json`, overwrite `searxng_base_url`, write
     /// atomically. Mirrors Python: `self.config[...] = base; self.save_config()`.
     ///

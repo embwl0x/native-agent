@@ -55,7 +55,7 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
               let appToken, !appToken.isEmpty else {
             return nil
         }
-        let enabled = firstBool(keys: ["socket_mode_enabled", "inbound_enabled"], in: objects) ?? true
+        let enabled = firstBool(keys: socketModeKeys, in: objects) ?? true
         let historyPollEnabled = firstBool(
             keys: ["history_poll_enabled", "socket_mode_history_poll_enabled"],
             in: objects
@@ -90,6 +90,13 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
             ),
             requireMention: firstBool(keys: ["require_mention", "requireMention"], in: objects) ?? true
         )
+    }
+
+    private static let socketModeKeys = ["socket_mode_enabled", "inbound_enabled"]
+
+    /// Switched off in the saved Slack config, whatever the tokens say.
+    static func socketModeSwitchedOff(dataRoot: URL) -> Bool {
+        firstBool(keys: socketModeKeys, in: tokenObjects(dataRoot: dataRoot)) == false
     }
 
     private static func tokenObjects(dataRoot: URL) -> [[String: Any]] {

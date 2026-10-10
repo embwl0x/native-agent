@@ -188,8 +188,6 @@ public enum ToolNameAliases {
         "swift_build": "swift.build", "swift_test": "swift.test",
         "remote_node_list": "node.list", "remote_node_execute": "node.run",
         "restart_app": "app.restart", "install_app": "app.install",
-        "evolution_propose": "evolution.propose", "evolution_status": "evolution.status",
-        "evolution_withdraw": "evolution.withdraw", "self_install": "evolution.install",
         "read_page": "web.read", "mcp__searxng-local__search": "web.search",
         "maps_route": "maps.route",
         "maps_search": "maps.search",
@@ -368,6 +366,12 @@ public enum ToolNameAliases {
         guard name == "app", case .string(let action)? = input["action"] else { return name }
         let id = action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return foldedTools.filter { $0.value == id }.keys.sorted().first ?? mcpTool(action) ?? authoredTool(action) ?? name
+    }
+
+    /// The tools a call runs: each entry's of an `app {actions}` list, else its one.
+    public static func ranTools(_ name: String, input: [String: JSONValue]) -> [String] {
+        guard name == "app", case .array(let entries)? = input["actions"], !entries.isEmpty else { return [ranTool(name, input: input)] }
+        return entries.flatMap { if case .object(let call) = $0 { ranTools(name, input: call) } else { [name] } }
     }
 
     /// The input a call ran with: a folded `app` action's args, by the tool's own names.

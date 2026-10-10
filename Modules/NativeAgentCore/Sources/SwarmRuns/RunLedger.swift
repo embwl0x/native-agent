@@ -11,7 +11,7 @@ import Foundation
 ///
 /// Contract notes:
 /// - The on-disk shape is a BARE ARRAY of row objects, newest-first — the
-///   shape `NativeClient.getRunsStrict()` already parses. Readers are not
+///   shape `RuntimeReadProjection.runs(dataRoot:)` already parses. Readers are not
 ///   changed by this writer. If a daemon-era `{"runs": [...]}` wrapper file
 ///   is ever encountered, its rows are preserved and the file is rewritten
 ///   as a bare array.

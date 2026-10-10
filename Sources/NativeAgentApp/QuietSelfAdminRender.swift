@@ -181,7 +181,7 @@ enum QuietSelfAdminRender {
             case .memories: MemoriesRailPage()
             case .desk: DeskPageView()
             case .inboxPolicy: ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() }
-            case .bots: BotsShelfPreviewPage()
+            case .bots: BotsShelfView()
             case .personality: PersonalityRailPage()
             case .providers: ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, alive: true) { ProviderSettingsView() }
             case .trust: TrustRailPage()
@@ -732,23 +732,38 @@ extension QuietSelfAdminRender {
         waiting.append(countLine(pending.count, "approval waiting", "approvals waiting"))
         waiting.append(countLine(waitingNotes.count, "unread note", "unread notes"))
         waiting.append(countLine(proposals.count, "memory waiting to be reviewed", "memories waiting to be reviewed"))
-        var sections = [section("Waiting on you", waiting)]
+        // The page's blocks (ui/layout.json, today): the waiting card, then
+        // the queues its links open, in the order the window shows them.
+        var queues: [JSONValue] = []
         switch await appModel.engine.cognitionView.pendingProposals() {
         case .available(let pending):
-            sections.append(section("Proposed views", pending.standingViews.isEmpty ? ["None."]
+            queues.append(section("Proposed views", pending.standingViews.isEmpty ? ["None."]
                 : pending.standingViews.map { "\($0.id): \($0.title)" }))
-        case .unavailable(let reason): sections.append(section("Proposed views", [reason]))
+        case .unavailable(let reason): queues.append(section("Proposed views", [reason]))
         }
         if !pending.isEmpty {
-            sections.append(section("Approvals", pending.prefix(12).map { "\($0.title) — \($0.action), risk \($0.risk)" }))
+            queues.append(section("Approvals", pending.prefix(12).map { "\($0.title) — \($0.action), risk \($0.risk)" }))
         }
         if !waitingNotes.isEmpty {
-            sections.append(section("Notes", waitingNotes.prefix(12).map { "\($0.severity): \($0.title) — \($0.summary)" }))
+            queues.append(section("Notes", waitingNotes.prefix(12).map { "\($0.severity): \($0.title) — \($0.summary)" }))
         }
         if !proposals.isEmpty {
-            sections.append(section("Memories waiting", proposals.prefix(12).map(proposalLine)))
+            queues.append(section("Memories waiting", proposals.prefix(12).map(proposalLine)))
         }
-        return sections
+        // The rest of the page from the readers it draws with (TodayView).
+        let (snapshot, collaboration, _) = await TodayView.readLanes(appModel)
+        let earlier = TodayView.earlierNotes(appModel)
+        func rows(_ heading: String, _ rows: [TodayRow]) -> [JSONValue] {
+            rows.isEmpty ? [] : [section(heading, rows.map { [$0.time, $0.title, $0.line].filter { !$0.isEmpty }.joined(separator: " · ") })]
+        }
+        let blocks: [String: [JSONValue]] = [
+            "waiting": [section("Waiting on you", waiting)],
+            "earlier": TodayView.earlierNotesLine(earlier).map { [section("Earlier", [$0] + earlier.map { $0.title + ($0.count > 1 ? " ×\($0.count)" : "") })] } ?? [],
+            "did": rows("What I did today", TodayView.didTodayRows(appModel, snapshot, collaboration)),
+            "ahead": rows("Ahead", TodayView.aheadRows(snapshot)),
+            "queues": queues,
+        ]
+        return SurfaceLayoutStore.layout(dataRoot: dataRoot(appModel)).shown("today", profile: SimpleViewMode.advanced).flatMap { blocks[$0.name] ?? [] }
     }
 
     // MARK: Providers
@@ -857,7 +872,7 @@ extension QuietSelfAdminRender {
             list.prefix(20).map { item in
                 let line = "\(item.alias) \(DeskPageContent.title(item)) [\(item.project)]"
                 guard stuck else { return line }
-                let reason = DeskPageContent.stuckReason(item)
+                let reason = DeskPageContent.stuckReason(item, in: items)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 return reason.isEmpty ? line : "\(line) — \(reason)"
             }
@@ -976,7 +991,10 @@ extension QuietSelfAdminRender {
             "Telegram: \(appModel.engine.telegram.status?.tokenConfigured == true ? "configured" : "not configured")",
         ])]
         sections.append(section("Connector ids", appModel.connectors.isEmpty ? ["None."] : appModel.connectors.map {
-            "\($0.id): \($0.name)\($0.kind.isEmpty ? "" : " (\($0.kind))"): \($0.enabled ? "on" : "off")"
+            // The same word the Connectors page shows (Connected / Needs sign-in / Off …),
+            // so she never has to open each connector to learn who needs a sign-in (10-10).
+            "\($0.id): \($0.name)\($0.kind.isEmpty ? "" : " (\($0.kind))"): \($0.enabled ? "on" : "off") · "
+                + ConnectorsView.statusText(for: $0, uiState: ConnectorUIState.resolve(authState: $0.authState, healthStatus: $0.healthStatus))
         }))
         return sections
     }
@@ -1004,7 +1022,7 @@ extension QuietSelfAdminRender {
         ])]
         if !appModel.mcpServers.isEmpty {
             sections.append(section("Servers", appModel.mcpServers.map {
-                "\($0.name) [\($0.id)]: \($0.status ?? $0.healthStatus ?? "status unknown") · \($0.toolCount ?? 0) tools"
+                "\($0.name) [\($0.id)]: \($0.status) · \($0.toolCount) tools"
             }))
         }
         if !appModel.mcpConsent.isEmpty {
@@ -1056,7 +1074,8 @@ extension QuietSelfAdminRender {
                 + "setting trust.mac_integration_\(mac), on mac_integration)")
         }
         for connector in appModel.connectors where service.connectors.contains(connector.id) {
-            lines.append("\(connector.name.isEmpty ? connector.id : connector.name): \(connector.enabled ? "on" : "off")"
+            lines.append("\(connector.name.isEmpty ? connector.id : connector.name): \(connector.enabled ? "on" : "off") · "
+                + ConnectorsView.statusText(for: connector, uiState: ConnectorUIState.resolve(authState: connector.authState, healthStatus: connector.healthStatus))
                 + (connector.authState.map { " · \($0)" } ?? ""))
         }
         if lines.isEmpty { lines.append("\(page.title) is not set up in Connectors.") }

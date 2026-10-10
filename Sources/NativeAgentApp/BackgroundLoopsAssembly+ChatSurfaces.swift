@@ -24,9 +24,10 @@ import DeviceSync
 // MARK: - Chat Surface Loops
 
 extension BackgroundLoopsAssembly {
-    static func makeSlackSocketModeLoopIfConfigured(
+    /// The Slack lane: the Socket Mode loop, or its Off placeholder saying why.
+    static func makeSlackSocketModeLane(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> SlackSocketModeLoop? {
+    ) -> any LoopRunner {
         SlackSocketModeLoop.ifConfigured(
             dataRoot: dataRoot,
             chatClient: { NativeAgentEngine.live.chatClient(profile: .slack) },
@@ -44,6 +45,9 @@ extension BackgroundLoopsAssembly {
                     await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: dataRoot)
                 })
             }
+        ) ?? unconfiguredLanePlaceholder(
+            loopId: "slack_socket_mode",
+            reason: SlackSocketModeLoop.offReason(dataRoot: dataRoot)
         )
     }
 
@@ -81,7 +85,7 @@ extension BackgroundLoopsAssembly {
                 )
             },
             approvalResolver: { id, decision, provenance in
-                _ = try await NativeClient().resolveApproval(
+                _ = try await ApprovalTransactionCoordinator.app().resolveApproval(
                     id: id, decision: decision.rawValue, provenance: provenance
                 )
             }

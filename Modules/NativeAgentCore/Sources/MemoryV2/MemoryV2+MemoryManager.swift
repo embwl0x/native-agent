@@ -477,6 +477,7 @@ public enum MemoryManagerLane {
         }
         if decision.kind == "correction", let subject = decision.correctionSubject {
             meta["correction_subject"] = .string(subject)
+            meta["lesson"] = .string(MemoryStatusProjection.lesson(metadata: .object(meta), text: decision.statement))
             meta["correction"] = .bool(true)
             meta["standing_evidence"] = decision.standingEvidence.map(JSONValue.string) ?? .null
             if let observedAt {

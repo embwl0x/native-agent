@@ -543,6 +543,17 @@ public actor BackgroundLoopsManager {
         await scheduler.setFailureRecoveryPush(push)
     }
 
+    /// Lands every organ's `OrganPulse.record` in this scheduler's loop-state
+    /// file. The app installs it once, before anything can beat.
+    public nonisolated func receiveOrganPulses() {
+        let scheduler = scheduler
+        OrganPulse.install { pulse in Task { await scheduler.recordPulse(pulse) } }
+    }
+
+    public func organPulses() async -> [OrganPulse] {
+        await scheduler.organPulses()
+    }
+
     /// Injects the app-assembled manifest and starts its periodic tasks. Once
     /// running, repeated calls are idempotent for existing ids and only add
     /// missing registrations. Runtime reconfiguration must use

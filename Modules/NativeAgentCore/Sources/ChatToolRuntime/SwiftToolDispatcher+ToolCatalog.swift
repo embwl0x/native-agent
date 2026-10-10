@@ -430,16 +430,6 @@ extension SwiftToolDispatcher {
         "restart_app", "install_app",
     ]
 
-    // evolution chat tools (2026-06-11, U2b). Not builder tools (no Process
-    // spawn) but they share the builder tools' policy shape: schemas live in
-    // the includeFullMacFileTools block, dispatch gates on file_ops_allowed,
-    // and listAvailableTools() / tool_load surface them under the same gate so
-    // catalog and dispatch agree. Their own list keeps the tool catalog from
-    // mislabeling them "implemented_swift_builder_tools".
-    static let fullMacEvolutionToolNames: [String] = [
-        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
-    ]
-
     /// Names implemented by this dispatcher, including capability-gated
     /// surfaces. Dynamic registry and MCP tools are catalog rows too, but are
     /// intentionally not claimed here because this static dispatcher cannot
@@ -454,7 +444,6 @@ extension SwiftToolDispatcher {
             + fullMacAccessibilityInjectionToolNames
             + fullMacBuilderToolNames
             + fullMacRestartToolNames
-            + fullMacEvolutionToolNames
         )
     }
 
@@ -464,8 +453,7 @@ extension SwiftToolDispatcher {
     public static func catalogBucket(forRegisteredToolNamed name: String) -> ChatToolCatalogBucket? {
         guard catalogRegisteredToolNames.contains(name) else { return nil }
         if Self.fullMacBuilderToolNames.contains(name)
-            || Self.fullMacRestartToolNames.contains(name)
-            || Self.fullMacEvolutionToolNames.contains(name) {
+            || Self.fullMacRestartToolNames.contains(name) {
             return .shell
         }
         if Self.standardFileToolNames.contains(name) || Self.fullMacFileToolNames.contains(name) {

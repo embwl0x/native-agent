@@ -450,7 +450,7 @@ extension MacFourVerbs {
                     detail: raiseDetail.merging([
                         "error": .string("needs_front"), "status": .string("needs_front"),
                         "needs_front_reason": .string(raise.reason),
-                        "raised": .bool(false), "user_front_changed": .bool(false),
+                        "raised": .bool(false), "owner_front_changed": .bool(false),
                     ]) { _, new in new }
                 )
             }

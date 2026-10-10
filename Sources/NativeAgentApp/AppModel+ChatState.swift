@@ -100,17 +100,17 @@ extension AppModel {
     /// and, when the profile had been read before onboarding, held the seed's
     /// fallback "NativeAgent". A failed read keeps the current value.
     func reloadPersonality() async {
-        guard let profile = try? await client.getPersonality() else { return }
+        guard let profile = try? await Self.readPersonality(dataRoot: engine.dataRoot) else { return }
         personality = profile
         teachMemoryHygieneName()
     }
 
     private func applyProfileRepairToResidentMind() async {
-        if let repaired = try? await client.getPersonality() {
+        if let repaired = try? await Self.readPersonality(dataRoot: engine.dataRoot) {
             personality = repaired
             teachMemoryHygieneName()
         }
-        await client.refreshResidentMindAfterOnboardingTransition()
+        await refreshResidentMindAfterOnboardingTransition()
     }
 
     /// Drop a session's cached messages. Called when a session is

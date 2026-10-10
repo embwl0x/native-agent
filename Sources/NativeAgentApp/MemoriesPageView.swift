@@ -80,15 +80,13 @@ enum MemoriesPageMetrics {
 // MARK: - Where a memory came from
 
 /// The row's provenance, as a WORD. The stored value is a run handle
-/// (`adaptive-promoter:1f3c…`, `workshop:ex-9`, `skill-index`) and a run handle
+/// (`adaptive-promoter:1f3c…`, `moment-promoter:…`) and a run handle
 /// on a page about what she remembers is machinery leaking through. Every case
 /// below is grounded in a source string something in this app actually writes:
 ///
 ///   `moment-promoter:<session>`     MemoryMoments.sourcePrefix
 ///   `adaptive-promoter:<session>`   MemoryV2+AdaptivePromoter
 ///   `semantic-adaptive-extractor`   MemoryV2+FoundationModels
-///   `workshop:<execution>`          WorkshopExecutionMemory.sourcePrefix
-///   `skill-index`                   MemoryV2+SkillIndex
 ///
 /// An unrecognised handle says so rather than being dressed up as one of these:
 /// inventing a provenance is worse than admitting to none.
@@ -96,8 +94,6 @@ enum MemoriesProvenance: Equatable {
     case fromHim
     case fromTalking
     case fromAMoment
-    case fromWork
-    case fromSkills
     case wroteItDown
     case tidiedUp
     case unknown
@@ -107,8 +103,6 @@ enum MemoriesProvenance: Equatable {
         case .fromHim: "Shared by you"
         case .fromTalking: "I picked it up while we talked"
         case .fromAMoment: "I kept it from something that happened"
-        case .fromWork: "I checked it myself"
-        case .fromSkills: "I learned it from what I can do"
         case .wroteItDown: "I wrote it down myself"
         case .tidiedUp: "I tidied it up from older notes"
         case .unknown: "I don't remember where this came from"
@@ -134,8 +128,6 @@ enum MemoriesProvenance: Equatable {
         if raw.hasPrefix("adaptive-promoter") || raw.hasPrefix("semantic-adaptive-extractor") {
             return .fromTalking
         }
-        if raw.hasPrefix("workshop") { return .fromWork }
-        if raw.hasPrefix("skill-index") || raw.hasPrefix("skill") { return .fromSkills }
         if raw.hasPrefix("consolidat") || raw.hasPrefix("hygiene") { return .tidiedUp }
         return .unknown
     }
@@ -246,6 +238,7 @@ enum MemoriesPageContent {
         var parts: [String] = []
         if let warning = MemorySenseProvenance.warning(in: memory.extras) { parts.append(warning) }
         if memory.pinned == true { parts.append("Pinned") }
+        if MemoryLifecycle.normalized(memory.lifecycle) == MemoryLifecycle.graduated { parts.append("graduated → GROWTH") }
         parts.append(MemoriesWhen.words(MemoriesWhen.stamp(memory), now: now))
         parts.append(MemoriesProvenance.classify(memory.sourceRunId).words)
         return parts.joined(separator: " · ")
@@ -263,12 +256,16 @@ enum MemoriesPageContent {
     /// The memory itself leads: for a moment that is the agent's own sentence,
     /// for a fact the fact. The quote that made a moment is evidence, shown
     /// beneath, never in place of the memory (User, 2026-09-10).
+    /// The quote shows once, beneath (User, 2026-10-10: it read twice).
     static func proposalLine(_ proposal: ProposalRecord) -> String {
-        proposal.content
+        MemoryMoments.narration(ofStored: proposal.content, metadata: proposal.metadata)
     }
-    static func proposalMeta(quote: String?, staged: String) -> String {
-        guard let quote, !quote.isEmpty else { return staged }
-        return "\u{201C}\(TodayWords.bounded(TodayWords.plain(quote), limit: 120))\u{201D} · \(staged)"
+    /// The lane first — Moment, Correction or Fact — so a card says what Keep writes.
+    static func proposalMeta(_ proposal: ProposalRecord, quote: String?, staged: String) -> String {
+        let kind = MemoryMoments.metadataString(proposal.metadata, "kind")
+        let lane = (quote?.isEmpty == false || kind == "moment") ? "Moment" : kind == "correction" ? "Correction" : "Fact"
+        guard let quote, !quote.isEmpty else { return "\(lane) · \(staged)" }
+        return "\(lane) · \u{201C}\(TodayWords.bounded(TodayWords.plain(quote), limit: 120))\u{201D} · \(staged)"
     }
 }
 
@@ -525,6 +522,7 @@ struct MemoriesPageView: View {
                     MemoriesProposalRow(
                         line: MemoriesPageContent.proposalLine(proposal),
                         meta: MemoriesPageContent.proposalMeta(
+                            proposal,
                             quote: snapshot.momentQuotes[proposal.id],
                             staged: "staged \(MemoriesWhen.words(proposal.createdAt, now: now))"),
                         isSaving: savingProposalIDs.contains(proposal.id),

@@ -484,6 +484,28 @@ public struct SwiftNativeDeskStore: Sendable {
         )
     }
 
+    /// Machine-filed work (origin system). `note`'s first line is the item's
+    /// key: the open item in `project` holding a note with that first line is
+    /// reused; otherwise the item is created with `note` and `refs`. Lookup
+    /// and writes share one flock transaction, so a repeat files nothing.
+    /// `reopen`: a closed item with that key is reopened rather than doubled.
+    public func fileSystemItem(
+        kind: DeskKind,
+        project: String,
+        title: String,
+        summary: String?,
+        assignee: String?,
+        note: String,
+        refs: [DeskRef],
+        reopen: Bool = false
+    ) async throws -> CreateResult {
+        try await createItemTransaction(
+            kind: kind, project: project, title: title, parent: nil, summary: summary,
+            assignee: assignee, laneOf: nil, reuseEquivalent: false,
+            origin: .system, keyNote: note, refs: refs, reopenKeyed: reopen
+        )
+    }
+
     /// Queue lookup, provenance and budget checks share the write transaction.
     func addQueueStep(_ incoming: DeskStep) async throws -> (entry: MyQueue.Entry, change: MyQueue.Change) {
         try await persistence.withFileLock(opsPath) {
@@ -549,7 +571,10 @@ public struct SwiftNativeDeskStore: Sendable {
         assignee: String?,
         laneOf: String?,
         reuseEquivalent: Bool,
-        origin: DeskOrigin = .owner
+        origin: DeskOrigin = .owner,
+        keyNote: String? = nil,
+        refs: [DeskRef] = [],
+        reopenKeyed: Bool = false
     ) async throws -> CreateResult {
         guard Self.equivalentDeskText(project) != MyQueue.project else {
             throw DeskError.queueCreationRequiresQueuePath
@@ -582,20 +607,42 @@ public struct SwiftNativeDeskStore: Sendable {
                }) {
                 return CreateResult(item: existing, reusedEquivalent: true)
             }
+            let firstLine = { (text: String) in text.prefix { $0 != "\n" } }
+            let keyed = keyNote.map { keyNote in priorState.items.filter { item in
+                item.project == project && item.notes.contains { firstLine($0.text) == firstLine(keyNote) }
+            } } ?? []
+            if let existing = keyed.first(where: { !$0.status.isTerminal }) {
+                return CreateResult(item: existing, reusedEquivalent: true)
+            }
+            if reopenKeyed, let closed = keyed.first {
+                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: closed.handle, body: .setStatus(
+                    status: .watch, blockedReason: nil, waitingOn: nil, progress: nil, assignee: nil, laneOf: nil))
+                try Self.validateHierarchyTransition(op, in: priorState, allowArchive: false)
+                let reopened = try await appendAndRecompactUnlocked(op, feed: feed).state
+                guard let item = reopened.items.first(where: { $0.handle == closed.handle }) else {
+                    throw DeskError.unknownHandle(closed.handle)
+                }
+                return CreateResult(item: item, reusedEquivalent: true)
+            }
             let alias = Self.nextAlias(parentHandle: parent, parentAlias: parentAlias, base: feed.base, ops: feed.ops)
             let handle = DeskClock.newHandle()
-            // The generic create path is HARD-PINNED to origin=.owner with no
+            // The generic create path never mints origin=agent and carries no
             // pursuit (H2) — an origin=agent pursuit can ONLY be minted through
             // openPursuit, which builds the create op with a validated dossier.
-            // MY QUEUE's agent-origin create is owned by addQueueStep.
-            let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: .createItem(
+            // MY QUEUE's agent-origin create is owned by addQueueStep; origin
+            // system only through fileSystemItem.
+            let create = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: .createItem(
                 alias: alias, kind: kind, project: project, title: title, parent: parent, summary: summary,
                 assignee: assignee, laneOf: laneOf,
                 origin: origin, pursuit: nil
             ))
-            try Self.validateHierarchyTransition(op, in: priorState, allowArchive: false)
-            try Self.validatePursuitInvariants(op, in: priorState, viaGenericPath: true)
-            let committedState = try await appendAndRecompactUnlocked(op, feed: feed).state
+            try Self.validateHierarchyTransition(create, in: priorState, allowArchive: false)
+            try Self.validatePursuitInvariants(create, in: priorState, viaGenericPath: true)
+            var (committedState, committedFeed) = try await appendAndRecompactUnlocked(create, feed: feed)
+            for body in (keyNote.map { [DeskOpBody.appendNote(text: $0)] } ?? []) + refs.map({ .addRef(ref: $0) }) {
+                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs), handle: handle, body: body)
+                (committedState, committedFeed) = try await appendAndRecompactUnlocked(op, feed: committedFeed)
+            }
             guard let created = committedState.items.first(where: { $0.handle == handle }) else {
                 throw DeskError.unknownHandle(handle)
             }
@@ -935,6 +982,38 @@ public struct SwiftNativeDeskStore: Sendable {
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
             _ = try await appendAndRecompactUnlocked(op, feed: feed)
             return .appended
+        }
+    }
+
+    /// End the waits an outside decision has answered, in one flock
+    /// transaction. `settlement` is asked about each open item as it stands
+    /// under the lock, so a close or a new blocker that landed first is never
+    /// overwritten; it returns the note to leave and the status to take, or nil.
+    /// The note is written once, so a crash between the two ops heals on the
+    /// next pass. An item the hierarchy refuses to move is left for Doctor's
+    /// terminal-parent check.
+    @discardableResult
+    public func settleWaits(
+        _ settlement: @escaping @Sendable (DeskItem) -> (note: String, status: DeskStatus, blockedReason: String?)?
+    ) async throws -> [DeskOp] {
+        try await persistence.withFileLock(opsPath) {
+            var feed = try await readFeedUnlocked()
+            var state = Self.compact(base: feed.base, feed.ops)
+            var settled: [DeskOp] = []
+            for item in state.items where !item.status.isTerminal {
+                guard let answer = settlement(item) else { continue }
+                let status = DeskOp(handle: item.handle, body: .setStatus(
+                    status: answer.status, blockedReason: answer.blockedReason, waitingOn: nil,
+                    progress: nil, assignee: nil, laneOf: nil))
+                guard (try? Self.validateHierarchyTransition(status, in: state, allowArchive: false)) != nil else { continue }
+                let note = DeskOp(handle: item.handle, body: .appendNote(text: answer.note))
+                for var op in item.notes.contains(where: { $0.text == answer.note }) ? [status] : [note, status] {
+                    op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+                    (state, feed) = try await appendAndRecompactUnlocked(op, feed: feed)
+                    settled.append(op)
+                }
+            }
+            return settled
         }
     }
 

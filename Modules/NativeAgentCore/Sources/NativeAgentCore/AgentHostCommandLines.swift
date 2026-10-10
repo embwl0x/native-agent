@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 
 /// HOW A COMMAND-LINE AGENT TAKES A PROMPT AND PRINTS A REPLY — data, like
 /// everything else on a known-agent row. One adapter reads this; nothing
@@ -10,7 +11,7 @@ import Foundation
 /// implemented the entry
 /// leaves `continuation` empty and every message is standalone, which is the
 /// honest answer rather than a guess at somebody else's session store.
-public struct AgentHostCommandLine: Sendable, Equatable {
+public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     /// Placeholders the adapter substitutes, one argument at a time, so a
     /// message is never parsed as a flag or split by a shell.
     public static let messagePlaceholder = "{{message}}"
@@ -133,14 +134,14 @@ public struct AgentHostCommandLine: Sendable, Equatable {
     }
 
     /// Stream shapes, by protocol rather than by agent.
-    public enum Stream: String, Sendable, Equatable {
+    public enum Stream: String, Sendable, Equatable, Codable {
         /// `agy --output-format stream-json`: step_update text_delta, then one result.
         case antigravity
         /// `codex exec --json`: whole items as they complete.
         case codex
     }
 
-    public enum PermissionFlags: String, Sendable, Equatable {
+    public enum PermissionFlags: String, Sendable, Equatable, Codable {
         /// `codex -c sandbox_mode=… -c approval_policy=…`.
         case codex
     }
@@ -191,12 +192,23 @@ public struct AgentHostCommandLine: Sendable, Equatable {
     }
 }
 
-/// The command-line half of the known-agent table, keyed by the row's id. It
-/// lives here, below the chat module, because the Trust boundary has to price a
-/// message to such a contact as what it is — running a command — and there must
-/// be ONE table to read rather than a second copy of the same facts.
+/// What a host's recipe launches now, read through `AgentRecipeStore.launch`.
+/// The Trust boundary prices a message by it but sits below the store's
+/// module, so the engine installs that reader here at assembly; until then
+/// no host launches anything, and the run itself is gated again at dispatch.
+public enum AgentHostLaunches {
+    public typealias Launch = (acp: AgentHostACP?, commandLine: AgentHostCommandLine?)
+    private static let reader = OSAllocatedUnfairLock<(@Sendable (String) -> Launch)?>(initialState: nil)
+
+    public static func install(_ read: @escaping @Sendable (String) -> Launch) { reader.withLock { $0 = read } }
+
+    public static func launch(host: String) -> Launch { reader.withLock { $0 }?(host) ?? (nil, nil) }
+}
+
+/// The command-line half of the known-agent table, keyed by the row's id: the
+/// recipes' seed (`AgentHostDirectory.seed`). What runs is the recipe.
 public enum AgentHostCommandLines {
-    public static let byHostID: [String: AgentHostCommandLine] = [
+    public static let seed: [String: AgentHostCommandLine] = [
         "antigravity-cli": AgentHostCommandLine(
             executable: "agy",
             arguments: ["--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
@@ -223,19 +235,28 @@ public enum AgentHostCommandLines {
             documentation: "https://learn.chatgpt.com/docs/non-interactive-mode"),
     ]
 
-    /// Fixed, ordered installation locations. Discovery never reads shell PATH or runs code.
+    /// Fixed, ordered installation locations: what a recipe's search paths are seeded with.
     // The person's own install folders first, as in a normal shell path: on the 09-19 drive the
     // Homebrew copy of Codex (0.131, from May) won over the one in ~/.local/bin the person uses.
     public static let searchPaths = ["~/.local/bin", "~/bin", "/opt/homebrew/bin", "/usr/local/bin",
         "~/.npm-global/bin", "~/.npm/bin", "~/Library/pnpm", "~/.local/share/pnpm",
         "~/.bun/bin", "~/.local/share/mise/shims", "~/.asdf/shims", "~/.lmstudio/bin"]
 
+    /// Where a program is looked for, connecting and discovery alike (one
+    /// list, so an offer and its connect agree): a recipe's search paths, then
+    /// the app's own PATH and ~/.cargo/bin. Discovery never runs what it finds.
+    public static func programFolders(_ searchPaths: [String]) -> [String] {
+        var seen: Set<String> = []
+        let path = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map(String.init)
+        return (searchPaths + path + ["~/.cargo/bin"]).filter { seen.insert($0).inserted }
+    }
+
     public static func resolveExecutable(_ name: String) -> String? {
         resolveExecutable(name, directories: searchPaths,
                           home: FileManager.default.homeDirectoryForCurrentUser.path)
     }
 
-    static func resolveExecutable(_ name: String, directories: [String], home: String) -> String? {
+    public static func resolveExecutable(_ name: String, directories: [String], home: String) -> String? {
         guard !name.isEmpty, !name.contains("/") else { return nil }
         for directory in directories {
             let expanded = directory.hasPrefix("~/") ? home + String(directory.dropFirst()) : directory

@@ -166,6 +166,22 @@ public enum LoopTickOutcome: Sendable, Equatable {
         .skipped(reason: reason, healthNeutral: true)
     }
 
+    /// A tick has one of four words: worked (`.completed`, the only outcome
+    /// that stamps `lastCompletedAt`), nothing to do (a plain skip), off (its
+    /// config switches it off) and not needed (another authority already does
+    /// its job). Off and not needed are skips whose reason carries the word,
+    /// so Doctor never counts them as healthy work.
+    public static let offPrefix = "off: "
+    public static let notNeededPrefix = "not needed: "
+
+    public static func off(_ reason: String) -> LoopTickOutcome {
+        .skipped(reason: offPrefix + reason)
+    }
+
+    public static func notNeeded(_ reason: String) -> LoopTickOutcome {
+        .skipped(reason: notNeededPrefix + reason)
+    }
+
     /// True only for the manager's single-flight coalesce skip.
     public var isCoalescedSkip: Bool {
         if case .skipped(let reason, _) = self { return reason == Self.coalescedSkipReason }
@@ -588,8 +604,13 @@ public actor SwiftNativeLoopScheduler {
     /// and completes nothing looks freshly-run forever), and without a durable
     /// floor a relaunch would reset the clock every time.
     private var persistedFirstSeen: [String: Date] = [:]
+    /// The last `OrganPulse` per organ, flushed under the "pulses" key.
+    private var persistedPulses: [String: OrganPulse] = [:]
+    package typealias PersistedLoopState = (
+        runs: [String: Date], completions: [String: Date], firstSeen: [String: Date], pulses: [String: OrganPulse]
+    )
     private var persistedStateLoaded = false
-    private var persistedStateLoad: Task<(runs: [String: Date], completions: [String: Date], firstSeen: [String: Date]), Never>?
+    private var persistedStateLoad: Task<PersistedLoopState, Never>?
     public static let healthCheckpointInterval: TimeInterval = 60
     private let durableFlushImmediateInterval: TimeInterval
     private var lastDurableFlushAt: Date?
@@ -847,6 +868,14 @@ public actor SwiftNativeLoopScheduler {
 
     public func start() async {
         await loadPersistedStateIfNeeded()
+        if !hasStarted {
+            hasStarted = true
+            // Registration is complete at launch; hot reloads retain their clocks.
+            persistedLastRun = persistedLastRun.filter { loops[$0.key] != nil }
+            persistedLastCompleted = persistedLastCompleted.filter { loops[$0.key] != nil }
+            persistedFirstSeen = persistedFirstSeen.filter { loops[$0.key] != nil }
+            await flushLoopState()
+        }
         running = true
         overdueStartupSlots = 0
         for (_, reg) in loops {
@@ -1053,7 +1082,7 @@ public actor SwiftNativeLoopScheduler {
     /// `register` spawn against a still-empty map and sleep a full interval.
     private func loadPersistedStateIfNeeded() async {
         if persistedStateLoaded { return }
-        let load: Task<(runs: [String: Date], completions: [String: Date], firstSeen: [String: Date]), Never>
+        let load: Task<PersistedLoopState, Never>
         if let inFlight = persistedStateLoad {
             load = inFlight
         } else {
@@ -1078,55 +1107,55 @@ public actor SwiftNativeLoopScheduler {
         for (id, date) in loaded.firstSeen {
             persistedFirstSeen[id] = [persistedFirstSeen[id], date].compactMap { $0 }.min()
         }
+        for (organ, pulse) in loaded.pulses where persistedPulses[organ] == nil {
+            persistedPulses[organ] = pulse
+        }
     }
 
-    /// L4-15: ids of loops that were deliberately DE-REGISTERED (assembly
-    /// comments explain why for each) and must not haunt the durable state
-    /// file forever. Entries normally outlive `unregister` on purpose (a
-    /// hot-reload must not reset a weekly clock), so retirement needs this
-    /// explicit tombstone: dropped at load, therefore absent from the next
-    /// flush. If a listed loop is ever re-registered, REMOVE its id here or
-    /// its due clock restarts from scratch on the next launch.
-    /// NOT listed: `mission_executor` — that is a live wire id (kept through
-    /// the de-mission rename fence), still registered by
-    /// BackgroundLoopsAssembly+WorkshopExecution.
-    static let retiredLoopIds: Set<String> = [
-        "golden_eval",
-        "stale_artifact_sweep",
-        // Retired 2026-08-31: the duplicate weekly REM lane. Weekly REM has one
-        // owner, the `nativeagent-weekly-rem` TriggerScheduler job. Tombstoned
-        // here so the loop's stale `loops`/`completions`/`firstSeen` stamps do
-        // not survive into the next flush.
-        "rem_cycle",
-    ]
+    private var hasStarted = false
 
     /// A missing file yields no persisted history. A corrupt one is reported
     /// (readJSON keeps its bytes beside it) and also yields none, which
     /// degrades to the pre-LOOPS-4 behavior rather than blocking startup.
-    private static func readLoopState(
+    package static func readLoopState(
         _ path: URL?
-    ) async -> (runs: [String: Date], completions: [String: Date], firstSeen: [String: Date]) {
-        guard let path else { return ([:], [:], [:]) }
+    ) async -> PersistedLoopState {
+        guard let path else { return ([:], [:], [:], [:]) }
         let value: JSONValue
         do {
             value = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
         } catch {
             nativeLog("BackgroundLoops: loop state unreadable, starting with no run history: %@", "\(error)")
-            return ([:], [:], [:])
+            return ([:], [:], [:], [:])
         }
-        guard case .object(let root) = value else { return ([:], [:], [:]) }
+        guard case .object(let root) = value else { return ([:], [:], [:], [:]) }
         let iso = ISO8601DateFormatter()
         func stamps(_ key: String) -> [String: Date] {
             guard case .object(let rows)? = root[key] else { return [:] }
             var result: [String: Date] = [:]
             for (id, raw) in rows {
-                guard !retiredLoopIds.contains(id) else { continue }
                 guard case .string(let stamp) = raw, let date = iso.date(from: stamp) else { continue }
                 result[id] = date
             }
             return result
         }
-        return (stamps("loops"), stamps("completions"), stamps("firstSeen"))
+        var pulses: [String: OrganPulse] = [:]
+        if case .object(let rows)? = root["pulses"] {
+            for (organ, raw) in rows {
+                guard case .object(let row) = raw,
+                      case .string(let stamp)? = row["at"], let at = iso.date(from: stamp),
+                      case .string(let word)? = row["outcome"], let outcome = OrganPulse.Outcome(rawValue: word)
+                else { continue }
+                let note: String = if case .string(let text)? = row["note"] { text } else { "" }
+                let cadence: TimeInterval? = switch row["cadenceSeconds"] {
+                case .int(let seconds)?: TimeInterval(seconds)
+                case .double(let seconds)?: seconds
+                default: nil
+                }
+                pulses[organ] = OrganPulse(organ: organ, at: at, outcome: outcome, note: note, cadence: cadence)
+            }
+        }
+        return (stamps("loops"), stamps("completions"), stamps("firstSeen"), pulses)
     }
 
     /// Serializes the whole (small — one entry per loop id ever registered)
@@ -1149,6 +1178,15 @@ public actor SwiftNativeLoopScheduler {
         for (id, date) in persistedFirstSeen {
             firstSeen[id] = .string(iso.string(from: date))
         }
+        let pulses = persistedPulses.mapValues { pulse -> JSONValue in
+            var row: [String: JSONValue] = [
+                "at": .string(iso.string(from: pulse.at)),
+                "outcome": .string(pulse.outcome.rawValue),
+                "note": .string(pulse.note),
+            ]
+            row["cadenceSeconds"] = pulse.cadence.map { .double($0) }
+            return .object(row)
+        }
         do {
             try await persistence.writeJSON(
                 .object([
@@ -1156,6 +1194,7 @@ public actor SwiftNativeLoopScheduler {
                     "loops": .object(loops),
                     "completions": .object(completions),
                     "firstSeen": .object(firstSeen),
+                    "pulses": .object(pulses),
                 ]),
                 to: loopStatePath
             )
@@ -1172,13 +1211,29 @@ public actor SwiftNativeLoopScheduler {
     /// durable; stop flushes the final live stamps without another wakeup.
     private func recordDurableRun(loopId: String, at date: Date) async {
         persistedLastRun[loopId] = date
-        let interval = loops[loopId]?.loop.interval
-        if let interval, interval < durableFlushImmediateInterval,
+        await flushLoopState(cadence: loops[loopId]?.loop.interval, at: date)
+    }
+
+    private func flushLoopState(cadence: TimeInterval?, at date: Date) async {
+        if let cadence, cadence < durableFlushImmediateInterval,
            let lastDurableFlushAt,
            date.timeIntervalSince(lastDurableFlushAt) < durableFlushImmediateInterval {
             return
         }
         await flushLoopState()
+    }
+
+    /// An organ's pulse rides the same checkpoint rule as a loop's run stamp.
+    func recordPulse(_ pulse: OrganPulse) async {
+        await loadPersistedStateIfNeeded()
+        if let held = persistedPulses[pulse.organ], held.at > pulse.at { return }
+        persistedPulses[pulse.organ] = pulse
+        await flushLoopState(cadence: pulse.cadence, at: pulse.at)
+    }
+
+    func organPulses() async -> [OrganPulse] {
+        await loadPersistedStateIfNeeded()
+        return Array(persistedPulses.values)
     }
 
     private func runOneTick(loop: any LoopRunner, registrationId: UUID) async {
@@ -1691,7 +1746,7 @@ public struct DoctorAutoRunLoop: LoopRunner {
     /// so callers can plug in env-derived roots or mkdir-on-demand logic
     /// without forcing the work onto every callsite.
     public init(
-        interval: TimeInterval = 600,
+        interval: TimeInterval,
         runChecks: @escaping @Sendable () async throws -> [CheckResult],
         storage: @escaping @Sendable () async throws -> URL = { defaultDoctorStorageDir() }
     ) {
@@ -1717,40 +1772,17 @@ public struct DoctorAutoRunLoop: LoopRunner {
                 return .skipped(reason: "doctor produced no check results")
             }
             let dir = try await storage()
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let target = dir.appendingPathComponent("latest.json")
-            let payload = try encodePayload(results: results, measuredAt: measuredAt)
-            try await SwiftNativePersistenceCore().writeJSON(payload, to: target)
+            // Two clocks, never one: `runAt` is when this file was written,
+            // `measuredAt` when the checks were asked — the age of the findings.
+            let formatter = ISO8601DateFormatter()
+            try await DoctorStatusProjection.persistDoctorSnapshot(
+                results, to: dir.appendingPathComponent("latest.json"),
+                runAt: formatter.string(from: Date()), measuredAt: formatter.string(from: measuredAt))
             return .completed(result: "doctor snapshot persisted (\(results.count) check(s))")
         } catch {
             FileHandle.standardError.write(Data("DoctorAutoRunLoop: tick failed: \(error)\n".utf8))
             return .failed(error: String(describing: error))
         }
-    }
-
-    private func encodePayload(results: [CheckResult], measuredAt: Date) throws -> JSONValue {
-        // Mirror the daemon's `{"checks": [...]}` wire shape so consumers
-        // reading `latest.json` can use the same parser as the live HTTP
-        // route. Use JSONEncoder → JSONValue.parse round-trip so encoding
-        // matches CheckResult's Codable representation byte-for-byte.
-        // `runAt` is added so the Mac health card can decide whether the
-        // cached doctor run is fresh enough to reuse vs. re-run live.
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.sortedKeys]
-        let data = try enc.encode(results)
-        let checksValue = try JSONValue.parse(data)
-        // Two clocks, never one. `runAt` is PUBLICATION — when this file was
-        // written — and is unchanged for every existing reader. `measuredAt` is
-        // when the checks were actually asked, which is the only one that says
-        // how old the findings are. (A check replaying its own declared
-        // 60-second memo can still make `measuredAt` that much optimistic; the
-        // refresh path asks for `freshMeasurementChecks()` so it cannot.)
-        let formatter = ISO8601DateFormatter()
-        return .object([
-            "checks": checksValue,
-            "runAt": .string(formatter.string(from: Date())),
-            "measuredAt": .string(formatter.string(from: measuredAt)),
-        ])
     }
 }
 

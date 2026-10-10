@@ -43,6 +43,7 @@ public struct RunLedgerIntegrityCheck: DoctorCheck {
         } catch {
             return CheckResult(id: id, title: title, status: "warn",
                 detail: "The runs ledger (data/runs/runs.json) cannot be read by the Runs page.",
+                harm: "Past runs cannot be reviewed in Runs.",
                 human_action: "If it is damaged JSON, the next recorded run moves it aside as runs.json.corrupt-*.bak and starts fresh. Otherwise move data/runs/runs.json aside yourself; the next run starts a fresh ledger.")
         }
     }
@@ -70,6 +71,7 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
         if FileManager.default.fileExists(atPath: folder.path), !FileManager.default.isReadableFile(atPath: folder.path) {
             return CheckResult(id: id, title: title, status: "fail",
                 detail: "The saved traces folder (\(folder.lastPathComponent)) exists but cannot be read, so Inspector Replay cannot open it.",
+                harm: "Saved turns cannot be reviewed in Inspector Replay.",
                 human_action: "Restore read permission on data/turn_traces for your user, then run Doctor again.",
                 ask: .permission)
         }
@@ -119,6 +121,7 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
         let humanDays = unreadable + unsalvageable
         return CheckResult(id: id, title: title, status: unreadable.isEmpty ? "warn" : "fail",
             detail: "Saved trace problems: " + problems.joined(separator: "; ") + ". \(coverage)",
+            harm: "Parts of saved turns cannot be reviewed in Inspector Replay.",
             repair: salvageable ? "Run Repair Safe Issues to back up each damaged trace and keep its readable rows." : nil,
             receipt: receipt,
             human_action: humanDays.isEmpty ? nil

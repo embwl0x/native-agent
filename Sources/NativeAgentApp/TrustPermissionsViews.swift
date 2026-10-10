@@ -220,7 +220,7 @@ struct MultimodalPermissionsView: View {
     }
 }
 
-// PATCH-2026-05-07: training-b1 ui Permissions panel for autonomous training loop.
+// Permissions for unattended background work.
 struct TrainingPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var draftEnableAutonomy = false
@@ -229,16 +229,11 @@ struct TrainingPermissionsView: View {
     /// the key. The switch shows the EFFECTIVE state, so it can never read OFF
     /// while `BackgroundLoopsAssembly.unattendedWorkAllowed` is admitting work.
     @State private var unattendedForced = false
-    @State private var draftTraining = TrustTrainingPolicy()
-    @State private var draftPromotion = TrustPromotionPolicy()
     @State private var isSaving = false
     @State private var completedInitialRead = false
     @State private var loadedPolicy: TrustPolicy?
     @State private var unattendedReadGate = LatestAsyncRequestGate()
 
-    /// Alive glass (2026-09-23): the master switch in its own group card, then
-    /// practice runs and automatic review as their own eyebrow and card. No
-    /// per-row timing pills; Trust's feature footnote says when changes land.
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             AliveGroupCard {
@@ -247,8 +242,8 @@ struct TrainingPermissionsView: View {
                 FeatureSwitchRow(
                     title: "Let me work unattended",
                     detail: unattendedForced
-                        ? "Full Mac access keeps me working unattended: helpers on their schedules, practice runs and background improvement. Choosing Safe on the Access tab turns it off. Work mode and Builder keep it on but unlock this switch, so you can turn it off here. Run once still works either way, because that is you asking."
-                        : "The main switch for background work: helpers on their schedules and replies to events, practice runs and app improvements. Run once still works either way, because that is you asking. Even with this on, I can only change my own files inside NativeAgent, never the rest of your Mac.",
+                        ? "Full Mac access keeps me working unattended: helpers on their schedules, background improvement. Choosing Safe on the Access tab turns it off. Work mode and Builder keep it on but unlock this switch, so you can turn it off here. Run once still works either way, because that is you asking."
+                        : "The main switch for background work: helpers on their schedules and replies to events, the weekly improvement pass. Run once still works either way, because that is you asking. Even with this on, I can only change my own files inside NativeAgent, never the rest of your Mac.",
                     isOn: Binding(
                         get: { draftEnableAutonomy || unattendedForced },
                         set: { newValue in
@@ -259,99 +254,6 @@ struct TrainingPermissionsView: View {
                     )
                 )
                 .disabled(unattendedForced)
-            }
-            // Taste pass 2026-07-24: was "Autonomous Training", an exact echo
-            // of the card title directly above it.
-            AdvancedSection(title: "Practice runs") {
-                FeatureSwitchRow(
-                    title: "Let me practice on my own",
-                    detail: "I work through my own saved exercises in the background, notice where my answers have slipped, and write up suggested changes. I never apply a change on my own; every suggestion waits for you.",
-                    isOn: Binding(
-                        get: { draftTraining.autonomous_training },
-                        set: { newValue in
-                            var next = draftTraining
-                            next.autonomous_training = newValue
-                            if !newValue {
-                                next.dream_scheduler = false
-                                next.route_through_promotion = false
-                            }
-                            draftTraining = next
-                            let patch = newValue
-                                ? ["autonomous_training": true]
-                                : ["autonomous_training": false, "dream_scheduler": false, "route_through_promotion": false]
-                            Task { await savePracticePolicy(training: patch) }
-                        }
-                    )
-                )
-                // The nightly dream switch is Settings ▸ Inner life's
-                // "Dreams at night" alone (one gate, one home).
-            }
-
-            // PATCH-2026-05-07: self-improvement-ui Promotion engine trust toggles
-            // Sweep R4 C9 — COPY ONLY. "Promotion engine" was the internal
-            // component name; what the user is granting is an automatic
-            // check that a proposed change is good enough to keep.
-            AdvancedSection(title: "Automatic review") {
-                // Sweep R4 C9 — COPY ONLY. The detail was a raw endpoint path
-                // plus "harness eval", neither of which appears anywhere else
-                // in the UI.
-                FeatureSwitchRow(
-                    title: "Check proposed changes automatically",
-                    detail: "Before any suggested change is kept, I re-run my own test set against it. A change that scores worse than what it replaces is thrown away instead of applied.",
-                    isOn: Binding(
-                        get: { draftPromotion.enabled },
-                        set: { newValue in
-                            var next = draftPromotion
-                            next.enabled = newValue
-                            if !newValue {
-                                next.auto_promote_tier_a = false
-                                var training = draftTraining
-                                training.route_through_promotion = false
-                                draftTraining = training
-                                draftPromotion = next
-                                Task {
-                                    await savePracticePolicy(training: ["route_through_promotion": false],
-                                                             promotion: ["enabled": false, "auto_promote_tier_a": false])
-                                }
-                            } else {
-                                draftPromotion = next
-                                Task { await savePracticePolicy(promotion: ["enabled": true]) }
-                            }
-                        }
-                    )
-                )
-                // Sweep R4 C9 — COPY ONLY. "Tier A acts as Tier B" was the
-                // only place those tiers were ever named; nothing in the UI
-                // defined either one.
-                FeatureSwitchRow(
-                    title: "Keep low-risk changes without asking you",
-                    detail: "Low-risk means my own notes about how I should behave and the exercises I practice against, never your files or your settings. With this off, every change waits for your sign-off, however small. Turn it on only if you trust the automatic check above to catch a bad one.",
-                    isOn: Binding(
-                        get: { draftPromotion.auto_promote_tier_a },
-                        set: { newValue in
-                            var next = draftPromotion
-                            next.auto_promote_tier_a = newValue
-                            draftPromotion = next
-                            Task { await savePracticePolicy(promotion: ["auto_promote_tier_a": newValue]) }
-                        }
-                    )
-                )
-                .disabled(!draftPromotion.enabled)
-                FeatureSwitchRow(
-                    title: "Put practice suggestions through the automatic check too",
-                    detail: "A suggestion you approve is still tested before it is written, instead of being applied straight away. Needs both practice runs and automatic review turned on.",
-                    isOn: Binding(
-                        get: { draftTraining.route_through_promotion },
-                        set: { newValue in
-                            var training = draftTraining
-                            training.route_through_promotion = newValue
-                            draftTraining = training
-                            Task { await savePracticePolicy(training: ["route_through_promotion": newValue]) }
-                        }
-                    )
-                )
-                .disabled(!draftPromotion.enabled || !draftTraining.autonomous_training)
-                FeatureNote("Practice only ever suggests. Changes to my personality and voice never apply without your approval.")
             }
         }
         .task(id: appModel.engine.trust.policy) {
@@ -384,11 +286,7 @@ struct TrainingPermissionsView: View {
     private func syncDraftsFromPolicy() {
         if let trustPolicy = appModel.engine.trust.policy {
             draftEnableAutonomy = trustPolicy.enableAutonomy
-        } else if let summary = appModel.improvementSummary {
-            draftEnableAutonomy = summary.trustEnabled ?? summary.enabled ?? false
         }
-        draftTraining = appModel.engine.trust.policy?.trainingPolicy ?? TrustTrainingPolicy()
-        draftPromotion = appModel.engine.trust.policy?.promotionPolicy ?? TrustPromotionPolicy()
     }
 
     private func saveEnableAutonomy(_ enabled: Bool) async {
@@ -398,12 +296,7 @@ struct TrainingPermissionsView: View {
         syncDraftsFromPolicy()
     }
 
-    private func savePracticePolicy(training: [String: Bool] = [:], promotion: [String: Bool] = [:]) async {
-        isSaving = true
-        await appModel.patchTrainingAndPromotion(training: training, promotion: promotion)
-        isSaving = false
-        syncDraftsFromPolicy()
-    }
+
 }
 
 // PATCH-2026-05-07: executions-b Permissions panel for autonomous executions
@@ -498,29 +391,11 @@ struct LivingMemoryPermissionsView: View {
                     set: { v in
                         var next = draftPolicy
                         next.consolidation_enabled = v
-                        if !v {
-                            next.auto_promote_consolidated = false
-                        }
                         draftPolicy = next
                         Task { await saveMemoryPolicy(next) }
                     }
                 )
             )
-            FeatureSwitchRow(
-                title: "Keep consolidated memories without asking",
-                detail: MemoryPolicyHelpCopy.autoPromoteConsolidated,
-                isOn: Binding(
-                    get: { draftPolicy.auto_promote_consolidated },
-                    set: { v in
-                        var next = draftPolicy
-                        next.consolidation_enabled = true
-                        next.auto_promote_consolidated = v
-                        draftPolicy = next
-                        Task { await saveMemoryPolicy(next) }
-                    }
-                )
-            )
-            .disabled(!draftPolicy.consolidation_enabled)
             FeatureSwitchRow(
                 title: "Knowledge graph",
                 detail: "I join up the people, places and things your conversations keep mentioning, and draw them in Memory → Graph.",
@@ -586,8 +461,7 @@ struct LivingMemoryPermissionsView: View {
         isSaving = true
         await appModel.saveMemoryPolicy(
             consolidationEnabled: policy.consolidation_enabled,
-            crossSessionRecall: policy.cross_session_recall,
-            autoPromoteConsolidated: policy.auto_promote_consolidated
+            crossSessionRecall: policy.cross_session_recall
         )
         isSaving = false
         syncDraftFromPolicy()
@@ -698,7 +572,4 @@ struct TrustBoundaryRow: View {
 enum MemoryPolicyHelpCopy {
     static let nightlyConsolidation =
         "Once a week, I look for things that keep coming up in your conversations and suggest them for your long-term memory profile."
-
-    static let autoPromoteConsolidated =
-        "Adds those suggestions to your long-term memory profile automatically, instead of waiting for you to approve each one."
 }

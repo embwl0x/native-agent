@@ -16,14 +16,14 @@ import ProviderRouting
 // are the same write; only the surface tag differs.
 //
 // This mirrors the existing precedent for a non-chat surface invoking a chat
-// tool impl locally: `NativeClient+ConnectorActions.swift:392` builds a bare
+// tool impl locally: `ConnectorActions.runMarketTool` (Core) builds a bare
 // `SwiftToolDispatcher()` and calls `dispatch(tool:input:surface:)` with
 // surface "connector_action". The desk uses surface "desk".
 //
 // WHY NOT `AppModel.dispatchToolData` — the seam the chat SLASH commands use:
-// that path is `NativeClient._swiftDispatch`, which builds the *Dispatcher*
-// module's `SwiftNativeDispatcher` (NativeClient+SwiftRuntime.swift:112). That
-// registry holds connector actions only; `grep -rn desk_ Modules/.../Dispatcher/`
+// that path is the Dispatcher module's `dispatchSlashCommand`, which builds a
+// `SwiftNativeDispatcher` over the read-only local actions. That registry
+// holds connector actions only; `grep -rn desk_ Modules/.../Dispatcher/`
 // is empty, so a `desk_close` sent through it would come back
 // `native_handler_missing`. The dispatcher that owns the desk tools is
 // `SwiftToolDispatcher`, and that is what this router calls.

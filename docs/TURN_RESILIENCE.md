@@ -73,6 +73,15 @@ bounded to 0–86,400 seconds, with zero disabling that timeout. Background
 calls use the same settings. Idle time is wire activity (headers, SSE
 comments, events); a cut is the typed `ProviderFailure.noReply`, and every
 stream failure's `Diagnostic` records whether the provider admitted the request.
+Until the adapter yields the provider's first output (text, tool, reasoning),
+wire keep-alives and a buffered adapter's own heartbeat hold the connection
+open but are not a reply: the guard also cuts at the provider's first-output
+deadline, the slowest adapter `ttftMs` of its retained calls on that model and
+stream kind (`ProviderVitalsSensor`: read from the trace's `llm.call` rows at
+launch, joined by each live call's `ttftMs`, nothing written). Under 100 calls
+it is unmeasured and only the wall stands; buffered kinds record no `ttftMs`,
+so idle and wall bound them.
+The cut text says the seconds waited, what arrived, and that evidence.
 
 `ProviderRouting/LLMClient+Real.swift` wraps streams with the guard and uses
 `withCompletionWall` for buffered calls. `ProviderRecoveryPolicy.callWallSeconds`
@@ -91,8 +100,9 @@ Network failures and rate limits can retry in place: up to ten attempts per
 call and twenty recoveries per turn. Once the provider admitted a request (a
 2xx response body began), a cut where it never said no (idle or wall,
 connection loss, truncation) is not re-issued before visible prose: the turn
-ends (a guard cut reads "No reply from <provider> in N s (M events)") and the
-person can say continue. An explicit provider error event (overloaded, rate
+ends (a guard cut says what it waited for, e.g. "No first word from
+<provider> in N s (headers and M keep-alives); its slowest first word in the
+last K calls was S s.") and the person can say continue. An explicit provider error event (overloaded, rate
 limit) said it did not generate and is retried as before. Backoff is 1, 2, 4, 8, 15, then 30 seconds;
 a longer provider `Retry-After` wins. The loop refuses a wait that would consume
 the remaining budget. Provider overload has a separate pre-output ladder in

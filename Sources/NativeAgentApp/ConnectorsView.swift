@@ -482,7 +482,7 @@ struct ConnectorsView: View {
         guard !workspaceSearchState.isSearching, !query.isEmpty else { return }
         workspaceSearchState = .searching
         do {
-            let response = try await appModel.client.searchWorkspace(query: query)
+            let response = try await ConnectorRegistryActions.searchWorkspace(query: query, root: appModel.engine.dataRoot)
             appModel.workspaceSearchResults = response.results
             appModel.statusText = "Workspace search found \(response.results.count)"
             workspaceSearchState = .completed(response.results)

@@ -13,7 +13,7 @@ requests offer it alone. The schema is defined in
 
 | Call | Meaning |
 |---|---|
-| `app {}` | Home first—where they left off—then the page index and action IDs. |
+| `app {}` | Home first—where they left off—then a line per page (with what blocks any of its actions) and the action IDs that work on every page; `pages_version` changes when pages, actions or readiness do. A page read lists the page's actions. |
 | `app {"page":"home"}` | Their work, arrivals, conversations and places. |
 | `app {"item":"<name or ref>","args":{…}}` | Open or act on a name returned by home or one of its rooms. Home arguments are `text` and `fields`. |
 | `app {"page":"home","find":"<words>"}` | Discover matching pages, actions and skills, just like find alone. |
@@ -21,6 +21,7 @@ requests offer it alone. The schema is defined in
 | `app {"find":"<words>"}` | Discover matching pages, actions and skills. |
 | `app {"action":"<id>","args":{…}}` | Run one registered action. |
 | `app {"script":"<JavaScript>"}` | Compose permitted app calls in JavaScriptCore. |
+| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call; every one runs and reports itself. An action's single-valued argument given a list (`args.handle:[…]`) runs once per value. |
 
 Home names belong under `item`; registry action IDs belong under `action`.
 A home item can change state or send a message immediately. Read its room to

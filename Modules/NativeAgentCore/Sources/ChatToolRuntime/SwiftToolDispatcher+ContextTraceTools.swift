@@ -104,6 +104,9 @@ extension SwiftToolDispatcher {
     }
 
     func impl_recent_trace_summary(input: [String: JSONValue]) async throws -> JSONValue {
+        if jsonString(input["view"]) == "model_calls" {
+            return try await TurnTraceRecentReader(dataRootOverride: dataRoot).modelCalls()
+        }
         let usage = jsonString(input["view"]) == "usage"
         let now = Date()
         let requestedLimit = optionalInt(input, "limit") ?? 10

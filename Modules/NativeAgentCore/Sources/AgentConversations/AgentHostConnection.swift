@@ -114,14 +114,14 @@ public enum AgentHostConnection {
                 .appendingPathComponent("agent-bridge-runs/" + (row.acp != nil ? row.id : contactID))
         }
         let executable = try row.acp.map { line in
-            guard let path = AgentHostCommandLines.resolveExecutable(line.executable) else { throw Refusal.notInstalled(row.displayName) }
+            guard let path = row.resolveExecutable(line.executable) else { throw Refusal.notInstalled(row.displayName) }
             return try AgentACPExecutable.capture(path: path)
         }
         return Proposal(row: row, command: command,
                         descriptorPath: AgentHostDirectory.bridgeDescriptorPath(dataRoot: dataRoot),
                         existing: existing, workingDirectory: directory, contactID: contactID, executable: executable,
                         workspace: folder,
-                        executablePath: executable?.path ?? row.commandLine.flatMap { AgentHostCommandLines.resolveExecutable($0.executable) })
+                        executablePath: executable?.path ?? row.commandLine.flatMap { row.resolveExecutable($0.executable) })
     }
 
     static func workspaceFolder(row: AgentHostRow, workspace: String?) throws -> String? {
@@ -371,7 +371,11 @@ public enum AgentHostConnection {
     public static func disconnect(contact: AgentPeerContact, store: AgentPeerStore) throws
         -> AgentHostConfigWriter.Outcome? {
         guard let id = AgentPeerStore.hostRowID(contact.endpoint),
-              var row = AgentHostDirectory.rows.first(where: { $0.id == id }) else { return nil }
+              var row = AgentHostDirectory.rows.first(where: { $0.id == id }) else {
+            try AgentPeerCredentials.delete(peerID: contact.id)
+            _ = try store.remove(contact.id)
+            return nil
+        }
         if contact.transport == .acp {
             try AgentPeerCredentials.delete(peerID: contact.id)
             _ = try store.remove(contact.id)

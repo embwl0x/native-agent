@@ -252,7 +252,8 @@ struct WorkPane: View {
 // MARK: - Steps
 
 /// The turn's steps as one-liners: what is happening now on top with a soft
-/// live dot, what finished below it with a check. Pending approvals for this
+/// live dot, what went before below it — a check only for a tool whose result
+/// says it worked, a cross for one refused or failed. Pending approvals for this
 /// chat sit above them, as the same card the transcript shows — one shared
 /// inbox, so answering here answers there.
 struct WorkPaneSteps: View {
@@ -262,14 +263,15 @@ struct WorkPaneSteps: View {
     /// The finished steps, newest first, and what is happening now. Stream
     /// bumps and repeats of one action collapse; a terminal reason is the
     /// turn's outcome, not a step.
-    static func steps(_ turn: TurnPresentationState) -> (now: String?, done: [String]) {
-        var seen: [String] = []
+    static func steps(_ turn: TurnPresentationState)
+        -> (now: String?, done: [(text: String, outcome: TurnPresentationActivity.Outcome?)]) {
+        var seen: [(text: String, outcome: TurnPresentationActivity.Outcome?)] = []
         for activity in turn.activities where !activity.phase.isTerminal {
-            guard let detail = activity.detail, seen.last != detail else { continue }
-            seen.append(detail)
+            guard let detail = activity.detail, seen.last?.text != detail else { continue }
+            seen.append((detail, activity.outcome))
         }
         let now = turn.isTerminal ? nil : turn.currentAction
-        if let now, seen.last == now { seen.removeLast() }
+        if let now, seen.last?.text == now { seen.removeLast() }
         return (now, seen.reversed())
     }
 
@@ -309,16 +311,17 @@ struct WorkPaneSteps: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                 }
                 ForEach(Array(steps.done.enumerated()), id: \.offset) { _, step in
+                    // The step's own words name its outcome ("Refused: …").
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Image(systemName: "checkmark")
+                        Image(systemName: step.outcome == .ok ? "checkmark" : "xmark")
                             .font(ShellType.caption)
                             .foregroundStyle(NativeAgentShell.tertiary)
+                            .opacity(step.outcome == nil ? 0 : 1)
                             .frame(width: 12)
                             .accessibilityHidden(true)
-                        line(step, style: NativeAgentShell.secondary)
+                        line(step.text, style: NativeAgentShell.secondary)
                     }
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel("Done: \(step)")
                 }
             }
             .padding(.horizontal, NativeAgentShellLayout.roomGutter)

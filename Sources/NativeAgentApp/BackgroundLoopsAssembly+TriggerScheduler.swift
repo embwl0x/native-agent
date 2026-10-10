@@ -117,11 +117,13 @@ extension BackgroundLoopsAssembly {
     static func makeMorningBriefSynthesizer() -> MorningBriefSynthesizer {
         TriggerSchedulerBackgroundWork.makeMorningBriefSynthesizer(runTurn: { prompt in
             let client = NativeAgentEngine.live.chatClient(profile: .background)
-            let response = try await client.runEphemeralToolTurn(
+            let response = try await LLMCallContext.$purpose.withValue("morning_brief") {
+            try await client.runEphemeralToolTurn(
                 message: prompt,
                 fileAccess: "read_only",
                 surface: WorkshopSurfaceVocabulary.canonical
             )
+            }
             return response.output
         })
     }

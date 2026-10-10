@@ -536,6 +536,7 @@ extension SwiftNativeChatOrchestrationClient {
             if toolName == "app" {
                 if case .string(let action)? = canonicalRiskInput["action"] { call += " " + action }
                 else if canonicalRiskInput["script"] != nil { call += " script" }
+                else if case .array(let list)? = canonicalRiskInput["actions"], !list.isEmpty { call += " actions" }
                 else if case .string(let page)? = canonicalRiskInput["page"] { call += " page=" + page }
                 else if case .string(let find)? = canonicalRiskInput["find"] { call += " find=" + find }
                 else if case .string(let item)? = canonicalRiskInput["item"] { call += " item=" + item }

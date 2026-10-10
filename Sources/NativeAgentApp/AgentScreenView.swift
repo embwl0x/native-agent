@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 import ChatOrchestration
 import PersistenceCore
@@ -22,7 +23,7 @@ struct AgentScreenView: View {
             // Every room in the Mac's own sidebar list (User 09-27: all
             // controls native), so none hides past the window's edge the way
             // the old capsule strip let them.
-            List(HerScreenPreview.tabs, id: \.self,
+            List(Self.tabs, id: \.self,
                  selection: Binding<String?>(get: { room }, set: { if let next = $0 { room = next } })) { name in
                 Text(name).font(ShellType.label)
             }
@@ -58,7 +59,8 @@ struct AgentScreenView: View {
         }
     }
 
-    static var tabs: [String] { HerScreenPreview.tabs }
+    /// Home, the places the layout shows (ui/layout.json), then home's rooms.
+    @MainActor static var tabs: [String] { HerScreenPreview.tabs(SurfaceLayoutLive.shared.layout, profile: SimpleViewMode.agent) }
 
     /// The pane for one tab, exactly as shown; app_page_read page=agent reads this.
     static func paneText(_ room: String, root: URL, scope: String) async -> String {

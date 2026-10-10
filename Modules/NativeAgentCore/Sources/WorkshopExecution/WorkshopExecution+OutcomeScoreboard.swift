@@ -5,7 +5,7 @@ import PersistenceCore   // SwiftNativePersistenceCore + readJSONL (timeline sca
 //
 // The north star is "Agent runs a real multi-step job unattended and gets
 // MEASURABLY better week over week." Nothing in the system produced that
-// number: the self-improvement machinery (ImprovementRun) records only the
+// number: historical improvement records carried only the
 // compile/test/promote LIFECYCLE of a code change, never the OUTCOME of the
 // real jobs Agent actually runs. So there was no scoreboard — no way to say
 // "her completion rate went up" or "she's solving jobs in fewer steps."

@@ -60,8 +60,9 @@ enum ToolPillPresentation {
             if fields["streamClosed"] == .bool(true) { return .connectionFailed }
             if fields["partial"] == .bool(true) { return .partial }
             return .succeeded
+        case .refused: return .refused
         case .failed:
-            if macOutcome == .refused || ["refused", "denied", "rejected"].contains(status ?? "") { return .refused }
+            if macOutcome == .refused { return .refused }
             if status == "failed", let error, error.hasPrefix("tool denied: "), fields["reason"] == .string(error) {
                 return .refused
             }

@@ -134,7 +134,7 @@ public enum InlineInteractionResolver {
             case .alreadyClaimed:
                 return "Already continuing — a second tap does nothing."
             case .usersCard:
-                return "That card is in User's conversation waiting for him, so answering it is his. "
+                return "That card is in the owner's conversation waiting for them, so answering it is theirs. "
                     + "Nothing was changed; Not now still withdraws your ask."
             case .notVerified(let detail):
                 return detail

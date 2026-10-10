@@ -67,7 +67,7 @@ final class AppModel: Sendable {
     /// `PollScheduler.swift` for the narrow retained-liveness contract.
     let pollScheduler = PollScheduler()
     private let activeChatSessionIDWriter: @MainActor (String?) -> Void
-    private let backgroundLoopsManager: BackgroundLoopsManager
+    let backgroundLoopsManager: BackgroundLoopsManager
     private let chatSnapshotPublisher: @MainActor () -> Void
     var approvalResolverOverride: (@MainActor (String, String) async throws -> ApprovalRecord)?
     var inboxActionOverride: (@MainActor (String, String) async throws -> Void)?
@@ -247,7 +247,7 @@ final class AppModel: Sendable {
         set { engine.transcripts.setMessages(newValue, for: activeChatSessionId) }
     }
     // M12 (2026-07-09): `refreshForSidebarItem` is a wall of
-    // `try? await api.getX() ?? existingValue`. When the backend is dead every
+    // `try? await <read>() ?? existingValue`. When the backend is dead every
     // one of those falls back to the previous value and the panel renders
     // last-week's data as if it were fetched a moment ago. Record which
     // endpoints came back nil so the UI can say so instead of lying.
@@ -301,7 +301,7 @@ final class AppModel: Sendable {
         chatSessionIndexRefreshFailed = false
     }
 
-    var compiledPersonality: CompiledPersonality?
+    var compiledPersonality: CompiledPersonalityWire?
     var privacyMap: PrivacyMap?
     var supportDiagnostics: SupportDiagnostics?
     /// Support Snapshot has its own bounded read pass. Keep its progress
@@ -317,6 +317,11 @@ final class AppModel: Sendable {
     /// The engine for this model's root: the live one, or a body-less one
     /// over an override. The memory pages observe `engine.memory`.
     @ObservationIgnored let engine: NativeAgentEngine
+    /// The Mac surface keeps one immutable orchestration body resident. It
+    /// owns no canonical mind state; it reuses the root's live cognition,
+    /// memory, routing, TrustCenter and tool owners while preserving their
+    /// per-turn reads and effect-time checks.
+    @ObservationIgnored lazy var macChatClient = engine.chatClient(profile: .mac)
     @ObservationIgnored var widgetContainerUnavailableLogged = false
     /// One overview read at a time; edges during a read ask for one more.
     @ObservationIgnored var workStatusInFlight = false
@@ -345,7 +350,7 @@ final class AppModel: Sendable {
         // the persona's name and the chosen pronoun.
         AgentVoice.live = AgentVoice.current(name: agentDisplayName)
     }
-    var personalityDocs: [PersonalityDoc] = []
+    var personalityDocs: [PersonaDocSpec] = []
     var skills: [SkillRecord] = []
     /// Toolbar-specific single-flight state. Navigation may still perform its
     /// own scoped load, but repeated user taps cannot launch concurrent Tools
@@ -359,18 +364,18 @@ final class AppModel: Sendable {
     /// the ApprovalInbox actor remains the durable terminal-decision authority.
     var approvalResolutionInFlightIDs: Set<String> = []
     /// Retains the one resolver task so direct callers (chat cards included)
-    /// join an active decision instead of re-entering NativeClient's executor.
+    /// join an active decision instead of re-entering the approval executor.
     var approvalResolutionTasks: [String: Task<ApprovalRecord, Error>] = [:]
     /// The decision each in-flight resolution is carrying. 2026-09-06: joining
     /// by id alone handed the FIRST decision's result back to a second caller
     /// who asked for the opposite one, so a Deny pressed over a running Approve
     /// silently reported "approved".
     var approvalResolutionDecisions: [String: String] = [:]
-    var mcpServers: [MCPServerRecord] = []
+    var mcpServers: [MCPServer] = []
     var mcpConsent: [MCPConsentRecord] = []
-    var mcpTools: [MCPToolRecord] = []
+    var mcpTools: [MCPTool] = []
     var mcpToolReadState: MCPHubToolReadState = .notLoaded
-    var mcpResources: [MCPResourceRecord] = []
+    var mcpResources: [MCPResource] = []
     var mcpResourceReadState: MCPHubResourceReadState = .notLoaded
     var latestMCPCall: MCPCallResult?
     var mcpRecentCallState: MCPHubRecentCallState = .notLoaded
@@ -417,7 +422,7 @@ final class AppModel: Sendable {
     /// non-memory panels (workflow run, eval run, capability pack install,
     /// MCP warm/refresh, etc.). When a Swift-native implementation is
     /// deliberately unavailable, the underlying call throws
-    /// `NativeClient.notImplemented(...)` with a
+    /// `NativeActionRouteSupport.notImplemented(...)` with a
     /// `panelDisabled` userInfo flag; AppModel converts that into this
     /// human-readable message so the UI can render a small orange badge
     /// instead of a fake success toast or a red error. Cleared by the next
@@ -433,19 +438,12 @@ final class AppModel: Sendable {
     /// The last action initiated on the Trust surface. Unlike `statusText`, it
     /// cannot be overwritten by refreshes or work from another surface.
     var trustCenterActionOutcome: TrustCenterActionOutcome?
-    var policySimulation: PolicySimulation?
-    /// A transport/read failure is distinct from SecurityCenter's fail-closed
-    /// unavailable-policy envelope. Keeping it separate prevents an old
-    /// successful verdict from remaining visible after a later failed run.
-    var policySimulationFailure: String?
     var connectors: [ConnectorRecord] = []
     var workspaces: [WorkspaceRecord] = []
     var workspaceSearchResults: [WorkspaceSearchResult] = []
     var evals: [EvalRun] = []
     var releaseChecklist: ReleaseChecklist?
     var trainingArtifacts: [TrainingArtifact] = []
-    var improvements: [ImprovementRun] = []
-    var improvementSummary: ImprovementSummary?
     var isSavingChatBrain = false
     /// One captured chat-brain tuple. Picker fields are optimistic UI caches;
     /// this value is updated only from a checked canonical read or a successful
@@ -527,6 +525,9 @@ final class AppModel: Sendable {
     /// broadcast: DeskPageView takes it once its load has landed and clears it,
     /// so the click always opens the item instead of firing into no subscriber.
     var pendingDeskHandle: String?
+    /// The transcript message a link asked the chat to land on (a miss's
+    /// `history:` locator), held the same way until ChatView reveals it.
+    var pendingChatMessageID: String?
     /// True while the Desk page is on screen. ⌘K there opens the one palette
     /// with the Desk's rows and verbs, so ContentView leaves the press to it.
     var deskHoldsCommandPalette = false
@@ -623,20 +624,8 @@ final class AppModel: Sendable {
     /// Event-identified feedback for the mounted Skill Lifecycle banner/toast.
     var skillLifecycleFeedback: SkillLifecycleFeedback?
 
-    // PATCH-2026-05-07: self-improvement-ui Beyond B.1/B.3 state
-    var trainingRuns: [TrainingRunSummary] = []
-    // F13: both feed `pendingSelfImprovementCount` → `pendingActivityCount`.
-    var trainingProposals: [TrainingProposalSummary] = [] {
-        didSet { recomputePendingActivityCount() }
-    }
-    var promotionCandidates: [PromotionCandidateSummary] = [] {
-        didSet { recomputePendingActivityCount() }
-    }
-    var promotionPending: [PromotionCandidateSummary] = []
-    var selfImprovementError: String?
-    // PATCH-2026-05-29: dreams-tab error surface for the Dreams tab (kept separate
-    // from selfImprovementError so a dream/REM failure doesn't bleed into the
-    // Self-Improvement view's banner).
+    /// The miss ledger, this week and last: the Self-Improvement page's first section.
+    var missLessons: [MemoryMissLesson] = []
     var dreamError: String?
     var pendingMemoryProposalsCount: Int {
         engine.memory.proposals.filter { $0.status == "pending" }.count
@@ -688,44 +677,12 @@ final class AppModel: Sendable {
         engine.inbox.items.filter { $0.isActivityPending && $0.isForYouLane }.count
     }
 
-    var pendingTrainingProposalCount: Int {
-        trainingProposals.filter(AppModel.isHumanActionableTrainingProposal).count
-    }
-
-    var pendingPromotionCandidateCount: Int {
-        promotionCandidates.filter(AppModel.isHumanActionablePromotionCandidate).count
-    }
-
-    var pendingSelfImprovementCount: Int {
-        pendingTrainingProposalCount + pendingPromotionCandidateCount
-    }
-
-    /// Render-cost audit F13 — the root `ContentView` observes ONE scalar.
-    ///
-    /// This used to be a computed property fanning out to five stored
-    /// collections (`engine.approvals.records`, `engine.inbox.items`, `engine.memory.proposals`,
-    /// `trainingProposals`, `promotionCandidates`). Reading it inside
-    /// `ContentView.body` (`ContentView.swift:372`, the sidebar badge)
-    /// registered an Observation dependency on all five, so ANY write to ANY
-    /// of them re-ran the root body — which contains the whole
-    /// `NavigationSplitView` and the inline `switch` that constructs the detail
-    /// view, `case .chat: ChatView()` included.
-    ///
-    /// **Staleness invariant.** The scalar is not maintained by the badge
-    /// refresh (that would go stale the moment any other path mutated a
-    /// collection — approve an approval, mark an inbox item read, `refreshAll`
-    /// landing new proposals). It is maintained by a `didSet` on each of the
-    /// five backing collections, so it is recomputed by *every* write to *any*
-    /// of them regardless of which code path performed it. Adding a sixth
-    /// source to the sum without adding its `didSet` is the one way to break
-    /// this; `SidebarBadgeScalarTests` pins each of the five and asserts the
-    /// scalar equals the recomputed sum.
     private(set) var pendingActivityCount: Int = 0
 
     /// The authoritative sum. Kept as a separate computed property so tests
     /// (and the `didSet` invariant) have one place to compare against.
     var computedPendingActivityCount: Int {
-        pendingApprovalsCount + pendingInboxCount + pendingMemoryProposalsCount + pendingSelfImprovementCount
+        pendingApprovalsCount + pendingInboxCount + pendingMemoryProposalsCount
     }
 
     /// Re-derive the badge scalar. Equality-gated so an unchanged badge after a
@@ -742,19 +699,6 @@ final class AppModel: Sendable {
     /// switching pages; Today consumes + clears it on appear. The
     /// notification path still works when Today is already in front.
     var pendingActivitySectionRaw: String? = nil
-
-    static func isHumanActionableTrainingProposal(_ proposal: TrainingProposalSummary) -> Bool {
-        let proposed = proposal.proposed.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rationale = proposal.rationale.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return proposal.status.lowercased() == "pending"
-            && !proposed.isEmpty
-            && !rationale.contains("proposal generation failed")
-    }
-
-    static func isHumanActionablePromotionCandidate(_ candidate: PromotionCandidateSummary) -> Bool {
-        (candidate.decision ?? "").uppercased() == "STAGE_FOR_HUMAN"
-            && candidate.source.lowercased() != "self_test"
-    }
 
     /// Production starts its refresh work immediately. Tests and isolated
     /// presentation hosts can opt out so mounting a chat control never reads
@@ -820,13 +764,6 @@ final class AppModel: Sendable {
         pollScheduler.bind(to: self)
     }
 
-    var client: NativeClient {
-        NativeClient(
-            dataRootOverride: dataRootOverride,
-            backgroundLoopsManager: backgroundLoopsManager
-        )
-    }
-
     func persistActiveChatSessionID(_ id: String?) {
         activeChatSessionIDWriter(id)
     }
@@ -835,7 +772,7 @@ final class AppModel: Sendable {
         chatSnapshotPublisher()
     }
 
-    var selectedMCPServer: MCPServerRecord? {
+    var selectedMCPServer: MCPServer? {
         if let selectedMCPServerId,
            let server = mcpServers.first(where: { $0.id == selectedMCPServerId }) {
             return server

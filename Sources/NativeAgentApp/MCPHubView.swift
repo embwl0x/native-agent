@@ -1,5 +1,6 @@
 import SwiftUI
 import PersistenceCore
+import MCPDispatcher
 
 enum MCPHubConsentPresentation {
     enum State: Equatable {
@@ -120,7 +121,7 @@ private struct MCPHubConsentRow: View {
 
 // MCP server control hub — the page that surfaces all connected MCP servers,
 // their tools, the consent log, and the most recent tool call. The backend
-// (AppModel + NativeClient) is fully wired; this view is purely the SwiftUI
+// (AppModel + MCPDispatcher) is fully wired; this view is purely the SwiftUI
 // layer. Dressed 2026-09-03 in the Advanced page kit: the room's sheet under
 // eyebrow-and-card sections (`MCPSection` / `MCPCard` / `MCPNote` at the foot
 // of this file), type from `ShellType`, colour from `NativeAgentShell`. No
@@ -140,11 +141,11 @@ struct MCPHubView: View {
     @State private var perToolDrafts: [String: MCPInputSchemaForm.Draft] = [:]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private func valuesKey(for tool: MCPToolRecord) -> String {
+    private func valuesKey(for tool: MCPTool) -> String {
         "\(tool.name)|\(schemaFingerprint(tool.inputSchema))"
     }
 
-    private func binding(for tool: MCPToolRecord) -> Binding<[String: JSONValue]> {
+    private func binding(for tool: MCPTool) -> Binding<[String: JSONValue]> {
         let key = valuesKey(for: tool)
         return Binding(
             get: { perToolValues[key] ?? [:] },
@@ -241,7 +242,7 @@ struct MCPHubView: View {
         }
     }
 
-    private func serverRow(_ server: MCPServerRecord) -> some View {
+    private func serverRow(_ server: MCPServer) -> some View {
         let isSelected = server.id == appModel.selectedMCPServerId
         let toolCount = MCPHubServerCountPresentation.resolve(
             isSelected: isSelected,
@@ -269,17 +270,17 @@ struct MCPHubView: View {
                     .help(toolCount.help)
                 Text(resourceCount.label(noun: "resource"))
                     .help(resourceCount.help)
-                Text(server.transport ?? "Transport unknown")
-                if let risk = server.riskClass, !risk.isEmpty {
-                    Text("Risk: \(risk)")
+                Text(server.transport)
+                if !server.riskClass.isEmpty {
+                    Text("Risk: \(server.riskClass)")
                 }
                 Spacer(minLength: 0)
             }
             .font(ShellType.caption)
             .foregroundStyle(NativeAgentShell.secondary)
 
-            if let endpoint = server.endpoint, !endpoint.isEmpty {
-                Text(endpoint)
+            if !server.endpoint.isEmpty {
+                Text(server.endpoint)
                     .font(ShellType.caption.monospaced())
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
@@ -305,8 +306,8 @@ struct MCPHubView: View {
                     Task { await appModel.refreshMCPCache(server) }
                 }
                 Spacer(minLength: 0)
-                if let updated = server.updatedAt, !updated.isEmpty {
-                    Text(updated)
+                if !server.updatedAt.isEmpty {
+                    Text(server.updatedAt)
                         .font(ShellType.caption)
                         .foregroundStyle(NativeAgentShell.secondary)
                 }
@@ -322,7 +323,7 @@ struct MCPHubView: View {
     }
 
     private func healthColor(_ status: String?) -> Color {
-        // gpt-5.5 review: added "error" as a red state. The NativeClient
+        // gpt-5.5 review: added "error" as a red state. The app
         // surfaces both "fail" and "error" depending on which adapter and
         // codepath produced the health row; without this, an "error" state
         // showed as muted secondary instead of red.
@@ -359,7 +360,7 @@ struct MCPHubView: View {
         }
     }
 
-    private func toolRow(_ tool: MCPToolRecord) -> some View {
+    private func toolRow(_ tool: MCPTool) -> some View {
         let isExpanded = expandedTool.contains(tool.name)
         return MCPCard {
             HStack(alignment: .top, spacing: 8) {

@@ -49,20 +49,31 @@ public enum TurnPresentationLifecycleEvent: Sendable, Equatable {
 /// arguments, provider payload, model output, hidden reasoning, or transport
 /// identity.
 public struct TurnPresentationActivity: Sendable, Equatable {
+    /// How a tool step ended, read from its own result. Nil for a step that
+    /// is not a settled tool result.
+    public enum Outcome: Sendable, Equatable {
+        case ok
+        case refused
+        case failed
+    }
+
     public let phase: TurnPresentationPhase
     public let detail: String?
     public let delegateName: String?
+    public let outcome: Outcome?
     public let occurredAt: Date
 
     init(
         phase: TurnPresentationPhase,
         detail: String?,
         delegateName: String?,
+        outcome: Outcome?,
         occurredAt: Date
     ) {
         self.phase = phase
         self.detail = detail
         self.delegateName = delegateName
+        self.outcome = outcome
         self.occurredAt = occurredAt
     }
 }
@@ -248,6 +259,7 @@ public enum TurnPresentationReducer {
         phase: TurnPresentationPhase,
         detail: String?,
         delegateName: String?,
+        outcome: TurnPresentationActivity.Outcome? = nil,
         at instant: Date,
         resetStreamLength: Bool = false,
         additionalRedactor: AdditionalRedactor? = nil
@@ -258,6 +270,7 @@ public enum TurnPresentationReducer {
             phase: phase,
             action: detail,
             delegate: delegateName,
+            outcome: outcome,
             at: instant,
             resetStreamLength: resetStreamLength,
             additionalRedactor: additionalRedactor
@@ -302,6 +315,7 @@ public enum TurnPresentationReducer {
         phase: TurnPresentationPhase,
         action: String? = nil,
         delegate: String? = nil,
+        outcome: TurnPresentationActivity.Outcome? = nil,
         at instant: Date,
         streamedTextLength: Int? = nil,
         resetStreamLength: Bool = false,
@@ -337,6 +351,7 @@ public enum TurnPresentationReducer {
             phase: phase,
             detail: safeAction,
             delegateName: safeDelegate,
+            outcome: outcome,
             occurredAt: movementAt
         ))
         if next.activities.count > detailHistoryLimit {

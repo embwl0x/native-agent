@@ -7,6 +7,8 @@ import ChatOrchestration
 import DoctorChecks
 import NotificationInbox
 import AttentionRouting
+import TrustPersistence
+import AppToolRuntime
 
 // App composition delegates background decisions and receipts to Core.
 extension BackgroundLoopsAssembly {
@@ -42,12 +44,6 @@ extension BackgroundLoopsAssembly {
         MaintenanceBackgroundWork(port: AppBackgroundWorkPort()).makeWeeklySelfImprovementLoop(dataRoot: dataRoot, llm: llm)
     }
 
-    static func makeEvolutionProposalRetentionLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> EvolutionProposalRetentionLoop {
-        MaintenanceBackgroundWork(port: AppBackgroundWorkPort()).makeEvolutionProposalRetentionLoop(dataRoot: dataRoot)
-    }
-
     static func makeDataRootDiskHygieneLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> DataRootDiskHygieneCheck {
@@ -66,12 +62,12 @@ extension BackgroundLoopsAssembly {
 }
 
 extension AppBackgroundWorkPort: MaintenanceBackgroundWorkPort {
+    func capabilityUpkeep(dataRoot: URL) async {
+        await AppToolExecutor.skillUpkeep(root: dataRoot)
+    }
+
     func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult] {
-        let client = NativeClient(dataRootOverride: dataRoot)
-        let rows = try await DoctorActionRuntime(port: client).runDoctor(repair: true, repairScope: .automatic, checks: checks).checks
-        let asksFiled = await Self.fileDoctorAsk(dataRoot: dataRoot, rows: rows)
-        NativeClient.acknowledgeDoctorTransitions(rows, asksFiled: asksFiled)
-        return rows
+        try await AppDoctorPort(dataRoot: dataRoot).runDoctor(repair: true, repairScope: .automatic, checks: checks).checks
     }
 
     /// What Doctor could not repair itself — sign-ins and permissions — goes
@@ -160,17 +156,19 @@ extension AppBackgroundWorkPort: MaintenanceBackgroundWorkPort {
     var unavailableSkipPrefix: String { DoctorLoopHealth.unavailableSkipPrefix }
 
     func autoDoctorConfig(dataRoot: URL) -> (enabled: Bool?, intervalSeconds: Int?) {
-        let config = NativeClient.readAutoDoctorConfig(dataRoot: dataRoot)
+        let config = DoctorStatusProjection.readAutoDoctorConfig(dataRoot: dataRoot)
         return (config.enabled, config.intervalSeconds)
     }
 
-    func offDiskBackupParent() -> URL { NativeClient.offDiskBackupParent() }
+    func offDiskBackupParent() -> URL { TrustBackupPersistence.offDiskBackupParent() }
 
     func offDiskAutomaticBackups(in parent: URL) throws -> [(url: URL, date: Date)] {
-        try NativeClient.offDiskAutomaticBackups(in: parent)
+        try TrustBackupPersistence.offDiskAutomaticBackups(in: parent)
     }
 
     func createOffDiskBackup(reason: String, dataRoot: URL, parent: URL, now: Date) async throws -> URL {
-        try await NativeClient.createOffDiskBackup(reason: reason, dataRoot: dataRoot, parent: parent, now: now)
+        try await TrustBackupPersistence.createOffDiskBackup(
+            reason: reason, dataRoot: dataRoot, parent: parent, now: now, host: .app
+        )
     }
 }

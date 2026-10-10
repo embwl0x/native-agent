@@ -27,14 +27,13 @@ public struct BrowserActionRoutes: Sendable {
         await effects.observeMotorAction(model)
     }
 
-    public func runBrowser<T>(
+    public func runBrowser(
         url: String,
         dryRun: Bool,
         captureSource: Bool,
         captureScreenshot: Bool,
-        dataRoot: URL,
-        decode: (JSONValue, String) throws -> BrowserRouteDecodedRun<T>
-    ) async throws -> T {
+        dataRoot: URL
+    ) async throws -> BrowserRun {
         // Browser Core owns every canonical operation transition and derived
         // receipt. The app owns only the visible WKWebView effect adapter.
         let bodyValue: JSONValue = .object([
@@ -50,11 +49,11 @@ public struct BrowserActionRoutes: Sendable {
         // `try`: nil means declined before any side effect; a THROW means a
         // native write already began, so the error propagates.
         if let envelope = try await writer.runBrowserAction(body: bodyValue) {
-            let decoded = try decode(envelope, "runBrowser(swiftNative)")
+            let run = try BrowserRun(row: envelope)
             if !dryRun {
-                await observeBrowserMotorAction(runID: decoded.id, dataRoot: dataRoot)
+                await observeBrowserMotorAction(runID: run.id, dataRoot: dataRoot)
             }
-            return decoded.value
+            return run
         }
         guard !dryRun else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
@@ -70,14 +69,10 @@ public struct BrowserActionRoutes: Sendable {
             captureScreenshot: captureScreenshot,
             dataRoot: dataRoot
         )
-        return try decode(run, "runBrowser(swiftVisibleDirect)").value
+        return try BrowserRun(row: run)
     }
 
-    public func cancelBrowserRun<T>(
-        id: String?,
-        dataRoot: URL,
-        decode: (JSONValue, String) throws -> BrowserRouteDecodedRun<T>
-    ) async throws -> T {
+    public func cancelBrowserRun(id: String?, dataRoot: URL) async throws -> BrowserRun {
         // Subsystem #27 wave 34 W17: cancel_browser_run is a pure flock'd
         // runs.json read-find-mutate-write + one receipt append — fully ported.
         // SwiftNativeBrowserClient handles it in-process; any IO failure fails
@@ -95,7 +90,7 @@ public struct BrowserActionRoutes: Sendable {
                    let runID = jsonString(envelope, "id") {
                     await effects.cancelNavigation(runID: runID)
                 }
-                return try decode(envelope, "cancelBrowserRun(swiftNative)").value
+                return try BrowserRun(row: envelope)
             }
         } catch let error as BrowserCancellationProjectionError {
             if let runID = jsonString(error.run, "id") {
@@ -251,7 +246,7 @@ public struct BrowserActionRoutes: Sendable {
         return ValidBrowserURL(url: url, domain: host)
     }
 
-    public func executeApprovedBrowserRun(from approval: ApprovalRecord) async throws {
+    public func executeApprovedBrowserRun(from approval: ApprovalRecord, dataRoot: URL) async throws {
         guard case .object(let payload) = approval.payload,
               case .string(let rawURL)? = payload["url"],
               case .string(let runID)? = payload["runId"] ?? payload["run_id"] else {
@@ -263,7 +258,7 @@ public struct BrowserActionRoutes: Sendable {
                     "action": .string(approval.action),
                     "error": .string("malformed payload: missing url/runId"),
                 ]),
-                detail: "Browser navigation FAILED: malformed payload (missing url/runId)")
+                detail: "Browser navigation FAILED: malformed payload (missing url/runId)", dataRoot: dataRoot)
             return
         }
         do {
@@ -280,10 +275,12 @@ public struct BrowserActionRoutes: Sendable {
                 runID: runID,
                 approvalId: approval.id,
                 captureSource: captureSource,
-                captureScreenshot: captureScreenshot
+                captureScreenshot: captureScreenshot,
+                dataRoot: dataRoot
             )
             let status = jsonString(run, "status") ?? "succeeded"
-            try await effects.annotateApprovalExecution(id: approval.id, executedAction: run, detail: "Browser navigation \(status)")
+            try await effects.annotateApprovalExecution(id: approval.id, executedAction: run,
+                                                        detail: "Browser navigation \(status)", dataRoot: dataRoot)
         } catch {
             // Mirror the self_improvement pattern: never leave an approved
             // record without an execution annotation when the executor threw.
@@ -294,19 +291,19 @@ public struct BrowserActionRoutes: Sendable {
                     "action": .string(approval.action),
                     "error": .string("\(error)"),
                 ]),
-                detail: "Browser navigation FAILED: \(error.localizedDescription)")
+                detail: "Browser navigation FAILED: \(error.localizedDescription)", dataRoot: dataRoot)
             throw error
         }
     }
 
-    public func finishRejectedBrowserRun(from approval: ApprovalRecord, status: String) async throws {
+    public func finishRejectedBrowserRun(from approval: ApprovalRecord, status: String, dataRoot: URL) async throws {
         guard case .object(let payload) = approval.payload,
               case .string(let rawURL)? = payload["url"],
               case .string(let runID)? = payload["runId"] ?? payload["run_id"],
               let parsed = try? validBrowserURL(rawURL) else {
             return
         }
-        let browser = SwiftNativeBrowserClient.defaultClient()
+        let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         let start = BrowserOperationStart(
             id: runID,
             url: parsed.url.absoluteString,
@@ -337,9 +334,10 @@ public struct BrowserActionRoutes: Sendable {
         try await effects.annotateApprovalExecution(
             id: approval.id,
             executedAction: committed,
-            detail: "Browser navigation \(committedStatus)"
+            detail: "Browser navigation \(committedStatus)",
+            dataRoot: dataRoot
         )
-        await observeBrowserMotorAction(runID: runID)
+        await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
     }
 
     @MainActor

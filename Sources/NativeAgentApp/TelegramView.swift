@@ -455,7 +455,7 @@ struct TelegramView: View {
                         Task {
                             defer { checkingSender = false }
                             do {
-                                let count = try await appModel.client.discoverTelegramSenders(token: appModel.telegramToken)
+                                let count = try await appModel.discoverTelegramSenders(token: appModel.telegramToken)
                                 await appModel.refreshTelegram()
                                 senderCheckMessage = count == 0 ? "No messages found. Send your bot a message, then check again." : "Sender IDs are in Blocked and ignored below. Choose your chat ID and save to admit it."
                             } catch {

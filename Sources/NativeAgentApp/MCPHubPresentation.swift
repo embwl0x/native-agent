@@ -270,15 +270,9 @@ enum MCPHubDurableCallHistory {
     }
 }
 
-extension NativeClient {
-    func readMCPHubRecentCall() -> MCPHubRecentCallState {
-        MCPHubDurableCallHistory.read(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
-    }
-}
-
 extension AppModel {
     @MainActor
     func refreshMCPHubRecentCall() {
-        mcpRecentCallState = client.readMCPHubRecentCall()
+        mcpRecentCallState = MCPHubDurableCallHistory.read(root: engine.dataRoot)
     }
 }

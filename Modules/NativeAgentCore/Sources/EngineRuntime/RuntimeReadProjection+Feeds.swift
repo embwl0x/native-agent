@@ -5,24 +5,12 @@ import TrustPersistence
 import TrustCenter
 import Browser
 import NotificationInbox
+import Skills
 
 private enum NextGenStatusFeedAvailability: Equatable {
     case absent
     case measured
     case unavailable
-}
-
-struct LossyElement<T: Decodable>: Decodable {
-    let result: Result<T, Error>
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        do {
-            result = .success(try container.decode(T.self))
-        } catch {
-            result = .failure(error)
-        }
-    }
 }
 
 extension RuntimeReadProjection {
@@ -161,39 +149,89 @@ extension RuntimeReadProjection {
         return try JSONDecoder.nativeAgent.decode(T.self, from: data)
     }
 
-    public static func decodeLossyArray<T: Decodable>(_ data: Data, context: String) throws -> [T] {
-        let decoder = JSONDecoder.nativeAgent
-        // Decode into an array of element containers; if the top level isn't an
-        // array, fall back to the strict decode (preserves prior behavior for
-        // dict-wrapped or otherwise-shaped responses).
-        guard let elements = try? decoder.decode([LossyElement<T>].self, from: data) else {
-            return try decoder.decode([T].self, from: data)
-        }
-        var firstDropError: Error? = nil
-        let survivors: [T] = elements.compactMap { element in
-            switch element.result {
-            case .success(let value):
-                return value
-            case .failure(let error):
+    /// The learned-skills registry, newest first. One malformed row drops
+    /// that row instead of blanking the list; a list where every row is
+    /// malformed throws, so it never reads as an empty registry.
+    public static func skills(dataRoot: URL) async throws -> [SkillRecord] {
+        let rows = try await makeSkillsClient(root: dataRoot).listSkills()
+        var firstDropError: Error?
+        let survivors = rows.compactMap { row -> SkillRecord? in
+            do { return try SkillRecord(row: row) } catch {
                 if firstDropError == nil { firstDropError = error }
-                print("[NativeAgent] \(context) dropped a malformed element: \(error)")
+                print("[NativeAgent] getSkills(swiftNative) dropped a malformed element: \(error)")
                 return nil
             }
         }
-        // FIX (B): partial success (some survivors) is fine and returns the good
-        // elements. But if the raw array was non-empty and EVERY element failed
-        // to decode (e.g. a server-side schema change), a silent [] would be
-        // indistinguishable from a genuinely empty list. Throw so the caller's
-        // decodeLogged records it in lastRefreshError; the caller still falls
-        // back to an empty list, so the returned data is unchanged.
-        if !elements.isEmpty && survivors.isEmpty {
-            throw firstDropError ?? NSError(
-                domain: "NativeAgent",
-                code: -2,
-                userInfo: [NSLocalizedDescriptionKey: "\(context): all \(elements.count) element(s) failed to decode"]
-            )
-        }
+        if !rows.isEmpty, survivors.isEmpty, let firstDropError { throw firstDropError }
         return survivors
+    }
+
+    /// `runs/runs.json`, newest first, at most 200. `[]` means the ledger
+    /// doesn't exist (or holds no runs); nil means a ledger EXISTS but could
+    /// not be read or decoded, so a snapshot writer can skip its write and a
+    /// corrupt ledger never overwrites last-good runs with fabricated-empty
+    /// state (sync-audit #1 discipline). The on-disk shape may be a bare
+    /// array or `{"runs": [...]}`.
+    public static func runs(dataRoot: URL) async -> [RunRecord]? {
+        let path = dataRoot
+            .appendingPathComponent("runs", isDirectory: true)
+            .appendingPathComponent("runs.json")
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        guard let data = try? Data(contentsOf: path) else { return nil }
+        let decoder = JSONDecoder.nativeAgent
+        var rows: [RunRecord]
+        if let arr = try? decoder.decode([RunRecord].self, from: data) {
+            rows = arr
+        } else if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let runs = obj["runs"],
+                  let runsData = try? JSONSerialization.data(withJSONObject: runs),
+                  let arr = try? decoder.decode([RunRecord].self, from: runsData) {
+            rows = arr
+        } else {
+            return nil
+        }
+        rows.sort { $0.createdAt > $1.createdAt }
+        return Array(rows.prefix(200))
+    }
+
+    /// The last `limit` rows of a JSONL file, each decoded on its own; a row
+    /// that does not decode is skipped and a missing file reads as `[]`.
+    /// Reads at most the last 1 MB, dropping the partial first line.
+    public static func tailJSONL<T: Decodable>(path: URL, limit: Int) async -> [T] {
+        guard limit > 0 else { return [] }
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
+              let sizeNumber = attrs[.size] as? NSNumber else {
+            return []
+        }
+        let size = sizeNumber.uint64Value
+        guard size > 0 else { return [] }
+
+        let toRead = min(size, 1_048_576)
+        let seekFromEnd = size > toRead
+        guard let handle = try? FileHandle(forReadingFrom: path) else { return [] }
+        defer { try? handle.close() }
+        if seekFromEnd {
+            do {
+                try handle.seek(toOffset: size - toRead)
+            } catch {
+                return []
+            }
+        }
+        let data = handle.readData(ofLength: Int(toRead))
+        let decoder = JSONDecoder.nativeAgent
+        let tail = decodeTailLines(data, dropFirstPartial: seekFromEnd).suffix(limit)
+        var out: [T] = []
+        out.reserveCapacity(tail.count)
+        for line in tail {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            if let lineData = trimmed.data(using: .utf8),
+               let row = try? decoder.decode(T.self, from: lineData) {
+                out.append(row)
+            }
+        }
+        return out
     }
 
     public static func readLocalJSON<T: Decodable>(_ url: URL, fallbackJSON: String) throws -> T {

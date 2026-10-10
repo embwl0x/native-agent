@@ -31,6 +31,10 @@ public enum AppDoorReentry {
     @TaskLocal public static var perform: Perform?
     public typealias Validate = @Sendable (String, [String: JSONValue]) async -> JSONValue?
     @TaskLocal public static var validate: Validate?
+    /// What a send listed in an `app {actions}` call returns instead of
+    /// running when the step also called something else: the step's held
+    /// receipt (`heldOutboundResult`), nil when the step holds no send.
+    @TaskLocal public static var heldSend: JSONValue?
 }
 
 // MARK: - Dotted-alias canonicalization (outermost)
@@ -200,7 +204,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         // Agent 09-24: "agent_message connects if needed and hands back the
         // thread, so it's one call." A known agent that is not a contact yet
         // is connected first, through agent_connect's own gates and card.
-        if tool == "agent_message", PersonInitiatedSend.current == nil,
+        if tool == "agent_message", PersonInitiatedSend.current == nil, !AgentRecipeStore.dryRun,
            case .string(let name)? = input["agent"], !name.contains(":"),
            !["codex", "claude", "omp", "claude"].contains(name.lowercased()),
            let row = AgentHostDirectory.row(named: name), let root = peerDataRoot,
@@ -250,7 +254,8 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
                 try await self.dispatchNormalized(tool: tool, input: input, surface: surface)
             }
         }
-        if !AgentConversationContext.isInternalRead,
+        // A repair's dry run is no exchange of hers: no thread, no record.
+        if !AgentConversationContext.isInternalRead, !AgentRecipeStore.dryRun,
            ["agent_message", "agent_read", "agent_cancel"].contains(tool), let root = peerDataRoot,
            let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
             return try await AgentConversationSession.dispatch(tool: tool, input: input, surface: surface,

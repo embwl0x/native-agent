@@ -40,6 +40,7 @@ public enum DesktopPeerReadLane {
         case secrets = "Grok Bot's Routines panel did not expose one unambiguous webhook URL and readable key through Accessibility. Close any open routine panel before sending a setup or cleanup request."
         case missingRoutine = "The NativeAgent reply routine is missing from Grok Bot's Routines panel."
         case cleanup = "Grok Bot's routine panel could not be closed. Close it before continuing."
+        case recipe = "Grok Bot's recipe has no routine labels (grokRoutine). Read it with agent.recipe and set them with agent.recipe_write, then Connect again."
     }
     static var running: Bool { !NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).isEmpty }
     /// Opens Grok Bot when it is closed and waits for it to be up, so a person
@@ -347,17 +348,19 @@ public enum DesktopPeerReadLane {
         }
         throw Blocker.submission
     }
+    /// Every Grok label below is its recipe's (`AgentHostRow.GrokRoutine`).
     static func importRoutine(peer: String, dataRoot: URL, waitForCreation: Bool) async throws {
+        guard let labels = AgentHostDirectory.rows.first(where: { $0.route == .grokBot })?.grokRoutine else { throw Blocker.recipe }
         try await restoringForeground {
-            do { try await importRoutineInForeground(peer: peer, dataRoot: dataRoot, waitForCreation: waitForCreation) }
+            do { try await importRoutineInForeground(peer: peer, dataRoot: dataRoot, waitForCreation: waitForCreation, labels: labels) }
             catch {
-                guard await closeRoutinePanel() else { throw Blocker.cleanup }
+                guard await closeRoutinePanel(labels) else { throw Blocker.cleanup }
                 throw error
             }
-            guard await closeRoutinePanel() else { throw Blocker.cleanup }
+            guard await closeRoutinePanel(labels) else { throw Blocker.cleanup }
         }
     }
-    private static func closeRoutinePanel() async -> Bool {
+    private static func closeRoutinePanel(_ labels: AgentHostRow.GrokRoutine) async -> Bool {
         // This bounded cleanup has its own cancellation lifetime so a canceled
         // import still hides the credential fields before restoring focus.
         await Task { @MainActor in
@@ -373,12 +376,12 @@ public enum DesktopPeerReadLane {
                 }
                 let routineOpen = tree.contains { string($0, kAXRoleAttribute) == "AXHeading" && label($0).hasPrefix("NativeAgent reply ") }
                     || (try? requireChatOnly()) == nil
-                let control = button("Back to Routines") ?? button("Back to details") ?? button("Close details")
-                    ?? (routineOpen ? button("Close") : nil)
+                let control = button(labels.backToRoutines) ?? button(labels.backToDetails) ?? button(labels.closeDetails)
+                    ?? (routineOpen ? button(labels.close) : nil)
                 if let control { _ = AXUIElementPerformAction(control, kAXPressAction as CFString) }
                 else if (try? requireChatOnly()) != nil {
                     // An import may have scrolled the chat back to its routine link.
-                    if let bottom = button("Scroll to bottom") { _ = AXUIElementPerformAction(bottom, kAXPressAction as CFString) }
+                    if let bottom = button(labels.scrollToBottom) { _ = AXUIElementPerformAction(bottom, kAXPressAction as CFString) }
                     return true
                 }
                 try? await Task.sleep(for: .milliseconds(100))
@@ -387,18 +390,19 @@ public enum DesktopPeerReadLane {
             return false
         }.value
     }
-    private static func importRoutineInForeground(peer: String, dataRoot: URL, waitForCreation: Bool) async throws {
+    private static func importRoutineInForeground(peer: String, dataRoot: URL, waitForCreation: Bool,
+                                                  labels: AgentHostRow.GrokRoutine) async throws {
         _ = try await awake()
         // A routine panel left open is closed first rather than stopping setup.
         if (try? requireChatOnly()) == nil {
-            guard await closeRoutinePanel() else { throw Blocker.cleanup }
+            guard await closeRoutinePanel(labels) else { throw Blocker.cleanup }
         }
-        do { try await openBotChat("Grok Bot") } catch { throw Blocker.mainBot }
-        try AgentPeerStore(dataRoot: dataRoot).updateGrok(peer) { $0.grokConversation = "Grok Bot" }
+        do { try await openBotChat(labels.mainChat) } catch { throw Blocker.mainBot }
+        try AgentPeerStore(dataRoot: dataRoot).updateGrok(peer) { $0.grokConversation = labels.mainChat }
         func section() throws -> AXUIElement? {
             let found = nodes(try window()).filter {
-                [kAXListRole, kAXGroupRole, "AXHeading", kAXStaticTextRole].contains(string($0, kAXRoleAttribute)) && label($0) == "Routines"
-                    && !(parent($0).map { label($0) == "Routines" } ?? false)
+                [kAXListRole, kAXGroupRole, "AXHeading", kAXStaticTextRole].contains(string($0, kAXRoleAttribute)) && label($0) == labels.routines
+                    && !(parent($0).map { label($0) == labels.routines } ?? false)
             }
             // The heading text and the list both say "Routines"; the list is the section.
             let lists = found.filter { string($0, kAXRoleAttribute) == kAXListRole }
@@ -418,7 +422,7 @@ public enum DesktopPeerReadLane {
         // Its Details row no longer opens on press, and later messages push the
         // link out of the tree, so scroll the chat back until it renders.
         func link() throws -> AXUIElement? {
-            let found = nodes(try window()).filter { string($0, kAXRoleAttribute) == kAXButtonRole && label($0) == "Open routine " + routine }
+            let found = nodes(try window()).filter { string($0, kAXRoleAttribute) == kAXButtonRole && label($0) == labels.openRoutine + routine }
             return found.count == 1 ? found[0] : nil
         }
         var found = try link()
@@ -441,7 +445,7 @@ public enum DesktopPeerReadLane {
         }
         if !(found.map(press) ?? false) {
             let tabs = nodes(try window()).filter {
-                [kAXButtonRole, kAXRadioButtonRole, "AXTab"].contains(string($0, kAXRoleAttribute)) && label($0) == "Details"
+                [kAXButtonRole, kAXRadioButtonRole, "AXTab"].contains(string($0, kAXRoleAttribute)) && label($0) == labels.details
             }
             guard tabs.count == 1, press(tabs[0]) else { throw Blocker.details }
             do { try await waitUntil { try section() != nil } } catch { throw Blocker.routines }
@@ -480,8 +484,8 @@ public enum DesktopPeerReadLane {
         do { try await waitUntil {
             let tree = nodes(try window())
             // The updated panel has no heading named after the routine; its Delete button marks it.
-            guard tree.contains(where: { string($0, kAXRoleAttribute) == kAXButtonRole && label($0) == "Delete routine" }) else { return false }
-            url = field(tree, "Webhook URL"); key = field(tree, "Webhook key")
+            guard tree.contains(where: { string($0, kAXRoleAttribute) == kAXButtonRole && label($0) == labels.deleteRoutine }) else { return false }
+            url = field(tree, labels.webhookURL); key = field(tree, labels.webhookKey)
             return url != nil && key != nil
         } } catch { throw Blocker.secrets }
         guard let url, let key else { throw Blocker.secrets }

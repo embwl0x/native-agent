@@ -5,6 +5,11 @@ import WebKit
 import Network
 import AppKit
 import PersistenceCore
+import ApprovalInbox
+import AppToolRuntime
+import Browser
+import Dispatcher
+import NativeAgentCore
 
 // MARK: - Models
 
@@ -953,5 +958,96 @@ enum BrowserError: LocalizedError {
         case .timeout: return "Browser navigation timed out"
         case .unsafeScheme(let scheme): return "Current page scheme '\(scheme)' is not allowed; only http/https are permitted"
         }
+    }
+}
+
+// MARK: - Browser route effects
+
+extension BrowserActionRoutes {
+    /// Browser Core's routes over this app's visible browser window.
+    static var app: BrowserActionRoutes { BrowserActionRoutes(effects: AppBrowserRouteEffects()) }
+}
+
+private struct AppBrowserRouteEffects: BrowserRouteEffects {
+    @MainActor
+    func acquireBrowser(runID: String) throws {
+        try BrowserWindowController.shared.acquireBrowser(runID: runID)
+    }
+
+    @MainActor
+    func releaseBrowser(runID: String) {
+        BrowserWindowController.shared.releaseBrowser(runID: runID)
+    }
+
+    func appendNativeActionReceipt(action: NativeActionRecord, status: String, dryRun: Bool, output: JSONValue,
+                                   dataRoot: URL) async throws -> NativeActionReceipt {
+        try await NativeActionRoutes.appendNativeActionReceipt(
+            action: action, status: status, dryRun: dryRun, output: output, dataRoot: dataRoot
+        )
+    }
+
+    @MainActor
+    func navigate(_ url: URL, runID: String) async throws -> BrowserNavigationResult {
+        let controller = BrowserWindowController.shared
+        // Navigation must not imply fronting (User's 3:30am dream-time popups):
+        // load quietly; only the explicit show surfaces front the window.
+        controller.ensureWindowLoadedQuietly()
+        let nav = try await controller.navigate(url, runID: runID, ownerID: runID)
+        return BrowserNavigationResult(url: nav.url, title: nav.title, httpStatus: nav.httpStatus)
+    }
+
+    @MainActor func currentURL() -> String? { BrowserWindowController.shared.currentURL() }
+    @MainActor func readText() async throws -> String { try await BrowserWindowController.shared.readText() }
+    @MainActor func readLinks() async throws -> [BrowserLink] { try await BrowserWindowController.shared.readLinks() }
+    @MainActor func screenshot() async throws -> Data { try await BrowserWindowController.shared.screenshot() }
+
+    func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool, dataRoot: URL) async -> BrowserNavigationTask {
+        let cancellationLatch = BrowserRunCancellationLatch()
+        let activeToken = await BrowserActiveRunRegistry.shared.register(runID: runID) {
+            cancellationLatch.cancel()
+        }
+        let captureTask = await MainActor.run {
+            let task = Task { @MainActor in
+                try await BrowserActionRoutes.app.navigateVisibleBrowser(
+                    url,
+                    runID: runID,
+                    captureSource: captureSource,
+                    captureScreenshot: captureScreenshot,
+                    dataRoot: dataRoot
+                )
+            }
+            // Creating and attaching are one non-suspending MainActor turn, so
+            // WebKit cannot begin between task creation and cancellation hookup.
+            cancellationLatch.install {
+                task.cancel()
+                _ = BrowserWindowController.shared.cancelNavigation(runID: runID)
+            }
+            return task
+        }
+        return BrowserNavigationTask(task: captureTask, token: activeToken)
+    }
+
+    @MainActor
+    func finishNavigation(runID: String, token: UUID) {
+        BrowserActiveRunRegistry.shared.unregister(runID: runID, token: token)
+    }
+
+    func cancelNavigation(runID: String) async {
+        _ = await BrowserActiveRunRegistry.shared.cancel(runID: runID)
+    }
+
+    func observeMotorAction(_ model: MotorActionReadModel) async {
+        await NativeAgentEngine.liveCognition.observeMotorActionState(model)
+    }
+
+    func annotateApprovalExecution(id: String, executedAction: JSONValue, detail: String, dataRoot: URL) async throws {
+        try await ApprovalExecutionAnnotation.annotateApprovalExecution(
+            id: id, executedAction: executedAction, detail: detail, root: dataRoot
+        )
+    }
+
+    func showProducedImage(at path: URL, name: String) -> (shown: Bool, note: String) {
+        let shown = LocalToolImage.showProducedImage(at: path, name: name)
+        return (shown.shown, shown.note)
     }
 }

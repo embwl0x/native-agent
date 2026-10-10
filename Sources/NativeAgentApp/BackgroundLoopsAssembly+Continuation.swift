@@ -6,7 +6,7 @@ import TelegramBot
 
 extension BackgroundLoopsAssembly {
     static func makeTurnContinuationRuntime(dataRoot: URL) -> TurnContinuationRuntime {
-        TurnContinuationRuntime(dataRoot: dataRoot, engine: NativeAgentEngine.live,
+        TurnContinuationRuntime(dataRoot: dataRoot, engine: .forRoot(dataRoot),
             telegramApprovalFiler: { TelegramApprovalFilerRef.shared.current() },
             makeSender: { LiveAgentBridgeCompletionSender(dataRoot: dataRoot, authorizeTelegramReply: $0) })
     }

@@ -78,10 +78,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// shared app-root store; an explicit store keeps a dispatcher assembled
     /// for another root from consulting live permission state.
     let macIntegrationPermissionStore: MacIntegrationPermissionStore
-    /// App-injected bridge for the self-evolution chat tools (propose / status
-    /// / self_install). nil in headless / restricted contexts — dispatch
-    /// surfaces a `bridge_not_wired` error envelope to the LLM in that case.
-    public let evolutionBridge: (any EvolutionToolBridge)?
     /// Tools an owner outside Core contributes (the app's browser, pages,
     /// health reads): registered in this one catalog and
     /// executed there. nil in headless bodies, which then have none of them.
@@ -145,7 +141,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         swarmApprovalFiler: (any ApprovalFiler)? = nil,
         macIntegrationBridge: (any MacIntegrationToolBridge)? = nil,
         macIntegrationPermissionStore: MacIntegrationPermissionStore? = nil,
-        evolutionBridge: (any EvolutionToolBridge)? = nil,
         appTools: (any ToolExecutor)? = nil,
         agentBridgeConfigRoot: URL? = nil,
         a2aPushConfiguration: (@Sendable (AgentPeerContact) async -> JSONValue?)? = nil,
@@ -178,7 +173,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             ?? (dataRoot == PersistenceCore.defaultDataRoot()
                 ? .shared
                 : MacIntegrationPermissionStore(dataRoot: dataRoot))
-        self.evolutionBridge = evolutionBridge
         self.appToolPort = appTools
         self.agentBridgeConfigRoot = agentBridgeConfigRoot ?? InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         self.a2aPushConfiguration = a2aPushConfiguration
@@ -332,8 +326,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             names.append(contentsOf: Self.fullMacBuilderToolNames.filter { !existingBuilder.contains($0) })
             let existingRestart = Set(names)
             names.append(contentsOf: Self.fullMacRestartToolNames.filter { !existingRestart.contains($0) })
-            let existingEvolution = Set(names)
-            names.append(contentsOf: Self.fullMacEvolutionToolNames.filter { !existingEvolution.contains($0) })
         }
         if access.systemAllowed {
             let existing = Set(names)
@@ -460,7 +452,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         .union(fullMacAccessibilityInjectionToolNames)
         .union(fullMacBuilderToolNames)
         .union(fullMacRestartToolNames)
-        .union(fullMacEvolutionToolNames)
         .union(macClipboardToolNames)
         .union(macMenuToolNames)
         .union(macReadToolNames)

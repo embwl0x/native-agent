@@ -7,8 +7,7 @@ extension BrowserActionRoutes {
         action: NativeActionRecord,
         dryRun: Bool,
         input: [String: Any],
-        dataRoot: URL,
-        decode: (JSONValue, String) throws -> BrowserRouteDecodedRun<BrowserRun>
+        dataRoot: URL
     ) async throws -> NativeActionReceipt {
         let jsonInput = try NativeActionRouteSupport.jsonValueBody(input)
         switch action.id {
@@ -30,8 +29,7 @@ extension BrowserActionRoutes {
                 dryRun: dryRun,
                 captureSource: captureSource,
                 captureScreenshot: captureScreenshot,
-                dataRoot: dataRoot,
-                decode: decode
+                dataRoot: dataRoot
             )
             // Browser Core projects the one canonical terminal transition into
             // the native-action receipt feed for both public aliases. Do not
@@ -56,7 +54,8 @@ extension BrowserActionRoutes {
                     action: action,
                     status: "dry_run",
                     dryRun: true,
-                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")])
+                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")]),
+                    dataRoot: dataRoot
                 )
             }
             let capture = try await captureCurrentVisibleBrowser(
@@ -76,7 +75,8 @@ extension BrowserActionRoutes {
                 action: action,
                 status: "completed",
                 dryRun: false,
-                output: .object(receipt)
+                output: .object(receipt),
+                dataRoot: dataRoot
             )
 
         case "browser.read_links":
@@ -85,7 +85,8 @@ extension BrowserActionRoutes {
                     action: action,
                     status: "dry_run",
                     dryRun: true,
-                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")])
+                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")]),
+                    dataRoot: dataRoot
                 )
             }
             let capture = try await captureCurrentVisibleBrowser(
@@ -104,7 +105,8 @@ extension BrowserActionRoutes {
                 action: action,
                 status: "completed",
                 dryRun: false,
-                output: .object(receipt)
+                output: .object(receipt),
+                dataRoot: dataRoot
             )
 
         case "browser.screenshot":
@@ -113,7 +115,8 @@ extension BrowserActionRoutes {
                     action: action,
                     status: "dry_run",
                     dryRun: true,
-                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")])
+                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")]),
+                    dataRoot: dataRoot
                 )
             }
             let capture = try await captureCurrentVisibleBrowser(
@@ -136,7 +139,8 @@ extension BrowserActionRoutes {
                 action: action,
                 status: "completed",
                 dryRun: false,
-                output: .object(receipt)
+                output: .object(receipt),
+                dataRoot: dataRoot
             )
 
         default:

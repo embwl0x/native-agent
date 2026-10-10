@@ -48,10 +48,6 @@ public enum ChatSurfaceBackgroundWork {
             // bot's growing draft wants accumulated text-so-far. One
             // accumulator per turn (this closure runs once per turn).
             let deltaAccumulator = TelegramDeltaAccumulator()
-            // Telegram uses the canonical surface profile. Its evolution
-            // backend is present so trusted Full Mac YOLO can read
-            // `evolution_status`; propose/install retain their ordinary
-            // TrustCenter and approval floors.
             // 2026-09-06: an approval continuation names the session its
             // interrupted turn ran in. Honour it — resolving the chat's active
             // binding here put the replayed tool result into whatever session
@@ -242,7 +238,7 @@ public enum ChatSurfaceBackgroundWork {
             // to the generic chat-draft path — a button that looks like a fix
             // and is not. The levers above are real; a fake one is worse than
             // none. (See report: wiring a true one-click Act needs a case in
-            // NativeClient+ExportWorkshopInbox.resolveInboxPrimaryAction.)
+            // InboxCardActions.resolvePrimaryAction.)
             "actions": .array([
                 .object(["id": .string("view"), "label": .string("View"),
                          "description": .string("See how to grant Speech Recognition")]),

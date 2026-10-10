@@ -45,7 +45,7 @@ enum NativeAgentTheme {
     static func statusColor(_ status: String?) -> Color {
         switch status?.lowercased() {
         case "ok", "done", "passed", "succeeded", "active", "valid", "ready", "scheduled": ok
-        case "running", "info": info
+        case "running", "info", "unmeasured": info
         case "warn", "warning", "blocked", "needs_setup", "planned", "interrupted", "disabled": warn
         case "fail", "failed", "error", "timeout", "quarantined": fail
         default: .secondary

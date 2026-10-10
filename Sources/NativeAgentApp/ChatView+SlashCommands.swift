@@ -5,6 +5,7 @@ import ChatOrchestration
 import PersistenceCore
 import Privacy
 import TurnTrace
+import Dispatcher
 
 extension ChatView {
     func send() {
@@ -442,13 +443,7 @@ extension ChatView {
         // Output preview (max 400 chars)
         var outputBlock = ""
         if result.ok, let out = result.output {
-            let json: String
-            if let value = try? JSONValue.parse(Data(out.rawString.utf8)),
-               let encoded = try? TurnTraceRedactor.redactValue(value).serialize(pretty: false) {
-                json = encoded
-            } else {
-                json = TurnTraceRedactor.redactText(out.rawString)
-            }
+            let json = (try? TurnTraceRedactor.redactValue(out.value).serialize(pretty: false)) ?? "{}"
             let safe = NativeAppSecretRedactor.redactText(
                 SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(
                     tool: tool, json: json))

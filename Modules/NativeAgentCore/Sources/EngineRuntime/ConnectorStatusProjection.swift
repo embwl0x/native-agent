@@ -8,9 +8,11 @@ import SlackBot
 import TelegramBot
 
 /// Platform permission evidence and the current display voice are supplied lazily.
-public protocol ConnectorStatusPlatform {
+public protocol ConnectorStatusPlatform: Sendable {
     func calendarEventKitReadState() -> String
     var agentSubject: String { get }
+    /// A distributed public build seeds no self-hosted connectors.
+    var isPublicReleaseBundle: Bool { get }
 }
 
 public enum ConnectorStatusProjection {
@@ -175,6 +177,9 @@ public enum ConnectorStatusProjection {
             let existingAuth = connectorString(out["authState"])?.lowercased()
             let existingHealth = connectorString(out["healthStatus"])?.lowercased()
             if existingAuth == "connected_unverified" || existingHealth == "needs_probe" {
+                // No usable token behind the claim: the owner has to sign in, not "check".
+                out["enabled"] = .bool(false)
+                out["healthStatus"] = .string("needs_auth")
                 return out
             }
             if !Self.oauthConnectorAppExists(
@@ -204,6 +209,7 @@ public enum ConnectorStatusProjection {
                 out["healthStatus"] = .string("ok")
                 markCredentialProof(&out)
             } else {
+                out["enabled"] = .bool(false)
                 // No token: honor the honest-disconnected freeze if set.
                 if existingAuth == "connected_unverified" || existingHealth == "needs_probe" {
                     // Slack's credential state remains frozen, but its
@@ -300,6 +306,16 @@ public enum ConnectorStatusProjection {
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return false
             }
+            // A token past its `expires_at` is not a credential (10-10: X read
+            // "on" for 16 days on an expired token while Doctor said the owner
+            // must sign in). Epoch seconds or an ISO stamp; no stamp means no expiry.
+            if let stamp = object["expires_at"] {
+                // The token writer stores the epoch as a string ("1790287928.98"); ISO is tolerated too.
+                let expires: Date? = (stamp as? Double).map(Date.init(timeIntervalSince1970:))
+                    ?? (stamp as? String).flatMap { Double($0) }.map(Date.init(timeIntervalSince1970:))
+                    ?? (stamp as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+                if let expires, expires <= Date() { return false }
+            }
             return ["access_token", "oauth_token", "token"].contains { key in
                 guard let value = object[key] as? String else { return false }
                 return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -389,9 +405,9 @@ public enum ConnectorStatusProjection {
               "Use the X tools through an operator-configured X OAuth app."),
     ]
 
-    public static func readConnectorRecords(root: URL, platform: any ConnectorStatusPlatform, seedDefaults: () async -> Void) async throws -> [ConnectorRecord] {
+    public static func readConnectorRecords(root: URL, platform: any ConnectorStatusPlatform) async throws -> [ConnectorRecord] {
         // Fresh install shows the blank-slate catalog instead of "0 connectors".
-        await seedDefaults()
+        await seedDefaultConnectorsIfEmpty(root: root, platform: platform)
         let path = connectorRegistryPath(root: root)
         let persistence = SwiftNativePersistenceCore()
         let current = try await persistence.withFileLock(path) {
@@ -409,7 +425,7 @@ public enum ConnectorStatusProjection {
         // would swap one lie for another. It is applied HERE,
         // on the list read that feeds both the Connectors view and the phone
         // projection, and deliberately NOT on the mutation path's readiness
-        // gate (NativeClient+RegistryMutations), which asks a different
+        // gate (`updateConnector`), which asks a different
         // question: may this connector be enabled at all.
         let proof = ConnectorProofLedger.lastSuccessByConnector(root: root)
         let decayNow = Date()
@@ -451,5 +467,104 @@ public enum ConnectorStatusProjection {
             }
         let data = try JSONValue.array(rows.map { .object($0) }).serializedData(pretty: false)
         return try JSONDecoder().decode([ConnectorRecord].self, from: data)
+    }
+
+    public static func updateConnector(
+        id: String, enabled: Bool, root: URL, platform: any ConnectorStatusPlatform
+    ) async throws -> ConnectorRecord {
+        let row = try await ConnectorRegistryActions.updateConnector(
+            id: id, enabled: enabled, root: root,
+            projection: ConnectorRegistryProjectionPort(
+                defaultName: defaultConnectorName,
+                overlay: { connectorRowWithRuntimeOverlay($0, root: $1, platform: platform) }
+            )
+        )
+        return try JSONDecoder().decode(ConnectorRecord.self, from: row.serializedData(pretty: false))
+    }
+
+    /// Blank-slate connector catalog seeded into an EMPTY registry so a fresh
+    /// install shows connectable integrations (present-but-unconnected, clickable
+    /// to connect) and the agent can see what it could connect to — instead of
+    /// "0 connectors". Auth-required services land as `needs_auth` (→ a "Connect"
+    /// button); local/no-auth ones as `ready`. All `enabled=false`.
+    private static func defaultConnectorCatalog(isPublicReleaseBundle: Bool) -> [[String: JSONValue]] {
+        func rec(_ id: String, _ name: String, _ kind: String,
+                 _ auth: String, _ health: String, _ risk: String,
+                 _ perms: [String], _ actions: [String], _ desc: String) -> [String: JSONValue] {
+            [
+                "id": .string(id), "name": .string(name), "kind": .string(kind),
+                "authState": .string(auth), "healthStatus": .string(health),
+                "riskClass": .string(risk), "enabled": .bool(false),
+                "permissions": .array(perms.map { .string($0) }),
+                "actions": .array(actions.map { .string($0) }),
+                "description": .string(desc),
+            ]
+        }
+        var catalog: [[String: JSONValue]] = [
+            rec("browser", "Visible Browser", "browser", "not_required", "ready", "network_read",
+                ["browse", "screenshot"], ["open", "inspect", "capture"],
+                "Visible browser research and inspection with receipts."),
+            rec("local_files", "Local File Workspaces", "files", "not_required", "ready", "file_access",
+                ["workspace_read", "workspace_write"], ["search", "list", "read"],
+                "Scoped folder access for user-approved workspaces."),
+        ]
+        // A2.5 (W1#10): SearXNG needs a self-hosted base URL, so on a fresh
+        // public install it seeds as a `needs_config` dead end. Drop it from the
+        // PUBLIC blank-slate seed (not a feature removal — the connector code,
+        // overlay, and wizard all still handle it, and an existing registry that
+        // already lists it is untouched since seeding only runs when empty).
+        // Dev/personal builds keep the convenience seed.
+        if !isPublicReleaseBundle {
+            catalog.append(
+                rec("searxng", "SearXNG", "research", "not_required", "ready", "network_read",
+                    ["search_web", "fetch_url"], ["search", "fetch"],
+                    "Private metasearch connector for research."))
+        }
+        catalog.append(contentsOf: [
+            rec("shortcuts", "Apple Shortcuts", "macos", "not_required", "ready", "system_surface",
+                ["run_intent"], ["run"],
+                "Run Shortcuts for Desk tasks, health checks, status, and chat."),
+            rec("telegram", "Telegram", "messaging", "needs_auth", "needs_auth", "external_send",
+                ["send_message", "receive_message"], ["reply"],
+                "Remote chat bridge through an allowlisted bot. Add a bot token in Telegram settings to connect."),
+            rec("github", "GitHub", "dev", "needs_auth", "needs_auth", "network_write",
+                ["repo_read", "repo_write"], ["search", "read", "write"],
+                "Read and write issues, PRs, and files across your repositories."),
+            rec("slack", "Slack", "messaging", "needs_auth", "needs_auth", "external_send",
+                ["read_messages", "send_message"], ["read", "send"],
+                "Read and post messages in your Slack workspaces."),
+            rec("notion", "Notion", "docs", "needs_auth", "needs_auth", "network_read",
+                ["read"], ["search", "read"],
+                "Search and read pages shared with a validated Notion integration."),
+            rec("gmail", "Gmail", "email", "needs_auth", "needs_auth", "network_read",
+                ["read_email"], ["search", "read"],
+                "Search and read email through your connected Google account."),
+            rec("gcal", "Google Calendar", "calendar", "needs_auth", "needs_auth", "network_read",
+                ["read_events"], ["read"],
+                "Read events from your connected primary Google Calendar."),
+            rec("x", "X (Twitter)", "social", "needs_auth", "needs_auth", "external_send",
+                ["read", "post"], ["search", "post"],
+                "Read your timeline and post with approval via OAuth."),
+        ])
+        return catalog
+    }
+
+    /// Only an absent registry bootstraps. Even an empty saved catalog belongs
+    /// to the operator; damaged content is reported by the checked reader.
+    private static func seedDefaultConnectorsIfEmpty(root: URL, platform: any ConnectorStatusPlatform) async {
+        let path = connectorRegistryPath(root: root)
+        let persistence = SwiftNativePersistenceCore()
+        _ = try? await persistence.withFileLock(path) {
+            do {
+                _ = try FileManager.default.attributesOfItem(atPath: path.path)
+                return
+            } catch CocoaError.fileReadNoSuchFile {
+                // Missing is the sole bootstrap case.
+            }
+            let catalog = JSONValue.array(
+                defaultConnectorCatalog(isPublicReleaseBundle: platform.isPublicReleaseBundle).map { .object($0) }
+            )
+            try await persistence.writeJSON(catalog, to: path)
+        }
     }
 }

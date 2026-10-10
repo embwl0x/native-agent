@@ -42,6 +42,7 @@ import AppToolRuntime
 import SwiftUI
 import NotificationInbox
 import NativeAgentShared
+import ChatOrchestration
 import NativeAgentCore
 import CognitiveSubstrate
 import PersistenceCore
@@ -154,6 +155,9 @@ struct TodayRow: Identifiable, Equatable, Sendable {
     let gutter: String?
     /// Only the diary key travels with the summary; the reader owns the body.
     let dreamDate: String?
+
+    /// The gutter as the page shows it: the span, a weekday or a clock.
+    var time: String { gutter ?? (isHorizon ? TodayWords.weekday(at) : TodayWords.clock(at)) }
 
     init(
         id: String,
@@ -726,64 +730,65 @@ struct TodayView: View {
                     text: isReading ? (snapshot.loaded ? "Refreshing today…" : "Reading today…") : nil
                 )
 
-                if hasWaiting {
-                    TodayWaitingCard(
-                        approvals: WaitingOnYou.approvals(appModel),
-                        deskCount: WaitingOnYou.onDesk(appModel),
-                        split: WaitingOnYou.split(appModel),
-                        onOpenApprovals: { sheet = .approvals }
-                    )
-                }
-
-                // Failures and notices from earlier days are not waiting. One
-                // folded quiet line; it opens the grouped list in place.
-                if let earlierNotesLine {
-                    VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-                        Button(earlierNotesLine + (earlierOpen ? " · Hide" : " · Show")) {
-                            withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)) {
-                                earlierOpen.toggle()
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .accessibilityIdentifier("today.earlier-notes")
-                        if earlierOpen {
-                            AliveGroupCard {
-                                ForEach(earlierNotes) { note in
-                                    TodayEarlierNoteRow(note: note) { openedNote = note.newest }
+                // The page's blocks in the layout's order (ui/layout.json, today).
+                let blocks = SurfaceLayoutLive.shared.layout.shown("today", profile: SimpleViewMode.advanced).map(\.name)
+                let waiting = blocks.contains("waiting") && hasWaiting
+                let earlier = blocks.contains("earlier") ? Self.earlierNotesLine(Self.earlierNotes(appModel)) : nil
+                let did = blocks.contains("did") ? Self.didTodayRows(appModel, snapshot, collaborationMessages) : []
+                let ahead = blocks.contains("ahead") ? Self.aheadRows(snapshot) : []
+                let empty = !waiting && did.isEmpty && ahead.isEmpty && earlier == nil
+                    && snapshot.loaded && !snapshot.memoryUnreadable && !dreamUnavailable
+                ForEach(blocks, id: \.self) { block in
+                    switch block {
+                    case "waiting" where waiting:
+                        TodayWaitingCard(
+                            approvals: WaitingOnYou.approvals(appModel),
+                            deskCount: WaitingOnYou.onDesk(appModel),
+                            split: WaitingOnYou.split(appModel),
+                            onOpenApprovals: { sheet = .approvals }
+                        )
+                    // Failures and notices from earlier days are not waiting. One
+                    // folded quiet line; it opens the grouped list in place.
+                    case "earlier":
+                        if let earlier {
+                            VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                                Button(earlier + (earlierOpen ? " · Hide" : " · Show")) {
+                                    withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)) {
+                                        earlierOpen.toggle()
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .font(ShellType.labelMedium)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .accessibilityIdentifier("today.earlier-notes")
+                                if earlierOpen {
+                                    AliveGroupCard {
+                                        ForEach(Self.earlierNotes(appModel)) { note in
+                                            TodayEarlierNoteRow(note: note) { openedNote = note.newest }
+                                        }
+                                    }
+                                    .transition(NativeAgentMotion.arrivalFade)
                                 }
                             }
-                            .transition(NativeAgentMotion.arrivalFade)
                         }
+                    case "did" where !did.isEmpty:
+                        TodaySection(
+                            title: "What I did today",
+                            rows: did,
+                            onReadDream: readDream,
+                            notes: noteItems,
+                            onOpenNote: { openedNote = $0 }
+                        )
+                    case "ahead" where !ahead.isEmpty:
+                        TodayAhead(rows: ahead)
+                    case "queues":
+                        if empty { emptyLine }
+                        queuesLine
+                    default:
+                        EmptyView()
                     }
                 }
-
-                let did = didTodayRows
-                if !did.isEmpty {
-                    TodaySection(
-                        title: "What I did today",
-                        rows: did,
-                        onReadDream: readDream,
-                        notes: noteItems,
-                        onOpenNote: { openedNote = $0 }
-                    )
-                }
-
-                let ahead = aheadRows
-                if !ahead.isEmpty {
-                    TodayAhead(rows: ahead)
-                }
-
-                if !hasWaiting, did.isEmpty, ahead.isEmpty, earlierNotesLine == nil,
-                   snapshot.loaded, !snapshot.memoryUnreadable, !dreamUnavailable {
-                    Text("Nothing yet today. I'm around.")
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .padding(.top, 8)
-                }
-
-                queuesLine
+                if empty, !blocks.contains("queues") { emptyLine }
 
                 // A store that would not open is the one thing a quiet page
                 // must still say out loud. One line, grey, no error text.
@@ -819,7 +824,7 @@ struct TodayView: View {
                 allItems: appModel.engine.inbox.items,
                 onAction: { actionID in
                     let outcome = await noteFlight.perform {
-                        try await appModel.client.inboxAction(item.id, action: actionID)
+                        try await InboxCardActions.perform(item.id, action: actionID, dataRootOverride: appModel.dataRootOverride)
                     }
                     if case .succeeded = outcome {
                         _ = await appModel.refreshForSidebarItem(.activity)
@@ -904,6 +909,13 @@ struct TodayView: View {
     /// with the decisions already made, every note, the self-improvement
     /// pass, and the standing views waiting for a call. A count rides a word
     /// only when something in it is waiting.
+    private var emptyLine: some View {
+        Text("Nothing yet today. I'm around.")
+            .font(ShellType.labelMedium)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .padding(.top, 8)
+    }
+
     private var queuesLine: some View {
         let standing = cognitionSubscription.pending.count
         // An unreadable queue says so; it never passes for an empty one.
@@ -915,8 +927,7 @@ struct TodayView: View {
             (.approvals, ActivitySection.approvals.sheetTitle),
             (.inbox, ActivitySection.inbox.sheetTitle
                 + (appModel.pendingInboxCount > 0 ? " (\(appModel.pendingInboxCount))" : "")),
-            (.selfImprovement, ActivitySection.selfImprovement.sheetTitle
-                + (appModel.pendingSelfImprovementCount > 0 ? " (\(appModel.pendingSelfImprovementCount))" : "")),
+            (.selfImprovement, ActivitySection.selfImprovement.sheetTitle),
             (.cognitionProposals, ActivitySection.cognitionProposals.sheetTitle
                 + (standingUnavailable != nil ? " (couldn't check)" : standing > 0 ? " (\(standing))" : "")),
         ]
@@ -942,7 +953,7 @@ struct TodayView: View {
         guard snapshot.loaded else { return nil }
         let hour = Calendar.current.component(.hour, from: Date())
         let part = hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening"
-        let did = didTodayRows.count
+        let did = Self.didTodayRows(appModel, snapshot, collaborationMessages).count
         let day: String
         switch did {
         case 0: day = "A quiet \(part) so far."
@@ -964,7 +975,7 @@ struct TodayView: View {
     /// told him. Not waiting: today's own notes are in the timeline, and a
     /// morning brief from yesterday is just a note. Grouped so the same agent
     /// failing the same way twice is one row, "×2"; newest group first.
-    private var earlierNotes: [TodayEarlierNote] {
+    static func earlierNotes(_ appModel: AppModel) -> [TodayEarlierNote] {
         let now = Date()
         var groups: [String: TodayEarlierNote] = [:]
         for item in appModel.engine.inbox.items where item.isActivityPending && item.isForYouLane {
@@ -991,8 +1002,7 @@ struct TodayView: View {
     }
 
     /// "3 failures and 1 note since Monday".
-    private var earlierNotesLine: String? {
-        let notes = earlierNotes
+    static func earlierNotesLine(_ notes: [TodayEarlierNote]) -> String? {
         guard let oldest = notes.map(\.oldest).min() else { return nil }
         let failures = notes.filter(\.isFailure).reduce(0) { $0 + $1.count }
         let others = notes.reduce(0) { $0 + $1.count } - failures
@@ -1014,7 +1024,7 @@ struct TodayView: View {
     /// voice. Provider health and the other system-lane machinery is NOT here
     /// — `isForYouLane` is the app's existing split and it already names them.
     /// The horizon read and the diary can both name tonight's dream; one card.
-    private var aheadRows: [TodayRow] {
+    static func aheadRows(_ snapshot: TodaySnapshot) -> [TodayRow] {
         // One dream chip: the horizon's own due time when it names the dream.
         let dreamFacing = snapshot.facing?.id == "facingDream"
         return [snapshot.facing, dreamFacing ? nil : snapshot.nextDream]
@@ -1022,8 +1032,8 @@ struct TodayView: View {
             .sorted { $0.at < $1.at }
     }
 
-    private var didTodayRows: [TodayRow] {
-        (snapshot.didToday + noteRows + conversationRows).sorted { lhs, rhs in
+    static func didTodayRows(_ appModel: AppModel, _ snapshot: TodaySnapshot, _ collaborationMessages: [String: [ChatMessage]]) -> [TodayRow] {
+        (snapshot.didToday + noteRows(appModel, snapshot) + conversationRows(appModel, collaborationMessages)).sorted { lhs, rhs in
             if lhs.at != rhs.at { return lhs.at < rhs.at }
             return lhs.id < rhs.id
         }
@@ -1032,7 +1042,7 @@ struct TodayView: View {
     /// Agent, 2026-09-02: "a Today page that ends before lunch is wrong about
     /// my day." Conversations are things I did: one row for the people, one
     /// for the agents I worked with, each stamped with the latest turn.
-    private var conversationRows: [TodayRow] {
+    private static func conversationRows(_ appModel: AppModel, _ collaborationMessages: [String: [ChatMessage]]) -> [TodayRow] {
         let now = Date()
         let calendar = Calendar.current
         struct Span { var count = 0; var start = Date.distantFuture; var end = Date.distantPast; var surfaces = Set<String>() }
@@ -1104,18 +1114,18 @@ struct TodayView: View {
         return rows
     }
 
-    private var noteRows: [TodayRow] {
-        foldClaudeRows(todayNotes.map(\.row))
+    private static func noteRows(_ appModel: AppModel, _ snapshot: TodaySnapshot) -> [TodayRow] {
+        foldClaudeRows(todayNotes(appModel, snapshot).map(\.row))
     }
 
     /// Today's notes by row, so a row opens the note it came from — the same
     /// detail sheet, with the same actions, an earlier note opens in. A row
     /// that folds several notes opens none.
     private var noteItems: [String: InboxItemRecord] {
-        Dictionary(todayNotes.map { ($0.row.id, $0.item) }, uniquingKeysWith: { first, _ in first })
+        Dictionary(Self.todayNotes(appModel, snapshot).map { ($0.row.id, $0.item) }, uniquingKeysWith: { first, _ in first })
     }
 
-    private var todayNotes: [(row: TodayRow, item: InboxItemRecord)] {
+    private static func todayNotes(_ appModel: AppModel, _ snapshot: TodaySnapshot) -> [(row: TodayRow, item: InboxItemRecord)] {
         let now = Date()
         let calendar = Calendar.current
         let haveDreamRow = snapshot.dream != nil
@@ -1185,7 +1195,7 @@ struct TodayView: View {
     /// delegation reported and when the note was written; they are not a job
     /// record, so this says nothing in the present tense — no "still out",
     /// no "back by". Whether anyone is working right now is not in this data.
-    private func foldClaudeRows(_ rows: [TodayRow]) -> [TodayRow] {
+    private static func foldClaudeRows(_ rows: [TodayRow]) -> [TodayRow] {
         let claude = rows.filter { $0.id.hasPrefix(Self.claudeJobRowPrefix) }
         guard !claude.isEmpty else { return rows }
         var order: [String] = []
@@ -1233,6 +1243,13 @@ struct TodayView: View {
     private func loadHerLanes() async {
         laneReadCount += 1
         defer { laneReadCount -= 1 }
+        (snapshot, collaborationMessages, dreamUnavailable) = await Self.readLanes(appModel)
+    }
+
+    /// Her own lanes, as the page reads them: the snapshot, the threads she
+    /// worked in with other agents, and whether the dream source read. The
+    /// door's Today read takes the same (`QuietSelfAdminRender`).
+    static func readLanes(_ appModel: AppModel) async -> (TodaySnapshot, [String: [ChatMessage]], Bool) {
         let sessionIDs = appModel.engine.transcripts.sessions
             .filter { $0.archived != true }
             .sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
@@ -1252,7 +1269,7 @@ struct TodayView: View {
             case .sourceAbsent, .unavailable: break
             }
         }
-        dreamUnavailable = diary == nil || (diary?.unreadableEntries ?? 0) > 0
+        let dreamUnavailable = diary == nil || (diary?.unreadableEntries ?? 0) > 0
             || (entry != nil && (markdown?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true))
         var loaded: [String: [ChatMessage]] = [:]
         // One read per transcript. The recollections the snapshot needs come
@@ -1265,10 +1282,9 @@ struct TodayView: View {
                 recollections += transcript.recollections
             }
         }
-        collaborationMessages = loaded
         // The Desk's own overview, for the shared count.
         await appModel.publishWorkStatus()
-        snapshot = await TodaySnapshot.load(
+        let snapshot = await TodaySnapshot.load(
             sessionIDs: Array(sessionIDs),
             recollections: recollections,
             dreamMarkdown: markdown,
@@ -1278,6 +1294,7 @@ struct TodayView: View {
             nextDreamAt: nextDreamAt,
             now: Date()
         )
+        return (snapshot, loaded, dreamUnavailable)
     }
 
     private func readDream(_ date: String) async -> Bool {
@@ -1597,9 +1614,7 @@ struct TodayTimelineRow: View {
     @State private var dreamMissing = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var gutter: String {
-        row.gutter ?? (row.isHorizon ? TodayWords.weekday(row.at) : TodayWords.clock(row.at))
-    }
+    private var gutter: String { row.time }
 
     private var foldable: Bool { !row.details.isEmpty }
 

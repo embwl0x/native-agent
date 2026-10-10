@@ -62,6 +62,56 @@ public struct ProductionExportReceipt: Sendable, Equatable {
     public func toJSON() -> JSONValue { raw }
 }
 
+/// One production export as the Capabilities page shows it: the typed
+/// projection of a registry row, and the row an export appends.
+public struct ProductionExport: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var kind: String?
+    public var path: String
+    public var scope: [String]
+    public var checksum: String?
+    public var sizeBytes: Int?
+    public var createdAt: String?
+
+    public init(id: String, kind: String?, path: String, scope: [String], checksum: String?,
+                sizeBytes: Int?, createdAt: String?) {
+        self.id = id; self.kind = kind; self.path = path; self.scope = scope
+        self.checksum = checksum; self.sizeBytes = sizeBytes; self.createdAt = createdAt
+    }
+
+    /// A present field of the wrong type makes the row malformed.
+    public init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            id: try row.string("id"), kind: try row.optionalString("kind"), path: try row.string("path"),
+            scope: try row.strings("scope"), checksum: try row.optionalString("checksum"),
+            sizeBytes: try row.optionalInt("sizeBytes"), createdAt: try row.optionalString("createdAt"))
+    }
+
+    public var row: JSONValue {
+        var obj: [String: JSONValue] = [
+            "id": .string(id),
+            "path": .string(path),
+            "scope": .array(scope.map { .string($0) }),
+        ]
+        if let kind { obj["kind"] = .string(kind) }
+        if let checksum { obj["checksum"] = .string(checksum) }
+        if let sizeBytes { obj["sizeBytes"] = .int(Int64(sizeBytes)) }
+        if let createdAt { obj["createdAt"] = .string(createdAt) }
+        return .object(obj)
+    }
+
+    /// `production/exports/registry.json`, newest first; a malformed row fails the read.
+    public static func list(dataRoot: URL) async throws -> [ProductionExport] {
+        let registryPath = dataRoot
+            .appendingPathComponent("production", isDirectory: true)
+            .appendingPathComponent("exports", isDirectory: true)
+            .appendingPathComponent("registry.json")
+        return try await SwiftNativeProductionExportsClient(registryPath: registryPath).listExports()
+            .map { try ProductionExport(row: $0.raw) }
+    }
+}
+
 public protocol ProductionExportsClient: Sendable {
     func listExports() async throws -> [ProductionExportReceipt]
 }

@@ -32,23 +32,6 @@ extension SchedulerDueJobRunner {
             return try await executeDream(job: job)
         case .rem:
             return try await executeREM(job: job)
-        case .improve:
-            let objective = string(job.payload["objective"]) ?? "Make NativeAgent meaningfully better."
-            let run = try await platform.startImprovement(objective: objective)
-            let runStatus = (run.status ?? "pending").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let status = runStatus == "disabled" ? "skipped" : "warn"
-            let detail = runStatus == "disabled"
-                ? "self-improvement disabled"
-                : "improvement run \(run.id) \(runStatus); no execution occurred"
-            return JobResult(
-                status: status,
-                detail: detail,
-                output: .object([
-                    "runId": .string(run.id),
-                    "phase": .string(run.phase ?? "pending"),
-                    "status": .string(run.status ?? "pending"),
-                ])
-            )
         case .harnessBenchmark:
             let run = try await platform.runHarnessBenchmark()
             let runStatus = run.status ?? "unknown"

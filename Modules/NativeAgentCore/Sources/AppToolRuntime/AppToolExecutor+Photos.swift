@@ -36,7 +36,7 @@ extension AppToolExecutor {
             authorization = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         }
         guard authorization == .authorized || authorization == .limited else {
-            return Self.failure("photos_access_off", "Photos access is off. User can enable NativeAgent in System Settings › Privacy & Security › Photos. If access is restricted by device management, the administrator must allow it.")
+            return Self.failure("photos_access_off", "Photos access is off. The owner can enable NativeAgent in System Settings › Privacy & Security › Photos. If access is restricted by device management, the administrator must allow it.")
         }
         let limited = authorization == .limited
         let dates = bounds

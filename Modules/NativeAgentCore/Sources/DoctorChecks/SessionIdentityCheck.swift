@@ -67,7 +67,8 @@ public struct SessionIdentityCheck: DoctorCheck {
             return CheckResult(
                 id: id, title: title, status: "fail",
                 detail: "chat/sessions.json is unreadable or malformed."
-                    + " Session identity cannot be measured."
+                    + " Session identity cannot be measured.",
+                harm: "Saved conversations cannot be reliably identified or reopened."
             )
         }
 
@@ -141,9 +142,14 @@ public struct SessionIdentityCheck: DoctorCheck {
             if status == "ok" { status = "warn" }
         }
 
+        // Both warnings are build findings — a mint site stamping the wrong
+        // source, or a transcript with content that cannot be scanned — so
+        // they go to the harness queue, never to her as a triage.
         return CheckResult(
             id: id, title: title, status: status,
-            detail: parts.joined(separator: "; ") + "."
+            detail: parts.joined(separator: "; ") + ".",
+            harm: status == "warn" ? "Conversation messages cannot be reliably matched to their saved session and surface." : nil,
+            owner: status == "warn" ? .builder : nil
         )
     }
 }

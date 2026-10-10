@@ -89,6 +89,31 @@ extension MCPUIActions {
         )
     }
 
+    /// Live tool list for a server (the shared stdio pool on demand, cached
+    /// 60 s). The input schema rides through so the Hub can build its form.
+    public static func listTools(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> [MCPTool] {
+        try await dispatcher.listToolsLive(forServer: serverId).compactMap { entry in
+            guard case .object(let obj) = entry, case .string(let name) = obj["name"] ?? .null else { return nil }
+            var desc: String? = nil
+            if case .string(let s) = obj["description"] ?? .null { desc = s }
+            var schema: JSONValue? = nil
+            if let s = obj["inputSchema"], case .object = s { schema = s }
+            return MCPTool(serverId: serverId, name: name, description: desc, inputSchema: schema)
+        }
+    }
+
+    /// Live resource list for a server — the same caching contract as `listTools`.
+    public static func listResources(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> [MCPResource] {
+        try await dispatcher.listResourcesLive(forServer: serverId).compactMap { entry in
+            guard case .object(let obj) = entry, case .string(let uri) = obj["uri"] ?? .null else { return nil }
+            var name: String? = nil
+            if case .string(let s) = obj["name"] ?? .null { name = s }
+            var mime: String? = nil
+            if case .string(let s) = obj["mimeType"] ?? .null { mime = s }
+            return MCPResource(uri: uri, name: name, mimeType: mime)
+        }
+    }
+
     public static func warmMCPServer(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> MCPSessionStatus {
         _ = try await dispatcher.listToolsLive(forServer: serverId, cached: false)
         return try await sessionStatus(serverId: serverId, dispatcher: dispatcher)

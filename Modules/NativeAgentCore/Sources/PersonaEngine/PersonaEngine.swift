@@ -151,9 +151,11 @@ public protocol PersonaEngineWriting: Sendable {
     /// held under a cross-process flock on the target. `kind` is canonicalized
     /// NFKC+strip+lower and must be in {soul,skill,voice,growth,agents};
     /// USER.md is rejected because MemoryV2 owns that projection;
-    /// `skillName` is required + validated when kind=skill.
+    /// `skillName` is required + validated when kind=skill; `keeping` may
+    /// refuse the replacement after seeing the current document under the lock.
     @discardableResult
-    func personaWrite(kind: String, content: String, skillName: String?) async throws -> PersonaToolWriteResult
+    func personaWrite(kind: String, content: String, skillName: String?,
+                      keeping: (@Sendable (_ current: String) throws -> Void)?) async throws -> PersonaToolWriteResult
 
     /// Mirror of the agent tool `_exec_persona_append_section` (builtin_tools.py
     /// L3948-4038): append `\n\n## <title>\n<content>` to a persona file
@@ -325,6 +327,9 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
     // three diverged from the daemon contract; the daemon's contract is
     // the source of truth across surfaces.
     public func listPersonaDocSpecs() async throws -> PersonaDocListing {
+        // Scaffold first so content and updatedAt describe persisted defaults
+        // (SOUL.md gates, USER.md skipped, each write locked; failures propagate).
+        _ = try await scaffoldMissingDocs()
         // Local helper avoids capturing a non-Sendable ISO8601DateFormatter
         // in the loop body (Swift 6 strict-concurrency would flag sending
         // a class instance into an actor-isolated closure body).
@@ -544,11 +549,7 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
 
 // MARK: - PersonaDocSpec / PersonaDocListing
 
-/// Wire-shape DTO mirroring the daemon's `/v1/personality/docs` entry
-/// shape. Kept in Core (not NativeAgentShared) so PersonaEngineTests can
-/// verify the adapter end-to-end without crossing module boundaries; the
-/// app-side `NativeAgentShared.PersonalityDoc` is a field-for-field copy
-/// that NativeClient maps to.
+/// One persona document as the Personality tab reads and saves it.
 public struct PersonaDocSpec: Sendable, Equatable, Codable {
     public let id: String
     public let title: String

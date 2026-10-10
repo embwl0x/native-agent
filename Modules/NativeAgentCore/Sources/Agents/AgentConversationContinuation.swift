@@ -59,6 +59,8 @@ public struct AgentConversationContinuation: Sendable {
     /// refused and the message is held with the reason.
     private func resumeQueues() {
         guard queuesResumed.set() else { return }
+        // Every agent row below reads its recipe: seeded and loaded first.
+        AgentRecipeStore.load(dataRoot: dataRoot)
         grok.resumeHandOvers(dataRoot: dataRoot)
         // Dot's room is pushed to her from here on; nothing pulls it.
         ChatGPTDotIPCTransport.listen(dataRoot: dataRoot)
@@ -156,6 +158,8 @@ public struct AgentConversationContinuation: Sendable {
     public func tick() async throws {
         resumeQueues()
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
+        // Discovery at launch and after an install: no scan unless one is due.
+        Task.detached(priority: .utility) { await AgentDiscoverySession.shared.refreshIfInstallsChanged(dataRoot: dataRoot) }
         // MY QUEUE steps whose condition is met become one arrival each, once
         // a day: her own turn works them (Agent, 10-02: "a queue I can't
         // reach is a list"). A step a peer steered carries that peer.

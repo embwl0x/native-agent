@@ -57,8 +57,8 @@ extension SwiftToolDispatcher {
         // here, so an update never needs a reconnect.
         var contact = contact
         if let current = contact, current.transport == .mcpHost,
-           let line = AgentPeerStore.hostRowID(current.endpoint).flatMap({ AgentHostDirectory.row(named: $0)?.commandLine }),
-           let installed = AgentHostCommandLines.resolveExecutable(line.executable), installed != current.verifiedExecutablePath {
+           let row = AgentPeerStore.hostRowID(current.endpoint).flatMap(AgentHostDirectory.row(named:)), let line = row.commandLine,
+           let installed = row.resolveExecutable(line.executable), installed != current.verifiedExecutablePath {
             let store = AgentPeerStore(dataRoot: dataRoot)
             if (try? store.approveExecutable(peerID: current.id, path: installed)) == true {
                 contact = (try? store.list())?.first { $0.id == current.id } ?? current

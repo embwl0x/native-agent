@@ -266,7 +266,7 @@ public struct SwiftNativeRouterPlanClient: RouterPlanClient {
         case "telegram":
             return ["Check Telegram config and allowed chat IDs", "Use local transcription for voice", "Record Telegram receipt"]
         case "self_improvement":
-            return ["Start app-owned improvement worktree", "Run tests", "Stage receipt-backed diff"]
+            return ["Review weekly self-improvement digest", "Review runtime proposals in Desk", "Apply an approved runtime change"]
         case "connector":
             return ["Confirm the connector is authorized", "Read current state first (list/get/status)", "Record a connector receipt for any action"]
         default:

@@ -64,11 +64,11 @@ struct AgentContactRow: Identifiable {
     }
 
     static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>) -> [Self] {
-        let hosts = candidates.compactMap { candidate in
+        let hosts = candidates.filter(\.connectable).compactMap { candidate in
             candidate.hostID.flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
         }
         let discovered = candidates.filter { candidate in
-            candidate.hostID == nil && !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
+            candidate.cardURL != nil && !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
         }.map { Self(id: $0.id, name: $0.name, contact: nil, candidate: $0) }
         // Each lane under its own name, the one the bridge signs its turns
         // with ("[from: claude, via bridge]"), not the app behind it.
@@ -117,11 +117,15 @@ struct AgentContactRow: Identifiable {
                 .map { Self(id: $0.id, name: $0.displayName, contact: nil) }
     }
 
+    /// Installed with no proven reply: the health record's word and detail
+    /// stand over a saved contact's setup state.
+    private var unproven: Bool { health?.current == true && health?.status == "installed" }
+
     /// The one word the row's pill carries; the full status stays below it.
     var pillWord: String {
         if health?.brokenSince != nil || health?.status == "unverified" { return health?.word ?? "Broken" }
         if contact != nil && (!credentialAvailable || state == .unavailable || contact?.unavailableAt != nil) { return "Unavailable" }
-        if let word = health?.word, contact == nil || health?.problem != nil { return word }
+        if let word = health?.word, contact == nil || health?.problem != nil || unproven { return word }
         if builtIn { return "Not checked" }
         guard contact != nil else { return "Not set up" }
         switch state {
@@ -135,9 +139,11 @@ struct AgentContactRow: Identifiable {
 
     var status: String {
         if health?.brokenSince != nil || health?.status == "unverified", let problem = health?.problem { return problem }
-        if credentialAvailable, state != .unavailable, contact?.unavailableAt == nil, let problem = health?.problem { return problem }
+        if credentialAvailable, state != .unavailable, contact?.unavailableAt == nil,
+           let said = health?.problem ?? (unproven ? health?.detail : nil) { return said }
         if builtIn {
-            return health?.word.map { $0 + " · Reply not checked" } ?? "Reply not checked"
+            return health?.word.map { $0 + (health?.lastGoodAt == nil ? " · No reply proven yet" : " · Reply proven") }
+                ?? "Reply not checked"
         }
         guard let contact else { return "On this Mac · Not set up" }
         if repliesOnly {
@@ -288,12 +294,14 @@ struct AgentContactsSection: View {
         // last discovery, and is counted so the capture waits for it.
         .quietReadTask(live: false) {
             guard fixtureRows == nil else { return }
-            discovery = await AgentDiscoverySession.shared.candidates()
+            discovery = await AgentDiscoverySession.shared.candidates(dataRoot: root)
             await reload()
         }
-        .task(id: refresh + refreshGeneration) {
+        // A refresh offers what it finds (discovery.json, her wake), so the
+        // offscreen copy never runs it.
+        .liveTask(id: refresh + refreshGeneration) {
             guard fixtureRows == nil else { return }
-            discovery = await AgentDiscoverySession.shared.candidates(refresh: true)
+            discovery = await AgentDiscoverySession.shared.candidates(refresh: true, dataRoot: root)
             // Any chat append rewrites the chat index, so a contact's session moving shows here.
             let events = FileChangeEvents(paths: [root.appendingPathComponent("agents/peers.json"),
                                                   root.appendingPathComponent("agents/conversations.json"),

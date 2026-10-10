@@ -30,6 +30,19 @@ public struct BrowserRun: Identifiable, Codable, Hashable {
     public func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
+extension BrowserRun {
+    /// The browser writer's run envelope, as the record the app renders.
+    init(row: JSONValue) throws {
+        let row = try JSONRow(row)
+        self.init(
+            id: try row.string("id"), url: try row.optionalString("url"), domain: try row.optionalString("domain"),
+            status: try row.string("status"), dryRun: try row.optionalBool("dryRun"),
+            visible: try row.optionalBool("visible"), opened: try row.optionalBool("opened"),
+            approvalId: try row.optionalString("approvalId"), createdAt: try row.optionalString("createdAt"),
+            sourceReceipt: row.optionalValue("sourceReceipt"), screenshotReceipt: row.optionalValue("screenshotReceipt"))
+    }
+}
+
 public struct NativeActionReceipt: Identifiable, Codable, Hashable {
     public var id: String
     public var actionId: String

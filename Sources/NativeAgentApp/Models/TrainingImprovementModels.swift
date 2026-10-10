@@ -4,6 +4,9 @@ import NativeAgentShared
 import PersistenceCore
 import TriggerScheduler
 import SelfImprovement
+import MCPDispatcher
+import MemoryV2
+import DoctorChecks
 
 struct TrainingArtifact: Identifiable, Codable, Hashable {
     var id: String
@@ -14,13 +17,6 @@ struct TrainingArtifact: Identifiable, Codable, Hashable {
     var status: String?
     var createdAt: String?
     var summary: String?
-}
-
-extension SelfImprovement.ImprovementSummary {
-    var trustEnabled: Bool? {
-        guard case .object(let row) = rawResponse, case .bool(let enabled)? = row["trustEnabled"] else { return nil }
-        return enabled
-    }
 }
 
 struct HarnessBenchmarkRun: Identifiable, Codable, Hashable {
@@ -42,80 +38,94 @@ struct HarnessBenchmarkCheck: Identifiable, Codable, Hashable {
     var detail: String?
 }
 
+extension HarnessBenchmarkRun {
+    /// Validates the local Swift surfaces — tool manifest, MCP registry,
+    /// embedding runtime, Doctor — with no model call, and appends the run to
+    /// `harness/benchmark/runs.jsonl`. A failed read is a failed check that
+    /// carries its actual error text.
+    static func run(dataRoot: URL) async -> HarnessBenchmarkRun {
+        let start = Date()
+        var checks: [HarnessBenchmarkCheck] = []
+
+        do {
+            let tools = try await ToolsFacade(dataRoot: dataRoot).listAuthored()
+            checks.append(HarnessBenchmarkCheck(
+                id: "tools_manifest",
+                title: "Tool manifest loads",
+                passed: true,
+                detail: "\(tools.count) tool row(s)"
+            ))
+        } catch {
+            checks.append(HarnessBenchmarkCheck(
+                id: "tools_manifest",
+                title: "Tool manifest loads",
+                passed: false,
+                detail: "tools read failed: \(error.localizedDescription)"
+            ))
+        }
+
+        do {
+            let mcpServers = try await makeMCPDispatcher().listServers()
+            checks.append(HarnessBenchmarkCheck(
+                id: "mcp_registry",
+                title: "MCP registry loads",
+                passed: true,
+                detail: "\(mcpServers.count) configured server(s)"
+            ))
+        } catch {
+            checks.append(HarnessBenchmarkCheck(
+                id: "mcp_registry",
+                title: "MCP registry loads",
+                passed: false,
+                detail: "MCP registry read failed: \(error.localizedDescription)"
+            ))
+        }
+
+        let memorySnapshot = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot()
+        checks.append(HarnessBenchmarkCheck(
+            id: "memory_runtime",
+            title: "Memory embedding runtime reports",
+            passed: memorySnapshot != nil,
+            detail: memorySnapshot == nil ? "no embedding runtime snapshot" : "embedding runtime snapshot available"
+        ))
+
+        let doctor = try? await makeDoctorChecks().runAll(repair: false)
+        let failedDoctor = doctor?.filter { $0.status == "fail" }.count ?? 0
+        checks.append(HarnessBenchmarkCheck(
+            id: "doctor_snapshot",
+            title: "Doctor checks run",
+            passed: doctor != nil && failedDoctor == 0,
+            detail: doctor == nil ? "doctor unavailable" : "\(doctor?.count ?? 0) check(s), \(failedDoctor) fail"
+        ))
+
+        let passed = checks.allSatisfy { $0.passed == true }
+        let run = HarnessBenchmarkRun(
+            id: "hb-\(UUID().uuidString.lowercased())",
+            name: "Swift Native Harness Benchmark",
+            status: passed ? "passed" : "warn",
+            checks: checks,
+            durationSeconds: Date().timeIntervalSince(start),
+            schedule: "manual",
+            manualRunnable: true,
+            chatPathImpact: "No model call; validates local Swift surfaces only.",
+            createdAt: ISO8601DateFormatter().string(from: Date())
+        )
+        if let row = try? JSONValue.parse(JSONEncoder().encode(run)) {
+            let path = dataRoot
+                .appendingPathComponent("harness", isDirectory: true)
+                .appendingPathComponent("benchmark", isDirectory: true)
+                .appendingPathComponent("runs.jsonl")
+            try? await appendPathOwnedJSONL(
+                row, to: path, using: SwiftNativePersistenceCore(), logLabel: "NativeClient.harnessBenchmark"
+            )
+        }
+        return run
+    }
+}
+
 // PATCH-2026-05-08: no-terminal-moments — rebuild result
 struct SystemRebuildResult: Codable, Hashable {
     var ok: Bool
     var message: String?
     var error: String?
-}
-
-extension SelfImprovement.ImprovementSummary {
-    /// The persisted UI summary is a flat record; the core summary keeps its
-    /// long-tail fields in rawResponse instead of duplicating them in app state.
-    init(persistedRow value: JSONValue) throws {
-        guard case .object(let row) = value,
-              let enabled = improvementBool(row["enabled"]),
-              let status = improvementString(row["status"]) else {
-            throw CocoaError(.coderReadCorrupt)
-        }
-        func count(_ key: String) throws -> Int {
-            guard case .int(let value)? = row[key], let result = Int(exactly: value) else {
-                throw CocoaError(.coderReadCorrupt)
-            }
-            return result
-        }
-        func run(_ key: String) throws -> SelfImprovement.ImprovementRun? {
-            guard let value = row[key], value != .null else { return nil }
-            return try SelfImprovement.ImprovementRun(persistedRow: value)
-        }
-        let staged: [SelfImprovement.ImprovementRun]?
-        if case .array(let values)? = row["stagedRuns"] {
-            staged = try values.map { try SelfImprovement.ImprovementRun(persistedRow: $0) }
-        } else {
-            staged = nil
-        }
-        self.init(
-            enabled: enabled, status: status,
-            disabledReason: improvementString(row["disabledReason"]),
-            runningCount: try count("runningCount"), succeededCount: try count("succeededCount"),
-            failedCount: try count("failedCount"), interruptedCount: try count("interruptedCount"),
-            stagedCount: try count("stagedCount"), totalCount: try count("totalCount"),
-            latestRun: try run("latestRun"), latestFailure: try run("latestFailure"),
-            stagedRuns: staged, rawResponse: value
-        )
-    }
-}
-
-private extension SelfImprovement.ImprovementRun {
-    init(persistedRow value: JSONValue) throws {
-        guard case .object(let row) = value,
-              let id = improvementString(row["id"]),
-              let status = improvementString(row["status"]),
-              let phase = improvementString(row["phase"]),
-              let createdAt = improvementString(row["createdAt"]),
-              let objective = improvementString(row["objective"]) else {
-            throw CocoaError(.coderReadCorrupt)
-        }
-        let known: Set<String> = ["id", "status", "phase", "createdAt", "completedAt", "objective", "summary", "model", "worktree", "exitReason", "promotedCommitSha", "revertCommitSha"]
-        let extras = row.filter { !known.contains($0.key) }
-        self.init(
-            id: id, status: status, phase: phase, createdAt: createdAt,
-            completedAt: improvementString(row["completedAt"]), objective: objective,
-            summary: improvementString(row["summary"]), model: improvementString(row["model"]),
-            worktree: improvementString(row["worktree"]), exitReason: improvementString(row["exitReason"]),
-            promotedCommitSha: improvementString(row["promotedCommitSha"]),
-            revertCommitSha: improvementString(row["revertCommitSha"]),
-            extras: extras.isEmpty ? nil : .object(extras)
-        )
-    }
-}
-
-private func improvementString(_ value: JSONValue?) -> String? {
-    guard case .string(let string)? = value else { return nil }
-    return string
-}
-
-private func improvementBool(_ value: JSONValue?) -> Bool? {
-    guard case .bool(let bool)? = value else { return nil }
-    return bool
 }

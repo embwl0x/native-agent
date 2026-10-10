@@ -116,11 +116,7 @@ extension AppToolExecutor {
         activeProviderID: String?,
         activeProviderReady: Bool?
     ) -> JSONValue {
-        let repairHandlers = Set(SwiftNativeDoctorChecks.defaultChecks.compactMap { check in
-            check is any RepairingDoctorCheck ? check.id : nil
-        })
-        let executableRepairs = Set(DoctorSafeRepairPolicy.checkIDs(for: report.checks))
-            .intersection(repairHandlers)
+        let executableRepairs = DoctorSafeRepairPolicy.executableCoreIDs(for: report.checks)
         let checks = report.checks.map { check in
             let repairAvailable = executableRepairs.contains(check.id)
                 || (check.id.hasPrefix("live.") && check.repair_available == true
@@ -132,6 +128,12 @@ extension AppToolExecutor {
                 "detail": .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(check.detail))),
                 "repair_available": .bool(repairAvailable),
             ]
+            if let harm = check.harm {
+                row["harm"] = .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(harm)))
+            }
+            if let owner = DoctorOwner.of(check, repairAvailable: repairAvailable) {
+                row["owner"] = .string(owner.rawValue)
+            }
             if let action = check.recoveryAction(repairAvailable: repairAvailable) {
                 row["human_action"] = .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(action)))
             }

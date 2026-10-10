@@ -108,7 +108,7 @@ extension SwiftNativeBrowserClient: BrowserWriter {
         // dry_run = bool(body.get("dryRun", body.get("dry_run", True)))
         let dryRun = Self.pyBool(b["dryRun"] ?? b["dry_run"], default: true)
         // EXECUTE path is app-target owned. Anything non-dry-run is declined
-        // before side effects so NativeClient can use the WKWebView executor.
+        // before side effects so the app can use the WKWebView executor.
         if !dryRun { return nil }
 
         let visible = Self.pyBool(b["visible"], default: true)

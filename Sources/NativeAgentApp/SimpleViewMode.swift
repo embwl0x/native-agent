@@ -74,14 +74,9 @@ extension View {
     }
 }
 
-/// Simple view reuses the Chat page whole, minus its conversation list.
-private struct ChatHidesConversationListKey: EnvironmentKey {
-    static let defaultValue = false
-}
-
 extension EnvironmentValues {
-    var chatHidesConversationList: Bool {
-        get { self[ChatHidesConversationListKey.self] }
-        set { self[ChatHidesConversationListKey.self] = newValue }
-    }
+    /// The layout profile (ui/layout.json) the surfaces under it draw with:
+    /// Simple's shell sets simple, so its chat shows no conversations column
+    /// (as seeded) and has no Work pane; every page elsewhere is Advanced's.
+    @Entry var layoutProfile = SimpleViewMode.advanced
 }

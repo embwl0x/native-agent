@@ -13,7 +13,7 @@ Sources/NativeAgentApp/ActivityWatchController.swift	Task.sleep(for: .seconds(Ac
 # script/chatgpt_dot_ipc.js: three JS setTimeout sites (11-second request acknowledgement, 8-second snapshot, and the listener's 8-second "Dot isn't open" report after following); timeout_retry_deadline, each cleared on settlement or a new selection. The listener itself is event-driven (ChatGPT pushes; no poll). The scanner below inventories Swift primitives only.
 # Extensions/NativeAgentChrome/src/page-agent.js controlMedia: one deadline per call on the first admitted player only — 1.5 seconds for a pause to hold, 5 seconds for play to advance or a seek to report seeked; event_deadline, settled by the player's own events, cleared on cancellation or tab takeover. No background poll.
 # 2026-10-07: Dot room reads are pushed by the long-lived listener (ChatGPTDotIPCTransport.listen); the continuation pull and the 2-second read/wait loops are gone. No sleep/timer primitive added.
-Sources/NativeAgentApp/NativeClient+SystemOpsActions.swift	Task.sleep(	3	timeout_retry_deadline	Doctor one-attempt live repair verification: local SearXNG answers within 30 seconds (2s polls), observe Telegram poll for at most 35 seconds and listener binding for at most 3 seconds; no workload retries
+Sources/NativeAgentApp/AppDoctorPort.swift	Task.sleep(	4	timeout_retry_deadline	Doctor one-attempt live repair verification: local SearXNG answers within 30 seconds (2s polls), observe Telegram poll for at most 35 seconds and listener binding for at most 3 seconds; no workload retries; Doctor transition repair: one deferred wake per 10-minute attempt window while an ok→adverse repair remains pending; fresh Doctor measurements settle healed rows or saved sign-in/permission asks; manager readiness also wakes retained work
 Modules/NativeAgentCore/Sources/DeviceSync/SwiftNativeAPNS.swift	Task.sleep(	1	timeout_retry_deadline	SwiftNativeAPNSSender five-second overall concurrent fan-out deadline; cancels outstanding URLSession sends before publishing bridge notification
 iOS/NativeAgentMobile/Sources/PhoneTurnActivity.swift	Task.sleep(	1	timeout_retry_deadline	PhoneTurnActivity cancellable staleDate expiry; renewed by signed progress, cancelled on finish, reconciled on resume
 iOS/NativeAgentMobile/Sources/PhoneTurnActivity+Work.swift	Task.sleep(	1	timeout_retry_deadline	PhoneTurnActivity canonical work stale expiry; cancelled on new evidence or opt-out
@@ -75,17 +75,13 @@ Modules/NativeAgentCore/Sources/ProviderRouting/LLMClient+CodexAdapter.swift	*	5
 Modules/NativeAgentCore/Sources/ProviderRouting/ProviderErrorBodyDrain.swift	try await Task.sleep(for: .seconds(timeout))	1	timeout_retry_deadline	ProviderErrorBodyDrainDeadline
 Modules/NativeAgentCore/Sources/ProviderRouting/ProviderStreamGuard.swift	*	1	timeout_retry_deadline	ProviderStreamGuard
 Modules/NativeAgentCore/Sources/Research/ResearchTransports.swift	*	3	timeout_retry_deadline	ResearchTransportBackoff; runResearchSubprocess reap thread (20ms poll under the caller deadline: docker 8s, Codex web search 60s; SIGTERM->SIGKILL, hang-proofing 2026-08-25); Doctor search repair waits at most 90s (3s polls) for a Docker Desktop daemon it opened
-Modules/NativeAgentCore/Sources/SelfImprovement/EvolutionSupport.swift	*	2	timeout_retry_deadline	EvolutionProcessOwner
-Modules/NativeAgentCore/Sources/SelfImprovement/SelfImprovement+Git.swift	*	1	timeout_retry_deadline	SelfImprovementGitProcess
-Modules/NativeAgentCore/Sources/SelfImprovement/SelfImprovementOrchestrator.swift	*	1	timeout_retry_deadline	SelfImprovementBuildProcess
 Modules/NativeAgentCore/Sources/SwarmRuns/SwarmExecutor.swift	*	1	timeout_retry_deadline	SwarmExecutorWait
-Modules/NativeAgentCore/Sources/SystemOps/SystemOps+Types.swift	*	1	timeout_retry_deadline	SystemOpsDeadline
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+ChatProgress.swift	*	2	external_protocol_poll	TelegramProgressTransport
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+Transport.swift	try await Task.sleep(nanoseconds: $0)	2	external_protocol_poll	TelegramFloodControlRetry (both defaults feed the same injected sleeper: the once-only 429 retry and the per-chat send lane cooldown wait, 2026-09-06)
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop.swift	*	1	external_protocol_poll	TelegramTurnProgressCardDriver.cadence
 # FFmpeg waits on exit/cancellation signals with a 30-second deadline and a 200ms TERM grace; no queued asyncAfter survives completion.
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramVoiceTranscription.swift	*	1	timeout_retry_deadline	TelegramTranscriptionProcess
-Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+Executor.swift	*	2	timeout_retry_deadline	WorkshopStepCancellationDeadline
+Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+Executor.swift	*	1	timeout_retry_deadline	WorkshopStepCancellationDeadline
 Modules/NativeAgentCore/Sources/Agents/AgentBridgeCompletionRouter.swift	*	1	timeout_retry_deadline	AgentBridgeCompletionRetry
 Sources/NativeAgentApp/AppDelegate+Launch.swift	*	2	timeout_retry_deadline	LaunchGraceDeadline; quit-time turn wait (200ms check of in-flight runs, bounded at 20s, only while a Quit is held)
 Modules/NativeAgentCore/Sources/ChatTurnRuntime/MacChatStreamAccumulator.swift	*	1	visible_ui	ChatStreamAccumulator frame ticker — publishes changed reply snapshots to MainActor; token intake and idle ticks stay on the actor
@@ -110,7 +106,7 @@ Sources/NativeAgentApp/MacControlBridge.swift	*	1	timeout_retry_deadline	MacCont
 Sources/NativeAgentApp/MacControlBridgeProcesses.swift	*	4	timeout_retry_deadline	MacControlBridgeProcesses (cancellation, emergency stop, process timeout, kill grace and bounded pipe-drain readiness waits)
 Sources/NativeAgentApp/MacIntegrationView.swift	*	1	visible_ui	MacIntegrationUI
 Sources/NativeAgentApp/MacPairingView.swift	*	2	visible_ui	MacPairingUI
-Modules/NativeAgentCore/Sources/DeviceSync/MacSyncEngine+Lifecycle.swift	Task.sleep(for: .seconds(15 * 60))	1	integrity_sweep	MacSyncSnapshotIntegrityFallback
+Modules/NativeAgentCore/Sources/DeviceSync/MacSyncEngine+Lifecycle.swift	Task.sleep(for: .seconds(Self.snapshotIntegrityCadence))	1	integrity_sweep	MacSyncSnapshotIntegrityFallback
 Modules/NativeAgentCore/Sources/DeviceSync/MacSyncEngine+Lifecycle.swift	Task.sleep(for: .seconds(delay))	1	external_protocol_poll	MacSyncPresenceBeat; healthy two-minute beat, failed delivery backs off up to the phone presence window; actual-completion lane retains one latest beat, cancelled on stop
 Modules/NativeAgentCore/Sources/DeviceSync/MacSyncEngine.swift	Task.sleep(for: duration)	1	event_deadline	MacSyncChatTranscriptCoalescer
 Modules/NativeAgentCore/Sources/DeviceSync/MacSyncEngine+Storage.swift	*	1	event_deadline	MacSyncArchiveRetentionDeadline including bounded failed-deletion retry
@@ -190,6 +186,5 @@ Sources/NativeAgentApp/Shotgun.swift	.asyncAfter(	1	event_deadline	ShotgunContro
 Modules/NativeAgentCore/Sources/MacControl/MacAccessibilityActuator.swift	.asyncAfter(	1	event_deadline	AgentPointerHold.scheduleRelease gives the person's cursor back once the agent's pointer action goes idle (settle 0.35s, never past cap 15s); one generation-guarded chain per hold
 Sources/NativeAgentApp/ShotgunPointer.swift	Task.sleep(for: Self.lingers)	1	visible_ui	AgentPointerOverlay.show fades the agent's pointer once, three seconds after its last pointer action; replaced by each new action and cancelled by fade()
 Modules/NativeAgentCore/Sources/ChatToolRuntime/MCPToolCatalogWarmer.swift	Task.sleep(for: .seconds(wait))	1	event_deadline	MCPToolCatalogWarmer first sweep: one deadline per process, armed only by a catalog kick inside the first minute after launch; runs the ordinary single-flight kick when it fires
-Sources/NativeAgentApp/NativeClient+Providers.swift	Task.sleep(	1	timeout_retry_deadline	Doctor transition repair: one deferred wake per 10-minute attempt window while an ok→adverse repair remains pending; fresh Doctor measurements settle healed rows or saved sign-in/permission asks; manager readiness also wakes retained work
 Modules/NativeAgentCore/Sources/ChatToolRuntime/SwiftToolDispatcher+MacIntegration.swift	Task.sleep(nanoseconds: 1_500_000_000)	1	timeout_retry_deadline	maps.route: one 1.5 s pause before a single retry of a MapKit serverFailure, loadingThrottled or directionsNotFound directions error inside the same tool call; no loop
 Modules/NativeAgentCore/Sources/MacControl/MacFourVerbs+Wait.swift	Task.sleep(nanoseconds: UInt64(left	1	event_deadline	MacFourVerbs.wait plain seconds wait when NativeAgent is in front: caller-bounded, cancellable, ends the call

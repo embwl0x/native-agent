@@ -221,8 +221,7 @@ public enum MemoryConsolidationGate {
             candidateStorage = try MemoryStorage(dataRoot: candidateRootURL)
             // 2026-09-06: the candidate root holds a COPY of memory.sqlite and
             // nothing else — no trust/policy.json. Pass the REAL data root so
-            // "Keep consolidated memories without asking" and "Memory hygiene"
-            // are read from the policy the user actually edited.
+            // "Memory hygiene" is read from the policy the user actually edited.
             plan = try await MemoryConsolidator(
                 storage: candidateStorage,
                 now: now,
@@ -726,7 +725,6 @@ public enum MemoryConsolidationGate {
         let spotlightRecords = memories.filter {
             $0.status == "active"
                 && MemoryLifecycle.isRecallEligible($0.lifecycle)
-                && !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix)
         }
         let spotlight = SwiftNativeMemoryIndexer(client: environment.spotlightClient)
         try await spotlight.removeAll()

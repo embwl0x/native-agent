@@ -252,8 +252,6 @@ public enum SecurityCapabilityClassifier {
         "browser_interaction",
         "clipboard_write",
         "destructive",
-        "evolution_apply_trigger",
-        "evolution_write",
         "external_send",
         "file_write",          // normalized policy vocabulary
         "filesystem_delete",   // canonical tool-profile vocabulary

@@ -388,7 +388,7 @@ public actor MemoryStorage {
             let scope = MemoryRecordDisclosurePolicy.classify(incoming)
             let rows = try Row.fetchAll(db, sql: """
                 SELECT * FROM memories WHERE status = 'active'
-                    AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                    AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                     AND (? = 0 OR id = ?)
                 ORDER BY rowid
             """, arguments: [preserveID, memory.id]).map(Self.decodeMemory)
@@ -675,6 +675,10 @@ public actor MemoryStorage {
                 var metadata: [String: JSONValue] = [:]
                 if case .object(let current)? = existing.metadata { metadata = current }
                 if merge["pinned"] == .bool(true), metadata["pinned"] != .bool(true) {
+                    let kind: String? = if case .string(let value)? = metadata["kind"] { value } else { nil }
+                    if let refusal = UserMDGenerator.pinRefusal(kind: kind) {
+                        throw MemoryV2Error.underlying(refusal)
+                    }
                     let last = try Int64.fetchOne(db, sql: """
                         SELECT MAX(CAST(json_extract(metadata_json, '$.pinned_order') AS INTEGER)) FROM memories
                     """) ?? 0
@@ -764,10 +768,13 @@ public actor MemoryStorage {
         return result.deleted
     }
 
+    /// `keepingGraduated`: the Memories page keeps a graduated lesson in view
+    /// as history; every other "active" read is recall's and leaves it out.
     public func listMemories(
         persona: String? = nil,
         status: String? = "active",
-        limit: Int? = nil
+        limit: Int? = nil,
+        keepingGraduated: Bool = false
     ) async throws -> [StoredMemory] {
         try await dbPool.read { db in
             var sql = "SELECT * FROM memories WHERE 1=1"
@@ -775,7 +782,8 @@ public actor MemoryStorage {
             if let persona { sql += " AND persona_id = ?"; args.append(persona) }
             if let status { sql += " AND status = ?"; args.append(status) }
             if status == "active" {
-                sql += " AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')"
+                sql += " AND (lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)"
+                    + (keepingGraduated ? " OR lifecycle = '\(MemoryLifecycle.graduated)')" : ")")
             }
             sql += " ORDER BY created_at DESC"
             if let limit { sql += " LIMIT ?"; args.append(limit) }
@@ -784,8 +792,9 @@ public actor MemoryStorage {
         }
     }
 
-    /// Read pinned rows in chosen order, or disclosure-filtered user facts
-    /// before the first pin. An empty result never restores unfiltered USER.md.
+    /// Read pinned facts about User in chosen order, or disclosure-filtered user
+    /// facts before the first pin. Both admit only `userIdentityKinds`. An
+    /// empty result never restores unfiltered USER.md.
     public func userPromptCore(surface: String) async throws -> [String]? {
         try await dbPool.read { db in
             let chosen = try Bool.fetchOne(db, sql: """
@@ -795,7 +804,7 @@ public actor MemoryStorage {
             if !chosen {
                 let rows = try Row.fetchAll(db, sql: """
                     SELECT * FROM memories WHERE status = 'active' AND persona_id = ?
-                        AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                        AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                     ORDER BY created_at DESC
                 """, arguments: [MemoryV2Defaults.personaID]).map(Self.decodeMemory).filter {
                     MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0))?
@@ -805,11 +814,12 @@ public actor MemoryStorage {
             }
             return try Row.fetchAll(db, sql: """
                 SELECT * FROM memories WHERE status = 'active'
-                    AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                    AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                     AND json_extract(metadata_json, '$.pinned') = 1
                 ORDER BY COALESCE(json_extract(metadata_json, '$.pinned_order'), 0), created_at, id
             """).map(Self.decodeMemory).map(MemoryRecord.init(stored:)).filter {
-                MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: nil) == true
+                $0.memoryKind.map(UserMDGenerator.userIdentityKinds.contains) == true
+                    && MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: nil) == true
             }.map { record in
                 (MemorySenseProvenance.warning(in: record.extras).map { "[\($0)]\n" } ?? "") + record.text
             }
@@ -953,7 +963,7 @@ public actor MemoryStorage {
             guard var row = try Row.fetchOne(db, sql: """
                 SELECT * FROM memories
                 WHERE id = ? AND status = 'active'
-                  AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
             """, arguments: [id]).map(Self.decodeMemory) else {
                 return nil
             }
@@ -986,7 +996,7 @@ public actor MemoryStorage {
             try db.execute(sql: """
                 UPDATE memories SET lifecycle = ?, updated_at = ?, metadata_json = ?
                 WHERE id = ? AND status = 'active'
-                  AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
             """, arguments: [row.lifecycle, row.updatedAt, Self.encodeMetadata(row.metadata), id])
             return db.changesCount > 0 ? row : nil
         }

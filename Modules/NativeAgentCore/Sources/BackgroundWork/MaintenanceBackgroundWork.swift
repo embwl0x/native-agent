@@ -8,8 +8,12 @@ import PersistenceCore
 import TurnTrace
 import ApprovalInbox
 import WorkshopExecution
-import SelfImprovement
 import NotificationInbox
+import MemoryV2
+import DreamREMCycle
+import AgentWorkspace
+import Desk
+import AttentionRouting
 
 // MARK: - Maintenance Loops
 
@@ -35,18 +39,86 @@ public struct MaintenanceBackgroundWork: Sendable {
             .map(TimeInterval.init)
             .flatMap { $0.isFinite && $0 >= 3600 ? $0 : nil }
         let interval = intervalSeconds ?? configuredInterval ?? (7 * 24 * 60 * 60)
-        let checks = SwiftNativeDoctorChecks(
-            checks: freshMeasurement
-                ? SwiftNativeDoctorChecks.freshMeasurementChecks()
-                : SwiftNativeDoctorChecks.defaultChecks
-        )
+        let checks = makeDoctorChecks(root: dataRoot, freshMeasurement: freshMeasurement)
         return ConfiguredDoctorAutoRunLoop(
             enabled: config.enabled ?? true,
             doctor: DoctorAutoRunLoop(
                 interval: interval,
-                runChecks: { try await port.runAutoDoctor(checks: checks, dataRoot: dataRoot) }
+                runChecks: { try await port.runAutoDoctor(checks: checks, dataRoot: dataRoot) },
+                storage: { dataRoot.appendingPathComponent("doctor", isDirectory: true) }
             )
         )
+    }
+
+    /// Doctor's routes past its repairs and the one ask: a row she triages
+    /// (`agent`) is one arrival on her home, key `doctor.<check id>`, cleared
+    /// from the day's ledger when it has no finding; a row a build must fix (`builder`) is one harness
+    /// item, resolved when it has no finding. Returns the adverse rows now routed,
+    /// which no longer hold Doctor's transition wake; app and owner rows have
+    /// their own routes (the repair, the doctor-ask card) and are not here.
+    public static func routeDoctorRows(_ rows: [CheckResult], dataRoot: URL) async -> Set<String> {
+        var routed = Set<String>()
+        var healed: [String] = []
+        for row in rows {
+            guard let owner = DoctorOwner.of(row, repairAvailable: row.repair_available == true) else {
+                healed.append(row.id)
+                continue
+            }
+            switch owner {
+            case .agent:
+                // A row Doctor keeps for a person reading it (heartbeat-ineligible:
+                // a just-launched reading that clears itself, an operator-only
+                // cognition readout) is handled without an arrival for her.
+                guard DoctorHeartbeatPolicy.isEligible(row.id) else { routed.insert(row.id); break }
+                // What is wrong, then the step where one is written.
+                let harm = row.harm ?? ""
+                let detail = String(row.detail.prefix { $0 != "\n" }.prefix(max(0, 300 - harm.count - 1)))
+                let wrong = [detail, harm].filter { !$0.isEmpty }.joined(separator: " ")
+                let step = String((row.human_action ?? "").prefix(max(0, 300 - wrong.count - 3)))
+                let said = (step.contains(wrong) ? step : [wrong, step].filter { !$0.isEmpty }.joined(separator: " — "))
+                    .split(whereSeparator: \.isNewline).joined(separator: "; ")
+                if ResidentWake.shared.request(dataRoot: dataRoot, reason: "Doctor", items: [.init(
+                    id: "doctor." + row.id, line: "Doctor: \(row.title) — \(said)", key: "doctor." + row.id, home: true)]) {
+                    routed.insert(row.id)
+                }
+            case .builder:
+                // The failure, not its remedy, names the item: the detail's first
+                // line without timestamps, paths or numbers, so a count that moves
+                // is the same finding and a different failure is a new one.
+                let signature = String(row.detail.prefix { $0 != "\n" })
+                    .replacingOccurrences(of: #"\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}:?\d{2})?"#, with: "", options: .regularExpression)
+                    .replacingOccurrences(of: #"[~/][^\s,;:()]*"#, with: "", options: .regularExpression)
+                    .replacingOccurrences(of: #"\d+"#, with: "", options: .regularExpression)
+                do {
+                    try await HarnessQueue.file(HarnessFinding(
+                        key: row.id + "|" + AttentionRouter.stableDigest(signature),
+                        title: "Doctor: \(row.title)",
+                        summary: row.detail + (row.harm.map { "\n" + $0 } ?? "") + (row.human_action.map { "\n" + $0 } ?? ""),
+                        owner: .builder,
+                        refs: [DeskRef(kind: .file(path: dataRoot.appendingPathComponent("doctor/latest.json").path,
+                                                   line: nil, label: "Doctor check \(row.id)"))],
+                        source: .doctor
+                    ), dataRoot: dataRoot)
+                    routed.insert(row.id)
+                } catch {
+                    nativeLog("[Doctor] could not file %@ on the harness queue: %@", row.id, error.localizedDescription)
+                }
+            default:
+                break
+            }
+        }
+        let waking = Set(ResidentWake.homeItems(dataRoot).compactMap(\.key))
+        for id in healed where waking.contains("doctor." + id) {
+            ResidentWake.shared.clear(dataRoot: dataRoot, key: "doctor." + id)
+        }
+        do {
+            try await HarnessQueue.resolve(keyPrefixes: Dictionary(uniqueKeysWithValues: Set(healed).map {
+                ($0 + "|", "Doctor no longer routes \($0) as a finding.")
+            }), dataRoot: dataRoot)
+        } catch {
+            nativeLog("[Doctor] could not resolve healed harness items: %@", error.localizedDescription)
+        }
+        return routed
     }
 
     /// The mounted six-hour retention wake handles date-named trace expiry,
@@ -63,8 +135,8 @@ public struct MaintenanceBackgroundWork: Sendable {
         )
     }
 
-    /// Off-disk backup of Agent into iCloud Drive: daily, and within one wake of
-    /// an identity (persona) write. See `OffDiskBackupRunner`.
+    /// Off-disk backup into iCloud Drive every 24 hours; identity (persona)
+    /// writes are included at the next daily wake. See `OffDiskBackupRunner`.
     public func makeOffDiskBackupLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> some LoopRunner {
@@ -113,12 +185,12 @@ public struct MaintenanceBackgroundWork: Sendable {
                 let findingId = proposal.findingId
                 if let existing = try? await inbox.list(
                     filter: ApprovalFilter(status: "pending", action: "self_improvement.apply")
-                ), existing.contains(where: { record in
+                ), let card = existing.first(where: { record in
                     guard case .object(let payload) = record.payload,
                           case .string(let staged)? = payload["findingId"] else { return false }
                     return staged == findingId
                 }) {
-                    return
+                    return card.id
                 }
                 let body: JSONValue = .object([
                     "title": .string(proposal.title),
@@ -151,7 +223,7 @@ public struct MaintenanceBackgroundWork: Sendable {
                     ),
                 ])
                 do {
-                    _ = try await inbox.create(body)
+                    return try await inbox.create(body).id
                 } catch {
                     // FIX 3 (A4.5): rethrow so the loop rolls back its weekly
                     // marker (retry next tick) and returns .failed — a swallowed
@@ -162,50 +234,17 @@ public struct MaintenanceBackgroundWork: Sendable {
                     throw error
                 }
             },
-            // U2b wave 2: code-class findings stop dying in the digest —
-            // they file into the evolution proposal store as `needs_diff`
-            // (prose, no patch yet; the diff lane is a deliberate act by
-            // Agent/Claude/the user, plan A4). Filed proposals carry the engine's
-            // pinned risk=critical + autoApprove=false; nothing here stages
-            // an approval card — only a GREEN candidate ever reaches
-            // stageEvolutionApprovals.
-            fileCodeFinding: { finding in
-                let store = EvolutionProposalStore(dataRoot: dataRoot)
-                let evidence = finding.evidence
-                    + "\n\nproposed change: " + finding.proposedChange
-                // Same skip-if-present as the approvals stager above
-                // (2026-09-06): a retried sweep re-files every code finding it
-                // already filed. Live rows only — a terminal proposal
-                // (verified/reverted/denied) is settled and must not block the
-                // finding from returning.
-                //
-                // Second pass, same day: this matched on the title plus the
-                // EVIDENCE TEXT, and the evidence carries the week's
-                // timestamps — so no two passes ever agreed and the guard never
-                // fired. It keys on the finding's own content digest now, the
-                // one the approvals stager uses, which is computed over the
-                // fields with dates normalised out.
-                let findingId = finding.findingId
-                if let existing = try? await store.list(),
-                   existing.contains(where: {
-                       $0.source == .weekly && !$0.status.isTerminal
-                           && $0.findingId == findingId
-                   }) {
-                    return
-                }
-                do {
-                    _ = try await store.propose(
-                        source: .weekly,
-                        title: finding.title,
-                        evidence: evidence,
-                        findingId: findingId)
-                } catch {
-                    // FIX 3 (A4.5): rethrow — a swallowed propose() dropped the
-                    // code finding silently while the pass reported success.
-                    FileHandle.standardError.write(Data(
-                        "WeeklySelfImprovement: evolution filing failed for \(finding.title): \(error)\n".utf8))
-                    throw error
-                }
+            // A code finding needs a code change: the harness queue holds it
+            // for the builder, once per finding, with this pass's digest.
+            fileCodeFinding: { proposal in
+                let digest = dataRoot.appendingPathComponent("self_improvement/digests/\(NativeTimestampFormat.utcDay(Date())).md")
+                try await HarnessQueue.file(HarnessFinding(
+                    key: proposal.findingId, title: proposal.title,
+                    summary: proposal.proposedChange + "\nEvidence: " + proposal.evidence,
+                    owner: .builder,
+                    refs: [DeskRef(kind: .file(path: digest.path, line: nil, label: "weekly digest"))],
+                    source: .sweep
+                ), dataRoot: dataRoot)
             },
             // MEASURE leg (north-star, 2026-06-15): feed the real week-over-week
             // execution-outcome trend into the weekly analysis so the improvement
@@ -216,23 +255,117 @@ public struct MaintenanceBackgroundWork: Sendable {
             workshopOutcomes: {
                 let runner = SwiftNativeWorkshopRunner(root: dataRoot)
                 return WorkshopOutcomeScoreboard.formatForPrompt(await runner.weeklyOutcomeStats())
-            }
+            },
+            // The sweep learns from itself: this week's misses by lesson against
+            // last week's, and what became of the previous pass's cards.
+            learning: { previousCards in
+                var sections: [String] = []
+                let weeks = [MemoryStatusProjection.isoWeek(), MemoryStatusProjection.isoWeek(ago: 1)]
+                do {
+                    let lessons = try await MemoryStatusProjection.misses(dataRoot: dataRoot, weeks: weeks)
+                    sections.append("## Misses by lesson (corrections this week, last week in brackets)\n" + (lessons.isEmpty ? "(none)"
+                        : lessons.map { "- \($0.lesson): \($0.count(week: weeks[0])) (\($0.count(week: weeks[1])))" }.joined(separator: "\n")))
+                } catch { sections.append("## Misses by lesson\n(unreadable: \(error))") }
+                if let previousCards {
+                    sections.append(await Self.passOutcomes(cards: previousCards, inbox: inbox, dataRoot: dataRoot))
+                }
+                var standing: [String: String] = [:]
+                do { standing = try await Self.standingLessons(dataRoot: dataRoot) } catch {
+                    FileHandle.standardError.write(Data("WeeklySelfImprovement: standing lessons unreadable: \(error)\n".utf8))
+                }
+                return SelfImprovementLearning(signals: sections.joined(separator: "\n\n"), standing: standing)
+            },
+            // A standing lesson rides the REM path: one GROWTH row per memory
+            // (its id makes a re-offer a no-op, approved or denied), through
+            // REM's tombstone filter (a line denied or retired before stays
+            // gone, whichever memory offers it), staged by the same stager the
+            // weekly REM job uses.
+            stageStandingLessons: { lines in
+                let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+                let tombstones = REMTombstoneStore(dataRoot: dataRoot)
+                var proposals: [REMProposal] = []
+                for (id, line) in lines.sorted(by: { $0.key < $1.key }) {
+                    guard let memory = try await storage.memory(id: id) else { continue }
+                    // One card per wording of the correction: an edited one
+                    // (its card goes stale) can be offered again.
+                    let proposal = REMProposal(
+                        id: "standing-\(id)-\(MemoryStorage.contentHash(memory.content).prefix(12))",
+                        targetDoc: "GROWTH.md", proposalText: line, evidenceDates: [],
+                        confidence: 1, createdAt: ISO8601DateFormatter().string(from: Date()),
+                        supportingPassages: [REMSupportingPassage(dreamDate: "", quote: memory.content, sourceRefs: ["memory:" + id])],
+                        support: .standing)
+                    if try await !tombstones.isTombstoned(proposal) { proposals.append(proposal) }
+                }
+                try await REMProposalStore(dataRoot: dataRoot).appendPending(proposals)
+                await DreamBackgroundWork.stagePendingREMProposalsAtLaunch(dataRoot: dataRoot, notifications: port)
+                return proposals.map(\.id)
+            },
+            capabilityUpkeep: { await port.capabilityUpkeep(dataRoot: dataRoot) }
         )
     }
 
-    /// Weekly retention sweep for the evolution proposal store (tightness round
-    /// 2 P-M2). `EvolutionProposalStore.sweep()` drops TERMINAL proposals older
-    /// than 30 days; it had zero production callers, so `proposals.json` only ever
-    /// grew. Dependency-clean: the prune is an injected closure so BackgroundLoops
-    /// gains no SelfImprovement dependency.
-    public func makeEvolutionProposalRetentionLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> EvolutionProposalRetentionLoop {
-        EvolutionProposalRetentionLoop(
-            sweep: {
-                try await EvolutionProposalStore(dataRoot: dataRoot).sweep()
+    /// The previous pass's cards, by the ids its digest recorded — its
+    /// one-tap proposals (`approval:`) and its standing lessons (`rem:`) — and
+    /// what became of each, its execution receipt included.
+    static func passOutcomes(cards: [String], inbox: SwiftNativeApprovalInbox, dataRoot: URL) async -> String {
+        let rem = REMProposalStore(dataRoot: dataRoot).loadAll()
+        var lines: [String] = []
+        for card in cards {
+            var what = card, approvalID: String?
+            if card.hasPrefix("approval:") {
+                approvalID = String(card.dropFirst("approval:".count))
+            } else if let row = rem.first(where: { "rem:" + $0.id == card }) {
+                what = "standing lesson: " + row.proposalText
+                approvalID = row.approvalId
             }
-        )
+            guard let approvalID else { lines.append("- \(what): not on a card now (it is staged again)"); continue }
+            guard let record = try? await inbox.get(approvalID) else { lines.append("- \(what): its card is gone"); continue }
+            if card.hasPrefix("approval:") { what = record.title }
+            var failed = false
+            if case .object(let executed)? = record.executedAction { failed = executed["error"] != nil }
+            let outcome = record.status == "pending" ? "ignored, still waiting"
+                : record.decision == "approved" ? (record.executedAction == nil ? "approved, not yet carried out"
+                    : failed ? "approved, but carrying it out failed: \(record.detail ?? "")" : "approved and carried out")
+                : record.decision == "denied" || record.status == "denied" ? "denied" : "ignored (\(record.decision ?? record.status))"
+            lines.append("- \(what): \(outcome)")
+        }
+        return "## The last pass: its proposals and what became of them\n" + (lines.isEmpty ? "(none recorded)" : lines.joined(separator: "\n"))
+    }
+
+    /// Standing lessons, measured on 14 days of live traces (2026-09-27 to
+    /// 10-10, 35 and 96 conversations a week): a correction or instruction
+    /// recalled at least `standingUses` times that ran through (half or more of
+    /// the turns of) at least `standingSessions` conversations and two thirds
+    /// of the week's. Each week three corrections ran through 71–100% of the
+    /// conversations, the fewest 25; the next ran through under half, topical
+    /// ones a tenth or less. Every conversation with a context build counts,
+    /// whether or not it recalled anything. Memory id → text.
+    static let standingUses: Int64 = 1_000
+    static let standingSessions = 25
+
+    static func standingLessons(dataRoot: URL, now: Date = Date()) async throws -> [String: String] {
+        let events = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
+            .read(now: now, since: now.addingTimeInterval(-7 * 86_400)).events
+        var sessionOf: [String: String] = [:]
+        for event in events { if let session = event.sessionId { sessionOf[event.turnId] = session } }
+        var turns: [String: Int] = [:]
+        var recalls: [String: [String: Int]] = [:]
+        for event in events where event.kind == "context.summary" {
+            guard let session = sessionOf[event.turnId], case .object(let payload) = event.payload,
+                  case .array(let ids)? = payload["injectedMemoryIds"] else { continue }
+            turns[session, default: 0] += 1
+            for case .string(let id) in ids { recalls[id, default: [:]][session, default: 0] += 1 }
+        }
+        func throughout(_ id: String) -> Int {
+            (recalls[id] ?? [:]).filter { $0.value * 2 >= turns[$0.key] ?? 0 }.count
+        }
+        let rows = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+            .listMemories(persona: nil, status: "active", limit: nil)
+        return Dictionary(uniqueKeysWithValues: rows.filter {
+            ["correction", "instruction"].contains(MemoryMoments.metadataString($0.metadata, "kind") ?? "")
+                && $0.useCount >= standingUses && throughout($0.id) >= standingSessions
+                && throughout($0.id) * 3 >= turns.count * 2
+        }.map { ($0.id, $0.content) })
     }
 
     /// Daily disk-hygiene watchdog (tightness round 2, item 6 — User: "make sure
@@ -255,8 +388,15 @@ public struct MaintenanceBackgroundWork: Sendable {
             // reservation = runs once a day, robust to restarts.
             interval: 60 * 60,
             dataRoot: dataRoot,
+            // The day's body report rides the same once-a-day pass; a failed
+            // write rolls the day back like a failed notice, and retries.
             fileNotice: { report in
-                await fileDiskHygieneNotice(dataRoot: dataRoot, report: report)
+                guard await fileDiskHygieneNotice(dataRoot: dataRoot, report: report) else { return false }
+                do { try await BodyReport.writeDaily(dataRoot: dataRoot) } catch {
+                    nativeLog("BodyReport: daily note not written (%@); the next hourly tick retries", "\(error)")
+                    return false
+                }
+                return true
             }
         )
     }
@@ -551,7 +691,7 @@ private struct ConfiguredDoctorAutoRunLoop: LoopRunner {
     }
 
     func tickOutcome() async -> LoopTickOutcome {
-        guard enabled else { return .skipped(reason: "auto doctor disabled") }
+        guard enabled else { return .off("auto doctor disabled") }
         return await doctor.tickOutcome()
     }
 }

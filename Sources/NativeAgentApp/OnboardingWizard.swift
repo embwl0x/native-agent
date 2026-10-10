@@ -1,79 +1,18 @@
 import ProviderRouting
 import AppToolRuntime
+import Onboarding
 // PATCH-2026-05-07: onboarding-2 Generic onboarding wizard — name + persona type
 import SwiftUI
 import AppKit
 
 // MARK: - Models
 
-struct OnboardingStartResponse: Codable {
-    var ready: Bool
-    var hasExisting: Bool
-    var currentPersonaName: String?
-    var personaTypeOptions: [PersonaTypeOption]?
-    var abilityOverview: [OnboardingAbility]?
-    var pendingRecovery: Bool?
-    var resetRequired: Bool?
-    var profileRepairRequired: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case ready
-        case hasExisting = "has_existing"
-        case currentPersonaName = "current_persona_name"
-        case personaTypeOptions = "persona_type_options"
-        case abilityOverview = "ability_overview"
-        case pendingRecovery = "pending_recovery"
-        case resetRequired = "reset_required"
-        case profileRepairRequired = "profile_repair_required"
-    }
-}
-
-struct OnboardingAbility: Codable, Identifiable, Hashable {
-    var id: String
-    var title: String
-    var detail: String
-    var systemImage: String?
-
+extension AbilityOverviewEntry: @retroactive Identifiable {
     /// Also translate older start-response copy without changing the stored catalog.
     var displayDetail: String {
         detail.replacingOccurrences(of: "keep receipts", with: "show results and keep an activity record")
             .replacingOccurrences(of: "behind Trust settings", with: "with your permission, managed in Trust")
     }
-
-    enum CodingKeys: String, CodingKey {
-        case id, title, detail
-        case systemImage = "system_image"
-    }
-}
-
-struct PersonaTypeOption: Codable, Identifiable, Hashable {
-    var id: String
-    var label: String
-    var description: String
-    var sampleAnchor: String
-    var pronouns: String
-
-    enum CodingKeys: String, CodingKey {
-        case id, label, description, pronouns
-        case sampleAnchor = "sample_anchor"
-    }
-}
-
-struct OnboardingCompleteResponse: Sendable, Equatable {
-    let ok: Bool
-    let agentName: String?
-    let personaType: String?
-    let userName: String?
-    let docsWritten: [String]
-    let error: String?
-    let detail: String?
-}
-
-struct OnboardingResetResponse: Sendable, Equatable {
-    let ok: Bool
-    let backedUp: [String]
-    let readyForOnboarding: Bool
-    let error: String?
 }
 
 // MARK: - Wizard State
@@ -160,7 +99,7 @@ final class OnboardingWizardState {
     // (NSFullUserName): a public user's Mac account isn't their answer to
     // "your name," and it leaked the host account into onboarding (User, 2026-07-05).
     var userName: String = ""
-    var abilities: [OnboardingAbility] = OnboardingWizardState.defaultAbilities
+    var abilities: [AbilityOverviewEntry] = OnboardingWizardState.defaultAbilities
     var showsAbilityOverview = false
     var errorMessage: String?
     var pendingRecoveryNeedsReset = false
@@ -240,13 +179,13 @@ final class OnboardingWizardState {
         step = previous
     }
 
-    static let defaultAbilities: [OnboardingAbility] = [
-        OnboardingAbility(id: "chat", title: "Chat with memory", detail: "Long-running conversations, recall, corrections, and personality growth.", systemImage: "message"),
-        OnboardingAbility(id: "projects", title: "Build with you", detail: "Read approved projects, edit files, run tests, and show results and keep an activity record when access allows.", systemImage: "hammer"),
-        OnboardingAbility(id: "mac", title: "Use Mac actions", detail: "Notifications, Spotlight, Shortcuts, files, shell, and app control with your permission, managed in Trust.", systemImage: "macbook"),
-        OnboardingAbility(id: "connectors", title: "Connect services", detail: "Optional providers and connectors for chat models, Telegram, GitHub, email, calendar, and more.", systemImage: "point.3.connected.trianglepath.dotted"),
-        OnboardingAbility(id: "mobile", title: "Work from iPhone", detail: "Pair the mobile app for chat, approvals, push notifications, inbox, activity, and remote actions.", systemImage: "iphone"),
-        OnboardingAbility(id: "improve", title: "The agent improves with use", detail: "Work is checked and kept in a record you can read.", systemImage: "checkmark.shield"),
+    static let defaultAbilities: [AbilityOverviewEntry] = [
+        AbilityOverviewEntry(id: "chat", title: "Chat with memory", detail: "Long-running conversations, recall, corrections, and personality growth.", systemImage: "message"),
+        AbilityOverviewEntry(id: "projects", title: "Build with you", detail: "Read approved projects, edit files, run tests, and show results and keep an activity record when access allows.", systemImage: "hammer"),
+        AbilityOverviewEntry(id: "mac", title: "Use Mac actions", detail: "Notifications, Spotlight, Shortcuts, files, shell, and app control with your permission, managed in Trust.", systemImage: "macbook"),
+        AbilityOverviewEntry(id: "connectors", title: "Connect services", detail: "Optional providers and connectors for chat models, Telegram, GitHub, email, calendar, and more.", systemImage: "point.3.connected.trianglepath.dotted"),
+        AbilityOverviewEntry(id: "mobile", title: "Work from iPhone", detail: "Pair the mobile app for chat, approvals, push notifications, inbox, activity, and remote actions.", systemImage: "iphone"),
+        AbilityOverviewEntry(id: "improve", title: "The agent improves with use", detail: "Work is checked and kept in a record you can read.", systemImage: "checkmark.shield"),
     ]
 }
 
@@ -359,12 +298,12 @@ struct OnboardingWizard: View {
     // MARK: - Logic
 
     private func loadOnboardingState() async {
-        // WAVE 15 (2026-06-01): switched from raw URLSession to NativeClient.startOnboarding()
-        // so the SwiftNative gate in startOnboarding() is exercised rather than bypassed.
+        // WAVE 15 (2026-06-01): switched from raw URLSession to the Swift onboarding
+        // owner so the SwiftNative gate in startOnboarding() is exercised rather than bypassed.
         // Runtime MUST be passed — daemon-side /v1/onboarding/start is retired (would throw
         // DaemonError.swiftOnlyRoute on fallthrough), and only the SwiftNative path is live.
-        // R22: AppModel's canonical `client` already carries the shared runtime.
-        let resp: OnboardingStartResponse
+        // R22: AppModel picks the onboarding owner for its own root.
+        let resp: OnboardingStartResult
         // Any path through start state is a fresh verdict; a stale scaffold flag
         // must not hijack the next Retry.
         state.scaffoldRepairFailed = false
@@ -376,7 +315,7 @@ struct OnboardingWizard: View {
             state.step = .error
             return
         }
-        if resp.pendingRecovery == true {
+        if resp.pendingRecovery {
             state.step = .building
             do {
                 let resumed = try await appModel.resumePendingOnboarding()
@@ -404,7 +343,7 @@ struct OnboardingWizard: View {
         // default profile — the configured names silently gone. Reset is the
         // wrong remedy (it would back out good persona documents over one
         // missing file), so this state gets its own two-field repair lane.
-        if resp.profileRepairRequired == true {
+        if resp.profileRepairRequired {
             // User, 2026-09-06: blank the fields only on FIRST entry. A re-read
             // from inside the lane (the refusal recheck below) must not throw
             // away the names the person just typed.
@@ -421,7 +360,7 @@ struct OnboardingWizard: View {
         }
         state.profileRepairRecheckOffered = false
         state.profileRepairOnly = false
-        if resp.resetRequired == true {
+        if resp.resetRequired {
             state.pendingRecoveryNeedsReset = true
             state.errorMessage = "Incomplete persona documents were found. Reset will back them up before onboarding starts again."
             state.step = .error
@@ -442,7 +381,7 @@ struct OnboardingWizard: View {
         state.pendingRecoveryNeedsReset = false
         // Persona-type picker removed 2026-07-04 (single AI persona) — only the
         // ability overview is still consumed from the start response.
-        state.abilities = resp.abilityOverview?.isEmpty == false ? (resp.abilityOverview ?? OnboardingWizardState.defaultAbilities) : OnboardingWizardState.defaultAbilities
+        state.abilities = resp.abilityOverview.isEmpty ? OnboardingWizardState.defaultAbilities : resp.abilityOverview
         if state.step == .error {
             state.step = state.trimmedUserName.isEmpty || state.trimmedAgentName.isEmpty
                 ? .identity : .provider
@@ -761,14 +700,14 @@ private struct OnboardingCard<Content: View>: View {
 }
 
 private struct AbilityOverviewTile: View {
-    let ability: OnboardingAbility
+    let ability: AbilityOverviewEntry
     @Environment(\.colorScheme) private var scheme
     private let bodySize: CGFloat = 16
     private let detailSize: CGFloat = 13
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: ability.systemImage ?? "sparkles")
+            Image(systemName: ability.systemImage.isEmpty ? "sparkles" : ability.systemImage)
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(NativeAgentShell.secondary)
                 .frame(width: 24, height: 24, alignment: .leading)
@@ -893,7 +832,6 @@ private struct ProviderConnectStep: View {
                         disabled: state.savingModel || state.providersLoading,
                         onSelect: { provider, model in
                             state.savingModel = true
-                            state.chatModelReady = false
                             modelSaveError = nil
                             Task {
                                 defer { state.savingModel = false }
@@ -902,7 +840,6 @@ private struct ProviderConnectStep: View {
                                         group: ProviderSurfaceGroups.chat,
                                         providerID: provider.id, model: model.id
                                     )
-                                    updateModelReadiness()
                                 } catch {
                                     modelSaveError = UserFacingError.message(error, action: "save your model choice")
                                 }
@@ -933,6 +870,8 @@ private struct ProviderConnectStep: View {
         .task {
             await reload()
         }
+        // The chat model can be set from anywhere, not only this sheet's picker.
+        .onChange(of: [appModel.chatProvider, appModel.chatModel]) { updateModelReadiness() }
     }
 
     private var agentDisplayName: String {

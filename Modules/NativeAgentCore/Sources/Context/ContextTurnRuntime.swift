@@ -110,7 +110,8 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     public func publish(
         _ embedding: [Float],
         alternate: [Float]? = nil,
-        modelFingerprint: String = "legacy-unverified"
+        modelFingerprint: String = "legacy-unverified",
+        modelID: String
     ) {
         guard !embedding.isEmpty, embedding.allSatisfy(\.isFinite) else { return }
         let fingerprint = modelFingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -127,7 +128,8 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
             let published = ContextQueryEmbeddingValue(
                 values: embedding,
                 alternateValues: alternateVector,
-                modelFingerprint: fingerprint
+                modelFingerprint: fingerprint,
+                modelID: modelID
             )
             value = published
             resolved = published
@@ -149,15 +151,21 @@ public struct ContextQueryEmbeddingValue: Sendable, Equatable {
     /// question reads the same in both voices, or when no names are known.
     public let alternateValues: [Float]?
     public let modelFingerprint: String
+    /// The embedder's model id (`embedding.json` `model_id`, or the bundled
+    /// MiniLM's), read from the same runtime snapshot as the fingerprint. The
+    /// selector's semantic floor is per model (`memorySemanticFloors`).
+    public let modelID: String
 
     public init(
         values: [Float],
         alternateValues: [Float]? = nil,
-        modelFingerprint: String
+        modelFingerprint: String,
+        modelID: String
     ) {
         self.values = values
         self.alternateValues = alternateValues
         self.modelFingerprint = modelFingerprint
+        self.modelID = modelID
     }
 }
 
@@ -182,6 +190,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
     /// See `ContextQueryEmbeddingValue.alternateValues`.
     public let alternateQueryEmbedding: [Float]?
     public let queryEmbeddingModelFingerprint: String?
+    /// See `ContextQueryEmbeddingValue.modelID`.
+    public let queryEmbeddingModelID: String?
     public let allowedPrivacy: Set<ContextPrivacy>
     public let permissionLabels: Set<String>
     public let characterBudget: Int
@@ -238,6 +248,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
         queryEmbedding: [Float]? = nil,
         alternateQueryEmbedding: [Float]? = nil,
         queryEmbeddingModelFingerprint: String? = nil,
+        queryEmbeddingModelID: String? = nil,
         allowedPrivacy: Set<ContextPrivacy> = [.localPrivate, .trustedRemote, .publicSafe],
         permissionLabels: Set<String> = [],
         characterBudget: Int = 6_000,
@@ -276,6 +287,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
         self.queryEmbeddingModelFingerprint = self.queryEmbedding == nil
             ? nil
             : ((fingerprint?.isEmpty == false) ? fingerprint : nil)
+        self.queryEmbeddingModelID = self.queryEmbedding == nil ? nil : queryEmbeddingModelID
         self.allowedPrivacy = allowedPrivacy
         self.permissionLabels = permissionLabels
         self.characterBudget = max(1, characterBudget)

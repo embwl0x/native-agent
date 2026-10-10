@@ -103,6 +103,20 @@ extension SwiftToolDispatcher {
         }
     }
 
+    /// No path, or an empty one, lists the folder a relative path starts
+    /// from, exactly as "." does (2026-10-09: `{"path": ""}` was refused, then
+    /// `"."` listed). Reads and writes still refuse an empty path.
+    static func listDirInput(_ input: [String: JSONValue]) -> [String: JSONValue] {
+        switch input["path"] {
+        case nil, .null?: break
+        case .string(let path)? where path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty: break
+        default: return input
+        }
+        var input = input
+        input["path"] = .string(".")
+        return input
+    }
+
     func impl_list_dir(input: [String: JSONValue]) async throws -> JSONValue {
         let path = try requireString(input, "path")
         let url = try await resolveTrustedFilePath(path)
@@ -136,6 +150,7 @@ extension SwiftToolDispatcher {
     /// growth, image delivery, dispatch ledger, provider, command or write runs.
     func fileReadPreviewRefusal(tool: String, input: [String: JSONValue], surface: String) async -> JSONValue? {
         guard ["read_file", "list_dir", "file_excerpt"].contains(tool) else { return nil }
+        let input = tool == "list_dir" ? Self.listDirInput(input) : input
         do {
             let result = try await FileReadSourceMaterial.$metadataOnly.withValue(true) {
                 if await self.fullMacToolAccess(surface: surface).fileOpsAllowed || tool == "file_excerpt" {

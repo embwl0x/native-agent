@@ -47,19 +47,6 @@ extension PersonalityProfile {
     )
 }
 
-struct CompiledPersonality: Codable, Hashable {
-    var surface: String
-    var fingerprint: String
-    var compiled: String
-}
-
 // PATCH-2026-05-07: chat-context-status Per-session context-window usage
 // for the small fill bar in the chat brain area + the auto-compact path.
 typealias SessionContextStatus = EngineRuntime.SessionContextStatus
-
-// PersonalityDoc moved to NativeAgentShared.
-
-struct PersonalityDocsResponse: Codable, Hashable {
-    var docs: [PersonalityDoc]
-    var updatedAt: String?
-}

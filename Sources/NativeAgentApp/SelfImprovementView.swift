@@ -1,10 +1,11 @@
 // Self-Improvement tab — the home for the weekly WeeklySelfImprovementLoop.
 // A simple on/off switch + the latest digest + a manual run. The one-tap
 // "apply" proposals surface in Approvals (Today ▸ Approvals and past
-// decisions); the training candidates the pass staged are listed here.
+// decisions).
 import SwiftUI
 import Foundation
 import BackgroundLoops
+import MemoryV2
 
 struct SelfImprovementView: View {
     @Environment(AppModel.self) private var appModel
@@ -19,12 +20,43 @@ struct SelfImprovementView: View {
 
     var body: some View {
         // Render-cost audit: same env-gated counter as `contentview.body`.
-        // This view reads `trainingRuns` / `trainingProposals` /
-        // `promotionCandidates`, the three fields that gained equality gates in
-        // perf wave 2 — so this is the before/after number for those.
         RenderAudit.bump("selfimprovement.body")
         return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                // ── Misses ────────────────────────────────────────────────
+                // What she was corrected on, by lesson, this week against
+                // last: the growth metric. A row opens the conversation.
+                Text("Misses").font(.headline)
+                if appModel.missLessons.isEmpty {
+                    Text(appModel.panelRefreshStatus[.activity]?.failedEndpoints.contains("misses") == true
+                         ? "The miss ledger could not be read." : "No corrections this week or last.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                ForEach(appModel.missLessons) { lesson in
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack {
+                            Text(lesson.lesson).font(.callout.weight(.semibold))
+                            Spacer()
+                            Text("\(lesson.count(week: MemoryStatusProjection.isoWeek())) this week · "
+                                 + "\(lesson.count(week: MemoryStatusProjection.isoWeek(ago: 1))) last week")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        ForEach(lesson.misses) { miss in
+                            Button(miss.text) {
+                                if let session = miss.sessionId {
+                                    Task { await NativeAgentNotificationActions.openConversation(
+                                        session, messageID: miss.history.map { String($0.dropFirst("history:".count)) }) }
+                                }
+                            }
+                            .buttonStyle(.link)
+                            .lineLimit(1)
+                            .disabled(miss.sessionId == nil)
+                            .help(miss.history ?? "Kept before corrections carried their turn.")
+                        }
+                    }
+                }
+                Divider()
+
                 // ── The switch ────────────────────────────────────────────
                 Toggle(isOn: $enabled) {
                     VStack(alignment: .leading, spacing: 3) {
@@ -52,26 +84,6 @@ struct SelfImprovementView: View {
                     .disabled(!enabled || running)
                     if !runNote.isEmpty {
                         Text(runNote).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-
-                // ── Training candidates ───────────────────────────────────
-                // The same two queues, and the same human-actionable filters,
-                // the Activity page previewed. View-only, as they were there.
-                if !candidates.isEmpty {
-                    Divider()
-                    Text("Staged for a look").font(.headline)
-                    ForEach(candidates, id: \.id) { candidate in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(candidate.title)
-                                .font(.callout.weight(.semibold))
-                                .lineLimit(1)
-                            Text(candidate.summary)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(3)
-                                .textSelection(.enabled)
-                        }
                     }
                 }
 
@@ -105,16 +117,6 @@ struct SelfImprovementView: View {
         .task { await loadDigest() }
     }
 
-    private var candidates: [(id: String, title: String, summary: String)] {
-        appModel.trainingProposals.filter(AppModel.isHumanActionableTrainingProposal).map {
-            (id: "training:\($0.proposal_id)", title: $0.target_doc, summary: $0.proposed)
-        } + appModel.promotionCandidates.filter(AppModel.isHumanActionablePromotionCandidate).map {
-            (id: "promotion:\($0.candidate_id)",
-             title: "Promotion · \($0.tier ?? "?")",
-             summary: $0.reason ?? "Harness staged a promotion candidate.")
-        }
-    }
-
     @MainActor
     private func runNow() async {
         running = true
@@ -146,7 +148,7 @@ struct SelfImprovementView: View {
                 token: requestToken
             )
         } catch {
-            note += " Request cleanup could not be verified: \(NativeClient.safeDoctorDetail(error.localizedDescription))."
+            note += " Request cleanup could not be verified: \(AppDoctorPort.safeDetail(error.localizedDescription))."
         }
         // The pass may have staged new candidates; re-read the queues.
         _ = await appModel.refreshForSidebarItem(.activity)
@@ -161,9 +163,9 @@ struct SelfImprovementView: View {
             if outcome.isCoalescedSkip {
                 return "Already running — joined the active pass."
             }
-            return "Not run — \(NativeClient.safeDoctorDetail(reason))."
+            return "Not run — \(AppDoctorPort.safeDetail(reason))."
         case .failed(let error):
-            return "Failed — \(NativeClient.safeDoctorDetail(error))."
+            return "Failed — \(AppDoctorPort.safeDetail(error))."
         }
     }
 

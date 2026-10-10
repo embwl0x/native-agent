@@ -161,8 +161,6 @@ public enum PeerTurnEffectPolicy {
         // Defaults `persist: true` and REPLACES the durable tracking config,
         // so the name's "discover" reads like a probe and is not one.
         "github_discover_tracking", "github_project_digest",
-        // Self-evolution.
-        "self_install", "evolution_propose", "evolution_withdraw",
     ]
 
     /// Underscore-separated name tokens that mean "this call changes

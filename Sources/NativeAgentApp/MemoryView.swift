@@ -371,9 +371,7 @@ struct MemorySpotlightReindexOperation {
                 status: "active",
                 limit: nil
             )
-            let batch = memories
-                .filter { !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) }
-                .map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
+            let batch = memories.map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
 
             // Delete the old proof BEFORE clearing the derived index. A crash
             // or failure after `removeAll()` must read as unconfirmed rather
@@ -565,9 +563,7 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
             let activeMemories = try await store.listMemories(persona: nil, status: "active", limit: nil)
             snap.storageReadable = true
             snap.sqliteRecordCount = activeMemories.count
-            spotlightEligibleCount = activeMemories.filter {
-                !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix)
-            }.count
+            spotlightEligibleCount = activeMemories.count
             storageGeneration = try await store.projectionGenerationFingerprint()
             if let proposals = try? await store.listProposals(status: "pending") {
                 snap.sqliteProposalCount = proposals.count
