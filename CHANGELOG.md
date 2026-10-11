@@ -6,6 +6,14 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.6.2 — a cleaner first run, fewer rounds (2026-10-11)
+
+### First run
+- Doctor's launch run waits for onboarding; an adopted Codex CLI sign-in reads as an honest search reading, not an ask; Continue is visibly disabled with its reason until a model is chosen.
+
+### Fewer rounds
+- Search continuations return the exact next call; list fan-out advertised from the door's own eligibility; one Mac Integration read answers reach; find ranks description and owner scope over page words; background history reads named on the chat page.
+
 ## 0.6.1 — the body heals, the window follows (2026-10-10)
 
 ### Surfaces as data

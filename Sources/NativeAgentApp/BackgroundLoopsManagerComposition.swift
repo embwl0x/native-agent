@@ -7,6 +7,7 @@ import DoctorChecks
 import MemoryV2
 import NotificationInbox
 import PersistenceCore
+import PersonaEngine
 import Privacy
 
 // MARK: - BackgroundLoopsManager
@@ -76,7 +77,9 @@ public actor BackgroundLoopsManager {
             }
         },
         runAutoDoctorAtLaunch: @escaping @Sendable () -> Bool = {
-            let config = DoctorStatusProjection.readAutoDoctorConfig(dataRoot: PersistenceCore.defaultDataRoot())
+            let dataRoot = PersistenceCore.defaultDataRoot()
+            guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) else { return false }
+            let config = DoctorStatusProjection.readAutoDoctorConfig(dataRoot: dataRoot)
             return (config.enabled ?? true) && (config.runOnStartup ?? true)
         },
         // A4.8a: injectable so tests can suppress the fire-and-forget launch

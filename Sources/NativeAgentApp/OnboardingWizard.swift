@@ -1124,12 +1124,19 @@ private struct OnboardingNavBar: View {
                 .help("Finish setup without a provider — chat won't work until one is connected.")
                 .disabled(!state.canContinue)
             } else {
+                if state.step == .provider && state.providerConnected && !state.providersLoading
+                    && !state.savingModel && !state.chatModelReady {
+                    Text("Choose a model to continue")
+                        .font(NativeAgentFont.label)
+                        .foregroundStyle(.secondary)
+                }
                 Button("Continue") {
                     onContinue()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .disabled(!state.canContinue)
+                .opacity(state.canContinue ? 1 : 0.4)
             }
         }
         .padding(.horizontal, NativeAgentSpacing.xl)

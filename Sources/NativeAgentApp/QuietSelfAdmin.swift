@@ -87,7 +87,7 @@ struct QuietPage: Sendable, Equatable {
 enum QuietPages {
     static let all: [QuietPage] = [
         QuietPage(id: "chat", title: "Chat", item: .chat,
-                  summary: "Conversations, attachments, voice, sessions, and the agent's name and status."),
+                  summary: "Conversations, attachments, voice, sessions, and the agent's name and status. Screen controls are separate from background history: page:chat + item:<conversation id> reads 8 messages or args {limit} up to 16. Resolve with chat.list; chat.search {session_id, sort:newest, limit:12} without query reads older history through next_call; chat.message reads full truncated bodies."),
         QuietPage(id: "today", title: "Today", item: .activity,
                   summary: "Notifications, approvals, proposals, recent work, and what is waiting."),
         QuietPage(id: "memories", title: "Memories", item: .memories,

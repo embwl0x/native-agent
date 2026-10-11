@@ -3,6 +3,7 @@ import ChromeControl
 import Foundation
 import MemoryV2
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import Skills
 import StandingBots
@@ -28,6 +29,8 @@ public struct AppAction: Sendable {
     public let page: String
     /// The button's words.
     public let label: String
+    /// Searchable scope from the action's owning schema or surface vocabulary.
+    public let scope: String
     /// `name`, `a|b` for either, `?` optional, `:type` when not a string;
     /// `:secret` is a key or token, which receipts and logs redact.
     public let args: [String]
@@ -65,13 +68,14 @@ public struct AppAction: Sendable {
     init(_ id: String, _ page: String, _ label: String, _ args: [String] = [], owner: Owner = .hers,
          irreversible: Bool = false, screen: Bool = false, safe: Bool = false, warn: String = "", tool: String = "",
          input: [String: JSONValue] = [:], rename: [String: String] = [:], scriptable: Bool = true, read: Bool = false,
-         versionExempt: Bool = false, revision: Int = 1, readWhen: [String: JSONValue] = [:]) {
+         versionExempt: Bool = false, revision: Int = 1, readWhen: [String: JSONValue] = [:], scope: String = "") {
         self.id = id; self.page = page; self.label = label; self.args = args; self.owner = owner
         self.irreversible = irreversible; self.screen = screen; self.safe = safe; self.warn = warn; self.tool = tool
         self.input = input; self.rename = rename; self.scriptable = scriptable; self.read = read
         self.versionExempt = versionExempt
         self.revision = revision
         self.readWhen = readWhen
+        self.scope = scope
     }
 
     /// A folded tool as an action (`ToolNameAliases.foldedTools` names its
@@ -99,7 +103,8 @@ public struct AppAction: Sendable {
                                ? ["raw?:boolean", "wrong?:boolean", "why?:string"] : []),
                          irreversible: irreversible, screen: screen, warn: warn, tool: tool,
                          rename: Dictionary(uniqueKeysWithValues: names.map { ($0.value, $0.key) }),
-                         scriptable: scriptable ?? read, read: read, versionExempt: versionExempt, readWhen: readWhen)
+                         scriptable: scriptable ?? read, read: read, versionExempt: versionExempt, readWhen: readWhen,
+                         scope: schema.map { ToolNameAliases.foldedProse($0.description) } ?? "")
     }
 
     public var isHis: Bool { if case .his = owner { true } else { false } }
@@ -295,9 +300,9 @@ public enum AppActions {
         // How the window lays out each surface (ui/layout.json), hers to read
         // and rewrite as the person asks; the window changes as a write lands.
         AppAction("layout.read", "settings", "The window's layout: each surface's blocks in order, hidden and expanded, each view's profile, its version, the previous layout and what every block is",
-                  safe: true, tool: "app_page_read", read: true),
+                  safe: true, tool: "app_page_read", read: true, scope: layoutScope),
         AppAction("layout.write", "settings", "Change the layout, passing layout.read's version as layout_version and only what changes (a surface's whole block list, a profile, phone); the window follows at once; writing the previous back undoes it",
-                  ["layout:object", "layout_version"], tool: "app_setting_set", scriptable: false),
+                  ["layout:object", "layout_version"], tool: "app_setting_set", scriptable: false, scope: layoutScope),
         // Settings rows: owner_only rows stay his, lower-only rows move the safe way.
         AppAction("setting.set", "*", "Set", ["setting", "value:any", "because"],
                   warn: "on model turns, because must quote at least 3 words from a person or trusted agent in this conversation; you may restore a switch whose last change was yours",
@@ -900,6 +905,36 @@ public enum AppActions {
                 : SwiftToolDispatcher.authoredTools(dataRoot: root).first { $0.schema.name == action.tool }?.schema)
     }
 
+    static let layoutScope = SurfaceLayout.vocabulary.map { surface, about, blocks in
+        ([surface, about] + blocks.map { $0.name + " " + $0.shows }).joined(separator: " ")
+    }.joined(separator: " ") + " " + SurfaceLayout.profilesAbout
+
+    static func pluralKeys(_ action: AppAction, properties: [String: JSONValue]) -> [String] {
+        func scalar(_ schema: JSONValue) -> Bool {
+            guard case .object(let property) = schema else { return false }
+            let scalarTypes: Set<String> = ["string", "boolean", "integer", "number", "null"]
+            if case .string(let type)? = property["type"] { return scalarTypes.contains(type) }
+            if case .array(let types)? = property["type"] {
+                return types.contains { if case .string(let type) = $0 { scalarTypes.contains(type) } else { false } }
+            }
+            for key in ["anyOf", "oneOf"] {
+                if case .array(let variants)? = property[key] { return variants.contains(where: scalar) }
+            }
+            if case .array(let variants)? = property["allOf"] { return variants.contains(where: scalar) }
+            let values = if case .array(let values)? = property["enum"] { values } else { property["const"].map { [$0] } ?? [] }
+            return values.contains { if case .array = $0 { false } else if case .object = $0 { false } else { true } }
+        }
+        return properties.keys.filter { !action.secretArgs.contains($0) && scalar(properties[$0]!) }.sorted()
+    }
+
+    public static func integrationRoutes(_ integration: String) -> [JSONValue] {
+        return all.compactMap { action in
+            guard let gate = ToolPreloadHeuristics.macIntegrationGates[action.tool], gate.integration == integration else { return nil }
+            return .object(["action": .string(action.id), "mode": .string(gate.mode.rawValue),
+                "connection_readiness": .string("unverified")])
+        }
+    }
+
     /// Discovery uses the door's accepted names and requiredness, retaining
     /// the native schema's descriptions, enums and nested constraints.
     static func discovery(_ action: AppAction, blocker: String? = nil) -> JSONValue {
@@ -968,6 +1003,13 @@ public enum AppActions {
             "args_schema": .object(args), "scriptable": .bool(action.scriptable),
             "read_when": .object(action.readWhen),
             "example": .object(call)]) { _, value in value }
+        let plural = pluralKeys(action, properties: props)
+        if !plural.isEmpty, action.isFold || action.read || !action.readWhen.isEmpty {
+            result["door_expansion"] = .object(["scalar_arguments": .array(plural.map(JSONValue.string)),
+                "max_list_arguments": .int(1),
+                "note": .string("For a folded action or a read call, give one eligible scalar argument a nonempty list to run once per value. Each child retains validation and gates. Native array arguments stay arrays.")])
+        }
+        if !action.scope.isEmpty { result["scope"] = .string(action.scope) }
         if !action.read { result["version_note"] = .string("expected_version is optional. For consecutive versioned calls, use the latest action receipt's page_version; a change can replace the previous version.") }
         if let blocker {
             result["availability"] = .string("unavailable")
@@ -1062,7 +1104,7 @@ public enum AppActions {
         pattern: #"(?i)\b(?:no|without|never|avoid|do\s+not|don['’]t|not)(?!\s+only\b)\s+(.+?)(?=[,.;!?\n]|\s+\b(?:but|instead|however|then)\b|$)"#)
 
     /// `degraded` says why the ranking fell back to words alone; nil when the embedder ranked it.
-    static func ranked(_ query: String, titles: [String: String], dataRoot: URL)
+    static func ranked(_ query: String, pages: [String: QuietToolPage], dataRoot: URL)
         async -> (actions: [AppAction], skills: [(name: String, about: String)], degraded: String?) {
         let range = NSRange(query.startIndex..., in: query)
         let negative = negation.matches(in: query, range: range).compactMap {
@@ -1119,7 +1161,8 @@ public enum AppActions {
                 : (["bot.ask", "bot.list"].contains(action.id) ? helpers : [])
             return [firstSentence(ToolNameAliases.foldedProse(foldSchemas[action.tool]?.description ?? action.label)),
                     action.id.replacingOccurrences(of: ".", with: " "), action.label,
-                    titles[action.page] ?? action.page, action.argSpecs.flatMap(\.names).joined(separator: " "),
+                    action.scope, pages[action.page]?.title ?? action.page, pages[action.page]?.summary ?? "",
+                    action.argSpecs.flatMap(\.names).joined(separator: " "),
                     names.joined(separator: ", ")].joined(separator: " ")
         }
         // Her installed skills ride the same read and blend (10-10: the memory
@@ -1241,7 +1284,7 @@ public enum AppActions {
         } catch { degraded = error.localizedDescription }
         var ranked: [(offset: Int, action: AppAction, score: Double)] = []
         for (offset, action) in actions.enumerated() {
-            let lexical = Double(score(action, asked, pageTitle: titles[action.page] ?? ""))
+            let lexical = Double(score(action, asked, page: pages[action.page]))
             let own: Set<String> = rejected.isEmpty ? [] : Set(intentWords(texts[offset]))
             var value: Double
             if let embedding {
@@ -1255,6 +1298,7 @@ public enum AppActions {
                 value = lexical / (lexical + 12.0) - (rejected.contains { hits(own, $0) > 0 } ? 0.5 : 0)
             }
             value += boost(action)
+            value += Double(matchedWords(action, asked)) / Double(max(1, asked.count))
             if value > 0 { ranked.append((offset, action, value)) }
         }
         // Every skill is a skill: that word alone matches none of them.
@@ -1301,22 +1345,21 @@ public enum AppActions {
         }
     }
 
-    /// How many of the asked words an action carries, in its id, label, page
-    /// or why. A word matches its own stem ("archiving" finds archive).
-    static func score(_ action: AppAction, _ asked: [String], pageTitle: String) -> Int {
+    static func matchedWords(_ action: AppAction, _ asked: [String]) -> Int {
+        hits(Set(intentWords(action.label + " " + action.scope)), asked)
+    }
+
+    /// Description and owner scope carry the action; page context only supports it.
+    static func score(_ action: AppAction, _ asked: [String], page: QuietToolPage?) -> Int {
         var why = ""
         if case .his(let text, let instead) = action.owner { why = text + " " + (instead ?? "") }
-        let own = Set(intentWords([action.id, action.label, action.page, pageTitle, why].joined(separator: " ")))
-        let domain = Set(intentWords(action.page + " " + pageTitle))
+        let own = Set(intentWords(action.label + " " + action.scope))
+        let context = Set(intentWords([action.page, page?.title ?? "", page?.summary ?? "", why].joined(separator: " ")))
         let named = Set(intentWords(action.id))
         let verb = Set(intentWords(String(action.id.split(separator: ".").last ?? "")))
-        let matched = hits(own, asked)
-        // In a longer ask, one shared word ("read", "settings") backs no bonus.
+        let matched = hits(own.union(context).union(named), asked)
         guard matched >= 2 || asked.count <= 2 else { return matched }
-        return matched + 8 * asked.filter { domain.contains($0) }.count
-            + 4 * asked.filter { named.contains($0) }.count
-            + 6 * asked.filter { verb.contains($0) }.count
-            + (asked.contains("read") && domain.contains("mail") && action.read ? 4 : 0)
+        return 8 * hits(own, asked) + hits(context, asked) + 2 * hits(named, asked) + 2 * hits(verb, asked)
     }
 
     static func hits(_ own: Set<String>, _ asked: [String]) -> Int {

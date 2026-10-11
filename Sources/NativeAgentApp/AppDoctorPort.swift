@@ -109,6 +109,15 @@ extension AppDoctorPort {
         await WebSearchRoutes.codexSignedIn(dataRoot: dataRoot)
     }
 
+    func doctorSearchSetupReading() -> String? {
+        let owned = NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot)
+        guard !FileManager.default.fileExists(atPath: owned.path),
+              OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: dataRoot) == .allowed,
+              OpenAIOAuthDirectAdapter.hasUsableTokens(at: OpenAIOAuthDirectAdapter.defaultUserCodexHome()
+                .appendingPathComponent("auth.json")) else { return nil }
+        return "Chat uses your adopted Codex CLI sign-in. General search currently requires a separate NativeAgent ChatGPT sign-in; no search has been measured."
+    }
+
     /// Doctor state: the local SearXNG URL for which Docker was checked and
     /// holds no SearXNG container. Automatic runs leave Docker Desktop closed
     /// until the URL changes or Repair is pressed.

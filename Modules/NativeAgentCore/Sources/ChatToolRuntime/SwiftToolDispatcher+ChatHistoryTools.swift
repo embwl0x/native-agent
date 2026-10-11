@@ -597,6 +597,10 @@ extension SwiftToolDispatcher {
         }
         if offset + out.count < selectableCount {
             response["next_offset"] = .int(Int64(offset + out.count))
+            var args = input.filter { !$0.key.hasPrefix("__") && $0.key != "current_session_id" }
+            args["offset"] = response["next_offset"]
+            response["next_call"] = .object(["tool": .string("app"), "input": .object([
+                "action": .string("chat.search"), "args": .object(args)])])
         }
         if let currentSessionId, !currentSessionId.isEmpty {
             response["current_session_id"] = .string(currentSessionId)

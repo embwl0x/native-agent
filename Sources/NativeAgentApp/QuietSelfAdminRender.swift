@@ -15,6 +15,7 @@ import MacIntegration
 import MemoryV2
 import Studio
 import ToolRegistry
+import TrustCenter
 import PersonaEngine
 
 /// Only screenshots mount an offscreen copy of a page. Text reads load owner
@@ -435,10 +436,14 @@ extension QuietSelfAdminRender {
         case .telegram: return telegramProjection(appModel: appModel)
         case .mcp: return mcpProjection(appModel: appModel)
         case .macIntegration:
-            return [section("Mac Integration", [
-                "Each app's access is a setting below (off, read, write, read_write). Under Full Mac an app "
-                + "left untouched is allowed anyway; one set off here stays off.",
-            ])]
+            var capabilities: [JSONValue] = []
+            for mac in MacIntegrationID.all { capabilities.append(await macAccess(mac, appModel: appModel)) }
+            var overview: [JSONValue] = [.object(["heading": .string("Mac Integration"), "capabilities": .array(capabilities),
+                "note": .string("Supported routes, effective permission, connection readiness and verified OS access are separate facts. Unverified means this page has not checked access. No app or content was probed; no permission was requested.")])]
+            if appModel.panelRefreshStatus[.macIntegration]?.failedEndpoints.contains("connectors") == true {
+                overview.append(section("Connection readiness", ["Unavailable: the checked connector read failed; current connection status cannot be reported."]))
+            } else { overview += connectorsProjection(appModel: appModel) }
+            return overview
         case .personality: return await personalityProjection(appModel: appModel)
         case .settings: return settingsProjection(appModel: appModel)
         default: return []
@@ -1057,29 +1062,56 @@ extension QuietSelfAdminRender {
         "github": (nil, ["github"]), "slack": (nil, ["slack"]), "notion": (nil, ["notion"]), "x": (nil, ["x"]),
     ]
 
-    private static func serviceProjection(_ page: QuietPage, _ service: (mac: String?, connectors: [String]),
-                                          appModel: AppModel) async -> [JSONValue] {
-        var lines: [String] = []
-        if let mac = service.mac {
-            let store = MacIntegrationPermissionStore.shared
-            let admitted = await appModel.fullMacYoloAuthorityAdmitted(tool: "mac_integration",
+    private static func macAccess(_ mac: String, appModel: AppModel) async -> JSONValue {
+        let routes = AppActions.integrationRoutes(mac)
+        var access: [String: JSONValue] = ["integration": .string(mac), "name": .string(MacIntegrationID.displayName(for: mac)),
+            "supported_routes": .array(routes), "supported": .bool(!routes.isEmpty),
+            "verified_os_access": .string("unverified"), "setting": .string("trust.mac_integration_\(mac)")]
+        do {
+            let store = MacIntegrationPermissionStore(dataRoot: dataRoot(appModel))
+            let stored = try await store.currentChecked()[mac]!
+            let readiness = try await store.readinessChecked()
+            var origin = SecurityOriginContext.currentTurn(verifiedSessionId: ChatToolSessionContext.verifiedSessionId,
                 surface: ChatToolSessionContext.envelope?.surface ?? "chat")
-            let storedRead = await store.allows(mac, mode: .read), storedWrite = await store.allows(mac, mode: .write)
+            origin.source = "native_client_direct_action"
+            let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot(appModel)).fullMacYoloAuthority(tool: "mac_integration", origin: origin)
+            access["full_mac_admission"] = .string(authority.state.rawValue)
+            access["full_mac_reason"] = .string(authority.reason)
+            if authority.state == .unavailable || authority.state == .explicitlyBlocked {
+                access["permission_state"] = .string(authority.state == .unavailable ? "unavailable" : "blocked")
+                access["blocker"] = .string(authority.reason)
+                return .object(access)
+            }
+            let admitted = authority.admitted
             let read = await store.allows(mac, mode: .read, fullMacAdmitted: admitted)
             let write = await store.allows(mac, mode: .write, fullMacAdmitted: admitted)
-            let access = read && write ? "read and write" : read ? "read" : write ? "write" : "off"
-            let stored = storedRead && storedWrite ? "read and write" : storedRead ? "read" : storedWrite ? "write" : "off"
-            lines.append("\(MacIntegrationID.displayName(for: mac)) effective permission: \(access); stored permission: \(stored) "
-                + "(Full Mac \(admitted ? "admitted" : "not admitted"); macOS permissions still apply; "
-                + "setting trust.mac_integration_\(mac), on mac_integration)")
+            access["effective_permission"] = .object(["read": .bool(read), "write": .bool(write)])
+            access["stored_permission"] = .object(["read": .bool(stored.read), "write": .bool(stored.write)])
+            access["full_mac_admitted"] = .bool(admitted)
+            access["permission_state"] = .string(read || write ? "allowed" : "off")
+            access["permission_blockers"] = .array([MacIntegrationPermissionMode.read, .write].compactMap {
+                readiness.refusal(integration: mac, mode: $0).map(JSONValue.string)
+            })
+        } catch {
+            access["permission_state"] = .string("unavailable")
+            access["blocker"] = .string(error.localizedDescription)
         }
+        return .object(access)
+    }
+
+    private static func serviceProjection(_ page: QuietPage, _ service: (mac: String?, connectors: [String]),
+                                          appModel: AppModel) async -> [JSONValue] {
+        var sections: [JSONValue] = []
+        var lines: [String] = []
+        if let mac = service.mac { sections.append(await macAccess(mac, appModel: appModel)) }
         for connector in appModel.connectors where service.connectors.contains(connector.id) {
             lines.append("\(connector.name.isEmpty ? connector.id : connector.name): \(connector.enabled ? "on" : "off") · "
                 + ConnectorsView.statusText(for: connector, uiState: ConnectorUIState.resolve(authState: connector.authState, healthStatus: connector.healthStatus))
                 + (connector.authState.map { " · \($0)" } ?? ""))
         }
-        if lines.isEmpty { lines.append("\(page.title) is not set up in Connectors.") }
-        return [section(page.title, lines)]
+        if lines.isEmpty, sections.isEmpty { lines.append("\(page.title) is not set up in Connectors.") }
+        if !lines.isEmpty { sections.append(section(page.title, lines)) }
+        return sections
     }
 
     /// The Agents tab's rows, as its own reload builds them.

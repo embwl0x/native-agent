@@ -56,6 +56,7 @@ public protocol DoctorActionPort: Sendable {
     func doctorTelegramSnapshot() async throws -> DoctorTelegramSnapshot
     func doctorSearchURL() async throws -> String?
     func doctorProbeSearch(base: String) async -> Bool
+    func doctorSearchSetupReading() -> String?
     /// Codex web search, the route that answers first: is its login live?
     func doctorProbeCodexSearch() async -> Bool
     /// Doctor state: Docker was checked for this search URL and holds no SearXNG.
@@ -567,6 +568,9 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
     }
 
     private func searchDoctorCoverageCheck(_ raw: String, probe: Bool) async -> CheckResult {
+        if raw.isEmpty, let detail = port.doctorSearchSetupReading() {
+            return CheckResult(id: "live.search", title: "Search", status: "unmeasured", detail: detail)
+        }
         let validCategoryURL = URL(string: raw).map {
             ["http", "https"].contains($0.scheme?.lowercased() ?? "")
                 && $0.host?.isEmpty == false && $0.query == nil && $0.fragment == nil

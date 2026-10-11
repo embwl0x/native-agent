@@ -137,8 +137,8 @@ extension AppToolExecutor {
     /// The items a page reads besides inbox notes: the id, and what reading
     /// it returns.
     static let doorItemReads: [String: [String: String]] = [
-        "chat": ["<conversation id>": "the composer as it is, and the latest messages, 8 or args {limit} up to 16, "
-                 + "with whether app chat.reply can answer it"],
+        "chat": ["<conversation id>": "background read with page:chat and item:<conversation id>: the composer and latest messages, 8 or args {limit} up to 16 messages, with whether app chat.reply can answer it. "
+                 + "For older history, resolve with chat.list, then chat.search {session_id, sort:newest, limit:12} without query; follow next_call and use chat.message for full truncated bodies. Screen controls are separate actions."],
         "inbox": ["all": "compact notes newest first, archived and dismissed too, up to 200; read a note id for details and actions"],
         "desk": ["<exact title or handle>": "the matching Desk record; duplicate titles require the exact desk number"],
         "diagnostics": ["doctor": "Doctor's last report; run doctor.run for fresh checks"],
@@ -703,14 +703,14 @@ extension AppToolExecutor {
         let photosRead = AppActions.photosIntent(query)
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let permissions = try? await MacIntegrationPermissionStore(dataRoot: root).readinessChecked()
-        let titles = Dictionary(doorPages.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
+        let pageIndex = Dictionary(doorPages.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var senses: [SenseRecord] = []
         var sensesError: String?
         do { senses = try await SensesHub.shared.registry?.all() ?? [] }
         catch { sensesError = error.localizedDescription }
         let active = Set(senses.filter { $0.status == .on }.map(\.id))
         let unready = AgentWorkspaceReadiness.unreadyTools(dataRoot: root)
-        let (ranked, rankedSkills, degraded) = await AppActions.ranked(query, titles: titles, dataRoot: root)
+        let (ranked, rankedSkills, degraded) = await AppActions.ranked(query, pages: pageIndex, dataRoot: root)
         let actions = ranked.prefix(5)
         let pages = doorPages.map { page in
             (page, AppActions.hits(Set(AppActions.intentWords(page.id + " " + page.title + " " + page.summary)), asked))
@@ -774,13 +774,13 @@ extension AppToolExecutor {
             found["location_note"] = .string("This Mac has no current location reader. The owner's location is unknown; a timezone does not identify their city. Ask for a city or use phone.request {kind:\"location.current\"} if they want to share their phone's location; an expired request is not a location.")
         }
         // "my …" with no strong local action (battery, IP, volume have one) is a personal fact to look up.
-        let strongLocal = ranked.contains(where: { !$0.id.hasPrefix("web.") && AppActions.score($0, asked, pageTitle: titles[$0.page] ?? "") >= 8 })
+        let strongLocal = ranked.contains(where: {
+            !$0.id.hasPrefix("web.") && AppActions.matchedWords($0, asked) >= max(2, (asked.count + 1) / 2)
+        })
         if words.contains("my"), information || words.first == "my", !strongLocal, !photosRead, actions.first?.id != "weather.forecast" {
             found["next_call"] = .object(["action": .string("work.context"), "args": .object(["query": .string(query)])])
             found["next_note"] = .string("Mail, Messages and Notes can hold personal facts. Start with work.context for saved work, conversations and recent Mail sender/subject matches; open an observed mail.N to read its body. If needed, search Messages or Notes directly before asking the person.")
-        } else if information, !photosRead, actions.first?.id != "weather.forecast", !ranked.contains(where: {
-            !$0.id.hasPrefix("web.") && AppActions.score($0, asked, pageTitle: titles[$0.page] ?? "") >= 8
-        }) {
+        } else if information, !photosRead, actions.first?.id != "weather.forecast", !strongLocal {
             found["next_call"] = .object(["action": .string("web.search"), "args": .object(["query": .string(query)])])
             found["read_with"] = .object(["action": .string("web.read"),
                 "args": .object(["url": .string("<URL from search result>")])])
@@ -909,8 +909,9 @@ extension AppToolExecutor {
     static func doorPlural(_ action: AppAction, _ args: [String: JSONValue]) -> (String, [JSONValue])? {
         guard case .object(let discovery) = AppActions.discovery(action), case .object(let schema)? = discovery["args_schema"],
               case .object(let properties)? = schema["properties"] else { return nil }
+        let eligible = AppActions.pluralKeys(action, properties: properties)
         let plural = args.compactMap { key, value -> (String, [JSONValue])? in
-            guard case .array(let values) = value, !values.isEmpty, !action.secretArgs.contains(key),
+            guard eligible.contains(key), case .array(let values) = value, !values.isEmpty,
                   let property = properties[key], doorTypeProblem(value, schema: property, path: key) != nil,
                   values.allSatisfy({ if case .array = $0 { false } else if case .object = $0 { false } else { true } })
             else { return nil }
@@ -937,7 +938,7 @@ extension AppToolExecutor {
                 remedy: "find", "Use one of nearest, find it by what you want done, or open a home name with item; nothing was done.",
                 next: ["find": .string(id)],
                 extra: ["requested": .string(id),
-                        "nearest": .array(await AppActions.ranked(id, titles: [:],
+                        "nearest": .array(await AppActions.ranked(id, pages: [:],
                             dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
                             .actions.prefix(3).map { .string($0.line) })])
         }
