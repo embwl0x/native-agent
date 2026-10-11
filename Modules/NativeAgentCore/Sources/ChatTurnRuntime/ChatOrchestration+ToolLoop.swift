@@ -1,4 +1,6 @@
 import ChatToolParsing
+import ChatToolRuntime
+import NativeAgentShared
 import Foundation
 import Dispatcher
 import NativeAgentCore
@@ -19,7 +21,7 @@ import TrustCenter
 // through the injected tool client, and returns tool results to the provider.
 // Tool errors remain model-visible feedback. The loop itself lives in
 // ChatOrchestration+StreamingToolLoop.swift; its dispatch, completion, and
-// exhaustion segments are below.
+// waiting segments are below.
 
 // MARK: - Lazy tool filtering
 
@@ -59,7 +61,7 @@ extension TurnContext {
 
 extension SwiftNativeTurnEngine {
     // MARK: - Turn-loop segments
-    // Context, completion, dispatch and exhaustion. Provider calls stay in the
+    // Context, completion, dispatch and waiting. Provider calls stay in the
     // loop, which owns live deltas and protocol-buffer cleanup.
 
     /// Empty replies leave no assistant message. Append the nudge through
@@ -131,18 +133,9 @@ extension SwiftNativeTurnEngine {
         userMessage: String,
         sessionId: String?,
         surface: String,
-        workingCommentaryCharacters: Int? = nil
+        workingCommentaryCharacters: Int? = nil,
+        completionState: TurnEngineResult.CompletionState = .completed
     ) async -> TurnEngineResult {
-        // An assistant row is NEVER blank. A completed turn whose reply trims
-        // to nothing persisted an empty bubble under the receipts — the
-        // "Looked something up · 8 of 12 failed" card with no sentence beside
-        // it. Keep this guard at the shared completed-turn boundary too.
-        let reply = reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? ToolLoopExhaustion.emptyReply(
-                dispatchCount: dispatches.count,
-                providerRounds: providerCallCount
-            )
-            : reply
         let recalledIds = ctx.resolvedRecalledIds
         await ctx.fluidContextTurn?.recordOutcome(.completed)
         await queuePromises(in: reply, dispatches: dispatches, surface: surface)
@@ -173,7 +166,7 @@ extension SwiftNativeTurnEngine {
             elapsedMs: elapsedMs,
             rawLLMResponse: rawLLMResponse,
             providerCallCount: providerCallCount,
-            completionState: .completed,
+            completionState: completionState,
             memoryPromotionTicket: promotionTicket,
             workingCommentaryCharacters: workingCommentaryCharacters
         )
@@ -241,22 +234,14 @@ extension SwiftNativeTurnEngine {
         }
     }
 
-    /// A stopped dispatch round carries its actual cause: takeover, a needed
-    /// interaction, or the no-progress guard. Otherwise it continues.
-    ///
-    /// `madeProgress` is the whole-turn wall-clock budget's extension signal:
-    /// true when at least ONE dispatch in the round returned a real result
-    /// (`ChatToolOutcome.outputLooksSuccessful` — the same classification that
-    /// sets the provider's tool_result `is_error` bit). An all-errored round is
-    /// exactly the stuck case the budget exists to kill, so it extends nothing.
-    enum ToolDispatchRoundOutcome { case continueLoop(madeProgress: Bool), stopLoop(TurnEngineResult.TerminalReason) }
+    /// A dispatch round continues or waits for the person.
+    enum ToolDispatchRoundOutcome { case continueLoop, waiting(TurnEngineResult.TerminalReason) }
 
     /// Post-provider-call round of the structured loop: mint the
     /// assistant message (prose + tool_use blocks, synthesizing collision-free
     /// ids for id-less calls), dispatch the iteration's calls through the shared
     /// core, append the paired tool_result user message, run the no-progress
-    /// guard, and — unless a stop was raised — refresh same-turn tool schemas and
-    /// age older tool-result bodies (compat-only). The loop flushes its
+    /// guard. The loop flushes its
     /// pending prose delta BEFORE calling this.
     func runToolDispatchRound(
         providerCalls: [ParsedToolCall],
@@ -268,15 +253,14 @@ extension SwiftNativeTurnEngine {
         progress: ChatOrchestrationProgressHandler?,
         conversation: inout [LLMMessage],
         dispatches: inout [TurnEngineResult.ToolDispatchRecord],
-        providerTools: inout ProviderToolNameMap,
+        providerTools: ProviderToolNameMap,
         noProgressGuard: inout ToolLoopNoProgressGuard,
-        loopRecoveryReply: inout String?,
         cancelFlagPath: URL? = nil,
         /// Set on the marker protocol: the round replays as the model's own
         /// text and its results come back as one text message (8b carrier).
         markerCodec: TextMarkerCodec? = nil,
         toolBoundaryReason: LLMToolBoundaryReason? = nil
-    ) async throws -> ToolDispatchRoundOutcome {
+    ) async -> ToolDispatchRoundOutcome {
         // Append the assistant turn that contained the tool calls. Strip any
         // <tool_use> markers from the surfaced text so the assistant text block
         // carries only the model's prose (the structured toolUse blocks below
@@ -352,54 +336,50 @@ extension SwiftNativeTurnEngine {
                 )
                 resultIndex += 1
             }
-            if resultIndex > 0 { markerCodec.closeRound(&carrier, boundaryReason: toolBoundaryReason) }
+            if resultIndex > 0 { markerCodec.closeRound(&carrier) }
             toolResultBlocks = (carrier.isEmpty ? [] : [.text(carrier)]) + images
         }
         dispatches.append(contentsOf: iterationRecords)
         ChatTurnExecution.current?.keepTools(iterationRecords)
+        conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
+        if let toolBoundaryReason {
+            TurnObservation.apply(.boundary(toolBoundaryReason), to: &conversation, surface: surface)
+        }
+        LocalToolImage.boundConversation(&conversation)
         // An app chrome.* call is the Chrome tool it ran, with its args as input.
-        if let stopped = iterationRecords.first(where: {
+        if iterationRecords.contains(where: {
             let ran = ToolNameAliases.ranTool($0.name, input: $0.input)
             return Self.driverTakeoverReceipt($0.result) != nil
                 || (!MacAttentionSessionStore.shared.currentDriverAllowed
                     && ["act", "go"].contains(ran)
                     && ChatToolOutcome.wasCancelled($0.result))
         }) {
-            let stoppedName = ToolNameAliases.ranTool(stopped.name, input: stopped.input)
-            let stoppedInput = ToolNameAliases.ranInput(stopped.name, input: stopped.input)
-            let receipt = Self.driverTakeoverReceipt(stopped.result) ?? [:]
-            let place = [stoppedInput["app"], stoppedInput["target"], stoppedInput["url"]]
-                .compactMap { if case .string(let value)? = $0 { value } else { nil } }
-                .joined(separator: " · ")
-            var lines = ["I stopped because you took control of the Mac."]
-            if !place.isEmpty { lines.append("Stopped at: " + place + ".") }
-            if case .object(let result) = stopped.result, case .string(let text)? = result["text"] {
-                lines.append(String(text.prefix(1_600)))
-            }
-            for (key, label) in [("failed_step", "Stopped at step"), ("steps_completed", "Steps completed"), ("steps_total", "Steps requested"), ("repeat_completed", "Attempts completed"), ("posted_events", "Input events sent"), ("characters_sent", "Characters sent"), ("requested_events_emitted", "Gesture events sent"), ("recovery_events_emitted", "Held inputs released"), ("gesture", "Gesture"), ("outcome", "Outcome")] {
-                if let value = receipt[key], value != .null {
-                    if let data = try? value.serializedData(pretty: false), let text = String(data: data, encoding: .utf8) {
-                        lines.append(label + ": " + text)
+            await progress?(.notice(kind: "mac_handback", text:
+                "You took control of the Mac; waiting for you to return control."))
+            // Keep the conversation and its delivery route alive while the
+            // existing handback event or this run's Stop releases the wait.
+            let changes = await MacAttentionSessionStore.shared.driverChanges(waitingForReturn: true)
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    for await _ in changes {
+                        if Self.dispatchCancelSignalled(cancelFlagPath)
+                            || MacAttentionSessionStore.shared.currentDriverAllowed { return }
                     }
                 }
-            }
-            if stoppedName.contains("chrome") {
-                let tab: Int64? = if case .int(let value)? = receipt["tabId"] ?? stoppedInput["tab_id"] { value } else { nil }
-                if let page = ChromePageMirror.page(tab: tab, session: sessionId) {
-                    lines.append("Chrome page: " + page.title + " · " + page.url)
-                    let node = receipt["nodeId"] ?? receipt["targetNodeId"] ?? stoppedInput["node_id"]
-                    if (receipt["snapshotId"] ?? stoppedInput["snapshot_id"]) == .string(page.snapshotID),
-                       case .string(let id)? = node, let target = page.rows.first(where: { $0.node == id }) {
-                        lines.append("Chrome target: " + target.label)
+                if let flag = cancelFlagPath {
+                    group.addTask {
+                        let stop = FileChangeEvents(paths: [URL(fileURLWithPath: flag.path)])
+                        defer { stop.cancel() }
+                        for await _ in stop.stream {
+                            if Self.dispatchCancelSignalled(flag) { return }
+                        }
                     }
                 }
-                lines.append("Chrome action: " + stoppedName.replacingOccurrences(of: "browser.chrome_", with: ""))
+                _ = await group.next()
+                group.cancelAll()
             }
-            let handback = String(lines.joined(separator: "\n").prefix(2_200))
-                + "\nInput already sent may have changed the app; unfinished work remains unverified. Under Full Mac I'll pick it up when you ask; otherwise I'll wait until you return Mac control with Let agent use Mac."
-            loopRecoveryReply = handback
-            await progress?(.notice(kind: "mac_handback", text: handback))
-            return .stopLoop(.humanTakeover)
+            if Self.dispatchCancelSignalled(cancelFlagPath) { return .continueLoop }
+            Self.appendStructuredUserNudge("Mac control has returned; continue from the recorded results.", to: &conversation)
         }
         if StandingBotContinuity.isHelperTurn, iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
             ChatTurnExecution.current?.waitForApproval()
@@ -410,48 +390,46 @@ extension SwiftNativeTurnEngine {
             .compactMap({ InlineInteractionNeed.interaction(in: $0.result) })
             .first(where: InlineInteractionNeed.blocksTurn) {
             ChatTurnExecution.current?.waitForInteraction(waiting)
-            return .stopLoop(.interactionRequired)
-        }
-        // Whole-turn budget extension signal (see ToolDispatchRoundOutcome).
-        // User, 2026-09-06: an approval FILED is not a tool that ran, so it does
-        // not re-earn the surface window. A model stuck re-asking for the same
-        // CONFIRM renewed the budget every round and rode the turn to the
-        // iteration cap.
-        let madeProgress = iterationRecords.contains {
-            ChatToolOutcome.outputLooksSuccessful($0.result)
-                && !ChatToolOutcome.isWaitingOnPerson($0.result)
-                && !ChatToolOutcome.neverRan($0.result)
+            return .waiting(.interactionRequired)
         }
         switch noProgressGuard.observe(iterationRecords) {
         case .none:
             break
         case .warn(let feedback, let visible):
-            // 2026-09-13 (first-failure pass): the model-directed correction
-            // used to go straight into the visible progress stream, so the
-            // reader was handed the agent's repair work ("change the
-            // arguments", "use a narrower query"). Only an evidenced blocker
-            // they can actually resolve surfaces now; the correction still
-            // rides into the conversation below, where it belongs.
             if let visible {
                 await progress?(.notice(kind: "tool_loop_recovery", text: visible))
             }
-            // 2026-07-21 audit fix: the WARN text is model-directed
-            // guidance ("change the arguments, use a narrower query or a
-            // different tool...") but only the USER ever saw it — the
-            // model repeated identical rounds 9-15 with zero corrective
-            // signal until the hard stop (whose feedback IS appended).
-            // Feed it into the conversation like the stop branch does.
-            toolResultBlocks.append(.text(feedback))
-        case .stop(let feedback, let visible):
-            toolResultBlocks.append(.text(feedback))
-            // The final answer is the person-facing half: what stopped and what
-            // survived, never an inference about the agent's arguments.
-            loopRecoveryReply = visible
+            Self.appendStructuredUserNudge(feedback, to: &conversation)
+        case .wait(let count):
+            let question = "I've done the same thing \(count) times in a row without getting further — keep going, or change course?"
+            let input: [String: JSONValue] = [
+                "kind": .string("choose"), "title": .string(question),
+                "why": .string(question),
+                "decline_consequence": .string("I'll wait for your direction before carrying on."),
+                "options": .array([
+                    .object(["id": .string("keep_going"), "label": .string("Keep going")]),
+                    .object(["id": .string("change_course"), "label": .string("Change course")]),
+                ]),
+            ]
+            // The existing receipt path stamps and persists the same-turn continuation.
+            let need = InlineInteraction(kind: .choose, target: "", title: question,
+                why: question, primaryActionLabel: "Choose",
+                declineConsequence: "I'll wait for your direction before carrying on.",
+                cardProse: question, options: [
+                    .init(id: "keep_going", label: "Keep going"),
+                    .init(id: "change_course", label: "Change course"),
+                ])
+            let result = InlineInteractionNeed.envelope(need)
+            ChatTurnExecution.current?.waitForInteraction(need)
+            let record = TurnEngineResult.ToolDispatchRecord(name: InlineInteractionWire.toolName,
+                input: input, result: result)
+            dispatches.append(record)
+            ChatTurnExecution.current?.keepTools([record])
+            await progress?(.toolUse(name: record.name, input: .object(input)))
+            await progress?(.toolResult(name: record.name, output: result))
+            return .waiting(.interactionRequired)
         }
-        conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
-        LocalToolImage.boundConversation(&conversation)
-        if loopRecoveryReply != nil { return .stopLoop(.noProgress) }
-        return .continueLoop(madeProgress: madeProgress)
+        return .continueLoop
     }
 
     private static func driverTakeoverReceipt(_ value: JSONValue, depth: Int = 0) -> [String: JSONValue]? {
@@ -468,13 +446,6 @@ extension SwiftNativeTurnEngine {
         return nil
     }
 
-    /// Shared exhaustion tail for a loop that ran out of iterations without a
-    /// final reply: pick the best-effort reply (loop-recovery stop > protocol-
-    /// violation terminal > exhaustion fallback when there's no usable prose or
-    /// the last raw was only a structured tool call > the stripped fallback
-    /// text), record the abandoned outcome, run memory promotion, and build the
-    /// result. A streamed tool-call round also counts as "only a structured
-    /// tool call", so that extra signal is a parameter.
     /// The turn's OWN terminal for "waiting on you".
     ///
     /// A raised need is not exhaustion, not a protocol violation, and not a
@@ -508,115 +479,4 @@ extension SwiftNativeTurnEngine {
         )
     }
 
-    func finishExhaustedTurn(
-        ctx: TurnContext,
-        lastRawResponse: String,
-        lastProtocolViolation: ToolCallProtocolViolation?,
-        loopRecoveryReply: String?,
-        iterationLimit: Int,
-        wallClockElapsedSeconds: Int?,
-        dispatches: [TurnEngineResult.ToolDispatchRecord],
-        startNs: UInt64,
-        providerCallCount: Int,
-        userMessage: String,
-        sessionId: String?,
-        surface: String,
-        additionalStructuredToolCallSignal: Bool,
-        /// Prose the user ALREADY WATCHED RENDER this turn, marker-stripped.
-        /// User, 2026-09-06: a streaming turn that hit the whole-turn budget in
-        /// the reconnect ladder took the generic exhaustion reply whenever an
-        /// earlier round had tool calls, and the client persisted THAT as the
-        /// reply — so displayed paragraphs vanished on reload.
-        visiblePartial: String,
-        codec: ToolCallCodec = .native
-    ) async -> TurnEngineResult {
-        let fallbackText = ToolCallParser.stripToolUseMarkers(lastRawResponse).trimmingCharacters(in: .whitespacesAndNewlines)
-        let recalledIds = ctx.resolvedRecalledIds
-        let rawWasOnlyStructuredToolCall = additionalStructuredToolCallSignal
-            || !ToolCallParser.parse(lastRawResponse, parseInvoke: codec == .textMarkers).isEmpty
-        // What the user saw stays: the terminal line explains the stop, but it
-        // never REPLACES prose that already rendered.
-        //
-        // User, 2026-09-06: this used to apply on the exhaustion branch alone, so
-        // a turn that ended on the no-progress guard or on a protocol violation
-        // persisted the canned line by itself and the paragraphs the user had
-        // just watched render vanished on reload.
-        let shown = visiblePartial.trimmingCharacters(in: .whitespacesAndNewlines)
-        func keepingVisible(_ terminal: String) -> String {
-            shown.isEmpty ? terminal : shown + "\n\n" + terminal
-        }
-        let final: String
-        if let loopRecoveryReply {
-            final = keepingVisible(loopRecoveryReply)
-        } else if let lastProtocolViolation {
-            final = keepingVisible(lastProtocolViolation.terminalReply)
-        } else if fallbackText.isEmpty || rawWasOnlyStructuredToolCall {
-            final = keepingVisible(ToolLoopExhaustion.fallbackReply(
-                iterationLimit: iterationLimit,
-                dispatchCount: dispatches.count,
-                providerRounds: providerCallCount,
-                wallClockElapsedSeconds: wallClockElapsedSeconds
-            ))
-        } else {
-            final = fallbackText
-        }
-        await ctx.fluidContextTurn?.recordRetry()
-        await ctx.fluidContextTurn?.recordOutcome(.abandoned)
-        let promotionTicket = deferMemoryPromotion(
-            userMessage: userMessage,
-            assistantMessage: final,
-            toolDispatches: dispatches,
-            sessionId: sessionId,
-            surface: surface
-        )
-        let endNs = DispatchTime.now().uptimeNanoseconds
-        let elapsedMs = Int((endNs &- startNs) / 1_000_000)
-        return TurnEngineResult(
-            reply: final,
-            modelUsed: ctx.modelId,
-            recalledIds: recalledIds,
-            toolDispatches: dispatches,
-            elapsedMs: elapsedMs,
-            rawLLMResponse: lastRawResponse,
-            providerCallCount: providerCallCount,
-            completionState: .incomplete,
-            memoryPromotionTicket: promotionTicket
-        )
-    }
-
-    /// A provider output budget is a terminal incomplete answer, with no retry
-    /// or dispatch of the unfinished round's tool plan.
-    func finishLengthLimitedTurn(
-        ctx: TurnContext,
-        partial: String,
-        dispatches: [TurnEngineResult.ToolDispatchRecord],
-        startNs: UInt64,
-        providerCallCount: Int,
-        userMessage: String,
-        sessionId: String?,
-        surface: String,
-        codec: ToolCallCodec = .native
-    ) async -> TurnEngineResult {
-        // 2026-09-23: keep the prose before any repetition loop, and say why.
-        let (kept, notice) = RunawayOutputDetector.cutoffReply(partial)
-        let prefix = codec.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(kept))
-        let prose = LLMCallContext.turnTokenBudget != nil ? prefix : prefix.trimmingCharacters(in: .whitespacesAndNewlines)
-        await ctx.fluidContextTurn?.recordOutcome(.abandoned)
-        let reply = LLMCallContext.turnTokenBudget != nil ? prose : (prose.isEmpty ? notice : prose + "\n\n" + notice)
-        let promotionTicket = deferMemoryPromotion(
-            userMessage: userMessage, assistantMessage: reply, toolDispatches: dispatches,
-            sessionId: sessionId, surface: surface
-        )
-        return TurnEngineResult(
-            reply: reply,
-            modelUsed: ctx.modelId,
-            recalledIds: ctx.resolvedRecalledIds,
-            toolDispatches: dispatches,
-            elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
-            rawLLMResponse: partial,
-            providerCallCount: providerCallCount,
-            completionState: .incomplete,
-            memoryPromotionTicket: promotionTicket
-        )
-    }
 }

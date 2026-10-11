@@ -187,15 +187,6 @@ public func makeChatOrchestrationClient(
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     // 2026-09-06: forward the engine's retry wait seam for factory fixtures.
     providerRecoverySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
-    /// Per-surface tool-loop budget override forwarded to
-    /// `ToolLoopBudget.resolve(surface:requested:)` (clamped to hardCap).
-    /// nil = the surface's default. The bridge profile passes 180: the loop
-    /// runs under surface "chat" (the model pick must keep following the
-    /// chat picker — 2026-06-13), so a surface-keyed budget can never reach
-    /// it (proven live 2026-08-27: Agent exhausted at 60 with the
-    /// "claude-bridge" budget case shipped but unreachable).
-    toolLoopMaxIterations: Int? = nil,
-    turnWallClockSeconds: TimeInterval? = nil,
     continuationCapabilityProfile: String? = nil,
     /// OPTIONAL CREDENTIAL/ROUTING ROOT — token-refresh writes allowed there, nothing else (nil = today's behaviour,
     /// byte for byte). See `makeDefaultChatOrchestrationClient`.
@@ -225,8 +216,6 @@ public func makeChatOrchestrationClient(
         tools: tools,
         approvalFiler: approvalFiler,
         providerRecoverySleep: providerRecoverySleep,
-        toolLoopMaxIterations: toolLoopMaxIterations,
-        turnWallClockSeconds: turnWallClockSeconds,
         continuationCapabilityProfile: continuationCapabilityProfile,
         dataRoot: dataRoot,
         providersRoot: providersRoot,
@@ -398,8 +387,6 @@ private func makeDefaultChatOrchestrationClient(
     tools: any ToolDispatchClient,
     approvalFiler: (any ApprovalFiler)?,
     providerRecoverySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
-    toolLoopMaxIterations: Int? = nil,
-    turnWallClockSeconds: TimeInterval? = nil,
     continuationCapabilityProfile: String? = nil,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     /// OPTIONAL CREDENTIAL/ROUTING ROOT. Reads credentials + routing there; the ONLY
@@ -534,8 +521,6 @@ private func makeDefaultChatOrchestrationClient(
         turnTraceBus: turnTraceBus,
         trust: trust,
         approvalFiler: approvalFiler,
-        toolLoopMaxIterations: toolLoopMaxIterations,
-        turnWallClockSeconds: turnWallClockSeconds,
         continuationCapabilityProfile: continuationCapabilityProfile,
         // AdaptiveMemoryPromoter.shared is rooted in the production MemoryV2
         // singleton.  An alternate-root client must never feed a synthetic

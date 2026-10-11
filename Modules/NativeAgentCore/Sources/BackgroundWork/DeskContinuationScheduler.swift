@@ -3,6 +3,7 @@ import Desk
 import PersistenceCore
 import StandingBots
 import WorkshopExecution
+import TurnTrace
 
 public actor DeskContinuationScheduler {
     /// A domain's answer about one pending step. `waiting`: its owner is still
@@ -28,6 +29,15 @@ public actor DeskContinuationScheduler {
 
     private func eligible(_ item: DeskItem) -> Bool {
         guard !item.requiresOwnerInput, let record = item.continuation else { return false }
+        if let sessionId = record.sessionID {
+            do {
+                if try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
+                    .contains(where: { $0.runId == record.runID }) { return false }
+            } catch {
+                failure = "Repair the turn checkpoint before resuming this task: \(error.localizedDescription)"
+                return false
+            }
+        }
         if record.reason == "reply_ready" { return item.status != .canceled && record.pending.isEmpty }
         guard !item.status.isTerminal else { return false }
         switch record.state {

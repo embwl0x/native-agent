@@ -876,6 +876,7 @@ public enum MacChatTurnLifecycleRestartRepair {
     public static func repair(
         record: MacChatPersistedTurnLifecycle,
         transcriptProof: MacChatTurnTranscriptTerminalProof,
+        hasCheckpoint: Bool,
         at instant: Date
     ) -> MacChatTurnLifecycleState? {
         guard let restored = record.restoredState() else { return nil }
@@ -886,10 +887,8 @@ public enum MacChatTurnLifecycleRestartRepair {
         case .failed: kind = .failed(reason: nil)
         case .canceled: kind = .cancellationConfirmed
         case .absent, .unavailable:
-            // 2026-09-22 WHY: same plain line Telegram and Slack use after a restart.
-            kind = .outcomeUnknown(
-                reason: "I lost my answer to your last message when I restarted \u{2014} say it again and I'll pick it up."
-            )
+            if hasCheckpoint { return restored }
+            kind = .outcomeUnknown(reason: "This reply did not finish before the app restarted.")
         }
         return MacChatTurnLifecycleReducer.reduce(
             restored,

@@ -32,7 +32,7 @@ public final class PeerDataTaint: @unchecked Sendable {
         self.init()
         // These peers already latched. Persisted labels do not attest identity,
         // and a later trust change must not clear the original steer.
-        self.sources = Array(sources.filter { Self.isAgent($0) && !Self.ownerTrusts($0) }.prefix(8))
+        self.sources = Array(Set(sources)).sorted()
         restored = !self.sources.isEmpty
     }
 

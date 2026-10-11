@@ -227,7 +227,7 @@ extension TelegramPollLoop {
         return nil
     }
 
-    func runChatHandlerWithRetry(
+    func runChatHandler(
         destination: TelegramDestination,
         text: String,
         attachments: [TelegramMediaAttachment] = [],
@@ -249,7 +249,7 @@ extension TelegramPollLoop {
         }
         return try await withTaskCancellationHandler {
             do {
-                let reply = try await runChatHandlerAttempts(
+                let reply = try await invokeChatHandler(
                     destination: destination, text: text, attachments: attachments,
                     progress: displayProgress, replyTo: replyTo, fromUserId: fromUserId,
                     suppressUserAppend: suppressUserAppend, sessionId: sessionId, runId: runId
@@ -265,7 +265,7 @@ extension TelegramPollLoop {
         }
     }
 
-    private func runChatHandlerAttempts(
+    private func invokeChatHandler(
         destination: TelegramDestination,
         text: String,
         attachments: [TelegramMediaAttachment],
@@ -287,85 +287,41 @@ extension TelegramPollLoop {
             return spoken
         }
 
-        let totalAttempts = max(1, chatRetryAttempts + 1)
-        var lastError: Error?
-        for attempt in 0..<totalAttempts {
-            let context = TelegramChatAttemptContext(
-                attemptIndex: attempt,
-                totalAttempts: totalAttempts,
-                replyTo: replyTo,
-                fromUserId: fromUserId,
-                suppressUserAppend: suppressUserAppend,
-                sessionId: sessionId,
-                runId: runId,
-                threadId: destination.threadId
-            )
-            do {
-                // Prefer the attachment-aware handler when staged images exist
-                // (telegram-vision-in) so the bytes reach the model. The
-                // attachment handler is also used for plain text when it's the
-                // only handler wired.
-                if let attachmentChatHandler {
-                    return try await attachmentChatHandler(destination.chatId, text, attachments, progress, context)
-                }
-                // A staged image must NEVER silently fall through to a
-                // text-only handler — the model would answer the caption
-                // blind, exactly the failure the vision-in port removes
-                // (gpt-5.5 review). Tripwire + honest reply instead.
-                if !attachments.isEmpty {
-                    await emitAttachmentDroppedTrace(
-                        kind: "image",
-                        reason: "no attachment-capable chat handler wired",
-                        chatId: destination.chatId, updateId: 0)
-                    return "(I received your image but this bot configuration "
-                        + "has no vision-capable handler wired — the image was "
-                        + "not processed.)"
-                }
-                if let progressChatHandler {
-                    return try await progressChatHandler(destination.chatId, text, progress, context)
-                }
-                if let chatHandler {
-                    return try await chatHandler(destination.chatId, text)
-                }
-                throw TelegramBotError.unavailable
-            } catch {
-                lastError = error
-                guard attempt + 1 < totalAttempts, Self.isRetryableChatHandlerError(error) else {
-                    throw error
-                }
-                FileHandle.standardError.write(
-                    Data("TelegramPollLoop: retrying chat handler after transient failure: \(Self._tgRedactToken(String(describing: error)))\n".utf8)
-                )
-                await progress(.status(text: "Still can't reach the model — trying again."))
-                await writeStatePatch([
-                    "lastChatRetryAt": .string(_tgNowString()),
-                    "lastChatRetryFailedAttempt": .int(Int64(attempt + 1)),
-                    "lastChatRetryNextAttempt": .int(Int64(attempt + 2)),
-                    "lastChatRetrySuppressUserAppend": .bool(true),
-                    "lastChatRetryError": .string(Self._tgRedactToken(String(describing: error))),
-                ])
-                // A3.4: honor a provider Retry-After when the failure carried
-                // one (the typed failure carries the delay). Wait
-                // max(ladder backoff, Retry-After) so we neither hammer a 429
-                // before its window nor shorten the ladder's own floor.
-                let delayNanos = max(
-                    chatRetryDelayNanoseconds,
-                    Self.retryAfterNanoseconds(for: error)
-                )
-                if delayNanos > 0 {
-                    try await Task.sleep(nanoseconds: delayNanos)
-                }
-            }
+        let context = TelegramChatAttemptContext(
+            replyTo: replyTo,
+            fromUserId: fromUserId,
+            suppressUserAppend: suppressUserAppend,
+            sessionId: sessionId,
+            runId: runId,
+            threadId: destination.threadId
+        )
+        // Prefer the attachment-aware handler when staged images exist
+        // (telegram-vision-in) so the bytes reach the model. The
+        // attachment handler is also used for plain text when it's the
+        // only handler wired.
+        if let attachmentChatHandler {
+            return try await attachmentChatHandler(destination.chatId, text, attachments, progress, context)
         }
-        throw lastError ?? TelegramBotError.unavailable
-    }
-
-    static func retryAfterNanoseconds(for error: Error) -> UInt64 {
-        UInt64(min(ProviderRecoveryPolicy.retryAfterSeconds(in: error) ?? 0, 300)) * 1_000_000_000
-    }
-
-    static func isRetryableChatHandlerError(_ error: Error) -> Bool {
-        ProviderRecoveryPolicy.permitsWholeTurnRetry(error)
+        // A staged image must NEVER silently fall through to a
+        // text-only handler — the model would answer the caption
+        // blind, exactly the failure the vision-in port removes
+        // (gpt-5.5 review). Tripwire + honest reply instead.
+        if !attachments.isEmpty {
+            await emitAttachmentDroppedTrace(
+                kind: "image",
+                reason: "no attachment-capable chat handler wired",
+                chatId: destination.chatId, updateId: 0)
+            return "(I received your image but this bot configuration "
+                + "has no vision-capable handler wired — the image was "
+                + "not processed.)"
+        }
+        if let progressChatHandler {
+            return try await progressChatHandler(destination.chatId, text, progress, context)
+        }
+        if let chatHandler {
+            return try await chatHandler(destination.chatId, text)
+        }
+        throw TelegramBotError.unavailable
     }
 
     static func chatErrorNotice(for error: Error) -> String {

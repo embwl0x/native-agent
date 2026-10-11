@@ -696,36 +696,27 @@ public struct TurnContext: Sendable {
 
 public struct TurnEngineResult: Sendable {
     public enum TerminalState: String, Sendable, Codable {
-        case completed, interrupted, waiting, braked, failed
+        case completed, interrupted, waiting, failed
     }
 
     public enum TerminalReason: String, Sendable {
         case replyCompleted = "reply_completed"
         case approvalRequired = "approval_required"
         case interactionRequired = "interaction_required"
+        case providerRequired = "provider_required"
         case cancelled
         case providerInterrupted = "provider_interrupted"
         case providerFailed = "provider_failed"
         case executionFailed = "execution_failed"
         case incomplete
         case completionUnreported = "completion_unreported"
-        case iterationLimit = "iteration_limit"
-        case wallClockLimit = "wall_clock_limit"
-        case noProgress = "no_progress"
-        case humanTakeover = "human_takeover"
-        case protocolViolation = "protocol_violation"
-        case unfulfilledPromise = "unfulfilled_promise"
-        case emptyReply = "empty_reply"
-        case outputLimit = "output_limit"
 
         public var state: TerminalState {
             switch self {
             case .replyCompleted: return .completed
-            case .approvalRequired, .interactionRequired: return .waiting
-            case .cancelled, .providerInterrupted, .incomplete, .completionUnreported, .humanTakeover: return .interrupted
+            case .approvalRequired, .interactionRequired, .providerRequired: return .waiting
+            case .cancelled, .providerInterrupted, .incomplete, .completionUnreported: return .interrupted
             case .providerFailed, .executionFailed: return .failed
-            case .iterationLimit, .wallClockLimit, .noProgress, .protocolViolation,
-                 .unfulfilledPromise, .emptyReply, .outputLimit: return .braked
             }
         }
     }

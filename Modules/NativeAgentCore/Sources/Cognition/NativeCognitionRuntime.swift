@@ -264,14 +264,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     var liveTurnStartedAtByRunId: [String: Date] = [:]  // internal for actor extensions
     private var liveTurnRunOrder: [String] = []
     static let maximumLiveTurnRuns = 64
-    /// Safety: a latch older than this is not trusted. ChatOrchestration's
-    /// `WholeTurnWallClockBudget` clamps EVERY turn — interactive, telegram,
-    /// bridge — to `defaultUnattendedSeconds` (3_900), so a latch older than
-    /// that cannot belong to a turn that is still running; it belongs to a
-    /// terminal event that never arrived. Mirrored rather than imported: that
-    /// budget type is internal to the ChatOrchestration module.
-    static let liveTurnLatchWallClockBudget: TimeInterval = 3_900
-
     /// Admission edge. The user's message row is persisted and observed BEFORE
     /// the provider call begins, so this is the earliest honest "a turn is
     /// running" moment the runtime is given.
@@ -279,7 +271,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         let key = runId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return }
         let startedAt = now()
-        pruneExpiredLiveTurns(asOf: startedAt)
         if liveTurnStartedAtByRunId.updateValue(startedAt, forKey: key) == nil {
             liveTurnRunOrder.append(key)
         }
@@ -297,7 +288,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         guard !key.isEmpty else { return }
         guard liveTurnStartedAtByRunId.removeValue(forKey: key) != nil else { return }
         liveTurnRunOrder.removeAll { $0 == key }
-        pruneExpiredLiveTurns(asOf: now())
     }
 
     /// Latch the admission edge off the event the runtime already receives.
@@ -307,27 +297,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         noteTurnStarted(runId: runId)
     }
 
-    /// Turns admitted, not yet terminal, and still inside the wall-clock budget.
-    func liveTurnLatchCount() -> Int {
-        guard !liveTurnStartedAtByRunId.isEmpty else { return 0 }
-        let instant = now()
-        return liveTurnStartedAtByRunId.values.filter {
-            instant.timeIntervalSince($0) <= Self.liveTurnLatchWallClockBudget
-        }.count
-    }
-
-    private func pruneExpiredLiveTurns(asOf instant: Date) {
-        guard !liveTurnStartedAtByRunId.isEmpty else { return }
-        var expired: [String] = []
-        for (key, startedAt) in liveTurnStartedAtByRunId
-        where instant.timeIntervalSince(startedAt) > Self.liveTurnLatchWallClockBudget {
-            expired.append(key)
-        }
-        guard !expired.isEmpty else { return }
-        let expiredKeys = Set(expired)
-        for key in expired { liveTurnStartedAtByRunId.removeValue(forKey: key) }
-        liveTurnRunOrder.removeAll { expiredKeys.contains($0) }
-    }
+    /// Turns admitted and not yet terminal, including long-running work.
+    func liveTurnLatchCount() -> Int { liveTurnStartedAtByRunId.count }
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -1977,7 +1948,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// flight.
     ///
     /// The turn latch is the authority (admission → terminal settlement, counted
-    /// by runId, wall-clock-bounded). The coalescer generation is kept as the
+    /// by runId). The coalescer generation is kept as the
     /// second term: it still covers non-chat sensory work and any turn admitted
     /// without a runId, and it is what this property used to mean.
     public var liveTurnInFlight: Bool {  // internal for actor extensions

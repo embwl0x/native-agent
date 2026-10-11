@@ -237,6 +237,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                             continuation.yield(.textDelta(content))
                         }
                         for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
+                        if decoder.toolBoundaryReason != nil { break }
                     }
                     let terminal = Result {
                         try decoder.finalizedToolCalls(
@@ -251,7 +252,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                         usage: decoder.usage,
                         ttftMs: ttftMs,
                         durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000),
-                        status: try terminal.chatCompletionsTerminalStatus()
+                        status: decoder.reachedLengthLimit ? "incomplete" : (try terminal.chatCompletionsTerminalStatus())
                     )
                     let completed = try terminal.get()
                     for call in completed {
@@ -261,6 +262,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                             inputJSON: Data(call.arguments.utf8)
                         )))
                     }
+                    if let reason = decoder.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                     continuation.finish()
                 } catch let error as LLMError {
                     continuation.finish(throwing: error)

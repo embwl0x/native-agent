@@ -50,11 +50,7 @@ extension OpenAIOAuthDirectAdapter {
         // sibling. Same omission, same misclassification.
         var incompleteReason: String?
         var refusalTextByPart: [String: String] = [:]
-        // 2026-09-25: the loop guard every other streaming
-        // adapter has. Without it a looping reply ran to the
-        // model's own cap (no max_output_tokens is sent).
         var runaway = RunawayOutputDetector()
-        var runawayTripped = false
 
         func stampTTFT() {
             emittedProviderOutput = true
@@ -119,11 +115,10 @@ extension OpenAIOAuthDirectAdapter {
                     lastRawDelta = ContinuousClock.now
                     resumeReply()
                     stampTTFT()
-                    continuation.yield(.textDelta(delta))
-                    if runaway.feed(delta) {
-                        runawayTripped = true
-                        return true
-                    }
+                    let boundary = runaway.feed(delta)
+                    let kept = runaway.keptPart(of: delta)
+                    if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
+                    if boundary { return true }
                 }
             } else if etype == "response.output_item.added" {
                 if let item = event["item"] as? [String: Any],
@@ -260,7 +255,7 @@ extension OpenAIOAuthDirectAdapter {
         } catch {
             throw mapTransportError(error, fallback: networkError(error))
         }
-        if runawayTripped {
+        if let reason = runaway.toolBoundaryReason {
             await telemetry.record(
                 requestBody: req.httpBody,
                 provider: providerId,
@@ -269,11 +264,12 @@ extension OpenAIOAuthDirectAdapter {
                 usage: capturedUsage,
                 ttftMs: ttftMs,
                 durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                status: "incomplete",
+                status: "ok",
                 substitutedFrom: substitutedFrom,
-                stopReason: "client_runaway"
+                stopReason: "client_tool_boundary"
             )
-            throw runaway.stopError
+            continuation.yield(.toolBoundary(reason))
+            return
         }
         guard shouldStop else {
             // Byte stream ended WITHOUT a terminal event
@@ -299,8 +295,10 @@ extension OpenAIOAuthDirectAdapter {
                 substitutedFrom: substitutedFrom,
                 stopReason: reason
             )
-            if reason == "max_output_tokens" {
-                throw LLMError.outputLengthLimit(partial: runaway.text)
+            if reason == "max_output_tokens" || reason == "max_tokens" {
+                RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+                continuation.yield(.toolBoundary(.outputLimit))
+                return
             }
             throw LLMError.providerError(message: Self.incompleteNote(reason))
         }
@@ -343,8 +341,6 @@ extension OpenAIOAuthDirectAdapter {
     /// Technical stop reasons stay in telemetry, never in the reply.
     static func incompleteNote(_ reason: String) -> String {
         switch reason {
-        case "max_output_tokens", "max_tokens":
-            return LLMError.outputLengthLimitNotice
         case "content_filter":
             return "The provider stopped this response because of its content policy."
         default:
@@ -368,6 +364,7 @@ extension OpenAIOAuthDirectAdapter {
             case .toolCall(let call):
                 let arguments = String(decoding: call.inputJSON, as: UTF8.self)
                 markers.append("<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(arguments)</tool_use>")
+            case .toolBoundary(.outputLimit): throw LLMError.outputLengthLimit(partial: text)
             case .keepAlive, .replyTextSettled, .toolBoundary: break
             }
         }

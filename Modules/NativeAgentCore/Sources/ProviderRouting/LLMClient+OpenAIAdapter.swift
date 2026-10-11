@@ -341,6 +341,7 @@ public final class OpenAIAdapter: LLMAdapter {
                             continuation.yield(.textDelta(content))
                         }
                         for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
+                        if decoder.toolBoundaryReason != nil { break }
                     }
                     let terminal = Result {
                         try decoder.finalizedToolCalls(
@@ -352,7 +353,7 @@ public final class OpenAIAdapter: LLMAdapter {
                         requestBody: req.httpBody,
                         provider: providerId, model: model, streaming: true,
                         usage: decoder.usage, ttftMs: ttftMs, durationMs: durationMs,
-                        status: try terminal.chatCompletionsTerminalStatus()
+                        status: decoder.reachedLengthLimit ? "incomplete" : (try terminal.chatCompletionsTerminalStatus())
                     )
                     let completed = try terminal.get()
                     for call in completed {
@@ -362,6 +363,7 @@ public final class OpenAIAdapter: LLMAdapter {
                             inputJSON: Data(call.arguments.utf8)
                         )))
                     }
+                    if let reason = decoder.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                     continuation.finish()
                 } catch let err as LLMError {
                     continuation.finish(throwing: err)

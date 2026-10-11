@@ -198,6 +198,7 @@ public final class MoonshotAdapter: LLMAdapter {
                         for _ in 0..<frame.toolCallDeltaCount {
                             continuation.yield(.keepAlive)
                         }
+                        if decoder.toolBoundaryReason != nil { break }
                     }
                     // User, 2026-09-06: `[DONE]` with zero reply content AND zero
                     // tool calls was accepted as a successful turn, so an
@@ -215,7 +216,7 @@ public final class MoonshotAdapter: LLMAdapter {
                         requestBody: request.httpBody,
                         provider: providerID, model: model, streaming: true,
                         usage: decoder.usage, ttftMs: ttftMs, durationMs: duration,
-                        status: try terminal.chatCompletionsTerminalStatus()
+                        status: decoder.reachedLengthLimit ? "incomplete" : (try terminal.chatCompletionsTerminalStatus())
                     )
                     let completed = try terminal.get()
                     for call in completed {
@@ -228,6 +229,7 @@ public final class MoonshotAdapter: LLMAdapter {
                     if !completed.isEmpty, !decoder.reasoning.isEmpty {
                         await ledger.record(reasoning: decoder.reasoning, callIDs: completed.map(\.id))
                     }
+                    if let reason = decoder.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

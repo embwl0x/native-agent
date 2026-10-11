@@ -353,9 +353,8 @@ extension AnthropicOAuthDirectAdapter {
     /// chat calls carrying the text-lane protocol only, never side calls.
     /// Every transport (messages and the legacy prompt stream) reads it.
     /// `</tool_use>`/`</invoke>` are deliberately NOT stops: bare markers have
-    /// no outer block, so stopping at the first would drop parallel calls (up
-    /// to 4 per reply). A bare-block runaway (the same call again, or a 5th)
-    /// is ended client-side at the last good block's closing tag instead —
+    /// no outer block, so stopping at the first would drop parallel calls.
+    /// A repeated bare block ends at the last good block's closing tag instead —
     /// `RunawayOutputDetector(endsAtToolBoundary:)`, 2026-09-23.
     static func applyTextLaneStops(to body: inout [String: Any], system: String?) {
         if system?.contains(textToolProtocolHeader) == true {

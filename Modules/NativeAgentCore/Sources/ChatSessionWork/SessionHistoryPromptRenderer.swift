@@ -32,17 +32,15 @@ public enum SessionHistoryPromptRenderer {
         let originLabel: String?
         let incompleteReplyLabel: String?
         let timestamp: String
-        let isTool: Bool
+        package let isTool: Bool
         let isCompactionSummary: Bool
         /// True for the read-only recollection borrowed from the conversation
         /// anchor (`CarriedAnchorRecollection`). Changes only the LABEL the v2
         /// projection leads with — every cap, exemption and identity rule
         /// treats it exactly as the session's own recollection.
         var isCarriedRecollection: Bool = false
-        /// Run id of the turn that produced this row. Only the v2 volatile
-        /// replay reads it — it is how an archived block finds the user message
-        /// it originally followed.
-        var runId: String? = nil
+        /// Run id of the turn that produced this row, shared by history and recovery.
+        package var runId: String? = nil
 
         /// How a recollection announces itself at the head of the replayed
         /// prefix. A borrowed one says so: the model must never read the main

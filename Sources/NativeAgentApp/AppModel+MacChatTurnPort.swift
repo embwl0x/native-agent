@@ -5,10 +5,71 @@ import AppKit
 import MacControl
 import NativeAgentCore
 import TrustCenter
+import TurnTrace
 
 extension AppModel: MacChatTurnPresentationPort {
     var macChatTurns: MacChatTurnRuntime { engine.turns.runtime }
     var knownChatSessionIDs: Set<String> { Set(engine.transcripts.sessions.map(\.id)) }
+
+    func resumeMacChatTurn(_ checkpoint: TurnCheckpoint,
+        operation: @escaping @Sendable (@escaping ChatOrchestrationProgressHandler) async throws -> Void) async throws {
+        let session = checkpoint.sessionId
+        let identity = MacChatTurnIdentity(sessionId: session, turnId: checkpoint.turnId)
+        let records = try await macChatTurns.lifecycleStore.records()
+        guard let state = records.first(where: { $0.identity == identity })?.restoredState(),
+              !macChatTurns.busySessions.contains(session) else { throw MacChatTurnLifecycleStoreError.invalidRecord }
+        var rows = try await engine.transcripts.loadMessages(sessionId: session)
+        rows.removeAll { $0.runId == checkpoint.runId && $0.metadata?.partial == true }
+        let bubble = ChatMessage(sessionId: session, runId: checkpoint.runId)
+        rows.append(bubble)
+        engine.transcripts.setMessages(rows, for: session)
+        let generation = (macChatTurns.taskGenerations[session] ?? 0) + 1
+        macChatTurns.taskGenerations[session] = generation
+        macChatTurns.activeTurnIDsBySession[session] = identity.turnId
+        macChatTurns.lifecycleBySession[session] = state
+        macChatTurns.busySessions.insert(session)
+        macChatTurns.streamingSessions.insert(session)
+        engine.turns.streamingBubbleIds[session] = bubble.id
+
+        let events = AsyncThrowingStream<TurnStreamEvent, Error>.makeStream()
+        let frames = AsyncThrowingStream<MacChatStreamUpdate, Error>.makeStream()
+        let meta = MacChatStreamAdapter.MetaBox()
+        let adapter = Task {
+            await MacChatStreamAdapter.bridgeChatStreamEvents(events.stream, sessionId: session,
+                activityIdentity: identity, metaBox: meta,
+                onTurnActivity: { [weak self] in await self?.receiveChatTurnActivity($0) },
+                continuation: frames.continuation)
+        }
+        let producer = Task {
+            defer { events.continuation.finish() }
+            do { try await ChatToolSessionContext.$replyStreamRendersCards.withValue(true) {
+                try await MacScreenPreviewBus.$publish.withValue({ [weak self] in
+                    await self?.receiveMacScreenPreview($0, identity: identity)
+                }) {
+                    try await operation { events.continuation.yield($0) }
+                }
+            } } catch { events.continuation.finish(throwing: error); throw error }
+        }
+        macChatTurns.tasks[session] = Task {
+            _ = await withTaskCancellationHandler { await producer.result } onCancel: { producer.cancel() }
+        }
+        let consumer = Task {
+            try await consumeMacChatStream(frames.stream, sessionId: session, bubbleId: bubble.id,
+                generation: generation, activityIdentity: identity)
+        }
+        let outcome = await producer.result
+        await adapter.value
+        let rendered = await consumer.result
+        _ = await settleMacChatStream(identity: identity, metaBox: meta, exit: .exhausted)
+        _ = closeChatTurnLifecycleIntake(sessionId: session, turnId: identity.turnId, at: Date())
+        _ = macChatTurns.finishRuntime(sessionId: session, generation: generation)
+        engine.turns.streamingTexts[session] = nil
+        engine.turns.streamingBubbleIds[session] = nil
+        engine.turns.replyingSessions.remove(session)
+        await refreshChatMessagesAfterTurn(sessionId: session)
+        try outcome.get()
+        _ = try rendered.get()
+    }
 
     func captureMacWorkContinuation(_ text: String, taskReference: String) async -> MacWorkContinuation? {
         guard UserMessageIntentSignals.isTakeOver(text) else { return nil }

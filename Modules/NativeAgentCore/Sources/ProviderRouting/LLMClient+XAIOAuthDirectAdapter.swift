@@ -245,6 +245,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                                finish == "tool_calls" || finish == "stop" {
                                 continuation.yield(.keepAlive)
                             }
+                            if decoder.toolBoundaryReason != nil { break }
                         }
                         // User, 2026-09-06: `[DONE]` with no content and no tool
                         // calls was accepted as success — the same empty-and-
@@ -263,7 +264,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                             usage: decoder.usage,
                             ttftMs: ttftMs,
                             durationMs: durationMs,
-                            status: try terminal.chatCompletionsTerminalStatus()
+                            status: decoder.reachedLengthLimit ? "incomplete" : (try terminal.chatCompletionsTerminalStatus())
                         )
                         let completedCalls = try terminal.get()
                         for call in completedCalls {
@@ -273,6 +274,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                                 inputJSON: Data(call.arguments.utf8)
                             )))
                         }
+                        if let reason = decoder.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                         continuation.finish()
                         return
                     }

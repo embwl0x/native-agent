@@ -89,8 +89,7 @@ public actor DesktopAgentConversationRoute {
             }
         }
         let operatorTools = DesktopConversationTools(inner: inner, bundle: bundle, label: label, message: message)
-        let client = clients.chatClient(
-            tools: operatorTools, toolLoopMaxIterations: 16, turnWallClockSeconds: 180)
+        let client = clients.chatClient(tools: operatorTools)
         let task: JSONValue = .object([
             "app_bundle_id": .string(bundle), "conversation_label": .string(label),
             "operation": .string("send"), "message": .string(message)

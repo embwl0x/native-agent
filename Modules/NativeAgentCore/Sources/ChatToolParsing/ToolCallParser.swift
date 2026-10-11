@@ -48,9 +48,6 @@ package struct ToolCallProtocolViolation: Equatable {
         return "Your reply formatted a tool call as Markdown. No call from it ran. Use this conversation's tool-call format to make the needed call now."
     }
 
-    package var terminalReply: String {
-        return "Stopped: the model did not recover its tool call. The requested work is incomplete."
-    }
 }
 
 package enum ToolCallParser {

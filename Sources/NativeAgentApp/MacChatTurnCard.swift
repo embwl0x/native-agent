@@ -382,7 +382,7 @@ enum MacChatTurnCardProjection {
         case .stalled:
             return "Nothing has moved for a while. This is an observation, not a verdict \u{2014} it clears on the next sign of work."
         case .outcomeUnknown:
-            return "I lost my answer to your last message when I restarted \u{2014} say it again and I'll pick it up."
+            return "This reply did not finish before the app restarted."
         default:
             return nil
         }

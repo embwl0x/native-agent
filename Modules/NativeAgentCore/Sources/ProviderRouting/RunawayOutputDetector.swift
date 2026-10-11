@@ -4,47 +4,11 @@ import os
 import PersistenceCore
 import TurnTrace
 
-/// 2026-09-23 (turn 4976a970): Agent streamed 97k chars for 404s until
-/// max_tokens, and the whole reply was replaced by the length notice. This
-/// watches reply text as it streams and says when it is looping, so the stream
-/// can be stopped early and the prose before the loop kept.
-///
-/// Fed one delta at a time; only the new characters are scanned and each
-/// completed line is hashed once, so the cost per delta is its own length.
-///
-/// Trips on either:
-/// - a dense loop: one line seen `lineRepeatLimit` (6) times within the last
-///   `window` (24) counted lines, the window at least `minWindow` (12) lines
-///   long and at least half repeats. A short run of intentional copies (four
-///   identical code lines, a refrain) stays under it; a real runaway goes on
-///   for thousands of lines, so waiting a dozen costs nothing (live false
-///   trip 09-23 at 4-of-4).
-///   Density is the point (Sol, 09-23): a refrain or a log line that recurs
-///   across a long reply is scattered, a loop is not. A line only counts when
-///   it has at least four letters and does not start with `|` (tables share
-///   headers). Dense repetition inside code is checked too.
-/// - `headerLimit` (3) lines that START with "NativeAgent tool result #", the
-///   app's own result header. Tool results come from the app, never from the
-///   model; a mention of the phrase inside a sentence is not one.
-///
-/// Text tool lane only (`endsAtToolBoundary`), 2026-09-23 (cutoffs c5b405e6,
-/// de3b9224): Opus 5.5 writes bare `<invoke>` blocks with no `<function_calls>`
-/// wrapper, so no server stop fires and she wrote the same call until
-/// max_tokens (98k chars of `agent_contacts`; `read_file` x12). Complete
-/// `<invoke>`/`<tool_use>` blocks are counted as they stream; a block that
-/// repeats the one just before it, an action repeated anywhere in the reply
-/// (reads may recur), sets `toolBoundary` just after the
-/// last good block's closing tag. The adapter ends the stream there like a
-/// server stop sequence, so the complete calls before it dispatch. A block
-/// only counts once its closing tag has arrived, and the offending block's
-/// closing tag is never passed on, so no half-written call can run.
+/// Correctness boundaries retain complete calls before a repeated action or
+/// fabricated result. Text after a boundary is withheld; the turn continues
+/// with the retained calls and the boundary reason.
 public struct RunawayOutputDetector: Sendable {
-    public static let loopNotice = "I started repeating myself, so I stopped here."
     static let fabricatedHeader = "NativeAgent tool result #"
-    static let lineRepeatLimit = 6
-    static let headerLimit = 3
-    static let window = 24
-    static let minWindow = 12
 
     /// UTF-8 offset where the reply ends at a tool-call boundary.
     public private(set) var toolBoundary: Int?
@@ -53,7 +17,7 @@ public struct RunawayOutputDetector: Sendable {
     private var blockCursor = 0
     private var openBlock: (start: Int, close: String)?
     private var lastSignature: String?
-    private var blockSignatures: Set<String> = []
+    private var blockSignatures: [String: Int] = [:]
     private var blockCount = 0
 
     /// Classification receives the complete block so the parser and registry
@@ -86,99 +50,53 @@ public struct RunawayOutputDetector: Sendable {
 
     /// Everything fed so far.
     public private(set) var text = ""
-    /// UTF-8 offset where the loop begins (the prose worth keeping ends here).
-    public private(set) var loopStart: Int?
     public private(set) var reason: String?
     private var lineStart = 0
     private var pending = ""
-    private var inlineCheckBytes = 0
-    /// The last `window` counted lines: hash and where each starts.
-    private var recent: [(key: Int, start: Int)] = []
     private var inFence = false
     private var fenceStarts: [Int] = []
-    private var headers = 0
-    private var firstHeader = 0
+    private var firstHeader: Int?
 
     public init(endsAtToolBoundary: Bool = false) {
         self.endsAtToolBoundary = endsAtToolBoundary
     }
 
-    /// Feed one text delta. Returns true once the stream should stop: the reply
-    /// is looping, or (when `toolBoundary` is set) it reached a tool-call
-    /// boundary. Further input is ignored.
+    /// Feed one text delta; true when a correctness boundary ends the stream.
     public mutating func feed(_ delta: String) -> Bool {
+        guard toolBoundary == nil else { return true }
         text += delta
-        guard loopStart == nil, toolBoundary == nil else { return true }
         var rest = Substring(delta)
         while let nl = rest.unicodeScalars.firstIndex(of: "\n") {
             pending += Substring(rest.unicodeScalars[..<nl])
             let start = lineStart
             lineStart += pending.utf8.count + 1
-            if check(pending, at: start) { return true }
+            check(pending, at: start)
             pending = ""
             rest = Substring(rest.unicodeScalars[rest.unicodeScalars.index(after: nl)...])
         }
         pending += rest
-        if text.utf8.count >= inlineCheckBytes + 512 {
-            inlineCheckBytes = text.utf8.count
-            if checkInline(text, at: 0) { return true }
-        }
-        // Record fence positions before checking completed tool blocks.
+        check(pending, at: lineStart)
         if endsAtToolBoundary {
             bytes.append(contentsOf: delta.utf8)
             if scanToolBlocks() { return true }
         }
+        if let firstHeader {
+            return setToolBoundary(.fabricatedResult, "fabricated tool-result header", at: firstHeader)
+        }
         return false
     }
 
-    private mutating func check(_ line: String, at start: Int) -> Bool {
-        if checkInline(line, at: start) { return true }
+    private mutating func check(_ line: String, at start: Int) {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        // Fences only guard the header rule (a quoted header in a code block is
-        // not a fabricated one); loops are loops inside code too, and density
-        // keeps real code safe, so an unclosed fence never blinds the guard.
         if trimmed.hasPrefix("```") {
+            guard line.utf8.count + start < lineStart else { return }
             inFence.toggle()
             fenceStarts.append(start)
-            return false
+            return
         }
         if !inFence, trimmed.hasPrefix(Self.fabricatedHeader) {
-            if headers == 0 { firstHeader = start }
-            headers += 1
-            if headers >= Self.headerLimit {
-                return trip(at: firstHeader, "\(headers) fabricated tool-result headers")
-            }
+            if firstHeader == nil { firstHeader = start }
         }
-        guard !trimmed.hasPrefix("|"),
-              trimmed.unicodeScalars.filter(CharacterSet.letters.contains).count >= 4
-        else { return false }
-        let key = trimmed.hashValue
-        recent.append((key, start))
-        if recent.count > Self.window { recent.removeFirst() }
-        let copies = recent.filter { $0.key == key }
-        guard recent.count >= Self.minWindow, copies.count >= Self.lineRepeatLimit else { return false }
-        let repeats = recent.count - Set(recent.map(\.key)).count
-        guard repeats * 2 >= recent.count else { return false }
-        return trip(at: copies[1].start, "line repeated \(copies.count)x in \(recent.count) lines")
-    }
-
-    // Catch short-unit loops with or without newlines in a bounded tail.
-    private mutating func checkInline(_ line: String, at start: Int) -> Bool {
-        guard line.utf8.count >= 512 else { return false }
-        let tail = String(line.suffix(2048))
-        guard let loop = tail.range(of: #"(?s)(\S.{0,127}?)\1{7,}"#, options: .regularExpression),
-              tail[loop].utf8.count >= 512 else { return false }
-        let offset = start + line.utf8.count - tail.utf8.count + tail[..<loop.lowerBound].utf8.count
-        return trip(at: offset, "dense short-unit repetition")
-    }
-
-    private mutating func trip(at offset: Int, _ why: String) -> Bool {
-        loopStart = offset
-        reason = why
-        let chars = text.count
-        Logger(subsystem: "NativeAgent", category: "Cutoff")
-            .error("runaway output: \(why, privacy: .public) chars=\(chars, privacy: .public) keep=\(offset, privacy: .public)B")
-        return true
     }
 
     /// Finds tool blocks completed since the last call; true once the boundary is set.
@@ -200,18 +118,17 @@ public struct RunawayOutputDetector: Sendable {
                 let block = String(decoding: bytes[open.start..<end], as: UTF8.self)
                 // Runaway repeats are byte-identical; only the outer edges
                 // are trimmed, so "red fox" and "redfox" stay different (Sol).
-                // A runaway writes the SAME block back to back, which always
-                // ends the reply. A READ made again after another call is a
-                // sequence — home between rooms (09-25: 21 of 24 repeat trips
-                // were `workspace {}` between rooms, each costing a round) —
-                // but an action repeated anywhere in the reply (send, read,
-                // send) still ends it: a double send is real harm.
                 let signature = block.trimmingCharacters(in: .whitespacesAndNewlines)
                 if signature == lastSignature {
-                    return setToolBoundary(.repeatedBlock, "tool block repeated")
+                    return setToolBoundary(.repeatedBlock, "tool block repeated", at: lastBlockEnd)
                 }
-                if !blockSignatures.insert(signature).inserted, !Self.isReadOnly(signature) {
-                    return setToolBoundary(.repeatedAction, "tool action repeated")
+                let copies = blockSignatures[signature, default: 0] + 1
+                blockSignatures[signature] = copies
+                if copies > 1, !Self.isReadOnly(signature) {
+                    return setToolBoundary(.repeatedAction, "tool action repeated", at: lastBlockEnd)
+                }
+                if copies >= 3 {
+                    return setToolBoundary(.repeatedBlock, "read-only tool block repeated \(copies) times", at: lastBlockEnd)
                 }
                 lastSignature = signature
                 blockCount += 1
@@ -225,7 +142,7 @@ public struct RunawayOutputDetector: Sendable {
                 // lines until the loop guard cut the reply and nothing ran.
                 // Short narration between two calls stays (Sol).
                 if blockCount > 0, let why = gapAfterCall() {
-                    return setToolBoundary(why.kind, why.detail)
+                    return setToolBoundary(why.kind, why.detail, at: lastBlockEnd)
                 }
                 let opens = [("<invoke", "</invoke>"), ("<tool_use", "</tool_use>")].compactMap { tag, close in
                     Self.find(tag, in: bytes, from: blockCursor, tag: true).map { ($0, tag, close) }
@@ -278,8 +195,8 @@ public struct RunawayOutputDetector: Sendable {
         return nil
     }
 
-    private mutating func setToolBoundary(_ kind: LLMToolBoundaryReason, _ why: String) -> Bool {
-        let end = lastBlockEnd, chars = text.count
+    private mutating func setToolBoundary(_ kind: LLMToolBoundaryReason, _ why: String, at end: Int) -> Bool {
+        let chars = text.count
         toolBoundary = end
         toolBoundaryReason = kind
         reason = "tool_marker_boundary: \(why)"
@@ -295,36 +212,6 @@ public struct RunawayOutputDetector: Sendable {
         guard let toolBoundary else { return delta }
         let start = text.utf8.count - delta.utf8.count
         return String(decoding: delta.utf8.prefix(max(0, toolBoundary - start)), as: UTF8.self)
-    }
-
-    /// Text before the loop (all of it when there is none).
-    public var kept: String {
-        guard let loopStart else { return text }
-        return String(decoding: text.utf8.prefix(loopStart), as: UTF8.self)
-    }
-
-    /// The stream ends here: truncated, so no tool marker in it may dispatch.
-    public var stopError: LLMError { .outputLengthLimit(partial: text) }
-
-    /// A cut-off reply (max_tokens, a runaway trip, a spent budget) as the
-    /// person should see it: the prose before any loop or fabricated tool
-    /// result, plus the notice saying why it stopped. Writes the raw text to
-    /// `diagnostics/cutoffs/` for the post-mortem.
-    public static func cutoffReply(_ raw: String) -> (kept: String, notice: String) {
-        var detector = RunawayOutputDetector()
-        let looped = detector.feed(raw + "\n")
-        var kept = String(detector.kept.dropLast(looped ? 0 : 1))
-        // Cut at a fabricated result header only where one starts a line
-        // outside a code fence.
-        var fenced = false, offset = kept.startIndex
-        for line in kept.split(separator: "\n", omittingEmptySubsequences: false) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") { fenced.toggle() }
-            else if !fenced, trimmed.hasPrefix(fabricatedHeader) { kept = String(kept[..<offset]); break }
-            offset = line.endIndex < kept.endIndex ? kept.index(after: line.endIndex) : kept.endIndex
-        }
-        writeDiagnostic(raw, reason: detector.reason ?? "cutoff")
-        return (kept, looped ? loopNotice : LLMError.outputLengthLimitNotice)
     }
 
     private static let diagnosticLock = OSAllocatedUnfairLock(initialState: ())

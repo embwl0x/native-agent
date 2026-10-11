@@ -22,8 +22,6 @@ public enum TelegramChatProgressEvent: Sendable, Equatable {
 public typealias TelegramChatProgressSink = @Sendable (TelegramChatProgressEvent) async -> Void
 
 public struct TelegramChatAttemptContext: Sendable, Equatable {
-    public let attemptIndex: Int
-    public let totalAttempts: Int
     public let replyTo: TelegramReplyContext?
     /// Transport-decoded Telegram sender identity. This is carried separately
     /// from chatId because group chats differ and private installs commonly
@@ -41,14 +39,9 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
     /// supergroup is its own conversation, and nil means the whole chat — a
     /// DM, an ordinary group, or a forum's General topic.
     public let threadId: Int?
-    private let suppressUserAppendOverride: Bool
-
-    public var isRetry: Bool { attemptIndex > 0 }
-    public var suppressUserAppend: Bool { suppressUserAppendOverride || isRetry }
+    public let suppressUserAppend: Bool
 
     public init(
-        attemptIndex: Int,
-        totalAttempts: Int,
         replyTo: TelegramReplyContext? = nil,
         fromUserId: Int? = nil,
         suppressUserAppend: Bool = false,
@@ -56,12 +49,10 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
         runId: String? = nil,
         threadId: Int? = nil
     ) {
-        self.attemptIndex = max(0, attemptIndex)
-        self.totalAttempts = max(1, totalAttempts)
         self.replyTo = replyTo
         self.fromUserId = fromUserId
         self.threadId = threadId
-        self.suppressUserAppendOverride = suppressUserAppend
+        self.suppressUserAppend = suppressUserAppend
         let trimmedSession = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.sessionId = (trimmedSession?.isEmpty ?? true) ? nil : trimmedSession
         self.runId = runId

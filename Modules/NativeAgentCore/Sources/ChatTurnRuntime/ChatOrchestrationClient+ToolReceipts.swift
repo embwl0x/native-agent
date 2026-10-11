@@ -55,6 +55,7 @@ extension SwiftNativeChatOrchestrationClient {
                 ),
                 source: writer.surface
             )
+            try await TurnCheckpointScope.current?.receiptWritten()
         } catch {
             // M2 (2026-07-09): a swallowed failure here dropped the tool
             // receipt from the persisted transcript while the live pill still
@@ -64,7 +65,7 @@ extension SwiftNativeChatOrchestrationClient {
                 label: "appendToolMessage(\(receipt.toolName))\(writer.laneLabel)",
                 path: dataRoot,
                 error: error,
-                userText: "Couldn't save the receipt for tool '\(receipt.toolName)' - it won't appear in the saved transcript.",
+                userText: "Couldn't save the receipt or restart checkpoint for tool '\(receipt.toolName)'; inspect the saved transcript before repeating it.",
                 onNotice: writer.onNotice
             )
         }

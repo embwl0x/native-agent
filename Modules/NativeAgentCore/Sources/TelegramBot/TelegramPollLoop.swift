@@ -120,8 +120,6 @@ public struct TelegramPollLoop: LoopRunner {
     /// transcription is unconfigured. nil disables image ingestion.
     let photoDownloader: (any TelegramMediaDownloading)?
     let photoMaxBytes: Int
-    let chatRetryAttempts: Int
-    let chatRetryDelayNanoseconds: UInt64
     let typingRefreshNanoseconds: UInt64
     let turnCoordinator: TelegramTurnCoordinator
     let revokeDriverControl: @Sendable () async -> Void
@@ -217,10 +215,6 @@ public struct TelegramPollLoop: LoopRunner {
         voiceMaxBytes: Int = TelegramConfig.defaultVoiceMaxBytes,
         photoDownloader: (any TelegramMediaDownloading)? = TelegramMediaDownloader(),
         photoMaxBytes: Int = TelegramPollLoop.defaultPhotoMaxBytes,
-        // 2026-09-22: 0 — the provider ladder already retries; whole-turn
-        // reruns on top ran one message three times over 19 minutes.
-        chatRetryAttempts: Int = 0,
-        chatRetryDelayNanoseconds: UInt64 = 750_000_000,
         typingRefreshNanoseconds: UInt64 = 4_000_000_000,
         turnCoordinator: TelegramTurnCoordinator = .shared,
         pollBackoff: TelegramExponentialBackoff = TelegramExponentialBackoff(),
@@ -318,8 +312,6 @@ public struct TelegramPollLoop: LoopRunner {
         self.voiceMaxBytes = max(1, voiceMaxBytes)
         self.photoDownloader = photoDownloader
         self.photoMaxBytes = max(1, photoMaxBytes)
-        self.chatRetryAttempts = max(0, chatRetryAttempts)
-        self.chatRetryDelayNanoseconds = chatRetryDelayNanoseconds
         self.typingRefreshNanoseconds = typingRefreshNanoseconds
         self.turnCoordinator = turnCoordinator
         self.pollBackoff = pollBackoff
@@ -580,10 +572,6 @@ public struct TelegramPollLoop: LoopRunner {
                     "lastError": .null,
                     "pollBackoffFailures": .int(0),
                     "pollBackoffRetryDelaySeconds": .null,
-                    "lastChatRetryError": .null,
-                    "lastChatRetryFailedAttempt": .null,
-                    "lastChatRetryNextAttempt": .null,
-                    "lastChatRetrySuppressUserAppend": .null,
                 ])
             }
         }
@@ -1296,7 +1284,7 @@ public struct TelegramPollLoop: LoopRunner {
                         await generatedImages.record(event)
                         await progress(event)
                     }
-                    let reply = try await runChatHandlerWithRetry(
+                    let reply = try await runChatHandler(
                         destination: msg.destination,
                         text: text,
                         attachments: turnMediaAttachments,

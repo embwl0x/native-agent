@@ -1,32 +1,9 @@
 import Foundation
 
-// MARK: - In-loop provider recovery (2026-09-05)
-
-/// Which provider failures a turn may retry IN PLACE — same call, same
-/// conversation, nothing re-executed.
-///
-/// This is NOT the whole-turn retry ladder. A surface replay re-runs the tool
-/// dispatches (messages re-send, files re-write), which is why
-/// `ProviderErrorAfterToolEffects` vetoes it. Retrying the provider call from
-/// inside the tool loop has none of that hazard: the tool results are already
-/// appended to `conversation`, so the retry is a second attempt at the SAME
-/// request body. A recoverable drop must therefore keep the turn alive rather
-/// than kill it, which is the whole point of this type.
-///
-/// MODULE PLACEMENT: this lives in ProviderRouting, not ChatOrchestration,
-/// because TelegramBot's `isRetryableChatHandlerError` shares the typed policy
-/// and TelegramBot depends on ProviderRouting but deliberately NOT on
-/// ChatOrchestration (adding that edge would drag the whole tool stack into
-/// the bot module — the same posture DelegationOutcomeLoop documents). The two
-/// wrapper errors ChatOrchestration owns are unwrapped by the extension in
-/// `ChatOrchestration/ProviderRecoveryPolicy.swift`.
+/// Shared classification and backoff for continuing the current provider call.
 public enum ProviderRecoveryPolicy {
-    // Standalone calls retry overloads before output; turns own their reconnect
-    // ladder. Output vetoes replay without exhausting in-place continuation.
     private struct StoppedOverload: ProviderFailureWrapping, LocalizedError {
         let providerFailureCause: Error
-        let exhausted: Bool
-        var permitsWholeTurnRetry: Bool { false }
         var errorDescription: String? { ProviderFailure.overloaded.errorDescription }
     }
 
@@ -37,36 +14,9 @@ public enum ProviderRecoveryPolicy {
             do { return try await operation() }
             catch {
                 guard canRetryOverload(error) else { throw error }
-                guard attemptsMade < maxAttemptsPerCall else { throw stopOverload(error, exhausted: true) }
+                guard attemptsMade < 10 else { throw stopOverload(error) }
                 try await Task.sleep(for: .seconds(backoffSeconds(forRetry: attemptsMade)))
             }
-        }
-    }
-
-    static func retryOverloadStream<Event: Sendable>(
-        hasOutput: @escaping @Sendable (Event) -> Bool,
-        operation: @escaping @Sendable () -> AsyncThrowingStream<Event, Error>
-    ) -> AsyncThrowingStream<Event, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                var emittedOutput = false
-                do {
-                    try await retryOverload {
-                        do {
-                            for try await event in operation() {
-                                try Task.checkCancellation()
-                                emittedOutput = emittedOutput || hasOutput(event)
-                                continuation.yield(event)
-                            }
-                            try Task.checkCancellation()
-                        } catch {
-                            throw emittedOutput ? stopOverload(error, exhausted: false) : error
-                        }
-                    }
-                    continuation.finish()
-                } catch { continuation.finish(throwing: error) }
-            }
-            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -74,28 +24,12 @@ public enum ProviderRecoveryPolicy {
         !(error is StoppedOverload) && isRecoverable(error) && ProviderFailure.classify(error) == .overloaded
     }
 
-    static func stopOverload(_ error: Error, exhausted: Bool) -> Error {
+    private static func stopOverload(_ error: Error) -> Error {
         ProviderFailure.classify(error) == .overloaded
-            ? StoppedOverload(providerFailureCause: error, exhausted: exhausted) : error
+            ? StoppedOverload(providerFailureCause: error) : error
     }
 
-    /// 1 original attempt + 9 retries for a single provider call. The shape is
-    /// Claude Code's reconnect ladder on purpose (the user: it says
-    /// "reconnecting, try n of 10" and keeps going): a provider blip should
-    /// cost a wait, never the turn. Network failures and rate limits ride
-    /// this ladder alongside overloads; standalone calls use the pre-output
-    /// overload ladder above.
-    public static let maxAttemptsPerCall = 10
-
-    /// Ceiling on recoveries across the WHOLE turn, so a provider that drops
-    /// every round cannot ride the per-call budget forever. Two full ladders'
-    /// worth: a turn that needs more than this is not blipping, it is down.
-    public static let maxRecoveriesPerTurn = 20
-
-    /// 1, 2, 4, 8, 15, then 30 held flat — 2m30s of patience across the nine
-    /// retries. It doubles early so a one-packet blip costs a second, and caps
-    /// at 30 so a long provider outage neither hammers the endpoint nor leaves
-    /// the surface staring at a dead status line for minutes at a time.
+    /// 1, 2, 4, 8, 15, then 30 held flat to avoid hammering a provider outage.
     public static let maxBackoffSeconds: TimeInterval = 30
 
     public static func backoffSeconds(forRetry n: Int) -> TimeInterval {
@@ -126,81 +60,14 @@ public enum ProviderRecoveryPolicy {
         return delay.map(TimeInterval.init)
     }
 
-    /// The line a surface shows when the provider asked for a wait longer than
-    /// the turn has left, so the ladder stops instead of sleeping past the
-    /// budget and reporting a bare exhaustion.
-    public static func retryAfterBeyondBudgetStatus(
-        delaySeconds: TimeInterval,
-        remainingSeconds: TimeInterval
-    ) -> String {
-        "The model needs more time than this turn has left; try again in \(Int(delaySeconds.rounded())) seconds."
-    }
-
-    /// Only a provider-requested wait warrants a notice. Ordinary backoff
-    /// exhausting the budget ends the turn without attributing it to the provider.
-    public static func retryAfterBeyondBudgetNotice(
-        for error: Error,
-        remainingSeconds: TimeInterval
-    ) -> String? {
-        guard let retryAfter = retryAfterSeconds(in: error),
-              retryAfter >= remainingSeconds else { return nil }
-        return retryAfterBeyondBudgetStatus(
-            delaySeconds: retryAfter,
-            remainingSeconds: remainingSeconds
-        )
-    }
-
-    /// Reserve held back from the per-call provider wall so a hung call always
-    /// leaves the reconnect ladder somewhere to stand: one full backoff plus a
-    /// short second call.
-    public static let reconnectReserveSeconds: TimeInterval = 60
-
-    /// Floor for the per-call wall. Below this a "timeout" says nothing about
-    /// the provider, only about the budget.
-    public static let minimumCallWallSeconds: TimeInterval = 60
-
-    /// The per-call provider wall, bounded by what the whole turn has left.
-    ///
-    /// User, 2026-09-06: interactive and Telegram turn windows are 600s and the
-    /// default provider wall was also 600s, so the FIRST timeout consumed the
-    /// entire turn — the ladder announced "try 2", slept, and then exited on
-    /// the whole-turn budget without ever re-asking. Shaving the reserve off
-    /// the wall means a hung call always leaves room for one more attempt.
-    /// `remaining` nil (a caller with no turn budget) leaves the wall alone.
-    ///
-    /// User, 2026-09-06: `remaining == 0` is NOT "no budget" — it is a turn
-    /// whose budget is spent, reachable when the sample happens after an
-    /// in-turn compaction. Treating it like nil handed that call the FULL
-    /// configured wall, the largest wall in the whole policy, to an exhausted
-    /// turn. Zero (or negative) now falls through to the floor like any other
-    /// too-small remainder.
-    public static func callWallSeconds(
-        configured: TimeInterval,
-        remainingTurnSeconds remaining: TimeInterval?
-    ) -> TimeInterval {
-        guard configured > 0, let remaining else { return configured }
-        let bounded = remaining - reconnectReserveSeconds
-        if bounded <= minimumCallWallSeconds {
-            return min(configured, minimumCallWallSeconds)
-        }
-        return min(configured, bounded)
-    }
-
-    /// The one line a surface shows while a reconnect is in flight.
-    ///
-    /// `attemptsMade` is how many attempts the call has already burned, so the
-    /// number shown is the attempt ABOUT TO BE MADE — the first reconnect reads
-    /// "try 2 of 10" (try 1 is the one that just dropped) and the last reads
-    /// "try 10 of 10". Counting the retries instead would top out at 9 of 10
-    /// and read as giving up early.
+    /// The next attempt shown while the current call reconnects.
     public static func reconnectStatus(attemptsMade: Int) -> String {
-        "Reconnecting to the model, try \(attemptsMade + 1) of \(maxAttemptsPerCall)…"
+        "Reconnecting to the model, try \(attemptsMade + 1)…"
     }
 
     /// 2026-09-18 WHY: one typed verdict for every adapter and surface.
     /// Model fallback is deliberately absent: the person's selection is binding.
     public static func isRecoverable(_ error: Error) -> Bool {
-        if let stopped = error as? StoppedOverload, stopped.exhausted { return false }
         if let wrapped = error as? any ProviderFailureWrapping {
             return isRecoverable(wrapped.providerFailureCause)
         }
@@ -212,13 +79,6 @@ public enum ProviderRecoveryPolicy {
 
     public static func isContextOverflow(_ error: Error) -> Bool {
         ProviderFailure.classify(error) == .contextTooLong
-    }
-
-    public static func permitsWholeTurnRetry(_ error: Error) -> Bool {
-        if let wrapped = error as? any ProviderFailureWrapping {
-            return wrapped.permitsWholeTurnRetry && permitsWholeTurnRetry(wrapped.providerFailureCause)
-        }
-        return isRecoverable(error)
     }
 
     public static func personMessage(_ error: Error) -> String? {

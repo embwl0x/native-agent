@@ -29,21 +29,13 @@ extension SwiftNativeTurnEngine {
         /// identity without becoming a chat transcript or provider session.
         toolSessionId: String? = nil,
         runId: String? = nil,
-        maxIterations: Int? = nil,
-        turnWallClockSecondsOverride: TimeInterval? = nil,
         llm: any LLMClient,
         tools: any ToolDispatchClient,
         preBuiltContext: TurnContext? = nil,
         progress: ChatOrchestrationProgressHandler? = nil,
-        /// Does the caller render this turn's prose as it streams? When it does
-        /// not (chat() and ephemeral callers await the result), no prose was
-        /// "watched": the reply is the final round's text, a dropped stream
-        /// replays whole, and the terminals read the last round, exactly as a
-        /// turn that only awaits its result has always been answered.
-        rendersProse: Bool = true,
         cancelFlagPath: URL? = nil,
-        /// Asked before every provider call of the turn, retries included. A
-        /// throw ends the turn before that call starts.
+        /// Asked before every provider call, retries included. Admission errors
+        /// stay with their owner; provider recovery cannot override them.
         providerAdmission: (@Sendable () async throws -> Void)? = nil
     ) async throws -> TurnEngineResult {
         return try await ChatToolSessionContext.$userText.withValue(userMessage) {
@@ -60,12 +52,12 @@ extension SwiftNativeTurnEngine {
             sessionId: toolSessionId ?? sessionId,
             turnId: TurnTraceContext.turnId
         )
+        var cleanFinish = false
         defer {
-            if let recoveryScope {
+            if cleanFinish || Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath), let recoveryScope {
                 Task { await ProviderToolResultRecoveryStore.shared.remove(scope: recoveryScope) }
             }
         }
-        var wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface, requestedSeconds: turnWallClockSecondsOverride)
         let startNs = DispatchTime.now().uptimeNanoseconds
         // Shared pre-loop context resolution (C2): prefer preBuiltContext, else
         // build + lazy-filter (so the turn never ships the full eager catalog),
@@ -94,7 +86,7 @@ extension SwiftNativeTurnEngine {
 
         // The provider-name map is built from the array and then held still
         // for the whole turn.
-        var providerTools = ProviderToolNameMap(resolvedTurnContext.toolSchemas)
+        let providerTools = ProviderToolNameMap(resolvedTurnContext.toolSchemas)
         // How tools are offered and calls read back, per provider (8a seam).
         // Chosen from the provider the client itself resolves under the SAME
         // bindings every call of this turn runs with, so a route the client
@@ -192,835 +184,396 @@ extension SwiftNativeTurnEngine {
         var counters = TurnEngineResult.LoopCounters()
         defer { ToolLoopTraceObservation.current?.record(counters, dispatches: dispatches) }
         var previousRoundFailed = false
-        var brakeReason = TurnEngineResult.TerminalReason.iterationLimit
         func observed(_ result: TurnEngineResult, reason: TurnEngineResult.TerminalReason) -> TurnEngineResult {
-            result.observingTerminal(reason: reason, counters: counters)
+            cleanFinish = reason == .replyCompleted || reason == .incomplete
+            return result.observingTerminal(reason: reason, counters: counters)
         }
         var lastRawResponse = ""
-        // #5: visible prose accumulated across iterations (text deltas only, no
-        // tool markers) — carried across a mid-stream throw so the partial isn't
-        // lost. Used only on the failure path.
         var visibleText = ""
-        // Transcript-loss fix (2026-07-31): interstitial narration from every
-        // NON-final iteration (prose → tool → prose → tool → prose). Those bytes
-        // were streamed to the surface but the success return built `reply` from
-        // the LAST iteration's `iterAccumulated` only, so a reload showed one
-        // paragraph where the user watched three render. The failure path already
-        // persisted the whole accumulated `visibleText`; success now matches it —
-        // raw concatenation, no injected separator, exactly the bytes emitted via
-        // progress?(.delta(...)). Bounced iterations (violation / empty-reply /
-        // announce) `continue` before the append, so rejected narration is
-        // discarded here the same way those paths reset `visibleText`.
         var turnInterstitialProse = ""
-        // The last round's raw output (text, then its tool calls as markers):
-        // what the terminals read when the caller renders no prose.
-        var lastRoundRaw = ""
-        var lastProviderHadToolCalls = false
-        var lastProtocolViolation: ToolCallProtocolViolation?
-        // F2-M4 (2026-07-23): completion-contract announce-without-act bounce on
-        // the structured lane (mirrors the text-compat call site), so missions,
-        // workshop, bridge and every OpenAI-wire provider enforce it. Bounded
-        // at two; a third announcement settles explicitly as incomplete.
-        var announceNudgeCount = 0
-        // FIX 1 (B1.1, 2026-07-23): empty-reply recovery, ported from the
-        // text-compat lane. Bounded at two; the third empty reply is accepted
-        // as final, so a thinking-only provider can never loop.
-        var emptyReplyNudgeCount = 0
+        var retainedAnswerProse = ""
         var emittedProviderFirstDelta = false
         var noProgressGuard = ToolLoopNoProgressGuard()
-        var loopRecoveryReply: String?
-        // B3 (2026-07-17): the streaming loop is the PRIMARY chat path but never
-        // counted provider calls — cost/telemetry undercounted the main surface.
-        // One streamMessages call per iteration; count it and thread it into
-        // every TurnEngineResult return below.
         var providerCallCount = 0
         var replyTextSettled = false
-        // In-loop provider recovery (2026-09-05): how many times THIS turn has
-        // re-issued a provider call after a recoverable drop. Bounded so a
-        // provider that fails every round cannot ride the per-call budget
-        // forever. See ProviderRecoveryPolicy.
-        var turnRecoveries = 0
-        var wallClockElapsedSeconds: Int?
-        let iterationLimit = ToolLoopBudget.resolve(surface: surface, requested: maxIterations)
+        var retryAttempt = 0
 
-        streamingIterations: for _ in 0..<iterationLimit {
+        if let restarted = TurnCheckpointScope.resuming, restarted.runId == runId,
+           restarted.turnId == TurnTraceContext.turnId {
+            let rows = TurnCheckpointScope.resumedRows
+            let receipts = rows.filter { SessionHistoryPromptRenderer.renderable($0)?.isTool == true }
+            dispatches = receipts.compactMap { row in
+                guard case .object(let fields)? = row.extras, case .object(let metadata)? = fields["metadata"],
+                      case .string(let name)? = metadata["toolName"],
+                      case .string(let raw)? = metadata["resultBody"] ?? metadata["resultSummary"],
+                      var result = try? JSONValue.parse(Data(raw.utf8)) else { return nil }
+                if let images = metadata["generatedImages"], case .object(var fields) = result {
+                    fields["images"] = images
+                    result = .object(fields)
+                }
+                let input: [String: JSONValue]
+                if case .string(let raw)? = metadata["inputJSON"],
+                   case .object(let saved)? = try? JSONValue.parse(Data(raw.utf8)) { input = saved }
+                else { input = [:] }
+                return TurnEngineResult.ToolDispatchRecord(
+                    name: metadata["generatedImages"] == nil ? name : "image_generate", input: input, result: result)
+            }
+            guard let user = rows.first(where: { $0.role == "user" }) else {
+                throw ChatOrchestrationError.underlying("The resumed turn's saved user message is missing; repair its transcript.")
+            }
+            let replay = SessionHistoryMessageProjection.project(messages: [user] + receipts,
+                historyLimit: max(1, receipts.count + 1), surface: surface, windowTokens: turnWindowTokens)
+            visibleText = restarted.keptProse
+            turnInterstitialProse = String(restarted.keptProse.prefix(restarted.workingCommentaryCharacters))
+            retainedAnswerProse = String(restarted.keptProse.dropFirst(restarted.workingCommentaryCharacters))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !restarted.workingNotes.isEmpty { conversation.append(.assistantText(restarted.workingNotes)) }
+            TurnObservation.apply(.restarted(stepsDone: receipts.count,
+                unknownStep: restarted.runningStep == nil ? nil : receipts.count + 1),
+                kept: restarted.keptProse, to: &conversation, surface: surface)
+            // Reuse the history projection, without inventing provider call IDs.
+            if let last = conversation.last {
+                conversation[conversation.count - 1] = LLMMessage(role: last.role,
+                    content: last.content + replay.messages.dropFirst().flatMap(\.content))
+            }
+            if !visibleText.isEmpty { await progress?(.delta(visibleText)) }
+        }
+
+        func finishIncompleteTurn() async -> TurnEngineResult {
+            observed(await finishCompletedTurn(
+                reply: Self.joinedProse(turnInterstitialProse, retainedAnswerProse),
+                ctx: ctx, dispatches: dispatches,
+                startNs: startNs, rawLLMResponse: lastRawResponse,
+                providerCallCount: providerCallCount, userMessage: userMessage,
+                sessionId: sessionId, surface: surface,
+                workingCommentaryCharacters: turnInterstitialProse.isEmpty ? nil : turnInterstitialProse.count,
+                completionState: .incomplete
+            ), reason: .incomplete)
+        }
+
+        func stopCarryingPartial() -> Error {
+            TurnEngineError.streamCancelled(
+                partial: toolCallCodec.visiblePrefix(in: visibleText),
+                underlying: CancellationError())
+        }
+
+        while true {
+            if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
+                throw stopCarryingPartial()
+            }
             if replyTextSettled {
                 replyTextSettled = false
                 await progress?(.replyTextSettled(false))
             }
-            // B7: a cross-process Stop that only WROTE cancelled.flag (no Task
-            // handle — e.g. the bridge) is honored before a round starts, not
-            // only once a stream is running: a buffered provider yields nothing
-            // to poll until it is done.
-            if ChatCancelFlag.isRaised(cancelFlagPath) {
-                throw TurnEngineError.streamCancelled(
-                    partial: toolCallCodec.visiblePrefix(in: visibleText),
-                    underlying: CancellationError()
-                )
-            }
-            // A6: do not interrupt an active provider stream or dispatch. At
-            // this boundary, expiry falls through to the one exhaustion tail.
-            if wholeTurnBudget.isExhausted {
-                wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
-                break
-            }
-            var iterAccumulated = ""
-            // Bytes this iteration actually handed to the surface (marker-safe
-            // slices only). Folded into `turnInterstitialProse` when the
-            // iteration ends in a tool dispatch.
-            var iterEmittedProse = ""
-            var streamedCalls: [ParsedToolCall] = []
-            var toolBoundaryReason: LLMToolBoundaryReason?
-            var pendingProtocolDelta = ""
-            if await IntraTurnContextCompaction.compactProactivelyIfNeeded(
+            _ = await IntraTurnContextCompaction.compactProactivelyIfNeeded(
                 conversation: &conversation,
                 turnStartIndex: compactionTurnStart,
                 windowTokens: turnWindowTokens,
                 distill: distillWorkingNotes,
                 surface: surface,
-                turnRecoveries: turnRecoveries,
+                turnRecoveries: counters.providerRecoveryCount,
                 progress: progress
-            ) {
-                // User, 2026-09-06: compaction can distill through the model, so
-                // it spends real wall time. Re-check the budget it may have
-                // just exhausted — otherwise the round below samples a
-                // remainder of zero for its per-call wall and starts a provider
-                // call the turn has no time for.
-                if wholeTurnBudget.isExhausted {
-                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
-                    break
-                }
-            }
-            // User, 2026-09-06: counted HERE, after the last exit above it. A
-            // compaction that exhausted the budget used to leave a counted
-            // round that was never made, and the exhaustion line quoted that
-            // inflated count back to the user.
-            providerCallCount += 1
-            // In-loop provider recovery (2026-09-05). A recoverable mid-stream
-            // drop no longer kills the turn: the tool results already sit in
-            // `conversation`, so the stream is re-issued in place. `retryAfterDrop`
-            // is how the catch (which lives INSIDE the task-local nest below)
-            // reports the drop out to the retry block after the nest closes —
-            // the stream has to be rebuilt under freshly-entered bindings.
-            // `attemptBase*` are the per-turn accumulators as they stood BEFORE
-            // this attempt, so a replay can discard the attempt whole.
-            var callAttempt = 1
-            var recoveryMode = "replay"
-            var retryAfterDrop: Error?
-            var reachedLengthLimit = false
-            var lengthLimitPartial = ""
-            var emptyThinkingOnlyReply = false
-            // Context-overflow survival: `overflowAfterDrop` is the sibling of
-            // `retryAfterDrop` — the compaction receipt reported out of the nest
-            // so the block after it can announce and re-issue.
-            var overflowRecoveries = 0
-            var overflowAfterDrop: IntraTurnContextCompaction.Receipt?
-            var attemptMessages = conversation
-            let attemptBaseVisibleText = visibleText
-            let attemptBaseRawResponse = lastRawResponse
-            while true {
-            // U1 step 4: thread the session id task-locally so the OpenAI
-            // Responses adapter gets a stable prompt_cache_key. U1 step 2b/3b:
-            // same for the stable/dynamic system split (Anthropic adapters'
-            // breakpoint placement).
-            // MEMORY-SAFETY (2026-07-04): bind via the ASYNC withValue overload
-            // wrapping BOTH construction AND consumption — NOT a sync withValue
-            // around construction alone. llm.streamMessages(...) builds an
-            // AsyncThrowingStream whose adapter child Task inherits these
-            // task-locals and reads them LAZILY (e.g. sessionId → prompt_cache_key
-            // in buildResponsesBodyFromMessages, after streamMessages has already
-            // returned). A sync withValue pops the binding the instant the stream
-            // is constructed — while the child still references it — the same
-            // task-allocator LIFO shape ("freed pointer was not the last
-            // allocation" / swift_task_dealloc_specific) that caused the
-            // release-only first-chat crash on the text-compat path (1b1caf58).
-            // The async overload holds the binding until the stream is fully
-            // drained (child Task done), keeping the pop LIFO-ordered. The
-            // no-tool-calls early return + tool dispatch stay OUTSIDE this block,
-            // so wrapping only construction+consumption needs no re-indent.
-            let providerRoute = ctx.providerId ?? LLMCallContext.providerId
-            let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
-            // Keep stream reduction out of the nested generic expressions;
-            // construction and consumption still run inside every binding below.
-            let wakeRoot = remPinsDataRoot
-            let consumeAttempt: () async throws -> Void = {
-            // Before the stream exists, so a refusal starts no provider call.
-            do {
-                try await providerAdmission?()
-            } catch {
-                throw ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
-            }
-            // Iteration, budget, compaction, schema refresh and provider
-            // admission all succeeded. Only now can a follow-up leave its queue.
-            if !dispatches.isEmpty, let sessionId, !sessionId.isEmpty {
-                // Undelivered offers stay reserved; a turn that ends before a
-                // round reads them returns them to the queue at close.
-                let offers = await ChatTurnSteering.shared.drain(
-                    sessionId: sessionId, cancelFlagPath: cancelFlagPath)
-                if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
-                    throw TurnEngineError.streamCancelled(
-                        partial: toolCallCodec.visiblePrefix(in: visibleText),
-                        underlying: CancellationError())
-                }
-                if wholeTurnBudget.isExhausted {
-                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
-                    return
-                }
-                steeringOffers += offers
-                for offer in offers {
-                    Self.appendStructuredUserNudge(
-                        ChatTurnSteering.deliveryText(offer.text), to: &conversation)
-                    Self.appendStructuredUserNudge(
-                        ChatTurnSteering.deliveryText(offer.text), to: &attemptMessages)
-                }
-                // What resolved meanwhile feeds this turn, not a second one:
-                // hers only, never a helper's or one a peer steers or answers to.
-                if let root = wakeRoot, !sessionId.hasPrefix("bot-"), PeerDataTaint.current?.isTainted != true,
-                   [nil, "self"].contains(ChatToolSessionContext.envelope?.agent),
-                   let arrived = ResidentWake.shared.take(dataRoot: root) {
-                    Self.appendStructuredUserNudge(arrived, to: &conversation)
-                    Self.appendStructuredUserNudge(arrived, to: &attemptMessages)
-                }
-            }
-            // Sample after steering persistence has spent its wall time.
-            try await LLMCallContext.$remainingTurnSeconds
-                .withValue(wholeTurnBudget.remainingSeconds) {
-            try await LLMCallContext.$purpose.withValue(LLMCallContext.purpose == "other"
-                ? (dispatches.isEmpty ? "turn" : "tool_round") : LLMCallContext.purpose) {
-            counters.providerAttemptCount += 1
-            if callAttempt == 1 {
-                counters.providerRoundCount += 1
-                if previousRoundFailed { counters.roundsAfterToolFailureCount += 1 }
-                previousRoundFailed = false
-            } else {
-                counters.providerRecoveryCount += 1
-                if recoveryMode == "overflow" { counters.contextOverflowRecoveryCount += 1 }
-                if recoveryMode == "continuation" { counters.providerContinuationCount += 1 }
-                else { counters.providerReplayCount += 1 }
-            }
-            let stream = llm.streamMessages(
-                messages: attemptMessages,
-                system: wireSystem.prompt,
-                model: ctx.modelId,
-                surface: surface,
-                tools: toolCallCodec.requestTools(providerTools.schemas)
             )
-            var streamEventIndex = 0
+            try await TurnCheckpointScope.current?.capture(
+                prose: Self.joinedProse(turnInterstitialProse, retainedAnswerProse),
+                commentaryCharacters: turnInterstitialProse.count, conversation: conversation, nextIteration: true)
+            var iterAccumulated = ""
+            var iterEmittedProse = ""
+            var streamedCalls: [ParsedToolCall] = []
+            var toolBoundaryReason: LLMToolBoundaryReason?
+            var pendingProtocolDelta = ""
+            let roundBaseVisibleText = visibleText
+            let roundBaseRawResponse = lastRawResponse
+            let roundStarted = DispatchTime.now().uptimeNanoseconds
+
+            // Only prose can survive an incomplete stream; none of its calls ran.
+            func keepPartial() async -> String {
+                let kept = toolBoundaryReason == .fabricatedResult
+                    ? iterEmittedProse : toolCallCodec.visiblePrefix(in: iterAccumulated)
+                if kept.hasPrefix(iterEmittedProse) {
+                    let tail = String(kept.dropFirst(iterEmittedProse.count))
+                    if !tail.isEmpty { await progress?(.delta(tail)) }
+                }
+                visibleText = roundBaseVisibleText + kept
+                lastRawResponse = roundBaseRawResponse + kept
+                retainedAnswerProse = Self.joinedProse(retainedAnswerProse, kept)
+                streamedCalls.removeAll(keepingCapacity: true)
+                pendingProtocolDelta.removeAll(keepingCapacity: true)
+                return kept
+            }
+
+            do { try await providerAdmission?() }
+            catch is CancellationError { throw stopCarryingPartial() }
             do {
-                for try await event in stream {
-                    try Task.checkCancellation()
-                    streamEventIndex += 1
-                    // #19 (2026-06-14): a cross-process Stop that only WRITES the
-                    // cancelled.flag (no Task handle — e.g. the bridge surface)
-                    // must be able to halt a structured turn, else it runs to
-                    // completion burning provider tokens. Mirror streamTurn's poll.
-                    if let flag = cancelFlagPath,
-                       streamEventIndex % 8 == 0,
-                       ChatCancelFlag.isRaised(flag) {
+                if !dispatches.isEmpty, let sessionId, !sessionId.isEmpty {
+                    let offers = await ChatTurnSteering.shared.drain(
+                        sessionId: sessionId, cancelFlagPath: cancelFlagPath)
+                    if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
                         throw CancellationError()
                     }
-                    switch event {
-                    case .toolBoundary(let reason):
-                        toolBoundaryReason = reason
-                    case .replyTextSettled(let settled):
-                        if settled, lastProtocolViolation == nil {
-                            let prose = toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta)
-                            if !prose.isEmpty {
-                                iterEmittedProse += prose
-                                await progress?(.delta(prose))
+                    steeringOffers += offers
+                    for offer in offers {
+                        Self.appendStructuredUserNudge(
+                            ChatTurnSteering.deliveryText(offer.text), to: &conversation)
+                    }
+                    if let root = remPinsDataRoot, !sessionId.hasPrefix("bot-"), PeerDataTaint.current?.isTainted != true,
+                       [nil, "self"].contains(ChatToolSessionContext.envelope?.agent),
+                       let arrived = ResidentWake.shared.take(dataRoot: root) {
+                        Self.appendStructuredUserNudge(arrived, to: &conversation)
+                    }
+                }
+                providerCallCount += 1
+                counters.providerAttemptCount += 1
+                if retryAttempt == 0 {
+                    counters.providerRoundCount += 1
+                    if previousRoundFailed { counters.roundsAfterToolFailureCount += 1 }
+                    previousRoundFailed = false
+                } else {
+                    counters.providerRecoveryCount += 1
+                }
+                // Construction and consumption share the async task-local scope.
+                let providerRoute = ctx.providerId ?? LLMCallContext.providerId
+                let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
+                let purpose = LLMCallContext.purpose == "other"
+                    ? (dispatches.isEmpty ? "turn" : "tool_round") : LLMCallContext.purpose
+                let consumeStream: () async throws -> Void = {
+                    try await LLMCallContext.$purpose.withValue(purpose) {
+                    let stream = llm.streamMessages(
+                        messages: conversation,
+                        system: wireSystem.prompt,
+                        model: ctx.modelId,
+                        surface: surface,
+                        tools: toolCallCodec.requestTools(providerTools.schemas)
+                    )
+                    for try await event in stream {
+                        try Task.checkCancellation()
+                        if ChatCancelFlag.isRaised(cancelFlagPath) { throw CancellationError() }
+                        switch event {
+                        case .toolBoundary(let reason):
+                            toolBoundaryReason = reason
+                        case .replyTextSettled(let settled):
+                            if settled {
+                                let prose = toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta)
+                                if !prose.isEmpty {
+                                    iterEmittedProse += prose
+                                    await progress?(.delta(prose))
+                                }
+                                pendingProtocolDelta.removeAll(keepingCapacity: true)
                             }
-                            pendingProtocolDelta.removeAll(keepingCapacity: true)
-                        }
-                        replyTextSettled = settled
-                        await progress?(.replyTextSettled(settled))
-                    case .textDelta(let delta):
-                        if !delta.isEmpty {
+                            replyTextSettled = settled
+                            await progress?(.replyTextSettled(settled))
+                        case .textDelta(let delta):
+                            if !delta.isEmpty {
+                                await ctx.fluidContextTurn?.recordDelivery()
+                                try await commitDelivery()
+                                if !emittedProviderFirstDelta {
+                                    emittedProviderFirstDelta = true
+                                    TurnLifecycleTelemetry.emit(
+                                        .providerFirstDelta, surface: surface, sessionId: sessionId,
+                                        observedBy: "structured_tool_loop.stream")
+                                }
+                            }
+                            iterAccumulated += delta
+                            lastRawResponse += delta
+                            visibleText += delta
+                            pendingProtocolDelta += delta
+                            let safe = toolCallCodec.releasableProse(holding: &pendingProtocolDelta)
+                            if !safe.isEmpty {
+                                iterEmittedProse += safe
+                                await progress?(.delta(safe))
+                            }
+                        case .toolCall(let call):
                             await ctx.fluidContextTurn?.recordDelivery()
                             try await commitDelivery()
+                            guard let parsed = try toolCallCodec.decode(call) else { continue }
+                            streamedCalls.append(parsed)
+                            let args = String(data: call.inputJSON, encoding: .utf8) ?? "{}"
+                            lastRawResponse += "\n<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(args)</tool_use>"
+                        case .keepAlive:
+                            break
                         }
-                        if !delta.isEmpty, !emittedProviderFirstDelta {
-                            emittedProviderFirstDelta = true
-                            TurnLifecycleTelemetry.emit(
-                                .providerFirstDelta,
-                                surface: surface,
-                                sessionId: sessionId,
-                                observedBy: "structured_tool_loop.stream"
-                            )
-                        }
-                        iterAccumulated += delta
-                        lastRawResponse += delta
-                        visibleText += delta
-                        pendingProtocolDelta += delta
-                        let safe = lastProtocolViolation == nil
-                            ? toolCallCodec.releasableProse(holding: &pendingProtocolDelta) : ""
-                        if !safe.isEmpty {
-                            iterEmittedProse += safe
-                            await progress?(.delta(safe))
-                        }
-                    case .toolCall(let call):
-                        await ctx.fluidContextTurn?.recordDelivery()
-                        try await commitDelivery()
-                        guard let parsed = try toolCallCodec.decode(call) else {
-                            continue
-                        }
-                        streamedCalls.append(parsed)
-                        let args = String(data: call.inputJSON, encoding: .utf8) ?? "{}"
-                        lastRawResponse += "\n<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(args)</tool_use>"
-                    case .keepAlive:
-                        // Liveness signal (no content): nothing to accumulate and
-                        // no progress delta to emit. The cancel-flag poll above
-                        // still ran, so a keepalive is also a valid stop checkpoint.
-                        break
+                    }
+                    try Task.checkCancellation()
+                    if ChatCancelFlag.isRaised(cancelFlagPath) { throw CancellationError() }
+                    try await commitDelivery()
                     }
                 }
-                // Cancellation can resume AsyncThrowingStream.next() with nil
-                // rather than throw or deliver another event. Check the same
-                // stop signals at EOF before treating visible prose as complete
-                // or dispatching any tool calls buffered by this iteration.
-                try Task.checkCancellation()
-                if ChatCancelFlag.isRaised(cancelFlagPath) {
-                    throw CancellationError()
+                try await ConversationPrefixBoundary.$currentUserIndex.withValue(prefixSeed.currentUserIndex) {
+                try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
+                try await LLMCallContext.$providerId.withValue(providerRoute) {
+                try await LLMCallContext.$serviceTier.withValue(serviceTier) {
+                try await LLMCallContext.$systemSegments.withValue(wireSystem.segments) {
+                try await LLMCallContext.$sessionId.withValue(sessionId) {
+                try await LLMCallContext.$reasoningEffort.withValue(ctx.reasoningEffort) {
+                try await AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
+                try await InspectorThinkingLane.$summarizedThinking
+                    .withValue(InspectorThinkingLane.isEnabledForSurface(surface)) {
+                    try await consumeStream()
                 }
-                try await commitDelivery()
-            } catch is CancellationError {
-                // 2026-07-21 audit fix: a user stop mid-stream CARRIES the
-                // visible partial (marker-stripped, same as the interrupted
-                // path below) so the orchestration catch can persist it with
-                // cancelled:true — previously this lane dropped every
-                // streamed character on Stop while text-compat persisted it.
-                // Cancel still propagates as cancel semantics (not a
-                // failure) via the dedicated case.
-                let safePartial = toolCallCodec.visiblePrefix(in: visibleText)
-                throw TurnEngineError.streamCancelled(
-                    partial: safePartial,
-                    underlying: CancellationError()
-                )
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
             } catch {
-                if replyTextSettled {
-                    replyTextSettled = false
-                    await progress?(.replyTextSettled(false))
-                }
-                if case .outputLengthLimit(let partial) = error as? LLMError {
-                    TurnTraceBus.fireFromContext(kind: "provider.output_limit", surface: surface, payload: .object([
-                        "byteSize": .int(Int64(partial.utf8.count)),
-                        "responseTail": .string(String(decoding: ChatSecretRedactor.redactText(partial).utf8.suffix(2000), as: UTF8.self)),
-                    ]))
-                    reachedLengthLimit = true
-                    lengthLimitPartial = partial
-                    return
-                }
-                counters.failedProviderAttemptCount += 1
-                // A reply that was all thinking and no text: the Anthropic-wire
-                // adapters report it as a transient error ("no answer text"),
-                // and an identical replay is proven useless against it
-                // (2026-07-20). It is an empty round, so it ends the attempt
-                // with nothing in it and takes the empty-reply bounce below,
-                // same caps, instead of the reconnect ladder.
-                if ProviderRecoveryPolicy.isEmptyReply(error),
-                   iterAccumulated.isEmpty, streamedCalls.isEmpty {
-                    emptyThinkingOnlyReply = true
-                    return
-                }
-                // Context-overflow survival, REACTIVE half: the provider refused
-                // the body as TOO LONG. The 400 lands BEFORE any delta, so the
-                // attempt is discarded whole (replay) and nothing the user
-                // watched render is lost. Compaction runs HERE and mutates the
-                // REAL `conversation`, not the attempt copy, so every later round
-                // of the turn keeps the room it gave back; the block after the
-                // nest does the announcing and the re-issue.
-                if callAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
-                   overflowRecoveries < IntraTurnContextCompaction.maxOverflowRecoveriesPerCall,
-                   turnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
-                   // Replay is only honest when the attempt produced NOTHING: a
-                   // provider that streamed text and then reported overflow has
-                   // already put prose on the surface, and that case belongs to
-                   // the interrupted-stream continuation path below. A caller
-                   // that renders no prose saw nothing, so it always replays.
-                   !rendersProse || (iterAccumulated.isEmpty && iterEmittedProse.isEmpty && streamedCalls.isEmpty),
-                   ProviderRecoveryPolicy.isContextOverflow(error) {
-                    let receipt = await IntraTurnContextCompaction.compact(
-                        conversation: &conversation,
-                        turnStartIndex: compactionTurnStart,
-                        windowTokens: turnWindowTokens,
-                        pressure: .overflow,
-                        distill: distillWorkingNotes
-                    )
-                    // "none" means nothing left to trim — fall through to the
-                    // throw below and die the old way.
-                    if receipt.mode != "none" {
-                        overflowAfterDrop = receipt
-                        return
-                    }
-                }
-                // A recoverable drop is a RETRY, not a death: report it out of
-                // the task-local nest and let the block after the nest back off
-                // and re-issue. Only an unrecoverable failure — or a spent
-                // budget — falls through to the throw below.
-                if callAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
-                   turnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
-                   ProviderRecoveryPolicy.isRecoverableTurnFailure(
-                       error, replays: iterEmittedProse.isEmpty || !rendersProse) {
-                    retryAfterDrop = error
-                    return
-                }
-                // #5 (2026-06-14): a mid-stream provider failure must not silently
-                // DROP the prose the user already watched render. Carry the visible
-                // partial across the throw so the orchestration catch can persist
-                // it (cancelled:false). Strip any tool marker first — some
-                // structured-path providers emit <tool_use> as TEXT (the
-                // streamedCalls.isEmpty fallback below parses it), so visibleText
-                // can hold a raw/partial marker that must NOT persist as visible
-                // prose (gpt-5.5 review 2026-06-14).
-                let safePartial = toolCallCodec.visiblePrefix(in: visibleText)
-                // Wrap the UNDERLYING only: `case .streamInterrupted(partial, _)`
-                // pattern-matches upstream still fire (partial persistence), and
-                // streamInterrupted's errorDescription flows the wrapped marker
-                // through to surface retry ladders.
-                throw TurnEngineError.streamInterrupted(
-                    partial: safePartial,
-                    underlying: ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
-                )
-            }
-            } // LLMCallContext.$purpose.withValue
-            } // LLMCallContext.$remainingTurnSeconds.withValue
-            }
-            // Where THIS turn begins. The adapter cannot re-derive it: replayed
-            // history carries archived `system` blocks of its own, so the old
-            // `lastIndex(.system)` anchor selected one of THOSE and dropped the
-            // cross-turn 1h marker near the start of the conversation. Rounds
-            // only ever APPEND, so this index stays correct for the whole turn.
-            try await ConversationPrefixBoundary.$currentUserIndex
-                .withValue(prefixSeed.currentUserIndex) {
-            try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
-            try await LLMCallContext.$providerId.withValue(providerRoute) {
-            try await LLMCallContext.$serviceTier.withValue(serviceTier) {
-            try await LLMCallContext.$systemSegments.withValue(wireSystem.segments) {
-            try await LLMCallContext.$sessionId.withValue(sessionId) {
-            try await LLMCallContext.$reasoningEffort.withValue(ctx.reasoningEffort) {
-            // Read only by the Claude subscription adapter: this conversation is
-            // re-sent as a prefix next round (its conversation cache markers),
-            // and the Mac chat surface's summarized-thinking opt-in.
-            try await AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
-            try await InspectorThinkingLane.$summarizedThinking
-                .withValue(InspectorThinkingLane.isEnabledForSurface(surface)) {
-                try await consumeAttempt()
-            } // InspectorThinkingLane.$summarizedThinking.withValue
-            } // MessagesCacheHint.$withinTurnReuse.withValue
-            } // LLMCallContext.$reasoningEffort.withValue
-            } // LLMCallContext.$sessionId.withValue
-            } // LLMCallContext.$systemSegments.withValue
-            } // LLMCallContext.$serviceTier.withValue
-            } // LLMCallContext.$providerId.withValue
-            } // LLMCallContext.$admittedModel.withValue
-            } // ConversationPrefixBoundary.$currentUserIndex.withValue
-
-            if wallClockElapsedSeconds != nil {
-                providerCallCount -= 1
-                break streamingIterations
-            }
-
-            // The same Stop checks a clean end of stream gets.
-            if emptyThinkingOnlyReply, Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
-                throw TurnEngineError.streamCancelled(
-                    partial: toolCallCodec.visiblePrefix(in: visibleText),
-                    underlying: CancellationError()
-                )
-            }
-            if reachedLengthLimit {
-                if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
-                    throw TurnEngineError.streamCancelled(
-                        partial: toolCallCodec.visiblePrefix(in: visibleText),
-                        underlying: CancellationError()
-                    )
-                }
-                return observed(await finishLengthLimitedTurn(
-                    ctx: ctx, partial: rendersProse ? visibleText : lengthLimitPartial, dispatches: dispatches,
-                    startNs: startNs, providerCallCount: providerCallCount,
-                    userMessage: userMessage, sessionId: sessionId, surface: surface, codec: toolCallCodec
-                ), reason: .outputLimit)
-            }
-
-            // Context-overflow survival, second act: the conversation was
-            // already trimmed inside the nest. Announce it and re-issue in
-            // REPLAY mode — the 400 arrived before any delta, so discarding the
-            // attempt whole loses nothing. No backoff: the body CHANGED.
-            // A Stop that lands between attempts carries the prose the user
-            // already watched, exactly as one inside the stream does (Codex
-            // review 2026-09-05: a bare CancellationError here skipped the
-            // partial persistence).
-            func stopCarryingPartial() -> Error {
-                let safePartial = toolCallCodec.visiblePrefix(in: visibleText)
-                return TurnEngineError.streamCancelled(partial: safePartial, underlying: CancellationError())
-            }
-            if let overflowReceipt = overflowAfterDrop {
-                overflowAfterDrop = nil
-                overflowRecoveries += 1
-                turnRecoveries += 1
-                TurnTraceBus.fireFromContext(
-                    kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
-                    surface: surface,
-                    payload: IntraTurnContextCompaction.tracePayload(
-                        overflowReceipt, trigger: "overflow", turnRecoveries: turnRecoveries
-                    )
-                )
-                // Cancellation outranks recovery — the same two signals the
-                // stream body polls, checked before anything is re-issued.
-                if Task.isCancelled { throw stopCarryingPartial() }
-                if ChatCancelFlag.isRaised(cancelFlagPath) {
+                if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) || error is CancellationError {
                     throw stopCarryingPartial()
                 }
-                await progress?(.notice(
-                    kind: IntraTurnContextCompaction.noticeKind,
-                    text: IntraTurnContextCompaction.noticeText
-                ))
-                if wholeTurnBudget.isExhausted {
-                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
-                    break streamingIterations
+                counters.failedProviderAttemptCount += 1
+                if iterAccumulated.isEmpty, case .outputLengthLimit(let partial) = error as? LLMError {
+                    iterAccumulated = partial
                 }
-                callAttempt += 1
-                recoveryMode = "overflow"
-                providerCallCount += 1
-                streamedCalls.removeAll(keepingCapacity: true)
-                pendingProtocolDelta = ""
-                iterAccumulated = ""
-                iterEmittedProse = ""
-                visibleText = attemptBaseVisibleText
-                lastRawResponse = attemptBaseRawResponse
-                attemptMessages = conversation
+                let kept = await keepPartial()
+                if case .outputLengthLimit = error as? LLMError,
+                   LLMCallContext.turnTokenBudget?.exhausted == true {
+                    return await finishIncompleteTurn()
+                }
+                if ProviderRecoveryPolicy.isContextOverflow(error) {
+                    let receipt = await IntraTurnContextCompaction.compact(
+                        conversation: &conversation, turnStartIndex: compactionTurnStart,
+                        windowTokens: turnWindowTokens, pressure: .overflow, distill: distillWorkingNotes)
+                    if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { throw stopCarryingPartial() }
+                    counters.contextOverflowRecoveryCount += 1
+                    TurnTraceBus.fireFromContext(
+                        kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
+                        surface: surface, payload: IntraTurnContextCompaction.tracePayload(
+                            receipt, trigger: "overflow", turnRecoveries: counters.providerRecoveryCount))
+                    if receipt.mode == "none" {
+                        await progress?(.notice(kind: "context_full",
+                            text: ProviderFailure.contextTooLong.localizedDescription))
+                        return await finishIncompleteTurn()
+                    }
+                    TurnObservation.apply(.contextFull, kept: kept, to: &conversation, surface: surface)
+                    await progress?(.notice(kind: IntraTurnContextCompaction.noticeKind,
+                        text: IntraTurnContextCompaction.noticeText))
+                } else if case .outputLengthLimit = error as? LLMError {
+                    TurnObservation.apply(.lengthLimit(chars: kept.count), kept: kept, to: &conversation, surface: surface)
+                } else if ProviderRecoveryPolicy.isEmptyReply(error) {
+                    counters.emptyReplyRoundCount += 1
+                    TurnObservation.apply(.emptyReply, kept: kept, to: &conversation, surface: surface)
+                } else if ProviderRecoveryPolicy.isRecoverable(error) {
+                    retryAttempt += 1
+                    let delay = ProviderRecoveryPolicy.retryDelaySeconds(forRetry: retryAttempt, error: error)
+                    let elapsed = Int((DispatchTime.now().uptimeNanoseconds &- roundStarted) / 1_000_000_000)
+                    if kept.isEmpty {
+                        counters.providerReplayCount += 1
+                        // An empty transport cut replays the identical conversation.
+                        TurnObservation.record(.cut(seconds: elapsed, keptChars: 0), surface: surface)
+                    } else {
+                        counters.providerContinuationCount += 1
+                        TurnObservation.apply(.cut(seconds: elapsed, keptChars: kept.count),
+                            kept: kept, to: &conversation, surface: surface)
+                    }
+                    ProviderRetryTrace.emit(error: error, attempt: retryAttempt,
+                        delaySeconds: delay, mode: kept.isEmpty ? "replay" : "continuation",
+                        turnRecoveries: counters.providerRecoveryCount, surface: surface)
+                    await progress?(.notice(kind: "provider_retry",
+                        text: ProviderRecoveryPolicy.reconnectStatus(attemptsMade: retryAttempt)))
+                    do { try await providerRecoverySleep(delay) }
+                    catch is CancellationError { throw stopCarryingPartial() }
+                } else {
+                    switch ProviderFailure.classify(error) {
+                    case .authExpired, .codexCLISessionExpired, .routingUnavailable, .modelUnavailable:
+                        throw TurnEngineError.streamInterrupted(partial: visibleText, underlying: error)
+                    case .refused:
+                        TurnObservation.apply(.refused(reason: ProviderFailure.diagnosticDescription(error)),
+                            kept: kept, to: &conversation, surface: surface)
+                    default:
+                        TurnObservation.apply(.malformedCall(why: ProviderFailure.diagnosticDescription(error)),
+                            kept: kept, to: &conversation, surface: surface)
+                    }
+                }
                 continue
             }
-            guard let droppedStream = retryAfterDrop else { break }
-            retryAfterDrop = nil
-            // Prose the user ALREADY WATCHED RENDER decides the recovery shape.
-            // Nothing emitted → replay: discard the attempt whole and re-issue
-            // the identical call. Something emitted → continuation: keep those
-            // bytes as the prefix and ask the provider to resume after them,
-            // because re-issuing would render the same paragraph twice.
-            recoveryMode = iterEmittedProse.isEmpty || !rendersProse ? "replay" : "continuation"
-            // User, 2026-09-06: honor the provider's own Retry-After when it
-            // asked for a longer wait than the ladder's backoff, and refuse a
-            // wait the turn cannot afford — sleeping past the budget only
-            // converts a rate limit into a bare exhaustion.
-            let delaySeconds = ProviderRecoveryPolicy.retryDelaySeconds(
-                forRetry: callAttempt, error: droppedStream
-            )
-            let remainingBudget = wholeTurnBudget.remainingSeconds
-            if delaySeconds >= remainingBudget {
-                if let notice = ProviderRecoveryPolicy.retryAfterBeyondBudgetNotice(
-                    for: droppedStream, remainingSeconds: remainingBudget
-                ) {
-                    await progress?(.notice(
-                        kind: "provider_retry",
-                        text: notice
-                    ))
+            retryAttempt = 0
+            if toolBoundaryReason == .outputLimit {
+                let kept = await keepPartial()
+                if LLMCallContext.turnTokenBudget?.exhausted == true {
+                    return await finishIncompleteTurn()
                 }
-                wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
-                break streamingIterations
+                TurnObservation.apply(.lengthLimit(chars: kept.count), kept: kept, to: &conversation, surface: surface)
+                continue
             }
-            turnRecoveries += 1
-            ProviderRetryTrace.emit(
-                error: droppedStream, attempt: callAttempt,
-                delaySeconds: delaySeconds, mode: recoveryMode,
-                turnRecoveries: turnRecoveries, surface: surface
-            )
-            // Cancellation outranks recovery — same two signals the stream body
-            // polls, checked before the backoff so a Stop lands immediately.
-            if Task.isCancelled { throw stopCarryingPartial() }
-            if ChatCancelFlag.isRaised(cancelFlagPath) {
-                throw stopCarryingPartial()
-            }
-            // A silent reconnect looks identical to a hang. Emitted AFTER the
-            // cancellation checks so a Stop never leaves a "reconnecting" line
-            // as the last thing the surface said, and BEFORE the backoff so it
-            // stands for the whole wait. The user may already be watching prose
-            // render, so the notice rides the surface's status lane and never
-            // the reply text.
-            await progress?(.notice(
-                kind: "provider_retry",
-                text: ProviderRecoveryPolicy.reconnectStatus(attemptsMade: callAttempt)
-            ))
-            do {
-                try await providerRecoverySleep(delaySeconds)
-            } catch is CancellationError {
-                throw stopCarryingPartial()
-            }
-            // A Stop written during the backoff must not start one more
-            // provider call: re-check both signals after the wait.
-            if Task.isCancelled { throw stopCarryingPartial() }
-            if ChatCancelFlag.isRaised(cancelFlagPath) {
-                throw stopCarryingPartial()
-            }
-            // The retry ladder is not exempt from the whole-turn budget: no
-            // attempt starts after it is spent (Codex review 2026-09-05).
-            if wholeTurnBudget.isExhausted {
-                wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
-                break streamingIterations
-            }
-            callAttempt += 1
-            providerCallCount += 1
-            // Streamed tool calls from the dropped attempt are DISCARDED in both
-            // modes: they were never dispatched, and the re-issued call emits
-            // its own. Same for the held-back marker tail, which never reached
-            // the surface.
-            streamedCalls.removeAll(keepingCapacity: true)
-            pendingProtocolDelta = ""
-            if recoveryMode == "replay" {
-                iterAccumulated = ""
-                iterEmittedProse = ""
-                visibleText = attemptBaseVisibleText
-                lastRawResponse = attemptBaseRawResponse
-                attemptMessages = conversation
-            } else {
-                // Marker-strip exactly as the interrupted path does — emitted
-                // slices are marker-safe by construction, so this is a no-op in
-                // practice and a guard if that ever stops being true.
-                let seen = toolCallCodec.visiblePrefix(in: iterEmittedProse)
-                iterAccumulated = seen
-                iterEmittedProse = seen
-                visibleText = attemptBaseVisibleText + seen
-                lastRawResponse = attemptBaseRawResponse + seen
-                // A LOCAL copy: the continuation nudge is scaffolding for one
-                // re-issue, never appended to the real `conversation` and never
-                // persisted. The next iteration builds from `conversation`.
-                attemptMessages = conversation + [
-                    .assistantText(seen),
-                    .user("[Your reply was interrupted by a connection drop right after the text above. Continue exactly where you stopped. Do not repeat anything already written.]"),
-                ]
-            }
-            }
-
-            lastRoundRaw = iterAccumulated + streamedCalls.map { call in
-                let args = (try? JSONValue.object(call.input).serializedData(pretty: false))
-                    .map { String(decoding: $0, as: UTF8.self) } ?? "{}"
-                return "\n<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(args)</tool_use>"
-            }.joined()
-            // The marker protocol's detection and words (8b): the whole catalog
-            // and the session's loaded tools name what counts as a call.
             let markerCodec = toolCallCodec == .textMarkers
-                ? TextMarkerCodec(
-                    schemas: activeToolSchemas,
-                    turnActiveTools: LLMCallContext.turnActiveTools ?? [],
-                    catalogNames: Set(ctx.toolsAvailable))
+                ? TextMarkerCodec(schemas: activeToolSchemas,
+                    turnActiveTools: LLMCallContext.turnActiveTools ?? [], catalogNames: Set(ctx.toolsAvailable))
                 : nil
-            let roundViolation: ToolCallProtocolViolation? = if let markerCodec {
-                markerCodec.malformedCall(in: iterAccumulated)
-            } else {
-                ToolCallParser.formattedToolCallViolation(
-                    in: iterAccumulated, toolNames: Set(ctx.toolsAvailable))
-            }
-            if let violation = roundViolation {
-                // One format nudge per turn; a second broken call in a row stops honestly.
-                if lastProtocolViolation != nil { brakeReason = .protocolViolation; break }
-                lastProtocolViolation = violation
+            let violation = markerCodec?.malformedCall(in: iterAccumulated)
+                ?? ToolCallParser.formattedToolCallViolation(in: iterAccumulated, toolNames: Set(ctx.toolsAvailable))
+            if let violation {
                 counters.protocolViolationRoundCount += 1
-                loopRecoveryReply = nil
-                // Rejected arguments may contain secrets; retain no raw output.
                 let rejectedBytes = Data(iterAccumulated.utf8)
                 TurnTraceBus.fireFromContext(kind: "tool.protocol_violation", surface: surface, payload: .object([
                     "type": .string(violation.traceType),
                     "byteSize": .int(Int64(rejectedBytes.count)),
                     "sha256": .string(SHA256.hash(data: rejectedBytes).map { String(format: "%02x", $0) }.joined()),
                 ]))
-                lastProviderHadToolCalls = false
-                pendingProtocolDelta.removeAll(keepingCapacity: true)
-                // Rewind to where THIS iteration started, not to nothing.
-                // Both of these are the WHOLE turn's accumulation, so
-                // wiping them here threw away the prose the person watched
-                // render in EARLIER rounds as well as this rejected one -
-                // and every later Stop, interruption or exhaustion on this
-                // turn then persisted a partial missing all of it. The
-                // bases are marker-free by construction, which is what the
-                // marker search was protecting.
-                lastRawResponse = attemptBaseRawResponse
-                visibleText = attemptBaseVisibleText
-                if counters.protocolViolationRoundCount > 1 { brakeReason = .protocolViolation; break }
-                conversation.append(.assistantText(iterAccumulated))
-                conversation.append(.user(markerCodec?.protocolFailureFeedback ?? violation.modelFeedback))
+                let kept = await keepPartial()
+                TurnObservation.apply(.malformedCall(why: violation.modelFeedback),
+                    kept: kept, to: &conversation, surface: surface)
                 continue
             }
             let providerCalls = toolCallCodec.roundCalls(
                 streamed: streamedCalls, text: iterAccumulated, schemas: activeToolSchemas)
-            lastProviderHadToolCalls = !providerCalls.isEmpty
-            // A pending promise stop is only relevant until the next reply.
-            loopRecoveryReply = nil
             if providerCalls.isEmpty {
-                let reply = iterAccumulated
-                let emptyReply = reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                if emptyReply { counters.emptyReplyRoundCount += 1 }
-                // FIX 1 (B1.1): empty-reply recovery, checked BEFORE the announce
-                // bounce. Empty text + empty tool calls is not a valid final;
-                // nudge (max 2) then settle incomplete. Resets the stream state
-                // exactly like the announce/violation siblings so the re-prompted
-                // response cannot leak into the next iteration. An empty string
-                // can never match looksLikeUnfulfilledActionPromise, so the two
-                // bounces never contend.
-                if emptyReplyNudgeCount < 2,
-                   !providerTools.schemas.isEmpty,
-                   reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    emptyReplyNudgeCount += 1
-                    Self.appendStructuredUserNudge(
-                        ToolCallParser.structuredEmptyReplyRemedy(
-                            secondBounce: emptyReplyNudgeCount == 2
-                        ),
-                        to: &conversation
-                    )
-                    pendingProtocolDelta.removeAll(keepingCapacity: true)
-                    lastProviderHadToolCalls = false
-                    // Rewind to this iteration's base, as the violation bounce does.
-                    lastRawResponse = attemptBaseRawResponse
-                    visibleText = attemptBaseVisibleText
+                if let toolBoundaryReason {
+                    let kept = await keepPartial()
+                    TurnObservation.apply(.boundary(toolBoundaryReason), kept: kept, to: &conversation, surface: surface)
                     continue
                 }
-                if reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    loopRecoveryReply = "Stopped without a final answer: the model returned no reply text."
-                    brakeReason = .emptyReply
-                    break
+                if iterAccumulated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    counters.emptyReplyRoundCount += 1
+                    TurnObservation.apply(.emptyReply, to: &conversation, surface: surface)
+                    continue
                 }
-                // F2-M4: completion-contract bounce, BEFORE flushing the pending
-                // delta as final. Only when tools are available and at most
-                // twice per turn. On a bounce, reset the accumulated stream state
-                // exactly like the protocol-violation path above so this
-                // re-prompted response cannot leak into the next iteration.
-                //
-                // KNOWN PARITY LIMITATION (gpt-5.5 round-3 review, accepted):
-                // deltas already flushed past the 16-char holdback may have
-                // surfaced part of the rejected narration before this bounce
-                // runs; the accepted continuation then streams after it. The
-                // text-compat lane has behaved this way since the detector
-                // shipped. A true fix needs a retract/reset TurnStreamEvent
-                // honored by every consumer surface — tracked on the round-3
-                // board as a design item, not silently absorbed here. Buffering
-                // all deltas until iteration-accept was rejected: it would turn
-                // every streaming turn into chunk-at-end delivery.
-                let promisesWork = (markerCodec?.promisesUnfulfilledWork(reply)
-                    ?? (!providerTools.schemas.isEmpty
-                        && ToolCallParser.looksLikeUnfulfilledActionPromise(reply)))
+                let promisesWork = (markerCodec?.promisesUnfulfilledWork(iterAccumulated)
+                    ?? (!providerTools.schemas.isEmpty && ToolCallParser.looksLikeUnfulfilledActionPromise(iterAccumulated)))
                     || (dispatches.contains(where: { !ChatToolOutcome.neverRan($0.result) })
-                        && ToolCallParser.looksLikeAnnouncedNextToolStep(reply))
+                        && ToolCallParser.looksLikeAnnouncedNextToolStep(iterAccumulated))
                 if promisesWork {
                     counters.unfulfilledPromiseRoundCount += 1
-                    let stoppedAt = dispatches.last(where: { !ChatToolOutcome.neverRan($0.result) })
-                        .map { "after the \(ToolNameAliases.shown($0.name, input: .object($0.input)).name) result" }
-                        ?? "before any tool ran"
-                    loopRecoveryReply = "Stopped \(stoppedAt): the reply announced more work without making a tool call. The remaining work is unfinished."
-                    guard announceNudgeCount < 2, !providerTools.schemas.isEmpty else {
-                        brakeReason = .unfulfilledPromise
-                        break
-                    }
-                    announceNudgeCount += 1
-                    conversation.append(.assistantText(iterAccumulated))
-                    conversation.append(.user(
-                        markerCodec?.unfulfilledPromiseFeedback(bounce: announceNudgeCount)
-                            ?? ToolCallParser.structuredAnnounceContractRemedy(
-                                secondBounce: announceNudgeCount == 2
-                            )
-                    ))
-                    pendingProtocolDelta.removeAll(keepingCapacity: true)
-                    lastProviderHadToolCalls = false
-                    // Rewind to this iteration's base, as the violation bounce does.
-                    lastRawResponse = attemptBaseRawResponse
-                    visibleText = attemptBaseVisibleText
+                    let kept = await keepPartial()
+                    TurnObservation.apply(.announcedNoCall, kept: kept, to: &conversation, surface: surface)
                     continue
                 }
                 if !pendingProtocolDelta.isEmpty {
                     await progress?(.delta(toolCallCodec.visiblePrefix(in: pendingProtocolDelta)))
-                    pendingProtocolDelta.removeAll(keepingCapacity: true)
                 }
-                // Shared completed-turn finish (C2), with the turn's
-                // accumulated lastRawResponse as rawLLMResponse.
-                //
-                // The PERSISTED reply is every visible byte of the turn — the
-                // narration streamed before each tool round plus this final
-                // iteration's text — not just the last iteration. Single-round
-                // turns leave `turnInterstitialProse` empty, so they persist
-                // exactly `reply` as before.
                 let completed = await finishCompletedTurn(
-                    reply: Self.joinedProse(turnInterstitialProse, reply),
-                    ctx: ctx,
-                    dispatches: dispatches,
-                    startNs: startNs,
-                    rawLLMResponse: lastRawResponse,
-                    providerCallCount: providerCallCount,
-                    userMessage: userMessage,
-                    sessionId: sessionId,
-                    surface: surface,
-                    // Item 3 (third conversation pass): the commentary bytes
-                    // still go to the transcript exactly as before — this only
-                    // says where they stop, so the settled bubble can fold
-                    // "I'll check… now I'll read…" away and leave the answer.
-                    workingCommentaryCharacters: turnInterstitialProse.isEmpty
-                        ? nil : turnInterstitialProse.count
-                )
-                return observed(completed, reason: emptyReply ? .emptyReply : completed.resolvedTerminalReason(dataRoot: remPinsDataRoot))
+                    reply: Self.joinedProse(turnInterstitialProse,
+                        Self.joinedProse(retainedAnswerProse, iterAccumulated)),
+                    ctx: ctx, dispatches: dispatches, startNs: startNs,
+                    rawLLMResponse: lastRawResponse, providerCallCount: providerCallCount,
+                    userMessage: userMessage, sessionId: sessionId, surface: surface,
+                    workingCommentaryCharacters: turnInterstitialProse.isEmpty ? nil : turnInterstitialProse.count)
+                return observed(completed, reason: completed.resolvedTerminalReason(dataRoot: remPinsDataRoot))
             }
 
-            let pendingProse = lastProtocolViolation == nil
-                ? toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta) : ""
+            let pendingProse = toolBoundaryReason == .fabricatedResult
+                ? "" : toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta)
             if !pendingProse.isEmpty {
                 iterEmittedProse += pendingProse
                 await progress?(.delta(pendingProse))
             }
-            pendingProtocolDelta.removeAll(keepingCapacity: true)
-            // Text-parsed call encoding rides the text deltas, so
-            // the round's raw text in `visibleText` would cut every later
-            // partial at this round's first marker. Keep only what reached the
-            // surface, as the violation bounce's rewind does.
-            if streamedCalls.isEmpty || toolCallCodec == .textMarkers || lastProtocolViolation != nil {
-                visibleText = attemptBaseVisibleText + iterEmittedProse
-            }
-            // This iteration is committed (it dispatches tools, so it can never
-            // be rewound by a bounce): keep its narration for the persisted
-            // reply.
-            //
-            // ONLY when the provider streamed STRUCTURED tool calls. If the
-            // calls were instead recovered by parsing the iteration's TEXT, that
-            // text IS the call encoding — an XML <tool_use> marker or a raw
-            // {"tool_calls":[…]} payload depending on dialect — and must never
-            // land in the transcript as prose. stripToolUseMarkers only knows
-            // the XML dialect, so text-parsed iterations contribute nothing at
-            // all, exactly as before this fix. The marker protocol is the
-            // exception: its emitted prose stopped before the first marker.
-            if rendersProse, !streamedCalls.isEmpty || toolCallCodec == .textMarkers {
-                turnInterstitialProse = Self.joinedProse(turnInterstitialProse, ToolCallParser.stripToolUseMarkers(iterEmittedProse))
-            }
-            // Shared post-dispatch round (C2): assistant blocks → shared
-            // dispatch core → no-progress guard → paired tool_result append →
-            // schema refresh + compat-only sweep. The pending-prose flush above
-            // runs first.
+            visibleText = roundBaseVisibleText + iterEmittedProse
+            turnInterstitialProse = Self.joinedProse(turnInterstitialProse, iterEmittedProse)
             counters.toolRoundCount += 1
+            try await TurnCheckpointScope.current?.capture(
+                prose: Self.joinedProse(turnInterstitialProse, retainedAnswerProse),
+                commentaryCharacters: turnInterstitialProse.count, conversation: conversation,
+                startingCalls: providerCalls.count)
             let roundStart = dispatches.count
-            let outcome: ToolDispatchRoundOutcome
-            do {
-                outcome = try await runToolDispatchRound(
-                    providerCalls: providerCalls,
-                    iterationRawText: iterAccumulated,
-                    ctx: ctx,
-                    surface: surface,
-                    sessionId: toolSessionId ?? sessionId,
-                    tools: tools,
-                    progress: progress,
-                    conversation: &conversation,
-                    dispatches: &dispatches,
-                    providerTools: &providerTools,
-                    noProgressGuard: &noProgressGuard,
-                    loopRecoveryReply: &loopRecoveryReply,
-                    cancelFlagPath: cancelFlagPath,
-                    markerCodec: markerCodec,
-                    toolBoundaryReason: toolBoundaryReason
-                )
-            } catch is CancellationError {
-                throw TurnEngineError.streamCancelled(
-                    partial: toolCallCodec.visiblePrefix(in: visibleText),
-                    underlying: CancellationError()
-                )
-            } catch {
-                // Schema refresh can fail after dispatch; keep the same partial
-                // and whole-turn retry veto as a failure inside the stream.
-                throw TurnEngineError.streamInterrupted(
-                    partial: toolCallCodec.visiblePrefix(in: visibleText),
-                    underlying: ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
-                )
-            }
+            let outcome = await runToolDispatchRound(
+                providerCalls: providerCalls,
+                iterationRawText: toolCallCodec == .textMarkers ? iterAccumulated : iterEmittedProse,
+                ctx: ctx, surface: surface, sessionId: toolSessionId ?? sessionId,
+                tools: tools, progress: progress, conversation: &conversation,
+                dispatches: &dispatches, providerTools: providerTools,
+                noProgressGuard: &noProgressGuard, cancelFlagPath: cancelFlagPath,
+                markerCodec: markerCodec, toolBoundaryReason: toolBoundaryReason)
             previousRoundFailed = dispatches.dropFirst(roundStart).contains {
                 !ChatToolOutcome.outputLooksSuccessful($0.result)
                     && !ChatToolOutcome.wasCancelled($0.result)
@@ -1028,77 +581,18 @@ extension SwiftNativeTurnEngine {
                     && !ChatToolOutcome.isWaitingOnPerson($0.result)
                     && !ChatToolOutcome.neverRan($0.result)
             }
-            // A6 progress extension: a round that actually landed a tool result
-            // re-earns the surface window (capped at the unattended ceiling).
-            // Streamed TEXT is never progress.
-            if case .continueLoop(let madeProgress) = outcome, madeProgress {
-                wholeTurnBudget.recordProgress()
-            }
-            // User, 2026-09-06: a Stop during the last batch used to leave
-            // through the exhaustion tail as `.abandoned` instead of as a
-            // cancel. Decide cancellation right after the round; it carries the
-            // prose the user already watched render, exactly like a Stop inside
-            // the stream does.
-            if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
-                let shown = toolCallCodec.visiblePrefix(in: visibleText).trimmingCharacters(in: .whitespacesAndNewlines)
-                let safePartial = loopRecoveryReply.map { shown.isEmpty ? $0 : shown + "\n\n" + $0 } ?? shown
-                throw TurnEngineError.streamCancelled(
-                    partial: safePartial, underlying: CancellationError()
-                )
-            }
-            lastProtocolViolation = nil
-            // A bot round that filed an approval ends the run here: the
-            // approval resumes it, and the reply is what the bot said so far.
+            if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { throw stopCarryingPartial() }
             if StandingBotContinuity.isHelperTurn, ChatTurnExecution.current?.waitingForApproval == true {
-                return observed(TurnEngineResult(reply: toolCallCodec.visiblePrefix(in: LLMCallContext.turnTokenBudget?.partialReply ?? iterAccumulated),
-                    modelUsed: ctx.modelId, recalledIds: ctx.resolvedRecalledIds, toolDispatches: dispatches,
-                    elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
-                    rawLLMResponse: lastRawResponse, providerCallCount: providerCallCount, completionState: .incomplete), reason: .approvalRequired)
+                return observed(waitingOnInteractionResult(ctx: ctx, visible: visibleText,
+                    lastRawResponse: lastRawResponse, dispatches: dispatches,
+                    startNs: startNs, providerCallCount: providerCallCount), reason: .approvalRequired)
             }
-            if case .stopLoop(let reason) = outcome { brakeReason = reason; break }
+            if case .waiting(let reason) = outcome {
+                return observed(waitingOnInteractionResult(ctx: ctx, visible: visibleText,
+                    lastRawResponse: lastRawResponse, dispatches: dispatches,
+                    startNs: startNs, providerCallCount: providerCallCount), reason: reason)
+            }
         }
-
-        // A raised need is its own terminal, not exhaustion: the turn ends as
-        // "waiting on you", keeping the prose the person already watched
-        // render and adding no exhaustion line under it.
-        // A finished round returned above; a need outranks the exhaustion
-        // below on this lane.
-        if TurnSettle.isWaitingOnCard(finishedRound: false, capped: false) {
-            return observed(waitingOnInteractionResult(
-                ctx: ctx,
-                visible: rendersProse
-                    ? toolCallCodec.visiblePrefix(in: visibleText)
-                    : toolCallCodec.visiblePrefix(in: LLMCallContext.turnTokenBudget?.partialReply ?? lastRoundRaw),
-                lastRawResponse: lastRawResponse,
-                dispatches: dispatches,
-                startNs: startNs,
-                providerCallCount: providerCallCount
-            ), reason: .interactionRequired)
-        }
-        // Shared exhaustion tail (C2). Streaming also treats a streamed
-        // tool-call round as "only a structured tool call", so it passes
-        // lastProviderHadToolCalls as the extra signal.
-        return observed(await finishExhaustedTurn(
-            ctx: ctx,
-            lastRawResponse: rendersProse ? lastRawResponse : lastRoundRaw,
-            lastProtocolViolation: lastProtocolViolation,
-            loopRecoveryReply: loopRecoveryReply,
-            iterationLimit: iterationLimit,
-            wallClockElapsedSeconds: wallClockElapsedSeconds,
-            dispatches: dispatches,
-            startNs: startNs,
-            providerCallCount: providerCallCount,
-            userMessage: userMessage,
-            sessionId: sessionId,
-            surface: surface,
-            // A marker round's text is its call encoding (and what followed the
-            // last marker was written before any result), so it is never the
-            // answer, rendered or not.
-            additionalStructuredToolCallSignal: (rendersProse || toolCallCodec == .textMarkers)
-                && lastProviderHadToolCalls,
-            visiblePartial: rendersProse ? toolCallCodec.visiblePrefix(in: visibleText) : "",
-            codec: toolCallCodec
-        ), reason: wallClockElapsedSeconds == nil ? brakeReason : .wallClockLimit)
         }
         }
     }

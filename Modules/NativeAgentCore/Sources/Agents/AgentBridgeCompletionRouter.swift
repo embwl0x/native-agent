@@ -5,38 +5,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 
-public struct AgentBridgeCompletionRoute: Sendable, Equatable {
-  public let surface: String
-  public let sessionId: String?
-  public let destinationId: String?
-  public let threadId: String?
-  public let sourceKey: String?
-  public let replyTo: String?
-  public let correlationId: String?
-  /// Where the turn that produced the answer ran, when that is not the chat
-  /// it answers (a contact's own conversation): its result marker is there.
-  public let turnSessionId: String?
-
-  public init(
-    surface: String,
-    sessionId: String? = nil,
-    destinationId: String? = nil,
-    threadId: String? = nil,
-    sourceKey: String? = nil,
-    replyTo: String? = nil,
-    correlationId: String? = nil,
-    turnSessionId: String? = nil
-  ) {
-    self.surface = surface
-    self.sessionId = sessionId
-    self.destinationId = destinationId
-    self.threadId = threadId
-    self.sourceKey = sourceKey
-    self.replyTo = replyTo
-    self.correlationId = correlationId
-    self.turnSessionId = turnSessionId
-  }
-
+extension AgentBridgeCompletionRoute {
   /// The door a contact's send was asked from, for an answer from a turn
   /// that ran in `turnSessionId`.
   public init(asking row: AgentConversationRecord, turnSessionId: String) {
@@ -153,14 +122,6 @@ public protocol AgentBridgeCompletionSending: Sendable {
 }
 
 public enum AgentBridgeCompletionRouter {
-  private enum ValidatedRoute: Equatable {
-    case local
-    case callerResult
-    case telegram
-    case slack
-    case ios
-  }
-
   private struct RouteValidationFailure: Error, Equatable {
     let reason: String
   }
@@ -168,31 +129,31 @@ public enum AgentBridgeCompletionRouter {
   private static func validatedRoute(
     surface: String,
     route: AgentBridgeCompletionRoute
-  ) -> Result<ValidatedRoute, RouteValidationFailure> {
-    switch surface {
-    case "chat", "app", "mac", "github-command", "mission", "missions", "workshop":
-      return .success(.local)
-    case "caller-result":
+  ) -> Result<AgentBridgeCompletionRoute.Kind, RouteValidationFailure> {
+    guard let kind = route.kind else {
+      return .failure(RouteValidationFailure(reason: surface.isEmpty
+        ? "missing_origin_surface" : "unknown_origin_surface:\(surface)"))
+    }
+    switch kind {
+    case .local: break
+    case .callerResult:
       guard let owner = route.destinationId, !owner.isEmpty,
             let context = route.threadId, let request = route.correlationId,
             NativeAgentA2AWire.locator("na3.\(context).\(request)") != nil,
             route.sessionId?.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: owner)) == true else {
         return .failure(RouteValidationFailure(reason: "invalid_caller_result_route"))
       }
-      return .success(.callerResult)
-    case "telegram":
+    case .telegram:
       guard let destination = route.destinationId, Int(destination) != nil else {
         return .failure(RouteValidationFailure(reason: "invalid_telegram_destination"))
       }
-      return .success(.telegram)
-    case "slack":
+    case .slack:
       guard let destination = route.destinationId?
         .trimmingCharacters(in: .whitespacesAndNewlines),
         !destination.isEmpty else {
         return .failure(RouteValidationFailure(reason: "missing_slack_destination"))
       }
-      return .success(.slack)
-    case "ios", "iphone", "mobile", "icloud":
+    case .ios:
       guard let sourceKey = route.sourceKey?
         .trimmingCharacters(in: .whitespacesAndNewlines),
         !sourceKey.isEmpty else {
@@ -201,12 +162,8 @@ public enum AgentBridgeCompletionRouter {
       guard isValidIOSDeviceRouteKey(sourceKey) else {
         return .failure(RouteValidationFailure(reason: "invalid_ios_source_key"))
       }
-      return .success(.ios)
-    case "":
-      return .failure(RouteValidationFailure(reason: "missing_origin_surface"))
-    default:
-      return .failure(RouteValidationFailure(reason: "unknown_origin_surface:\(surface)"))
     }
+    return .success(kind)
   }
 
   /// Current iOS clients mint an exact per-device route as `iphone` or

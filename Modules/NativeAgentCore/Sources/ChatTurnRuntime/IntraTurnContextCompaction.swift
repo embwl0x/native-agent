@@ -16,7 +16,7 @@ import ProviderRouting
 // fit: an Anthropic `status 400: ... prompt is too long ...` (or the OpenAI
 // `context_length_exceeded`) is not "recoverable" — re-issuing the identical
 // body gets the identical 400 — so the turn died via
-// `ProviderErrorAfterToolEffects`.
+// a terminal provider error.
 //
 // This type is the missing measurement plus the missing recovery, in two steps:
 //
@@ -71,10 +71,6 @@ public enum IntraTurnContextCompaction {
     /// must cost the fold's quality, never the turn.
     static let distillDeadlineSeconds: TimeInterval = 60
 
-    /// At most this many overflow recoveries per PROVIDER CALL. Two is enough
-    /// for step A then step B; a third would mean the body is not the problem.
-    static let maxOverflowRecoveriesPerCall = 2
-
     /// The one line a surface shows while a compaction is in flight, and the
     /// notice kind both surfaces match on.
     static let noticeKind = "context_compaction"
@@ -84,8 +80,7 @@ public enum IntraTurnContextCompaction {
 
     /// What one compaction pass actually did. `mode` is the closed vocabulary
     /// the trace and the reactive caller both read: "none" means there was
-    /// nothing left to trim, which is the caller's signal to stop recovering
-    /// and let the failure through.
+    /// nothing left to trim, so the turn finishes with its retained answer.
     struct Receipt: Sendable, Equatable {
         let charsBefore: Int
         let charsAfter: Int

@@ -151,16 +151,14 @@ public enum LLMError: Error, Equatable, LocalizedError {
     /// otherwise look like a legitimate clean end (A3.3).
     case streamTruncated(message: String)
     /// The provider ended at its output budget. Retain prose, withhold tools,
-    /// and end this turn without replaying the same request.
+    /// Standalone completions and helper-owned token budgets retain partial prose.
     case outputLengthLimit(partial: String)
-
-    public static let outputLengthLimitNotice = "The answer hit the length limit. Ask to continue from here."
 
     public var errorDescription: String? {
         switch self {
         case .notConfigured: return "Connect your model in Settings to continue."
         case .modelUnavailable: return "The selected model is unavailable; choose another model."
-        case .outputLengthLimit: return Self.outputLengthLimitNotice
+        case .outputLengthLimit: return "The provider reached its output length limit."
         default: return ProviderFailure.classify(self)?.errorDescription
         }
     }
@@ -640,19 +638,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         providerId: String,
         _ work: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        // User, 2026-09-06: bound the per-call wall by what the whole turn has
-        // left, minus a reconnect reserve. At the shipped defaults the wall
-        // (600s) equalled the interactive/Telegram turn window (600s), so the
-        // first hung call spent the entire budget and the reconnect ladder
-        // exited on the budget instead of retrying.
         // 2026-09-22 WHY: 300s, not the stream's 600s, on the OAuth-direct routes
         // only. Slowest real non-streaming call there in 14 days was 245s; hung
         // ones sat the full 600s then passed on retry.
-        let wall = ProviderRecoveryPolicy.callWallSeconds(
-            configured: providerId.hasSuffix("_oauth_direct")
-                ? min(streamGuardConfig.wallTimeout, 300) : streamGuardConfig.wallTimeout,
-            remainingTurnSeconds: LLMCallContext.remainingTurnSeconds
-        )
+        let wall = providerId.hasSuffix("_oauth_direct")
+            ? min(streamGuardConfig.wallTimeout, 300) : streamGuardConfig.wallTimeout
         guard wall > 0 else {
             return try await ProviderStreamContext.$stallOnly.withValue(true) { try await work() }
         }
@@ -907,7 +897,6 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             let task = Task {
                 await LLMCallContext.$surface.withValue(surface) {
                 var lifecycle: LLMCallLifecycleEvent?
-                var emittedOutput = false
                 var streamKind: LLMMessagesStreamKind?
                 let attemptStartedAt = ProcessInfo.processInfo.systemUptime
                 let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
@@ -919,12 +908,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         routingSnapshot: routingSnapshot
                     )
 
-                    // Same per-call wall bound as `withCompletionWall`.
                     var streamGuardConfig = self.streamGuardConfig
-                    streamGuardConfig.wallTimeout = ProviderRecoveryPolicy.callWallSeconds(
-                        configured: streamGuardConfig.wallTimeout,
-                        remainingTurnSeconds: LLMCallContext.remainingTurnSeconds
-                    )
 
                     func forward(
                         makeStream: @escaping @Sendable () -> AsyncThrowingStream<LLMMessageStreamEvent, Error>,
@@ -939,11 +923,6 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         )
                         for try await event in guardedStream {
                             try Task.checkCancellation()
-                            switch event {
-                            case .keepAlive, .replyTextSettled: break
-                            case .textDelta(let text): emittedOutput = emittedOutput || !text.isEmpty
-                            case .toolCall, .toolBoundary: emittedOutput = true
-                            }
                             if let budget = LLMCallContext.turnTokenBudget {
                                 switch event {
                                 case .textDelta(let delta):
@@ -1027,9 +1006,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                                                            streamKind: streamKind, error: error)
                         await self.recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
                     }
-                    let failure = ProviderFailure.normalize(error)
-                    continuation.finish(throwing: emittedOutput
-                        ? ProviderRecoveryPolicy.stopOverload(failure, exhausted: false) : failure)
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
                 }
                 }
             }
@@ -1062,25 +1039,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         model: String?,
         surface: String
     ) -> AsyncThrowingStream<String, Error> {
-        ProviderRecoveryPolicy.retryOverloadStream(hasOutput: { !$0.isEmpty }) { [self] in
-            streamAttempt(prompt: prompt, system: system, model: model, surface: surface)
-        }
-    }
-
-    private func streamAttempt(
-        prompt: String, system: String?, model: String?, surface: String
-    ) -> AsyncThrowingStream<String, Error> {
         // U1 step 1: bind the calling surface task-locally for telemetry.
         // 2026-07-21 audit fix: bound INSIDE the worker Task via the async
         // withValue overload (was a sync binding around construction — the
         // G4-5 release-crash LIFO shape; see ChatOrchestration+ToolLoop).
         AsyncThrowingStream { continuation in
-            // Same per-call wall bound as `withCompletionWall`.
-            var streamGuardConfig = self.streamGuardConfig
-            streamGuardConfig.wallTimeout = ProviderRecoveryPolicy.callWallSeconds(
-                configured: streamGuardConfig.wallTimeout,
-                remainingTurnSeconds: LLMCallContext.remainingTurnSeconds
-            )
+            let streamGuardConfig = self.streamGuardConfig
             // Hoist the worker Task into a binding so onTermination can cancel
             // it. Without this, a cancelled consumer (chat-turn aborted, view
             // dismissed, etc.) would leave the inner adapter.stream() iteration

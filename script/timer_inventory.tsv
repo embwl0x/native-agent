@@ -76,7 +76,7 @@ Modules/NativeAgentCore/Sources/ProviderRouting/ProviderErrorBodyDrain.swift	try
 Modules/NativeAgentCore/Sources/ProviderRouting/ProviderStreamGuard.swift	*	1	timeout_retry_deadline	ProviderStreamGuard
 Modules/NativeAgentCore/Sources/Research/ResearchTransports.swift	*	3	timeout_retry_deadline	ResearchTransportBackoff; runResearchSubprocess reap thread (20ms poll under the caller deadline: docker 8s, Codex web search 60s; SIGTERM->SIGKILL, hang-proofing 2026-08-25); Doctor search repair waits at most 90s (3s polls) for a Docker Desktop daemon it opened
 Modules/NativeAgentCore/Sources/SwarmRuns/SwarmExecutor.swift	*	1	timeout_retry_deadline	SwarmExecutorWait
-Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+ChatProgress.swift	*	2	external_protocol_poll	TelegramProgressTransport
+Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+ChatProgress.swift	*	1	external_protocol_poll	TelegramProgressTransport
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+Transport.swift	try await Task.sleep(nanoseconds: $0)	2	external_protocol_poll	TelegramFloodControlRetry (both defaults feed the same injected sleeper: the once-only 429 retry and the per-chat send lane cooldown wait, 2026-09-06)
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop.swift	*	1	external_protocol_poll	TelegramTurnProgressCardDriver.cadence
 # FFmpeg waits on exit/cancellation signals with a 30-second deadline and a 200ms TERM grace; no queued asyncAfter survives completion.

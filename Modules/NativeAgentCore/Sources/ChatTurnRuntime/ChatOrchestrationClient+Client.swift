@@ -47,8 +47,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
     let approvalFiler: (any ApprovalFiler)?
     let approvalTimeoutSeconds: Double
     let historyLimit: Int
-    let toolLoopMaxIterationsOverride: Int?
-    let turnWallClockSecondsOverride: TimeInterval?
     let continuationCapabilityProfile: String?
     let promoter: (any MemoryPromoting)?
     let cognitiveObserver: (any CognitiveEventObserving)?
@@ -69,8 +67,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         approvalFiler: (any ApprovalFiler)? = nil,
         approvalTimeoutSeconds: Double = 30,
         historyLimit: Int = 400,
-        toolLoopMaxIterations: Int? = nil,
-        turnWallClockSeconds: TimeInterval? = nil,
         continuationCapabilityProfile: String? = nil,
         promoter: (any MemoryPromoting)? = nil,
         cognitiveObserver: (any CognitiveEventObserving)? = nil,
@@ -102,8 +98,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         self.approvalFiler = approvalFiler
         self.approvalTimeoutSeconds = approvalTimeoutSeconds
         self.historyLimit = historyLimit
-        self.toolLoopMaxIterationsOverride = toolLoopMaxIterations
-        self.turnWallClockSecondsOverride = turnWallClockSeconds
         self.continuationCapabilityProfile = continuationCapabilityProfile
         self.promoter = promoter
         self.cognitiveObserver = cognitiveObserver
@@ -269,7 +263,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
                 persistToolMessages: true,
                 // chat() callers await the reply; deltas they draw (Telegram's
                 // draft) are a preview, not the answer.
-                rendersProse: false,
                 progress: progress,
                 noticeSink: { kind, text in await progress?(.notice(kind: kind, text: text)) }
             )

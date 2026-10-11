@@ -749,7 +749,7 @@ extension TelegramPollLoop {
                 await generatedImages.record(event)
                 await progress(event)
             }
-            let reply = try await runChatHandlerWithRetry(
+            let reply = try await runChatHandler(
                 destination: message.destination,
                 text: retryText,
                 attachments: attachments,

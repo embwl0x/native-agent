@@ -373,15 +373,23 @@ extension AppDelegate {
             catch { nativeLog("[senses] Launch registration unavailable: %@", error.localizedDescription) }
             let loops = BackgroundLoopsAssembly.assembleAllLoops()
             await installBotProviderCheck()
+            await AbandonedTurnReconciliationHook.arm(completedTurnNotification: .chatTurnCompleted,
+                inFlight: { Set(ChatCancelFlag.inFlightTurns(dataRoot: NativeAgentPaths.dataRoot).map(\.turnId)) },
+                resume: { checkpoint in
+                    let runtime = BackgroundLoopsAssembly.makeTurnContinuationRuntime(dataRoot: NativeAgentPaths.dataRoot)
+                    if checkpoint.capabilityProfile == "mac", checkpoint.surface == "chat", checkpoint.helperDefinition == nil {
+                        guard let model = await QuietSelfAdmin.shared.appModel else { throw MacChatTurnLifecycleStoreError.invalidRecord }
+                        try await model.resumeMacChatTurn(checkpoint) { progress in
+                            try await runtime.resumeTurn(checkpoint, progress: progress)
+                        }
+                    } else { try await runtime.resumeTurn(checkpoint) }
+                })
             await BackgroundLoopsManager.shared.start(loops: loops)
         }
         // Refresh the doctor snapshot ONCE after this launch's first completed
         // turn, so the turn-behaviour checks in data/doctor/latest.json report
         // observations instead of the launch-time UNMEASURED.
         DoctorFirstTurnRefresh.arm()
-        // Accepted turns that never got a terminal row are an outcome gap, not
-        // a mystery: reconcile them, bounded, at launch and after later turns.
-        AbandonedTurnReconciliationHook.arm(completedTurnNotification: .chatTurnCompleted)
         Task.detached(priority: .utility) {
             // Reconcile historical Desk feeds written before parent/child
             // terminal-state invariants existed. The store repairs by appending

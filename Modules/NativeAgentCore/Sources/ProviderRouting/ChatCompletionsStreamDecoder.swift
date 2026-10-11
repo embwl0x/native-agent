@@ -50,9 +50,11 @@ public struct ChatCompletionsStreamDecoder {
     /// delta, reasoning, or a tool-call fragment. User, 2026-09-06: gates the
     /// malformed-frame rule in `consume`.
     private var sawSemanticOutput = false
-    private var reachedLengthLimit = false
-    private var content = ""
+    public private(set) var reachedLengthLimit = false
     private var runaway = RunawayOutputDetector()
+    public var toolBoundaryReason: LLMToolBoundaryReason? {
+        reachedLengthLimit ? .outputLimit : runaway.toolBoundaryReason
+    }
 
     public init(providerLabel: String) {
         self.providerLabel = providerLabel
@@ -83,10 +85,7 @@ public struct ChatCompletionsStreamDecoder {
     /// accumulators.
     public mutating func consume(payload: String) throws -> DecodedFrame {
         var frame = DecodedFrame()
-        // After a loop trip the next frame reads as done: the adapter leaves
-        // its loop and finalize throws the length limit AFTER telemetry records
-        // the call as incomplete (a throw from here skipped the record).
-        if runaway.loopStart != nil {
+        if toolBoundaryReason != nil {
             frame.isDone = true
             return frame
         }
@@ -134,18 +133,9 @@ public struct ChatCompletionsStreamDecoder {
             sawSemanticOutput = true
         }
         if let content = delta["content"] as? String, !content.isEmpty {
-            self.content += content
-            frame.content = content
-            // Tripped here: this frame still yields the prose before the loop
-            // start (none when the loop began in an earlier frame; the offset
-            // is a line start, so the cut never splits a character). The next
-            // frame reads as done.
-            if runaway.feed(content), let loopStart = runaway.loopStart {
-                reachedLengthLimit = true
-                let start = runaway.text.utf8.count - content.utf8.count
-                let kept = String(decoding: content.utf8.prefix(max(0, loopStart - start)), as: UTF8.self)
-                frame.content = kept.isEmpty ? nil : kept
-            }
+            _ = runaway.feed(content)
+            let kept = runaway.keptPart(of: content)
+            frame.content = kept.isEmpty ? nil : kept
             sawSemanticOutput = true
         }
         if let calls = delta["tool_calls"] as? [[String: Any]] {
@@ -237,12 +227,15 @@ public struct ChatCompletionsStreamDecoder {
         providerID: String,
         sawContent: Bool
     ) throws -> [ChatCompletionsToolCall] {
-        if reachedLengthLimit { throw LLMError.outputLengthLimit(partial: content) }
-        guard sawDone else {
+        if reachedLengthLimit {
+            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+            return []
+        }
+        guard sawDone || toolBoundaryReason != nil else {
             throw LLMError.streamTruncated(message: "\(providerID) stream ended without [DONE]")
         }
         let completed = try completedToolCalls(idPrefix: idPrefix)
-        if !sawContent && completed.isEmpty {
+        if !sawContent && completed.isEmpty && toolBoundaryReason == nil {
             throw LLMError.streamTruncated(
                 message: "\(providerID) stream produced no content ([DONE], empty)"
             )
@@ -254,7 +247,7 @@ public struct ChatCompletionsStreamDecoder {
     /// Empty arguments mean `{}`; a missing name or non-object JSON rejects
     /// the batch so no sibling can execute a partial plan.
     public func completedToolCalls(idPrefix: String) throws -> [ChatCompletionsToolCall] {
-        if reachedLengthLimit { throw LLMError.outputLengthLimit(partial: content) }
+        if reachedLengthLimit { return [] }
         var out: [ChatCompletionsToolCall] = []
         for index in toolOrder {
             guard let call = toolAccum[index] else { continue }

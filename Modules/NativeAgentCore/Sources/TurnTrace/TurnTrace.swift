@@ -795,7 +795,7 @@ public actor TurnTraceBus {
     /// pending rows.
     private final class _PersistPump: @unchecked Sendable {
         private let lock = NSLock()
-        private let lane: TurnTracePersistLane
+        let lane: TurnTracePersistLane
         private let capacity: Int
         private var queue: [TurnTraceEvent] = []
         private var head = 0
@@ -941,6 +941,16 @@ public actor TurnTraceBus {
         // short lock operation; no disk await occurs on this actor or on the
         // process-wide ingress worker.
         persistPump.submit(event)
+    }
+
+    /// A terminal must reach disk before its restart checkpoint can be removed.
+    public func deliverDurably(_ event: TurnTraceEvent) async throws {
+        let wrote = try await persistPump.lane.appendGuarded(event, shouldAppend: { current in
+            guard event.kind == "turn.terminal", case .object(let payload) = event.payload,
+                  case .string(let status)? = payload["status"] else { return true }
+            return !AbandonedTurnReconciler.containsTerminal(forTurn: event.turnId, in: current, status: status)
+        })
+        if wrote { deliverToSubscribers(event) }
     }
 
     /// Live delivery without persistence. Reconciliation uses this after its

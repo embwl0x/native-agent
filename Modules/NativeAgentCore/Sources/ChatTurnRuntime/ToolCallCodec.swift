@@ -68,13 +68,15 @@ enum ToolCallCodec: Sendable, Equatable {
         }
         defer { pending += citationTail }
         pending = ChatRichContentParser.visibleText(pending)
-        if self == .textMarkers {
-            return TextMarkerCodec.releasableProse(holding: &pending, force: false)
-        }
-        if let marker = ToolCallParser.earliestPotentialProtocolMarker(in: pending) {
+        let heldStarts = [ToolCallParser.earliestPotentialProtocolMarker(in: pending),
+                          pending.range(of: "NativeAgent tool result #")].compactMap { $0 }
+        if let marker = heldStarts.min(by: { $0.lowerBound < $1.lowerBound }) {
             let safe = String(pending[..<marker.lowerBound])
             pending = String(pending[marker.lowerBound...])
             return safe
+        }
+        if self == .textMarkers {
+            return TextMarkerCodec.releasableProse(holding: &pending, force: false)
         }
         // Hold only a tail that could still grow into a marker ("<to",
         // "**tool c"); plain prose goes out now. A fixed 16-character hold
@@ -87,14 +89,14 @@ enum ToolCallCodec: Sendable, Equatable {
         return safe
     }
 
-    private static let markerStarts = ToolCallParser.protocolMarkerStarts + ["```", "~~~"]
+    private static let markerStarts = ToolCallParser.protocolMarkerStarts + ["```", "~~~", "NativeAgent tool result #"]
 
     /// Length of the longest suffix of `text` that is a proper start of a marker.
-    private static func markerPrefixTailLength(_ text: String) -> Int {
+    static func markerPrefixTailLength(_ text: String) -> Int {
         let longest = markerStarts.map(\.count).max() ?? 0
         for length in stride(from: min(longest, text.count), to: 0, by: -1) {
             let tail = text.suffix(length).lowercased()
-            if markerStarts.contains(where: { $0.hasPrefix(tail) }) { return length }
+            if markerStarts.contains(where: { $0.lowercased().hasPrefix(tail) }) { return length }
         }
         return 0
     }

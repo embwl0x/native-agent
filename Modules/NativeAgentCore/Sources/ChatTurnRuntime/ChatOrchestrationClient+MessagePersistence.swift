@@ -212,7 +212,7 @@ public enum CodexCompletionTranscriptEvidence {
         return matches.first
     }
 
-    private static func decodeAttachments(_ value: JSONValue?) throws -> [MultimodalAttachment] {
+    static func decodeAttachments(_ value: JSONValue?) throws -> [MultimodalAttachment] {
         guard let value else { return [] }
         guard case .array(let rows) = value else { throw RecoveryError.corruptBinding }
         return try rows.map { row in
@@ -311,6 +311,7 @@ extension SwiftNativeChatOrchestrationClient {
             "cancelled": .bool(cancelled),
             "partial": .bool(true),
             "envelope": TurnEnvelope.current(surface: messageSource).persistedMetadata(),
+            "untrusted_sources": .array((PeerDataTaint.current?.checkpointSources ?? []).map(JSONValue.string)),
         ]
         if !cancelled, let failure {
             partialMetadata["error"] = .string(ProviderFailure.report(failure)?.personDescription ?? "The reply could not be completed.")
@@ -518,6 +519,9 @@ extension SwiftNativeChatOrchestrationClient {
         // Keep the small receipt fields before the persisted body is clipped.
         // These are returned values, never the transcript's own id or runId.
         if let originalResult {
+            if ranTool == "image_generate", case .object(let result) = originalResult, let images = result["images"] {
+                metadata["generatedImages"] = images
+            }
             if let id = SessionHistoryPromptRenderer.returnedIdentifier(originalResult) {
                 metadata["resultReturnedID"] = .string(ChatSecretRedactor.redactText(id))
             }
@@ -1165,7 +1169,7 @@ extension SwiftNativeChatOrchestrationClient {
             // pass can correlate. Including base64 inline would explode the
             // JSONL — daemon practice is to keep blobs out of this file.
             var arr: [JSONValue] = []
-            for a in attachments {
+            for (index, a) in attachments.enumerated() {
                 var item: [String: JSONValue] = [
                     "id": .string(a.id),
                     "type": .string(a.type),
@@ -1176,6 +1180,14 @@ extension SwiftNativeChatOrchestrationClient {
                 if let path = a.path?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !path.isEmpty {
                     item["path"] = .string(path)
+                } else if role == "user", !a.base64.isEmpty {
+                    guard let runId, NativeAgentChatSessionID.normalizedPathComponent(runId) == runId,
+                          let bytes = Data(base64Encoded: a.base64) else {
+                        throw ChatOrchestrationError.underlying("Couldn't save this turn's attachment for restart recovery.")
+                    }
+                    let path = dataRoot.appendingPathComponent("chat/attachments/\(runId)/\(index)")
+                    try await SwiftNativePersistenceCore().writeDataAtomicDurable(bytes, to: path)
+                    item["path"] = .string(path.path)
                 }
                 arr.append(.object(item))
             }

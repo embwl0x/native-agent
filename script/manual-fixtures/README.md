@@ -38,3 +38,11 @@ development. Nothing in the build or test suite runs them automatically.
   and `streamKind` `incremental` into its `traces/events.jsonl`. Launch it with
   `open -n --env NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT=http://127.0.0.1:8799/v1/chat/completions /Applications/NativeAgent.app`;
   only a loopback host is honored.
+
+- `sse_repeat_forever.py [port=8799]` sends Responses API prose deltas of one
+  line forever until the client closes; the next request carrying the turn
+  observation gets a completed reply. Use the same test install and loopback
+  endpoint above; set its provider wall to 5 seconds for this bounded proof.
+- `sse_cut_after_prose.py [port=8799]` sends three Responses API prose deltas
+  then closes without a terminal event; the observation-bearing continuation
+  completes. Use the same test install and loopback endpoint above.

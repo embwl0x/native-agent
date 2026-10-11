@@ -6,6 +6,14 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.6.3 — a turn never fails (2026-10-11)
+
+### One way out
+- The tool loop's only exit is the agent finishing (Stop and waits aside); every abnormal case — length limit, cut stream, boundary, malformed call, empty reply, refusal, trimmed context — is one observation the next iteration reads and continues from. Round caps, wall clock, retry caps, strike counters, every braked ending and the runaway detector's line and inline rules deleted; circling asks a card; a Mac takeover suspends and resumes the turn.
+
+### Survives a relaunch
+- Each iteration checkpoints (chat/session_state/<session>/turn-<id>.json); at launch the reconciler resumes checkpointed turns through the same loop with a restart observation; a completed turn whose remote delivery was interrupted is delivered next launch from the saved answer; one settlement rule at the terminal retires every other checkpoint.
+
 ## 0.6.2 — a cleaner first run, fewer rounds (2026-10-11)
 
 ### First run

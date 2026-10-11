@@ -130,11 +130,9 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: nil,
                     toolSessionId: toolSessionId,
                     runId: runId,
-                    maxIterations: toolLoopMaxIterations(for: surface),
                     llm: llm,
                     tools: gated,
                     preBuiltContext: projectedContext,
-                    rendersProse: false,
                     providerAdmission: providerAdmission,
                     fileAccess: fileAccess
                 )

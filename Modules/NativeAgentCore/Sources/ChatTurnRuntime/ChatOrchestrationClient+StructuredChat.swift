@@ -142,13 +142,12 @@ extension SwiftNativeChatOrchestrationClient {
     // left no terminal row, so the trace read as an unexplained hang.
     func turnFailedEvent(
         turnId: String, sessionId: String, surface: String, error: Error,
-        observation: ToolLoopTraceObservation? = nil,
-        terminalReasonOverride: TurnEngineResult.TerminalReason? = nil
+        observation: ToolLoopTraceObservation? = nil
     ) -> TurnTraceEvent {
         let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         let terminalReason: TurnEngineResult.TerminalReason
-        if let terminalReasonOverride {
-            terminalReason = terminalReasonOverride
+        if [.authExpired, .codexCLISessionExpired, .routingUnavailable, .modelUnavailable].contains(ProviderFailure.classify(error)) {
+            terminalReason = .providerRequired
         } else if case .streamInterrupted(let partial, _) = error as? TurnEngineError {
             terminalReason = partial.isEmpty ? .providerFailed : .providerInterrupted
         } else {
@@ -160,7 +159,7 @@ extension SwiftNativeChatOrchestrationClient {
         payload["reason"] = .string(String(reason.prefix(200)))
         return TurnTraceEvent(
             turnId: turnId,
-            kind: "turn.failed",
+            kind: terminalReason.state == .waiting ? "turn.terminal" : "turn.failed",
             sessionId: sessionId,
             surface: surface,
             payload: .object(payload)
@@ -194,10 +193,6 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         suppressUserAppend: Bool,
         persistToolMessages: Bool,
-        /// See `executeTurnWithStreamingToolLoop(rendersProse:)`. False for
-        /// chat(): its callers get the final round's reply and the provider's
-        /// own error, and no partial prose is saved on a stop or failure.
-        rendersProse: Bool,
         progress: ChatOrchestrationProgressHandler?,
         noticeSink: @escaping @Sendable (String, String) async -> Void
     ) async throws -> StructuredChatExecution {
@@ -221,12 +216,19 @@ extension SwiftNativeChatOrchestrationClient {
         ChatTurnExecution.current?.bindHistoryRunID(runId)
         var livePartial: String?
         let boundTurnId = StructuredTurnTraceIdentity.currentOrMint()
-        // The run's one terminal row, published at its one exit after it has
-        // left the run registry (the `finish` defer below runs first), so a
-        // window seeding from the registry either holds the run and gets this
-        // row, or sees neither.
+        // Finish evidence must reach disk before recovery ownership is removed.
         var terminal: TurnTraceEvent?
-        defer { if let terminal { TurnTraceBus.fire(terminal, on: turnTraceBus) } }
+        defer {
+            if let terminal {
+                Task {
+                    do {
+                        try await settleTurnCheckpoint(terminal, sessionId: resolvedSession, runId: runId)
+                    } catch {
+                        FileHandle.standardError.write(Data("Couldn't settle the turn checkpoint; it is retained for recovery: \(error)\n".utf8))
+                    }
+                }
+            }
+        }
         do {
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
         // #19 + B7: derive the per-session cancel flag AT TURN ACCEPT, keyed by
@@ -542,7 +544,6 @@ extension SwiftNativeChatOrchestrationClient {
         }
 
         let loopObservation = ToolLoopTraceObservation()
-        var terminalFailureReason: TurnEngineResult.TerminalReason?
         let result: TurnEngineResult
         do {
             // Turn Inspector W1: bind the per-turn trace id around the engine
@@ -601,32 +602,19 @@ extension SwiftNativeChatOrchestrationClient {
                 return currentRequest && value != currentValue && lastChange?["decided_by"] == .string("agent")
                     && lastChange?["old_value"] == value && lastChange?["new_value"] == currentValue
             }) {
-                do {
-                    return try await engine.executeTurnWithStreamingToolLoop(
+                return try await engine.executeTurnWithStreamingToolLoop(
                         surface: surface,
                         userMessage: message,
                         sessionId: resolvedSession,
                         runId: runId,
-                        maxIterations: toolLoopMaxIterations(for: surface),
-                        turnWallClockSecondsOverride: turnWallClockSecondsOverride,
                         llm: llm,
                         tools: gated,
                         preBuiltContext: providerCtx,
                         progress: effectiveProgress,
-                        rendersProse: rendersProse,
                         cancelFlagPath: cancelFlagPath,
                         fileAccess: fileAccess,
                         capabilityProfile: continuationCapabilityProfile
                     )
-                } catch TurnEngineError.streamCancelled where !rendersProse {
-                    // No partial prose is kept for a caller that renders none: a
-                    // stop is a plain cancellation, handled below.
-                    throw CancellationError()
-                } catch TurnEngineError.streamInterrupted(_, let underlying) where !rendersProse {
-                    // Likewise: the provider failure itself, handled below.
-                    terminalFailureReason = .providerFailed
-                    throw underlying
-                }
             }
             }
             }
@@ -667,7 +655,7 @@ extension SwiftNativeChatOrchestrationClient {
         } catch let e as ChatOrchestrationError {
             terminal = turnFailedEvent(
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: e,
-                observation: loopObservation, terminalReasonOverride: terminalFailureReason
+                observation: loopObservation
             )
             if Self.shouldPersistFailureMessage(surface: surface) {
                 try? await appendFailureMessageIfNeeded(
@@ -695,7 +683,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
             terminal = turnFailedEvent(
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: e,
-                observation: loopObservation, terminalReasonOverride: terminalFailureReason
+                observation: loopObservation
             )
             if Self.shouldPersistFailureMessage(surface: surface) {
                 try? await appendFailureMessageIfNeeded(
@@ -723,7 +711,7 @@ extension SwiftNativeChatOrchestrationClient {
         } catch {
             terminal = turnFailedEvent(
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error,
-                observation: loopObservation, terminalReasonOverride: terminalFailureReason
+                observation: loopObservation
             )
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
@@ -844,6 +832,10 @@ extension SwiftNativeChatOrchestrationClient {
         ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId,
                          response.runtimeStatus.map { .incomplete(transcriptRow.text, status: $0) }
                              ?? .answered(transcriptRow.text))
+        if let event = terminal {
+            try await settleTurnCheckpoint(event, sessionId: resolvedSession, runId: runId)
+            terminal = nil
+        }
         return StructuredChatExecution(response: response, turn: result)
         } catch {
             // A run that ended before naming its own terminal (attachments,

@@ -23,29 +23,26 @@ contract is in [Tool loading](TOOL_LOADING.md).
 
 ## The pieces
 
-### 1. Whole-turn budget (progress-aware)
+### 1. One clean exit
 
-`ChatTurnRuntime/ToolLoopSupport.swift` owns `WholeTurnWallClockBudget`.
-Default windows are 600 seconds for interactive and Telegram turns, and
-3,900 seconds for unattended surfaces. Successful tool results renew the
-window, up to six hours from the start. Waiting on a person, calls that never
-ran, and streamed prose do not renew it.
+`ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` continues until
+the model answers with no calls or pending work. Stop interrupts; approvals,
+questions and a Mac takeover wait for the person. There is no iteration or
+whole-turn clock limit. Helper owners can still request a per-run token budget;
+that owner's exhaustion returns the kept reply as incomplete.
+Mac takeover suspends the same conversation on `MacAttentionSessionStore`'s
+driver-change stream. Returning control continues from the recorded results;
+task cancellation or the run-tagged Stop flag releases the wait. A waiting turn
+keeps the return-control action reachable under Full Mac.
 
-This is a checkpoint between provider attempts, not an interrupt of a running
-action. Exhaustion ends through the loop's terminal path, retaining accumulated
-prose and dispatch records. The shared loop checks the budget again after
-compaction and before another provider attempt.
+### 2. Progress and the circling question
 
-### 2. Iteration cap
-
-`ToolLoopBudget`, in the same file, defaults to 60 iterations for ordinary
-chat, 90 for mobile, 180 for Telegram and Codex/Claude bridges, and 80 for
-autonomy/background, swarm and Workshop surfaces. Explicit limits are clamped
-to 1–240.
-
-`ToolLoopNoProgressGuard` warns after eight identical tool rounds and stops
-after sixteen. A repeated identical failure has a separate warning at four
-rounds and stop at eight, even if the arguments change.
+`ToolLoopNoProgressGuard` keeps its evidence: a warning after eight identical
+tool rounds, or four identical failures even when arguments change. Sixteen
+identical rounds or eight identical failures raise one choice card:
+“I've done the same thing N times in a row without getting further — keep going,
+or change course?” The existing receipt and interaction continuation own its
+persistence and resume.
 
 ### 3. Tool dispatch deadline
 
@@ -83,51 +80,49 @@ it is unmeasured and only the wall stands; buffered kinds record no `ttftMs`,
 so idle and wall bound them.
 The cut text says the seconds waited, what arrived, and that evidence.
 
-`ProviderRouting/LLMClient+Real.swift` wraps streams with the guard and uses
-`withCompletionWall` for buffered calls. `ProviderRecoveryPolicy.callWallSeconds`
-reduces the call wall using the turn's remaining time, reserving 60 seconds
-for recovery with a 60-second floor, never exceeding the configured wall.
-The loop separately refuses to start an attempt after the turn budget is spent.
+`ProviderRouting/LLMClient+Real.swift` wraps streams with the configured
+per-call guard and uses `withCompletionWall` for buffered calls. A guard cut
+is input to recovery, never a whole-turn deadline.
 
 ### 5. In-loop provider recovery (the reconnect ladder)
 
 `ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` owns the loop,
-including native-tool and text-marker protocols and callers that do not render
-live prose. `ProviderRouting/ProviderRecoveryPolicy.swift` classifies failures;
-its `ChatTurnRuntime` extension supplies turn-error replay restrictions.
+including native-tool and text-marker protocols. One `TurnObservation` owns
+the model's next-round feedback for a limit, stream cut, correctness boundary,
+malformed call, empty reply, announced work without a call, refusal, or full
+context. It preserves kept prose and appends a user text block alongside the
+round's tool results, or a standalone user message when there were no results.
+`turn.observation` records the same feedback on both protocols.
 
-Network failures and rate limits can retry in place: up to ten attempts per
-call and twenty recoveries per turn. Once the provider admitted a request (a
-2xx response body began), a cut where it never said no (idle or wall,
-connection loss, truncation) is not re-issued before visible prose: the turn
-ends (a guard cut says what it waited for, e.g. "No first word from
-<provider> in N s (headers and M keep-alives); its slowest first word in the
-last K calls was S s.") and the person can say continue. An explicit provider error event (overloaded, rate
-limit) said it did not generate and is retried as before. Backoff is 1, 2, 4, 8, 15, then 30 seconds;
-a longer provider `Retry-After` wins. The loop refuses a wait that would consume
-the remaining budget. Provider overload has a separate pre-output ladder in
-`LLMClient+Real.swift`; exhaustion there vetoes outer retries.
+Network, no-reply, overload and rate-limit failures retry with backoff until
+the provider answers or the person stops: 1, 2, 4, 8, 15, then 30 seconds;
+a longer provider `Retry-After` wins. A cut with no kept prose replays the
+identical conversation and records an observation only in the trace. After
+prose, the observation tells the provider to continue after it. No calls from
+an incomplete stream dispatch; previously completed results remain.
+`provider.retry` and `provider_retry` carry uncapped reconnect status.
 
-When no prose was rendered, recovery reissues the request. After visible
-prose, it keeps that prefix and asks the provider to continue from it.
-Undispatched calls from the failed attempt are discarded in either case;
-completed tool results stay in the conversation. Cancellation is checked
-before and after the recovery wait.
+Streaming adapters report max-token limits as `toolBoundary(.outputLimit)`;
+buffered adapters carry the answer prefix in `outputLengthLimit(partial:)`.
+The loop retains yielded prose, or the buffered prefix if nothing was yielded,
+discards that reply's calls and continues. Retained answer text stays outside
+the pre-tool commentary prefix, so every surface delivers it as answer text.
+Repeated blocks/actions, invented results and prose after a call are
+correctness boundaries: complete
+calls before the cut run and their results carry the observation. The third
+identical read in one reply is a boundary even when other reads intervene.
+Line-density and inline short-unit rules and harness notices are removed.
 
-Output-length exhaustion keeps the partial answer and ends the turn without
-automatic continuation. Context overflow uses compaction below. Recovery emits
-`provider.retry` trace events and `provider_retry` status notices.
+Authentication, missing configuration/routing and unavailable-model errors
+remain repair waits. Standalone `complete()` overload retries retain their
+own ten-attempt bound and deadlines.
 
-### 6. Surface retry boundary
+### 6. Surface ownership
 
-Telegram's `TelegramBot/TelegramPollLoop+ChatProgress.swift` delegates
-whole-turn retry eligibility to `ProviderRecoveryPolicy.permitsWholeTurnRetry`.
-`ProviderErrorAfterToolEffects` vetoes replay after completed dispatch work,
-including reads; cancelled calls with unknown effects also count. Visible
-partial answers veto whole-turn replay through `TurnEngineError`.
-
-These restrictions differ from retrying a provider request inside the loop:
-starting the turn over could repeat actions and reset its recovery allowance.
+Telegram invokes the shared chat engine once. Provider recovery lives inside
+the same turn; no surface automatically re-runs its completed tools.
+The person's explicit `/retry` and Telegram delivery retries retain their
+existing meaning. Streaming surfaces keep editing the same reply after cuts.
 
 ### 7. Cancellation trace
 
@@ -145,9 +140,11 @@ and current state before trying it again.
 `ChatTurnRuntime/IntraTurnContextCompaction.swift` bounds the working
 conversation: it stubs older tool-result bodies and folds earlier rounds into
 working notes. It can run proactively before a provider call or reactively
-after a context-overflow refusal. Reactive recovery is limited to two passes
-per call and shares the twenty-recovery turn budget; for visible streaming,
-it requires that the failed attempt emitted neither prose nor calls.
+after a context-overflow refusal. Reactive compaction has no attempt cap.
+When nothing remains to fold, the turn finishes incomplete with its retained
+prose and the existing context-full notice to the person; no provider call
+follows. After a successful trim, a `contextFull` observation asks the model
+to finish from what it has. The seeded prefix remains protected.
 Trace `context.intraTurnCompaction` records the mode, trigger and size change;
 the status notice is `context_compaction`.
 
@@ -158,21 +155,54 @@ and recent rows, and writes durably. `ChatCompactionDistiller.swift` can improve
 the mechanical recollection; a failed distillation leaves the fallback.
 Compaction is bounded summarization, not lossless retention.
 
-### 9. Abandoned-turn reconciliation
+### 9. Process continuation
 
-`TurnTrace/AbandonedTurnReconciler.swift` finds accepted turns with no
-`turn.terminal`, `turn.cancelled` or `turn.failed` event. Only turns accepted
-before the current process epoch qualify; there is no six-hour minimum age.
+`TurnTrace/AbandonedTurnReconciler.swift` owns the small atomic checkpoint at
+`chat/session_state/<session>/turn-<turnId>.json`. The shared loop writes it
+before each provider iteration and before dispatch; durable tool receipts
+advance its step count and peer sources in the same checkpoint write. Receipts
+also retain their latched sources, which recovery consumes without weakening
+saved taint when peer trust changes. It keeps identity, input, envelope and reply
+route, iteration, kept prose, working notes and a possibly running step, never the
+provider message array. Input attachment bytes stay in `chat/attachments/`;
+their existing transcript metadata supplies the saved paths.
 
-Before appending, it locks and rereads the target and neighboring trace-day
-files. An existing terminal prevents the abandoned verdict; unreadable scan
-files abort the sweep, and unreadable neighboring files prevent the append.
-The result is `turn.terminal` with `status: "abandoned"` and
-`observedBy: "terminal_reconciliation"`, not a claim of successful completion.
+At launch, the reconciliation hook discovers checkpoints independently of the
+legacy trace window and excludes the in-flight registry and claimed resumes.
+`EngineRuntime/EngineTurnContinuation.swift` restores the original admission,
+surface capabilities, peer provenance, helper ownership and delivery route.
+`ChatOrchestration+Continuation.swift` re-enters the shared loop under the old
+runId and turnId with `suppressUserAppend: true`. It rebuilds the current turn
+from the durable user row and the same tool-receipt projection later turns use,
+restores working notes and kept prose, and applies `TurnObservation.restarted`.
+Saved dispatch receipts also rebuild delivery artifacts; generated-image paths
+survive transcript body clipping. Mac recovery connects the existing stream
+adapter and lifecycle intake under the saved identity.
+An unrecorded effect is unknown, not permission to repeat it. Oversize-result
+pages cannot survive the process; the observation says they are unavailable.
 
-`TurnTrace/AbandonedTurnReconciliationHook.swift` runs a sweep at launch and
-after completed turns, at most once every five minutes and one at a time,
-after draining the trace bus. It does not replay the interrupted work.
+Terminal settlement retains a completed restart-resume checkpoint only when
+it is not helper-owned and its shared completion route has a redelivery owner
+(Telegram, Slack, iOS or caller-result). It atomically marks deliveryPending
+before the durable terminal append, then the existing reply owner removes it
+after completed delivery. Every other terminal removes its checkpoint after
+the durable append. All terminals retire the live spill scope; Mac recovery
+still posts chatTurnCompleted to refresh its transcript without pushed delivery.
+If the answer was already saved, recovery uses it without another provider call.
+Pending checkpoints with no redelivery owner retire at launch with one
+turn.checkpoint_retired trace row; bridge responses and internal helper turns
+leave no pending checkpoint. Scheduled helpers settle through BotRunner.
+Terminal persistence awaits its own append, without draining process-wide telemetry.
+An existing Desk journal stays attached to its original item; its scheduler
+does not compete with checkpoint recovery. Ordinary turns acquire no Desk item.
+There is no process-resume count limit or new timer.
+
+Turns from older builds with no checkpoint keep guarded legacy reconciliation:
+`turn.terminal` with `status: "abandoned"` and
+`observedBy: "terminal_reconciliation"`. Their existing remote system note and
+Mac outcome-unknown card say, “This reply did not finish before the app restarted.”
+The hook reuses settled-boundary sweeps, throttled to once every five minutes;
+those legacy scans do not bound checkpoint discovery or the running turn.
 
 ### 10. Bridge deadlines
 

@@ -21,6 +21,7 @@ engine through their adapters.
 | `Sources/NativeAgentApp/` | SwiftUI app, Mac platform adapters and live engine assembly |
 | `Sources/NativeAgentSenseHost/` | Isolated JavaScriptCore sense plug and Swift plug-program launcher; app supplies source/material and owns supervision |
 | `Modules/NativeAgentCore/Sources/` | Engine, turn execution, domain stores, tools and policy |
+| `Modules/NativeAgentCore/Sources/NativeAgentCore/AgentBridgeCompletionRoute.swift` | Shared completion route, surface classification and redelivery eligibility for the router and checkpoints |
 | `Modules/NativeAgentShared/Sources/NativeAgentShared/` | Shared Mac/iPhone declarations |
 | `iOS/NativeAgentMobile/Sources/` | iPhone UI and sync adapters |
 
@@ -169,7 +170,7 @@ this grant, and `script/verify_release_artifact.sh` checks the signed entitlemen
 | `AppModel+GraphCapabilityActions.swift` | `AppModel`: `searchGraph`, `refreshGraph`, `runResearchLab` |
 | `AppModel+HealthEmbeddings.swift` | `AppModel`: `fetchEmbeddingsStatus`, `toggleEmbeddingsBackend`, `setEmbeddingsMemoryMode` |
 | `AppModel+MacChatSessionPort.swift` | `AppModel`: `noteChatSessionUserChoice`, `hasCachedChatTranscript`, `containsChatSession` |
-| `AppModel+MacChatTurnPort.swift` | `AppModel`: `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
+| `AppModel+MacChatTurnPort.swift` | `AppModel`: `resumeMacChatTurn` reconnects checkpoint progress to the existing stream adapter and lifecycle; `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
 | `AppModel+MemoryActions.swift` | `AppModel`: `pinMemory`, `deleteMemory`, `consolidateMemory`, `runMemoryConsolidation`, `memoryHygieneReport` |
 | `AppModel+NextGen.swift` | `AppModel`: `nextGenActionResponse`, `isNextGenActionBacked` (the Capabilities NextGen probes and their receipts) |
 | `AppModel+PersonalitySelfImprovement.swift` | `AppModel`: `savePersonality`, `savePersonalityChecked`, `savePersonalityName` |
@@ -454,7 +455,7 @@ Directory: `Modules/NativeAgentCore/Sources/Agents/`
 
 | File | Owns |
 |---|---|
-| `AgentBridgeCompletionRouter.swift` | `AgentBridgeCompletionRouter` enum; `isValidIOSDeviceRouteKey`, `deliverAnswer` |
+| `AgentBridgeCompletionRouter.swift` | Completion-route adapters and destination validation; `AgentBridgeCompletionRouter`: `isValidIOSDeviceRouteKey`, `deliverAnswer` |
 | `ChatGPTDotConversation.swift` | `ChatGPTDotConversation` actor; `refresh`, `conversation`; cached failed-admission peer IDs gate link recovery before peer/file reads; room cleanup keeps the first revised message per ID |
 | `CodexCompletionLifecycle.swift` | `CodexCompletionLifecycle` struct; `claim`, `markNotStarted` |
 | `ClaudeBridgeDenyDispatcher.swift` | `ClaudeBridgeDenyDispatcher` class; `builtInAgentLaneUsable`, `preApprovalRefusal` |
@@ -556,7 +557,7 @@ Directory: `Modules/NativeAgentCore/Sources/BackgroundWork/`
 | `ChatSurfaceBackgroundWork.swift` | `ChatSurfaceBackgroundWork` enum; `makeTelegramChatHandler`, `fileSystemPermissionNotice` |
 | `DelegationBackgroundWork.swift` | `DelegationBackgroundWork` struct; `makeDelegationOutcomeLoop`, `delegationJobSnapshot` |
 | `BodyReport.swift` | `BodyReport` struct; `read`, `writeDaily`: the day's crashes, loop failures, overdue organs, peers, first replies, cuts, misses, retired jobs, repairs, rounds per turn |
-| `DeskContinuationScheduler.swift` | `DeskContinuationScheduler` actor; `nextDeadline`, `runDue` |
+| `DeskContinuationScheduler.swift` | `DeskContinuationScheduler` actor; `nextDeadline`, `runDue`; checkpointed runs retain their process-resume owner |
 | `DeskNotifyRunner.swift` | `DeskNotifyRunner` struct; `physiologyEvents`, `nextMeaningfulDeadline` |
 | `DreamBackgroundWork.swift` | `DreamBackgroundWork` enum; `stagePendingREMProposalsAtLaunch`, `makeREMProposalStager` |
 | `GitHubTrackingBackgroundWork.swift` | `GitHubTrackingBackgroundWork` enum; `githubTrackingWatchedPaths`, `makeGitHubTrackingLoop` |
@@ -751,7 +752,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `AgentConversationsExports.swift` | Re-exports `AgentConversations` |
 | `AgentWorkspaceExports.swift` | Re-exports `AgentWorkspace` |
 | `ChatLiveTap.swift` | `ChatLiveTap` enum; `observe` (every turn's deltas and saved answer, for the phone) |
-| `ChatOrchestration+Continuation.swift` | `SwiftNativeTurnEngine`: `executeTurnWithStreamingToolLoop` |
+| `ChatOrchestration+Continuation.swift` | `SwiftNativeTurnEngine`: `executeTurnWithStreamingToolLoop`; `TurnCheckpointScope`, serialized `TurnCheckpointWriter`; same-turn transcript/receipt recovery and finished-run cleanup |
 | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory`, `fireAssemblyStageEvent`, `injectingSessionDigest` |
 | `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody`, `joinedProse` |
 | `ChatOrchestration+ToolDispatch.swift` | Shared per-iteration tool dispatch and refusal of unoffered folded calls |
@@ -799,8 +800,9 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `SwarmChatClientFactory.swift` | `NativeSwarmChatClientFactory` struct; `makeClient` |
 | `SwiftToolDispatcherConstruction.swift` | `SwiftToolDispatcher`: extension |
 | `TextMarkerCodec.swift` | `TextMarkerCodec` struct; `calls`, `throughLastMarker` |
-| `ToolLoopSupport.swift` | `TurnEngineResult`: `ToolLoopTraceObservation`, `ToolLoopExhausted`, `ToolLoopExhaustion` |
+| `ToolLoopSupport.swift` | `ToolLoopTraceObservation`, `ToolDispatchDeadline`, `ToolLoopNoProgressGuard` |
 | `TurnEngineContracts.swift` | `MemoryRecalling`: `recall`, `recordServedContextHits` |
+| `TurnObservation.swift` | `TurnObservation` enum; `text`, `apply`, shared trace emission in `record` |
 | `TurnSettle.swift` | `TurnSettle` enum; `requestedResultIntent`, `isWaitingOnCard` |
 
 ### ChromeControl
@@ -1090,7 +1092,7 @@ Directory: `Modules/NativeAgentCore/Sources/EngineRuntime/`
 | `EngineTelegramRouting.swift` | `TelegramBrainResolution` struct |
 | `EngineTools.swift` | `ToolsFacade` class; `mcp`, `listMCPSessions`, `loadManifest`, `promote`, `quarantine`, `updateTool` |
 | `EngineCapabilityLifecycle.swift` | `CapabilityLifecycleCommands` struct; skill/tool commands, approval filing and decision receipts; `CapabilityCommandOutcome` invalidates UI projections |
-| `EngineTurnContinuation.swift` | `TurnContinuationRuntime` struct; Desk verification/resumption and approval follow-up share turn admission and reply settlement |
+| `EngineTurnContinuation.swift` | `TurnContinuationRuntime` struct; process checkpoint resume, Desk verification/resumption and approval follow-up share turn admission and reply settlement; composes existing TurnTrace state and helper ownership |
 | `EngineTranscripts.swift` | `TranscriptsFacade`: `messages`, `setMessages`, `streamingTailBox` |
 | `EngineTrust.swift` | `TrustFacade` class; `loadCapabilities`, `load`; capability `catalog`, `catalogSources`, `packInstalls`, `saveCatalogSource` |
 | `EngineTurns.swift` | `TurnsFacade` class; `lifecycle`, `screenPreview` |
@@ -1571,7 +1573,9 @@ Directory: `Modules/NativeAgentCore/Sources/TurnTrace/`
 
 | File | Owns |
 |---|---|
-| `AbandonedTurnReconciliationHook.swift` | `AbandonedTurnReconciliationHook` enum; `arm` |
+| `AbandonedTurnReconciler.swift` | `TurnCheckpoint` durable run state; `AbandonedTurnReconciler` checkpoint discovery and guarded legacy terminals |
+| `AbandonedTurnReconciliationHook.swift` | `AbandonedTurnReconciliationHook` enum; `arm`; excludes active turns and claims checkpoint resumes |
+| `TurnTrace.swift` | `TurnTraceBus` durable terminal delivery before checkpoint retirement |
 
 ### WorkshopExecution
 

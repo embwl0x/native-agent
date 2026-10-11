@@ -10,7 +10,7 @@ import ProviderRouting
 /// per round. `ToolCallCodec.textMarkers` is this codec in the streaming
 /// loop's shape.
 ///
-/// The loop owns counts, caps and where a bounce is placed; the codec owns
+/// The loop owns where an observation is placed; the codec owns
 /// detection and the exact words the model reads.
 struct TextMarkerCodec: Sendable {
     /// The turn's catalog. Typed-argument repair and the undeclared-field
@@ -105,7 +105,7 @@ struct TextMarkerCodec: Sendable {
         if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pending) {
             holdFrom = r.lowerBound
         } else {
-            let tail = min(16, pending.count)
+            let tail = min(pending.count, max(16, ToolCallCodec.markerPrefixTailLength(pending)))
             holdFrom = pending.index(pending.endIndex, offsetBy: -tail)
         }
         guard holdFrom > pending.startIndex else { return "" }
@@ -134,22 +134,8 @@ struct TextMarkerCodec: Sendable {
 
     /// 2026-09-22: once per round, not per result (51 copies in one turn);
     /// names only the marker form the protocol teaches.
-    func closeRound(_ carrier: inout String, boundaryReason: LLMToolBoundaryReason? = nil) {
-        if let boundaryReason {
-            let reason: String
-            switch boundaryReason {
-            case .repeatedBlock: reason = "a tool call repeated the immediately preceding call"
-            case .repeatedAction: reason = "an action repeated an earlier action in the same reply"
-            case .fabricatedResult: reason = "it contained an invented tool result after a call"
-            case .postCallProse: reason = "it continued with prose after a call before receiving results"
-            }
-            carrier = "NativeAgent stopped this reply because \(reason). The results below account for the retained calls; calls after that boundary did not run. Use these results and make a new call only for work still needed. Do not repeat a completed action.\n" + carrier
-        }
+    func closeRound(_ carrier: inout String) {
         carrier += "\n\nUse these verified results. If more work is needed, put the next calls in one <function_calls> block using <tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use>, then end at </function_calls>. Otherwise answer directly.\n"
-    }
-
-    var protocolFailureFeedback: String {
-        "No call from that reply ran. Make the needed call now: <function_calls><tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use></function_calls>. Use the real tool name and arguments. End at </function_calls> and wait for the result."
     }
 
     // MARK: - Bounces
@@ -170,21 +156,6 @@ struct TextMarkerCodec: Sendable {
                     text,
                     knownToolNames: catalogNames.union(turnActiveTools)
                 ))
-    }
-
-    /// The tools the unfulfilled-promise bounce names as ready.
-    var readyTools: String {
-        let readySource = turnActiveTools.isEmpty ? catalogNames : turnActiveTools
-        // A tool folded into app is ready as its app action, not by name.
-        return readySource.filter { !SwiftToolDispatcher.isModelHidden($0) }.sorted().prefix(8).joined(separator: ", ")
-    }
-
-    /// The unfulfilled-promise bounce; `bounce` is 1 or 2.
-    func unfulfilledPromiseFeedback(bounce: Int) -> String {
-        if bounce == 1 {
-            return "Your reply announced work but made no tool call. Continue in this turn: put the next calls in one <function_calls> block using <tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use>, then end at </function_calls>, or give your complete answer. Tools ready: \(readyTools)."
-        }
-        return "Your reply again announced work without a tool call. This is the last continuation: put the next call in one <function_calls> block using <tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use>, then end at </function_calls>, or give your complete answer including any concrete blocker."
     }
 
     // MARK: - Catalog carrier

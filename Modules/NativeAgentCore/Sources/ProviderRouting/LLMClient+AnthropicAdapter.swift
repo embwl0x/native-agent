@@ -545,11 +545,8 @@ public final class AnthropicAdapter: LLMAdapter {
     /// Names an HTTP-200 response that carried zero answer text — the error a
     /// caller sees must say WHAT came back, not "invalid response status 200"
     /// (that anonymous form sent the K3 debugging in the wrong direction three
-    /// times, 2026-07-19/20). max_tokens truncation stays a providerError (a
-    /// retry of the same request truncates again); every other textless 200 is
-    /// a transient provider glitch — `llm: transient` is what the surface retry
-    /// ladders match on, and ProviderErrorAfterToolEffects still vetoes
-    /// whole-turn replays once tool effects exist.
+    /// times, 2026-07-19/20). The stop reason distinguishes a length limit or
+    /// refusal from an empty provider response.
     func emptyTextResponseError(_ obj: [String: Any], content: [[String: Any]]) -> LLMError {
         let stopReason = (obj["stop_reason"] as? String) ?? "absent"
         if stopReason == "max_tokens" {
@@ -738,6 +735,11 @@ public final class AnthropicAdapter: LLMAdapter {
                                 durationMs: durationMs,
                                 stopReason: lastStopReason
                             )
+                            if lastStopReason == "max_tokens" {
+                                RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+                                continuation.finish()
+                                return
+                            }
                             if !yieldedAnyText {
                                 throw FirstPartyExecutionControls.anthropicEmptyStreamError(
                                     providerID: providerId,
@@ -745,9 +747,6 @@ public final class AnthropicAdapter: LLMAdapter {
                                     expectedOutput: "answer text"
                                 )
                             }
-                            // Same rule as the OAuth lane (2026-09-22): a
-                            // max_tokens reply is truncated, never finished.
-                            if lastStopReason == "max_tokens" { throw runaway.stopError }
                             continuation.finish()
                             return
                         case "content_block_delta":
@@ -767,7 +766,6 @@ public final class AnthropicAdapter: LLMAdapter {
                                     // Ended by us, not by message_stop: record the call anyway, so
                                     // the turn's cost stays visible (usage has message_start's input
                                     // and cache counts; output tokens are unknown after cancel).
-                                    // A loop trip is recorded too: it is the costliest call.
                                     await telemetry.record(
                                         requestBody: req.httpBody,
                                         provider: providerId,
@@ -776,12 +774,11 @@ public final class AnthropicAdapter: LLMAdapter {
                                         usage: usage.isEmpty ? nil : usage,
                                         ttftMs: ttftMs,
                                         durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                                        status: runaway.toolBoundary != nil ? "ok" : "incomplete",
-                                        stopReason: runaway.toolBoundary != nil ? "client_tool_boundary" : "client_runaway"
+                                        status: "ok",
+                                        stopReason: "client_tool_boundary"
                                     )
                                     // Ended at a complete tool block, like a
                                     // stop sequence: the calls before it run.
-                                    guard runaway.toolBoundary != nil else { throw runaway.stopError }
                                     continuation.finish()
                                     return
                                 }

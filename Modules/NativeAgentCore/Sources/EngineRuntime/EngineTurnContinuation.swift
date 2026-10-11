@@ -4,6 +4,7 @@ import ChatOrchestration
 import CryptoKit
 import Desk
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
@@ -11,6 +12,7 @@ import StandingBots
 import TelegramBot
 import TrustCenter
 import WorkshopExecution
+import TurnTrace
 
 /// Continuations use the same admitted turn and reply path; Desk receipts and
 /// approval claims retain their own settlement and retry rules.
@@ -79,6 +81,68 @@ public struct TurnContinuationRuntime: Sendable {
             })
     }
 
+    public func resumeTurn(_ checkpoint: TurnCheckpoint, progress: ChatOrchestrationProgressHandler? = nil) async throws {
+        guard let saved = TurnEnvelope.fromPersistedMetadata(.object(checkpoint.envelope)),
+              let name = checkpoint.capabilityProfile,
+              let profile = NativeAgentAppChatSurfaceProfile(rawValue: name),
+              let sources = checkpoint.peerSources,
+              let surface = text(checkpoint.replyRoute, "surface") else {
+            throw DeskContinuationError.unavailable
+        }
+        let envelope = TurnEnvelope(surface: saved.surface, agent: saved.agent,
+            verifiedChatId: saved.verifiedChatId, verifiedUserId: saved.verifiedUserId,
+            commandSignatureVerified: checkpoint.commandSignatureVerified,
+            deliveryRoute: saved.deliveryRoute, declaredRemote: checkpoint.declaredRemote)
+        let route = AgentBridgeCompletionRoute(surface: surface, sessionId: checkpoint.sessionId,
+            destinationId: text(checkpoint.replyRoute, "destinationId"), threadId: text(checkpoint.replyRoute, "threadId"),
+            sourceKey: text(checkpoint.replyRoute, "sourceKey"), replyTo: text(checkpoint.replyRoute, "replyTo"),
+            correlationId: text(checkpoint.replyRoute, "correlationId"))
+        let request = followUpRequest(message: checkpoint.userMessage, sessionID: checkpoint.sessionId,
+            fileAccess: checkpoint.fileAccess, surface: checkpoint.surface, envelope: envelope,
+            replyRoute: route.chatToolReplyRoute, pinnedRunID: checkpoint.runId)
+        _ = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+        let client = engine.chatClient(profile: profile, approvalFiler: profile == .telegram ? telegramApprovalFiler() : nil)
+        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
+        let item = try await store.liveState().items.first { $0.continuation?.runID == checkpoint.runId }
+        let journal: DeskContinuationTurn?
+        if let item, var record = item.continuation {
+            guard item.status != .canceled else {
+                throw DeskContinuationError.unavailable
+            }
+            let expected = record.revision
+            record.state = .running
+            record.processID = DeskContinuationScope.processID
+            record.revision = UUID().uuidString
+            try await store.setContinuation(item.handle, expectedRevision: expected, record: record)
+            journal = DeskContinuationTurn(store: store, record: record, handle: item.handle)
+        } else { journal = nil }
+        let response = try await PeerDataTaint.$current.withValue(PeerDataTaint(restoring: sources)) {
+            try await DeskContinuationScope.$current.withValue(journal) {
+                try await runOwnedContinuation(request, helperDefinition: checkpoint.helperDefinition) {
+                    guard let current = try TurnCheckpoint.read(dataRoot: dataRoot,
+                        sessionId: checkpoint.sessionId, turnId: checkpoint.turnId), current.updatedAt == checkpoint.updatedAt else {
+                        throw DeskContinuationError.conflict
+                    }
+                    return try await client.resumeTurn(current, request: request, progress: progress)
+                }
+            }
+        }
+        if checkpoint.hasRedeliveryOwner {
+            let digest = CodexCompletionTranscriptEvidence.responseDigest(sessionId: checkpoint.sessionId,
+                runId: checkpoint.runId, content: response.output, attachments: response.attachments ?? [])
+            guard try await settleReply(response: response, route: route, envelope: envelope,
+                settlement: .durable(deliveryID: "turn-restart.\(checkpoint.runId)", requestDigest: digest, notifyRequestedResult: false)) == "completed" else { return }
+            try checkpoint.remove(dataRoot: dataRoot)
+        } else if checkpoint.helperDefinition == nil, route.kind == .local {
+            await MainActor.run {
+                NotificationCenter.default.post(name: .chatTurnCompleted, object: checkpoint.sessionId)
+            }
+        }
+        if response.terminalState == .completed {
+            if let journal, await journal.snapshot().pending.isEmpty { try await journal.delivered() }
+        }
+    }
+
     private func resumeDeskContinuation(item: DeskItem, record: DeskContinuation) async throws {
         let envelope = try continuationEnvelope(record)
         guard let peerSources = record.peerSources,
@@ -118,9 +182,10 @@ public struct TurnContinuationRuntime: Sendable {
                 return
             }
             let response = try JSONDecoder().decode(ChatResponse.self, from: cached.serializedData(pretty: false))
+            let digest = SHA256.hash(data: try cached.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()
             let delivery = try await settleReply(response: response, route: route, envelope: envelope,
-                settlement: .desk(deliveryID: "desk-continuation.\(current.originRunID).\(item.handle).\(current.resumeCount)",
-                    cached: cached))
+                settlement: .durable(deliveryID: "desk-continuation.\(current.originRunID).\(item.handle).\(current.resumeCount)",
+                    requestDigest: digest, notifyRequestedResult: true))
             if delivery == "completed" { try await journal.delivered() }
             else { try await journal.block(reason: "reply_delivery_\(delivery)") }
         } catch {
@@ -135,40 +200,53 @@ public struct TurnContinuationRuntime: Sendable {
 
     private func runDeskContinuationRequest(_ request: TurnRequest, record: DeskContinuation,
         client: SwiftNativeChatOrchestrationClient, journal: DeskContinuationTurn) async throws {
-        guard record.surface == "bot" else {
-            _ = try await runAdmittedContinuation(sessionID: record.sessionID ?? record.runID) {
-                try await request.chat(on: client)
+        do {
+            _ = try await runOwnedContinuation(request, helperDefinition: record.helperDefinition) {
+                guard let bot = StandingBotContinuity.currentBot else { return try await request.chat(on: client) }
+                return try await request.bind {
+                    try await client.chat(message: request.message, sessionId: bot.sessionID,
+                        choice: ProviderTurnChoice.current, tokenLimit: bot.budget.tokens, surface: request.surface,
+                        fileAccess: request.fileAccess, suppressUserAppend: true, mechanicalRow: .botReceipt)
+                }
             }
-            return
+        } catch {
+            if record.surface == "bot" { try await journal.block(reason: "helper_continuation_refused") }
+            throw error
         }
-        guard let saved = record.helperDefinition,
+    }
+
+    private func runOwnedContinuation(_ request: TurnRequest, helperDefinition: JSONValue?,
+        operation: @escaping @Sendable () async throws -> ChatResponse) async throws -> ChatResponse {
+        guard request.surface == "bot" else {
+            return try await runAdmittedContinuation(sessionID: request.sessionID) { try await operation() }
+        }
+        guard let saved = helperDefinition,
               let bot = try? JSONDecoder().decode(BotDefinition.self, from: saved.serializedData(pretty: false)),
-              bot.sessionID == record.sessionID else {
-            try await journal.block(reason: "helper_context_required")
-            return
+              bot.sessionID == request.sessionID else {
+            throw DeskContinuationError.unavailable
         }
-        let runner = BotRunner(dataRoot: dataRoot, session: { bot, message in
+        let responses = AsyncStream<ChatResponse>.makeStream()
+        defer { responses.continuation.finish() }
+        let runner = BotRunner(dataRoot: dataRoot, session: { bot, _ in
             let choice = ProviderTurnChoice(provider: bot.provider ?? "", model: bot.model ?? "",
                 reasoningEffort: bot.reasoningEffort ?? "", fast: bot.fast ?? false)
             return try await StandingBotContinuity.$currentBot.withValue(bot) {
                 try await runAdmittedContinuation(sessionID: bot.sessionID) {
-                    try await request.bind {
-                        let response = try await client.chat(message: message, sessionId: bot.sessionID,
-                            choice: choice, tokenLimit: bot.budget.tokens, surface: request.surface,
-                            fileAccess: request.fileAccess, suppressUserAppend: true, mechanicalRow: .botReceipt)
+                    try await ProviderTurnChoice.$current.withValue(choice) {
+                        let response = try await operation()
+                        responses.continuation.yield(response)
                         return StandingBotContinuity.reply(response)
                     }
                 }
             }
         })
-        do {
-            _ = try await runner.resume(bot: bot, message: request.message, holdUnattended: { _ in
+        _ = try await runner.resume(bot: bot, message: request.message, holdUnattended: { _ in
                 !(await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot))
             })
-        } catch {
-            try await journal.block(reason: "helper_continuation_refused")
-            throw error
-        }
+        responses.continuation.finish()
+        var iterator = responses.stream.makeAsyncIterator()
+        guard let response = await iterator.next() else { throw DeskContinuationError.unavailable }
+        return response
     }
 
     private func continuationEnvelope(_ record: DeskContinuation) throws -> TurnEnvelope {
@@ -238,7 +316,7 @@ public struct TurnContinuationRuntime: Sendable {
             replyRoute: replyRoute, pinnedRunID: pinnedRunID, serviceTier: serviceTier)
     }
 
-    private func runAdmittedContinuation<T: Sendable>(sessionID: String,
+    private func runAdmittedContinuation<T: Sendable>(sessionID: String?,
         operation: @escaping @Sendable () async throws -> T) async throws -> T {
         try await TurnAdmission.shared.run(sessionID: sessionID, operation: operation)
     }
@@ -262,7 +340,7 @@ public struct TurnContinuationRuntime: Sendable {
     }
 
     private enum ReplySettlement {
-        case desk(deliveryID: String, cached: JSONValue)
+        case durable(deliveryID: String, requestDigest: String, notifyRequestedResult: Bool)
         case approvalClaim
     }
 
@@ -270,7 +348,7 @@ public struct TurnContinuationRuntime: Sendable {
                              settlement: ReplySettlement) async throws -> String {
         let requiresDestinationMatch: Bool
         switch settlement {
-        case .desk: requiresDestinationMatch = true
+        case .durable: requiresDestinationMatch = true
         case .approvalClaim: requiresDestinationMatch = false
         }
         let sender = makeSender { config, chatID in
@@ -281,15 +359,15 @@ public struct TurnContinuationRuntime: Sendable {
                 ) == .allowed
         }
         switch settlement {
-        case .desk(let deliveryID, let cached):
-            let digest = SHA256.hash(data: try cached.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()
+        case .durable(let deliveryID, let digest, let notifyRequestedResult):
             let lifecycle = CodexCompletionLifecycle(
                 receiptURL: dataRoot.appendingPathComponent("chat/human-reply-delivery/receipts.jsonl"),
                 ownerInstanceId: CodexCompletionLifecycle.processOwnerInstanceId, dataRoot: dataRoot)
             _ = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
             let delivery = await AgentBridgeCompletionRouter.deliver(
                 deliveryId: deliveryID, requestDigest: digest, text: response.output,
-                attachments: response.attachments ?? [], route: route, sender: sender, lifecycle: lifecycle)
+                attachments: response.attachments ?? [], route: route, sender: sender, lifecycle: lifecycle,
+                notifyRequestedResult: notifyRequestedResult)
             return delivery.status
         case .approvalClaim:
             // The approval claim already covers the turn and its single send.

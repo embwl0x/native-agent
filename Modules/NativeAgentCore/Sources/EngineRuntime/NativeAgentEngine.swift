@@ -308,16 +308,12 @@ public final class NativeAgentEngine: Sendable {
     public func chatClient(
         tools: any ToolDispatchClient,
         approvalFiler: (any ApprovalFiler)? = nil,
-        toolLoopMaxIterations: Int? = nil,
-        turnWallClockSeconds: TimeInterval? = nil,
         continuationCapabilityProfile: NativeAgentAppChatSurfaceProfile? = nil
     ) -> SwiftNativeChatOrchestrationClient {
         let contextFlow = hasBody ? self.contextFlow : nil
         return makeChatOrchestrationClient(
             tools: tools,
             dataRoot: dataRoot,
-            toolLoopMaxIterations: toolLoopMaxIterations,
-            turnWallClockSeconds: turnWallClockSeconds,
             continuationCapabilityProfile: continuationCapabilityProfile?.rawValue,
             approvalFiler: approvalFiler,
             cognitiveObserver: cognition,
@@ -358,8 +354,6 @@ public final class NativeAgentEngine: Sendable {
         return chatClient(
             tools: tools,
             approvalFiler: resolvedApprovalFiler,
-            toolLoopMaxIterations: profile.toolLoopMaxIterations,
-            turnWallClockSeconds: profile.turnWallClockSeconds,
             continuationCapabilityProfile: profile
         )
     }
@@ -375,9 +369,8 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
 
     func bridgeChatClient() -> SwiftNativeChatOrchestrationClient { engine.chatClient(profile: .bridge) }
     func backgroundChatClient() -> SwiftNativeChatOrchestrationClient { engine.chatClient(profile: .background) }
-    func chatClient(tools: any ToolDispatchClient, toolLoopMaxIterations: Int?,
-                    turnWallClockSeconds: TimeInterval?) -> SwiftNativeChatOrchestrationClient {
-        engine.chatClient(tools: tools, toolLoopMaxIterations: toolLoopMaxIterations, turnWallClockSeconds: turnWallClockSeconds)
+    func chatClient(tools: any ToolDispatchClient) -> SwiftNativeChatOrchestrationClient {
+        engine.chatClient(tools: tools)
     }
     func toolDispatchClient(denyExternalMcp: Bool, enforceAppAutonomy: Bool) -> any ToolDispatchClient {
         engine.toolDispatchClient(denyExternalMcp: denyExternalMcp, enforceAppAutonomy: enforceAppAutonomy)

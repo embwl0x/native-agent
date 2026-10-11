@@ -445,10 +445,6 @@ extension TelegramPollLoop {
         await writeStatePatch([
             "lastReplyAt": .string(at),
             "lastError": .null,
-            "lastChatRetryError": .null,
-            "lastChatRetryFailedAttempt": .null,
-            "lastChatRetryNextAttempt": .null,
-            "lastChatRetrySuppressUserAppend": .null,
         ])
     }
 }

@@ -77,9 +77,14 @@ extension MacSyncEngine {
                 case "completed": state = .completed; status = "Reply ready"
                 case "waiting":
                     state = .waiting
-                    status = text("terminalReason") == "approval_required" ? "Approval required" : "Needs your answer"
+                    switch text("terminalReason") {
+                    case "approval_required": status = "Approval required"
+                    case "provider_required": status = "Model connection needs attention"
+                    case "human_takeover": status = "Waiting for Mac control"
+                    default: status = "Needs your answer"
+                    }
                 case "failed": state = .failed; status = "Failed — open the conversation"
-                case "interrupted", "braked": state = .interrupted; status = "Stopped before completion"
+                case "interrupted": state = .interrupted; status = "Stopped before completion"
                 default: state = .unknown; status = "Outcome unknown"
                 }
             default: return false

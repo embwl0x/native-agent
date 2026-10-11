@@ -34,10 +34,6 @@ extension SwiftNativeChatOrchestrationClient {
         return f.string(from: date)
     }
 
-    func toolLoopMaxIterations(for surface: String) -> Int {
-        ToolLoopBudget.resolve(surface: surface, requested: toolLoopMaxIterationsOverride)
-    }
-
     nonisolated static func inputWithSessionIfNeeded(
         toolName: String,
         input: [String: JSONValue],

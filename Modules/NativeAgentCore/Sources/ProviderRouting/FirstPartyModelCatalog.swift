@@ -430,10 +430,7 @@ public enum FirstPartyExecutionControls {
     ) -> LLMError {
         let reason = stopReason ?? "absent"
         if reason == "max_tokens" {
-            return .providerError(message:
-                "\(providerID): thinking consumed the entire max_tokens budget "
-                + "before any \(expectedOutput) (stop_reason=max_tokens); raise "
-                + "max_tokens or lower the reasoning effort")
+            return .outputLengthLimit(partial: "")
         }
         if reason == "refusal" {
             return .providerError(message:

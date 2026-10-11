@@ -1,5 +1,6 @@
 import Foundation
 import Privacy
+import TurnTrace
 
 public extension MacChatTurnPresentationPort {
     /// Opens the exact generation for one accepted Mac turn. This is the only
@@ -336,6 +337,16 @@ public extension MacChatTurnPresentationPort {
         var repairPersistenceFailed = false
 
         for record in records {
+            let hasCheckpoint: Bool
+            do {
+                hasCheckpoint = try TurnCheckpoint.read(dataRoot: macChatTurns.dataRoot,
+                    sessionId: record.sessionId, turnId: record.turnId) != nil
+            } catch {
+                hasPendingRepairWork = true
+                logChatTurnLifecyclePersistenceFailure("repair_checkpoint", error: error)
+                continue
+            }
+            if hasCheckpoint && !record.isTerminal { hasPendingRepairWork = true }
             guard knownSessionIds.contains(record.sessionId) else {
                 // Session-index reconciliation is independently bounded at
                 // launch, so a transcript can briefly exist before its index
@@ -361,6 +372,7 @@ public extension MacChatTurnPresentationPort {
                 guard let repaired = MacChatTurnLifecycleRestartRepair.repair(
                     record: record,
                     transcriptProof: proof,
+                    hasCheckpoint: hasCheckpoint,
                     at: instant
                 ) else {
                     hasPendingRepairWork = true
@@ -386,6 +398,7 @@ public extension MacChatTurnPresentationPort {
             guard let repaired = MacChatTurnLifecycleRestartRepair.repair(
                 record: record,
                 transcriptProof: proof,
+                hasCheckpoint: hasCheckpoint,
                 at: instant
             ) else { continue }
             guard macChatTurns.activeTurnIDsBySession[record.sessionId] == nil else {

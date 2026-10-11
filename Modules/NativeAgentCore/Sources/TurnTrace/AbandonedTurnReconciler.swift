@@ -2,26 +2,92 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - Terminal reconciliation for abandoned accepted turns
-//
-// A turn writes `turn.accepted` when the orchestrator takes it and a terminal
-// row (`turn.terminal` / `turn.cancelled` / `turn.failed`) when it ends. A
-// process that dies mid-turn writes neither a terminal nor an error, so the
-// turn stays accepted forever and every reader that counts outcomes silently
-// counts it as neither success nor failure.
-//
-// Measured 2026-09-11 over data/turn_traces: 1470 accepted turns since Aug 29,
-// 33 of them with no terminal row of any kind — 9 in the audit's four-day
-// window (e.g. a29e5e8c… 2026-09-10T14:32:51Z, 3623211e… 2026-09-09T21:07:54Z).
-//
-// WHAT THIS IS NOT: it does not replay, retry, resume or repair anything. It
-// writes the one row the evidence supports — "this turn was accepted, nothing
-// ever finished it" — so an unfinished turn is a RECORDED outcome instead of an
-// invisible gap.
+/// The conversation is rebuilt from the transcript; only in-flight state lives here.
+public struct TurnCheckpoint: Codable, Sendable, Equatable {
+    public let runId: String
+    public let turnId: String
+    public let sessionId: String
+    public let surface: String
+    public let userMessage: String
+    public let acceptedAt: Date
+    public var updatedAt = Date()
+    public let envelope: [String: JSONValue]
+    public let replyRoute: [String: JSONValue]
+    public let fileAccess: String
+    public let capabilityProfile: String?
+    public var peerSources: [String]?
+    public let commandSignatureVerified: Bool?
+    public let declaredRemote: Bool?
+    public let helperDefinition: JSONValue?
+    public var iteration = 0
+    public var keptProse = ""
+    public var workingCommentaryCharacters = 0
+    public var workingNotes = ""
+    public var dispatchCount = 0
+    public var runningStep: Int?
+    public var deliveryPending = false
+
+    public var hasRedeliveryOwner: Bool {
+        guard helperDefinition == nil, case .string(let surface)? = replyRoute["surface"] else { return false }
+        return AgentBridgeCompletionRoute.Kind(surface: surface)?.hasRedeliveryOwner == true
+    }
+
+    public init(runId: String, turnId: String, sessionId: String, surface: String, userMessage: String,
+                envelope: [String: JSONValue], replyRoute: [String: JSONValue], fileAccess: String,
+                capabilityProfile: String?, peerSources: [String]?, commandSignatureVerified: Bool?,
+                declaredRemote: Bool?, helperDefinition: JSONValue?) {
+        self.runId = runId; self.turnId = turnId; self.sessionId = sessionId; self.surface = surface
+        self.userMessage = userMessage; self.acceptedAt = Date()
+        self.envelope = envelope; self.replyRoute = replyRoute; self.fileAccess = fileAccess
+        self.capabilityProfile = capabilityProfile; self.peerSources = peerSources
+        self.commandSignatureVerified = commandSignatureVerified; self.declaredRemote = declaredRemote
+        self.helperDefinition = helperDefinition
+    }
+
+    public static func path(dataRoot: URL, sessionId: String, turnId: String) throws -> URL {
+        guard NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId,
+              NativeAgentChatSessionID.normalizedPathComponent(turnId) == turnId else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+        return dataRoot.appendingPathComponent("chat/session_state/\(sessionId)/turn-\(turnId).json")
+    }
+
+    public func write(dataRoot: URL) throws {
+        let path = try Self.path(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId)
+        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var record = self
+        record.updatedAt = Date()
+        try JSONEncoder().encode(record).write(to: path, options: .atomic)
+    }
+
+    public static func read(dataRoot: URL, sessionId: String, turnId: String) throws -> Self? {
+        let path = try path(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId)
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        let record = try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
+        guard record.sessionId == sessionId, record.turnId == turnId else { throw CocoaError(.fileReadCorruptFile) }
+        return record
+    }
+
+    public static func forSession(dataRoot: URL, sessionId: String) throws -> [Self] {
+        let directory = try path(dataRoot: dataRoot, sessionId: sessionId, turnId: "checkpoint").deletingLastPathComponent()
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("turn-") && $0.pathExtension == "json" }
+            .compactMap { file in
+                try read(dataRoot: dataRoot, sessionId: sessionId,
+                    turnId: String(file.deletingPathExtension().lastPathComponent.dropFirst(5)))
+            }
+    }
+
+    public func remove(dataRoot: URL) throws {
+        let path = try Self.path(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId)
+        if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
+    }
+}
+
+/// Checkpointed turns resume; older turns without a checkpoint retain an honest terminal.
 public struct AbandonedTurnReconciler: Sendable {
-    /// Day files read by an ordinary sweep. Three covers a turn accepted near
-    /// midnight plus the 6h window, and keeps the sweep's cost fixed. A sweep
-    /// that finds a stale cursor scans back further — see `daysToScan`.
+    /// Ordinary trace window; checkpoints are discovered independently of age.
     public static let dayWindow = 3
 
     /// Upper bound on the catch-up scan after a gap. Without it, an install
@@ -31,15 +97,7 @@ public struct AbandonedTurnReconciler: Sendable {
     /// Bound guarded rereads as well as durable appends, including failed writes.
     public static let maximumWritesPerPass = 25
 
-    /// This process's epoch. A turn accepted at or after it belongs to THIS
-    /// run: it is either live right now or it already wrote its own terminal,
-    /// and either way this sweep has no business judging it (GPT-5.6 round
-    /// review, 2026-09-11 — the sweep could stamp "abandoned" on a long
-    /// productive turn that was still running). Reconciliation is only ever
-    /// about turns a PREVIOUS process left accepted.
-    ///
-    /// Resolved on first use; the launch hook touches it at startup so it is
-    /// the launch time in production.
+    /// Pinned at launch; only a previous process's turns are candidates.
     public static let processEpoch = Date()
 
     private let dataRoot: URL
@@ -62,30 +120,26 @@ public struct AbandonedTurnReconciler: Sendable {
     public struct Outcome: Sendable, Equatable {
         public let acceptedScanned: Int
         public let reconciled: [String]
-        /// Accepted turns with no terminal that are still INSIDE the wall-clock
-        /// window — they may be running right now, so they are left alone.
+        /// Turns accepted in this process are left alone.
         public let tooRecentToJudge: Int
-        /// Sessions whose turn was cut off by the previous process ending
-        /// shortly before this launch — the ones worth a one-line note.
-        public let interruptedSessions: [(sessionId: String, surface: String)]
+        public let resumable: [TurnCheckpoint]
         /// Why the sweep could not conclude: a day file it could not read or a
         /// row it could not append. Nil for a conclusive sweep.
         public let failure: String?
 
         public init(acceptedScanned: Int, reconciled: [String], tooRecentToJudge: Int,
-                    interruptedSessions: [(sessionId: String, surface: String)] = [], failure: String? = nil) {
+                    resumable: [TurnCheckpoint] = [], failure: String? = nil) {
             self.acceptedScanned = acceptedScanned
             self.reconciled = reconciled
             self.tooRecentToJudge = tooRecentToJudge
-            self.interruptedSessions = interruptedSessions
+            self.resumable = resumable
             self.failure = failure
         }
 
         public static func == (lhs: Outcome, rhs: Outcome) -> Bool {
             lhs.acceptedScanned == rhs.acceptedScanned && lhs.reconciled == rhs.reconciled
                 && lhs.tooRecentToJudge == rhs.tooRecentToJudge && lhs.failure == rhs.failure
-                && lhs.interruptedSessions.map { $0.sessionId + "|" + $0.surface }
-                    == rhs.interruptedSessions.map { $0.sessionId + "|" + $0.surface }
+                && lhs.resumable == rhs.resumable
         }
     }
 
@@ -95,9 +149,9 @@ public struct AbandonedTurnReconciler: Sendable {
         let surface: String?
     }
 
-    /// One bounded pass. Returns what it wrote so a caller can log or test it.
+    /// Discover checkpoints and reconcile a bounded legacy trace window.
     @discardableResult
-    public func sweep() async -> Outcome {
+    public func sweep(inFlightTurnIds: Set<String> = []) async -> Outcome {
         let today = now()
         var accepted: [String: Accepted] = [:]
         var terminated: Set<String> = []
@@ -155,16 +209,70 @@ public struct AbandonedTurnReconciler: Sendable {
         var writeAttempts = 0
         var persistenceFailure: String?
         var deferred = false
-        var interrupted: [(sessionId: String, surface: String)] = []
+        var resumable: [TurnCheckpoint] = []
+        var checkpoints: [String: TurnCheckpoint] = [:]
+        do {
+            let root = dataRoot.appendingPathComponent("chat/session_state")
+            if FileManager.default.fileExists(atPath: root.path) {
+                for session in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
+                    for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: session.lastPathComponent) {
+                        let turnId = checkpoint.turnId
+                        checkpoints[turnId] = checkpoint
+                        if accepted[turnId] == nil {
+                            accepted[turnId] = Accepted(ts: checkpoint.acceptedAt,
+                                sessionId: checkpoint.sessionId, surface: checkpoint.surface)
+                        }
+                    }
+                }
+            }
+        } catch {
+            return Outcome(acceptedScanned: accepted.count, reconciled: [], tooRecentToJudge: 0,
+                failure: "Turn checkpoint is unreadable; repair chat/session_state before resuming: \(error)")
+        }
         let candidates = accepted
-            .filter { !terminated.contains($0.key) }
-            .sorted { $0.value.ts < $1.value.ts }
+            .filter { (!terminated.contains($0.key) || checkpoints[$0.key] != nil)
+                && !inFlightTurnIds.contains($0.key) }
+            .sorted {
+                if (checkpoints[$0.key] != nil) != (checkpoints[$1.key] != nil) { return checkpoints[$0.key] != nil }
+                return $0.value.ts < $1.value.ts
+            }
         for (turnId, row) in candidates {
             let age = today.timeIntervalSince(row.ts)
             // A turn this process accepted is never abandoned by this process;
             // one a previous process accepted cannot still be running.
             guard row.ts < processEpoch else {
                 tooRecent += 1
+                continue
+            }
+            if let checkpoint = checkpoints[turnId] {
+                do {
+                    let days = Set([row.ts, checkpoint.updatedAt, today].flatMap { day in
+                        [day] + [-1, 1].compactMap { Self.dayCalendar.date(byAdding: .day, value: $0, to: day) }
+                    }.map { lane.path(for: $0) })
+                    let traces = try days.compactMap { path -> String? in
+                        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+                        return try String(contentsOf: path, encoding: .utf8)
+                    }
+                    let hasTerminal = traces.contains { Self.containsTerminal(forTurn: turnId, in: $0) }
+                    if hasTerminal, checkpoint.deliveryPending, !checkpoint.hasRedeliveryOwner {
+                        // A finished turn whose route cannot redeliver: the retirement row
+                        // lands durably (deduped) before the file goes, so a kill between the
+                        // two retires it again next launch and never loses the row.
+                        let retired = TurnTraceEvent(turnId: turnId, kind: "turn.checkpoint_retired",
+                            sessionId: checkpoint.sessionId, surface: checkpoint.surface,
+                            payload: .object(["reason": .string("no_redelivery_owner")]))
+                        let wrote = try await lane.appendGuarded(retired) { current in
+                            !current.split(separator: "\n").contains { $0.contains("\"turn.checkpoint_retired\"") && $0.contains(turnId) }
+                        }
+                        if wrote { await TurnTraceBus.shared.deliverToSubscribers(retired) }
+                        try checkpoint.remove(dataRoot: dataRoot)
+                        continue
+                    }
+                    let replyReady = checkpoint.deliveryPending
+                        && traces.contains { Self.containsTerminal(forTurn: turnId, in: $0, status: "completed") }
+                    if !hasTerminal || replyReady { resumable.append(checkpoint) }
+                    else { try checkpoint.remove(dataRoot: dataRoot) }
+                } catch { persistenceFailure = "Cannot check checkpoint terminal: \(error)" }
                 continue
             }
             guard writeAttempts < Self.maximumWritesPerPass else {
@@ -238,8 +346,20 @@ public struct AbandonedTurnReconciler: Sendable {
                     await TurnTraceBus.shared.deliverToSubscribers(event)
                     written.append(turnId)
                     if processEpoch.timeIntervalSince(row.ts) <= 3600,
-                       let sessionId = row.sessionId, let surface = row.surface {
-                        interrupted.append((sessionId, surface))
+                       let sessionId = row.sessionId, NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId,
+                       let surface = row.surface,
+                       ["telegram", "agent-bridge", "slack", "ios", "phone", "siri"].contains(surface) || sessionId.hasPrefix("agent-") {
+                        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
+                        if FileManager.default.fileExists(atPath: path.path) {
+                            let persistence = SwiftNativePersistenceCore()
+                            let note: JSONValue = .object([
+                                "id": .string(UUID().uuidString.lowercased()), "sessionId": .string(sessionId),
+                                "role": .string("system"), "source": .string(surface),
+                                "content": .string("This reply did not finish before the app restarted."),
+                                "createdAt": .string(Self.iso8601String(today)),
+                                "metadata": .object(["kind": .string("interrupted_turn_note")])])
+                            try await persistence.withFileLock(path) { try await persistence.appendJSONL(note, to: path) }
+                        }
                     }
                 }
             } catch {
@@ -267,7 +387,7 @@ public struct AbandonedTurnReconciler: Sendable {
             acceptedScanned: accepted.count,
             reconciled: written,
             tooRecentToJudge: tooRecent,
-            interruptedSessions: interrupted,
+            resumable: resumable,
             failure: persistenceFailure
         )
     }
@@ -362,7 +482,7 @@ public struct AbandonedTurnReconciler: Sendable {
     /// Does this JSONL text already carry a terminal row for `turnId`? The
     /// substring pre-check keeps a 20k-line day file from being parsed for a
     /// turn it never mentions.
-    static func containsTerminal(forTurn turnId: String, in text: String) -> Bool {
+    static func containsTerminal(forTurn turnId: String, in text: String, status: String? = nil) -> Bool {
         guard text.contains(turnId) else { return false }
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard line.contains(turnId),
@@ -373,6 +493,9 @@ public struct AbandonedTurnReconciler: Sendable {
                   rowTurnId == turnId,
                   case .string(let kind)? = row["kind"] else { continue }
             if kind == "turn.terminal" || kind == "turn.cancelled" || kind == "turn.failed" {
+                if let status {
+                    guard case .object(let payload)? = row["payload"], payload["status"] == .string(status) else { continue }
+                }
                 return true
             }
         }

@@ -29,7 +29,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
         case .network: return "The connection was interrupted; check your internet connection and try again."
         case .noReply(let provider, let seconds, let events, let account):
-            return (account ?? "No reply from \(provider) in \(seconds) s (\(events) events).") + " Say continue to pick it up."
+            return account ?? "No reply from \(provider) in \(seconds) s (\(events) events)."
         case .refused: return "The model turned this request down. Try again, or pick another model in Settings."
         case .malformedResponse: return "The model returned an unreadable response; try again."
         case .routingUnavailable: return "Your model settings could not be loaded; check your model connection in Settings."
@@ -91,9 +91,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return fallback
     }
 
-    // 2026-09-22 WHY: spent quota does not come back inside a turn; an hour's
-    // wait trips the ladder's "needs more time than this turn has left" stop
-    // on the first failure instead of nine retries into the same refusal.
+    // A quota response without Retry-After asks for an hour before retrying.
     private static let quotaRetryAfter = 3600
 
     private static func quotaExceeded(_ detail: String) -> Bool {
@@ -227,13 +225,6 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                           admitted: admitted)
     }
 
-    /// Whether this failure forbids sending the same request again.
-    public static func forbidsResend(_ error: Error) -> Bool {
-        if let diagnostic = error as? Diagnostic { return diagnostic.forbidsResend }
-        if let wrapper = error as? any ProviderFailureWrapping { return forbidsResend(wrapper.providerFailureCause) }
-        return false
-    }
-
     /// Retain transport evidence while people and retry policy still consume
     /// the same typed category. Redact before it can reach durable diagnostics.
     public struct Diagnostic: Error, LocalizedError, Sendable, ProviderFailureWrapping {
@@ -250,16 +241,6 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         }
         public var errorDescription: String? { cause.errorDescription }
         public var providerFailureCause: Error { cause }
-        public var permitsWholeTurnRetry: Bool { !forbidsResend }
-        /// Admitted, then cut without the provider saying no (idle or wall,
-        /// connection loss, truncation): it may still be generating, and a
-        /// second copy is a second generation of one turn. An explicit error
-        /// event (overloaded, rate limit) said it did not generate.
-        public var forbidsResend: Bool {
-            guard admitted else { return false }
-            if case .noReply = cause { return true }
-            return cause == .network
-        }
     }
 
     public static func diagnosticDescription(_ error: Error) -> String {
@@ -291,11 +272,9 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     }
 }
 
-/// Wrappers preserve typed recovery across module boundaries without replaying
-/// tools that already ran (2026-07-18 WHY: a whole-turn retry repeats effects).
+/// Wrappers preserve typed recovery and work evidence across module boundaries.
 public protocol ProviderFailureWrapping: Error {
     var providerFailureCause: Error { get }
-    var permitsWholeTurnRetry: Bool { get }
     var providerWorkState: ProviderFailure.WorkState? { get }
 }
 
@@ -314,20 +293,9 @@ extension ProviderFailure {
     public struct Report: Error, Codable, Equatable, Sendable, LocalizedError, ProviderFailureWrapping {
         public let cause: ProviderFailure
         public let work: WorkState
-        public let permitsWholeTurnRetry: Bool
-        public init(cause: ProviderFailure, work: WorkState, permitsWholeTurnRetry: Bool = true) {
+        public init(cause: ProviderFailure, work: WorkState) {
             self.cause = cause
             self.work = work
-            self.permitsWholeTurnRetry = permitsWholeTurnRetry && work == .nothingRan
-        }
-        private enum CodingKeys: String, CodingKey { case cause, work, permitsWholeTurnRetry }
-        public init(from decoder: Decoder) throws {
-            let values = try decoder.container(keyedBy: CodingKeys.self)
-            self.init(
-                cause: try values.decode(ProviderFailure.self, forKey: .cause),
-                work: try values.decode(WorkState.self, forKey: .work),
-                permitsWholeTurnRetry: try values.decodeIfPresent(Bool.self, forKey: .permitsWholeTurnRetry) ?? true
-            )
         }
         public var providerFailureCause: Error { cause }
         public var providerWorkState: WorkState? { work }
@@ -349,8 +317,7 @@ extension ProviderFailure {
         }
         return Report(
             cause: cause,
-            work: work ?? observed(error) ?? (cause == .network ? .outcomeUnknown : .nothingRan),
-            permitsWholeTurnRetry: ProviderRecoveryPolicy.permitsWholeTurnRetry(error)
+            work: work ?? observed(error) ?? (cause == .network ? .outcomeUnknown : .nothingRan)
         )
     }
 }

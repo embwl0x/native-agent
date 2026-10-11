@@ -334,7 +334,7 @@ extension TelegramPollLoop {
                 var answerOwed = false
                 do {
                     let progress = makeProgressSink(delivery: delivery, card: card)
-                    let reply = try await runChatHandlerWithRetry(
+                    let reply = try await runChatHandler(
                         destination: destination,
                         text: prompt,
                         attachments: [],

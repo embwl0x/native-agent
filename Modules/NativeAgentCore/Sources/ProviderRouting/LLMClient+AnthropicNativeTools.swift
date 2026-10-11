@@ -777,8 +777,23 @@ extension AnthropicAdapter {
         var openThinkingSignature = ""
         var openThinkingData: String?
         var thinkingBlocks: [AnthropicThinkingBlock] = []
-        var streamedToolUseIDs: [String] = []
         var runaway = RunawayOutputDetector()
+
+        func releasePendingToolCalls() async throws {
+            let content = try pendingToolCalls.map { call -> [String: Any] in
+                let json = call.json.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let input = try? JSONSerialization.jsonObject(with: Data((json.isEmpty ? "{}" : json).utf8))
+                    as? [String: Any] else { throw LLMError.failure(.malformedResponse) }
+                return ["type": "tool_use", "id": call.id, "name": call.name, "input": input]
+            }
+            let calls = try Self.nativeToolCalls(content)
+            if !calls.isEmpty {
+                await thinkingLedger.record(thinkingBlocks, toolUseIDs: calls.map(\.id))
+                yieldedSemanticOutput = true
+            }
+            for call in calls { continuation.yield(.toolCall(call)) }
+            pendingToolCalls = []
+        }
 
         do {
             // R15: SSEEventStream owns framing; protocol semantics stay here.
@@ -809,62 +824,9 @@ extension AnthropicAdapter {
                         lastStopReason = stop
                     }
                 case "message_stop":
-                    // User, 2026-09-06: release the buffered tool calls, dropping
-                    // any whose arguments do not parse as a JSON object and ALL
-                    // of them when the response was cut by `max_tokens` — a call
-                    // the limit truncated carries arguments the model never
-                    // finished choosing. A drop makes the reply INCOMPLETE, and
-                    // this lane says so the way the OpenAI OAuth-direct lane
-                    // does, in the only channel it has: a note in the text.
-                    // User, 2026-09-06: all-or-nothing, as the max_tokens
-                    // branch already was. Dropping only the malformed call and
-                    // yielding its valid siblings executed a subset of a
-                    // parallel response — half of a plan the model wrote as
-                    // one decision, chosen by which block happened to survive.
+                    // Truncated batches never dispatch; validate the whole
+                    // batch before yielding any completed call.
                     let cutByTokenLimit = (lastStopReason == "max_tokens")
-                    let decodedToolCalls = pendingToolCalls.map { call -> (id: String, name: String, bytes: Data?) in
-                        let trimmed = call.json.trimmingCharacters(in: .whitespacesAndNewlines)
-                        // An argument-free tool legally streams nothing, which
-                        // is the empty object, not "".
-                        let bytes = trimmed.isEmpty ? Data("{}".utf8) : Data(trimmed.utf8)
-                        let parsesAsObject =
-                            (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any] != nil
-                        return (call.id, call.name, parsesAsObject ? bytes : nil)
-                    }
-                    let unparsableToolCalls = decodedToolCalls.filter { $0.bytes == nil }.count
-                    let incompleteToolReason = cutByTokenLimit
-                        ? "max_tokens cut \(decodedToolCalls.count) tool call(s)"
-                        : "\(unparsableToolCalls) of \(decodedToolCalls.count) tool call(s) had unparsable arguments"
-                    if cutByTokenLimit || unparsableToolCalls > 0 {
-                        if !decodedToolCalls.isEmpty {
-                            continuation.yield(.textDelta(
-                                "\n\n" + OpenAIOAuthDirectAdapter.incompleteNote(
-                                    cutByTokenLimit ? "max_tokens" : incompleteToolReason
-                                )
-                            ))
-                            yieldedSemanticOutput = true
-                        }
-                    } else {
-                        for call in decodedToolCalls {
-                            guard let bytes = call.bytes else { continue }
-                            streamedToolUseIDs.append(call.id)
-                            continuation.yield(.toolCall(LLMStreamToolCall(
-                                id: call.id,
-                                name: call.name,
-                                inputJSON: bytes
-                            )))
-                            yieldedSemanticOutput = true
-                        }
-                    }
-                    pendingToolCalls = []
-                    // Bank this response's thinking against the tool ids it
-                    // called with — the assistant turn replayed on the next
-                    // round must carry them back, signed and in order.
-                    if !streamedToolUseIDs.isEmpty {
-                        await thinkingLedger.record(
-                            thinkingBlocks, toolUseIDs: streamedToolUseIDs
-                        )
-                    }
                     let durationMs = Int(
                         (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     await telemetry.record(
@@ -875,12 +837,17 @@ extension AnthropicAdapter {
                         usage: usage.isEmpty ? nil : usage,
                         ttftMs: ttftMs,
                         durationMs: durationMs,
-                        status: cutByTokenLimit || unparsableToolCalls > 0 ? "incomplete" : "ok",
-                        stopReason: (cutByTokenLimit || unparsableToolCalls > 0) && !decodedToolCalls.isEmpty
-                            ? incompleteToolReason : lastStopReason
+                        status: cutByTokenLimit ? "incomplete" : "ok",
+                        stopReason: lastStopReason
                     )
-                    // Prose is truncated even when no tool calls were buffered.
-                    if cutByTokenLimit { throw runaway.stopError }
+                    if cutByTokenLimit {
+                        pendingToolCalls = []
+                        RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+                        continuation.yield(.toolBoundary(.outputLimit))
+                        continuation.finish()
+                        return
+                    }
+                    try await releasePendingToolCalls()
                     if !yieldedSemanticOutput {
                         throw FirstPartyExecutionControls.anthropicEmptyStreamError(
                             providerID: providerId,
@@ -923,9 +890,10 @@ extension AnthropicAdapter {
                                 (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                         }
                         yieldedSemanticOutput = true
-                        continuation.yield(.textDelta(text))
-                        if runaway.feed(text) {
-                            // Recorded like message_stop would: the loop is the costliest call.
+                        let boundary = runaway.feed(text)
+                        let kept = runaway.keptPart(of: text)
+                        if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
+                        if boundary {
                             await telemetry.record(
                                 requestBody: req.httpBody,
                                 provider: providerId,
@@ -934,10 +902,13 @@ extension AnthropicAdapter {
                                 usage: usage.isEmpty ? nil : usage,
                                 ttftMs: ttftMs,
                                 durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                                status: "incomplete",
-                                stopReason: "client_runaway"
+                                status: "ok",
+                                stopReason: "client_tool_boundary"
                             )
-                            throw runaway.stopError
+                            try await releasePendingToolCalls()
+                            if let reason = runaway.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
+                            continuation.finish()
+                            return
                         }
                     case "input_json_delta":
                         if ttftMs == nil {

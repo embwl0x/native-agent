@@ -8,9 +8,8 @@ public protocol AgentContactClients: Sendable {
     func bridgeChatClient() -> SwiftNativeChatOrchestrationClient
     /// A bot's requested check and an explicit human reply (the background profile).
     func backgroundChatClient() -> SwiftNativeChatOrchestrationClient
-    /// The desktop operator's short turn over its own fenced tools.
-    func chatClient(tools: any ToolDispatchClient, toolLoopMaxIterations: Int?,
-                    turnWallClockSeconds: TimeInterval?) -> SwiftNativeChatOrchestrationClient
+    /// The desktop operator's turn over its own fenced tools.
+    func chatClient(tools: any ToolDispatchClient) -> SwiftNativeChatOrchestrationClient
     /// The app tool chain a queued follow-up is sent through.
     func toolDispatchClient(denyExternalMcp: Bool, enforceAppAutonomy: Bool) -> any ToolDispatchClient
     /// The raw bridge tool chain a contact's reply is read through.

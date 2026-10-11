@@ -663,18 +663,18 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         cacheMarkers: Self.cacheMarkers(in: body),
                         stopReason: lastStopReason
                     )
+                    if lastStopReason == "max_tokens" {
+                        Self.logCutoffShape(runaway.text)
+                        RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+                        continuation.finish()
+                        return
+                    }
                     if !yieldedAnyText {
                         throw FirstPartyExecutionControls.anthropicEmptyStreamError(
                             providerID: providerId,
                             stopReason: lastStopReason,
                             expectedOutput: "answer text"
                         )
-                    }
-                    // 2026-09-22: a max_tokens cut-off is a truncated reply, not
-                    // a finished one — tool markers in it must never dispatch.
-                    if lastStopReason == "max_tokens" {
-                        Self.logCutoffShape(runaway.text)
-                        throw LLMError.outputLengthLimit(partial: runaway.text)
                     }
                     Self.logStopWithoutToolCall(lastStopReason, runaway.text)
                     continuation.finish()
@@ -696,7 +696,6 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         // Ended by us, not by message_stop: record the call anyway, so
                         // the turn's cost stays visible (usage has message_start's input
                         // and cache counts; output tokens are unknown after cancel).
-                        // A loop trip is recorded too: it is the costliest call.
                         await telemetry.record(
                             requestBody: req.httpBody,
                             provider: providerId,
@@ -705,14 +704,13 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             usage: usage.isEmpty ? nil : usage,
                             ttftMs: ttftMs,
                             durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                            status: runaway.toolBoundary != nil ? "ok" : "incomplete",
+                            status: "ok",
                             substitutedFrom: substitutedFrom,
                             cacheMarkers: Self.cacheMarkers(in: body),
-                            stopReason: runaway.toolBoundary != nil ? "client_tool_boundary" : "client_runaway"
+                            stopReason: "client_tool_boundary"
                         )
                         // Ended at a complete tool block, like a stop sequence:
                         // a normal finish, so the calls before it dispatch.
-                        guard runaway.toolBoundary != nil else { throw runaway.stopError }
                         continuation.finish()
                         return
                     }
@@ -887,19 +885,19 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             cacheMarkers: Self.cacheMarkers(in: body),
                             stopReason: lastStopReason
                         )
+                        if lastStopReason == "max_tokens" {
+                            Self.logCutoffShape(runaway.text)
+                            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+                            continuation.yield(.toolBoundary(.outputLimit))
+                            continuation.finish()
+                            return
+                        }
                         if !yieldedSemanticOutput {
                             throw FirstPartyExecutionControls.anthropicEmptyStreamError(
                                 providerID: providerId,
                                 stopReason: lastStopReason,
                                 expectedOutput: "answer text or tool call"
                             )
-                        }
-                        // 2026-09-22: turn 37802ab2 hit max_tokens and ran 51
-                        // tool calls parsed from the cut-off text. Truncated is
-                        // not finished: the text lane stops on this error.
-                        if lastStopReason == "max_tokens" {
-                            Self.logCutoffShape(runaway.text)
-                            throw LLMError.outputLengthLimit(partial: runaway.text)
                         }
                         Self.logStopWithoutToolCall(lastStopReason, runaway.text)
                         continuation.finish()
@@ -929,7 +927,6 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                                 // Ended by us, not by message_stop: record the call anyway, so
                                 // the turn's cost stays visible (usage has message_start's input
                                 // and cache counts; output tokens are unknown after cancel).
-                                // A loop trip is recorded too: it is the costliest call.
                                 await telemetry.record(
                                     requestBody: req.httpBody,
                                     provider: providerId,
@@ -938,15 +935,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                                     usage: usage.isEmpty ? nil : usage,
                                     ttftMs: ttftMs,
                                     durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                                    status: runaway.toolBoundary != nil ? "ok" : "incomplete",
+                                    status: "ok",
                                     substitutedFrom: substitutedFrom,
                                     cacheMarkers: Self.cacheMarkers(in: body),
-                                    stopReason: runaway.toolBoundary != nil ? "client_tool_boundary" : "client_runaway"
+                                    stopReason: "client_tool_boundary"
                                 )
                                 // Ended at a complete tool block, like a stop
                                 // sequence: a normal finish, so the calls
                                 // before it dispatch.
-                                guard runaway.toolBoundary != nil else { throw runaway.stopError }
                                 if let reason = runaway.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                                 continuation.finish()
                                 return

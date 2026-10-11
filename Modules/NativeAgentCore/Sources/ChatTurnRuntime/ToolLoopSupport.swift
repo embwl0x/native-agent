@@ -77,276 +77,10 @@ extension TurnEngineResult.LoopCounters {
     }
 }
 
-// MARK: - Error extension
-
-extension TurnEngineError {
-    /// Carrier for max-iteration overflow. We can't add a new case to the
-    /// existing enum without touching its declaration, so the loop throws
-    /// this nested type instead.
-    public struct ToolLoopExhausted: Error, LocalizedError {
-        public let iterations: Int
-        public init(iterations: Int) { self.iterations = iterations }
-        public var errorDescription: String? {
-            "tool loop exhausted after \(iterations) iterations without a final reply"
-        }
-    }
-}
-
-// MARK: - Tool-loop-exhausted fallback reply
-
-/// The single wording for a tool loop that stopped without a final reply.
-/// The tool loop builds its best-effort fallback reply from this so the
-/// phrasing can't drift again. Execution counters stay in diagnostic receipts.
-enum ToolLoopExhaustion {
-    static func fallbackReply(
-        iterationLimit: Int,
-        dispatchCount: Int,
-        providerRounds: Int,
-        wallClockElapsedSeconds: Int? = nil
-    ) -> String {
-        "I stopped before I could finish my reply."
-    }
-
-    /// A turn that COMPLETED with no text at all. An assistant row is never
-    /// blank: an empty final reply used to persist an empty bubble under the
-    /// receipts — the "Looked something up · 8 of 12 failed" card with nothing
-    /// said beside it. Say plainly that no answer came back.
-    static func emptyReply(dispatchCount: Int, providerRounds: Int) -> String {
-        "I did not receive an answer to share."
-    }
-}
-
-// MARK: - Post-tool-effect provider failures (whole-turn retry unsafe)
-
-/// A provider failure thrown AFTER at least one tool dispatch in this turn
-/// already produced side effects. Surface-level retry ladders (Telegram's
-/// whole-turn retry is the live one) MUST NOT replay the full turn on this
-/// error: replaying re-executes the tools (messages re-send, files re-write),
-/// and `suppressUserAppend` only dedupes transcript rows, not tool effects
-/// (gpt-5.5 fix round 2026-07-18, HIGH). ProviderFailureWrapping carries the
-/// cross-module replay veto; the diagnostic description retains its marker.
-public struct ProviderErrorAfterToolEffects: Error, LocalizedError, CustomStringConvertible {
-    public let underlying: Error
-    public let dispatchCount: Int
-
-    public static let markerPhrase = "whole-turn retry unsafe: tool effects present"
-
-    public var errorDescription: String? {
-        (underlying as? LocalizedError)?.errorDescription ?? String(describing: underlying)
-    }
-    public var description: String {
-        let inner = (underlying as? LocalizedError)?.errorDescription
-            ?? String(describing: underlying)
-        return "provider failure after \(dispatchCount) tool dispatch(es) [\(Self.markerPhrase)]: \(inner)"
-    }
-
-    /// Completed reads also consume the turn's provider recovery budget.
-    /// Retry the provider call in place; replaying the whole turn after its
-    /// recovery is exhausted would repeat completed work and reset that budget.
-    ///
-    /// User, 2026-09-06: and except the slots a Stop reached before they ran.
-    /// Those records exist only to keep the wire pairing valid; counting them
-    /// by NAME made an undispatched `write_file` look like a write that had
-    /// happened, and refused the turn a replay that was safe.
-    ///
-    /// User, 2026-09-06: a call the Stop reached AFTER it started is the other
-    /// way round — it carries `effects_unknown`, and unknown effects are
-    /// effects for retry safety.
-    public static func effectfulCount(_ dispatches: [TurnEngineResult.ToolDispatchRecord]) -> Int {
-        dispatches.filter {
-            // A held send or an unoffered tool never ran either.
-            if ChatToolOutcome.neverRan($0.result) { return false }
-            return !ChatToolOutcome.wasCancelled($0.result)
-                || ChatToolOutcome.effectsUnknown($0.result)
-        }.count
-    }
-
-    /// Wraps only when wrapping is meaningful: never cancellation (user stops
-    /// must keep their type), never double-wraps, and never before the first
-    /// EFFECTFUL tool dispatch (pre-effect failures stay retryable end-to-end).
-    static func wrapping(_ error: Error, dispatchCount: Int) -> Error {
-        if error is CancellationError { return error }
-        if error is ProviderErrorAfterToolEffects { return error }
-        guard dispatchCount > 0 else { return error }
-        return ProviderErrorAfterToolEffects(underlying: error, dispatchCount: dispatchCount)
-    }
-}
-
-// MARK: - Tool loop budgets
-
-public enum ToolLoopBudget {
-    public static let hardCap = 240
-
-    public static func defaultIterations(for surface: String) -> Int {
-        switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "telegram":
-            return 180
-        case "ios", "icloud", "iphone", "mobile":
-            return 90
-        case "swarm", "swarms", "worker", "workers":
-            return 80
-        // Wave 5b: Workshop spellings via `WorkshopSurfaceVocabulary`
-        // (same three strings as the open-coded list this replaces).
-        case "autonomy", "background":
-            return 80
-        // Agent-to-agent bridge lanes run delegation marathons (dispatch,
-        // audit, merge, restart in one turn); 60 kept exhausting mid-pipeline
-        // and dropping the tail steps (User, 2026-08-27: "that ain't enough
-        // for her to do stuff"). Telegram-tier.
-        case "claude-bridge", "codex-bridge":
-            return 180
-        case let s where WorkshopSurfaceVocabulary.isWorkshopGateSurface(s):
-            return 80
-        default:
-            return 60
-        }
-    }
-
-    public static func resolve(surface: String, requested: Int? = nil) -> Int {
-        let desired = requested ?? defaultIterations(for: surface)
-        return min(max(1, desired), hardCap)
-    }
-}
-
-// MARK: - Whole-turn wall-clock budget (A6, 2026-08-27)
-
-/// A monotonic, surface-scoped ceiling for the complete tool-loop turn.
-///
-/// This is deliberately a checkpoint budget, not a cancellation deadline. A
-/// loop observes it only before starting another provider iteration, after any
-/// current provider round and tool dispatch (including an explicitly requested
-/// `timeout_seconds` window) has settled. Expiry therefore takes the loop's
-/// existing exhausted-turn terminal path; it never manufactures a new error,
-/// fallback, receipt, cancellation, or provider-failure shape.
-///
-/// It is also PROGRESS-AWARE (2026-08-31): a round that lands at least one
-/// successful tool dispatch re-grants the surface window via `recordProgress()`,
-/// capped at start + `progressCeilingSeconds`. So the ceiling a turn actually
-/// feels is "how long since it last got somewhere", not "how long has it run" —
-/// stuck turns still die on schedule, working turns keep working.
-///
-/// The `nowNanoseconds` TaskLocal is the shared injection seam for the
-/// structured and text-compatible loops. Production uses uptime nanoseconds;
-/// deterministic tests bind a manual monotonic clock without sleeping.
-struct WholeTurnWallClockBudget: Sendable {
-    typealias MonotonicClock = @Sendable () -> UInt64
-
-    /// 600, not 180: the original 180 sat BELOW the measured p95 of User's
-    /// own heavy chat turns (188s, 2026-08-27 instrument run), so the brake
-    /// was clipping legitimate deep turns the day it shipped. A runaway loop
-    /// still dies; a real deliberate turn cannot be touched (>3x worst case).
-    static let defaultInteractiveSeconds: TimeInterval = 600
-    /// 600, not 300: Telegram is the surface the agent works User's real
-    /// research on REMOTELY, and it carried the shortest budget in the app —
-    /// half the interactive one the same p95 evidence justified. A live
-    /// multi-tool research turn was cut at 300s (2026-08-31). Same floor as
-    /// interactive now; progress extension does the rest.
-    static let defaultTelegramSeconds: TimeInterval = 600
-    static let defaultUnattendedSeconds: TimeInterval = 3_900
-    /// 6h, and it bounds the PROGRESS EXTENSION only — never a fresh window.
-    /// The old ceiling was start + defaultUnattendedSeconds, which killed
-    /// turns that were still landing productive rounds an hour in: a turn that
-    /// re-earns its window every round is by definition not the runaway the
-    /// brake exists for, so the only honest ceiling is one long enough to
-    /// outlast a real work session. Surface defaults and the per-round window
-    /// are untouched — a stuck turn still dies at its surface budget.
-    static let progressCeilingSeconds: TimeInterval = 21_600
-
-    @TaskLocal static var nowNanoseconds: MonotonicClock = {
-        DispatchTime.now().uptimeNanoseconds
-    }
-
-    private let startedAtNanoseconds: UInt64
-    /// Slides forward on `recordProgress()`, never past `ceilingNanoseconds`.
-    private var deadlineNanoseconds: UInt64
-    /// The surface (or override) window, re-granted by each productive round.
-    private let windowNanoseconds: UInt64
-    /// start + progressCeilingSeconds: an extended turn can never outlive a
-    /// full work session, no matter how productive.
-    private let ceilingNanoseconds: UInt64
-    private let clock: MonotonicClock
-
-    static func defaultSeconds(for surface: String) -> TimeInterval {
-        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized == "telegram" {
-            return defaultTelegramSeconds
-        }
-        switch normalized {
-        case "autonomy", "background",
-             "swarm", "swarms", "worker", "workers", "training":
-            return defaultUnattendedSeconds
-        case let value where WorkshopSurfaceVocabulary.isWorkshopGateSurface(value):
-            // Includes canonical `workshop` plus both shipped legacy gate
-            // spellings (`mission` / `missions`) through the vocabulary owner.
-            return defaultUnattendedSeconds
-        default:
-            return defaultInteractiveSeconds
-        }
-    }
-
-    static func start(surface: String, requestedSeconds: TimeInterval? = nil) -> Self {
-        let clock = nowNanoseconds
-        let startedAt = clock()
-        // A caller-scoped override (the bridge profile's marathon budget)
-        // wins over the surface default, clamped to the unattended ceiling.
-        let seconds = min(requestedSeconds ?? defaultSeconds(for: surface), defaultUnattendedSeconds)
-        let duration = UInt64(seconds * 1_000_000_000)
-        let deadline = Self.offset(startedAt, by: duration)
-        return Self(
-            startedAtNanoseconds: startedAt,
-            deadlineNanoseconds: deadline,
-            windowNanoseconds: duration,
-            ceilingNanoseconds: Self.offset(
-                startedAt, by: UInt64(progressCeilingSeconds * 1_000_000_000)
-            ),
-            clock: clock
-        )
-    }
-
-    private static func offset(_ base: UInt64, by duration: UInt64) -> UInt64 {
-        base > UInt64.max - duration ? UInt64.max : base + duration
-    }
-
-    /// A turn that is GETTING SOMEWHERE re-earns its window: at least one tool
-    /// dispatch in the round just finished came back a real result, so the
-    /// deadline slides to now + the surface budget. The brake is for turns that
-    /// spin, not for turns that take a while — a real research turn on Telegram
-    /// was dying at the floor while it was still producing (2026-08-31).
-    ///
-    /// Two invariants keep this from becoming "no budget at all": the deadline
-    /// only ever moves FORWARD, and it is hard-capped at start + the unattended
-    /// window, so a productive interactive turn can still never outlive a
-    /// background one. Surfaces already at that ceiling extend by zero.
-    mutating func recordProgress() {
-        let extended = Self.offset(clock(), by: windowNanoseconds)
-        deadlineNanoseconds = min(max(deadlineNanoseconds, extended), ceilingNanoseconds)
-    }
-
-    var isExhausted: Bool {
-        clock() >= deadlineNanoseconds
-    }
-
-    /// Seconds left before the current deadline, floored at zero. Two readers,
-    /// both added 2026-09-06: the per-call provider wall is bounded by this so
-    /// one hung call cannot eat the whole turn, and the reconnect ladders
-    /// refuse a Retry-After longer than what is left.
-    var remainingSeconds: TimeInterval {
-        let now = clock()
-        guard deadlineNanoseconds > now else { return 0 }
-        return TimeInterval(deadlineNanoseconds - now) / 1_000_000_000
-    }
-
-    /// Whole-turn wall time so far, on the SAME clock isExhausted reads, so
-    /// the exhaustion fallback message reports the budget's own elapsed value.
-    var elapsedSeconds: Int {
-        Int((clock() &- startedAtNanoseconds) / 1_000_000_000)
-    }
-}
-
 // MARK: - Per-tool-dispatch deadline (Trust loop #3, 2026-06-15)
 //
 // The chat tool loop's only existing brake on a single tool call is the
-// iteration cap. The LLM *stream* is guarded by ProviderStreamGuard
+// dispatch boundary. The LLM *stream* is guarded by ProviderStreamGuard
 // (idle 90s / wall 600s) but a single `tools.dispatch(...)` has NO timeout —
 // so a wedged tool (dead network, an MCP server that never answers, a stuck
 // subprocess) freezes that one dispatch forever. On any surface the whole
@@ -396,7 +130,7 @@ public enum ToolDispatchDeadline {
 
     /// Surfaces with no human watching the turn — a hung tool there freezes
     /// work nobody can recover without an app restart. Mirrors the
-    /// machine-driven set in `ToolLoopBudget.defaultIterations` (+ "training").
+    /// machine-driven surfaces, including training.
     static func isUnattended(surface: String) -> Bool {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         // Wave 5b: Workshop spellings via `WorkshopSurfaceVocabulary`
@@ -617,10 +351,7 @@ struct ToolLoopNoProgressGuard {
         /// thing to say is "fix your arguments" - that is the agent's job, not
         /// the reader's (2026-09-13, first-failure pass).
         case warn(model: String, person: String?)
-        /// `model` ends the loop in the conversation; `person` becomes the
-        /// visible final answer, so it never asserts a cause the rounds did
-        /// not establish.
-        case stop(model: String, person: String)
+        case wait(rounds: Int)
     }
 
     private var previous: [TurnEngineResult.ToolDispatchRecord]?
@@ -658,15 +389,7 @@ struct ToolLoopNoProgressGuard {
                 )
             }
             if sameFailureRoundCount >= 8 {
-                // Eight identical failures prove repetition, nothing else: an
-                // unavailable service or a revoked permission fails exactly
-                // this way with perfectly good arguments. So the visible text
-                // no longer claims "the call needs different inputs".
-                return .stop(
-                    model: "I stopped the tool loop after eight rounds of \(failure.name) failing with the same error: \(failure.error). No tool capability was disabled. Repetition alone does not say whether the arguments or the service is at fault.",
-                    person: Self.standingBlocker(failure)
-                        ?? "I stopped after eight attempts that failed the same way, so I did not keep retrying into it. Everything that completed is kept - the last error was: \(failure.error)"
-                )
+                return .wait(rounds: sameFailureRoundCount)
             }
         } else {
             previousFailure = nil
@@ -686,10 +409,7 @@ struct ToolLoopNoProgressGuard {
             )
         }
         if identicalRoundCount >= 16 {
-            return .stop(
-                model: "I stopped the tool loop after sixteen identical rounds with no progress. No tool capability was disabled, and all completed tool results and receipts were preserved. Retry with narrower arguments, a different tool, or an explicit longer timeout if the work truly needs it.",
-                person: "I stopped after sixteen rounds that kept returning the same thing. Everything that completed is kept."
-            )
+            return .wait(rounds: identicalRoundCount)
         }
         return .none
     }

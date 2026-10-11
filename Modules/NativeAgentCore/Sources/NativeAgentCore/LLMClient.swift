@@ -63,16 +63,6 @@ public enum LLMCallContext {
     /// test around the call → the row lands under the test's tmp root and the
     /// LIVE default `traces/events.jsonl` is never touched.
     @TaskLocal public static var traceDataRootOverride: URL?
-    /// Seconds the WHOLE turn has left when this provider call starts, bound
-    /// by the tool loops around each call.
-    ///
-    /// User, 2026-09-06: the per-call provider wall (600s) equalled the
-    /// interactive/Telegram turn window (600s), so one hung call spent the
-    /// entire budget and the reconnect ladder had nothing left to retry with.
-    /// The router shortens the wall to fit inside what is left, keeping a
-    /// reconnect reserve. Unbound → the configured wall stands unchanged.
-    @TaskLocal public static var remainingTurnSeconds: TimeInterval?
-
     /// The tools this turn offers by name: `app` on her chat, a lane's own
     /// declared list on an ephemeral turn.
     @TaskLocal public static var turnActiveTools: Set<String>?
@@ -504,7 +494,7 @@ public struct LLMStreamToolCall: Sendable, Equatable {
 }
 
 public enum LLMToolBoundaryReason: String, Sendable, Equatable {
-    case repeatedBlock, repeatedAction, fabricatedResult, postCallProse
+    case repeatedBlock, repeatedAction, fabricatedResult, postCallProse, outputLimit
 }
 
 public enum LLMMessageStreamEvent: Sendable, Equatable {

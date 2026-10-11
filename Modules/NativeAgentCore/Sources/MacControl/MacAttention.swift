@@ -559,6 +559,7 @@ public actor MacAttentionSessionStore {
     private nonisolated(unsafe) var handbackGeneration: UInt64 = 0
     private nonisolated(unsafe) weak var inputBinding: MacDriverBinding?
     private var driverObservers: [UUID: AsyncStream<UInt64>.Continuation] = [:]
+    private var driverReturnWaiters: Set<UUID> = []
 
     public nonisolated func permitsDriver(_ generation: UInt64) -> Bool {
         driverLock.lock()
@@ -643,9 +644,10 @@ public actor MacAttentionSessionStore {
 
     /// Whether the composer's hand-back would change anything now: a Mac
     /// action has asked for the driver this run, the person holds it, and the
-    /// posture is below Full Mac (under Full Mac her next act takes it back).
+    /// posture is below Full Mac, or a turn is waiting for control to return.
     public func handoffWouldChange() async -> Bool {
         guard observation != nil, !currentDriverAllowed else { return false }
+        if !driverReturnWaiters.isEmpty { return true }
         return !(await Self.savedFullMac())
     }
 
@@ -662,10 +664,14 @@ public actor MacAttentionSessionStore {
                                 handback: handbackGeneration)
     }
 
-    public func driverChanges() -> AsyncStream<UInt64> {
+    public func driverChanges(waitingForReturn: Bool = false) -> AsyncStream<UInt64> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<UInt64>.makeStream(bufferingPolicy: .bufferingNewest(1))
         driverObservers[id] = continuation
+        if waitingForReturn {
+            driverReturnWaiters.insert(id)
+            publishDriver()
+        }
         continuation.yield(makeDriverBinding().generation)
         continuation.onTermination = { [weak self] _ in
             Task { await self?.removeDriverObserver(id) }
@@ -673,7 +679,10 @@ public actor MacAttentionSessionStore {
         return stream
     }
 
-    private func removeDriverObserver(_ id: UUID) { driverObservers[id] = nil }
+    private func removeDriverObserver(_ id: UUID) {
+        driverObservers[id] = nil
+        if driverReturnWaiters.remove(id) != nil { publishDriver() }
+    }
 
     private func publishDriver() {
         let generation = makeDriverBinding().generation
