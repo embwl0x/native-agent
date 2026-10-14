@@ -166,7 +166,9 @@ struct ToolPillView: View {
     @State private var presentation: ToolPillPresentation?
     private var resultSummary: String { meta?.resultSummary ?? "" }
     var body: some View {
-        Group {
+        // A container, not a Group, so the preparation task has a host
+        // before the first presentation exists.
+        VStack(alignment: .leading, spacing: 0) {
             if let presentation, presentation.revision.metadata == meta {
                 pill(presentation)
             }

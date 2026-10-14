@@ -492,6 +492,11 @@ struct ChatMessageListView: View {
         let sessionId: String
         let version: UInt64
     }
+    private struct PreparationKey: Equatable {
+        let revision: Revision
+        let count: Int
+        let lastID: String?
+    }
     @State private var preparedTranscript = (
         revision: Revision(sessionId: "", version: 0),
         groups: MessageGrouper.Projection(base: [])
@@ -569,16 +574,23 @@ struct ChatMessageListView: View {
     }
 
     var body: some View {
-        Group { transcriptRows }
-            .task(id: revision) {
-                let revision = revision
-                let messages = messages
-                let groups = await Task.detached(priority: .userInitiated) {
-                    MessageGrouper.projection(for: messages, sessionId: revision.sessionId, structureVersion: revision.version)
-                }.value
-                guard !Task.isCancelled else { return }
-                preparedTranscript = (revision, groups)
-            }
+        // The rows sit in one stack with the transcript's own spacing and
+        // alignment, so the parent lays out exactly what it did before, and
+        // the preparation task has ONE host that exists even before any row
+        // does. On a Group the task went to each child: with no rows yet it
+        // never ran (a transcript that stayed blank), with rows it ran per row.
+        VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
+            transcriptRows
+        }
+        .task(id: PreparationKey(revision: revision, count: messages.count, lastID: messages.last?.id)) {
+            let revision = revision
+            let messages = messages
+            let groups = await Task.detached(priority: .userInitiated) {
+                MessageGrouper.projection(for: messages, sessionId: revision.sessionId, structureVersion: revision.version)
+            }.value
+            guard !Task.isCancelled else { return }
+            preparedTranscript = (revision, groups)
+        }
     }
 
     @ViewBuilder private var transcriptRows: some View {
@@ -1999,7 +2011,11 @@ struct ChatPreparedContent: View {
     private var source: Source { Source(text: text, spacing: lineSpacing, proseOnly: proseOnly) }
 
     var body: some View {
-        Group {
+        // A real container, not a Group: the task below must have a host
+        // while nothing is prepared yet, or it never runs and the text never
+        // appears (a modifier on a Group goes to its children, and there are
+        // none until preparation finishes).
+        VStack(alignment: seatsRight ? .trailing : .leading, spacing: 0) {
             if preparedSource == source {
                 if blocks.count == 1, case .prose(let segments) = blocks[0] {
                     proseSegments(segments)
