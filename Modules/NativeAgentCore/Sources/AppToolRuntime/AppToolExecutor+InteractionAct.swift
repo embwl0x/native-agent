@@ -561,6 +561,9 @@ extension AppToolExecutor {
                 "Signing in to \(interaction.target) happens in a browser, with the person there."
             )
         case .macPermissionGrant:
+            if interaction.allTargets.contains(where: InlineInteractionRegistry.isMacControlCategory) {
+                return .needsGlass("Allowing Mac control is the owner's choice. Use the permission card on the Mac.")
+            }
             return .permissionGrant
         case .trustPostureRequired:
             return .needsGlass(

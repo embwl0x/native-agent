@@ -5,37 +5,22 @@ import NativeAgentShared
 import PersistenceCore
 
 extension SwiftToolDispatcher {
-    /// The Trust Full-Mac category gate, raised as a CARD instead of prose.
-    ///
-    /// The MacIntegration capabilities have asked this way since the wiring
-    /// landed; the Mac Control categories (`file_ops`, `shell`, `applescript`,
-    /// …) still answered with a sentence telling the person to go and find a
-    /// switch. Both are the same thing — a decision the person has not made
-    /// yet — so both are asked where the work is.
-    ///
-    /// Two rules this keeps:
-    ///
-    ///  * **The mode travels.** A blocked READ raises a read need, and the
-    ///    grant says so. A refused read must never be settled by handing over
-    ///    write as well.
-    ///  * **The posture is never touched.** Safe and Workspace are the
-    ///    person's standing choice; under them the descriptor resolves to
-    ///    `trustPostureRequired` and the card can only offer Trust itself.
-    ///    Nothing here writes a posture.
-    ///
-    /// Returns nil when the category is already allowed — then the refusal is
-    /// about something else and keeps its own envelope.
+    /// Trust category refusals share one card path, preserving the requested
+    /// axis and leaving posture changes to the owner in Trust. Already-allowed
+    /// categories cannot explain a refusal and keep their original error.
     func macControlCategoryNeedEnvelope(
-        category: String,
+        categories: [String],
         mode: InlineInteraction.AccessMode,
         why: String,
         declineConsequence: String? = nil
     ) -> JSONValue? {
-        guard InlineInteractionRegistry.isMacControlCategory(category) else { return nil }
-        guard !InlineInteractionRegistry.macControlCategoryAllowed(category, dataRoot: dataRoot)
+        guard !categories.isEmpty, categories.allSatisfy(InlineInteractionRegistry.isMacControlCategory)
         else { return nil }
+        guard categories.contains(where: {
+            !InlineInteractionRegistry.macControlCategoryAllowed($0, dataRoot: dataRoot)
+        }) else { return nil }
         guard let need = InlineInteractionRegistry.permission(
-            [category], why: why, mode: mode, declineConsequence: declineConsequence
+            categories, why: why, mode: mode, declineConsequence: declineConsequence
         ) else { return nil }
         return InlineInteractionNeed.envelope(need)
     }
@@ -45,7 +30,7 @@ extension SwiftToolDispatcher {
     /// something else) or the person's posture forbids raising it at all.
     func builderFullMacRequired(tool: String) -> JSONValue {
         macControlCategoryNeedEnvelope(
-            category: "file_ops",
+            categories: ["file_ops"],
             mode: .write,
             why: "\(tool) runs on your Mac, and file access is off right now.",
             declineConsequence:
@@ -69,7 +54,7 @@ extension SwiftToolDispatcher {
         let named = (path?.isEmpty == false) ? path! : "that file"
         let verb = mode == .read ? "read" : "change"
         return macControlCategoryNeedEnvelope(
-            category: "file_ops",
+            categories: ["file_ops"],
             mode: mode,
             why: "\(named) is outside the folders I can reach, so \(tool) stopped before touching it.",
             declineConsequence:

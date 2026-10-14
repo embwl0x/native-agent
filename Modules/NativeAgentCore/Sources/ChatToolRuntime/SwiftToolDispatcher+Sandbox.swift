@@ -503,7 +503,7 @@ extension SwiftToolDispatcher {
             // made. It gets asked where the work is, carrying the axis this
             // call wanted, and it never touches the Trust posture itself.
             if let category, let need = macControlCategoryNeedEnvelope(
-                category: category,
+                categories: [category],
                 mode: (tool == "read_file" || tool == "list_dir") ? .read : .write,
                 why: "\(tool) needs \(InlineInteractionRegistry.macCapabilityDisplayName(category).lowercased()), which is off right now."
             ) {
@@ -743,19 +743,14 @@ extension SwiftToolDispatcher {
                 "detail": .object(["error": .string("continuation_unavailable")])])
         }
         let access = await fullMacToolAccess(surface: surface)
-        switch tool {
-        case "screen", "wait":
-            guard access.accessibilityAllowed else {
-                throw AutonomyGateError.toolDenied(
-                    reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
-                )
-            }
-        default:
-            guard access.accessibilityAllowed else {
-                throw AutonomyGateError.toolDenied(
-                    reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
-                )
-            }
+        guard access.accessibilityAllowed else {
+            if let need = macControlCategoryNeedEnvelope(
+                categories: ["accessibility"], mode: (tool == "screen" || tool == "wait") ? .read : .write,
+                why: "Screen control lets me read and control apps on your Mac."
+            ) { return need }
+            throw AutonomyGateError.toolDenied(
+                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+            )
         }
         func str(_ key: String) -> String? {
             if case .string(let value)? = input[key] {
@@ -1086,21 +1081,20 @@ extension SwiftToolDispatcher {
         surface: String
     ) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
+        guard access.accessibilityAllowed else {
+            if let need = macControlCategoryNeedEnvelope(
+                categories: ["accessibility"], mode: tool == "clipboard_read" ? .read : .write,
+                why: "Screen control lets me read and control apps on your Mac."
+            ) { return need }
+            throw AutonomyGateError.toolDenied(
+                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+            )
+        }
         let action: String
         switch tool {
         case "clipboard_read":
-            guard access.accessibilityAllowed else {
-                throw AutonomyGateError.toolDenied(
-                    reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
-                )
-            }
             action = "clipboard_read"
         case "clipboard_write":
-            guard access.accessibilityAllowed else {
-                throw AutonomyGateError.toolDenied(
-                    reason: "Trust Center Full Mac Accessibility app control is not active for \(tool)"
-                )
-            }
             action = "clipboard_write"
         default:
             throw AutonomyGateError.toolDenied(
@@ -1135,6 +1129,15 @@ extension SwiftToolDispatcher {
         surface: String
     ) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
+        guard access.accessibilityAllowed else {
+            if let need = macControlCategoryNeedEnvelope(
+                categories: ["accessibility"], mode: tool == "menu" ? .read : .write,
+                why: "Screen control lets me read and control apps on your Mac."
+            ) { return need }
+            throw AutonomyGateError.toolDenied(
+                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+            )
+        }
         let impl = { [dataRoot] in
             makeMacControl(
                 policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
@@ -1143,18 +1146,8 @@ extension SwiftToolDispatcher {
         }
         switch tool {
         case "menu":
-            guard access.accessibilityAllowed else {
-                throw AutonomyGateError.toolDenied(
-                    reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
-                )
-            }
             return try await impl().dispatch(action: "menu", body: input).toJSON()
         case "menu_press":
-            guard access.accessibilityAllowed else {
-                throw AutonomyGateError.toolDenied(
-                    reason: "Trust Center Full Mac Accessibility app control is not active for \(tool)"
-                )
-            }
             // USER 2026-08-12 — YOLO, same as every other Mac motor action: if
             // no capability was bound by the gated dispatcher, mint one for
             // THIS exact call. Full Mac + the accessibility category + the TCC
@@ -1223,20 +1216,22 @@ extension SwiftToolDispatcher {
                 reason: "SwiftToolDispatcher: '\(tool)' has no Swift read implementation"
             )
         }
-        let access = await fullMacToolAccess(surface: surface)
-        guard access.accessibilityAllowed else {
-            throw AutonomyGateError.toolDenied(
-                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
-            )
-        }
         let namedPath: String? = {
             guard case .string(let path)? = input["path"] else { return nil }
             let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }()
-        if namedPath != nil, !access.fileOpsAllowed {
+        let access = await fullMacToolAccess(surface: surface)
+        guard access.accessibilityAllowed, namedPath == nil || access.fileOpsAllowed else {
+            if let need = macControlCategoryNeedEnvelope(
+                categories: ["accessibility"] + (namedPath == nil ? [] : ["file_ops"]), mode: .read,
+                why: namedPath == nil ? "Screen control lets me read and control apps on your Mac."
+                    : "Screen control and file access let me read the document you named on your Mac."
+            ) { return need }
             throw AutonomyGateError.toolDenied(
-                reason: "Trust Center Full Mac file access is not active for \(tool) with an explicit path; "
+                reason: !access.accessibilityAllowed
+                    ? "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                    : "Trust Center Full Mac file access is not active for \(tool) with an explicit path; "
                     + "read what is on screen instead by calling it with no path"
             )
         }
@@ -1292,6 +1287,10 @@ extension SwiftToolDispatcher {
     ) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
         guard access.accessibilityAllowed else {
+            if let need = macControlCategoryNeedEnvelope(
+                categories: ["accessibility"], mode: .read,
+                why: "Screen control lets me read and control apps on your Mac."
+            ) { return need }
             throw AutonomyGateError.toolDenied(
                 reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
             )
@@ -1486,6 +1485,10 @@ extension SwiftToolDispatcher {
     ) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
         guard access.accessibilityAllowed else {
+            if let need = macControlCategoryNeedEnvelope(
+                categories: ["accessibility"], mode: .write,
+                why: "Screen control lets me read and control apps on your Mac."
+            ) { return need }
             throw AutonomyGateError.toolDenied(
                 reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
             )

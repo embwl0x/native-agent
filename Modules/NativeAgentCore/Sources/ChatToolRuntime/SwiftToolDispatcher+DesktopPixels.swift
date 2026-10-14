@@ -10,6 +10,10 @@ extension SwiftToolDispatcher {
     func impl_mac_screenshot_save(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
         guard access.fileOpsAllowed, access.accessibilityAllowed else {
+            if let need = macControlCategoryNeedEnvelope(
+                categories: ["accessibility", "file_ops"], mode: .write,
+                why: "Screen control and file access let me save a screenshot on your Mac."
+            ) { return need }
             throw AutonomyGateError.toolDenied(reason: "Saving screenshots requires Trust Center Full Mac file access and the Accessibility category.")
         }
         guard defaultMacScreenCaptureSource().isScreenRecordingTrusted() else {

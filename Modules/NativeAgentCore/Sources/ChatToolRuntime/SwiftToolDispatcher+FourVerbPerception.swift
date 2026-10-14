@@ -798,7 +798,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         guard recorded, reason != nil || forced else { return nil }
         let why = reason.map { "thin accessibility: \($0)" } ?? "pixels:true"
         guard screenRecording else {
-            return "Pixels (\(why)): needs Screen Recording permission (the person's call). No capture was attempted and no prompt was opened; the words above are all I have."
+            return "Pixels (\(why)): needs Screen Recording permission (the person's call). No capture was attempted and no prompt was opened; the words above are all I have. A scriptable app can be worked without the screen: write a tool for it with tool.propose (host.apps.call)."
         }
         guard !discarded else {
             return "Pixels (\(why)): the window changed while I looked, so that capture was dropped and no image was attached; look again."
