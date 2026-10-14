@@ -66,17 +66,21 @@ public enum MacMenuBar {
         /// is still returned (a model that cannot see "Export" cannot ask for
         /// "Export › PDF"), and pressing it is still a legitimate act.
         public let hasSubmenu: Bool
+        /// Identifier and key equivalent, when the item publishes them.
+        public let commandKey: String?
 
         public init(
             titlePath: [String],
             path: [Int],
             enabled: Bool,
-            hasSubmenu: Bool
+            hasSubmenu: Bool,
+            commandKey: String? = nil
         ) {
             self.titlePath = titlePath
             self.path = path
             self.enabled = enabled
             self.hasSubmenu = hasSubmenu
+            self.commandKey = commandKey
         }
 
         /// How this organ PRINTS a path.
@@ -152,7 +156,7 @@ public enum MacMenuBar {
                     truncated = true
                     return
                 }
-                guard let attributes = source.attributes(of: child) else { continue }
+                guard let attributes = source.attributes(of: child), !attributes.isHiddenMenuItem else { continue }
                 let indexPath = indices + [offset]
                 switch attributes.role {
                 case "AXMenu":
@@ -184,7 +188,8 @@ public enum MacMenuBar {
                         titlePath: names,
                         path: indexPath,
                         enabled: attributes.enabled,
-                        hasSubmenu: submenu != nil
+                        hasSubmenu: submenu != nil,
+                        commandKey: attributes.menuCommandKey
                     )
                     items.append(item)
                     inMenu += 1
@@ -277,7 +282,15 @@ public enum MacMenuBar {
             { zip(levels($0), wanted).allSatisfy { $0.contains($1) } },
         ]
         for pass in passes {
-            let hits = sameDepth.filter(pass)
+            // The same path AND the same command identity is one command listed
+            // twice (Keynote's File › New…: one identifier, one ⌘N): the first
+            // stands for all. Same-titled items without that identity — two
+            // windows named alike under Window — stay an answer, never a guess.
+            var seen = Set<[String]>()
+            let hits = sameDepth.filter(pass).filter { item in
+                guard let key = item.commandKey else { return true }
+                return seen.insert(levels(item) + [key]).inserted
+            }
             if hits.count == 1 {
                 return hits[0].enabled ? .matched(hits[0]) : .disabled(hits[0])
             }

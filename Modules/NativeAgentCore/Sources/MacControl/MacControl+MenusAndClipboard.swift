@@ -236,7 +236,7 @@ extension SwiftNativeMacControl {
         let requireFront = body["require_front"] == .bool(true)
         let statesKnown = !requireFront && accessibilitySource.frontmostApp()?.processIdentifier == app.processIdentifier
         let resolution = MacMenuBar.resolve(requested, among: statesKnown ? reading.items : reading.items.map {
-            MacMenuBar.Item(titlePath: $0.titlePath, path: $0.path, enabled: true, hasSubmenu: $0.hasSubmenu)
+            MacMenuBar.Item(titlePath: $0.titlePath, path: $0.path, enabled: true, hasSubmenu: $0.hasSubmenu, commandKey: $0.commandKey)
         })
         guard case .matched(let item) = resolution else {
             let code: String = {

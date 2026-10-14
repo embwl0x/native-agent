@@ -510,7 +510,7 @@ public enum AppActions {
                   input: verb("tool_approve"), lifecycle: .enable),
         // Her authoring surface: a tool she writes is filed as a proposal and
         // becomes the action authored.<tool_id> once it is approved.
-        AppAction("tool.propose", "diagnostics", "Learn a new way to act by writing a tool",
+        AppAction("tool.propose", "diagnostics", "Learn a new way to act by writing a tool: drive any scriptable Mac app (its documents, presentations, spreadsheets, mail) through AppleScript or Apple Events, or do anything no existing action does",
                   ["tool_id", "description", "code", "tests?:list", "permissions?:list", "input_schema?:any", "actions?:list", "input?:object", "capture?:bool", "converts?:list"],
                   warn: "code is tool.js, sync-only JavaScript: define function run(input) returning plain JSON; async functions and Promises are unsupported. host.files and host.network (or host.call(operation, args)) serve "
                       + "files.list/count/read/info/write/mkdir/remove/copy/move and network.connect/listen/accept/send/receive/close. "

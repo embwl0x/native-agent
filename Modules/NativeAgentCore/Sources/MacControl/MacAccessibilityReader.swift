@@ -76,6 +76,11 @@ public struct MacAXAttributes: Sendable, Equatable {
     public let titleIsHelp: Bool
     public let displayTitle: String?
     public let listSummary: String?
+    /// Hidden or modifier-only alternate, absent from the default menu.
+    public let isHiddenMenuItem: Bool
+    /// A menu item's command identity (identifier and key equivalent) when it
+    /// has one: two items with the same path and the same key are one command.
+    public let menuCommandKey: String?
 
     public init(
         role: String,
@@ -93,7 +98,9 @@ public struct MacAXAttributes: Sendable, Equatable {
         valueIsHelp: Bool = false,
         titleIsHelp: Bool = false,
         displayTitle: String? = nil,
-        listSummary: String? = nil
+        listSummary: String? = nil,
+        isHiddenMenuItem: Bool = false,
+        menuCommandKey: String? = nil
     ) {
         self.placeholder = placeholder
         self.selectionRange = selectionRange
@@ -103,6 +110,8 @@ public struct MacAXAttributes: Sendable, Equatable {
         self.titleIsHelp = titleIsHelp
         self.displayTitle = displayTitle
         self.listSummary = listSummary
+        self.isHiddenMenuItem = isHiddenMenuItem
+        self.menuCommandKey = menuCommandKey
         self.role = role
         self.subrole = subrole
         self.title = title
@@ -801,6 +810,7 @@ public enum MacAccessibilityReader {
                 reasons.insert("unreadable_element")
                 continue
             }
+            if attributes.isHiddenMenuItem { continue }
             // The menu bar belongs to the APP, not the window: a window read
             // never spends its budget there (the `menu` organ reads it).
             if attributes.role == "AXMenuBar", !item.path.isEmpty { continue }
@@ -1534,6 +1544,17 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     public func attributes(of ref: MacAXElementRef) -> MacAXAttributes? {
         guard let element = element(ref) else { return nil }
         guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
+        // Modifier-only alternates point to the item shown without modifiers.
+        let primaryMenuItem = role == "AXMenuItem"
+            ? MacAXAttributeRead.copyElement(element, kAXMenuItemPrimaryUIElementAttribute) : nil
+        let isHiddenMenuItem = (role == "AXMenuItem" || role == "AXMenuBarItem")
+            && (MacAXAttributeRead.copyBool(element, kAXHiddenAttribute) == true
+                || primaryMenuItem.map { !CFEqual($0, element) } == true)
+        let menuCommandKey: String? = role == "AXMenuItem" ? {
+            let identifier = MacAXAttributeRead.copyString(element, kAXIdentifierAttribute) ?? ""
+            let key = MacAXAttributeRead.copyString(element, kAXMenuItemCmdCharAttribute) ?? ""
+            return identifier.isEmpty && key.isEmpty ? nil : identifier + "|" + key
+        }() : nil
         let title = MacAXAttributeRead.copyLabel(element, role: role, prepare: prepareForRead)
         let displayTitle = MacAXAttributeRead.copyLabel(element, role: role, forDisplay: true, prepare: prepareForRead)
         return MacAXAttributes(
@@ -1565,7 +1586,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             } ?? false,
             titleIsHelp: title != displayTitle,
             displayTitle: displayTitle,
-            listSummary: MacAXAttributeRead.listSummary(element, role: role)
+            listSummary: MacAXAttributeRead.listSummary(element, role: role),
+            isHiddenMenuItem: isHiddenMenuItem,
+            menuCommandKey: menuCommandKey
         )
     }
 
