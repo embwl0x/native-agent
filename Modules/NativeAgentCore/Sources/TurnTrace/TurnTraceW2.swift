@@ -16,15 +16,8 @@ import PersistenceCore
 //      BEFORE it is bounded and fired onto the bus. Same redaction-at-emission
 //      discipline as ChatToolDispatchTracer: redact, THEN truncate.
 //
-//   2. InspectorThinkingLane — the per-surface opt-in GATE for the summarized
-//      thinking request-body change. A @TaskLocal default-FALSE flag (same
-//      propagation mechanism as MessagesCacheHint.withinTurnReuse /
-//      LLMCallContext.sessionId): the chat surface binds it TRUE around the
-//      synchronous request construction ONLY when the per-surface setting is on;
-//      the Anthropic adapter reads it at body-assembly time. Unbound everywhere
-//      else → FALSE → the request body is BYTE-IDENTICAL to today (the U1
-//      cache-prefix contract — `thinking` is part of the request body, so the
-//      flag-OFF path must not add it).
+//   2. InspectorThinkingLane — the per-surface opt-in for displaying
+//      summarized thinking. Provider requests and liveness are independent.
 
 // MARK: - TurnTraceRedactor
 
@@ -54,16 +47,9 @@ public enum TurnTraceRedactor {
     }
 }
 
-// MARK: - InspectorThinkingLane (gated summarized-thinking opt-in)
+// MARK: - InspectorThinkingLane (summarized-thinking display opt-in)
 
 /// Per-surface opt-in for the Turn Inspector's summarized-thinking lane.
-///
-/// THE U1 CONTRACT: `thinking` is part of the Anthropic request BODY. When this
-/// gate is OFF (the default), the body MUST be byte-identical to pre-W2 — so the
-/// default is a `@TaskLocal` that is FALSE unless a surface explicitly binds it
-/// TRUE around its synchronous request construction. The Anthropic OAuth adapter
-/// reads `summarizedThinking` at `makeMessagesRequestBody` time; unbound → false
-/// → no `thinking` key is added → byte-identical body.
 ///
 /// `isEnabledForSurface` is the persisted per-surface setting (Mac chat surface
 /// only for now), read from `UserDefaults` under the
@@ -78,10 +64,8 @@ public enum InspectorThinkingLane {
     /// (W2 scope: Mac chat surface only — `surface == "chat"`.)
     public static let eligibleSurface = "chat"
 
-    /// Request-body gate, propagated the same way as
-    /// `MessagesCacheHint.withinTurnReuse`: bound TRUE around the SYNCHRONOUS
-    /// request construction; the adapter's inner Task inherits it. Default
-    /// FALSE → request body byte-identical to pre-W2 (no `thinking` key).
+    /// Display gate inherited by the adapter's inner Task; it controls only
+    /// thinking.delta emission to the Inspector bus.
     @TaskLocal public static var summarizedThinking: Bool = false
 
     /// True when the persisted per-surface setting is on AND `surface` is the

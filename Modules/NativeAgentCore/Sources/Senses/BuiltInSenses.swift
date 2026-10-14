@@ -17,12 +17,25 @@ public enum BuiltInSenses {
     /// Call after installing the registry in SensesHub. Missing/malformed kit
     /// resources are launch errors, never an apparently successful empty kit.
     public static func registerAll(dataRoot: URL, resources: URL? = nil) async throws {
-        guard let registry = SensesHub.shared.registry else {
+        guard let registry = SensesHub.shared.registry as? FileSenseRegistry else {
             throw SenseFailure(code: "source_unavailable", message: "The senses registry is not installed.")
         }
+        let defaults = try defaults(resources: resources)
+        let existing = try await registry.all()
+        for version in defaults {
+            let record = version.record
+            guard let saved = existing.first(where: { $0.id == record.id }),
+                  saved.language == record.language, saved.corner == record.corner else {
+                throw SenseFailure(code: "bad_output", message: "Built-in sense identity collision: \(record.id).")
+            }
+            if record.language == .native { NativeSenseCatalog.shared.register(ExistingCornerSense(record: saved)) }
+        }
+    }
+
+    static func defaults(resources: URL? = nil) throws -> [FileSenseRegistry.Version] {
         let root = resources ?? resourceRoot()
         let entries = try manifest(at: root.appendingPathComponent("builtin.json"))
-        let now = Date()
+        let now = Date(timeIntervalSince1970: 0)
         let native: [(String, SenseCorner)] = [
             ("builtin-screen", .app(bundleID: "*")),
             ("builtin-chrome", .site(host: "*")),
@@ -35,48 +48,19 @@ public enum BuiltInSenses {
         for entry in entries where native.contains(where: { $0.0 == entry.id }) {
             throw SenseFailure(code: "bad_output", message: "Built-in sense identity collision: \(entry.id).")
         }
-        let existing = try await registry.all()
-        for (id, corner) in native {
-            let record = existing.first { $0.id == id } ?? SenseRecord(
+        var versions = native.map { id, corner in
+            FileSenseRegistry.Version(record: SenseRecord(
                 id: id, corner: corner, language: .native, origin: .builtIn,
                 entry: nil, createdAt: now, enabledAt: now
-            )
-            guard record.language == .native, record.origin == .builtIn, record.corner == corner else {
-                throw SenseFailure(code: "bad_output", message: "Built-in sense identity collision: \(id).")
-            }
-            if !existing.contains(where: { $0.id == id }) { try await registry.upsert(record) }
-            NativeSenseCatalog.shared.register(ExistingCornerSense(record: record))
+            ), files: [])
         }
         for entry in entries {
-            var record = SenseRecord(id: entry.id, corner: entry.corner, version: entry.version,
+            let record = SenseRecord(id: entry.id, corner: entry.corner, version: entry.version,
                 language: .javascript, mode: entry.mode, origin: .builtIn, entry: entry.entry, verbs: entry.verbs,
                 createdAt: now, enabledAt: now)
-            let saved = existing.first(where: { $0.id == record.id })
-            if let saved {
-                guard (saved.origin == .builtIn || (saved.origin == .grown && saved.version > 1)),
-                      saved.language == .javascript, saved.corner == record.corner else {
-                    throw SenseFailure(code: "bad_output", message: "Built-in sense identity collision: \(record.id).")
-                }
-                // Versions are immutable. The newest version that came from the
-                // bundle tells whether this app ships new code for the sense; if
-                // it does, that code becomes the next version above everything,
-                // including the lane's own repairs. Unchanged code changes nothing
-                // (counters, off-switch and later repairs stay as they are).
-                let bundled = try Data(contentsOf: root.appendingPathComponent(entry.entry))
-                if let last = lastBundledVersion(id: record.id, entry: entry.entry, upTo: saved.version, dataRoot: dataRoot),
-                   last.code == bundled { continue }
-                record.version = max(entry.version, saved.version + 1)
-            }
-            try installKit(root: root, record: record, dataRoot: dataRoot)
-            var next = record
-            if let saved {
-                next.status = saved.status; next.createdAt = saved.createdAt
-                next.unavailableReason = saved.unavailableReason
-                next.enabledAt = saved.enabledAt; next.lastUsedAt = saved.lastUsedAt
-                next.uses = saved.uses; next.corrections = saved.corrections
-            }
-            try await registry.upsert(next)
+            versions.append(FileSenseRegistry.Version(record: record, files: [entry.entry]))
         }
+        return versions
     }
 
     private struct Entry: Decodable {
@@ -128,38 +112,6 @@ public enum BuiltInSenses {
         return entries
     }
 
-    /// The newest installed version whose folder holds the bundled entry
-    /// (lane repairs hold only their own entry), with that entry's code.
-    private static func lastBundledVersion(id: String, entry: String, upTo version: Int,
-                                           dataRoot: URL) -> (version: Int, code: Data)? {
-        let parent = dataRoot.appendingPathComponent("senses").appendingPathComponent(id)
-        for candidate in stride(from: version, through: 1, by: -1) {
-            let url = parent.appendingPathComponent("v\(candidate)").appendingPathComponent(entry)
-            if let code = try? Data(contentsOf: url) { return (candidate, code) }
-        }
-        return nil
-    }
-
-    private static func installKit(root: URL, record: SenseRecord, dataRoot: URL) throws {
-        let fm = FileManager.default
-        let parent = dataRoot.appendingPathComponent("senses").appendingPathComponent(record.id)
-        let version = parent.appendingPathComponent("v\(record.version)")
-        // Registry owns lifecycle; this only lays down the bundled entry and
-        // its shared JS helpers before making the record visible.
-        // A folder left without a registry record (interrupted launch) is
-        // completed from the bundle; registered versions are never rewritten.
-        if fm.fileExists(atPath: version.path), let entry = record.entry,
-           (try? Data(contentsOf: version.appendingPathComponent(entry))) == (try? Data(contentsOf: root.appendingPathComponent(entry))) {
-            return
-        }
-        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
-        let staging = parent.appendingPathComponent(".builtin-\(UUID().uuidString)")
-        defer { if fm.fileExists(atPath: staging.path) { try? fm.removeItem(at: staging) } }
-        try fm.copyItem(at: root, to: staging)
-        if fm.fileExists(atPath: version.path) { _ = try fm.replaceItemAt(version, withItemAt: staging) }
-        else { try fm.moveItem(at: staging, to: version) }
-    }
-
     private static func safeComponent(_ value: String) -> Bool {
         !value.isEmpty && value != "." && value != ".."
             && value.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || "-_.".contains($0)) }
@@ -170,7 +122,7 @@ public enum BuiltInSenses {
             && value.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { safeComponent(String($0)) }
     }
 
-    private static func resourceRoot() -> URL {
+    static func resourceRoot() -> URL {
         if Bundle.main.bundleURL.pathExtension == "app", let resources = Bundle.main.resourceURL {
             return resources.appendingPathComponent("Senses")
         }

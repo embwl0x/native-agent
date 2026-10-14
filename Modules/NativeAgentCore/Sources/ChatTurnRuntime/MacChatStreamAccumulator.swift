@@ -3,7 +3,7 @@ import Foundation
 /// Stream-local accumulator for one chat turn's deltas.
 ///
 /// Token intake, append and length accounting stay here; only changed display
-/// snapshots cross to MainActor. Idle publish ticks never wake MainActor.
+/// snapshots cross to MainActor. Publication retires when no text has changed.
 ///
 /// `takeIfChanged` only hands back growing text. A settled-state update joins
 /// the publisher and flushes the full snapshot before changing presentation.
@@ -13,6 +13,7 @@ public actor ChatStreamAccumulator {
     private var accumulated = ""
     private var accumulatedUTF16 = 0
     private var takenUTF16 = 0
+    private var ticker: Task<Void, Error>?
 
     /// Consume tokens here, not in the MainActor caller. Only changed display
     /// snapshots cross back; a provider pause never leaves a trailing chunk
@@ -23,7 +24,7 @@ public actor ChatStreamAccumulator {
         interval: TimeInterval,
         publish: @escaping @MainActor @Sendable (String, Int, Bool?) throws -> Void
     ) async throws -> String {
-        var ticker: Task<Void, Error>?
+        defer { ticker = nil }
         do {
             for try await update in stream {
                 try Task.checkCancellation()
@@ -47,7 +48,10 @@ public actor ChatStreamAccumulator {
                     while !Task.isCancelled {
                         try await Task.sleep(for: .seconds(interval))
                         try Task.checkCancellation()
-                        guard let snapshot = self.takeIfChanged() else { continue }
+                        guard let snapshot = self.takeIfChanged() else {
+                            self.ticker = nil
+                            return
+                        }
                         try await publish(snapshot, self.takenUTF16, nil)
                     }
                 }

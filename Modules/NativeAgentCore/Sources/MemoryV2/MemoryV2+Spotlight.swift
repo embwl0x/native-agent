@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -75,35 +76,13 @@ public final class SystemSpotlightIndexClient: SpotlightIndexClient, @unchecked 
 }
 #endif
 
-// MARK: - In-memory mock for tests
+// MARK: - Isolated backend
 
 public actor MockSpotlightIndexClient: SpotlightIndexClient {
-    public private(set) var indexed: [String: SpotlightItem] = [:]
-
     public init() {}
-
-    public func index(_ items: [SpotlightItem]) async throws {
-        for item in items {
-            indexed[item.id] = item
-        }
-    }
-
-    public func delete(ids: [String]) async throws {
-        for id in ids {
-            indexed.removeValue(forKey: id)
-        }
-    }
-
-    public func deleteAll(domainIdentifier: String) async throws {
-        let prefix = domainIdentifier + "."
-        for (id, item) in indexed where item.domainIdentifier == domainIdentifier || item.domainIdentifier.hasPrefix(prefix) {
-            indexed.removeValue(forKey: id)
-        }
-    }
-
-    public func snapshot() async -> [String: SpotlightItem] {
-        indexed
-    }
+    public func index(_ items: [SpotlightItem]) async throws {}
+    public func delete(ids: [String]) async throws {}
+    public func deleteAll(domainIdentifier: String) async throws {}
 }
 
 // MARK: - SwiftNativeMemoryIndexer
@@ -148,5 +127,132 @@ public actor SwiftNativeMemoryIndexer {
             keywords: keywords,
             domainIdentifier: domain
         )
+    }
+}
+
+extension SwiftNativeMemoryIndexer {
+    public static func reindex(dataRoot: URL, client: any SpotlightIndexClient) async throws -> ReindexOutcome {
+        let marker = markerURL(dataRoot: dataRoot)
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        let generation = try await storage.projectionGenerationFingerprint()
+        let memories = try await storage.listMemories(
+            persona: nil,
+            status: "active",
+            limit: nil
+        )
+        let batch = memories.map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
+
+        // Delete the old proof BEFORE clearing the derived index. A crash
+        // or failure after `removeAll()` must read as unconfirmed rather
+        // than reporting the old SQLite count over an empty Spotlight
+        // domain.
+        try clearMarker(at: marker)
+
+        let indexer = SwiftNativeMemoryIndexer(client: client)
+        try await indexer.removeAll()
+        try await indexer.indexBatch(batch)
+
+        let completedGeneration = try await storage.projectionGenerationFingerprint()
+        guard completedGeneration == generation else {
+            // A concurrent canonical write makes this batch stale. There
+            // is intentionally no marker: the next reindex must start
+            // from the new source generation.
+            return .changedDuringReindex
+        }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(
+            Data((generation + "\n").utf8),
+            to: marker
+        )
+        return .indexed(count: batch.count)
+    }
+
+    public static func markerURL(dataRoot: URL) -> URL {
+        dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent(".spotlight_reindexed", isDirectory: false)
+    }
+
+    private static func clearMarker(at marker: URL) throws {
+        guard FileManager.default.fileExists(atPath: marker.path) else { return }
+        try FileManager.default.removeItem(at: marker)
+    }
+
+    public static func liveClient(dataRoot: URL) -> any SpotlightIndexClient {
+        #if canImport(CoreSpotlight) && !os(Linux)
+        if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
+            return SystemSpotlightIndexClient()
+        }
+        #endif
+        // An injected/test root must not replace the user's system Spotlight
+        // domain merely because the UI is hosted in this app process.
+        return MockSpotlightIndexClient()
+    }
+}
+
+/// Honest launch-only owner for the one-time Spotlight projection. MemoryV2
+/// itself remains canonical; this type owns no memory state and advertises no
+/// CloudKit subscription that the runtime cannot actually provide.
+public actor MemorySpotlightBootstrap {
+    public static let shared = MemorySpotlightBootstrap()
+    private var didReindex = false
+    private let dataRootOverride: URL?
+    private let indexClientOverride: (any SpotlightIndexClient)?
+
+    private init() {
+        dataRootOverride = nil
+        indexClientOverride = nil
+    }
+
+    /// Hermetic seam for the launch projection's exact durable behavior. The
+    /// mounted app uses `shared`; an injected root never touches the user's
+    /// Spotlight domain.
+    public init(dataRoot: URL, indexClient: any SpotlightIndexClient) {
+        dataRootOverride = dataRoot
+        indexClientOverride = indexClient
+    }
+
+    /// Read every active memory through SwiftNativeMemoryV2.shared and push
+    /// CSSearchableItems to the system Spotlight index. The sentinel is
+    /// written only after success, so a crash retries on the next launch.
+    public func reindexAll() async {
+        if didReindex { return }
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let marker = SwiftNativeMemoryIndexer.markerURL(dataRoot: dataRoot)
+        let storage: MemoryStorage
+        do {
+            storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        } catch {
+            return
+        }
+        let generation: String
+        do {
+            generation = try await storage.projectionGenerationFingerprint()
+        } catch {
+            return
+        }
+        if let markerData = try? Data(contentsOf: marker),
+           String(data: markerData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) == generation {
+            didReindex = true
+            return
+        }
+        do {
+            if case .indexed = try await SwiftNativeMemoryIndexer.reindex(
+                dataRoot: dataRoot,
+                client: indexClientOverride ?? SwiftNativeMemoryIndexer.liveClient(dataRoot: dataRoot)
+            ) {
+                didReindex = true
+            }
+        } catch {
+            // No durable generation proof: launch must reconcile again.
+        }
+    }
+}
+
+extension SwiftNativeMemoryIndexer {
+    public enum ReindexOutcome: Equatable, Sendable {
+        case indexed(count: Int)
+        case changedDuringReindex
+        case failed(message: String, cause: String? = nil)
     }
 }

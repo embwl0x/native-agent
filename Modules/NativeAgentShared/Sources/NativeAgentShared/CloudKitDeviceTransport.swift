@@ -38,14 +38,6 @@ enum DeviceCloudKitSubscriptionID {
 
 // MARK: - Device timeout policies
 
-private enum DeviceCKTimeoutRace<T: Sendable>: Sendable {
-    case success(T)
-    case failure(String)
-    case failureError(Error)
-    case timedOut
-    case cancelled
-}
-
 private func formatDeviceCKTimeoutSeconds(_ seconds: TimeInterval) -> String {
     if seconds.rounded() == seconds { return "\(Int(seconds))s" }
     return String(format: "%.1fs", seconds)
@@ -86,39 +78,16 @@ private func withDeviceCKTimeout<T: Sendable>(
         catch { await state.finish(.failure(error)) }
     }
 
-    return await withTaskGroup(of: DeviceCKTimeoutRace<T>.self, returning: T?.self) { group in
-        group.addTask {
-            guard let result = await state.wait() else { return .cancelled }
-            switch result {
-            case .success(let value): return .success(value)
-            case .failure(let error): return .failureError(error)
-            }
-        }
-        group.addTask {
-            do {
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                return .timedOut
-            } catch { return .cancelled }
-        }
-
-        guard let first = await group.next() else {
-            group.cancelAll(); workTask.cancel(); await state.cancelWaiter()
-            return nil
-        }
-        group.cancelAll(); workTask.cancel(); await state.cancelWaiter()
-        switch first {
-        case .success(let value): return value
-        case .failure(let error):
-            nativeLog("[ck-device] \(label) failed: \(error)"); return nil
-        case .failureError(let error):
-            await onFailure?(error)
-            nativeLog("[ck-device] \(label) failed: \(error)"); return nil
-        case .timedOut:
-            nativeLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
-            return nil
-        case .cancelled:
-            return nil
-        }
+    switch await state.race(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds) {
+    case .success(let value): return value
+    case .failure(let error):
+        await onFailure?(error)
+        nativeLog("[ck-device] \(label) failed: \(error)"); return nil
+    case .timedOut:
+        nativeLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
+        return nil
+    case .cancelled:
+        return nil
     }
 }
 
@@ -126,49 +95,32 @@ private func withDeviceCKTimeoutThrowing<T: Sendable>(
     _ label: String,
     seconds: TimeInterval = 5,
     onFailure: (@Sendable (Error) async -> Void)? = nil,
+    beforeDispatch: @Sendable () async throws -> Void = {},
     _ work: @Sendable @escaping () async throws -> T
 ) async throws -> T {
+    try Task.checkCancellation()
     guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
     let seconds = NADeviceSyncRecoveryBudget.seconds(upTo: seconds)
+    try await beforeDispatch()
     let state = CloudKitTimeoutResultLatch<T>()
     let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
     let workTask = Task(priority: .utility) {
         do {
-            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
             await state.finish(.success(try await work()))
         }
         catch { await state.finish(.failure(error)) }
     }
 
-    return try await withThrowingTaskGroup(of: DeviceCKTimeoutRace<T>.self, returning: T.self) { group in
-        group.addTask {
-            guard let r = await state.wait() else { return .cancelled }
-            switch r {
-            case .success(let v): return .success(v)
-            case .failure(let e): return .failureError(e)
-            }
-        }
-        group.addTask {
-            _ = try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-            return .timedOut
-        }
-        guard let first = try await group.next() else {
-            group.cancelAll(); workTask.cancel(); await state.cancelWaiter()
-            throw DeviceCKLandmineTimeout(label: label, seconds: seconds)
-        }
-        group.cancelAll(); workTask.cancel(); await state.cancelWaiter()
-        switch first {
-        case .success(let v): return v
-        case .failureError(let e):
-            await onFailure?(e)
-            throw e
-        case .failure(let msg): throw DeviceSyncError.transient(message: msg)
-        case .timedOut:
-            nativeLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
-            throw DeviceCKLandmineTimeout(label: label, seconds: seconds)
-        case .cancelled:
-            throw CancellationError()
-        }
+    switch await state.race(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds, timeoutOnCancellation: true) {
+    case .success(let value): return value
+    case .failure(let error):
+        await onFailure?(error)
+        throw error
+    case .timedOut:
+        nativeLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
+        throw DeviceCKLandmineTimeout(label: label, seconds: seconds)
+    case .cancelled:
+        throw CancellationError()
     }
 }
 
@@ -461,6 +413,10 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     // MARK: send
 
     public func send(_ message: BridgeMessage) async throws {
+        try await send(message, beforeDispatch: {})
+    }
+
+    public func send(_ message: BridgeMessage, beforeDispatch: @Sendable () async throws -> Void) async throws {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
         let fields = try NAChatMessageCodec.encode(message)
         let recordType = Self.recordType(for: fields)
@@ -505,7 +461,14 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         let preparedAssetURL = assetURL
         let preparedLegacyFields = legacyFields
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send", onFailure: accountFailureReporter) {
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send", onFailure: accountFailureReporter,
+                                                  beforeDispatch: {
+                do { try await beforeDispatch() }
+                catch {
+                    if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) }
+                    throw error
+                }
+            }) {
                 defer { if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) } }
                 let ck = CKRecord(
                     recordType: recordType,
@@ -533,33 +496,29 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
                 op.savePolicy = .ifServerRecordUnchanged
                 op.qualityOfService = .userInitiated
-                try await self.performModifyRecords(op)
+                do { try await self.performModifyRecords(op) }
+                catch let error as DeviceSyncError {
+                    if case .conflict = error, await self.existingMessageRecordMatches(fields) {
+                        await self.touchExistingRecord(named: fields.recordName)
+                        return
+                    }
+                    switch error {
+                    case .transient, .underlying, .conflict:
+                        throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
+                    default: throw error
+                    }
+                } catch {
+                    throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
+                }
             }
         } catch is DeviceCKLandmineTimeout {
             if await existingMessageRecordMatches(fields) {
                 return
             }
             throw DeviceSyncSendOutcomeUnknown(message: "CloudKit send timed out; server acceptance is unknown")
-        } catch let error as DeviceSyncError {
-            if case .conflict = error, await existingMessageRecordMatches(fields) {
-                // 2026-09-06: the caller is told this send succeeded, but the
-                // server record still carries its ORIGINAL modificationDate —
-                // the only clock the retention sweep judges eligibility by. A
-                // replay of a record already past the window (stable ids come
-                // from AgentBridgeCompletionRouter's idempotencyKey) was swept
-                // away moments after the send reported success. Touch the
-                // record so the replay is fresh for another full window.
-                await touchExistingRecord(named: fields.recordName)
-                return
-            }
-            switch error {
-            case .transient, .underlying, .conflict:
-                throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
-            default:
-                throw error
-            }
-        } catch {
-            throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
+        } catch is CancellationError {
+            if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) }
+            throw CancellationError()
         }
     }
 
@@ -1282,7 +1241,6 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         // The lane belongs to the actual CloudKit completion, not the caller's
         // bounded wait. A timed-out write must settle before a successor starts.
         do {
-            // 2026-10-04: a cold-launch status write measured 4.6 s and landed; 3 s called it failed.
             try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 15, onFailure: accountFailureReporter) {
                 try await self.enqueueStatusWrite(key: key) {
                     let ck = CKRecord(
@@ -1295,7 +1253,9 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                     ck["updatedAt"] = updatedAt as CKRecordValue
                     let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
                     op.savePolicy = .changedKeys
-                    op.qualityOfService = .utility
+                    // Utility permits discretionary deferral when the Mac app is
+                    // backgrounded; phone status has a bounded publication deadline.
+                    op.qualityOfService = .userInitiated
                     try await self.performModifyRecords(op)
                 }
             }

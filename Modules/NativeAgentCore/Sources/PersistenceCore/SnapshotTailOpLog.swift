@@ -308,14 +308,6 @@ public enum SnapshotTailOpLog {
         return false
     }
 
-    /// TEST HOOK ONLY: clear the log-dedupe memo so a test can assert the
-    /// refusal path fires. Never called by product code.
-    static func resetIntegrityLogMemoForTesting() {
-        integrityLogLock.lock()
-        loggedIntegritySignatures.removeAll()
-        integrityLogLock.unlock()
-    }
-
     /// Return the ops that FOLLOW `lastCompactedOpId` (the compaction tail).
     /// Scans from the END so the LAST occurrence of the id wins — matching every
     /// store's `lastIndex(where:)`. If the id is not present (a genesis feed, or

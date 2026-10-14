@@ -11,8 +11,12 @@ import UIKit
 
 /// One device-local signing identity, never synced through iCloud or restored
 /// onto another phone. A failed read must not silently replace the identity.
-enum PhoneSigningIdentity {
-    static func key() throws -> Curve25519.Signing.PrivateKey {
+actor PhoneSigningIdentity {
+    static let shared = PhoneSigningIdentity()
+    private var cachedKey: Curve25519.Signing.PrivateKey?
+
+    func key() throws -> Curve25519.Signing.PrivateKey {
+        if let cachedKey { return cachedKey }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "NativeAgent.phoneSigning",
@@ -24,7 +28,9 @@ enum PhoneSigningIdentity {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(read as CFDictionary, &result)
         if status == errSecSuccess, let data = result as? Data {
-            return try Curve25519.Signing.PrivateKey(rawRepresentation: data)
+            let key = try Curve25519.Signing.PrivateKey(rawRepresentation: data)
+            cachedKey = key
+            return key
         }
         guard status == errSecItemNotFound else {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
@@ -37,8 +43,43 @@ enum PhoneSigningIdentity {
         guard saved == errSecSuccess else {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(saved))
         }
+        cachedKey = key
         return key
     }
+    func signedActionData(
+        _ action: InboxAction,
+        secret: Data
+    ) throws -> Data {
+        var body: [String: Any] = [
+            "msgId": action.msgId,
+            "clientId": action.clientId,
+            "action": action.action,
+            "payload": action.payload,
+            "createdAt": action.createdAt,
+        ]
+        if let protocolVersion = action.protocolVersion {
+            body["protocolVersion"] = protocolVersion
+        }
+        if let transactionId = action.transactionId {
+            body["transactionId"] = transactionId
+        }
+        let deviceKey = try self.key()
+        guard action.clientId == DeviceApprovalSignature.deviceID(publicKey: deviceKey.publicKey.rawRepresentation) else {
+            throw DeviceApprovalSignature.Failure.invalid
+        }
+        body["devicePublicKey"] = deviceKey.publicKey.rawRepresentation.base64EncodedString()
+        let deviceBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        body["deviceSignature"] = try deviceKey.signature(for: DeviceApprovalSignature.canonicalBody(deviceBody)).base64EncodedString()
+        let canonical = try JSONSerialization.data(
+            withJSONObject: body,
+            options: [.sortedKeys]
+        )
+        let key = SymmetricKey(data: secret)
+        let mac = HMAC<SHA256>.authenticationCode(for: canonical, using: key)
+        body["signature"] = Data(mac).map { String(format: "%02x", $0) }.joined()
+        return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+    }
+
 }
 
 enum PairingKVSRefreshResult {

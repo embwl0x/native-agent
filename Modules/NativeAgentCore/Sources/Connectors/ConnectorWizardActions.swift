@@ -37,6 +37,14 @@ public struct ConnectorRegisterAppResponse: Codable, Sendable {
 }
 
 public enum ConnectorWizardSetupRoute: Equatable, Sendable {
+    public static func skillOAuthConnectorID(for provider: String) -> String? {
+        switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "x", "twitter": return "x"
+        case "gmail", "email": return "gmail"
+        case "calendar", "google_calendar": return "calendar"
+        default: return nil
+        }
+    }
     case manualToken
     case notionToken
     case nativeOAuth(connectorId: String)
@@ -161,26 +169,6 @@ public enum ConnectorWizardActions {
 }
 
 extension ConnectorOAuthRegistry {
-    public static func connectorRows(from value: JSONValue) -> [[String: JSONValue]] {
-        switch value {
-        case .array(let rows):
-            return rows.compactMap {
-                guard case .object(let object) = $0 else { return nil }
-                return object
-            }
-        case .object(let object):
-            return object.keys.sorted().compactMap { key in
-                guard case .object(var entry)? = object[key] else { return nil }
-                if connectorString(entry["id"]) == nil {
-                    entry["id"] = .string(normalizedConnectorID(key))
-                }
-                return entry
-            }
-        default:
-            return []
-        }
-    }
-
     public static func readConnectorRegistryEntry(
         root: URL,
         provider: String

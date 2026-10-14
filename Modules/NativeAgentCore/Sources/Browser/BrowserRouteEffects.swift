@@ -11,6 +11,7 @@ public protocol BrowserRouteEffects: Sendable {
     @MainActor func readText() async throws -> String
     @MainActor func readLinks() async throws -> [BrowserLink]
     @MainActor func screenshot() async throws -> Data
+    @MainActor func cancelVisibleNavigation(runID: String)
     func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool, dataRoot: URL) async -> BrowserNavigationTask
     @MainActor func finishNavigation(runID: String, token: UUID)
     func cancelNavigation(runID: String) async
@@ -56,4 +57,42 @@ public struct BrowserVisibleCapture: Sendable {
         self.links = links
         self.screenshot = screenshot
     }
+}
+
+extension BrowserRouteEffects {
+    public func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool, dataRoot: URL) async -> BrowserNavigationTask {
+        let cancellationLatch = BrowserRunCancellationLatch()
+        let activeToken = await BrowserActiveRunRegistry.shared.register(runID: runID) {
+            cancellationLatch.cancel()
+        }
+        let captureTask = await MainActor.run {
+            let task = Task { @MainActor in
+                try await BrowserActionRoutes(effects: self).navigateVisibleBrowser(
+                    url,
+                    runID: runID,
+                    captureSource: captureSource,
+                    captureScreenshot: captureScreenshot,
+                    dataRoot: dataRoot
+                )
+            }
+            // Creating and attaching are one non-suspending MainActor turn, so
+            // WebKit cannot begin between task creation and cancellation hookup.
+            cancellationLatch.install {
+                task.cancel()
+                cancelVisibleNavigation(runID: runID)
+            }
+            return task
+        }
+        return BrowserNavigationTask(task: captureTask, token: activeToken)
+    }
+
+    @MainActor
+    public func finishNavigation(runID: String, token: UUID) {
+        BrowserActiveRunRegistry.shared.unregister(runID: runID, token: token)
+    }
+
+    public func cancelNavigation(runID: String) async {
+        _ = await BrowserActiveRunRegistry.shared.cancel(runID: runID)
+    }
+
 }

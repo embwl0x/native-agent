@@ -1,7 +1,5 @@
 import Foundation
 import CoreGraphics
-import NativeAgentCore
-import PersistenceCore
 import MacControl
 
 // MARK: - MacVisionPerception v0 — the general screen, from PIXELS ONLY
@@ -26,10 +24,7 @@ import MacControl
 //     asked for") is deliberately distinct from `role` ("how sure is this a
 //     button"), because target is the one that gates ACTING.
 //   • CALIBRATED REFUSAL is half the contract, co-equal with verified effects.
-//     `ambiguous` is a FIRST-CLASS result, and the abstain RATE is a QUALITY
-//     METRIC this module measures and surfaces — never a number to minimise by
-//     forcing guesses. "A vision lane that never abstains has not earned
-//     trust; it has just stopped saying when it is guessing."
+//     `ambiguous` is a FIRST-CLASS result — never hidden by forcing guesses.
 //   • STATE guesses name selected / checked / DISABLED explicitly, each with
 //     its OWN confidence, and never ride out as a bare boolean. `disabled` is
 //     load-bearing: acting on a control we believe is enabled when it is not
@@ -85,25 +80,6 @@ public struct VisionConfidence: Sendable, Equatable {
         guard value.isFinite else { return 0 }
         return min(1, max(0, (value * 100).rounded() / 100))
     }
-
-    /// The same five keys on every row, always all five present. A missing
-    /// attribute would read as "not applicable" when it actually means "we
-    /// forgot", so absence is not allowed here.
-    public func toJSON() -> JSONValue {
-        .object([
-            "bounds": .double(bounds),
-            "role": .double(role),
-            "state": .double(state),
-            "text": .double(text),
-            "target": .double(target),
-        ])
-    }
-
-    /// Copy with a new target confidence — the abstain rule's only lever on an
-    /// otherwise-good row.
-    public func withTarget(_ value: Double) -> VisionConfidence {
-        VisionConfidence(bounds: bounds, role: role, state: state, text: text, target: value)
-    }
 }
 
 // MARK: - State guesses
@@ -121,14 +97,6 @@ public struct VisionStateFlag: Sendable, Equatable {
         self.value = value
         self.confidence = VisionConfidence.clamp(confidence)
         self.evidence = evidence
-    }
-
-    public func toJSON() -> JSONValue {
-        .object([
-            "value": .bool(value),
-            "confidence": .double(confidence),
-            "evidence": .string(evidence),
-        ])
     }
 }
 
@@ -153,8 +121,6 @@ public struct VisionStateGuess: Sendable, Equatable {
         self.disabled = disabled
     }
 
-    public var isEmpty: Bool { selected == nil && checked == nil && disabled == nil }
-
     /// The confidence the `state` attribute reports: the weakest guess we
     /// actually made, because a row is only as trustworthy as its shakiest
     /// state claim. No guesses at all ⇒ 0 (we know nothing, and say so).
@@ -162,15 +128,6 @@ public struct VisionStateGuess: Sendable, Equatable {
         let all = [selected, checked, disabled].compactMap { $0?.confidence }
         guard let weakest = all.min() else { return 0 }
         return weakest
-    }
-
-    public func toJSON() -> JSONValue? {
-        guard !isEmpty else { return nil }
-        var object: [String: JSONValue] = [:]
-        if let selected { object["selected"] = selected.toJSON() }
-        if let checked { object["checked"] = checked.toJSON() }
-        if let disabled { object["disabled"] = disabled.toJSON() }
-        return .object(object)
     }
 }
 

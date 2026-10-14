@@ -232,14 +232,15 @@ enum TelegramRichMessageRenderer {
         return result
     }
 
+    private static let sanitizingExpressions = [
+        #"(?is)<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>"#,
+        #"(?is)<analysis\b[^>]*>.*?</analysis>"#,
+        #"(?im)^\s*(?:hidden[_ ]reasoning|internal[_ ]trace|raw[_ ]provider[_ ]payload|tool[_ ]arguments?)\s*:.*$"#,
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+
     static func sanitize(_ raw: String) -> String {
         var value = raw
-        for pattern in [
-            #"(?is)<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>"#,
-            #"(?is)<analysis\b[^>]*>.*?</analysis>"#,
-            #"(?im)^\s*(?:hidden[_ ]reasoning|internal[_ ]trace|raw[_ ]provider[_ ]payload|tool[_ ]arguments?)\s*:.*$"#,
-        ] {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+        for regex in sanitizingExpressions {
             value = regex.stringByReplacingMatches(
                 in: value,
                 range: NSRange(value.startIndex..., in: value),
@@ -248,17 +249,16 @@ enum TelegramRichMessageRenderer {
         }
         value = TelegramPollLoop._tgRedactToken(TurnTraceRedactor.redactText(value))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let tokenRegex = try? NSRegularExpression(
-            pattern: #"\b[0-9]{6,12}:[A-Za-z0-9_-]{12,}\b"#
-        ) {
-            value = tokenRegex.stringByReplacingMatches(
-                in: value,
-                range: NSRange(value.startIndex..., in: value),
-                withTemplate: "[REDACTED_TELEGRAM_TOKEN]"
-            )
-        }
         return value
     }
+
+    private static let boldExpression = try? NSRegularExpression(pattern: #"\*\*(?=\S)(.+?)(?<=\S)\*\*"#)
+    // Opens at start/after space or an opening bracket/quote; closes before
+    // space, punctuation or end. A / or . beside a star never counts (globs).
+    private static let italicExpression = try? NSRegularExpression(
+        pattern: #"(?<![^\s(\[{"'“‘])\*(?=[^\s*/.])(.+?)(?<=[^\s*/.])\*(?![^\s,;:!?)\]}"'”’])"#
+    )
+    private static let linkExpression = try? NSRegularExpression(pattern: #"\[([^\]\n]+)\]\(([^)\s]+)\)"#)
 
     /// 2026-09-22: rich blocks and ordinary sends carry plain text (no
     /// parse_mode, no entities), so markdown showed raw. Outside code fences:
@@ -267,13 +267,9 @@ enum TelegramRichMessageRenderer {
     /// stay untouched). Bullets ("* ") and math (2*3*4) are left alone.
     static func stripBoldMarkers(_ text: String) -> String {
         guard text.contains("*") || text.contains("`") || text.contains("]("),
-              let bold = try? NSRegularExpression(pattern: #"\*\*(?=\S)(.+?)(?<=\S)\*\*"#),
-              // Opens at start/after space or an opening bracket/quote; closes before
-              // space, punctuation or end. A / or . beside a star never counts (globs).
-              let italic = try? NSRegularExpression(
-                  pattern: #"(?<![^\s(\[{"'“‘])\*(?=[^\s*/.])(.+?)(?<=[^\s*/.])\*(?![^\s,;:!?)\]}"'”’])"#
-              ),
-              let link = try? NSRegularExpression(pattern: #"\[([^\]\n]+)\]\(([^)\s]+)\)"#)
+              let bold = boldExpression,
+              let italic = italicExpression,
+              let link = linkExpression
         else { return text }
         var inFence = false
         return text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in

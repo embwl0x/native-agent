@@ -18,7 +18,7 @@ import MapKit
 
 extension SwiftToolDispatcher {
     @MainActor
-    private func place(_ text: String) async throws -> MKMapItem {
+    private func place(_ text: String) async throws -> sending MKMapItem {
         try Task.checkCancellation()
         let request = MKLocalSearch.Request()
         request.naturalLanguageQuery = text
@@ -108,7 +108,10 @@ extension SwiftToolDispatcher {
         if let fraction, !fraction.isFinite || !(0...1).contains(fraction) {
             throw AutonomyGateError.toolDenied(reason: "fraction must be a number from 0 through 1, measured along the route distance.")
         }
-        let source = try await place(origin), target = try await place(destination)
+        async let originPlace = place(origin)
+        async let destinationPlace = place(destination)
+        let source = try await originPlace
+        let target = try await destinationPlace
         let request = MKDirections.Request()
         request.source = source; request.destination = target
         request.transportType = transport == "walking" ? .walking : .automobile

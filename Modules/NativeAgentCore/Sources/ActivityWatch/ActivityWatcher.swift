@@ -7,8 +7,6 @@ import MacControl
 import PersistenceCore
 
 /// Platform notifications translated before they enter the capture thread.
-/// Keeping this boundary injectable lets the real watcher own the same
-/// workspace/sleep behavior that tests drive, without a second state machine.
 public enum ActivityWorkspaceEvent: Sendable {
     case activate(bundleId: String?, appName: String?, pid: pid_t?)
     case terminate(pid: pid_t?)
@@ -16,56 +14,6 @@ public enum ActivityWorkspaceEvent: Sendable {
     case wake
     case sessionResignedActive
     case sessionBecameActive
-}
-
-public struct ActivityWorkspaceObserverRegistration: @unchecked Sendable {
-    public let cancel: () -> Void
-    public init(cancel: @escaping () -> Void) { self.cancel = cancel }
-}
-
-public struct ActivityWorkspaceObserverSource: @unchecked Sendable {
-    public let install: (@escaping @Sendable (ActivityWorkspaceEvent) -> Void)
-        -> ActivityWorkspaceObserverRegistration
-
-    public init(
-        install: @escaping (@escaping @Sendable (ActivityWorkspaceEvent) -> Void)
-            -> ActivityWorkspaceObserverRegistration
-    ) {
-        self.install = install
-    }
-
-    public static let system = ActivityWorkspaceObserverSource { handler in
-        let center = NSWorkspace.shared.notificationCenter
-        var tokens: [NSObjectProtocol] = []
-        tokens.append(center.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil
-        ) { note in
-            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            handler(.activate(bundleId: app?.bundleIdentifier, appName: app?.localizedName,
-                              pid: app?.processIdentifier))
-        })
-        tokens.append(center.addObserver(
-            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil
-        ) { note in
-            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            handler(.terminate(pid: app?.processIdentifier))
-        })
-        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
-            tokens.append(center.addObserver(forName: name, object: nil, queue: nil) { _ in handler(.sleep) })
-        }
-        tokens.append(center.addObserver(
-            forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: nil
-        ) { _ in handler(.wake) })
-        tokens.append(center.addObserver(
-            forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: nil
-        ) { _ in handler(.sessionResignedActive) })
-        tokens.append(center.addObserver(
-            forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: nil
-        ) { _ in handler(.sessionBecameActive) })
-        return ActivityWorkspaceObserverRegistration {
-            for token in tokens { center.removeObserver(token) }
-        }
-    }
 }
 
 /// The live capture spine — metadata only, zero inference.
@@ -85,12 +33,13 @@ public struct ActivityWorkspaceObserverSource: @unchecked Sendable {
 ///     `ActivitySpanStore`. AsyncStream preserves ordering, so open→touch→close
 ///     can never be applied out of order (a bare `Task { }` per command could).
 public final class ActivityWatcher: @unchecked Sendable {
-    // MARK: Tunables
+    // MARK: Capture boundaries
 
     /// Five minutes is a capture boundary, not a UI preference: a smaller
     /// value makes ordinary pauses look like app changes and a larger one
     /// silently overstates every inactive session.
     public static let defaultIdleThreshold: TimeInterval = 300
+    static let tickInterval: TimeInterval = 60
 
     /// How much newer than the agent's OWN last motor event the system's last
     /// input has to be before the idle-resume watch reads it as a person coming
@@ -98,28 +47,10 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// separation so it survives a tick that is far longer than the window.
     static let agentMotorSeparation: TimeInterval = NativeAgentMotorEpoch.defaultWindow
 
-    /// Kept as a static for source compatibility; the authority is
-    /// `ActivityPolicy.alwaysExcludedBundleIDs`, which cannot be overridden.
-    public static var nativeAgentBundleIDs: Set<String> {
-        ActivityPolicy.alwaysExcludedBundleIDs.subtracting([loginWindowBundleID])
-    }
-
     /// A frontmost reading of loginwindow is a LOCK SIGNAL, never a span.
     /// While locked, AX still answers and returns the bare app name — data that
     /// looks completely real (P0 blocker finding).
     public static let loginWindowBundleID = "com.apple.loginwindow"
-
-    public struct Status: Sendable {
-        public var spansOpened: Int
-        public var eventsRecorded: Int
-        public var titlesCaptured: Int
-        public var currentApp: String?
-        public var isPaused: Bool
-        public var isLocked: Bool
-        /// Distinguishes an enabled capture policy from a watcher that actually
-        /// retained the workspace notification set which supplies app changes.
-        public var workspaceObserversInstalled: Bool
-    }
 
     public enum LifecycleState: String, Sendable, Equatable {
         case stopped
@@ -132,67 +63,34 @@ public final class ActivityWatcher: @unchecked Sendable {
     // MARK: Stored state
 
     private let store: ActivitySpanStore
-    /// Retention is part of the capture owner: a running watcher must enforce
-    /// its own bounded history without relying on a settings-screen mutation.
-    private let retentionRunner: ActivityRetentionRunner
-    private let clock: ActivityClock
-    private let idleThreshold: TimeInterval
-    private let heartbeatInterval: TimeInterval
-    private let ownProcessID: pid_t
-    /// Out-of-band policy changes (W-live-fix, 2026-08-14). `nil` means this
-    /// watcher watches no file — the default, which keeps every existing
-    /// caller, test and simulation constructing exactly what it did before.
-    private let policySource: (any ActivityPolicySource)?
+    private let clock = SystemActivityClock()
+    private let idleThreshold = ActivityWatcher.defaultIdleThreshold
+    private let ownProcessID = ProcessInfo.processInfo.processIdentifier
     private let lifecycleChanged: (@Sendable (LifecycleState) -> Void)?
-    private let policyChanged: (@Sendable (ActivityPolicy) -> Void)?
-    private let workspaceObserverSource: ActivityWorkspaceObserverSource
-    /// Deterministic direct-event harnesses can retain PID lifecycle matching
-    /// without asking macOS to attach AX to a synthetic process identifier.
-    private let accessibilityObservationEnabled: Bool
-    private let motorEpochIsAgentDriven: @Sendable () -> Bool
-    private let idleSecondsSinceLastInput: @Sendable () -> Double
-    /// Age of the agent's own last synthesized motor event. Compared against
-    /// `idleSecondsSinceLastInput` so a tick far longer than the motor epoch's
-    /// window can still tell our input apart from the human's.
-    private let secondsSinceLastAgentMotorInput: @Sendable () -> Double
-    /// `nil` retains the real frontmost-app lock reconciliation. A supplied
-    /// value is a platform seam for deterministic observer/tick verification.
-    private let lockProbe: (@Sendable () -> Bool?)?
-    /// Where to publish the human-presence stamp, or `nil` to publish nothing.
-    /// `nil` is the default so every existing caller — every test, every
-    /// simulation — writes no file at all outside the app.
-    private let presenceStampURL: URL?
+    private let presenceTransitionURL: URL
 
     // Cross-thread scalars. Guarded by `lock`.
     private let lock = NSLock()
     private var _runLoop: CFRunLoop?
     private var _captureCommandSource: CFRunLoopSource?
     private var _captureBlocks: [@Sendable () -> Void] = []
-    private var _paused = false
     private var _stopping = false
     private var _stopRequested = false
     private var _restartAfterStop = false
     private var _lifecycleState: LifecycleState = .stopped
     /// Mirror of `policy.captureEnabled`, readable off the capture thread. The
-    /// engine owns the authoritative copy; this exists because `start()` has to
-    /// decide whether to create the capture thread BEFORE there is one to ask.
+    /// engine owns the authoritative copy; `startBounded()` must decide whether
+    /// to create the capture thread BEFORE there is one to ask.
     private var _captureEnabled: Bool
     /// The last policy actually pushed through `updatePolicy`. Compared against
-    /// what the policy source hands back so an unchanged (or merely re-saved)
-    /// policy file does not churn the engine once a minute.
+    /// incoming policy changes so queued updates use the latest authority.
     private var _lastKnownPolicy: ActivityPolicy
     /// Whether the observers/thread/pump are currently installed.
     private var _installed = false
-    private var _spansOpened = 0
-    private var _eventsRecorded = 0
-    private var _titlesCaptured = 0
-    private var _currentApp: String?
-    private var _lockedFlag = false
-    private var _workspaceObserverRegistration: ActivityWorkspaceObserverRegistration?
-    private var _retentionRunning = false
+    private var _workspaceObserverTokens: [NSObjectProtocol] = []
 
     // Capture-thread-only. Never touched off the capture thread.
-    /// THE state machine. Same type the simulator drives.
+    /// The span state machine.
     private var engine: ActivitySpanEngine
     private var observer: AXObserver?
     private var observerContext: ActivityObserverContext?
@@ -202,16 +100,11 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// running so ordinary interaction can reopen it. Cleared the moment a span
     /// opens again, or when the timer stops for any other reason.
     private var idleResumeWatch = false
-    /// MONOTONIC time of the last presence-stamp write. 2026-09-06: this was a
-    /// wall value, so a backward clock step (an NTP correction, a manual set)
-    /// parked the throttle in the future and the stamp stopped refreshing
-    /// until wall time caught up. `-.infinity` so the first live tick publishes.
-    private var lastPresenceStampWrite: Double = -.infinity
     /// Last present/away conclusion actually published, or nil before the first
     /// one. Only a CHANGE touches the transition file the scheduler watches.
     private var lastPublishedPresence: Bool?
-    /// The tick is alive purely to keep the presence stamp fresh: no span, no
-    /// observer, no title. Set when the frontmost app is privacy-excluded, this
+    /// The tick watches presence crossings without a span, AX observer, or
+    /// title. Set when the frontmost app is privacy-excluded, this
     /// process, or unidentifiable — states where the person is still at the Mac
     /// but nothing may be recorded about what they are doing.
     private var presenceOnlyWatch = false
@@ -233,52 +126,16 @@ public final class ActivityWatcher: @unchecked Sendable {
 
     public init(
         store: ActivitySpanStore,
-        policy: ActivityPolicy = ActivityPolicy(),
-        clock: ActivityClock = SystemActivityClock(),
-        idleThreshold: TimeInterval = ActivityWatcher.defaultIdleThreshold,
-        heartbeatInterval: TimeInterval = 60,
-        retentionRunner: ActivityRetentionRunner? = nil,
-        workspaceObserverSource: ActivityWorkspaceObserverSource = .system,
-        accessibilityObservationEnabled: Bool = true,
-        motorEpochIsAgentDriven: @escaping @Sendable () -> Bool = {
-            NativeAgentMotorEpoch.isAgentDriven()
-        },
-        idleSecondsSinceLastInput: @escaping @Sendable () -> Double = {
-            CGEventSource.secondsSinceLastEventType(
-                .combinedSessionState, eventType: CGEventType(rawValue: ~0) ?? .null
-            )
-        },
-        secondsSinceLastAgentMotorInput: @escaping @Sendable () -> Double = {
-            NativeAgentMotorEpoch.secondsSinceLastAgentMotorEvent()
-        },
-        lockProbe: (@Sendable () -> Bool?)? = nil,
-        policySource: (any ActivityPolicySource)? = nil,
+        policy: ActivityPolicy,
         lifecycleChanged: (@Sendable (LifecycleState) -> Void)? = nil,
-        policyChanged: (@Sendable (ActivityPolicy) -> Void)? = nil,
-        presenceStampURL: URL? = nil
+        presenceTransitionURL: URL
     ) {
         self.store = store
-        self.retentionRunner = retentionRunner ?? ActivityRetentionRunner(databaseURL: store.databaseURL)
-        self.clock = clock
         self.engine = ActivitySpanEngine(policy: policy)
         self._captureEnabled = policy.captureEnabled
         self._lastKnownPolicy = policy
-        self.idleThreshold = idleThreshold
-        self.heartbeatInterval = heartbeatInterval
-        self.ownProcessID = ProcessInfo.processInfo.processIdentifier
-        self.policySource = policySource
-        self.workspaceObserverSource = workspaceObserverSource
-        self.accessibilityObservationEnabled = accessibilityObservationEnabled
-        self.motorEpochIsAgentDriven = motorEpochIsAgentDriven
-        self.idleSecondsSinceLastInput = idleSecondsSinceLastInput
-        self.secondsSinceLastAgentMotorInput = secondsSinceLastAgentMotorInput
-        self.lockProbe = lockProbe
         self.lifecycleChanged = lifecycleChanged
-        self.policyChanged = policyChanged
-        self.presenceStampURL = presenceStampURL
-        // The caller passed us the policy it just loaded off disk; priming here
-        // stops the first poll from re-applying that identical policy.
-        (policySource as? ActivityPolicyFileSource)?.prime()
+        self.presenceTransitionURL = presenceTransitionURL
     }
 
     // MARK: - Lifecycle
@@ -291,7 +148,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// the Trust Center toggle is explicitly enabled**, and it is structural
     /// rather than conventional in three specific ways.
     ///
-    ///  1. `start()` returns having installed NOTHING when the policy says
+    ///  1. `startBounded()` returns having installed NOTHING when the policy says
     ///     off — no `AXObserver`, no `NSWorkspace` observer, no distributed
     ///     lock observer, no capture thread, no run loop, no pump. There is no
     ///     later `if` to forget: the machinery does not exist to be triggered.
@@ -299,8 +156,8 @@ public final class ActivityWatcher: @unchecked Sendable {
     ///     the whole apparatus; on→off tears it down and closes the open span,
     ///     which is what makes a Trust Center flip an INSTANT pause instead of
     ///     a restart-scoped one.
-    ///  3. The default is off, and `ActivityPolicyStore.load()` maps a missing
-    ///     OR unreadable OR garbage policy file to the safe default. A fresh
+    ///  3. The controller keeps capture off when the policy is missing or
+    ///     unavailable. A fresh
     ///     install captures nothing without a deliberate click.
     ///
     /// `ActivitySpanEngine` independently refuses to open a span while
@@ -317,43 +174,16 @@ public final class ActivityWatcher: @unchecked Sendable {
 
     /// True only when the observers are actually installed and running — what
     /// the menu-bar indicator renders. Distinct from `isCaptureEnabled`: an
-    /// enabled-but-paused watcher shows no indicator, because it is recording
-    /// nothing.
+    /// enabled-but-stopped watcher shows no indicator.
     public var isCapturing: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return _installed && !_paused && !_stopping && !_stopRequested
+        return _installed && !_stopping && !_stopRequested
             && _lifecycleState != .degraded
     }
 
     public var lifecycleState: LifecycleState {
         withLock { _lifecycleState }
-    }
-
-    /// Starts the pump, the capture thread, and the workspace observers —
-    /// **unless the policy says capture is off**, in which case this installs
-    /// nothing at all and returns immediately. See `isCaptureEnabled`.
-    public func start() {
-        let enabled = withLock { () -> Bool in
-            guard _captureEnabled else { return false }
-            if _stopping || _stopRequested {
-                _restartAfterStop = true
-                return false
-            }
-            return true
-        }
-        guard enabled else {
-            // REFUSED. No observer, no thread, no span, no pump. The caller is
-            // free to call `start()` unconditionally at launch; the policy is
-            // what decides, and it decides here rather than in five callers.
-            return
-        }
-        guard beginStartInstalled() else { return }
-        started.lock()
-        while !isThreadReady { started.wait() }
-        started.unlock()
-        transitionLifecycle(to: .running)
-        scheduleRetentionIfDue()
     }
 
     /// App-facing startup that never parks the main actor on an AX/run-loop
@@ -362,7 +192,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     @discardableResult
     public func startBounded(timeout: TimeInterval = 5) async -> Bool {
         let enabled = withLock { () -> Bool in
-            guard _captureEnabled else { return false }
+            guard !Task.isCancelled, _captureEnabled else { return false }
             if _stopping || _stopRequested {
                 _restartAfterStop = true
                 return false
@@ -374,12 +204,13 @@ public final class ActivityWatcher: @unchecked Sendable {
             return lifecycleState == .running || lifecycleState == .starting
         }
         guard await waitForThreadReady(timeout: timeout) else {
+            guard !Task.isCancelled else { return false }
             transitionLifecycle(to: .degraded)
             await stop()
             return false
         }
+        guard !Task.isCancelled else { return false }
         transitionLifecycle(to: .running)
-        scheduleRetentionIfDue()
         return true
     }
 
@@ -388,6 +219,10 @@ public final class ActivityWatcher: @unchecked Sendable {
     @discardableResult
     private func beginStartInstalled() -> Bool {
         lock.lock()
+        guard !Task.isCancelled else {
+            lock.unlock()
+            return false
+        }
         if _installed || _stopping || _stopRequested {
             if _captureEnabled { _restartAfterStop = true }
             lock.unlock()
@@ -514,7 +349,6 @@ public final class ActivityWatcher: @unchecked Sendable {
             _runLoop = nil
             _stopping = false
             _stopRequested = false
-            _currentApp = nil
             _lifecycleState = .stopped
             let shouldRestart = _restartAfterStop && _captureEnabled
             _restartAfterStop = false
@@ -598,61 +432,6 @@ public final class ActivityWatcher: @unchecked Sendable {
         Task { [weak self] in await self?.stop() }
     }
 
-    /// Runs retention once per durable due boundary. It is deliberately
-    /// independent of the capture pump: a failed prune must not make an
-    /// otherwise healthy privacy-gated recorder stop observing, and concurrent
-    /// startup/tick requests coalesce into one run.
-    private func scheduleRetentionIfDue() {
-        let policy = withLock { () -> ActivityPolicy? in
-            guard !_retentionRunning else { return nil }
-            _retentionRunning = true
-            return _lastKnownPolicy
-        }
-        guard let policy else { return }
-        let runner = retentionRunner
-        let store = store
-        let now = clock.wallNow()
-        Task { [weak self] in
-            defer {
-                if let self {
-                    self.withLock { self._retentionRunning = false }
-                }
-            }
-            do {
-                _ = try await runner.runIfDue(store: store, policy: policy, now: now)
-            } catch {
-                FileHandle.standardError.write(
-                    Data("activity-watch: retention failed: \(error)\n".utf8)
-                )
-            }
-        }
-    }
-
-    public func pause() {
-        lock.lock()
-        let wasPaused = _paused
-        _paused = true
-        lock.unlock()
-        guard !wasPaused else { return }
-        onCaptureThread { [weak self] in
-            guard let self else { return }
-            self.feed(.terminate(at: self.safeNow()))
-            self.detachObserver()
-            self.stopTickTimer()
-        }
-    }
-
-    public func resume() {
-        lock.lock()
-        let wasPaused = _paused
-        _paused = false
-        lock.unlock()
-        guard wasPaused else { return }
-        onCaptureThread { [weak self] in
-            self?.seedFromFrontmostApplication()
-        }
-    }
-
     /// Swap the privacy policy while running (the user edited exclusions, or
     /// flipped the master toggle in Trust Center).
     ///
@@ -691,7 +470,6 @@ public final class ActivityWatcher: @unchecked Sendable {
         let stopPending = _stopping || _stopRequested
         lock.unlock()
         if announceStopping { lifecycleChanged?(.stopping) }
-        policyChanged?(policy)
 
         switch (wasEnabled || installed, policy.captureEnabled) {
         case (_, false):
@@ -723,76 +501,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         }
     }
 
-    /// Re-read the policy FILE and apply it if it changed out of band.
-    ///
-    /// THE THIRD HALF OF THE RUNTIME FENCE (live-run defect, 2026-08-14).
-    /// `updatePolicy` makes the in-app Trust Center toggle an instant pause, but
-    /// it is only reached when something in THIS process calls it. A running
-    /// watcher was blind to every other writer of `activity_policy.json`: a live
-    /// run disabled capture through an out-of-band policy write and the
-    /// watcher kept recording, adding 4 more rows over the next 40 seconds.
-    ///
-    /// **Worst-case bound: an out-of-band disable takes effect within one tick**
-    /// (`heartbeatInterval`, 60 s by default), or at the next app activation,
-    /// whichever lands first. It cannot be worse than that: the tick fires
-    /// while a span is open, and the activation path is the only way a span can
-    /// be opened when no tick timer is running.
-    ///
-    /// Cost per call is one `stat`. The JSON is decoded only when the file's
-    /// modification date or size actually moved — see `ActivityPolicyFileSource`.
-    ///
-    /// THE POLL IS A SAFETY VALVE, NOT A CONTROL CHANNEL (gpt-5.5 BLOCKING,
-    /// 2026-08-14). It can only ever make capture LESS permissive.
-    ///
-    /// `ActivityPolicy`'s decoder defaults every missing key, deliberately, so
-    /// an older build's file still loads. The consequence is that a TORN or
-    /// partial external write — `{"captureEnabled":true}` landing mid-rewrite,
-    /// or a hand edit, or any process that is not the Trust Center — decodes as
-    /// a perfectly valid ENABLED policy with default exclusions. Applying that
-    /// verbatim would let a file nobody deliberately wrote turn capture on and
-    /// simultaneously drop every exclusion the user had added. So the polled
-    /// policy is passed through `safelyPolled` first, and:
-    ///
-    ///   * `captureEnabled == false` applies verbatim — disabling is always
-    ///     allowed and always safe, and it is the direction the poll exists for;
-    ///   * `captureEnabled == true` on a currently-DISABLED watcher is IGNORED
-    ///     outright. Turning capture on is a deliberate, user-driven act and it
-    ///     goes through the in-app Trust Center path (`updatePolicy` called
-    ///     directly), which no file write can impersonate;
-    ///   * on → on applies the rest, but never loosens privacy: exclusions are
-    ///     UNIONED with the current set (the poll cannot un-exclude an app),
-    ///     `captureTitles` / `browserTitlesEnabled` can only go true→false,
-    ///     `appNameOnlyMode` can only go false→true, and `retentionDays` can
-    ///     only shrink. Tightening in every direction; loosening in none.
-    ///
-    /// The cost of the asymmetry is stated plainly: an out-of-band ENABLE, or a
-    /// legitimate out-of-band widening (the user re-enabling titles by editing
-    /// the file), needs the in-app path or a restart. That is the correct trade
-    /// — being late to loosen is an inconvenience, being early to loosen is a
-    /// privacy defect.
-    ///
-    /// STATED LIMIT, in the same direction: an out-of-band disable is not picked
-    /// up by a fully STOPPED watcher either, because both poll sites live on the
-    /// capture thread and a stopped watcher has neither a tick timer nor an
-    /// observer — but a stopped watcher is recording nothing anyway.
-    ///
-    /// `@discardableResult` and public so the out-of-band path is testable
-    /// headlessly, with no window server and no wall-clock minute to wait for.
-    @discardableResult
-    public func pollPolicySource() -> Bool {
-        guard let policySource else { return false }
-        guard let polled = policySource.reloadIfChanged() else { return false }
-        let (current, enabled) = withLock { (_lastKnownPolicy, _captureEnabled) }
-        guard let safe = Self.safelyPolled(polled, current: current, currentlyEnabled: enabled)
-        else { return false }
-        guard safe != current else { return false }
-        updatePolicy(safe)
-        return true
-    }
-
-    /// The one-way clamp behind `pollPolicySource`. `nil` means "this polled
-    /// policy may not be applied at all". Static and internal so the asymmetry
-    /// is testable directly, without a running capture thread.
+    /// External file changes may only tighten the current capture policy.
     static func safelyPolled(
         _ polled: ActivityPolicy, current: ActivityPolicy, currentlyEnabled: Bool
     ) -> ActivityPolicy? {
@@ -809,7 +518,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         // false → true is loosening, so it is refused; true → false is tightening.
         safe.captureTitles = polled.captureTitles && current.captureTitles
         safe.browserTitlesEnabled = polled.browserTitlesEnabled && current.browserTitlesEnabled
-        // Model-provider access is a separate explicit consent. A file poll
+        // Model-provider access is a separate explicit consent. A file change
         // can turn it off, never on.
         safe.allowModelAccess = polled.allowModelAccess && current.allowModelAccess
         // The one flag whose TRUE is the private setting: it can only go on.
@@ -830,27 +539,13 @@ public final class ActivityWatcher: @unchecked Sendable {
     private func applyPolicyOnCaptureThread() {
         let apply: @Sendable () -> Void = { [weak self] in
             guard let self else { return }
-            // A queued UI update must not restore a policy superseded by a poll.
+            // A queued UI update must not restore a superseded policy.
             let policy = self.withLock { self._lastKnownPolicy }
             self.emit(self.engine.updatePolicy(policy, at: self.safeNow()))
         }
         let runLoop = withLock { _runLoop }
         if let runLoop, CFRunLoopGetCurrent() === runLoop { apply() }
         else { onCaptureThread(apply) }
-    }
-
-    public func status() -> Status {
-        lock.lock()
-        defer { lock.unlock() }
-        return Status(
-            spansOpened: _spansOpened,
-            eventsRecorded: _eventsRecorded,
-            titlesCaptured: _titlesCaptured,
-            currentApp: _currentApp,
-            isPaused: _paused,
-            isLocked: _lockedFlag,
-            workspaceObserversInstalled: _workspaceObserverRegistration != nil
-        )
     }
 
     // MARK: - Capture thread
@@ -905,8 +600,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         started.unlock()
 
         // `CFRunLoopRun()` may return `.finished` when AX observation is
-        // unavailable (permission missing, a transient process, or a
-        // deterministic harness with AX deliberately disabled). The watcher
+        // unavailable (permission missing or a transient process). The watcher
         // still owns workspace, sleep, and policy events in that state, so a
         // missing AX source must not silently kill the capture thread while
         // lifecycle state continues to report `.running`.
@@ -961,49 +655,49 @@ public final class ActivityWatcher: @unchecked Sendable {
     }
 
     private func emit(_ commands: [ActivityStoreCommand]) {
-        guard !commands.isEmpty else { return }
-        var opened = 0
-        var events = 0
-        var titles = 0
-        var current: String??
         for command in commands {
-            switch command {
-            case .open(let span):
-                opened += 1
-                current = .some(span.appName)
-                if span.titleRedacted != nil { titles += 1 }
+            if case .open(let span) = command {
                 spanStartWall = span.startedAt
                 spanStartMono = clock.monotonicNow()
-            case .touch:
-                events += 1
-            case .retitle(_, let title, _):
-                // The store counts a retitle as an event (a title arriving is
-                // evidence the human did something), so the in-memory counter
-                // has to agree or `status()` drifts from the database.
-                events += 1
-                if title != nil { titles += 1 }
-            case .close:
-                current = .some(nil)
-            case .heartbeat, .reconcileAbandoned:
-                break
             }
             continuation?.yield(command)
         }
-        lock.lock()
-        _spansOpened += opened
-        _eventsRecorded += events
-        _titlesCaptured += titles
-        if let current { _currentApp = current }
-        lock.unlock()
     }
 
     // MARK: - Workspace notifications
 
     private func installWorkspaceObservers() {
-        let registration = workspaceObserverSource.install { [weak self] event in
+        let handler: @Sendable (ActivityWorkspaceEvent) -> Void = { [weak self] event in
             self?.onCaptureThread { [weak self] in self?.handleWorkspaceEvent(event) }
         }
-        withLock { _workspaceObserverRegistration = registration }
+        let center = NSWorkspace.shared.notificationCenter
+        var tokens: [NSObjectProtocol] = []
+        tokens.append(center.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil
+        ) { note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            handler(.activate(bundleId: app?.bundleIdentifier, appName: app?.localizedName,
+                              pid: app?.processIdentifier))
+        })
+        tokens.append(center.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil
+        ) { note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            handler(.terminate(pid: app?.processIdentifier))
+        })
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
+            tokens.append(center.addObserver(forName: name, object: nil, queue: nil) { _ in handler(.sleep) })
+        }
+        tokens.append(center.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: nil
+        ) { _ in handler(.wake) })
+        tokens.append(center.addObserver(
+            forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: nil
+        ) { _ in handler(.sessionResignedActive) })
+        tokens.append(center.addObserver(
+            forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: nil
+        ) { _ in handler(.sessionBecameActive) })
+        withLock { _workspaceObserverTokens = tokens }
     }
 
     private func handleWorkspaceEvent(_ event: ActivityWorkspaceEvent) {
@@ -1017,7 +711,6 @@ public final class ActivityWatcher: @unchecked Sendable {
             screensAsleep = true
             feed(.sleep(at: safeNow()))
             standDownAway()
-            publishLocked(true)
         case .wake:
             guard screensAsleep else { return }
             screensAsleep = false
@@ -1028,7 +721,6 @@ public final class ActivityWatcher: @unchecked Sendable {
             sessionInactive = true
             feed(.lock(at: safeNow()))
             standDownAway()
-            publishLocked(true)
         case .sessionBecameActive:
             sessionInactive = false
             feed(.unlock(at: safeNow()))
@@ -1056,7 +748,6 @@ public final class ActivityWatcher: @unchecked Sendable {
                 self.screenLockedByNotification = true
                 self.feed(.lock(at: self.safeNow()))
                 self.standDownAway()
-                self.publishLocked(true)
             }
         })
         lockTokens.append(center.addObserver(
@@ -1077,11 +768,12 @@ public final class ActivityWatcher: @unchecked Sendable {
     }
 
     private func removeWorkspaceObservers() {
-        let registration = withLock { () -> ActivityWorkspaceObserverRegistration? in
-            defer { _workspaceObserverRegistration = nil }
-            return _workspaceObserverRegistration
+        let tokens = withLock { () -> [NSObjectProtocol] in
+            defer { _workspaceObserverTokens = [] }
+            return _workspaceObserverTokens
         }
-        registration?.cancel()
+        let center = NSWorkspace.shared.notificationCenter
+        for token in tokens { center.removeObserver(token) }
         let distributed = DistributedNotificationCenter.default()
         for token in lockTokens { distributed.removeObserver(token) }
         lockTokens = []
@@ -1094,20 +786,13 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// notification must degrade to "no span", never to "a confident wrong span".
     private func reconcileLocked() -> Bool {
         if screensAsleep || sessionInactive || screenLockedByNotification {
-            publishLocked(true)
             return true
         }
-        if let injected = lockProbe?() {
-            publishLocked(injected)
-            return injected
-        }
         let front = NSWorkspace.shared.frontmostApplication
-        let locked = Self.isLockSignal(
+        return Self.isLockSignal(
             bundleId: front?.bundleIdentifier,
             localizedName: front?.localizedName
         )
-        publishLocked(locked)
-        return locked
     }
 
     /// Pure predicate so the lock gate is testable without a locked screen.
@@ -1118,19 +803,6 @@ public final class ActivityWatcher: @unchecked Sendable {
         return bundleId == nil && localizedName == nil
     }
 
-    private func publishLocked(_ locked: Bool) {
-        lock.lock()
-        _lockedFlag = locked
-        if locked { _currentApp = nil }
-        lock.unlock()
-    }
-
-    private var isPaused: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _paused
-    }
-
     private var isStopping: Bool {
         withLock { _stopping || _stopRequested }
     }
@@ -1138,7 +810,6 @@ public final class ActivityWatcher: @unchecked Sendable {
     // MARK: - Span handling (capture thread)
 
     private func seedFromFrontmostApplication() {
-        guard !isPaused else { return }
         if reconcileLocked() {
             feed(.lock(at: safeNow()))
             standDownAway()
@@ -1163,34 +834,21 @@ public final class ActivityWatcher: @unchecked Sendable {
         // exactly the guarantee the toggle is supposed to make. Reading the
         // lock-guarded flag here closes the window regardless of queue order.
         //
-        // Polled FIRST so an out-of-band disable cannot be beaten by an app
-        // switch: without this, a watcher whose tick timer had stopped (idle,
-        // lock, terminated app) would open a fresh span here — under a policy
-        // that says off on disk — and only notice a whole tick later.
-        pollPolicySource()
         guard isCaptureEnabled else { return }
         guard !isStopping else { return }
-        guard !isPaused else { return }
 
         // An activation immediately following NativeAgent's own bounded motor
         // epoch is agent-driven provenance, not evidence that the person chose
         // this app. Close any human span and record nothing for this edge.
-        guard !motorEpochIsAgentDriven() else {
+        guard !NativeAgentMotorEpoch.isAgentDriven() else {
             feed(.activate(
                 bundleId: ActivityPolicy.selfProcessBundleID,
                 appName: "agent-driven",
                 at: safeNow()
             ))
             detachObserver()
-            // 2026-09-06: this stopped the tick outright, which also stopped the
-            // human-presence stamp — so an agent-driven activation left the
-            // stamp to go stale within five minutes while the person was
-            // sitting right there, the trigger scheduler fell back to chat
-            // quiet, and an idle check-in arrived at their elbow. The
-            // presence-only watch is the same answer the excluded-app path
-            // already uses: the tick survives writing nothing but the stamp,
-            // and the stamp's own provenance fence still refuses to publish
-            // while the last input was the agent's.
+            // Keep observing presence without attributing the agent's input
+            // to the human or recording the excluded app.
             enterPresenceOnlyWatch()
             // Observe without opening a span. The first later AX event outside
             // the bounded motor epoch is evidence the human took over this app;
@@ -1201,12 +859,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         }
 
         // Lock gate FIRST — while locked AX answers with plausible garbage.
-        // An injected probe is authoritative for deterministic platform
-        // boundary runs; otherwise a real loginwindow seed on the host would
-        // permanently gate the engine before the injected activation arrives.
-        let locked = lockProbe != nil
-            ? reconcileLocked()
-            : Self.isLockSignal(bundleId: bundleId, localizedName: appName) || reconcileLocked()
+        let locked = Self.isLockSignal(bundleId: bundleId, localizedName: appName) || reconcileLocked()
         if locked {
             feed(.lock(at: safeNow()))
             standDownAway()
@@ -1267,9 +920,7 @@ public final class ActivityWatcher: @unchecked Sendable {
 
         // Only NOW, with the span already open, is a title read attempted — and
         // only if policy allows it for this specific app.
-        if accessibilityObservationEnabled {
-            captureTitleIfAllowed(pid: pid, bundleID: bundleId)
-        }
+        captureTitleIfAllowed(pid: pid, bundleID: bundleId)
     }
 
     private func handleTermination(pid: pid_t?) {
@@ -1282,28 +933,15 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// One processed AX event. Runs on the capture thread (run-loop source);
     /// never awaits the actor.
     fileprivate func handleAXEvent(notification: String) {
-        guard !isPaused else { return }
         guard !isStopping else { return }
         // AX notifications caused by our own click/type/set-value must not be
         // counted as human focus events. A later physical app activation or AX
         // event outside the bounded motor epoch resumes ordinary attribution.
-        guard !motorEpochIsAgentDriven() else { return }
+        guard !NativeAgentMotorEpoch.isAgentDriven() else { return }
         if engine.openSpan == nil {
             seedFromFrontmostApplication()
             return
         }
-        // RECONCILE THE POLICY AT EVERY WRITE SITE (second pass, 2026-08-14).
-        //
-        // The poll already ran at span-OPEN (handleActivation) and on the tick,
-        // so an out-of-band disable could never let a NEW span start. But the
-        // touch path is also a write: without this, the span that was already
-        // open kept accumulating events and last_seen_at for up to a full 60 s
-        // tick after the user's disable landed on disk. Polling here makes the
-        // rule uniform — every place the engine can write to the store
-        // reconciles the policy first — and it is cheap: a stat is ~1 µs against
-        // the 63 µs AX read this callback is about to do anyway, and the JSON is
-        // only decoded when the file's stamp actually moves.
-        pollPolicySource()
         // RUNTIME FENCE, RE-CHECKED AT THE EVENT (gpt-5.5 BLOCKING, 2026-08-14).
         //
         // `updatePolicy` flips `_captureEnabled` under the lock immediately, but
@@ -1351,7 +989,7 @@ public final class ActivityWatcher: @unchecked Sendable {
             return
         }
         // RE-CHECK THE CAPTURE FENCE IMMEDIATELY BEFORE THE AX READ (gpt-5.5
-        // IMPORTANT, 2026-08-14). The caller polled the policy source and passed
+        // IMPORTANT, 2026-08-14). The caller passed
         // `isCaptureEnabled` earlier in the callback; an out-of-band or Trust
         // Center disable landing in the gap between that check and this read is
         // a real TOCTOU, and this is the LAST instruction before the read. The
@@ -1392,11 +1030,10 @@ public final class ActivityWatcher: @unchecked Sendable {
 
     private func startTickTimer() {
         guard tickTimer == nil else { return }
-        let interval = heartbeatInterval
         let timer = CFRunLoopTimerCreateWithHandler(
             nil,
-            CFAbsoluteTimeGetCurrent() + interval,
-            interval,
+            CFAbsoluteTimeGetCurrent() + Self.tickInterval,
+            Self.tickInterval,
             0,
             0
         ) { [weak self] _ in
@@ -1417,19 +1054,9 @@ public final class ActivityWatcher: @unchecked Sendable {
     }
 
     private func onTick() {
-        guard !isPaused else { return }
         guard !isStopping else { return }
 
-        // (4) re-read the policy file. An out-of-band disable (the probe CLI,
-        // a second process, a hand edit, a restore) is otherwise invisible to a
-        // watcher that is already running. One `stat`; decodes only on change.
-        if pollPolicySource(), !isCaptureEnabled {
-            // Capture just went off. `updatePolicy` has already applied the
-            // engine close and the teardown; nothing further belongs on this
-            // tick, least of all a heartbeat that would extend the row.
-            return
-        }
-        scheduleRetentionIfDue()
+        guard isCaptureEnabled else { return }
 
         // (3) reconcile lock state — a missed notification self-heals in <= 60 s.
         if reconcileLocked() {
@@ -1437,10 +1064,10 @@ public final class ActivityWatcher: @unchecked Sendable {
             standDownAway()
             return
         }
-        // (2.5) publish the human-presence stamp. Deliberately BEFORE the
+        // (2.5) publish presence crossings. Deliberately BEFORE the
         // open-span branch: while the person is away the span is closed, and
         // that is exactly the state the trigger scheduler most needs described.
-        writePresenceStampIfDue()
+        standUpPresent()
 
         guard let span = engine.openSpan else {
             // 2026-09-06: the idle close used to take the AX observer AND this
@@ -1455,7 +1082,7 @@ public final class ActivityWatcher: @unchecked Sendable {
                 stopTickTimer()
                 return
             }
-            // Presence-only: the stamp above is the whole job. Nothing here may
+            // Presence-only: the crossing above is the whole job. Nothing here may
             // seed a span — the frontmost app is one this watcher is not
             // allowed to record, and re-seeding would only re-derive that.
             guard !presenceOnlyWatch else { return }
@@ -1468,7 +1095,7 @@ public final class ActivityWatcher: @unchecked Sendable {
             // has to be newer than the agent's last motor event by a margin
             // before anyone but the human could have produced it.
             let systemIdle = idleSecondsSinceLastInput()
-            let motorAge = secondsSinceLastAgentMotorInput()
+            let motorAge = NativeAgentMotorEpoch.secondsSinceLastAgentMotorEvent()
             guard systemIdle.isFinite, systemIdle <= idleThreshold,
                   systemIdle + Self.agentMotorSeparation < motorAge else { return }
             idleResumeWatch = false
@@ -1499,71 +1126,8 @@ public final class ActivityWatcher: @unchecked Sendable {
         feed(.heartbeat(at: now))
     }
 
-    /// Publish the last input attributable to a PERSON, at most once a minute.
-    ///
-    /// 2026-09-06: the trigger scheduler's `idle` kind measured how long the
-    /// CHAT had been quiet, which says nothing about whether anyone is at the
-    /// Mac. It now reads this stamp too, and only fires when both are quiet.
-    /// The watcher is the writer because it already holds the one signal that
-    /// can tell a person apart from the agent's own synthesized input.
-    ///
-    /// Writes NOTHING when that separation cannot be made, rather than writing
-    /// a guess: an unrefreshed stamp goes stale within
-    /// `HumanPresenceStamp.freshness` and the reader falls back to the signal
-    /// it had before. "We cannot tell" must not read as "nobody is here" —
-    /// that is the direction that fires a check-in at the user's elbow.
-    private func writePresenceStampIfDue() {
-        guard presenceStampURL != nil else { return }
-        // 2026-09-06: the throttle is MONOTONIC. Compared against wall time, a
-        // backward clock step (NTP correction, a hand-set clock) left the last
-        // write sitting in the future and the stamp simply stopped refreshing
-        // until wall time caught up — silently, and in the direction that lets
-        // the reader fall back to chat quiet and fire beside the person.
-        let mono = clock.monotonicNow()
-        guard mono - lastPresenceStampWrite >= HumanPresenceStamp.writeInterval else { return }
-        // The same fence the idle-resume watch applies: the system's last input
-        // has to be newer than the agent's own last motor event by a margin
-        // before anyone but the human could have produced it. A once-a-minute
-        // tick cannot use the 3 s epoch window directly — the two AGES are
-        // compared instead.
-        let now = clock.wallNow()
-        let systemIdle = idleSecondsSinceLastInput()
-        let motorAge = secondsSinceLastAgentMotorInput()
-        guard systemIdle.isFinite, systemIdle >= 0, now.isFinite,
-              systemIdle + Self.agentMotorSeparation < motorAge else { return }
-        publish(
-            lastInputAt: now - systemIdle,
-            at: now,
-            away: false,
-            present: systemIdle <= idleThreshold,
-            mono: mono
-        )
-    }
-
-    /// The one write of both presence files.
-    ///
-    /// The stamp moves every minute; the transition file is touched ONLY when
-    /// the present/away conclusion actually flips. That split is the whole
-    /// point (2026-09-06): the trigger scheduler's event loop watches the
-    /// transition file, so a person coming back after an idle check-in fired
-    /// re-wakes the loop and it recomputes its next crossing there and then,
-    /// instead of waiting up to six hours for the integrity tick. Watching the
-    /// per-minute stamp instead would wake that loop sixty times an hour.
-    private func publish(
-        lastInputAt: Double,
-        at now: Double,
-        away: Bool,
-        present: Bool,
-        mono: Double
-    ) {
-        guard let presenceStampURL else { return }
-        let stamp = HumanPresenceStamp(
-            lastInputAt: Date(timeIntervalSince1970: min(lastInputAt, now)),
-            writtenAt: Date(timeIntervalSince1970: now),
-            away: away
-        )
-        guard stamp.write(to: presenceStampURL) else { return }
-        lastPresenceStampWrite = mono
+    /// Publish only changed conclusions to the scheduler's watched file.
+    private func publish(present: Bool, at now: Double) {
         guard lastPublishedPresence != present else { return }
         // 2026-09-06: `lastPublishedPresence` used to advance BEFORE this write
         // and the write's result was discarded, so ONE failed transition write
@@ -1574,7 +1138,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         guard HumanPresenceStamp.writeTransition(
             present: present,
             at: Date(timeIntervalSince1970: now),
-            to: HumanPresenceStamp.transitionURL(besideStampAt: presenceStampURL)
+            to: presenceTransitionURL
         ) else {
             FileHandle.standardError.write(Data((
                 "ActivityWatcher: presence transition write failed (present=\(present)); "
@@ -1585,78 +1149,36 @@ public final class ActivityWatcher: @unchecked Sendable {
         lastPublishedPresence = present
     }
 
-    /// The teardown every LOCK and SLEEP edge shares.
-    ///
-    /// 2026-09-06: locked counts as AWAY from the lock instant, and this writes
-    /// the one final stamp that says so before the watcher goes quiet. Nothing
-    /// is written while the screen stays locked — an away-marked stamp is the
-    /// writer's deliberate last word rather than a frozen tick, so the reader
-    /// keeps believing it past the ordinary freshness window. Unthrottled: this
-    /// is a crossing, and crossings are rare.
+    /// Lock and sleep publish away before capture stands down.
     private func standDownAway() {
-        if presenceStampURL != nil {
-            let now = clock.wallNow()
-            let systemIdle = idleSecondsSinceLastInput()
-            if now.isFinite {
-                let lastInput = systemIdle.isFinite && systemIdle >= 0 ? now - systemIdle : now
-                publish(
-                    lastInputAt: lastInput,
-                    at: now,
-                    away: true,
-                    present: false,
-                    mono: clock.monotonicNow()
-                )
-            }
-        }
+        let now = clock.wallNow()
+        if now.isFinite { publish(present: false, at: now) }
         detachObserver()
         stopTickTimer()
     }
 
-    /// The counterpart to `standDownAway` at every UNLOCK and WAKE edge.
-    ///
-    /// 2026-09-06: the lock/sleep edge writes an AWAY stamp that the reader
-    /// deliberately keeps believing past the ordinary freshness window — it is
-    /// the writer's last word, not a frozen tick from a writer that died.
-    /// Coming BACK published nothing at all: presence was republished only by
-    /// `onTick`, so the away stamp stayed authoritative for up to a minute, and
-    /// indefinitely whenever the frontmost app on return was one this watcher
-    /// may not record and the tick never restarted. Unthrottled, like the lock
-    /// edge it mirrors: a crossing is rare and it is the whole signal.
+    /// Tick, unlock and wake share the same human-input provenance fence.
     private func standUpPresent() {
-        guard presenceStampURL != nil else { return }
         let now = clock.wallNow()
         guard now.isFinite else { return }
         let systemIdle = idleSecondsSinceLastInput()
-        let motorAge = secondsSinceLastAgentMotorInput()
-        // Same provenance fence the tick applies: an unlock or wake whose only
-        // input was the agent's own synthetic motor event is not evidence that
-        // the person is back.
+        let motorAge = NativeAgentMotorEpoch.secondsSinceLastAgentMotorEvent()
         guard systemIdle.isFinite, systemIdle >= 0,
               systemIdle + Self.agentMotorSeparation < motorAge else { return }
-        publish(
-            lastInputAt: now - systemIdle,
-            at: now,
-            away: false,
-            present: systemIdle <= idleThreshold,
-            mono: clock.monotonicNow()
-        )
+        publish(present: systemIdle <= idleThreshold, at: now)
     }
 
-    /// Keep the tick alive purely to refresh the presence stamp.
-    ///
-    /// 2026-09-06: a privacy-excluded frontmost app (also this process, also an
-    /// unidentifiable one) closed the span, dropped the observer AND stopped
-    /// the tick — so the stamp went stale within five minutes while the person
-    /// was sitting there typing, the trigger scheduler fell back to chat quiet,
-    /// and an idle check-in arrived at their elbow. The tick survives instead,
-    /// writing nothing but the stamp: no span, no heartbeat, no title, no app
-    /// identity. The stamp says "human input at time T" and nothing else, so
-    /// refreshing it in an excluded app discloses nothing the exclusion
-    /// withholds.
+    /// Excluded apps still need present/away crossings, without app metadata.
     private func enterPresenceOnlyWatch() {
         idleResumeWatch = false
         presenceOnlyWatch = true
         startTickTimer()
+    }
+
+    private func idleSecondsSinceLastInput() -> Double {
+        CGEventSource.secondsSinceLastEventType(
+            .combinedSessionState, eventType: CGEventType(rawValue: ~0) ?? .null
+        )
     }
 
     /// The timer's temporal decision, factored only so the exact same boundary
@@ -1674,20 +1196,9 @@ public final class ActivityWatcher: @unchecked Sendable {
         return min(max(spanStartedAt, now - secondsSinceLastInput), now)
     }
 
-    /// Explicit diagnostic/test wake. It runs the real timer body on the
-    /// capture run loop; callers cannot bypass its policy, lock, idle, or store
-    /// boundaries.
-    public func runTickOnce() {
-        onCaptureThread { [weak self] in self?.onTick() }
-    }
-
     // MARK: - AX observer (capture thread only)
 
     private func attachObserver(pid: pid_t) {
-        guard accessibilityObservationEnabled else {
-            observedPID = pid
-            return
-        }
         var created: AXObserver?
         let createErr = AXObserverCreate(pid, activityAXObserverCallback, &created)
         guard createErr == .success, let created else { return }

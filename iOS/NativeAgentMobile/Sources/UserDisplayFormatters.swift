@@ -7,7 +7,20 @@
 import Foundation
 import NativeAgentShared
 
+@MainActor
 enum UserDisplayFormatters {
+    private static let fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let whole = ISO8601DateFormatter()
+    private static let relative: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+    private static var dates: [String: Date] = [:]
     /// Convert an ISO-8601 timestamp (with or without fractional seconds) to
     /// a relative phrase like "5 weeks ago" / "in 3 hours". On parse failure
     /// returns the raw input — better than dropping the field. Power-user UI
@@ -15,26 +28,23 @@ enum UserDisplayFormatters {
     static func humanizeISOTimestamp(_ iso: String) -> String {
         let trimmed = iso.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return "" }
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let date = fmt.date(from: trimmed) ?? ISO8601DateFormatter().date(from: trimmed)
-        guard let date else { return trimmed }
-        let rel = RelativeDateTimeFormatter()
-        rel.unitsStyle = .full
-        return rel.localizedString(for: date, relativeTo: Date())
+        guard let date = parseISOTimestamp(trimmed) else { return trimmed }
+        return relative.localizedString(for: date, relativeTo: Date())
     }
 
     /// Parse an ISO-8601 timestamp to a Date (fractional seconds tolerated).
     static func parseISOTimestamp(_ iso: String) -> Date? {
         let trimmed = iso.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fmt.date(from: trimmed) ?? ISO8601DateFormatter().date(from: trimmed)
+        if let date = dates[trimmed] { return date }
+        guard let date = fractional.date(from: trimmed) ?? whole.date(from: trimmed) else { return nil }
+        if dates.count >= 500, let key = dates.keys.first { dates.removeValue(forKey: key) }
+        dates[trimmed] = date
+        return date
     }
 
     /// Compact duration phrase: "0.4s", "4.6s", "2m 14s", "1h 3m".
-    static func humanizeDuration(_ seconds: Double) -> String {
+    nonisolated static func humanizeDuration(_ seconds: Double) -> String {
         CompactDurationFormatter.string(seconds)
     }
 }

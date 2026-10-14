@@ -84,10 +84,13 @@ package actor ProviderToolResultRecoveryStore {
         let resultClass: ChatToolOutcome.ExactResultClass
         let pageByteOffsets: [Int]
         let sectionBudget: Int
+        let version: JSONValue?
         let createdAt: Date
         /// Last time the model actually read a page. The idle clock runs from
         /// here, not from creation.
         var lastReadAt: Date
+        var sectionProjection: [(value: JSONValue, text: String, bytes: Int)]?
+        var sectionPages: (query: String, pages: [[JSONValue]])?
     }
 
     private let root: URL
@@ -188,6 +191,7 @@ package actor ProviderToolResultRecoveryStore {
         }
 
         let now = Date()
+        let version: JSONValue? = if case .object(let fields)? = try? JSONValue.parse(data) { fields["version"] } else { nil }
         let entry = Entry(
             handle: handle,
             toolName: toolName,
@@ -198,6 +202,7 @@ package actor ProviderToolResultRecoveryStore {
             resultClass: originalResultClass ?? Self.resultClass(content: content),
             pageByteOffsets: pageByteOffsets,
             sectionBudget: sectionBudget,
+            version: version,
             createdAt: now,
             lastReadAt: now
         )
@@ -228,6 +233,7 @@ package actor ProviderToolResultRecoveryStore {
             else { next = nil }
             readCursors[scope] = ReadCursor(handle: handle, nextPage: next, query: query)
             object["full_result_retained"] = .bool(true)
+            object["version"] = entries[handle]?.version
             object["next_call"] = next == nil ? .null : .object(["tool": .string("app"), "input": .object([
                 "action": .string("result.page"), "args": .object(["continue": .bool(true), "result_handle": .string(handle)])])])
             result = .object(object)
@@ -271,6 +277,22 @@ package actor ProviderToolResultRecoveryStore {
         return page(handle: entry.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "")
     }
 
+    private func sectionPages(handle: String, entry: Entry, query: String) -> [[JSONValue]]? {
+        if let cached = entry.sectionPages, cached.query == query { return cached.pages }
+        let projection: [(value: JSONValue, text: String, bytes: Int)]
+        if let cached = entry.sectionProjection {
+            projection = cached
+        } else {
+            guard let data = try? Data(contentsOf: entry.url),
+                  let content = String(data: data, encoding: .utf8) else { return nil }
+            projection = ToolResultSections.projection(content: content, budget: entry.sectionBudget)
+            entries[handle]?.sectionProjection = projection
+        }
+        let pages = ToolResultSections.pages(sections: projection, query: query, budget: entry.sectionBudget)
+        entries[handle]?.sectionPages = (query, pages)
+        return pages
+    }
+
     private func readPage(
         handle: String, page: Int, sessionId: String?, turnId: String?, query: String?
     ) -> JSONValue {
@@ -285,9 +307,7 @@ package actor ProviderToolResultRecoveryStore {
                 "recovery_hint": .string("Inspect the original operation's status or durable receipt. Missing output does not establish failure; do not repeat a write or external action merely to recover its output."),
             ])
         }
-        if let query, let data = try? Data(contentsOf: entry.url),
-           let content = String(data: data, encoding: .utf8) {
-            let pages = ToolResultSections.pages(content: content, query: query, budget: entry.sectionBudget)
+        if let query, let pages = sectionPages(handle: handle, entry: entry, query: query) {
             guard pages.indices.contains(page) else {
                 return .object(["status": .string("failed"), "reason": .string("page_out_of_range"),
                     "page_count": .int(Int64(pages.count)),

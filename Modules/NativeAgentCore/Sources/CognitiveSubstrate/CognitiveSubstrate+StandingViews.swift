@@ -439,11 +439,6 @@ extension CognitiveSubstrate {
     /// never leave >cap active views in memory — and `repairStandingViewCapIfNeeded` heals
     /// the store on the next restore if persistence died half-way (gpt-5.5 review,
     /// 2026-07-02). Retired views DELETE their artifact (timeline keeps the history).
-    @discardableResult
-    public func resolveStandingView(id: UUID, approved: Bool) async -> CognitiveStandingView? {
-        await resolveStandingViewChecked(id: id, approved: approved).view
-    }
-
     /// The review and its capacity releases commit together. A failed write
     /// restores the proposal so the same review controls can retry it.
     @discardableResult
@@ -574,11 +569,6 @@ extension CognitiveSubstrate {
     /// route) is a no-op that returns the view unchanged. Lived concerns need
     /// no re-minting call: `livedAppraisalConcerns()` derives them from the
     /// leaning set on every read, so dropping the status IS the re-mint.
-    @discardableResult
-    public func retireStandingView(id: UUID) async -> CognitiveStandingView? {
-        await retireStandingViewChecked(id: id).view
-    }
-
     /// `retireStandingView`, reporting whether the artifact delete reached the
     /// store (2026-09-06) — same reason as `resolveStandingViewChecked`: a
     /// retirement that only happened in memory came back on the next restore
@@ -647,23 +637,15 @@ extension CognitiveSubstrate {
     /// `StudioCanonTurnProvenance` the canon lane already uses, and the point of
     /// taking it as a parameter rather than deriving it here is that this module
     /// CANNOT derive it: the discriminators live in the chat tool loop's
-    /// task-locals. A caller that is not inside her own live local turn cannot
+    /// task-locals. A caller that is not inside her own trusted live turn cannot
     /// produce a complete one — `StudioCanonSeatGate.liveTurnProvenance` returns
     /// `.notALiveTurn` for the bridge tool runner, every approval executor,
-    /// every replay and every background pass, and `.bridgeLane` for a turn
-    /// Claude is steering. So "she adopted this" stays a fact about where the
+    /// every replay and every background pass, and `.untrustedPeer` for a turn
+    /// an untrusted peer is steering. So "she adopted this" stays a fact about where the
     /// call came from rather than a claim the caller makes.
     ///
     /// An incomplete seat is REFUSED (nil), never downgraded to a proposal: a
     /// silent fallback would let an unseated path mint views forever.
-    @discardableResult
-    public func holdStandingView(
-        id: UUID,
-        seat: StudioCanonTurnProvenance
-    ) async -> CognitiveStandingView? {
-        await holdStandingViewChecked(id: id, seat: seat).view
-    }
-
     /// The hold and its capacity releases commit together. A failed write
     /// restores the proposal and displaced views so the same hold can retry.
     @discardableResult
@@ -967,63 +949,22 @@ extension CognitiveSubstrate {
                     line: line,
                     concernKeywords: Array(Set(effective)).sorted(),
                     updatedAt: view.updatedAt,
-                    isHeld: view.status != .active,
-                    onlyWhenRelevant: view.status == .opinion || view.status == .interest
+                    isHeld: view.status != .active
                 )
             }
     }
 
-    /// Select at most one durable view for this turn. The canary is entirely
-    /// presentation-side: disabling it restores the historical newest-active
-    /// line, while active views continue to shape appraisal/disposition either
-    /// way. With the canary on, unrelated chat falls through to the fresher
-    /// reflection takeaway instead of repeating one old worldview every turn.
-    func activeStandingViewInnerLine(
-        relevantTo userMessage: String,
-        candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil,
-        relevanceEnabled: Bool? = nil
-    ) -> String? {
-        activeStandingViewInnerLines(
-            relevantTo: userMessage,
-            candidates: frozenCandidates,
-            relevanceEnabled: relevanceEnabled
-        ).first
-    }
-
-    /// EVERY view that is relevant to this turn, best match first.
-    ///
-    /// The capsule used to receive exactly one line from here, so the Inner
-    /// line's rotation had nothing to rotate BETWEEN while a standing view was
-    /// relevant: the top-ranked view led, rested, and the turn fell through to a
-    /// takeaway even though a second, equally on-topic view was sitting right
-    /// there. Ranked-all lets rotation move across her actual worldview before
-    /// it reaches for a transient seed. Ordering is unchanged for the head of
-    /// the list, so a single-candidate install is byte-identical.
-    func activeStandingViewInnerLines(
-        relevantTo userMessage: String,
-        candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil,
-        relevanceEnabled: Bool? = nil
-    ) -> [String] {
-        activeStandingViewInnerCandidates(
-            relevantTo: userMessage, candidates: frozenCandidates, relevanceEnabled: relevanceEnabled
-        ).map(\.candidate.line)
-    }
-
-    /// The same ranking with each view's relevance score (nil when relevance
-    /// is off) — Phase 5 B0 records it as the reason a view led.
+    /// The same ranking with each view's relevance score — Phase 5 B0 records
+    /// it as the reason a view led.
     func activeStandingViewInnerCandidates(
         relevantTo userMessage: String,
-        candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil,
-        relevanceEnabled: Bool? = nil
+        candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil
     ) -> [(candidate: CognitiveStandingViewCapsuleCandidate, score: Double?)] {
         let candidates = frozenCandidates ?? standingViewCapsuleCandidates()
         guard !candidates.isEmpty else { return [] }
-        let enabled = relevanceEnabled ?? configuration.standingViewCapsuleRelevanceEnabled
-        // TIERED, ALWAYS. Signed views first, held views after — including on
-        // the canary-off path, where relevance is not consulted at all.
+        // Signed views first, held views after.
         let signed = candidates.filter { !$0.isHeld }
         let held = candidates.filter(\.isHeld)
-        guard enabled else { return (signed + held).filter { !$0.onlyWhenRelevant }.map { ($0, nil) } }
         guard !userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         // Each tier is scored WITHIN ITSELF and the lists are concatenated, so a
         // held view can never outrank a signed one however well it matches the
@@ -1061,24 +1002,8 @@ extension CognitiveSubstrate {
     static let standingViewRelevanceMinimumIDF = 0.5
     static let standingViewRelevanceMaximumIDF = 2.0
 
-    static func bestRelevantCandidate(
-        in candidates: [CognitiveStandingViewCapsuleCandidate],
-        for userMessage: String
-    ) -> CognitiveStandingViewCapsuleCandidate? {
-        relevantCandidates(in: candidates, for: userMessage).first
-    }
-
     /// Every candidate clearing the relevance floor, best score first. Ties keep
-    /// the INCOMING order (newest-first), which is what `bestRelevantCandidate`
-    /// has always done — so the head of this list is bit-for-bit the answer that
-    /// function used to compute on its own.
-    static func relevantCandidates(
-        in candidates: [CognitiveStandingViewCapsuleCandidate],
-        for userMessage: String
-    ) -> [CognitiveStandingViewCapsuleCandidate] {
-        scoredRelevantCandidates(in: candidates, for: userMessage).map(\.candidate)
-    }
-
+    /// the incoming order (newest-first).
     static func scoredRelevantCandidates(
         in candidates: [CognitiveStandingViewCapsuleCandidate],
         for userMessage: String
@@ -1151,13 +1076,6 @@ extension CognitiveSubstrate {
                 return lhs.order < rhs.order
             }
             .map { ($0.candidate, $0.score) }
-    }
-
-    /// Compatibility read for non-turn diagnostics. It intentionally retains
-    /// the historical newest-active behavior because no user message exists to
-    /// establish relevance.
-    func activeStandingViewInnerLine() -> String? {
-        activeStandingViewInnerLine(relevantTo: "", relevanceEnabled: false)
     }
 
     // MARK: - Surfaces

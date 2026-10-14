@@ -2,12 +2,10 @@ import Foundation
 
 public enum TurnDeadline {
     /// Run `work` with a hard wall-clock ceiling, returning nil when the ceiling
-    /// wins. The distill runs as an unstructured child so the caller returns
+    /// wins. Work runs as an unstructured child so the caller returns
     /// the moment the ceiling passes: a task group would still wait for a
-    /// stuck provider request to observe its cancellation before the scope
-    /// closed, and this path exists to keep the turn moving. The loser is
-    /// cancelled so a timed-out distill stops paying for tokens the fold will
-    /// not use.
+    /// stuck operation to observe its cancellation before the scope closes.
+    /// The loser is cancelled and its late result is discarded.
     public static func withDeadline<T: Sendable>(
         seconds: TimeInterval,
         _ work: @escaping @Sendable () async throws -> T
@@ -42,14 +40,8 @@ public enum TurnDeadline {
                 Task {
                     await sleeper.value
                     guard !sleeper.isCancelled else { return }
-                    // User, 2026-09-06: CLAIM FIRST, THEN CANCEL — the same
-                    // order the provider completion wall uses. Cancelling the
-                    // child first let cooperative work observe the
-                    // cancellation and win the gate with its own outcome, so a
-                    // deadline expiry arrived as a CancellationError: a tool
-                    // dispatch that ran out its ceiling was reported as a user
-                    // Stop (ToolLoop `runSingleDispatch`) and Workshop turned
-                    // the same race into `.failed` instead of a deadline.
+                    // Claim expiry before cancelling work so a cooperative
+                    // child cannot turn deadline expiry into a user Stop.
                     once.resume(.failure(DeadlineExceeded()))
                     child.cancel()
                 }

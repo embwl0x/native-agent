@@ -17,6 +17,5 @@ public protocol SwarmChatClient: Sendable {
 public protocol SwarmChatClientFactory: Sendable {
     func makeClient(tools: any ToolDispatchClient, dataRoot: URL,
                     approvalFiler: (any ApprovalFiler)?,
-                    providerLifecycleObserver: (any LLMCallLifecycleObserving)?,
-                    codexAdapterFactory: (@Sendable ([String: String]?) -> any LLMAdapter)?) -> any SwarmChatClient
+                    providerLifecycleObserver: (any LLMCallLifecycleObserving)?) -> any SwarmChatClient
 }

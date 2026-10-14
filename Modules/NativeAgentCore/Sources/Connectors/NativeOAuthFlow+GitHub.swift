@@ -142,13 +142,6 @@ extension NativeOAuthFlow {
         }
     }
 
-    public static func loadGitHubToken(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        credentialStore: any GitHubOAuthCredentialPort
-    ) async throws -> String? {
-        try await credentialStore.resolveToken(dataRoot: dataRoot)
-    }
-
     private static func isPlausibleGitHubToken(_ token: String) -> Bool {
         let lower = token.lowercased()
         let acceptedPrefix = lower.hasPrefix("ghp_")

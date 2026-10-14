@@ -3,8 +3,10 @@ import ChatOrchestration
 import Dispatcher
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
+import Privacy
 import TrustCenter
 
 /// The `app` door's posture, page read and setting set.
@@ -363,7 +365,14 @@ extension AppToolExecutor {
 
         var request: String?
         var restoresPrevious = false
-        if ChatTurnRuntimeContext.current != nil {
+        if case .object(let receipt) = Self.undoReceipt {
+            guard receipt["setting"] == .string(setting.id), receipt["old_value"] == input["value"],
+                  receipt["new_value"] == (await setting.read(appModel)) else {
+                return refuse(Self.failure("stale_setting", "The setting changed after that receipt. Read its page again. Nothing was written."))
+            }
+            request = Self.text(receipt["user_request"])
+            restoresPrevious = true
+        } else if ChatTurnRuntimeContext.current != nil {
             request = Self.text(input["because"])
             guard let request, request.split(whereSeparator: \.isWhitespace).count >= 3,
                   let restores = await ChatToolSessionContext.settingRequestEvidence?(setting.id, input["value"] ?? .null, await setting.read(appModel), request) else {
@@ -487,6 +496,10 @@ extension AppToolExecutor {
             try await QuietWriteDetail.$current.withValue(writeDetail) {
                 try await QuietSettings.$fullMac.withValue(posture.name == Self.fullMacModeName) {
                     try await QuietSettings.$restoringPreviousValue.withValue(gated.restoresPrevious) {
+                        if case .object(let receipt) = Self.undoReceipt,
+                           receipt["new_value"] != (await setting.read(appModel)) {
+                            throw QuietSettingError.unavailable("The setting changed after that receipt. Read its page again. Nothing was written.")
+                        }
                         try await write(appModel, requestedValue)
                     }
                 }

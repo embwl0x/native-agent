@@ -6,7 +6,7 @@ import PersistenceCore
 import Desk
 import ApprovalInbox
 import WorkshopExecution
-import TrustCenter
+import AgentWorkspace
 import NotificationInbox
 import Privacy
 
@@ -24,8 +24,7 @@ public struct HeartbeatBackgroundWork: Sendable {
     /// block (stuck executions / Full-Mac expiry / Doctor),
     /// and surfaces deterministic anomalies as stable inbox cards. Clean
     /// assessments make no notice; anomalies use their per-condition template. The checklist read,
-    /// assessment gather, and notice surface are injected so the BackgroundLoops
-    /// module stays dependency-clean (same rule as makeWeeklySelfImprovementLoop).
+    /// assessment gather, and notice surface share this owner.
     public func makeHeartbeatLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> HeartbeatLoop {
@@ -47,8 +46,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             },
             gatherAssessment: {
                 await gatherHeartbeatAssessment(
-                    dataRoot: dataRoot,
-                    interval: interval
+                    dataRoot: dataRoot
                 )
             },
             surfaceNotice: { notice in
@@ -57,28 +55,6 @@ public struct HeartbeatBackgroundWork: Sendable {
                 try await upsertHeartbeatNoticeCard(dataRoot: dataRoot, notice: notice)
             }
         )
-    }
-
-    /// Drop the rows an UNATTENDED sweep is not allowed to judge.
-    ///
-    /// 2026-09-02 incident: two new Doctor-only diagnostic rows graded a
-    /// rolling history window, went red on pre-fix history, and this sweep
-    /// pushed "Doctor has 2 failing checks" to User's phone. Those rows are for
-    /// a person LOOKING at Doctor. The exclusion list is derived from the real
-    /// check registry (`DoctorHeartbeatPolicy`), never restated here, so a
-    /// check's own `heartbeatEligible` flag is the single source of truth.
-    ///
-    /// Returns the rows the heartbeat may judge plus how many it skipped, so
-    /// the signal line can SAY it looked at fewer rows than Doctor shows
-    /// rather than silently narrowing.
-    public func heartbeatEligibleDoctorRows(
-        _ rows: [[String: Any]]
-    ) -> (eligible: [[String: Any]], skipped: Int) {
-        let eligible = rows.filter { row in
-            guard let id = row["id"] as? String else { return true }
-            return DoctorHeartbeatPolicy.isEligible(id)
-        }
-        return (eligible, rows.count - eligible.count)
     }
 
     private struct HeartbeatIssue: Sendable {
@@ -92,7 +68,8 @@ public struct HeartbeatBackgroundWork: Sendable {
     public struct DurableResidueSummary: Sendable, Equatable {
         let staleWorkflowRunCount: Int
         let staleWorkflowRunIDs: [String]
-        let preservedCodexReplyCount: Int
+        let preservedCodexReplyCount: Int?
+        var codexReplyCountText: String { preservedCodexReplyCount.map(String.init) ?? "unavailable" }
         let terminalBridgeMessageCount: Int
         let terminalBridgeMessages: [String]
         let staleBridgeMessageCount: Int
@@ -112,7 +89,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         var signature: String {
             [
                 String(staleWorkflowRunCount),
-                String(preservedCodexReplyCount),
+                codexReplyCountText,
                 String(terminalBridgeMessageCount),
                 String(staleBridgeMessageCount),
                 String(veryOldDeskItemCount),
@@ -122,8 +99,7 @@ public struct HeartbeatBackgroundWork: Sendable {
 
         var signalLine: String {
             "Durable review residue: \(staleWorkflowRunCount) old non-terminal workflow run(s), "
-                + "\(preservedCodexReplyCount) preserved Codex reply/replies "
-                + "(automatic replay inactive by design), "
+                + "saved replies to Codex owed or sent unconfirmed: \(codexReplyCountText), "
                 + "\(terminalBridgeMessageCount) terminal bridge delivery failure(s), "
                 + "\(staleBridgeMessageCount) bridge message(s) unconsumed over 24h, "
                 + "\(veryOldDeskItemCount) open Desk item(s) older than 30d."
@@ -131,66 +107,34 @@ public struct HeartbeatBackgroundWork: Sendable {
     }
 
     private let heartbeatExecutionStuckAge: TimeInterval = 6 * 60 * 60
-    /// A failed candidate is not terminal: it can return to `proposed` after
-    /// correction, but it is otherwise easy to leave indefinitely in the one
-    /// proposal array. Name that stalled branch before it becomes invisible
-    /// behind later, healthy proposals.
 
-    /// Composes the heartbeat's live signal block and deterministic verdict.
-    /// Clean facts return `.clean` so the loop does not spend an LLM call.
+    /// Composes the heartbeat's deterministic verdict and stable inbox cards.
     public func gatherHeartbeatAssessment(
         dataRoot: URL,
-        interval: TimeInterval = HeartbeatLoop.defaultInterval,
         now: Date = Date(),
         bridgeConfigRoot: URL? = nil
     ) async -> HeartbeatAssessment {
-        var sections: [String] = []
         var issues: [HeartbeatIssue] = []
 
-        var doctorOwners: [DoctorOwner: [String]]?
-        do {
-            let body = try await BodyReport.read(dataRoot: dataRoot, now: now)
-            doctorOwners = body.doctorOwners
-            let owners = [DoctorOwner.app, .owner, .agent, .builder].compactMap { owner in
-                body.doctorOwners[owner].map { "\(owner.rawValue) [\($0.joined(separator: ", "))]" }
-            }
-            sections.append("Body: \(body.organsLine); harness open \(body.openHarness.count)"
-                + (body.openHarness.first.map { ", newest \"\($0.title)\"" } ?? "")
-                + (owners.isEmpty ? "" : "; Doctor findings by owner: " + owners.joined(separator: ", ")) + ".")
-        } catch {
-            sections.append("Body: the body report could not be read (\(error.localizedDescription)).")
-        }
+        let doctor = heartbeatDoctorIssue(dataRoot: dataRoot)
+        if let issue = doctor { issues.append(issue) }
 
-        let doctor = heartbeatDoctorSection(dataRoot: dataRoot, doctorOwners: doctorOwners)
-        sections.append(doctor.line)
-        if let issue = doctor.issue { issues.append(issue) }
+        let executions = heartbeatExecutionsIssue(dataRoot: dataRoot, now: now)
+        if let issue = executions { issues.append(issue) }
 
-        let executions = heartbeatExecutionsSection(dataRoot: dataRoot, now: now)
-        sections.append(executions.line)
-        if let issue = executions.issue { issues.append(issue) }
+        let errors = heartbeatErrorBurstIssue(dataRoot: dataRoot, now: now)
+        if let issue = errors { issues.append(issue) }
 
-        let fullMac = await heartbeatFullMacSection(dataRoot: dataRoot)
-        sections.append(fullMac.line)
-        if let issue = fullMac.issue { issues.append(issue) }
-
-        let errors = heartbeatErrorBurstSection(dataRoot: dataRoot, now: now)
-        sections.append(errors.line)
-        if let issue = errors.issue { issues.append(issue) }
-
-        let staleTasks = await heartbeatStaleTaskSection(dataRoot: dataRoot)
-        sections.append(staleTasks.line)
-        if let issue = staleTasks.issue { issues.append(issue) }
-
+        let staleTasks = await heartbeatStaleTaskIssue(dataRoot: dataRoot)
+        if let issue = staleTasks { issues.append(issue) }
 
         let residue = await heartbeatDurableResidueSummary(
             dataRoot: dataRoot,
             bridgeConfigRoot: bridgeConfigRoot,
             now: now
         )
-        sections.append(residue.signalLine)
         await reconcileDurableResidueCard(dataRoot: dataRoot, summary: residue, now: now)
 
-        let signals = sections.joined(separator: "\n")
         let sortedIssues = issues.sorted { lhs, rhs in
             lhs.priority == rhs.priority ? lhs.id < rhs.id : lhs.priority < rhs.priority
         }
@@ -200,136 +144,77 @@ public struct HeartbeatBackgroundWork: Sendable {
         if let primary = sortedIssues.first {
             let detail = heartbeatAlertBody(primary: primary, issues: sortedIssues)
             let assessment = HeartbeatAssessment(
-                signals: signals,
                 deterministicOK: false,
                 conditionId: primary.id,
                 fallbackAlert: detail,
                 actions: primary.actions
             )
-            await writeHeartbeatStatus(
-                dataRoot: dataRoot,
-                interval: interval,
-                now: now,
-                signals: signals,
-                issues: sortedIssues,
-                assessment: assessment
-            )
             return assessment
         }
 
-        let clean = HeartbeatAssessment.clean(signals: signals)
-        await writeHeartbeatStatus(
-            dataRoot: dataRoot,
-            interval: interval,
-            now: now,
-            signals: signals,
-            issues: [],
-            assessment: clean
-        )
-        return clean
+        return HeartbeatAssessment.clean()
     }
 
-    private func heartbeatDoctorSection(
-        dataRoot: URL, doctorOwners: [DoctorOwner: [String]]?
-    ) -> (line: String, healthy: Bool?, issue: HeartbeatIssue?) {
+    private func heartbeatDoctorIssue(dataRoot: URL) -> HeartbeatIssue? {
         let doctorPath = dataRoot.appendingPathComponent("doctor", isDirectory: true)
             .appendingPathComponent("latest.json")
         guard let text = try? String(contentsOf: doctorPath, encoding: .utf8),
               let data = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return (
-                "Doctor: no latest.json (no health snapshot yet).",
-                nil,
-                HeartbeatIssue(
-                    id: "doctor-missing",
-                    summary: "Doctor has no latest health snapshot.",
-                    detail: "Doctor has not written data/doctor/latest.json yet, so heartbeat cannot verify the health checklist.",
-                    priority: 20,
-                    actions: []
-                )
-            )
-        }
-
-        // Malformed/shape-shifted snapshot reads as UNVERIFIABLE, not as
-        // "0 failing" (gpt-5.5 wave-1 NEEDS_FIX).
-        guard let checks = obj["checks"] as? [[String: Any]] else {
-            return (
-                "Doctor: latest.json is unreadable (unexpected shape).",
-                nil,
-                HeartbeatIssue(
-                    id: "doctor-malformed",
-                    summary: "Doctor snapshot has an unexpected shape.",
-                    detail: "data/doctor/latest.json exists but has no readable `checks` array, so heartbeat cannot verify the health checklist.",
-                    priority: 20,
-                    actions: []
-                )
-            )
-        }
-        // Doctor-only rows are skipped ENTIRELY here: not counted in the
-        // totals, not eligible to raise an alert, not part of the health
-        // verdict. They stay fully visible in the Doctor UI.
-        let (judged, skipped) = heartbeatEligibleDoctorRows(checks)
-        let skippedNote = skipped > 0
-            ? " \(skipped) Doctor-only row(s) excluded from the heartbeat by design."
-            : ""
-
-        guard let doctorOwners else {
-            return (
-                "Doctor: finding owners are unavailable; resolve the body report read error above before judging failures.",
-                nil,
-                HeartbeatIssue(
-                    id: "doctor-malformed",
-                    summary: "Doctor finding ownership is unavailable.",
-                    detail: "The body report could not be read, so heartbeat cannot verify the health checklist. Resolve the body report read error before judging failures.",
-                    priority: 20,
-                    actions: []
-                )
-            )
-        }
-        // Nothing left to judge is UNVERIFIABLE, not "healthy" — the same rule
-        // the malformed-snapshot branch above follows.
-        guard !judged.isEmpty else {
-            return (
-                "Doctor: \(checks.count) check(s) in the snapshot, none heartbeat-eligible."
-                    + skippedNote,
-                nil,
-                nil
-            )
-        }
-        let owned = Set(doctorOwners.values.flatMap { $0 })
-        let fails = judged.filter { ($0["status"] as? String) == "fail" && owned.contains($0["id"] as? String ?? "") }
-        let warns = judged.filter { ($0["status"] as? String) == "warn" && owned.contains($0["id"] as? String ?? "") }
-        var line = "Doctor: \(fails.count) failing, \(warns.count) warning, \(judged.count) total."
-        if !fails.isEmpty {
-            line += " Failing: " + fails.compactMap { $0["id"] as? String }.joined(separator: ", ") + "."
-        }
-        line += skippedNote
-        guard !fails.isEmpty else { return (line, true, nil) }
-        let failedIDs = fails.compactMap { $0["id"] as? String }.joined(separator: ", ")
-        return (
-            line,
-            false,
-            HeartbeatIssue(
-                id: "doctor-failing",
-                summary: "Doctor has \(fails.count) failing check(s).",
-                detail: failedIDs.isEmpty
-                    ? "Doctor currently reports \(fails.count) failing check(s)."
-                    : "Doctor currently reports \(fails.count) failing check(s): \(failedIDs).",
-                priority: 10,
+            return HeartbeatIssue(
+                id: "doctor-missing",
+                summary: "Doctor has no latest health snapshot.",
+                detail: "Doctor has not written data/doctor/latest.json yet, so heartbeat cannot verify the health checklist.",
+                priority: 20,
                 actions: []
             )
+        }
+
+        // Malformed snapshots remain unverifiable, never a healthy empty list.
+        guard obj["checks"] is [[String: Any]] else {
+            return HeartbeatIssue(
+                id: "doctor-malformed",
+                summary: "Doctor snapshot has an unexpected shape.",
+                detail: "data/doctor/latest.json exists but has no readable `checks` array, so heartbeat cannot verify the health checklist.",
+                priority: 20,
+                actions: []
+            )
+        }
+        struct DoctorSnapshot: Decodable { let checks: [CheckResult] }
+        guard let snapshot = try? JSONDecoder().decode(DoctorSnapshot.self, from: data) else {
+            return HeartbeatIssue(
+                id: "doctor-malformed",
+                summary: "Doctor finding ownership is unavailable.",
+                detail: "The body report could not be read, so heartbeat cannot verify the health checklist. Resolve the body report read error before judging failures.",
+                priority: 20,
+                actions: []
+            )
+        }
+        let judged = snapshot.checks.filter { DoctorHeartbeatPolicy.isEligible($0.id) }
+        let owned = Set(judged.filter {
+            DoctorOwner.of($0, repairAvailable: $0.repair_available == true) != nil
+        }.map(\.id))
+        let fails = judged.filter { $0.status == "fail" && owned.contains($0.id) }
+        guard !fails.isEmpty else { return nil }
+        let failedIDs = fails.map(\.id).joined(separator: ", ")
+        return HeartbeatIssue(
+            id: "doctor-failing",
+            summary: "Doctor has \(fails.count) failing check(s).",
+            detail: failedIDs.isEmpty
+                ? "Doctor currently reports \(fails.count) failing check(s)."
+                : "Doctor currently reports \(fails.count) failing check(s): \(failedIDs).",
+            priority: 10,
+            actions: []
         )
     }
 
-    private func heartbeatExecutionsSection(
+    private func heartbeatExecutionsIssue(
         dataRoot: URL,
         now: Date
-    ) -> (line: String, issue: HeartbeatIssue?) {
+    ) -> HeartbeatIssue? {
         let executionsDir = dataRoot
             .appendingPathComponent("workshop", isDirectory: true)
             .appendingPathComponent("executions", isDirectory: true)
-        var active = 0
-        var blocked = 0
         var stale: [(id: String, title: String, status: String, age: TimeInterval)] = []
         if let subs = try? FileManager.default.contentsOfDirectory(
             at: executionsDir, includingPropertiesForKeys: nil) {
@@ -338,8 +223,6 @@ public struct HeartbeatBackgroundWork: Sendable {
                 guard let data = try? Data(contentsOf: mp),
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let status = obj["status"] as? String else { continue }
-                if ["queued", "running", "blocked_on_approval"].contains(status) { active += 1 }
-                if status == "blocked_on_approval" { blocked += 1 }
                 guard ["queued", "running", "blocked_on_approval"].contains(status) else { continue }
                 let updated = obj["updated_at"] as? String
                 let created = obj["created_at"] as? String
@@ -350,23 +233,19 @@ public struct HeartbeatBackgroundWork: Sendable {
                 stale.append((id: id, title: title, status: status, age: age))
             }
         }
-        let line = "Desk executions: \(active) active, \(blocked) blocked on approval."
-        guard !stale.isEmpty else { return (line, nil) }
+        guard !stale.isEmpty else { return nil }
         let rows = stale.prefix(5).map {
             "\($0.title) [\($0.status), \(heartbeatCompactAge($0.age)) old]"
         }.joined(separator: "; ")
         let hasBlocked = stale.contains { $0.status == "blocked_on_approval" }
-        return (
-            line + " Stale: " + rows + ".",
-            HeartbeatIssue(
-                id: "execution-stuck", // compatibility wire ID: persisted in heartbeat status/dedup state
-                summary: "\(stale.count) Desk execution(s) look stuck.",
-                detail: "\(stale.count) Desk execution(s) have been queued/running/blocked longer than \(Int(heartbeatExecutionStuckAge / 3600))h: \(rows).",
-                priority: 35,
-                actions: hasBlocked
-                    ? [HeartbeatCardAction.openApprovals.noticeAction]
-                    : []
-            )
+        return HeartbeatIssue(
+            id: "execution-stuck", // compatibility wire ID: persisted in heartbeat status/dedup state
+            summary: "\(stale.count) Desk execution(s) look stuck.",
+            detail: "\(stale.count) Desk execution(s) have been queued/running/blocked longer than \(Int(heartbeatExecutionStuckAge / 3600))h: \(rows).",
+            priority: 35,
+            actions: hasBlocked
+                ? [HeartbeatCardAction.openApprovals.noticeAction]
+                : []
         )
     }
 
@@ -382,30 +261,13 @@ public struct HeartbeatBackgroundWork: Sendable {
         return "under 1m"
     }
 
-    /// Full Mac has no timer (2026-09-10): the line states the saved grant,
-    /// and there is nothing to warn about.
-    private func heartbeatFullMacSection(
-        dataRoot: URL
-    ) async -> (line: String, issue: HeartbeatIssue?) {
-        let policyObj = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
-        let macPolicy = MacControlPolicy.fromTrustPolicyObject(policyObj)
-        let active = MacControlGate.fullMacActive(
-            macPolicy.trustPolicy ?? MacControlTrustPolicy()
-        )
-        return ("Full Mac: " + (active ? "on" : "off"), nil)
-    }
-
-    private func heartbeatErrorBurstSection(
+    private func heartbeatErrorBurstIssue(
         dataRoot: URL,
         now: Date
-    ) -> (line: String, issue: HeartbeatIssue?) {
+    ) -> HeartbeatIssue? {
         let statuses = ErrorFeeds.scanErrorFeeds(dataRoot: dataRoot, now: now)
         let windowMinutes = Int(ErrorFeeds.errorBurstWindow / 60)
-        let perFeed = statuses
-            .map { "\($0.feed.label) \($0.recentCount) row(s)" }
-            .joined(separator: ", ")
         let total = statuses.reduce(0) { $0 + $1.recentCount }
-        let line = "Errors observed (last \(windowMinutes)m): \(perFeed)."
 
         // Error-only sinks can be absent or quiet during healthy operation.
         // Availability is a file-access fact, not time since the last error.
@@ -415,37 +277,37 @@ public struct HeartbeatBackgroundWork: Sendable {
                 && !FileManager.default.isReadableFile(atPath: path)
         }
         if !unreadable.isEmpty {
-            return (line, HeartbeatIssue(
+            return HeartbeatIssue(
                 id: "error-feeds-unreadable",
                 summary: "Some error logs could not be read.",
                 detail: "Unreadable error logs: "
                     + unreadable.map { $0.feed.relativePath }.joined(separator: ", "),
                 priority: 30,
                 actions: []
-            ))
+            )
         }
 
-        guard total >= ErrorFeeds.errorBurstThreshold else { return (line, nil) }
+        guard total >= ErrorFeeds.errorBurstThreshold else { return nil }
         let samples = statuses
             .flatMap { status in status.recentLines.map { "[\(status.feed.label)] \($0)" } }
             .suffix(3)
             .map(NativeAgentSecretRedactor.redactText)
             .joined(separator: "\n")
-        return (line, HeartbeatIssue(
+        return HeartbeatIssue(
             id: "error-burst",
             summary: "\(total) errors logged in \(windowMinutes)m.",
             detail: "A recent error burst crossed the \(ErrorFeeds.errorBurstThreshold)-row threshold. Recent samples:\n\(samples)",
             priority: 18,
             actions: []
-        ))
+        )
     }
 
-    private func heartbeatStaleTaskSection(
+    private func heartbeatStaleTaskIssue(
         dataRoot: URL
-    ) async -> (line: String, issue: HeartbeatIssue?) {
+    ) async -> HeartbeatIssue? {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
         guard let stale = try? await ledger.staleClaims(), !stale.isEmpty else {
-            return ("Stale task claims: none.", nil)
+            return nil
         }
         let rows = stale.prefix(5).map { task -> String in
             let owner = task.owner?.rawValue ?? "?"
@@ -453,13 +315,13 @@ public struct HeartbeatBackgroundWork: Sendable {
             return "\(label) (owner \(owner), since \(task.updatedTs))"
         }
         let line = "Stale task claims (\(stale.count) >24h no update): " + rows.joined(separator: "; ")
-        return (line, HeartbeatIssue(
+        return HeartbeatIssue(
             id: "task-claims-stale",
             summary: "\(stale.count) task claim(s) are stale.",
             detail: line,
             priority: 45,
             actions: []
-        ))
+        )
     }
 
     /// Read-only review projection over durable state that should not be
@@ -504,18 +366,8 @@ public struct HeartbeatBackgroundWork: Sendable {
         // reads `~/.config`, so a fresh root does not report another install's
         // undelivered replies as its own residue.
         let configRoot = bridgeConfigRoot ?? InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
-        let preservedDir = configRoot
-            .appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
-            .appendingPathComponent("reply-jobs", isDirectory: true)
-            .appendingPathComponent("undelivered", isDirectory: true)
-        let preservedFiles = ((try? FileManager.default.contentsOfDirectory(
-            at: preservedDir,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []).filter { file in
-            file.pathExtension.lowercased() == "json"
-                && ((try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false)
-        }
+        let replyRead = DelegationStatusProjector(configRoot: configRoot, dataRoot: dataRoot).allJobsWithAvailability(now: now)
+        let preservedReplies = replyRead.jobs.filter { $0.agent == "codex" && $0.replyOwed }
 
         // The Codex inbox is the durable authority for work NativeAgent tried
         // to hand to Codex. A terminal delivery or an old row with no consume
@@ -584,7 +436,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         let sortedDeskItems = veryOldDeskItems.sorted()
         let membership = [
             sortedWorkflowIDs.joined(separator: "\n"),
-            preservedFiles.map(\.lastPathComponent).sorted().joined(separator: "\n"),
+            preservedReplies.map(\.id).sorted().joined(separator: "\n"),
             terminalBridgeMessages.sorted().joined(separator: "\n"),
             staleBridgeMessages.sorted().joined(separator: "\n"),
             sortedDeskItems.joined(separator: "\n"),
@@ -592,7 +444,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         return DurableResidueSummary(
             staleWorkflowRunCount: sortedWorkflowIDs.count,
             staleWorkflowRunIDs: Array(sortedWorkflowIDs.prefix(8)),
-            preservedCodexReplyCount: preservedFiles.count,
+            preservedCodexReplyCount: replyRead.allStoresReadable ? preservedReplies.count : nil,
             terminalBridgeMessageCount: terminalBridgeMessages.count,
             terminalBridgeMessages: Array(terminalBridgeMessages.sorted().prefix(8)),
             staleBridgeMessageCount: staleBridgeMessages.count,
@@ -638,9 +490,9 @@ public struct HeartbeatBackgroundWork: Sendable {
             }
 
             var detail: [String] = [
-                "This is a bounded review summary. NativeAgent did not replay, resume, archive, or delete any underlying state.",
+                "Review snapshot at \(heartbeatISO(now)). Current reply outcomes are on Delegations and Desk. NativeAgent did not replay, resume, archive, or delete any underlying state.",
                 "Old non-terminal workflow runs: \(summary.staleWorkflowRunCount).",
-                "Preserved Codex replies: \(summary.preservedCodexReplyCount). Automatic replay is inactive by design because delivery outcome is unknown.",
+                "Saved replies to Codex owed or sent unconfirmed: \(summary.codexReplyCountText).",
                 "Terminal Codex bridge deliveries: \(summary.terminalBridgeMessageCount). These briefs remain retained and are never treated as consumed.",
                 "Codex bridge messages unconsumed over 24h: \(summary.staleBridgeMessageCount). Historical reply receipts count as compatibility proof.",
                 "Open Desk items older than 30 days: \(summary.veryOldDeskItemCount).",
@@ -744,44 +596,6 @@ public struct HeartbeatBackgroundWork: Sendable {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f.string(from: date)
-    }
-
-    private func writeHeartbeatStatus(
-        dataRoot: URL,
-        interval: TimeInterval,
-        now: Date,
-        signals: String,
-        issues: [HeartbeatIssue],
-        assessment: HeartbeatAssessment
-    ) async {
-        let path = dataRoot.appendingPathComponent("heartbeat", isDirectory: true)
-            .appendingPathComponent("status.json")
-        let payload: JSONValue = .object([
-            "schema_version": .int(1),
-            "last_tick_at": .string(heartbeatISO(now)),
-            "cadence_seconds": .int(Int64(interval.rounded())),
-            "next_tick_no_earlier_than": .string(heartbeatISO(now.addingTimeInterval(interval))),
-            "status": .string(assessment.deterministicOK ? "ok" : "alert"),
-            "condition_id": .string(assessment.conditionId),
-            "summary": .string(assessment.deterministicOK ? "Heartbeat clean" : assessment.fallbackAlert),
-            "active_condition_ids": .array(issues.map { .string($0.id) }),
-            "issues": .array(issues.map { issue in
-                .object([
-                    "id": .string(issue.id),
-                    "summary": .string(issue.summary),
-                    "detail": .string(issue.detail),
-                    "priority": .int(Int64(issue.priority)),
-                    "actions": .array(issue.actions.map(heartbeatActionJSON)),
-                ])
-            }),
-            "signals": .string(signals),
-        ])
-        do {
-            try await SwiftNativePersistenceCore().writeJSON(payload, to: path)
-        } catch {
-            FileHandle.standardError.write(Data(
-                "HeartbeatLoop: status write failed: \(error)\n".utf8))
-        }
     }
 
     /// Upserts a stable heartbeat-alert card to notifications/inbox.jsonl.
@@ -940,6 +754,148 @@ public struct HeartbeatBackgroundWork: Sendable {
                     "Heartbeat condition \(conditionID) does not have a native repair action."]
             )
         }
+    }
+
+}
+
+public struct HeartbeatNoticeAction: Sendable, Equatable {
+    public let id: String
+    public let label: String
+    public let description: String?
+
+    public init(id: String, label: String, description: String? = nil) {
+        self.id = id
+        self.label = label
+        self.description = description
+    }
+}
+
+public struct HeartbeatAssessment: Sendable, Equatable {
+    public let deterministicOK: Bool
+    public let conditionId: String
+    public let fallbackAlert: String
+    public let actions: [HeartbeatNoticeAction]
+
+    public init(
+        deterministicOK: Bool,
+        conditionId: String,
+        fallbackAlert: String,
+        actions: [HeartbeatNoticeAction] = []
+    ) {
+        self.deterministicOK = deterministicOK
+        self.conditionId = conditionId
+        self.fallbackAlert = fallbackAlert
+        self.actions = actions
+    }
+
+    public static func clean() -> HeartbeatAssessment {
+        HeartbeatAssessment(
+            deterministicOK: true,
+            conditionId: "ok",
+            fallbackAlert: ""
+        )
+    }
+}
+
+public struct HeartbeatNotice: Sendable, Equatable {
+    public let conditionId: String
+    public let body: String
+    public let actions: [HeartbeatNoticeAction]
+
+    public init(conditionId: String, body: String, actions: [HeartbeatNoticeAction] = []) {
+        self.conditionId = conditionId
+        self.body = body
+        self.actions = actions
+    }
+}
+
+/// Reads the `HEARTBEAT.md` checklist and surfaces the assessment's
+/// per-condition alert. Healthy assessments make no notice.
+///
+/// Design notes:
+/// - Honest missing-checklist contract: no `HEARTBEAT.md` is NOT "healthy" —
+///   it's a no-op that logs and returns, never a fabricated all-clear (the
+///   loop has nothing to check against, so it asserts nothing).
+/// - tick() is non-throwing by LoopRunner contract — every error is caught
+///   and surfaced via stderr.
+public struct HeartbeatLoop: LoopRunner {
+    public let loopId: String = "heartbeat"
+    public let interval: TimeInterval
+    /// Default production cadence: twice daily. The loop is a low-noise
+    /// sentinel, not a near-real-time monitor; urgent faults are covered by
+    /// Doctor.
+    public static let defaultInterval: TimeInterval = 12 * 60 * 60
+
+    /// Reads the `HEARTBEAT.md` checklist (persona dir). Returns nil when the
+    /// file is absent — the honest no-op trigger.
+    private let loadChecklist: @Sendable () -> String?
+    /// Gathers the compact live signal assessment (stuck
+    /// Workshop executions / Full-Mac expiry / Doctor / error bursts).
+    private let gatherAssessment: @Sendable () async -> HeartbeatAssessment
+    /// Surfaces a non-OK heartbeat notice to the user (notice / inbox card).
+    /// The owning factory wires it to the durable inbox.
+    ///
+    /// 2026-07-23 FIX 3 (A4.5): `throws` so a failed inbox write is OBSERVABLE.
+    /// Previously this was `async -> Void`, so a staging-write failure was
+    /// swallowed and the tick still returned `.completed("heartbeat notice
+    /// surfaced")` — a lie, and it bypassed the manager's `.failed` →
+    /// background_loop_failures.jsonl receipt net entirely.
+    private let surfaceNotice: @Sendable (HeartbeatNotice) async throws -> Void
+
+    public init(
+        interval: TimeInterval = Self.defaultInterval,
+        loadChecklist: @escaping @Sendable () -> String?,
+        gatherAssessment: @escaping @Sendable () async -> HeartbeatAssessment,
+        surfaceNotice: @escaping @Sendable (HeartbeatNotice) async throws -> Void
+    ) {
+        self.interval = interval
+        self.loadChecklist = loadChecklist
+        self.gatherAssessment = gatherAssessment
+        self.surfaceNotice = surfaceNotice
+    }
+
+    public func tickOutcome() async -> LoopTickOutcome {
+        guard let checklist = loadChecklist()?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !checklist.isEmpty else {
+            // Missing (or empty) HEARTBEAT.md = honest no-op. We have nothing
+            // to check against; asserting "healthy" here would be a fabricated
+            // all-clear (the exact failure mode the silent-OK contract exists
+            // to prevent). Log and return — never surface, never claim health.
+            FileHandle.standardError.write(Data(
+                "HeartbeatLoop: no HEARTBEAT.md checklist — skipping (no-op, not healthy)\n".utf8))
+            return .off("HEARTBEAT.md missing or empty")
+        }
+        let assessment = await gatherAssessment()
+        if assessment.deterministicOK {
+            return .completed(result: "deterministic heartbeat healthy")
+        }
+
+        // Scheduler allows timed-out ticks to keep running until they observe
+        // cancellation — never emit a user-visible card after cancel/restart.
+        if Task.isCancelled { return .skipped(reason: "canceled") }
+        do {
+            try await surfaceNotice(HeartbeatNotice(
+                conditionId: assessment.conditionId,
+                body: Self.fallbackBody(for: assessment),
+                actions: assessment.actions
+            ))
+        } catch {
+            // The inbox write did not land — do NOT claim the notice surfaced.
+            // Returning .failed trips the manager's failure-receipt net so the
+            // dropped card is recorded instead of silently lost.
+            FileHandle.standardError.write(Data(
+                "HeartbeatLoop: notice staging failed: \(error)\n".utf8))
+            return .failed(error: "heartbeat notice staging: \(SwiftNativeLoopScheduler.describeLoopError(error))")
+        }
+        return .completed(result: "heartbeat notice surfaced")
+    }
+
+    // MARK: - Helpers
+
+    static func fallbackBody(for assessment: HeartbeatAssessment) -> String {
+        let trimmed = assessment.fallbackAlert.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return "(heartbeat found condition \(assessment.conditionId), but no alert text was supplied)"
     }
 
 }

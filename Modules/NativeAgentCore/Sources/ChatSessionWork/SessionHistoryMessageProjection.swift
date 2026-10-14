@@ -36,24 +36,13 @@ package enum SessionHistoryMessageProjection {
     package struct Result: Sendable {
         /// Oldest → newest. Always starts with a `.user` message (or is empty).
         package let messages: [LLMMessage]
-        /// Every admitted row reduced to what the window cursor needs —
-        /// identity, role, rendered length, anchor/recollection exemption.
-        /// Payload-free by construction: no transcript content leaves here.
-        package let rows: [HistoryWindowRow]
-        /// Sum of every rendered row's budgeted line length — the number the window
-        /// cursor compares against `budget.historyChars`.
-        package let usedChars: Int
-        /// Rows the cursor skipped this turn (already outside the window).
-        package let droppedRowCount: Int
         /// Run ids of the user turns this prefix actually replays. The volatile
         /// archive is pruned to exactly this set: a block whose position is no
         /// longer in the prefix cannot be replayed into it.
         package let replayedRunIds: Set<String>
 
-        package var admittedIdentities: [String] { rows.map(\.identity) }
-
         package static let empty = Result(
-            messages: [], rows: [], usedChars: 0, droppedRowCount: 0, replayedRunIds: []
+            messages: [], replayedRunIds: []
         )
     }
 
@@ -70,7 +59,6 @@ package enum SessionHistoryMessageProjection {
         let renderables: [SessionHistoryPromptRenderer.Renderable]
         package let budget: ContextBudgetPolicy.Resolved
         package let rows: [HistoryWindowRow]
-        package var usedChars: Int { rows.reduce(0) { $0 + $1.length + 1 } }
     }
 
     /// Admission retains the contiguous range the reader returned, rendered
@@ -83,26 +71,22 @@ package enum SessionHistoryMessageProjection {
     package static func admission(
         messages: [ChatMessage],
         historyLimit: Int,
-        surface: String,
         windowTokens: Int? = nil
     ) -> Admission? {
         admission(
             renderables: messages.compactMap(SessionHistoryPromptRenderer.renderable),
-            historyLimit: historyLimit, surface: surface, windowTokens: windowTokens
+            historyLimit: historyLimit, windowTokens: windowTokens
         )
     }
 
     package static func admission(
         renderables: [SessionHistoryPromptRenderer.Renderable],
         historyLimit: Int,
-        surface: String,
         windowTokens: Int?
     ) -> Admission? {
         guard max(0, historyLimit) > 0 else { return nil }
         guard !renderables.isEmpty else { return nil }
-        let budget = SessionHistoryPromptRenderer.budget(
-            for: surface, windowTokens: windowTokens
-        )
+        let budget = ContextBudgetPolicy.resolve(windowTokens: windowTokens)
         let anchorIdentities = Set(
             renderables
                 .filter { $0.role == "user" || $0.role == "assistant" }
@@ -125,7 +109,6 @@ package enum SessionHistoryMessageProjection {
     package static func project(
         messages: [ChatMessage],
         historyLimit: Int,
-        surface: String,
         windowTokens: Int? = nil,
         cursor: HistoryWindowCursor? = nil,
         archivedTurnMessages: [String: [LLMMessage]] = [:]
@@ -133,7 +116,6 @@ package enum SessionHistoryMessageProjection {
         guard let admission = admission(
             messages: messages,
             historyLimit: historyLimit,
-            surface: surface,
             windowTokens: windowTokens
         ) else { return .empty }
         return project(
@@ -167,7 +149,6 @@ package enum SessionHistoryMessageProjection {
         var admitted = admission.renderables
         let budget = admission.budget
         let rows = admission.rows
-        let usedChars = admission.usedChars
         let identities = rows.map(\.identity)
 
         // Window cursor: drop the oldest admitted rows through (and including)
@@ -176,7 +157,6 @@ package enum SessionHistoryMessageProjection {
         // what remains. A boundary that is not present (compaction rewrote the
         // transcript, or the window already slid past it) drops nothing:
         // fail-open is a bigger prompt, never a lost row.
-        var droppedRowCount = 0
         if let boundary = cursor?.dropBoundaryIdentity,
            let boundaryOffset = identities.firstIndex(of: boundary) {
             // THE HEAD IS THE BOUNDARY — nothing is pinned in front of it.
@@ -203,7 +183,6 @@ package enum SessionHistoryMessageProjection {
             var kept: [SessionHistoryPromptRenderer.Renderable] = []
             for (offset, row) in admitted.enumerated() {
                 if offset <= boundaryOffset, !rows[offset].isCompactionSummary {
-                    droppedRowCount += 1
                     continue
                 }
                 kept.append(row)
@@ -349,9 +328,6 @@ package enum SessionHistoryMessageProjection {
         }
         return Result(
             messages: out,
-            rows: rows,
-            usedChars: usedChars,
-            droppedRowCount: droppedRowCount,
             replayedRunIds: replayedRunIds
         )
     }

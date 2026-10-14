@@ -245,7 +245,7 @@ extension TelegramPollLoop {
         fromUserId: Int?,
         sessionId: String?
     ) async {
-        guard chatHandler != nil || progressChatHandler != nil || attachmentChatHandler != nil else {
+        guard attachmentChatHandler != nil else {
             try? await sendMessage(token, destination, acknowledgement)
             // Nothing here can continue the turn, so nothing is owed on the
             // next start either (no-op unless this is a replay).
@@ -346,7 +346,14 @@ extension TelegramPollLoop {
                     )
                     let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
                     let deliveredText = trimmed.isEmpty ? acknowledgement : trimmed
-                    switch await delivery.finalize(reply: deliveredText) {
+                    let saved = TelegramAssistantDeliveryState(reply: TelegramRichMessageRenderer.sanitize(
+                        TelegramRichMessageRenderer.stripBoldMarkers(deliveredText)), imagePaths: [])
+                    guard try await inbox.annotateChatContinuation(approvalId, done: false,
+                        assistantDelivery: JSONValue.parse(JSONEncoder().encode(saved))) else {
+                        throw TelegramBotError.underlying("Approval answer delivery could not be recorded.")
+                    }
+                    switch await delivery.finalize(reply: saved.reply, savedDelivery: saved) {
+                    case .held: answerOwed = true
                     case .delivered:
                         await card.transition(.completed(summary: "Reply delivered"))
                     case .failed(let reason):
@@ -396,11 +403,27 @@ extension TelegramPollLoop {
 
     /// 2026-09-06: await completion before returning, so restart repair cannot
     /// report a lost answer that was already delivered.
-    private func finishApprovalContinuation(approvalId: String) async {
+    func finishApprovalContinuation(approvalId: String) async {
         do {
             _ = try await approvalInbox.annotateChatContinuation(approvalId, done: true)
         } catch {
             await recordError(context: "approval_continuation_forget", error: String(describing: error))
+        }
+    }
+
+    func recoverApprovalAnswer(approvalId: String, destination: TelegramDestination,
+                               resendUnknown: Bool = false) async throws -> (TelegramAssistantDeliveryOutcome, String)? {
+        let key = Data(approvalId.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+        return try await SwiftNativePersistenceCore().withFileLock(dataRoot.appendingPathComponent("telegram/\(key).delivery")) {
+            let current = try await approvalInbox.get(approvalId)
+            guard case .object(let state)? = current.chatContinuation,
+                  state["done"] != .bool(true), let raw = state["assistantDelivery"] else { return nil }
+            let saved = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: raw.serializedData(pretty: false))
+            let delivery = makeAssistantDelivery(destination: destination, turnId: UUID(), errorContext: "recover_approval_answer",
+                update: nil, message: nil, text: nil, approvalId: approvalId)
+            let outcome = await delivery.finalize(reply: saved.reply, savedDelivery: saved, resendUnknown: resendUnknown)
+            if case .delivered = outcome { await finishApprovalContinuation(approvalId: approvalId) }
+            return (outcome, saved.reply)
         }
     }
 
@@ -417,20 +440,12 @@ extension TelegramPollLoop {
                 await sendCommandReply("I'm still delivering that answer.", kind: "retry_busy", update: update, message: message, text: text)
                 return true
             }
-            let key = Data(approval.id.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
-            try await SwiftNativePersistenceCore().withFileLock(dataRoot.appendingPathComponent("telegram/\(key).delivery")) {
-                let current = try await approvalInbox.get(approval.id)
-                guard case .object(let state)? = current.chatContinuation,
-                      state["done"] != .bool(true), let raw = state["assistantDelivery"] else { return }
-                let saved = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: raw.serializedData(pretty: false))
-                let delivery = makeAssistantDelivery(
-                    destination: message.destination, turnId: UUID(), errorContext: "retry_approval_answer",
-                    update: nil, message: message, text: nil, approvalId: approval.id
-                )
-                switch await delivery.finalize(reply: saved.reply, savedDelivery: saved, resendUnknown: args == ["resend"]) {
+            if let (outcome, reply) = try await recoverApprovalAnswer(approvalId: approval.id, destination: message.destination,
+                                                                    resendUnknown: args == ["resend"]) {
+                switch outcome {
+                case .held: break
                 case .delivered:
-                    await finishApprovalContinuation(approvalId: approval.id)
-                    await recordReceipt(kind: "retry_reply", update: update, message: message, text: text, reply: saved.reply)
+                    await recordReceipt(kind: "retry_reply", update: update, message: message, text: text, reply: reply)
                 case .failed(let reason), .outcomeUnknown(let reason):
                     await sendCommandReply(reason, kind: "retry_delivery_pending", update: update, message: message, text: text)
                 }
@@ -481,6 +496,8 @@ extension TelegramPollLoop {
         } catch {
             await recordError(context: "approval_continuation_legacy_import", error: String(describing: error))
         }
+        do { try await reconcileSavedReplies() }
+        catch { await recordError(context: "approval_answer_recovery", error: String(describing: error)) }
         let records: [(approval: ApprovalRecord, delivery: TelegramPendingApprovalContinuation)]
         do {
             records = try await approvalInbox.list(filter: .resolved).compactMap { approval in
@@ -513,19 +530,7 @@ extension TelegramPollLoop {
                 continue
             }
             guard case .object(let state)? = approval.chatContinuation else { continue }
-            if let raw = state["assistantDelivery"] {
-                do {
-                    let saved = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: raw.serializedData(pretty: false))
-                    if saved.isDelivered {
-                        await finishApprovalContinuation(approvalId: record.approvalId)
-                    } else {
-                        try await sendMessage(token, record.destination, "I saved the approval follow-up answer. Use /retry to deliver it; if delivery was unconfirmed, use /retry resend (it may arrive twice).")
-                    }
-                } catch {
-                    await recordError(context: "approval_answer_recovery", error: String(describing: error))
-                }
-                continue
-            }
+            if state["assistantDelivery"] != nil { continue }
             guard state["started"] == nil else {
                 let notice = "\(record.acknowledgement) I restarted before I could write the rest of that answer — ask again if you still need it."
                 do {

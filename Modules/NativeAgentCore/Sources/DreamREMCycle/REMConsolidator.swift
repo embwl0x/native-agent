@@ -2,6 +2,7 @@ import SwarmRuns
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import PersonaEngine
 import ProviderRouting
 
 // USER.md is owned by MemoryV2 and lives in the active persona root beside
@@ -293,8 +294,9 @@ public actor REMConsolidator {
             rollback = restore
         }
 
-        // (2) Read last-7-day entries by mtime.
-        let entries = try readRecentDiaryEntries(now: now, days: 7)
+        // (2) Read the inclusive local-day window once for eligibility and LLM input.
+        let since = DreamDiaryReader.startOfLocalDay(now, daysBefore: 7)
+        let entries = try await DreamDiaryReader(dataRoot: dataRoot).entriesSince(since)
 
         // (3) Distill via LLM under the Agent-persona-bypass: REM gets the
         // FULL untruncated persona (SOUL + VOICE + GROWTH + USER + AGENTS)
@@ -302,11 +304,7 @@ public actor REMConsolidator {
         // stub. Proposals still target SOUL/VOICE/GROWTH only — USER.md is
         // MemoryV2's responsibility. Distillation runs on the rem-surface
         // model, preserving the lane's unattended default and explicit pins.
-        let diary = DreamDiaryReader(dataRoot: dataRoot)
-        let helper = SwiftNativeREMConsolidator(llm: llm, diary: diary)
-        // 2026-09-06: calendar days, not 7 × 86,400 seconds — see
-        // `DreamDiaryReader.startOfLocalDay(_:daysBefore:)`.
-        let since = DreamDiaryReader.startOfLocalDay(now, daysBefore: 7)
+        let helper = SwiftNativeREMConsolidator(llm: llm)
         let personaDocs = try readPersonaDocs()
         let contextDocs = try await readDreamPersonaDocs(
             dataRoot: dataRoot, personaRoot: personaRoot, surface: "rem"
@@ -326,7 +324,7 @@ public actor REMConsolidator {
         let thinMaterial = distinctDreamDays < REMConstants._REM_MIN_EVIDENCE_DATES
         if !entries.isEmpty, !thinMaterial {
             rawProposals = try await helper.consolidate(
-                since: since,
+                entries: entries,
                 personaDocs: personaDocs,
                 system: bypassSystem,
                 model: pickedModel,
@@ -368,7 +366,7 @@ public actor REMConsolidator {
             // claim is released and the next tick retries the distillation.
             let decodeFailures = await helper.lastDecodeFailures
             if decodeFailures > 0 {
-                throw DreamREMCycleError.underlying(
+                throw DreamREMCycleError.remDecodeFailure(
                     "REM distillation could not decode the model's reply "
                     + "(\(decodeFailures) failure(s)): "
                     + parseErrors.joined(separator: "; ")
@@ -392,15 +390,8 @@ public actor REMConsolidator {
         }
 
         // (5) Tombstone filter.
-        var passTomb: [REMProposal] = []
-        var tombSkips = 0
-        for p in passEvidence {
-            if try await tombStore.isTombstoned(p) {
-                tombSkips += 1
-                continue
-            }
-            passTomb.append(p)
-        }
+        let passTomb = try await tombStore.filterTombstoned(passEvidence)
+        let tombSkips = passEvidence.count - passTomb.count
 
         // (6) Global cap (_REM_MAX_PROPOSALS). The skill reads this as a
         // weekly-pass cap, NOT per-doc. Per-doc allowed up to 15/week and
@@ -567,54 +558,6 @@ public actor REMConsolidator {
         return "execution_failed"
     }
 
-    // MARK: Diary read (mtime-filtered)
-
-    /// Read all <dataRoot>/dream_diary/*.md whose diary date is within
-    /// `days` of `now`. Accepts legacy `YYYY-MM-DD.md` and Swift runner
-    /// `YYYY-MM-DD_<session>.md`; the DreamEntry date is the date prefix.
-    private func readRecentDiaryEntries(now: Date, days: Int) throws -> [DreamEntry] {
-        let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        let fm = FileManager.default
-        // 2026-09-06: same window rule as `DreamDiaryReader.entriesSince` — the
-        // boundary DAY in the local calendar, inclusive. This gate used mtime,
-        // so it disagreed with the helper that actually feeds the LLM and could
-        // skip the distillation entirely for a week the helper would have read.
-        let cutoff = DreamDiaryReader.startOfLocalDay(now, daysBefore: days)
-        let names: [String]
-        do { names = try fm.contentsOfDirectory(atPath: dir.path) }
-        catch CocoaError.fileReadNoSuchFile { return [] }
-        let stemRE = try NSRegularExpression(pattern: "^(\\d{4}-\\d{2}-\\d{2})(?:_.+)?$")
-        let isoOut = ISO8601DateFormatter()
-        isoOut.formatOptions = [.withInternetDateTime]
-        var out: [DreamEntry] = []
-        for name in names where name.lowercased().hasSuffix(".md") {
-            let stem = (name as NSString).deletingPathExtension
-            let r = NSRange(stem.startIndex..., in: stem)
-            guard let match = stemRE.firstMatch(in: stem, options: [], range: r),
-                  let dateRange = Range(match.range(at: 1), in: stem) else { continue }
-            let date = String(stem[dateRange])
-            guard let entryDay = DreamDiaryReader.localDate(fromDateStem: date),
-                  entryDay >= cutoff else { continue }
-            let url = dir.appendingPathComponent(name)
-            let attrs = try fm.attributesOfItem(atPath: url.path)
-            let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
-            let text = try String(contentsOf: url, encoding: .utf8)
-            let size = (attrs[.size] as? NSNumber)?.intValue ?? text.utf8.count
-            out.append(DreamEntry(
-                date: date,
-                filename: name,
-                content: text,
-                size: size,
-                modifiedAt: isoOut.string(from: mtime)
-            ))
-        }
-        out.sort {
-            if $0.date == $1.date { return ($0.filename ?? "") < ($1.filename ?? "") }
-            return $0.date < $1.date
-        }
-        return out
-    }
-
     // MARK: Persona doc read
 
     /// Load the persona-doc bodies REM may draft against. REM proposals are
@@ -627,7 +570,7 @@ public actor REMConsolidator {
             let raw = FileManager.default.fileExists(atPath: url.path)
                 ? try String(contentsOf: url, encoding: .utf8) : ""
             out[name] = (name == "GROWTH.md")
-                ? DreamREMGrowthHygiene.stripEpisodicLines(raw)
+                ? SwiftNativePersonaEngine.filterEpisodicGrowthLines(raw)
                 : raw
         }
         return out
@@ -714,10 +657,6 @@ public actor REMConsolidator {
 
     // MARK: rem_pins.json (latest-3-approved index)
 
-    private var pinsURL: URL {
-        dataRoot.appendingPathComponent("rem_pins.json")
-    }
-
     /// Re-derive the persona_doc → [latest-3-approved-proposal-ids] index
     /// from the JSONL log. APPROVED entries have status="approved". The
     /// jsonl is the source of truth — pins.json is a derived cache that
@@ -737,15 +676,10 @@ public actor REMConsolidator {
         // compaction base are still seen — a raw feed read would miss them and
         // silently drop long-approved pins after a compaction.
         let rows = REMProposalStore(dataRoot: dataRoot).loadAll()
-        var perDoc: [String: [(id: String, text: String, createdAt: String)]] = [:]
         // APPROVED rows only — pending/denied must never leak into the
         // chat-turn injection.
-        for row in rows where row.status == "approved"
-            && REMProposalStore.supportsProposalTarget(row.targetDoc) {
-            let targetDoc = REMProposalStore.normalizedTargetDoc(row.targetDoc)
-            perDoc[targetDoc, default: []].append(
-                (id: row.id, text: row.proposalText, createdAt: row.createdAt)
-            )
+        let approved = rows.filter {
+            $0.status == "approved" && REMProposalStore.supportsProposalTarget($0.targetDoc)
         }
         // RECONCILE AGAINST THE LIVE DOCUMENT (2026-09-06). An approved row is
         // a historical fact and stays one; a PIN is a live instruction that
@@ -755,40 +689,31 @@ public actor REMConsolidator {
         // A pin now survives only while its lesson is still an entry in the
         // document it was approved into.
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        var documents: [String: String?] = [:]
         var out: [String: [REMPin]] = [:]
-        for (doc, items) in perDoc {
+        if !approved.isEmpty {
+            let doc = "GROWTH.md"
             let document: String?
-            if let cached = documents[doc] {
-                document = cached
-            } else {
-                // ABSENT and UNREADABLE are different facts (2026-09-06). A
-                // document that is gone retires its pins — deleting GROWTH.md
-                // means those lessons are no longer instructions — so it
-                // reconciles against an EMPTY body. A document that exists but
-                // cannot be read keeps every pin: a transient read failure must
-                // never silently strip her prompt. Both say which on stderr.
-                let url = personaRoot.appendingPathComponent(doc)
-                if FileManager.default.fileExists(atPath: url.path) {
-                    do {
-                        document = try String(contentsOf: url, encoding: .utf8)
-                    } catch {
-                        document = nil
-                        FileHandle.standardError.write(Data(
-                            "REMConsolidator: \(doc) unreadable (\(error)); keeping its pins\n".utf8
-                        ))
-                    }
-                } else {
-                    document = ""
+            // An absent document retires pins; an unreadable one preserves
+            // them until its authority can be checked again.
+            let url = personaRoot.appendingPathComponent(doc)
+            if FileManager.default.fileExists(atPath: url.path) {
+                do {
+                    document = try String(contentsOf: url, encoding: .utf8)
+                } catch {
+                    document = nil
                     FileHandle.standardError.write(Data(
-                        "REMConsolidator: \(doc) is absent; retiring its pins\n".utf8
+                        "REMConsolidator: \(doc) unreadable (\(error)); keeping its pins\n".utf8
                     ))
                 }
-                documents[doc] = document
+            } else {
+                document = ""
+                FileHandle.standardError.write(Data(
+                    "REMConsolidator: \(doc) is absent; retiring its pins\n".utf8
+                ))
             }
-            let live = items.filter { Self.pinIsLive($0.text, inDocument: document) }
+            let live = approved.filter { Self.pinIsLive($0.proposalText, inDocument: document) }
             let sorted = live.sorted { $0.createdAt > $1.createdAt }.prefix(3)
-            out[doc] = sorted.map { REMPin(id: $0.id, text: $0.text, createdAt: $0.createdAt) }
+            out[doc] = sorted.map { REMPin(id: $0.id, text: $0.proposalText, createdAt: $0.createdAt) }
         }
         let enc = JSONEncoder()
         enc.outputFormatting = [.sortedKeys, .prettyPrinted]

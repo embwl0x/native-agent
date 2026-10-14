@@ -26,6 +26,8 @@ enum MobileIntentRuntime {
 
     static func agent() async throws -> MobileAgentEntity {
         try prepare()
+        await iCloudBridge.shared.deviceIncomingSetupTask?.value
+        await iCloudBridge.shared.setupTask?.value
         await iCloudSyncEngine.shared.refreshLightweightSnapshots()
         let sync = iCloudSyncEngine.shared
         guard let fingerprint = AgentNameCache.fingerprint(sync.pairingStore?.iCloudPairingSecret),
@@ -58,6 +60,9 @@ enum MobileIntentRuntime {
 
     static func reply(to text: String, sessionID: String? = nil, timeout: TimeInterval) async throws -> String {
         try prepare()
+        await iCloudBridge.shared.deviceIncomingSetupTask?.value
+        await iCloudBridge.shared.setupTask?.value
+        await ChatStore.shared.restorationTask?.value
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw failure("Enter a message to send.")
         }
@@ -145,7 +150,7 @@ enum MobileIntentRuntime {
         // arrive through snapshots, without appending duplicate unsolicited rows.
         guard ChatStore.visibleStore == nil, let id = message.correlationID,
               ChatStore.shared.pendingExchanges[id] != nil else { return }
-        ChatStore.shared.receiveICloudReply(message)
+        Task { await ChatStore.shared.receiveICloudReply(message) }
     }
 
     nonisolated static func failure(_ message: String) -> NSError {

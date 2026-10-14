@@ -1,3 +1,4 @@
+import NativeAgentCore
 // DetachedChatPanel — free-floating chat windows for individual sessions.
 //
 // Drag a session card off the sidebar onto the desktop and it spawns one
@@ -53,7 +54,6 @@ enum DetachedChatFramePlacement {
         return clamped
     }
 }
-
 /// NSPanel subclass with a key-window override (the pattern the retired
 /// Spotlight overlay used, kept here because a floating panel that cannot
 /// become key takes no keystrokes).
@@ -303,7 +303,7 @@ final class DetachedChatWindowController {
             return
         }
         guard let appModel else {
-            nativeLog("[DetachedChatPanel] open(%@) before attach(appModel:) — skipping", sessionId)
+            ModuleLog.app("[DetachedChatPanel] open(%@) before attach(appModel:) — skipping", sessionId)
             return
         }
         // Validate the session still exists. A relaunch-restore for a
@@ -315,9 +315,9 @@ final class DetachedChatWindowController {
         // restoreFromPersist(after:) catches it once sessions load.
         if !appModel.engine.transcripts.sessions.contains(where: { $0.id == sessionId }) {
             if appModel.engine.transcripts.sessions.isEmpty {
-                nativeLog("[DetachedChatPanel] open(%@) — sessions not loaded yet; deferring", sessionId)
+                ModuleLog.app("[DetachedChatPanel] open(%@) — sessions not loaded yet; deferring", sessionId)
             } else {
-                nativeLog("[DetachedChatPanel] open(%@) — session not found; pruning persist set", sessionId)
+                ModuleLog.app("[DetachedChatPanel] open(%@) — session not found; pruning persist set", sessionId)
                 removeFromPersist(sessionId)
             }
             return
@@ -389,23 +389,14 @@ final class DetachedChatWindowController {
         panels[sessionId]?.show()
     }
 
-    /// Restore detached panels on launch from the persisted set. Waits up
-    /// to ~10s for AppModel.chatSessions to load before giving up, so a
-    /// slow cold-start session fetch doesn't drop the user's detached
-    /// windows. Each open() is idempotent (one-per-sessionId) and the
-    /// not-loaded-yet guard means early polls are harmless no-ops.
+    /// Restore detached panels after the canonical session load completes.
     func restoreFromPersist() {
         let saved = persistedSet()
         guard !saved.isEmpty else { return }
         Task { @MainActor in
-            // Poll for sessions to load (≤ ~10s), then restore.
-            for _ in 0..<40 {
-                if !(appModel?.engine.transcripts.sessions.isEmpty ?? true) { break }
-                try? await Task.sleep(nanoseconds: 250_000_000)  // 0.25s
-            }
-            for sid in saved {
-                open(sessionId: sid, origin: nil)
-            }
+            guard let appModel else { return }
+            await appModel.engine.transcripts.sessionTransactions.waitForLoadCompletion()
+            for sid in saved { open(sessionId: sid, origin: nil) }
         }
     }
 
@@ -453,5 +444,46 @@ private final class PanelDelegate: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard notification.object is DetachedChatPanel else { return }
         onWillClose?()
+    }
+}
+
+/// Owns the detached-window preference subscription. It deliberately accepts a
+/// notification center so its single-subscription and teardown guarantees can
+/// be exercised without observing the user's real defaults domain.
+final class DarkModePreferenceObserver {
+    private let center: NotificationCenter
+    private let name: Notification.Name
+    private let object: AnyObject?
+    private var token: NSObjectProtocol?
+
+    init(
+        center: NotificationCenter = .default,
+        name: Notification.Name = UserDefaults.didChangeNotification,
+        object: AnyObject? = UserDefaults.standard
+    ) {
+        self.center = center
+        self.name = name
+        self.object = object
+    }
+
+    var isObserving: Bool { token != nil }
+
+    func start(_ handler: @escaping @MainActor () -> Void) {
+        guard token == nil else { return }
+        token = center.addObserver(forName: name, object: object, queue: .main) { _ in
+            Task { @MainActor in handler() }
+        }
+    }
+
+    func stop() {
+        guard let token else { return }
+        center.removeObserver(token)
+        self.token = nil
+    }
+
+    deinit {
+        if let token {
+            center.removeObserver(token)
+        }
     }
 }

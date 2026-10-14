@@ -1,4 +1,6 @@
 import Foundation
+import BackgroundWork
+import NativeAgentShared
 import Observation
 import NotificationInbox
 import PersistenceCore
@@ -71,6 +73,12 @@ public final class InboxFacade {
         return items
     }
 
+    /// A resolving card action publishes its refreshed state to the phone.
+    public func publishAfterAction(_ actionID: String, refresh: @MainActor () async -> Void) async {
+        await refresh()
+        if actionID != "read" { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
+    }
+
     /// Marks the shown card read after a successful read action, so badges
     /// agree before the next reload.
     public func markRead(_ id: String) {
@@ -98,14 +106,6 @@ extension InboxFacade {
         try Self.requireTrigger(status, name: name)
     }
 
-    /// Merge `config` shallowly into a supported trigger's settings.
-    /// A name it does not know throws.
-    public nonisolated func configureTrigger(_ name: String, config: JSONValue) async throws {
-        let status = try await makeTriggerScheduler(dataRoot: dataRoot)
-            .configureInboxTrigger(name: name, config: config)
-        try Self.requireTrigger(status, name: name)
-    }
-
     private nonisolated static func requireTrigger(_ status: TriggerStatus, name: String) throws {
         if status.status == "not_found" {
             throw NSError(
@@ -114,5 +114,148 @@ extension InboxFacade {
                 userInfo: [NSLocalizedDescriptionKey: "trigger not found: \(name)"]
             )
         }
+    }
+}
+
+extension InboxItemRecord {
+    public var isHiddenFromDefaultInbox: Bool {
+        normalizedStatus == "archived" || normalizedStatus == "dismissed"
+    }
+    public var hasLinkedApproval: Bool { !(related_approval_id ?? "").isEmpty }
+    public var isProactiveCard: Bool { source.lowercased().hasPrefix("proactive_autonomy:") }
+    public var isApprovalBacklogCard: Bool {
+        let lowerSource = source.lowercased()
+        let lowerDetail = (detail ?? "").lowercased()
+        return hasLinkedApproval
+            || lowerSource.hasPrefix("proactive_autonomy:approval_backlog:")
+            || lowerDetail.contains("suggested action: approvals.triage")
+    }
+
+    public var fallbackPrimaryAction: InboxActionRecord? {
+        if isApprovalBacklogCard {
+            return InboxActionRecord(
+                id: "open_approvals",
+                label: "Open Approvals",
+                description: "Review pending approvals"
+            )
+        }
+        if isProactiveCard {
+            return nil
+        }
+        if severity.lowercased() == "actionable" || relatedWorkshopExecutionId != nil {
+            return InboxActionRecord(id: "act", label: "Act", description: "Take primary action")
+        }
+        return nil
+    }
+
+    public var effectiveActions: [InboxActionRecord] {
+        if !actions.isEmpty { return actions }
+        var fallback = [InboxActionRecord(id: "view", label: "View", description: "See full detail")]
+        if let primary = fallbackPrimaryAction {
+            fallback.append(primary)
+        }
+        fallback.append(contentsOf: [
+            InboxActionRecord(id: "archive", label: "Archive", description: "Archive this item"),
+            InboxActionRecord(id: "dismiss", label: "Dismiss", description: "Dismiss this item"),
+        ])
+        return fallback
+    }
+
+    public var actionIDs: Set<String> {
+        Set(effectiveActions.map(\.id))
+    }
+
+    public var isForYouLane: Bool { !isSystemLane }
+}
+
+extension InboxRelatedGroup {
+    public func matches(_ item: InboxItemRecord) -> Bool {
+        matches(itemID: item.id, title: item.title)
+    }
+}
+
+/// The persisted inbox action list includes control verbs which the Desk owns
+/// itself: opening a card marks it read, and viewing/replying are not direct
+/// button operations. Project once at the presentation boundary so every Desk
+/// surface offers exactly the native action that its button will invoke.
+public enum InboxVisibleActionsPresentation {
+    private static let hiddenActionIDs: Set<String> = ["view", "read", "reply"]
+    private static let executableActionIDs: Set<String> = Set([
+        "act", "approve", "reject",
+    ]).union(HeartbeatCardAction.ids)
+
+    public static func actions(for item: InboxItemRecord) -> [InboxActionRecord] {
+        guard !item.isHiddenFromDefaultInbox else { return [] }
+        var seen: Set<String> = []
+        var visible: [InboxActionRecord] = []
+
+        for action in item.effectiveActions {
+            let normalizedID = action.id
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let canonicalID = normalizedID == "deny" ? "reject" : normalizedID
+            guard !hiddenActionIDs.contains(canonicalID),
+                  executableActionIDs.contains(canonicalID)
+            else { continue }
+
+            let label = action.label.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !label.isEmpty, seen.insert(canonicalID).inserted else { continue }
+            visible.append(InboxActionRecord(
+                id: canonicalID,
+                label: label,
+                description: action.description
+            ))
+        }
+        return visible
+    }
+}
+
+
+/// WHAT STILL NEEDS THE PERSON, as opposed to what she has already told him.
+///
+/// The inbox was one flat list per lane in arrival order, and opening a card
+/// marked it read — so an approval he opened, thought about and did not act on
+/// sank under the next hour of notices and was gone. READING IS NOT
+/// RESOLVING. This derives prominence from the authoritative records the card
+/// already carries (its linked approval, and the actions that resolve real
+/// work), never from read state, and it deliberately spans BOTH lanes: a
+/// request that happens to have been filed under System is still a request.
+///
+/// Resolution is what removes it. A resolved approval's card stops coming back
+/// from the reload, which is the existing tombstone path — no second source of
+/// truth about what is outstanding.
+public enum InboxNeedsYou {
+    /// Action ids that mean the person still has to do something. `read` and
+    /// `dismiss` are deliberately absent: acknowledging is not deciding.
+    public static let resolvingActionIDs: Set<String> = [
+        "act", "approve", "reject", "open_approvals", "repair",
+    ]
+
+    public struct Sections {
+        public let needsYou: [InboxItemRecord]
+        public let rest: [InboxItemRecord]
+
+        public var isEmpty: Bool { needsYou.isEmpty && rest.isEmpty }
+    }
+
+    public static func needsYou(_ item: InboxItemRecord) -> Bool {
+        guard !item.isHiddenFromDefaultInbox else { return false }
+        if item.hasLinkedApproval { return true }
+        return item.actions.contains { resolvingActionIDs.contains($0.id) }
+    }
+
+    /// - Parameter everywhere: the visible population across every lane, so a
+    ///   System-lane request is not hidden from the person it is waiting on.
+    /// - Parameter lane: the lane's own visible population, which keeps its
+    ///   arrival order below.
+    public static func sections(
+        everywhere: [InboxItemRecord],
+        lane: [InboxItemRecord]
+    ) -> Sections {
+        let needsYou = everywhere
+            .filter(needsYou)
+            .sorted { $0.created_at > $1.created_at }
+        let claimed = Set(needsYou.map(\.id))
+        return Sections(needsYou: needsYou, rest: lane.filter { !claimed.contains($0.id) })
     }
 }

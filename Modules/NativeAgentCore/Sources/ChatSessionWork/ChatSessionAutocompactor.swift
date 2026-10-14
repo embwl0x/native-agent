@@ -30,10 +30,8 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
         case custom
     }
 
-    public var enabled: Bool
     public var thresholdTokens: Int
     public var contextWindowMode: ContextWindowMode
-    public var keepCount: Int
     /// When true (and a pre-compaction backup exists), the autocompactor's
     /// caller spawns a fire-and-forget LLM pass that swaps the mechanical
     /// compaction summary for a richer, recollection-voice distillation. Any
@@ -43,24 +41,17 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
     /// boundary schedules a background distillation of the session's older
     /// turns. Off → the pre-turn threshold is the only lane, exactly as before.
     public var agingEnabled: Bool
-    public var agingFraction: Double
 
     public init(
-        enabled: Bool = true,
         thresholdTokens: Int = Self.defaultThresholdTokens,
-        keepCount: Int = Self.defaultKeepCount,
         distillEnabled: Bool = true,
         agingEnabled: Bool = true,
-        agingFraction: Double = Self.defaultAgingFraction,
         contextWindowMode: ContextWindowMode = .custom
     ) {
-        self.enabled = enabled
         self.thresholdTokens = max(1, thresholdTokens)
         self.contextWindowMode = contextWindowMode
-        self.keepCount = max(1, keepCount)
         self.distillEnabled = distillEnabled
         self.agingEnabled = agingEnabled
-        self.agingFraction = min(0.95, max(0.01, agingFraction))
     }
 
     /// Reads the app preference at the production boundary.  The defaults
@@ -85,9 +76,7 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
             .flatMap(ContextWindowMode.init(rawValue:))
             ?? (stored > 0 ? .custom : .modelDefault)
         return ChatSessionAutocompactionConfig(
-            enabled: true,
             thresholdTokens: stored > 0 ? stored : defaultThresholdTokens,
-            keepCount: defaultKeepCount,
             distillEnabled: distill,
             agingEnabled: aging,
             contextWindowMode: mode
@@ -155,7 +144,7 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
             providerID: providerID,
             dataRoot: dataRoot
         )
-        return max(1, min(ceiling, Int(Double(ceiling) * agingFraction)))
+        return max(1, min(ceiling, Int(Double(ceiling) * Self.defaultAgingFraction)))
     }
 }
 
@@ -235,28 +224,22 @@ private struct ChatSessionCompactionTranscriptError: LocalizedError, Sendable {
 
 public struct ChatSessionAutocompactor: Sendable {
     static let maximumCompactBackups = 5
-    public typealias BackupFileCopy = @Sendable (_ source: URL, _ destination: URL) throws -> Void
 
     let dataRoot: URL
     let config: ChatSessionAutocompactionConfig
     let persistence: SwiftNativePersistenceCore
     let now: @Sendable () -> Date
-    let backupFileCopy: BackupFileCopy
 
     public init(
         dataRoot: URL,
         config: ChatSessionAutocompactionConfig = .productionDefault(),
         persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
-        now: @escaping @Sendable () -> Date = { Date() },
-        backupFileCopy: @escaping BackupFileCopy = { source, destination in
-            try FileManager.default.copyItem(at: source, to: destination)
-        }
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
         self.config = config
         self.persistence = persistence
         self.now = now
-        self.backupFileCopy = backupFileCopy
     }
 
     public func compactIfNeeded(
@@ -278,16 +261,6 @@ public struct ChatSessionAutocompactor: Sendable {
         // strip a busy session down to a summary plus one message.
         keepTailFixed: Bool = false
     ) async throws -> ChatSessionCompactionOutcome {
-        // Manual compaction is an explicit user action. It bypasses the
-        // automatic enable/threshold gates, but never the transcript validator,
-        // verified backup, keep-tail, or durable-write contracts below.
-        guard config.enabled || force else {
-            return skipped(
-                sessionId: rawSessionId,
-                reason: "autocompaction disabled",
-                trigger: trigger
-            )
-        }
         guard let sessionId = NativeAgentChatSessionID.normalizedPathComponent(rawSessionId) else {
             return skipped(
                 sessionId: rawSessionId,
@@ -305,12 +278,6 @@ public struct ChatSessionAutocompactor: Sendable {
                 trigger: trigger
             )
         }
-        let pending = config.distillEnabled
-            ? try await pendingDistillationOutcome(
-               sessionId: sessionId, messagesPath: messagesPath,
-               trigger: trigger, sourceBytes: sourceBytesBefore
-            ) : nil
-
         let modelThresholdTokens = config.effectiveThresholdTokens(
             forModel: model,
             providerID: providerID,
@@ -319,9 +286,9 @@ public struct ChatSessionAutocompactor: Sendable {
         let effectiveThresholdTokens = thresholdTokensOverride
             .map { max(1, min($0, modelThresholdTokens)) } ?? modelThresholdTokens
         let divisor = Self.tokenDivisor(forModel: model)
-        if !force,
-           Double(sourceBytesBefore) < Double(effectiveThresholdTokens) * divisor {
-            if let pending { return pending }
+        let belowFileThreshold = !force
+            && Double(sourceBytesBefore) < Double(effectiveThresholdTokens) * divisor
+        if !config.distillEnabled && belowFileThreshold {
             return skipped(
                 sessionId: sessionId,
                 reason: "below threshold by file size",
@@ -332,7 +299,22 @@ public struct ChatSessionAutocompactor: Sendable {
         }
 
         return try await persistence.withFileLock(messagesPath) {
-            let rows = try await readJSONLHonest(messagesPath, context: "autocompact")
+            var rows = try await readJSONLHonest(messagesPath)
+            let pending = config.distillEnabled
+                ? try await pendingDistillationOutcome(
+                    sessionId: sessionId, messagesPath: messagesPath, rows: &rows,
+                    trigger: trigger, sourceBytes: sourceBytesBefore
+                ) : nil
+            if belowFileThreshold {
+                if let pending { return pending }
+                return skipped(
+                    sessionId: sessionId,
+                    reason: "below threshold by file size",
+                    trigger: trigger,
+                    thresholdTokens: effectiveThresholdTokens,
+                    sourceBytesBefore: sourceBytesBefore
+                )
+            }
             let before = rows.count
             let transcriptChars = Self.transcriptCharacterCount(rows)
             let estimatedTokens = max(0, Int((Double(transcriptChars) / divisor).rounded()))
@@ -354,12 +336,12 @@ public struct ChatSessionAutocompactor: Sendable {
             let candidateReplaceCount = keepTailFixed
                 ? Self.keepingLastUserRow(
                     rows: rows,
-                    replaceCount: Self.fixedKeepTailReplacementCount(rows: rows, keepCount: config.keepCount)
+                    replaceCount: Self.fixedKeepTailReplacementCount(rows: rows, keepCount: ChatSessionAutocompactionConfig.defaultKeepCount)
                 )
                 : Self.replacementCount(
                     sessionId: sessionId,
                     rows: rows,
-                    keepCount: config.keepCount,
+                    keepCount: ChatSessionAutocompactionConfig.defaultKeepCount,
                     thresholdTokens: effectiveThresholdTokens,
                     divisor: divisor
                 )
@@ -421,24 +403,12 @@ public struct ChatSessionAutocompactor: Sendable {
             // with it (Agent's 644D65F1, 2026-09-14: 223 rows replaced, 8 cards
             // gone, 2 of them `failed` with a `waiting` continuation).
             let (pendingResults, compactible) = InlineInteractionCompactionRetention.splitPendingResults(foldingRows)
-            let (retainedCards, removableRows) = InlineInteractionCompactionRetention.split(compactible)
-            // Past the hard cap the preserved cards alone hold the session over
-            // threshold for ever: every pass would rewrite the prior summary and
-            // shrink nothing. The OLDEST are folded — each leaving a one-line
-            // receipt in the summary — so compaction converges.
-            let (preservedCards, foldedCards) = InlineInteractionCompactionRetention.capPreserved(
-                retainedCards,
-                maxCharacters: Self.preservedCardCharacterCap(
-                    thresholdTokens: effectiveThresholdTokens,
-                    divisor: divisor
-                )
-            )
+            let (preservedCards, removableRows) = InlineInteractionCompactionRetention.split(compactible)
             // Nothing left to fold once the cards are held back — or the only
             // removable row is a recollection, which would buy identical
             // coverage in new bytes on every pass. Skip honestly.
-            let worthCompacting = !foldedCards.isEmpty
-                || (!removableRows.isEmpty
-                    && (removableRows.count > 1 || Self.containsRawTurn(removableRows)))
+            let worthCompacting = !removableRows.isEmpty
+                && (removableRows.count > 1 || Self.containsRawTurn(removableRows))
             guard worthCompacting else {
                 if let pending { return pending }
                 return skipped(
@@ -462,9 +432,7 @@ public struct ChatSessionAutocompactor: Sendable {
                 for: removableRows,
                 sourceNote: sourceNote,
                 preservedCardCount: preservedCards.count,
-                foldedCards: foldedCards,
-                // 2026-09-23: 40K on a verified 1M route, 12K otherwise.
-                maxChars: ChatCompactionDistiller.maxSummaryChars(model: model, providerID: providerID)
+                maxChars: ChatCompactionDistiller.maxSummaryChars
             )
             let nowISO = ISO8601DateFormatter().string(from: now())
             let summaryId = "compact-\(UUID().uuidString.lowercased())"
@@ -494,13 +462,6 @@ public struct ChatSessionAutocompactor: Sendable {
             if let until = coverage.until {
                 summaryMetadata[ChatSessionRecollections.coversUntilKey] = .string(until)
             }
-            let incorporated = Self.incorporatedRange(replaced)
-            if let from = incorporated.from {
-                summaryMetadata[ChatSessionRecollections.incorporatedFromKey] = .string(from)
-            }
-            if let until = incorporated.until {
-                summaryMetadata[ChatSessionRecollections.incorporatedUntilKey] = .string(until)
-            }
             if willDistill {
                 summaryMetadata["distill"] = .string("pending")
                 summaryMetadata["distill_backup"] = .string(backupURL.lastPathComponent)
@@ -526,6 +487,7 @@ public struct ChatSessionAutocompactor: Sendable {
             // then the untouched tail — so a still-open card stays where the
             // reader and the resolver expect it, ahead of the recent turns.
             let nextRows = pendingRecollections + [summaryRow] + pendingResults + preservedCards + kept
+            try Task.checkCancellation()
             try writeRows(nextRows, to: messagesPath)
             let sourceBytesAfter = Self.fileSize(messagesPath)
             let outcome = ChatSessionCompactionOutcome(
@@ -558,68 +520,73 @@ public struct ChatSessionAutocompactor: Sendable {
     }
 
     private func pendingDistillationOutcome(
-        sessionId: String, messagesPath: URL, trigger: String, sourceBytes: Int64
+        sessionId: String, messagesPath: URL, rows: inout [JSONValue],
+        trigger: String, sourceBytes: Int64
     ) async throws -> ChatSessionCompactionOutcome? {
-        try await persistence.withFileLock(messagesPath) {
-            let rows = try await readJSONLHonest(messagesPath, context: "distillation recovery")
-            for row in rows where Self.hasPendingDistillation(row) {
-                guard case .object(var object) = row,
-                      case .string(let id)? = object["id"],
-                      case .object(var metadata)? = object["metadata"],
-                      case .int(let count)? = metadata["messages_replaced"], count > 0 else { continue }
-                let backup: String
-                if case .string(let recorded)? = metadata["distill_backup"],
-                   recorded == URL(fileURLWithPath: recorded).lastPathComponent {
-                    backup = recorded
-                } else {
-                    do {
-                        backup = try await recoverDistillationBackup(
-                            sessionId: sessionId, metadata: metadata, messagesReplaced: Int(count)
-                        ).lastPathComponent
-                    } catch {
-                        FileHandle.standardError.write(Data(
-                            "ChatSessionAutocompactor: pending recollection recovery failed for \(sessionId): \(error)\n".utf8
-                        ))
-                        continue
-                    }
-                    metadata["distill_backup"] = .string(backup)
-                    metadata.removeValue(forKey: "distill_process")
-                    object["metadata"] = .object(metadata)
-                    let raw = try String(contentsOf: messagesPath, encoding: .utf8)
-                    var segments = raw.components(separatedBy: "\n")
-                    if let index = segments.firstIndex(where: {
-                        guard let parsed = try? JSONValue.parse(Data($0.utf8)),
-                              case .object(let fields) = parsed else { return false }
-                        return fields["id"] == .string(id)
-                    }) {
-                        segments[index] = try JSONValue.object(object).serialize(pretty: false)
-                        try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                            Data(segments.joined(separator: "\n").utf8), to: messagesPath
-                        )
-                    }
-                }
-                let backupPath = sessionDir(sessionId: sessionId).appendingPathComponent(backup)
+        for row in rows where Self.hasPendingDistillation(row) {
+            guard case .object(var object) = row,
+                  case .string(let id)? = object["id"],
+                  case .object(var metadata)? = object["metadata"],
+                  case .int(let count)? = metadata["messages_replaced"], count > 0 else { continue }
+            let backup: String
+            if case .string(let recorded)? = metadata["distill_backup"],
+               recorded == URL(fileURLWithPath: recorded).lastPathComponent {
+                backup = recorded
+            } else {
                 do {
-                    let source = try await readJSONLHonest(backupPath, context: "pending distillation source")
-                    guard source.count >= Int(count) else { throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -7) }
+                    backup = try await recoverDistillationBackup(
+                        sessionId: sessionId, metadata: metadata, messagesReplaced: Int(count)
+                    ).lastPathComponent
                 } catch {
                     FileHandle.standardError.write(Data(
-                        "ChatSessionAutocompactor: pending recollection source failed for \(sessionId): \(error)\n".utf8
+                        "ChatSessionAutocompactor: pending recollection recovery failed for \(sessionId): \(error)\n".utf8
                     ))
                     continue
                 }
-                return ChatSessionCompactionOutcome(
-                    sessionId: sessionId, compacted: false, reason: "distillation pending",
-                    trigger: trigger, thresholdTokens: config.thresholdTokens,
-                    estimatedTokensBefore: 0, transcriptCharsBefore: Self.transcriptCharacterCount(rows),
-                    messagesBefore: rows.count, messagesAfter: rows.count,
-                    messagesReplaced: Int(count), summaryChars: 0,
-                    sourceBytesBefore: sourceBytes, sourceBytesAfter: sourceBytes,
-                    summaryRowId: id, backupPath: backupPath.path
-                )
+                metadata["distill_backup"] = .string(backup)
+                metadata.removeValue(forKey: "distill_process")
+                object["metadata"] = .object(metadata)
+                let raw = try String(contentsOf: messagesPath, encoding: .utf8)
+                var segments = raw.components(separatedBy: "\n")
+                if let index = segments.firstIndex(where: {
+                    guard let parsed = try? JSONValue.parse(Data($0.utf8)),
+                          case .object(let fields) = parsed else { return false }
+                    return fields["id"] == .string(id)
+                }) {
+                    segments[index] = try JSONValue.object(object).serialize(pretty: false)
+                    try Task.checkCancellation()
+                    try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                        Data(segments.joined(separator: "\n").utf8), to: messagesPath
+                    )
+                    if let rowIndex = rows.firstIndex(where: { row in
+                        guard case .object(let fields) = row else { return false }
+                        return fields["id"] == .string(id)
+                    }) {
+                        rows[rowIndex] = .object(object)
+                    }
+                }
             }
-            return nil
+            let backupPath = sessionDir(sessionId: sessionId).appendingPathComponent(backup)
+            do {
+                let source = try await readJSONLHonest(backupPath)
+                guard source.count >= Int(count) else { throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -7) }
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "ChatSessionAutocompactor: pending recollection source failed for \(sessionId): \(error)\n".utf8
+                ))
+                continue
+            }
+            return ChatSessionCompactionOutcome(
+                sessionId: sessionId, compacted: false, reason: "distillation pending",
+                trigger: trigger, thresholdTokens: config.thresholdTokens,
+                estimatedTokensBefore: 0, transcriptCharsBefore: Self.transcriptCharacterCount(rows),
+                messagesBefore: rows.count, messagesAfter: rows.count,
+                messagesReplaced: Int(count), summaryChars: 0,
+                sourceBytesBefore: sourceBytes, sourceBytesAfter: sourceBytes,
+                summaryRowId: id, backupPath: backupPath.path
+            )
         }
+        return nil
     }
 
     private func recoverDistillationBackup(
@@ -633,7 +600,7 @@ public struct ChatSessionAutocompactor: Sendable {
             && candidate.pathExtension == "jsonl" {
             let rows: [JSONValue]
             do {
-                rows = try await readJSONLHonest(candidate, context: "distillation backup recovery")
+                rows = try await readJSONLHonest(candidate)
             } catch {
                 FileHandle.standardError.write(Data(
                     "ChatSessionAutocompactor: distillation backup recovery could not read \(candidate.lastPathComponent): \(error)\n".utf8
@@ -705,7 +672,7 @@ public struct ChatSessionAutocompactor: Sendable {
             .appendingPathComponent(sessionId, isDirectory: true)
     }
 
-    private func readJSONLHonest(_ path: URL, context: String) async throws -> [JSONValue] {
+    private func readJSONLHonest(_ path: URL) async throws -> [JSONValue] {
         let data: Data
         do { data = try Data(contentsOf: path) } catch {
             throw ChatSessionCompactionTranscriptError(
@@ -754,7 +721,7 @@ public struct ChatSessionAutocompactor: Sendable {
         let suffix = "\(Self.fileSafeTimestamp(now())).\(UUID().uuidString.lowercased().prefix(8))"
         let backup = dir.appendingPathComponent("messages.compact.\(suffix).jsonl")
         do {
-            try backupFileCopy(messagesPath, backup)
+            try FileManager.default.copyItem(at: messagesPath, to: backup)
             let sourceData = try Data(contentsOf: messagesPath)
             let backupData = try Data(contentsOf: backup)
             guard backupData == sourceData else {
@@ -843,13 +810,17 @@ public struct ChatSessionAutocompactor: Sendable {
     /// recovery copy. Deduplication is byte-exact, so edited versions of the
     /// same message survive. Callers hold the session's transcript lock.
     private static func preserveOriginalMessages(from backup: URL, at archive: URL) throws {
-        func lines(_ bytes: Data) throws -> [Data] {
+        let dates = ISO8601DateFormatter()
+        dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let wholeSeconds = ISO8601DateFormatter()
+        func lines(_ bytes: Data) throws -> [(line: Data, stamp: String?)] {
             try bytes.split(separator: 0x0A).map { line in
                 let data = Data(line)
-                guard case .object = try JSONValue.parse(data) else {
+                guard case .object(let object) = try JSONValue.parse(data) else {
                     throw NSError(domain: "NativeAgent.ChatCompactionArchive", code: 1)
                 }
-                return data
+                let stamp: String? = if case .string(let raw)? = object["createdAt"] { raw } else { nil }
+                return (data, stamp)
             }
         }
         let source = try lines(Data(contentsOf: backup))
@@ -857,23 +828,15 @@ public struct ChatSessionAutocompactor: Sendable {
         do { existing = try Data(contentsOf: archive) }
         catch CocoaError.fileReadNoSuchFile { existing = Data() }
         var merged = try lines(existing)
-        var known = Set(merged)
-        for line in source where known.insert(line).inserted {
+        var known = Set(merged.map(\.line))
+        for line in source where known.insert(line.line).inserted {
             merged.append(line)
         }
         // Backups retire newest first. Keep recent reply evidence at the tail
         // even when an older copy contributes previously unseen lines.
-        let dates = ISO8601DateFormatter()
-        dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let wholeSeconds = ISO8601DateFormatter()
-        var ordered: [(index: Int, line: Data, at: Date)] = []
-        for (index, line) in merged.enumerated() {
-            let row = try? JSONValue.parse(line)
-            var at = Date.distantPast
-            if case .object(let object)? = row, case .string(let raw)? = object["createdAt"] {
-                at = dates.date(from: raw) ?? wholeSeconds.date(from: raw) ?? .distantPast
-            }
-            ordered.append((index: index, line: line, at: at))
+        var ordered = merged.enumerated().map { index, row in
+            (index: index, line: row.line,
+             at: row.stamp.flatMap { dates.date(from: $0) ?? wholeSeconds.date(from: $0) } ?? .distantPast)
         }
         ordered.sort { lhs, rhs in
             if lhs.at == rhs.at { return lhs.index < rhs.index }
@@ -888,8 +851,8 @@ public struct ChatSessionAutocompactor: Sendable {
             try FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(output, to: archive)
         }
-        let verified = Set(try lines(Data(contentsOf: archive)))
-        guard source.allSatisfy(verified.contains) else {
+        let verified = Set(try lines(Data(contentsOf: archive)).map(\.line))
+        guard source.allSatisfy({ verified.contains($0.line) }) else {
             throw NSError(domain: "NativeAgent.ChatCompactionArchive", code: 2)
         }
     }
@@ -1006,7 +969,6 @@ public struct ChatSessionAutocompactor: Sendable {
         guard preferredTailCount < messageCount else { return 0 }
 
         var tailCount = preferredTailCount
-        let cardCap = preservedCardCharacterCap(thresholdTokens: thresholdTokens, divisor: divisor)
         while tailCount > 1 {
             // 2026-09-23: the tail reaches back to its run's user row when that
             // still fits; otherwise the loop shrinks on as before.
@@ -1019,14 +981,11 @@ public struct ChatSessionAutocompactor: Sendable {
             let pendingRecollections = replaced.filter(Self.hasPendingDistillation)
             let (pendingResults, compactible) = InlineInteractionCompactionRetention
                 .splitPendingResults(replaced.filter { !Self.hasPendingDistillation($0) })
-            let (retained, removable) = InlineInteractionCompactionRetention.split(compactible)
-            let (preserved, folded) = InlineInteractionCompactionRetention
-                .capPreserved(retained, maxCharacters: cardCap)
+            let (preserved, removable) = InlineInteractionCompactionRetention.split(compactible)
             let summary = compactionSummary(
                 for: removable,
                 sourceNote: ChatCompactionRowRendering.receiptSourceNote(removable, sessionId: sessionId),
-                preservedCardCount: preserved.count,
-                foldedCards: folded
+                preservedCardCount: preserved.count
             )
             let tail = Array(rows.suffix(messageCount - replaceCount))
             let postCompactionChars = summary.count
@@ -1116,8 +1075,7 @@ public struct ChatSessionAutocompactor: Sendable {
         // full (see `compactionSummary`), so the span starts where THAT row's
         // coverage started — anything else understates the material and lets
         // the dream lane re-admit turns it already consumed (Astra audit
-        // 2026-09-11, finding 2). What this pass newly folded in is recorded
-        // separately by `incorporatedRange`.
+        // 2026-09-11, finding 2).
         var from: String?
         for row in rows {
             if isRecollection(row),
@@ -1148,40 +1106,6 @@ public struct ChatSessionAutocompactor: Sendable {
             from = untilValue
         }
         return (from, until)
-    }
-
-    /// The interval this pass NEWLY folded in: the first raw turn being
-    /// replaced through the end of the span. Informational — the dream lane's
-    /// admission decision uses `coverageRange`, which covers the whole text.
-    static func incorporatedRange(_ rows: [JSONValue]) -> (from: String?, until: String?) {
-        func createdAt(_ row: JSONValue) -> String? {
-            guard case .object(let obj) = row,
-                  case .string(let value)? = obj["createdAt"] else { return nil }
-            return value
-        }
-        func isRecollection(_ row: JSONValue) -> Bool {
-            guard case .object(let obj) = row,
-                  case .object(let metadata)? = obj["metadata"],
-                  case .string(let kind)? = metadata["kind"] else { return false }
-            return kind == ChatSessionRecollections.rowKind
-        }
-        let until = coverageRange(rows).until
-        var from: String?
-        for row in rows where !isRecollection(row) {
-            if let value = createdAt(row) {
-                from = value
-                break
-            }
-        }
-        // Nothing raw in the prefix: this pass incorporated no new material.
-        guard let fromValue = from else { return (nil, until) }
-        if let untilValue = until,
-           let fromDate = ChatSessionRecollections.parseTimestamp(.string(fromValue)),
-           let untilDate = ChatSessionRecollections.parseTimestamp(.string(untilValue)),
-           fromDate > untilDate {
-            return (untilValue, untilValue)
-        }
-        return (fromValue, until)
     }
 
     /// Shrink `replaceCount` so the recollection it produces never straddles
@@ -1226,13 +1150,6 @@ public struct ChatSessionAutocompactor: Sendable {
             else { return true }
             return kind != ChatSessionRecollections.rowKind
         }
-    }
-
-    /// How many characters of preserved inline cards a session may carry before
-    /// compaction folds the oldest anyway. Half the threshold budget: the cards
-    /// may never be the reason a session cannot get under its own limit.
-    static func preservedCardCharacterCap(thresholdTokens: Int, divisor: Double) -> Int {
-        max(0, Int((Double(thresholdTokens) * divisor / 2).rounded()))
     }
 
     /// 2026-09-23: the tail counts ROWS, so it could keep tool rows plus her
@@ -1296,18 +1213,13 @@ public struct ChatSessionAutocompactor: Sendable {
         for rows: [JSONValue],
         sourceNote: String,
         preservedCardCount: Int = 0,
-        foldedCards: [JSONValue] = [],
         maxChars: Int = ChatCompactionDistiller.maxSummaryChars
     ) -> String {
-        let header = "[NativeAgent compacted \(rows.count + foldedCards.count) earlier message(s)."
+        let header = "[NativeAgent compacted \(rows.count) earlier message(s)."
             + InlineInteractionCompactionRetention.summaryClause(preservedCount: preservedCardCount)
-            + InlineInteractionCompactionRetention.foldedClause(count: foldedCards.count)
             + " Replaced messages stay readable with chat.search / context.expand history:<id>."
             + "]"
-        // A card folded past the hard cap leaves its one line here, ahead of the
-        // capped body, so the receipt can never be the text that ages out.
-        let receipts = foldedCards.map(InlineInteractionCompactionRetention.foldReceipt)
-        var lines: [String] = [sourceNote, header] + receipts
+        var lines: [String] = [sourceNote, header]
         // 2026-09-05: a PRIOR recollection at the head of the replaced range is
         // the only carrier of everything that happened before it; the 500-char
         // per-row cap truncated it to its first paragraph, so when the distill

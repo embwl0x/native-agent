@@ -1164,9 +1164,6 @@ extension SwiftToolDispatcher {
         environmentOverride: [String: String]? = nil,
         closeStandardInput: Bool = false,
         reapDescendantsOnExit: Bool = false,
-        // agent_cancel: a cancelled task interrupts the run (SIGINT, then
-        // SIGTERM) and it reports "cancelled" for every synchronous run.
-        interruptOnCancel: Bool = true,
         // Each stdout line as it is written, for a caller that shows progress
         // live. The envelope is unchanged. Agent-host command runs only.
         onStdoutLine: (@Sendable (String) -> Void)? = nil
@@ -1295,26 +1292,57 @@ extension SwiftToolDispatcher {
         let stdoutBuf = BoundedBuffer(cap: 16 * 1024 * 1024, onLine: onStdoutLine)
         let stderrBuf = BoundedBuffer(cap: 16 * 1024 * 1024)
 
-        // FileHandle.readabilityHandler uses dispatch sources internally. The
-        // builder tools can launch long SwiftPM/test subprocess trees from the
-        // app, so keep pipe ownership explicit with short-lived drain threads.
-        let stdoutDrain = PipeDrainLoop(
-            fileDescriptor: stdout.fileHandleForReading.fileDescriptor,
-            buffer: stdoutBuf
-        )
-        let stderrDrain = PipeDrainLoop(
-            fileDescriptor: stderr.fileHandleForReading.fileDescriptor,
-            buffer: stderrBuf
-        )
-        stdoutDrain.start()
-        stderrDrain.start()
+        func spawnFailure(_ error: Error) -> JSONValue {
+            let spawnAudit: [String: Any] = [
+                "toolName": toolName,
+                "runId": runId,
+                "createdAt": ISO8601DateFormatter().string(from: started),
+                "completedAt": ISO8601DateFormatter().string(from: Date()),
+                "status": "failed_pre_spawn",
+                "reason": "spawn_failed",
+                "detail": String(describing: error),
+                "cwd": resolvedCwd,
+                "executable": executable,
+                "args": args,
+                "sandboxed": sandboxed,
+                "outer_sandbox_policy": "policy",
+            ]
+            let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: spawnAudit, dataRoot: dataRoot)
+            var env: [String: JSONValue] = [
+                "status": .string("failed"),
+                "effects": .string("none"),
+                "tool": .string(toolName),
+                "reason": .string("spawn_failed"),
+                "detail": .string(String(describing: error)),
+                "runId": .string(runId),
+                "sandboxed": .bool(sandboxed),
+                "outer_sandbox_policy": .string("policy"),
+                "audit_path": .string(auditURL.path),
+            ]
+            if let auditErr { env["audit_error"] = .string(auditErr) }
+            return .object(env)
+        }
+
+        let stdoutDrain: SystemProcessAdapter.PipeDrain
+        let stderrDrain: SystemProcessAdapter.PipeDrain
+        do {
+            stdoutDrain = try SystemProcessAdapter.PipeDrain(handle: stdout.fileHandleForReading) { stdoutBuf.append($0) }
+            do {
+                stderrDrain = try SystemProcessAdapter.PipeDrain(handle: stderr.fileHandleForReading) { stderrBuf.append($0) }
+            } catch {
+                stdoutDrain.stopAndWait()
+                throw error
+            }
+        } catch {
+            return spawnFailure(error)
+        }
 
         let launchedTree = LaunchedTreeBox()
         let cancelled = AtomicFlag()
         // Interrupt first, as a person at the terminal would, then terminate.
         let interruptRun: @Sendable () -> Void = {
             let pid = process.processIdentifier
-            guard interruptOnCancel, pid > 0 else { return }
+            guard pid > 0 else { return }
             Self.interruptThenTerminate(ProcessTreeReaper.snapshot(rootPID: pid, retaining: launchedTree.value), stillRunning: { process.isRunning })
         }
         return await withTaskCancellationHandler {
@@ -1327,12 +1355,10 @@ extension SwiftToolDispatcher {
                 if reapDescendantsOnExit || cancelled.isSet, let tree = launchedTree.value { Self.reapLaunchedTree(tree) }
                 // The direct child exiting does NOT guarantee EOF — a
                 // backgrounded grandchild can inherit the write end and keep it
-                // open. Stop the live drains, then grab any already-buffered
-                // bytes without waiting for EOF.
+                // open. The shared drains capture buffered bytes and stop
+                // without waiting for EOF.
                 stdoutDrain.stopAndWait()
                 stderrDrain.stopAndWait()
-                drainPipeNonBlocking(stdout.fileHandleForReading, into: stdoutBuf)
-                drainPipeNonBlocking(stderr.fileHandleForReading, into: stderrBuf)
                 stdoutBuf.finishLines()
                 try? stdout.fileHandleForReading.close()
                 try? stderr.fileHandleForReading.close()
@@ -1434,15 +1460,13 @@ extension SwiftToolDispatcher {
 
             do {
                 try process.run()
-                if reapDescendantsOnExit || interruptOnCancel {
-                    // Taken here, while the child is alive and leads its own
-                    // group: after it exits its descendants are reparented and
-                    // cannot be found from it any more.
-                    ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
-                    launchedTree.set(ProcessTreeReaper.snapshot(rootPID: process.processIdentifier))
-                }
+                // Taken here, while the child is alive and leads its own
+                // group: after it exits its descendants are reparented and
+                // cannot be found from it any more.
+                ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
+                launchedTree.set(ProcessTreeReaper.snapshot(rootPID: process.processIdentifier))
                 // Cancelled before the run existed: interrupt it now.
-                if interruptOnCancel, cancelled.isSet { interruptRun() }
+                if cancelled.isSet { interruptRun() }
                 try? stdout.fileHandleForWriting.close()
                 try? stderr.fileHandleForWriting.close()
             } catch {
@@ -1452,35 +1476,8 @@ extension SwiftToolDispatcher {
                 try? stderr.fileHandleForWriting.close()
                 try? stdout.fileHandleForReading.close()
                 try? stderr.fileHandleForReading.close()
-                let spawnAudit: [String: Any] = [
-                    "toolName": toolName,
-                    "runId": runId,
-                    "createdAt": ISO8601DateFormatter().string(from: started),
-                    "completedAt": ISO8601DateFormatter().string(from: Date()),
-                    "status": "failed_pre_spawn",
-                    "reason": "spawn_failed",
-                    "detail": String(describing: error),
-                    "cwd": resolvedCwd,
-                    "executable": executable,
-                    "args": args,
-                    "sandboxed": sandboxed,
-                    "outer_sandbox_policy": "policy",
-                ]
-                let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: spawnAudit, dataRoot: dataRoot)
                 guard resumed.tryResume() else { return }
-                var env: [String: JSONValue] = [
-                    "status": .string("failed"),
-                    "effects": .string("none"),
-                    "tool": .string(toolName),
-                    "reason": .string("spawn_failed"),
-                    "detail": .string(String(describing: error)),
-                    "runId": .string(runId),
-                    "sandboxed": .bool(sandboxed),
-                    "outer_sandbox_policy": .string("policy"),
-                    "audit_path": .string(auditURL.path),
-                ]
-                if let auditErr { env["audit_error"] = .string(auditErr) }
-                cont.resume(returning: .object(env))
+                cont.resume(returning: spawnFailure(error))
                 return
             }
 
@@ -1491,7 +1488,6 @@ extension SwiftToolDispatcher {
             )
         }
         } onCancel: {
-            guard interruptOnCancel else { return }
             cancelled.set()
             if process.isRunning { interruptRun() }
         }

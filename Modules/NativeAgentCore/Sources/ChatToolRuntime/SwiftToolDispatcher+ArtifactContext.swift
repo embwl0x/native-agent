@@ -15,6 +15,7 @@ extension SwiftToolDispatcher {
         guard !query.isEmpty, query.count <= 500 else {
             throw AutonomyGateError.toolDenied(reason: "artifact_find needs a description between 1 and 500 characters.")
         }
+        let topic = WorkContextQuery(query)
         let requestedSession = optionalString(input, "session_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let session: String?
         if let requestedSession, !requestedSession.isEmpty {
@@ -23,8 +24,8 @@ extension SwiftToolDispatcher {
             }
             session = safe
         } else { session = nil }
-        let limit = max(1, min(optionalInt(input, "limit") ?? 6, 12))
-        let offset = max(0, optionalInt(input, "session_offset") ?? 0)
+        let limit = max(1, min(Self.jsonInt(input["limit"]) ?? 6, 12))
+        let offset = max(0, Self.jsonInt(input["session_offset"]) ?? 0)
         let directory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
         var listingFailed = false
         let files: [URL]
@@ -74,7 +75,7 @@ extension SwiftToolDispatcher {
             let sampledHistory = !useFull || read.stats.truncated
             if sampledHistory { sampled += 1 }
             candidates += ArtifactContextProjection.chatCandidates(
-                read.messages, sessionID: sessionID, query: query,
+                read.messages, sessionID: sessionID, query: query, topic: topic,
                 sampled: sampledHistory, dataRoot: dataRoot)
         }
         var deskAvailable = true
@@ -83,7 +84,7 @@ extension SwiftToolDispatcher {
         if session == nil {
             do {
                 let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
-                candidates += ArtifactContextProjection.deskCandidates(state.items, query: query, dataRoot: dataRoot)
+                candidates += ArtifactContextProjection.deskCandidates(state.items, query: query, topic: topic, dataRoot: dataRoot)
             } catch { deskAvailable = false }
         }
         candidates.sort {
@@ -145,8 +146,7 @@ enum ArtifactContextProjection {
         String(ChatSecretRedactor.redactText(String(text.prefix(cap + 512))).prefix(cap))
     }
 
-    private static func relevance(query: String, name: String, context: String, locator: String?) -> (score: Int, basis: JSONValue)? {
-        let topic = WorkContextQuery(query)
+    private static func relevance(query: String, topic: WorkContextQuery, name: String, context: String, locator: String?) -> (score: Int, basis: JSONValue)? {
         // A filename is meaningful; its generic repository/root directories
         // are not evidence of what the file is about. Explicit path queries
         // may still match the full recorded locator.
@@ -225,7 +225,7 @@ enum ArtifactContextProjection {
         return .object(value)
     }
 
-    static func chatCandidates(_ messages: [ChatMessage], sessionID: String, query: String,
+    static func chatCandidates(_ messages: [ChatMessage], sessionID: String, query: String, topic: WorkContextQuery,
                                sampled: Bool, dataRoot: URL) -> [ArtifactContextCandidate] {
         var candidates: [ArtifactContextCandidate] = []
         for (index, message) in messages.enumerated() {
@@ -260,7 +260,7 @@ enum ArtifactContextProjection {
                 let name = string(ref["name"]) ?? string(ref["filename"]) ?? path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Recorded attachment"
                 let id = string(ref["id"])
                 guard path != nil || id != nil, seen.insert(path ?? id ?? name).inserted else { continue }
-                guard let match = relevance(query: query, name: name, context: context, locator: path) else { continue }
+                guard let match = relevance(query: query, topic: topic, name: name, context: context, locator: path) else { continue }
                 var value: [String: JSONValue] = [
                     "name": .string(safeText(name, cap: 250)),
                     "matching": match.basis,
@@ -309,7 +309,7 @@ enum ArtifactContextProjection {
         return Array(refs.prefix(20))
     }
 
-    static func deskCandidates(_ items: [DeskItem], query: String, dataRoot: URL) -> [ArtifactContextCandidate] {
+    static func deskCandidates(_ items: [DeskItem], query: String, topic: WorkContextQuery, dataRoot: URL) -> [ArtifactContextCandidate] {
         var candidates: [ArtifactContextCandidate] = []
         for item in items {
             for ref in item.refs {
@@ -317,7 +317,7 @@ enum ArtifactContextProjection {
                 guard let raw = string(recorded["path"]) ?? string(recorded["url"]),
                       let path = locator(raw, dataRoot: dataRoot) else { continue }
                 let label = string(recorded["label"]) ?? string(recorded["title"]) ?? path
-                guard let match = relevance(query: query, name: label,
+                guard let match = relevance(query: query, topic: topic, name: label,
                     context: "\(item.title) \(item.summary ?? "")", locator: path) else { continue }
                 var value: [String: JSONValue] = [
                     "name": .string(safeText(label, cap: 250)), "recorded_locator": .string(path),

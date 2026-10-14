@@ -11,7 +11,6 @@ public struct ConnectorOAuthConfig: Sendable {
     public let scopes: String
     public let redirectURI: String
     public let extraAuthParams: [(String, String)]
-    public let extraTokenParams: [String: String]
 
     public static let x = ConnectorOAuthConfig(
         connectorId:    "x",
@@ -25,8 +24,7 @@ public struct ConnectorOAuthConfig: Sendable {
         // make a re-auth round-trip downgrade her capabilities.
         scopes:         "follows.read offline.access tweet.write users.read tweet.read",
         redirectURI:    "http://127.0.0.1:53682/oauth/callback",
-        extraAuthParams: [],
-        extraTokenParams: [:]
+        extraAuthParams: []
     )
 
     public static let gmail = ConnectorOAuthConfig(
@@ -39,8 +37,7 @@ public struct ConnectorOAuthConfig: Sendable {
         redirectURI:    "http://127.0.0.1:53683/oauth/callback",
         // Google requires access_type=offline + prompt=consent to reliably
         // return a refresh_token for an already-consented user.
-        extraAuthParams: [("access_type", "offline"), ("prompt", "consent")],
-        extraTokenParams: [:]
+        extraAuthParams: [("access_type", "offline"), ("prompt", "consent")]
     )
 
     public static let calendar = ConnectorOAuthConfig(
@@ -51,7 +48,6 @@ public struct ConnectorOAuthConfig: Sendable {
         tokenURL:       "https://oauth2.googleapis.com/token",
         scopes:         "openid https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events",
         redirectURI:    "http://127.0.0.1:53684/oauth/callback",
-        extraAuthParams: [("access_type", "offline"), ("prompt", "consent")],
-        extraTokenParams: [:]
+        extraAuthParams: [("access_type", "offline"), ("prompt", "consent")]
     )
 }

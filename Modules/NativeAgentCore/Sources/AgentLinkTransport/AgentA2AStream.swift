@@ -38,13 +38,13 @@ public enum AgentA2AStream {
 
     /// Validated display snapshots: assembled artifact text, a direct message,
     /// and status progress notes, retained together for coalesced delivery.
-    /// Never evidence; `normalize` alone decides the outcome.
+    /// Never evidence; the accumulator's receipt alone decides the outcome.
     public struct LiveUpdate: Sendable {
         public var text: String?
         public var note: String?
     }
 
-    public struct Receipt: Sendable {
+    public struct Receipt: Sendable, Equatable {
         public let result: AgentA2AWire.Result?
         public let interrupted: Bool
     }

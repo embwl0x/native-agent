@@ -10,10 +10,8 @@ import Foundation
 /// morning brief share, so "what clock is the app speaking in?" has a single
 /// truth and can be changed in one place.
 ///
-/// Display only. Nothing persisted, scheduled or synced is formatted through
-/// this: bot cron cadences carry their own IANA zone, and stored timestamps
-/// stay UTC. Moving this zone changes what a person READS, never when anything
-/// runs.
+/// Scheduling follows the Mac's zone or an explicit schedule zone independently
+/// of this display preference; stored timestamps stay UTC.
 ///
 /// It lives in UserDefaults rather than the data root because it is a property
 /// of this Mac's screen, not of the agent's memory.
@@ -38,8 +36,8 @@ public enum DisplayTimeZone {
     /// Never nil, for the same reason.
     public static func resolved(in defaults: UserDefaults = .standard) -> TimeZone {
         let saved = identifier(in: defaults)
-        guard !saved.isEmpty else { return TimeZone.current }
-        return TimeZone(identifier: saved) ?? TimeZone.current
+        guard !saved.isEmpty else { return TimeZone.autoupdatingCurrent }
+        return TimeZone(identifier: saved) ?? TimeZone.autoupdatingCurrent
     }
 
     public static var current: TimeZone { resolved() }

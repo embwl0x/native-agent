@@ -19,7 +19,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         let pairing: String
         var envelope: BridgeMessage?
     }
-    private struct State: Codable {
+    private struct State: Codable, Sendable {
         var places: [Place] = []
         var pending: [Pending] = []
     }
@@ -28,7 +28,11 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
     @Published private(set) var locating = false
     @Published private(set) var alwaysAllowed = false
     private var state = State()
-    private var available = true
+    private let storage = MobileLocalStorage()
+    private var mutationTask: Task<State, Error>?
+    private var mutationGeneration = 0
+    private var appliedMutationGeneration = 0
+    private var available = false
     private let file = URL.applicationSupportDirectory.appendingPathComponent("phone-places.json")
     private let location = CLLocationManager()
     private var newName: String?
@@ -42,23 +46,41 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
 
     private override init() {
         super.init()
-        do {
-            if FileManager.default.fileExists(atPath: file.path) {
-                state = try JSONDecoder().decode(State.self, from: Data(contentsOf: file))
-            }
-            places = state.places
-        } catch { available = false; errorMessage = "Places could not be read: \(error.localizedDescription)" }
         location.delegate = self
         location.desiredAccuracy = kCLLocationAccuracyHundredMeters
         alwaysAllowed = location.authorizationStatus == .authorizedAlways
+        let file = file
+        Task {
+            do {
+                let restored = try await Task.detached(priority: .utility) {
+                    guard FileManager.default.fileExists(atPath: file.path) else { return State() }
+                    return try JSONDecoder().decode(State.self, from: Data(contentsOf: file))
+                }.value
+                state = restored
+                places = restored.places
+                available = true
+                if reconcileAgain { resume() }
+            } catch { errorMessage = "Places could not be read: \(error.localizedDescription)" }
+        }
     }
 
-    private func save(_ change: (inout State) -> Void) throws {
+    private func save(_ change: @escaping (inout State) -> Void) async throws {
         guard available else { throw DeviceSyncError.underlying(message: "Places storage is unavailable.") }
-        var next = state
-        change(&next)
-        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder().encode(next).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        let previous = mutationTask
+        let base = state
+        mutationGeneration += 1
+        let generation = mutationGeneration
+        let task = Task {
+            var next = try await previous?.value ?? base
+            change(&next)
+            try await storage.checkpoint(next, to: file)
+            return next
+        }
+        mutationTask = task
+        defer { if mutationGeneration == generation { mutationTask = nil } }
+        let next = try await task.value
+        guard generation > appliedMutationGeneration else { return }
+        appliedMutationGeneration = generation
         state = next; places = next.places
     }
 
@@ -81,7 +103,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         }
     }
 
-    func setEnabled(_ id: String, _ enabled: Bool) {
+    func setEnabled(_ id: String, _ enabled: Bool) async {
         let pairing = AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests)
         guard !enabled || pairing != nil else {
             errorMessage = "Pair this phone with your Mac before enabling a place."; return
@@ -90,7 +112,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
             errorMessage = "Places need the paired CloudKit connection to your Mac."; return
         }
         do {
-            try save { state in
+            try await save { state in
                 guard let index = state.places.firstIndex(where: { $0.id == id }) else { return }
                 state.places[index].enabled = enabled
                 state.places[index].inside = nil
@@ -103,9 +125,9 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         } catch { errorMessage = error.localizedDescription }
     }
 
-    func remove(_ id: String) {
+    func remove(_ id: String) async {
         do {
-            try save { state in
+            try await save { state in
                 state.places.removeAll { $0.id == id }
                 state.pending.removeAll { $0.event.placeID == id }
             }
@@ -114,8 +136,8 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
     }
 
     func resume() {
-        guard available else { return }
         reconcileAgain = true
+        guard available else { return }
         guard reconcileTask == nil else { return }
         reconcileTask = Task {
             defer { reconcileTask = nil }
@@ -130,7 +152,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
     private func reconcile() async {
         let pairing = AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests)
         do {
-            try save { state in
+            try await save { state in
                 for index in state.places.indices where state.places[index].enabled && state.places[index].pairing != pairing {
                     state.places[index].enabled = false
                     state.places[index].inside = nil
@@ -166,14 +188,14 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
             do {
                 for try await event in await monitor.events {
                     guard !Task.isCancelled, eventsGeneration == generation else { return }
-                    try observed(event)
+                    try await observed(event)
                     await publish()
                 }
             } catch { errorMessage = "Place monitoring stopped: \(error.localizedDescription)" }
         }
     }
 
-    private func observed(_ event: CLMonitor.Event) throws {
+    private func observed(_ event: CLMonitor.Event) async throws {
         guard event.state == .satisfied || event.state == .unsatisfied else {
             errorMessage = "A place could not be monitored. Check Always location and Precise Location in iPhone Settings."
             return
@@ -184,10 +206,13 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         let place = state.places[index], inside = event.state == .satisfied
         guard place.inside != inside else { return }
         guard state.pending.count < 128 else { throw DeviceSyncError.underlying(message: "Place events are waiting to sync. Open the app when connected.") }
-        try save { state in
+        try await save { state in
+            guard let index = state.places.firstIndex(where: { $0.id == place.id && $0.enabled && $0.pairing == pairing }),
+                  state.places[index].inside != inside else { return }
+            let previousInside = state.places[index].inside
             state.places[index].inside = inside
             // The first fix establishes a baseline, not a claimed journey.
-            if place.inside != nil {
+            if previousInside != nil {
                 let event = PhonePlaceEvent(id: "place-\(place.id)-\(event.date.timeIntervalSince1970)-\(inside)",
                     placeID: place.id, name: place.name, transition: inside ? .arrived : .left, timestamp: event.date)
                 state.pending.append(Pending(event: event, pairing: pairing))
@@ -216,13 +241,13 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
                               pending.pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else {
                             throw CancellationError()
                         }
-                        try self.save { state in
+                        try await self.save { state in
                             if let index = state.pending.firstIndex(where: { $0.event.id == pending.event.id }) {
                                 state.pending[index].envelope = message
                             }
                         }
                     })
-                try save { $0.pending.removeAll { $0.event.id == pending.event.id } }
+                try await save { $0.pending.removeAll { $0.event.id == pending.event.id } }
             } catch { errorMessage = "Place events are waiting to sync: \(error.localizedDescription)"; return }
         }
     }
@@ -241,9 +266,11 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
             errorMessage = "A precise current location was unavailable. Try saving this place again with Precise Location enabled."
             return
         }
-        do {
-            try save { $0.places.append(Place(name: name, latitude: fix.coordinate.latitude, longitude: fix.coordinate.longitude)) }
-        } catch { errorMessage = error.localizedDescription }
+        let latitude = fix.coordinate.latitude, longitude = fix.coordinate.longitude
+        Task {
+            do { try await save { $0.places.append(Place(name: name, latitude: latitude, longitude: longitude)) } }
+            catch { errorMessage = error.localizedDescription }
+        }
     }
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         locating = false; newName = nil; errorMessage = error.localizedDescription
@@ -261,8 +288,8 @@ struct PhonePlacesSettings: View {
                     .font(.footnote).foregroundStyle(AlivePalette.secondary)
                 ForEach(places.places) { place in
                     HStack {
-                        Toggle(place.name, isOn: Binding(get: { place.enabled }, set: { places.setEnabled(place.id, $0) }))
-                        Button(role: .destructive) { places.remove(place.id) } label: { Image(systemName: "trash") }
+                        Toggle(place.name, isOn: Binding(get: { place.enabled }, set: { value in Task { await places.setEnabled(place.id, value) } }))
+                        Button(role: .destructive) { Task { await places.remove(place.id) } } label: { Image(systemName: "trash") }
                             .accessibilityLabel("Delete \(place.name)")
                     }
                 }

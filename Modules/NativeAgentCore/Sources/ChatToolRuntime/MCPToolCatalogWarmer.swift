@@ -11,8 +11,6 @@ import MCPDispatcher
 /// at a time, with a minimum rearm interval so catalog builds cannot fan out
 /// into a subprocess storm.
 package actor MCPToolCatalogWarmer {
-    typealias Sweep = @Sendable (URL) async -> Void
-
     package static let shared = MCPToolCatalogWarmer()
 
     /// Minimum gap between sweeps. A chat turn builds the catalog repeatedly;
@@ -34,32 +32,12 @@ package actor MCPToolCatalogWarmer {
         return Date(timeIntervalSince1970: TimeInterval(started.tv_sec) + TimeInterval(started.tv_usec) / 1_000_000)
     }()
 
-    private let sweep: Sweep
-    private let clock: @Sendable () -> Date
-    private let rearmInterval: TimeInterval
-    private let sweepDeadline: TimeInterval
     private var lastStartedAt: Date?
     private var inFlight = false
-    private let firstSweepAt: Date
+    private let firstSweepAt = MCPToolCatalogWarmer.processStartedAt.addingTimeInterval(MCPToolCatalogWarmer.launchDelay)
     private var firstSweepScheduled = false
-    /// Test seam: sweeps that ran to completion (or were deadline-cancelled).
-    private(set) var finishedSweeps = 0
 
-    init(
-        sweep: @escaping Sweep = MCPToolCatalogWarmer.liveSweep,
-        clock: @escaping @Sendable () -> Date = { Date() },
-        rearmInterval: TimeInterval = MCPToolCatalogWarmer.rearmInterval,
-        sweepDeadline: TimeInterval = MCPToolCatalogWarmer.sweepDeadline,
-        firstSweepAt: Date = MCPToolCatalogWarmer.processStartedAt.addingTimeInterval(MCPToolCatalogWarmer.launchDelay)
-    ) {
-        self.sweep = sweep
-        self.clock = clock
-        self.rearmInterval = rearmInterval
-        self.sweepDeadline = sweepDeadline
-        self.firstSweepAt = firstSweepAt
-    }
-
-    static let liveSweep: Sweep = { root in
+    private static func liveSweep(_ root: URL) async {
         let report = await MCPWarmSweepLedger.shared.sweep(root: root)
         let refreshed = report.values.filter { $0 != "skipped" && !$0.hasPrefix("error") }.count
         let failed = report.values.filter { $0.hasPrefix("error") }.count
@@ -85,7 +63,7 @@ package actor MCPToolCatalogWarmer {
     @discardableResult
     func kickIfDue(dataRoot: URL) async -> Bool {
         guard !inFlight else { return false }
-        let now = clock()
+        let now = Date()
         if lastStartedAt == nil, now < firstSweepAt {
             if !firstSweepScheduled {
                 firstSweepScheduled = true
@@ -97,7 +75,7 @@ package actor MCPToolCatalogWarmer {
             }
             return false
         }
-        if let last = lastStartedAt, now.timeIntervalSince(last) < rearmInterval {
+        if let last = lastStartedAt, now.timeIntervalSince(last) < Self.rearmInterval {
             return false
         }
         lastStartedAt = now
@@ -107,33 +85,10 @@ package actor MCPToolCatalogWarmer {
     }
 
     private func runBoundedSweep(dataRoot: URL) async {
-        let sweep = self.sweep
-        let deadline = self.sweepDeadline
-        // Deliberately NOT a task group: a group awaits every child before it
-        // returns, so a sweep that ignores cancellation (an MCP subprocess
-        // wedged inside a `tools/list` round-trip is exactly that) would pin
-        // `inFlight` forever and the warmer could never refresh again. The
-        // one-shot latch lets the DEADLINE release the slot whether or not the
-        // sweep ever notices it was cancelled.
-        let latch = OneShotLatch()
-        let work = Task.detached(priority: .utility) {
-            await sweep(dataRoot)
-            await latch.fire()
+        try? await TurnDeadline.withThrowingDeadline(seconds: Self.sweepDeadline) {
+            await Self.liveSweep(dataRoot)
         }
-        let timer = Task.detached(priority: .utility) {
-            try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
-            await latch.fire()
-        }
-        await latch.wait()
-        work.cancel()
-        timer.cancel()
         inFlight = false
-        finishedSweeps += 1
-    }
-
-    /// Test seam.
-    func _testState() -> (inFlight: Bool, finished: Int, lastStartedAt: Date?) {
-        (inFlight, finishedSweeps, lastStartedAt)
     }
 }
 
@@ -141,7 +96,7 @@ package actor MCPToolCatalogWarmer {
 
 /// Decides which stdio servers a warm sweep actually has to handshake.
 ///
-/// `refreshAllToolsCaches` forces a live `tools/list` round-trip for EVERY
+/// A full live refresh forces a `tools/list` round-trip for EVERY
 /// configured server on every sweep — and because the subprocess pool reaps
 /// idle servers, a 300s-cadence sweep re-spawns each of them, waits out the
 /// handshake, and rewrites `mcp/cache/tools.json` with descriptors that are
@@ -179,24 +134,10 @@ actor MCPWarmSweepLedger {
         let at: Date
     }
 
-    private let maxHandshakeAge: TimeInterval
-    private let clock: @Sendable () -> Date
     /// key: "<resolved root path>|<serverId>"
     private var marks: [String: Mark] = [:]
-    /// Test seam: servers actually handshaken across this ledger's lifetime.
-    private(set) var handshakes = 0
-    /// Test seam: servers skipped because nothing about them had changed.
-    private(set) var skips = 0
 
-    init(
-        maxHandshakeAge: TimeInterval = MCPWarmSweepLedger.maxHandshakeAge,
-        clock: @escaping @Sendable () -> Date = { Date() }
-    ) {
-        self.maxHandshakeAge = maxHandshakeAge
-        self.clock = clock
-    }
-
-    /// Same contract as `refreshAllToolsCaches`: never throws, returns
+    /// Never throws: returns
     /// serverId → tool count or error text, and logs every failure and every
     /// zero-tool result loudly. Skipped servers are reported as "skipped" and
     /// leave `mcp/cache/tools.json` untouched — which is the point: their
@@ -205,9 +146,9 @@ actor MCPWarmSweepLedger {
     func sweep(root: URL) async -> [String: String] {
         let dispatcher = SwiftNativeMCPDispatcher(root: root)
         let servers = (try? await dispatcher.listServers()) ?? []
-        let manifest = await Self.manifestStamp(dispatcher: dispatcher, root: root)
+        let manifest = await Self.manifestStamp(dispatcher: dispatcher)
         let rootKey = root.resolvingSymlinksInPath().path
-        let now = clock()
+        let now = Date()
 
         var report: [String: String] = [:]
         var liveKeys: Set<String> = []
@@ -218,14 +159,12 @@ actor MCPWarmSweepLedger {
             if let mark = marks[key],
                mark.signature == signature,
                now.timeIntervalSince(mark.at) >= 0,
-               now.timeIntervalSince(mark.at) < maxHandshakeAge {
-                skips += 1
+               now.timeIntervalSince(mark.at) < Self.maxHandshakeAge {
                 report[server.id] = "skipped"
                 continue
             }
             do {
                 let count = try await dispatcher.refreshToolsCache(forServer: server.id)
-                handshakes += 1
                 // MARK ON SUCCESS ONLY. A server that threw, or that has not
                 // completed a handshake at all, must stay on the sweep list.
                 marks[key] = Mark(signature: signature, at: now)
@@ -236,7 +175,6 @@ actor MCPWarmSweepLedger {
                     ))
                 }
             } catch {
-                handshakes += 1
                 report[server.id] = "error: \(error)"
                 FileHandle.standardError.write(Data(
                     "MCPDispatcher: tools-cache refresh FAILED for server '\(server.id)': \(error) — its tools stay invisible to the model.\n".utf8
@@ -255,7 +193,7 @@ actor MCPWarmSweepLedger {
     /// `research/config.json` supplies `searxng_base_url` for the auto-merged
     /// default server, so a change to either can change a server's command
     /// line without touching the other.
-    private static func manifestStamp(dispatcher: SwiftNativeMCPDispatcher, root: URL) async -> String {
+    private static func manifestStamp(dispatcher: SwiftNativeMCPDispatcher) async -> String {
         let paths = [await dispatcher.serversPath, await dispatcher.configPath]
         return paths.map(fileStamp).joined(separator: "|")
     }
@@ -285,36 +223,4 @@ actor MCPWarmSweepLedger {
         ].joined(separator: "\u{1F}")
     }
 
-    /// Test seam.
-    func _testStats() -> (handshakes: Int, skips: Int, marks: Int) {
-        (handshakes, skips, marks.count)
-    }
-
-    /// Test seam: fresh-process equivalent.
-    func reset() {
-        marks.removeAll()
-        handshakes = 0
-        skips = 0
-    }
-}
-
-/// Resumes its single waiter on the FIRST `fire()` and ignores every later one.
-/// Used to race a bounded deadline against work that may never return.
-private actor OneShotLatch {
-    private var fired = false
-    private var waiter: CheckedContinuation<Void, Never>?
-
-    func fire() {
-        guard !fired else { return }
-        fired = true
-        waiter?.resume()
-        waiter = nil
-    }
-
-    func wait() async {
-        if fired { return }
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            if fired { c.resume() } else { waiter = c }
-        }
-    }
 }

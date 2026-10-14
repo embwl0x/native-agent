@@ -112,6 +112,8 @@ extension ApprovalChatCards {
                 // Kept so an answer on the Mac or phone can clear these buttons too.
                 _ = try? await inbox.patch(id: noteID, unlessPresent: "telegram_message_id",
                     ["telegram_message_id": .string(String(messageId)), "telegram_card_title": .string(title)])
+                // Answered while the send was in flight: settle it now that the id is known.
+                await settleTelegramCopy(id: card.id, sessionID: sessionID, dataRoot: dataRoot)
             } catch {
                 nativeLog("[approval-chat-card] Telegram card failed: %@", error.localizedDescription)
             }
@@ -156,18 +158,21 @@ extension ApprovalChatCards {
               !card.state.isOpen else { return }
         let title: String = if case .string(let saved)? = note["telegram_card_title"] { saved } else { NativeAppSecretRedactor.redactText(card.title) }
         let summary = card.state.outcome?.summary.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let text = title + "\n\n✓ " + (summary.isEmpty ? "Answered." : NativeAppSecretRedactor.redactText(summary))
+        // Telegram caps a message at 4096 characters.
+        let text = String((title + "\n\n" + (summary.isEmpty ? "Closed." : "✓ " + NativeAppSecretRedactor.redactText(summary))).prefix(3500))
+        // One attempt: a deleted message or a refused edit won't succeed later either.
+        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        guard (try? await inbox.patch(id: "interaction:\(id)", unlessPresent: "telegram_card_settled", ["telegram_card_settled": .bool(true)])) == true else { return }
         do {
             try await filer.settleChatCard(chatId: chatId, messageId: messageId, text: text)
-            let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
-            _ = try? await inbox.patch(id: "interaction:\(id)", unlessPresent: "telegram_card_settled", ["telegram_card_settled": .bool(true)])
         } catch {
             nativeLog("[approval-chat-card] Telegram settle failed: %@", error.localizedDescription)
         }
     }
 
     static func publishInteractionChange(id: String, sessionID: String, dataRoot: URL) async {
-        await settleTelegramCopy(id: id, sessionID: sessionID, dataRoot: dataRoot)
+        // Off the UI path: the app's own views never wait on Telegram.
+        Task.detached { await settleTelegramCopy(id: id, sessionID: sessionID, dataRoot: dataRoot) }
         var sessions: Set<String> = [sessionID]
         if case .string(let mirror)? = await mirrorNote(id, dataRoot: dataRoot)?["chat_session_id"],
            NativeAgentChatSessionID.normalizedPathComponent(mirror) == mirror {

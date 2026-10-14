@@ -436,3 +436,64 @@ public struct DeskNagConfigStore: Sendable {
         }
     }
 }
+
+public struct DeskNagLane: Identifiable, Equatable, Sendable {
+    public let project: String
+    public let enabled: Bool
+    public let itemCount: Int
+    public var id: String { project }
+}
+
+public enum DeskNagPanelModel {
+    /// One row per project that has live work, with its current scope decision.
+    /// A project with NO scope entry is off — matching `DeskNagConfig
+    /// .scopeEnabled(for:)`, where the absence of an entry means no nag.
+    public static func lanes(items: [DeskItem], config: DeskNagConfig) -> [DeskNagLane] {
+        let active = DeskBoardLayout.activeItems(items)
+        let byProject = Dictionary(grouping: active, by: \.project)
+        return byProject.keys.sorted().map { project in
+            let entry = config.scopes.first {
+                $0.kind == .project && $0.id.compare(project, options: .caseInsensitive) == .orderedSame
+            }
+            return DeskNagLane(
+                project: project,
+                enabled: entry?.enabled ?? false,
+                itemCount: byProject[project]?.count ?? 0)
+        }
+    }
+
+    /// Count live items using the owner's item-before-project scope decision.
+    public static func summary(_ config: DeskNagConfig, items: [DeskItem], now: Date) -> String {
+        if config.isMuted(now: now) {
+            let phrase = config.mutedUntil == DeskNagConfig.indefiniteMuteSentinel
+                ? "indefinitely" : "until \(config.mutedUntil ?? "?")"
+            return "Muted \(phrase) — still tracking, nothing will ping."
+        }
+        let on = DeskBoardLayout.activeItems(items).filter { config.scopeEnabled(for: $0) }.count
+        guard config.enabled else {
+            return on > 0
+                ? "Nagging is OFF globally — \(on) live item\(on == 1 ? "" : "s") enabled but silent."
+                : "Nagging is OFF. Nothing will ping."
+        }
+        return on == 0
+            ? "Nagging is ON, but no live item is enabled — nothing will ping until you enable one."
+            : "Nagging is ON for \(on) live item\(on == 1 ? "" : "s")."
+    }
+
+    /// Snooze choices, resolved against an injected `now` so the mapping is
+    /// testable. `nil` = mute with no end date (the tool writes its indefinite
+    /// sentinel).
+    public struct SnoozeOption: Identifiable, Equatable, Sendable {
+        public let label: String
+        public let until: String?
+        public var id: String { label }
+    }
+
+    public static func snoozeOptions(from now: Date, calendar: Calendar = .current) -> [SnoozeOption] {
+        [
+            SnoozeOption(label: "Until tomorrow", until: DeskDeferPreset.tomorrow.day(from: now, calendar: calendar)),
+            SnoozeOption(label: "Until next week", until: DeskDeferPreset.nextWeek.day(from: now, calendar: calendar)),
+            SnoozeOption(label: "Indefinitely", until: nil),
+        ]
+    }
+}

@@ -65,7 +65,7 @@ extension SwiftToolDispatcher {
     /// check; it touches no file.
     private func botCreateCandidate(_ args: [String: JSONValue]) async throws -> BotDefinition {
         let args = args.filter { $0.value != .null && (["output_format", "schedule", "timezone"].contains($0.key) || $0.value != .string("")) }
-        try botKeys(args, allowed: ["name", "brief", "cadence", "schedule", "timezone", "details", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format", "paused", "event_trigger", "notify_condition"])
+        try botKeys(args, allowed: ["name", "brief", "cadence", "schedule", "timezone", "details", "provider", "model", "model_pinned", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format", "paused", "event_trigger", "notify_condition"])
         _ = try botDetails(args)
         var bot = BotDefinition(name: try botString(args["name"], field: "name"),
                                 brief: try botString(args["brief"], field: "brief"),
@@ -73,15 +73,18 @@ extension SwiftToolDispatcher {
                                 budget: try args["budget"].map(botBudget)
                                     ?? BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds),
                                 outputFormat: try args["output_format"].map { try botDecode(String.self, $0, field: "output_format") })
-        // User, 2026-09-13: "Bots has no default model; Agent is supposed
-        // to pick the model when she makes one." A bot runs on the model
-        // it was made with — there is no inheritance from Chat — so a
-        // create with no route or model is refused, by name.
         bot.provider = try args["provider"].map { try botString($0, field: "provider") }
         bot.model = try args["model"].map { try botString($0, field: "model") }
         bot.reasoningEffort = try args["reasoning_effort"].map { try botString($0, field: "reasoning_effort") }
-        try await botRouteCheck(bot)
         bot.fast = try args["fast"].map { try botDecode(Bool.self, $0, field: "fast") }
+        bot.modelPinned = try args["model_pinned"].map { try botDecode(Bool.self, $0, field: "model_pinned") } ?? (bot.model != nil)
+        if bot.modelPinned == false {
+            guard args["model_pinned"] != nil || args["provider"] == nil && args["reasoning_effort"] == nil && args["fast"] == nil else {
+                throw botArgumentError("A provider choice needs a model to pin", field: "model", accepted: "Supply a complete provider/model/reasoning_effort choice, or omit all three to follow Providers.")
+            }
+            bot.followProviders()
+        }
+        try await botRouteCheck(bot)
         bot.paused = try args["paused"].map { try botDecode(Bool.self, $0, field: "paused") } ?? false
         bot.dailyTokenCeiling = try args["daily_token_ceiling"].map { try botDecode(Int.self, $0, field: "daily_token_ceiling") }
         bot.eventTrigger = try args["event_trigger"].map(botEventTrigger)
@@ -96,7 +99,7 @@ extension SwiftToolDispatcher {
         try botKeys(args, allowed: Set(botReferenceKeys + ["fields", "details"]))
         _ = try botDetails(args)
         let fields = try botObject(args["fields"], field: "fields")
-        try botKeys(fields, allowed: ["name", "brief", "cadence", "schedule", "timezone", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format", "event_trigger", "notify_condition"], path: "$.fields")
+        try botKeys(fields, allowed: ["name", "brief", "cadence", "schedule", "timezone", "provider", "model", "model_pinned", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format", "event_trigger", "notify_condition"], path: "$.fields")
         let edits = fields.filter { $0.value != .null && (["output_format", "schedule", "timezone", "notify_condition"].contains($0.key) || $0.value != .string("")) }
         guard !edits.isEmpty else { throw botArgumentError("fields must contain at least one setting", field: "fields", accepted: "An object containing at least one setting to change.") }
         var bot = try definitions.get(botReference(args, definitions: definitions))
@@ -117,16 +120,19 @@ extension SwiftToolDispatcher {
                 bot.notificationCondition = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
             }
             if let value = edits["provider"] { bot.provider = try botString(value, field: "provider") }
-            if let value = edits["model"] { bot.model = try botString(value, field: "model") }
+            if let value = edits["model"] { bot.model = try botString(value, field: "model"); bot.modelPinned = true }
+            if let value = edits["model_pinned"] { bot.modelPinned = try botDecode(Bool.self, value, field: "model_pinned") }
             if let value = edits["reasoning_effort"] { bot.reasoningEffort = try botString(value, field: "reasoning_effort") }
             if let value = edits["fast"] { bot.fast = try botDecode(Bool.self, value, field: "fast") }
             if let value = edits["daily_token_ceiling"] { bot.dailyTokenCeiling = try botDecode(Int.self, value, field: "daily_token_ceiling") }
             if let value = edits["output_format"] { bot.outputFormat = try botDecode(String.self, value, field: "output_format") }
             if let value = edits["budget"] { bot.budget = try botBudget(value) }
-            // The edited tuple has to stand on its own, whichever field was
-            // touched: changing the provider without the model, or the model
-            // without the Think level, would otherwise leave a bot that
-            // cannot run (2026-09-13 review).
+            if bot.modelPinned == false {
+                guard edits["model_pinned"] == .bool(false) || ["provider", "reasoning_effort", "fast"].allSatisfy({ edits[$0] == nil }) else {
+                    throw botArgumentError("A provider choice needs a model to pin", field: "model", accepted: "Supply a complete provider/model/reasoning_effort choice, or keep following Providers without per-helper route settings.")
+                }
+                bot.followProviders()
+            }
             try await botRouteCheck(bot)
         } catch let error as ToolFailureError {
             throw botFieldsError(error)
@@ -138,13 +144,10 @@ extension SwiftToolDispatcher {
     /// `BotRunGate` at launch (NativeAgentApp.swift), so a tuple refused here is
     /// refused identically by a scheduled run and by `BotChatContract`.
     private func botRouteCheck(_ bot: BotDefinition) async throws {
-        if let reason = await SwiftNativeProviderRouting(dataRoot: dataRoot)
-            .botChoiceRejection(
-                provider: bot.provider, model: bot.model,
-                reasoningEffort: bot.reasoningEffort
-            ) {
-            throw ToolFailureError("A bot runs on the model it is made with, not Chat's: \(reason)",
-                argumentPath: "$", accepted: "An explicit connected provider, model and supported reasoning_effort tuple from bot_list with include_models true.", effects: .none)
+        do { _ = try await BotChatContract.choice(for: bot, dataRoot: dataRoot) }
+        catch {
+            throw ToolFailureError(String(describing: error), argumentPath: "$",
+                accepted: "Follow Providers with model_pinned false, or pin a connected provider/model/reasoning_effort choice from bot_list include_models true.", effects: .none)
         }
     }
 
@@ -301,7 +304,8 @@ extension SwiftToolDispatcher {
                 catch let error as ToolFailureError { throw botTimingError(error, input: args) }
                 return try botDefinitionJSON(created,
                     details: botDetails(args), operation: (args["schedule"] ?? .null) == .null
-                        && (args["cadence"] ?? .null) == .null && created.eventTrigger == nil ? "created without timing" : "created")
+                        && (args["cadence"] ?? .null) == .null && created.eventTrigger == nil ? "created without timing" : "created",
+                    currentModel: try? await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model)
             case "bot_update":
                 let candidate = try await botUpdateCandidate(args, definitions: definitions)
                 let updated: BotDefinition
@@ -310,7 +314,8 @@ extension SwiftToolDispatcher {
                     throw botFieldsError(botTimingError(error, input: try botObject(args["fields"], field: "fields")))
                 }
                 return try botDefinitionJSON(updated,
-                    details: botDetails(args), operation: "updated")
+                    details: botDetails(args), operation: "updated",
+                    currentModel: try? await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model)
             case "bot_delete":
                 try botKeys(args, allowed: Set(botReferenceKeys))
                 try definitions.delete(botReference(args, definitions: definitions))
@@ -320,14 +325,16 @@ extension SwiftToolDispatcher {
                 let paused = try botDecode(Bool.self, args["paused"], field: "paused")
                 let details = try botDetails(args)
                 return try botDefinitionJSON(definitions.pause(botReference(args, definitions: definitions), paused: paused),
-                    details: details, operation: paused ? "paused" : "resumed")
+                    details: details, operation: paused ? "paused" : "resumed",
+                    currentModel: try? await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model)
             case "bot_list":
                 try botKeys(args, allowed: ["details", "include_models", "id"])
                 let details = try botDetails(args)
                 let includeModels = try args["include_models"].map { try botDecode(Bool.self, $0, field: "include_models") } ?? false
                 let selected = try args["id"].map { _ in try definitions.get(botReference(args, definitions: definitions)) }
+                let currentModel = try? await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model
                 var result: [String: JSONValue] = ["status": .string("ok"), "bots": .array(try (selected.map { [$0] } ?? definitions.list()).map {
-                    try botDefinitionJSON($0, details: details)
+                    try botDefinitionJSON($0, details: details, currentModel: currentModel)
                 })]
                 if includeModels { result["model_choices"] = try await SwiftNativeProviderRouting(dataRoot: dataRoot).botModelChoices() }
                 return .object(result)
@@ -427,9 +434,8 @@ extension SwiftToolDispatcher {
                     .map { try botDecode(Bool.self, $0, field: "mark_read") } ?? false
                 let page = try shelf.shelfRead(bot: bot, since: since, topic: topic, limit: limit,
                                               cursor: cursor, readerId: includeRead ? nil : Self.standingBotReaderID, newestFirst: newestFirst)
-                // One definition read for this page, including an unfiltered
-                // shelf. A missing/deleted helper keeps its exact saved ID.
-                let agentNames = Dictionary(((try? definitions.list()) ?? []).map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+                // Removed helpers still own their saved replies and names.
+                let agentNames = Dictionary(try definitions.list(includeDeleted: true).map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
                 var shortenedChange = false
                 // Entries first, then the approval boundary (which reads the
                 // pending set last), so a remotely decided approval settles for
@@ -699,14 +705,15 @@ private func botJSON<T: Encodable>(_ value: T) throws -> JSONValue {
     return try JSONDecoder().decode(JSONValue.self, from: encoder.encode(value))
 }
 
-private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, operation: String? = nil) throws -> JSONValue {
+private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, operation: String? = nil, currentModel: String? = nil) throws -> JSONValue {
     guard case .object(var fields) = try botJSON(bot) else { throw StandingBotsError.invalidValue("bot") }
     if !details {
-        let visible: Set<String> = ["id", "name", "brief", "provider", "model", "reasoningEffort", "fast",
+        let visible: Set<String> = ["id", "name", "brief", "provider", "model", "modelPinned", "reasoningEffort", "fast",
                                    "cadence", "paused", "budget", "outputFormat", "eventTrigger", "notificationCondition"]
         fields = fields.filter { visible.contains($0.key) }
     }
     fields["status"] = .string("ok")
+    fields["model_selection"] = .string(bot.modelSelection(currentModel: currentModel))
     fields["session_id"] = .string(bot.sessionID)
     fields["daily_token_ceiling"] = .int(Int64(bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens))
     fields["schedule"] = .string(StandingBotSchedule.describe(bot.cadence))

@@ -17,5 +17,5 @@ public struct MacSyncRemoteMacControlResult {
 @MainActor
 public protocol MacSyncRemoteMacControlPort {
     func loadTrustPolicy() async throws -> TrustPolicy
-    func run(path: String, bodyData: Data, timeout: TimeInterval) async throws -> MacSyncRemoteMacControlResult
+    func run(path: String, bodyData: Data) async throws -> MacSyncRemoteMacControlResult
 }

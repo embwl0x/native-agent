@@ -135,6 +135,51 @@ struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
 }
 
 extension iCloudSyncEngine {
+    @discardableResult
+    func refreshHelpersSnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
+        let lifecycle = lifecycleGeneration
+        await refreshSnapshotStaleness()
+        guard let snapshot: MobileHelpersSnapshot = await Self.loadSnapshotObjectOnly(named: "helpers_agents.json", in: snapshotDir),
+              lifecycle == lifecycleGeneration else { return false }
+        helpersSnapshot = snapshot
+        return staleSnapshotGroups["helpers_agents"] == nil
+    }
+
+    func applySchedulerSnapshot(_ snapshot: MobileSchedulerSnapshot) {
+        guard snapshot.capturedAt >= (schedulerSnapshot?.capturedAt ?? 0) else { return }
+        var merged = snapshot
+        schedulerJobReceiptTimes = schedulerJobReceiptTimes.filter { $0.value > snapshot.capturedAt }
+        // Preserve newer action readbacks without discarding other jobs in this full snapshot.
+        for job in schedulerSnapshot?.jobs ?? [] where schedulerJobReceiptTimes[job.id] != nil {
+            if let index = merged.jobs.firstIndex(where: { $0.id == job.id }) {
+                merged.jobs[index] = job
+            } else {
+                merged.jobs.append(job)
+            }
+        }
+        schedulerSnapshot = merged
+    }
+
+    @discardableResult
+    func refreshSchedulerSnapshot() async -> Bool {
+        await refreshSnapshotStaleness()
+        guard snapshotDir != nil else {
+            schedulerError = "Scheduler is unavailable until this iPhone receives a snapshot from the Mac."
+            return false
+        }
+        let lifecycle = lifecycleGeneration
+        let snapshot: MobileSchedulerSnapshot? = await loadSnapshotObjectAsync(named: "scheduler.json")
+        guard lifecycle == lifecycleGeneration else { return false }
+        guard let snapshot else {
+            schedulerError = "Could not refresh Scheduler. Keep the Mac app open and try again."
+            return false
+        }
+        applySchedulerSnapshot(snapshot)
+        schedulerError = nil
+        return true
+    }
+
     /// The one place a successful refresh clears its error.
     ///
     /// Every field being non-nil is not every file being read cleanly: the
@@ -147,16 +192,42 @@ extension iCloudSyncEngine {
         lastSyncAt = Date()
         syncError = SnapshotHealthLog.damageSentence(for: files)
         PhoneRequestCoordinator.shared.syncDidSucceed()
+        if !prefersCloudKitSnapshotCache { refreshLegacyPageVersions() }
+    }
+
+    private func refreshLegacyPageVersions() {
+        guard let snapshotDir else { return }
+        pageVersionQueued = true
+        guard pageVersionTask == nil else { return }
+        let generation = lifecycleGeneration
+        pageVersionTask = Task {
+            defer { if generation == lifecycleGeneration { pageVersionTask = nil } }
+            while pageVersionQueued {
+                pageVersionQueued = false
+                let versions = await Task.detached(priority: .utility) {
+                    Dictionary(uniqueKeysWithValues: ["knowledge_graph.json", "telegram.json"].map { filename in
+                        let digest = Self.loadSnapshotData(named: filename, in: snapshotDir).map { Data(SHA256.hash(data: $0)) } ?? Data()
+                        return (filename, digest)
+                    })
+                }.value
+                guard !Task.isCancelled, generation == lifecycleGeneration else { return }
+                for (filename, version) in versions where pageSnapshotVersions[filename] != version {
+                    pageSnapshotVersions[filename] = version
+                }
+            }
+        }
     }
 
     /// Apply the credential-free CloudKit projection published by the Mac.
     /// Decode/validation is all-or-nothing so malformed or future payloads
     /// retain the phone's last proven catalog instead of blanking the picker.
     @discardableResult
-    func applyProviderCatalogStatus(_ value: String) -> Bool {
-        do {
+    func applyProviderCatalogStatus(_ value: String, isCurrent: @MainActor () -> Bool) async -> Bool {
+        let lifecycle = lifecycleGeneration
+        let pairing = pairingStore?.iCloudPairingSecret
+        let result = await Task.detached(priority: .userInitiated) { () throws -> ([ProviderInfo], [String: SurfaceModelPref]) in
             let catalog = try NAProviderCatalogStatusCodec.decode(value)
-            providers = catalog.providers.map { provider in
+            let providers = catalog.providers.map { provider in
                 ProviderInfo(
                     provider_id: provider.providerID,
                     display_name: provider.displayName,
@@ -186,19 +257,24 @@ extension iCloudSyncEngine {
                     }
                 )
             }
-            applyRemoteSurfaceModels(
-                catalog.surfaces.mapValues { selection in
-                    SurfaceModelPref(
-                        model: selection.model,
-                        reasoningEffort: selection.reasoningEffort,
-                        serviceTier: selection.serviceTier,
-                        providerId: selection.providerID
-                    )
-                }
-            )
+            let surfaceModels = catalog.surfaces.mapValues { selection in
+                SurfaceModelPref(
+                    model: selection.model,
+                    reasoningEffort: selection.reasoningEffort,
+                    serviceTier: selection.serviceTier,
+                    providerId: selection.providerID
+                )
+            }
+            return (providers, surfaceModels)
+        }.result
+        guard !Task.isCancelled, isCurrent(), lifecycle == lifecycleGeneration,
+              pairing == pairingStore?.iCloudPairingSecret else { return false }
+        switch result {
+        case .success(let (providers, surfaceModels)):
+            applyProviderState(providers: providers, surfaceModels: surfaceModels)
             noteRefreshSucceeded()
             return true
-        } catch {
+        case .failure(let error):
             syncError = "Provider catalog sync failed: \(error.localizedDescription)"
             return false
         }
@@ -206,7 +282,9 @@ extension iCloudSyncEngine {
 
     // Phone selections return through the same Mac-owned snapshot as remote
     // changes. A matching pending selection is an acknowledgement, not a toast.
-    private func applyRemoteSurfaceModels(_ next: [String: SurfaceModelPref]) {
+    private func applyProviderState(providers nextProviders: [ProviderInfo]?, surfaceModels next: [String: SurfaceModelPref]?) {
+        if let nextProviders, providers != nextProviders { providers = nextProviders }
+        guard let next, surfaceModels != next || !pendingPhoneSurfaceModels.isEmpty else { return }
         let previous = surfaceModels
         for (surface, newPref) in next {
             let acknowledged = pendingPhoneSurfaceModels.filter { _, selection in
@@ -235,7 +313,7 @@ extension iCloudSyncEngine {
                 iOSSystemToastCenter.shared.push(info: "\(changeMessage).")
             }
         }
-        surfaceModels = next
+        if surfaceModels != next { surfaceModels = next }
     }
 
     // MARK: - Snapshot refresh
@@ -303,7 +381,9 @@ extension iCloudSyncEngine {
         let bundle = await Self.loadAllSnapshots(snapshotDir: snapshotDir)
         let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
         let layout: SurfaceLayout? = await Self.loadSnapshotObjectOnly(named: "ui_layout.json", in: snapshotDir)
-        // Resumption of an @MainActor async func is back on the main actor.
+        let projectedTranscripts: [String: PublishedTranscript]?
+        if let rows = bundle.chatTranscripts { projectedTranscripts = await Self.transcriptMap(rows) }
+        else { projectedTranscripts = nil }
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         let transcriptsCurrent = transcriptsGeneration == chatTranscriptsRefreshGeneration
@@ -312,7 +392,7 @@ extension iCloudSyncEngine {
         if var layout { layout.addMissing(); surfaceLayout = layout }
         if activityGeneration == targetedRefreshGeneration {
             if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
-            if let v = bundle.memories { memories = v }
+            if let v = bundle.memories, memories != v { memories = v }
             if let v = bundle.memoryProposals {
                 memoryProposalsSnapshotLoaded = true
                 memoryProposals = v.filter(\.isPending)
@@ -335,7 +415,7 @@ extension iCloudSyncEngine {
                 deskReadingCopies = Dictionary(v.map { ($0.handle, $0) }, uniquingKeysWith: { _, newer in newer })
             }
         }
-        if let v = bundle.skills { skills = v }
+        if let v = bundle.skills, skills != v { skills = v }
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let v = bundle.personality { applyPersonality(v, pairing: personalityPairing) }
         if let v = bundle.health { health = v }
@@ -344,18 +424,14 @@ extension iCloudSyncEngine {
         // a false current posture.
         organismLivingStatus = bundle.organismLivingStatus
         if sessionsCurrent {
-            if let v = bundle.sessions { sessions = v }
-            if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
+            if let v = bundle.sessions, sessions != v { sessions = v }
+            if let v = bundle.pinnedChatSessions, pinnedChatSessions != v { pinnedChatSessions = v }
             if let v = bundle.chatAnchor { chatAnchor = v }
         }
-        if transcriptsCurrent, let v = bundle.chatTranscripts { chatTranscripts = Self.transcriptMap(v) }
+        if transcriptsCurrent, let projectedTranscripts, chatTranscripts != projectedTranscripts { chatTranscripts = projectedTranscripts }
         if let v = bundle.connectors { connectors = v }
-        if let v = bundle.providers { providers = v }
-        if let v = bundle.providerSignIns { providerSignIns = v }
-        // gpt-5.5 review finding #2: don't gate on !isEmpty. A valid `{}`
-        // snapshot (Mac wiped all surface picks) should still propagate so
-        // the in-memory map matches the source of truth.
-        if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
+        applyProviderState(providers: bundle.providers, surfaceModels: bundle.surfaceModels)
+        if let v = bundle.providerSignIns, providerSignIns != v { providerSignIns = v }
         if approvalsGeneration == approvalsRefreshGeneration, let v = bundle.approvals {
             approvalsSnapshotLoaded = true
             approvals = v
@@ -443,14 +519,13 @@ extension iCloudSyncEngine {
         if let v = bundle.health { health = v }
         organismLivingStatus = bundle.organismLivingStatus
         if sessionsGeneration == chatSessionListRefreshGeneration {
-            if let v = bundle.sessions { sessions = v }
-            if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
+            if let v = bundle.sessions, sessions != v { sessions = v }
+            if let v = bundle.pinnedChatSessions, pinnedChatSessions != v { pinnedChatSessions = v }
             if let v = bundle.chatAnchor { chatAnchor = v }
         }
         if let v = bundle.connectors { connectors = v }
-        if let v = bundle.providers { providers = v }
-        if let v = bundle.providerSignIns { providerSignIns = v }
-        if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
+        applyProviderState(providers: bundle.providers, surfaceModels: bundle.surfaceModels)
+        if let v = bundle.providerSignIns, providerSignIns != v { providerSignIns = v }
         if approvalsGeneration == approvalsRefreshGeneration, let v = bundle.approvals {
             approvalsSnapshotLoaded = true
             approvals = v
@@ -525,7 +600,7 @@ extension iCloudSyncEngine {
         guard generation == targetedRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
-        if let v = bundle.memories { memories = v }
+        if let v = bundle.memories, memories != v { memories = v }
         if let v = bundle.inboxItems {
             inboxSnapshotLoaded = true
             inboxItems = v
@@ -772,11 +847,8 @@ extension iCloudSyncEngine {
         async let latestSurfaceModels: [String: SurfaceModelPref]? = Self.loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
         let (providerRows, trustRow, surfaceModelRows) = await (latestProviders, latestTrust, latestSurfaceModels)
         guard lifecycle == lifecycleGeneration else { return .superseded }
-        if let providerRows { providers = providerRows }
+        applyProviderState(providers: providerRows, surfaceModels: surfaceModelRows)
         if let trustRow { trustPolicy = trustRow }
-        // gpt-5.5 review finding #2: see the bulk-apply site above for why
-        // we don't gate on !isEmpty.
-        if let surfaceModelRows { applyRemoteSurfaceModels(surfaceModelRows) }
         if providerRows != nil && trustRow != nil && surfaceModelRows != nil {
             noteRefreshSucceeded(files: ProviderControlsRefreshOutcome.filenames)
             return .refreshed
@@ -833,9 +905,10 @@ extension iCloudSyncEngine {
         chatTranscriptsRefreshGeneration &+= 1
         let generation = chatTranscriptsRefreshGeneration
         if let latestTranscripts: [ChatTranscriptSnapshot] = await Self.loadSnapshotArrayOnly(named: "chat_transcripts.json", in: snapshotDir) {
+            let projected = await Self.transcriptMap(latestTranscripts)
             guard generation == chatTranscriptsRefreshGeneration,
                   lifecycle == lifecycleGeneration else { return false }
-            chatTranscripts = Self.transcriptMap(latestTranscripts)
+            if chatTranscripts != projected { chatTranscripts = projected }
             noteRefreshSucceeded()
             return true
         }
@@ -850,7 +923,7 @@ extension iCloudSyncEngine {
     func transcriptRead(for sessionID: String?) -> MacTranscriptRead {
         guard let sessionID, let published = chatTranscripts[sessionID] else { return .unavailable }
         return .published(
-            MacBridgeClient.projectChatRecords(published.records),
+            published.messages,
             generation: published.generation
         )
     }
@@ -1098,18 +1171,21 @@ extension iCloudSyncEngine {
     /// can never claim authority to clear.
     private nonisolated static func transcriptMap(
         _ rows: [ChatTranscriptSnapshot]
-    ) -> [String: PublishedTranscript] {
-        var out: [String: PublishedTranscript] = [:]
-        for row in rows {
-            let clean = row.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !clean.isEmpty else { continue }
-            out[clean] = PublishedTranscript(
-                records: row.messages,
-                generation: row.transcriptGeneration,
-                hasOlder: row.hasOlder ?? false
-            )
-        }
-        return out
+    ) async -> [String: PublishedTranscript] {
+        await Task.detached(priority: .userInitiated) {
+            var out: [String: PublishedTranscript] = [:]
+            for row in rows {
+                let clean = row.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !clean.isEmpty else { continue }
+                out[clean] = PublishedTranscript(
+                    records: row.messages,
+                    messages: MacBridgeClient.projectChatRecords(row.messages),
+                    generation: row.transcriptGeneration,
+                    hasOlder: row.hasOlder ?? false
+                )
+            }
+            return out
+        }.value
     }
 
     private nonisolated static func loadActivitySnapshots(snapshotDir: URL) async -> ActivitySnapshotBundle {
@@ -1329,13 +1405,11 @@ extension iCloudSyncEngine {
     // the detached-task Async wrappers, never synchronously on the MainActor.
     func loadSnapshotObjectAsync<T: Decodable & Sendable>(named filename: String, as type: T.Type = T.self) async -> T? {
         guard let snapshotDir else { return nil }
-        try? FileManager.default.startDownloadingUbiquitousItem(at: snapshotDir.appendingPathComponent(filename))
         return await Self.loadSnapshotObjectOnly(named: filename, in: snapshotDir)
     }
 
     func loadSnapshotArrayAsync<T: Decodable & Sendable>(named filename: String, as type: T.Type = T.self) async -> [T]? {
         guard let snapshotDir else { return nil }
-        try? FileManager.default.startDownloadingUbiquitousItem(at: snapshotDir.appendingPathComponent(filename))
         return await Self.loadSnapshotArrayOnly(named: filename, in: snapshotDir)
     }
 }

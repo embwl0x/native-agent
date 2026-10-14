@@ -39,7 +39,7 @@ extension SwiftNativeApprovalInbox {
             return .unavailable
         }
         let path = effectSpendPath
-        let now = clock()
+        let now = Date()
         let persistence = self.persistence
         do {
             return try await persistence.withFileLock(path) {

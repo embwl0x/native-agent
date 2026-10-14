@@ -113,7 +113,7 @@ enum AgentWorkspaceFind {
             let value = try await perform(tool, input)
             return AgentWorkspaceProjection.project(location: .record(tool: tool, input: input, title: title), result: value)
         }
-        if let peer = try AgentWorkspacePeerReader(dataRoot: dataRoot).list().first(where: { query == $0.id || query == "peer:" + $0.id }) {
+        if let peer = try AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot).first(where: { query == $0.id || query == "peer:" + $0.id }) {
             return try await read("agent_contacts", ["discover": .string("peer:" + peer.id)], peer.name)
         }
         if let bot = try BotDefinitionStore(dataRoot: dataRoot).list().first(where: { query == $0.id.uuidString.lowercased() || query == "bot:" + $0.id.uuidString.lowercased() }) {
@@ -132,7 +132,7 @@ enum AgentWorkspaceFind {
                 return .init(title: "Approval", content: .object(row.filter { ["id", "title", "status", "createdAt", "resolvedAt", "decision"].contains($0.key) }), items: [],
                     actions: [.init(label: "Open Inbox", action: .open(.area("inbox")))])
             }
-            if let record = try AgentWorkspaceConversationReader(dataRoot: dataRoot).records().first(where: {
+            if let record = try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true).first(where: {
                 $0.id == query || $0.operationID == query || $0.readInput?["message_id"] == .string(query)
             }) {
                 let input: [String: JSONValue] = ["agent": .string(record.agent), "conversation": .string(record.id)]

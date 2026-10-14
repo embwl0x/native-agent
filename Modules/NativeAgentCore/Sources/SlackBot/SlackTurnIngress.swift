@@ -1,4 +1,5 @@
 import Foundation
+import MacControl
 import ChatOrchestration
 import PersistenceCore
 import PersonaEngine
@@ -27,6 +28,7 @@ extension SlackSocketModeLoop {
         let slackSessions = SlackSessionStore(dataRoot: dataRoot)
         let client = makeChatClient()
         let handler: SlackSocketModeProgressChatHandler = { inbound, progress in
+            let takeover = await MacWorkContinuation.admit(inbound.text)
             let sessionId = try await slackSessions.activeSessionId(for: inbound)
             let prompt = """
             [from: slack, user: \(inbound.userId), channel: \(inbound.channelId)]
@@ -35,7 +37,8 @@ extension SlackSocketModeLoop {
             let replyRoute = ChatToolSessionContext.ReplyRoute(
                 surface: "slack",
                 destinationId: inbound.channelId,
-                threadId: inbound.replyThreadTs
+                threadId: inbound.replyThreadTs,
+                requesterUserId: inbound.userId
             )
             // 2026-07-21 audit fix: the forged commandSignatureVerified=true
             // binding is REMOVED. Socket mode carries no request signature;
@@ -51,7 +54,8 @@ extension SlackSocketModeLoop {
                 surface: "slack",
                 verifiedChatID: inbound.channelId,
                 verifiedUserID: inbound.userId,
-                replyRoute: replyRoute
+                replyRoute: replyRoute,
+                queryUserMessage: inbound.text
             )
             let response: ChatResponse
             do {
@@ -60,12 +64,14 @@ extension SlackSocketModeLoop {
                 // reconnect and compaction notices died here. Only notices are
                 // forwarded — tool events would be channel noise; the sink
                 // posts one line per kind.
-                response = try await TurnAdmission.shared.run(sessionID: sessionId) {
+                response = try await MacWorkContinuation.$current.withValue(takeover) {
+                try await TurnAdmission.shared.run(sessionID: sessionId) {
                     try await request.chat(on: client, progress: { event in
                         if case .notice(let kind, let text) = event {
                             await progress(kind, text)
                         }
                     })
+                }
                 }
             }
             return SlackSocketModeReply(

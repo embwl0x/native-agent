@@ -42,7 +42,7 @@ extension SwiftToolDispatcher {
     ///   - `workspace/` → user scratch + drafts
     ///
     /// Both `persona/` and `data/` subdirs are reachable from here, so a
-    /// caller asking for `persona/SOUL.md` or `data/skills/registry.json`
+    /// caller asking for `persona/SOUL.md` or an ability file
     /// both resolve via the SAME root — no "two tools, two roots" seam.
     static let allowedTopLevels: Set<String> = ["workspace", "persona", "data", "script"]
 
@@ -384,15 +384,6 @@ extension SwiftToolDispatcher {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : s
     }
-    func optionalInt(_ input: [String: JSONValue], _ key: String) -> Int? {
-        switch input[key] {
-        case .some(.int(let i)): return Int(i)
-        case .some(.double(let d)): return Int(exactly: d.rounded(.towardZero))
-        case .some(.string(let s)): return Int(s)
-        default: return nil
-        }
-    }
-
     func personaRootForTools() -> URL {
         PersonaRootResolver.resolve(dataRootProvider: { dataRoot })
     }
@@ -404,14 +395,7 @@ extension SwiftToolDispatcher {
             .lowercased()
     }
 
-    func validatePersonaSkillName(_ name: String) -> Bool {
-        guard !name.isEmpty else { return false }
-        return name.allSatisfy { ch in
-            ch.isASCII && (ch.isLetter || ch.isNumber || ch == "_" || ch == "-")
-        }
-    }
-
-    func personaToolPath(kind: String, skillName: String?) throws -> URL? {
+    func personaToolPath(kind: String) -> URL? {
         let personaRoot = personaRootForTools()
         switch kind {
         case "soul": return personaRoot.appendingPathComponent("SOUL.md")
@@ -419,15 +403,6 @@ extension SwiftToolDispatcher {
         case "voice": return personaRoot.appendingPathComponent("VOICE.md")
         case "growth": return personaRoot.appendingPathComponent("GROWTH.md")
         case "agents": return personaRoot.appendingPathComponent("AGENTS.md")
-        case "skill":
-            guard let skillName, validatePersonaSkillName(skillName) else { return nil }
-            let entries = try InstalledSkillInventory.entries(
-                dataRoot: dataRoot, sourceRoot: rootForRead, personaRoot: personaRoot)
-            // Registered identity wins over a stale loose body with the same name.
-            let entry = InstalledSkillInventory.match(skillName, in: entries.filter {
-                $0.row["source"] == .string("runtime_registry")
-            }) ?? InstalledSkillInventory.match(skillName, in: entries)
-            return entry?.bodyURL
         default:
             return nil
         }
@@ -463,30 +438,7 @@ extension SwiftToolDispatcher {
         var fullMacActive: Bool
         var fileOpsAllowed: Bool
         var systemAllowed: Bool
-        var appControlAllowed: Bool
-        /// READ tier of the SAME `accessibility` gate category (W1b).
-        ///
-        /// HONEST NOTE — today this is byte-for-byte the same boolean as
-        /// `appControlAllowed`, because `MacControlPolicy` carries exactly one
-        /// `accessibility_allowed` key: there is no separate read permission to
-        /// read. It exists as its own named field so (a) the perception reads do
-        /// not semantically depend on a field called "app control", and (b) if
-        /// User ever splits accessibility into read/act permissions, exactly one
-        /// line here changes and the read tools follow. It is NOT a weaker gate:
-        /// Full Mac must be active AND the accessibility category enabled.
-        var accessibilityReadAllowed: Bool
-        /// ACT tier of the same `accessibility` category (W2/W3) — keystroke,
-        /// click, scroll, ax_act.
-        ///
-        /// HONEST NOTE: like the read tier this is today the same boolean as
-        /// `appControlAllowed`, because there is one `accessibility_allowed`
-        /// key. It is named apart because the CONSEQUENCES differ by an order
-        /// of magnitude, and because this tier carries MacControl's body-bound
-        /// injection capability. Standard modes obtain it through approved
-        /// replay; admitted Full Mac YOLO obtains it directly for the checked
-        /// call. Catalog visibility from this flag is not authority — it only
-        /// decides what the model can SEE.
-        var accessibilityInjectionAllowed: Bool
+        var accessibilityAllowed: Bool
         var permissionLevel: String
         var outsideWorkspaceDefault: String
     }
@@ -512,9 +464,7 @@ extension SwiftToolDispatcher {
             fullMacActive: fullMacActive,
             fileOpsAllowed: categoryAllowed("file_ops"),
             systemAllowed: categoryAllowed("system"),
-            appControlAllowed: categoryAllowed("accessibility"),
-            accessibilityReadAllowed: categoryAllowed("accessibility"),
-            accessibilityInjectionAllowed: categoryAllowed("accessibility"),
+            accessibilityAllowed: categoryAllowed("accessibility"),
             permissionLevel: trust.permissionLevel,
             outsideWorkspaceDefault: trust.outsideWorkspaceDefault
         )
@@ -753,8 +703,7 @@ extension SwiftToolDispatcher {
     /// READ-ONLY accessibility perception (W1b): legacy AX status tool / legacy AX tree tool /
     /// legacy AX find tool. Mirrors `impl_mac_app_control_tool`'s shape, with three
     /// deliberate differences:
-    ///   1. gates on `access.accessibilityReadAllowed` (the accessibility
-    ///      category's READ tier) — NOT `appControlAllowed`. These tools do not
+    ///   1. gates on the accessibility category. These tools do not
     ///      act on any app, so requiring app-control authority to LOOK at the
     ///      screen would be the wrong contract.
     ///   2. no approval tier and no write side-effect. MacControl's own
@@ -796,13 +745,13 @@ extension SwiftToolDispatcher {
         let access = await fullMacToolAccess(surface: surface)
         switch tool {
         case "screen", "wait":
-            guard access.accessibilityReadAllowed else {
+            guard access.accessibilityAllowed else {
                 throw AutonomyGateError.toolDenied(
                     reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
                 )
             }
         default:
-            guard access.appControlAllowed else {
+            guard access.accessibilityAllowed else {
                 throw AutonomyGateError.toolDenied(
                     reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
                 )
@@ -840,11 +789,7 @@ extension SwiftToolDispatcher {
             policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
             auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
         )
-        guard let host = impl as? MacFourVerbsHost else {
-            throw AutonomyGateError.toolDenied(
-                reason: "four_verbs_host_unavailable: the MacControl client in this build does not host the four verbs"
-            )
-        }
+        let host = impl
         if tool == "screen", input["__sense_app_material"] == .bool(true) {
             guard let bundle = str("app"), bundle != "*" else {
                 throw SenseFailure(code: "source_unavailable", message: "App material needs a concrete already-running app.")
@@ -923,7 +868,6 @@ extension SwiftToolDispatcher {
             ? FourVerbPixelAttachment(part: str("part"), forced: input["pixels"] == .bool(true)) : nil
         var verbs = MacFourVerbs(
             host: host,
-            clock: SystemMacFourVerbsClock(),
             supplementalSource: SwiftToolDispatcherFourVerbPerceptionSource(
                 host: host,
                 liveScene: fourVerbLiveScene,
@@ -1122,12 +1066,12 @@ extension SwiftToolDispatcher {
     /// fable51 item 30 — THE CLIPBOARD ORGAN.
     ///
     /// One route, TWO gates, because the two halves are not the same act:
-    ///   • `clipboard_read` gates on `accessibilityReadAllowed`. It changes
+    ///   • `clipboard_read` gates on `accessibilityAllowed`. It changes
     ///     nothing, and the text it returns has already been through
     ///     `MacScreenViewTextRedaction` inside MacControl — the redaction is a
     ///     property of the handler, not of this route, so no caller can reach
     ///     an unredacted read by finding another way in.
-    ///   • `clipboard_write` gates on `appControlAllowed`. It replaces the
+    ///   • `clipboard_write` gates on `accessibilityAllowed`. It replaces the
     ///     general pasteboard, which the next ⌘V in any app will paste, so it
     ///     is a change to the world and sits at the same authority as the other
     ///     verbs that move things.
@@ -1145,14 +1089,14 @@ extension SwiftToolDispatcher {
         let action: String
         switch tool {
         case "clipboard_read":
-            guard access.accessibilityReadAllowed else {
+            guard access.accessibilityAllowed else {
                 throw AutonomyGateError.toolDenied(
                     reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
                 )
             }
             action = "clipboard_read"
         case "clipboard_write":
-            guard access.appControlAllowed else {
+            guard access.accessibilityAllowed else {
                 throw AutonomyGateError.toolDenied(
                     reason: "Trust Center Full Mac Accessibility app control is not active for \(tool)"
                 )
@@ -1175,12 +1119,12 @@ extension SwiftToolDispatcher {
     ///
     /// One route, TWO contracts, because listing a menu and pressing one are
     /// not the same act:
-    ///   • `menu` gates on `accessibilityReadAllowed` and goes through the
+    ///   • `menu` gates on `accessibilityAllowed` and goes through the
     ///     UNPRIVILEGED `dispatch`, which refuses every injection action by
     ///     signature. Walking a menu bar changes nothing — it does not even
     ///     open a menu, because the AX tree publishes the items whether or not
     ///     they are drawn.
-    ///   • `menu_press` gates on `appControlAllowed` AND goes through
+    ///   • `menu_press` gates on `accessibilityAllowed` AND goes through
     ///     `dispatchApprovedInjection` with a body-bound single-use capability,
     ///     exactly like `legacy AX act tool`. Pressing File › Quit runs the app's own
     ///     handler; a read-shaped route to that would be the bypass every other
@@ -1199,14 +1143,14 @@ extension SwiftToolDispatcher {
         }
         switch tool {
         case "menu":
-            guard access.accessibilityReadAllowed else {
+            guard access.accessibilityAllowed else {
                 throw AutonomyGateError.toolDenied(
                     reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
                 )
             }
             return try await impl().dispatch(action: "menu", body: input).toJSON()
         case "menu_press":
-            guard access.appControlAllowed else {
+            guard access.accessibilityAllowed else {
                 throw AutonomyGateError.toolDenied(
                     reason: "Trust Center Full Mac Accessibility app control is not active for \(tool)"
                 )
@@ -1241,7 +1185,7 @@ extension SwiftToolDispatcher {
     ///
     /// One route, ONE tool, and a gate that depends on an ARGUMENT — which is
     /// why it cannot live in a neighbour's list:
-    ///   • Always `accessibilityReadAllowed`. The ordinary call is "read what
+    ///   • Always `accessibilityAllowed`. The ordinary call is "read what
     ///     is in front of me": it walks the same AX tree `mac_look` walks and
     ///     moves a viewport it puts back, which is the same authority.
     ///   • ADDITIONALLY `fileOpsAllowed` when the call names a `path`. A named
@@ -1280,7 +1224,7 @@ extension SwiftToolDispatcher {
             )
         }
         let access = await fullMacToolAccess(surface: surface)
-        guard access.accessibilityReadAllowed else {
+        guard access.accessibilityAllowed else {
             throw AutonomyGateError.toolDenied(
                 reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
             )
@@ -1347,7 +1291,7 @@ extension SwiftToolDispatcher {
         surface: String
     ) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
-        guard access.accessibilityReadAllowed else {
+        guard access.accessibilityAllowed else {
             throw AutonomyGateError.toolDenied(
                 reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
             )
@@ -1532,7 +1476,7 @@ extension SwiftToolDispatcher {
     /// and if it somehow got past here, MacControl's `dispatch` refuses
     /// injection by signature anyway.
     ///
-    /// The category check below is `appControlAllowed` (Full Mac active AND the
+    /// The category check below is `accessibilityAllowed` (Full Mac active AND the
     /// accessibility category), NOT the read tier: typing into an app is at
     /// least as strong as controlling one.
     func impl_mac_injection_tool(
@@ -1541,7 +1485,7 @@ extension SwiftToolDispatcher {
         surface: String
     ) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
-        guard access.appControlAllowed else {
+        guard access.accessibilityAllowed else {
             throw AutonomyGateError.toolDenied(
                 reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
             )

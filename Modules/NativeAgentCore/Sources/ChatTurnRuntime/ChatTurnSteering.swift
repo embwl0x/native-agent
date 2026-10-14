@@ -1,5 +1,8 @@
 import Foundation
+import AgentWorkspace
+import Desk
 import Transcripts
+import TurnTrace
 
 /// A queued message the person chose to Steer into the turn already working
 /// (third conversation pass, item 5; a choice, not automatic, since User
@@ -57,6 +60,7 @@ public actor ChatTurnSteering {
     struct OpenTurn {
         let token: UUID
         let turnId: String
+        let dataRoot: URL
         /// This turn's persister cannot be replaced by another door.
         let persist: Persister?
     }
@@ -65,6 +69,7 @@ public actor ChatTurnSteering {
     /// close runs in a detached task, and without it a just-finished turn's
     /// close could shut the window of the NEXT turn that already opened.
     private var open: [String: OpenTurn] = [:]
+    private var lastTurnActivityAt: [String: Date] = [:]
     private init() {}
 
     /// Mark a session as running a turn. EVERY turn calls this — Mac stream,
@@ -78,18 +83,21 @@ public actor ChatTurnSteering {
     /// must not deliver it — the queue reconciles its identity before replay.
     @discardableResult
     public func openTurn(
-        sessionId: String, turnId: String, persist: Persister? = nil
+        sessionId: String, turnId: String, dataRoot: URL, persist: Persister? = nil
     ) -> UUID? {
         guard !sessionId.isEmpty else { return nil }
         let token = TurnAdmission.token ?? UUID()
-        open[sessionId] = OpenTurn(token: token, turnId: turnId, persist: persist)
+        open[sessionId] = OpenTurn(token: token, turnId: turnId, dataRoot: dataRoot, persist: persist)
+        noteTurnActivity(for: dataRoot, at: Date())
         return token
     }
 
     /// Close only this turn, returning unused offers before admission passes on.
     public func closeTurn(sessionId: String, token: UUID?) async {
-        guard let token, open[sessionId]?.token == token else { return }
+        guard let token, let turn = open[sessionId], turn.token == token else { return }
+        noteTurnActivity(for: turn.dataRoot, at: Date())
         open.removeValue(forKey: sessionId)
+        ResidentWake.shared.turnEnded(dataRoot: turn.dataRoot)
         for offer in delivered.removeValue(forKey: sessionId) ?? [] {
             if let handler = deliveryHandlers.removeValue(forKey: offer.id) { _ = await handler(offer, true) }
         }
@@ -125,6 +133,45 @@ public actor ChatTurnSteering {
     /// resident wake waits for a live one rather than starting a second.
     public func hasOpenTurn(excludingPrefix prefix: String) -> Bool {
         open.keys.contains { !$0.hasPrefix(prefix) }
+    }
+
+    public func noteTurnActivity(for dataRoot: URL, at: Date) {
+        let key = dataRoot.standardizedFileURL.path
+        lastTurnActivityAt[key] = max(lastTurnActivityAt[key] ?? at, at)
+    }
+
+    public func turnActivityOrSeed(for dataRoot: URL, at: Date) -> Date {
+        let key = dataRoot.standardizedFileURL.path
+        if let known = lastTurnActivityAt[key] { return known }
+        lastTurnActivityAt[key] = at
+        return at
+    }
+
+    package func residentWakeIsFree(dataRoot: URL, nextFreeAt: @Sendable (Date, Date) -> Date?) -> Bool {
+        if hasOpenTurn(excludingPrefix: "bot-") {
+            ResidentWake.shared.wait(dataRoot: dataRoot, until: nil)
+            return false
+        }
+        let now = Date()
+        if let due = nextFreeAt(now, turnActivityOrSeed(for: dataRoot, at: now)) {
+            ResidentWake.shared.wait(dataRoot: dataRoot, until: due)
+            return false
+        }
+        return true
+    }
+
+    /// Desk revision, freedom, ledger claim and turn reservation share this critical section.
+    package func claimResidentWake(dataRoot: URL, items: [ResidentWake.Item], deskRevision: UInt64,
+                                   nextFreeAt: @Sendable (Date, Date) -> Date?)
+        -> (text: String, items: [ResidentWake.Item])? {
+        guard let token = TurnAdmission.token,
+              deskRevision == SwiftNativeDeskStore.currentRevision,
+              residentWakeIsFree(dataRoot: dataRoot, nextFreeAt: nextFreeAt),
+              let wake = ResidentWake.shared.claim(dataRoot: dataRoot, prepared: items) else { return nil }
+        open[ResidentWake.session] = OpenTurn(token: token, turnId: TurnTraceContext.turnId ?? token.uuidString,
+                                            dataRoot: dataRoot, persist: nil)
+        noteTurnActivity(for: dataRoot, at: Date())
+        return wake
     }
 
     /// Offer a message to the session's running turn. `false` means it was not

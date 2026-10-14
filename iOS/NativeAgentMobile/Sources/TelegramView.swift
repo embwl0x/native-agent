@@ -2,7 +2,7 @@ import SwiftUI
 import NativeAgentShared
 
 struct TelegramView: View {
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var snapshot: MobileTelegramSnapshot?
     @State private var saving = false
@@ -46,7 +46,7 @@ struct TelegramView: View {
         }
         .macSyncErrorBanner()
         .task { await refresh() }
-        .onChange(of: sync.lastSyncAt) { _, _ in Task { await readSnapshot() } }
+        .onChange(of: sync.pageSnapshotVersions["telegram.json"]) { _, _ in Task { await readSnapshot() } }
         .refreshable { await refresh() }
         .confirmationDialog("Disconnect Telegram?", isPresented: $showDisconnect, titleVisibility: .visible) {
             Button("Disconnect", role: .destructive) { Task { await change(.disconnect) } }

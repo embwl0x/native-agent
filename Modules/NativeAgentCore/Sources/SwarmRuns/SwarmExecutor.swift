@@ -6,7 +6,6 @@ import TurnTrace
 public enum AgentSwarmError: Error, LocalizedError, Equatable {
     case invalidRequest(String)
     case policyDenied(String)
-    case timeout(seconds: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -14,8 +13,6 @@ public enum AgentSwarmError: Error, LocalizedError, Equatable {
             return message
         case .policyDenied(let message):
             return message
-        case .timeout(let seconds):
-            return "swarm worker timed out after \(seconds)s"
         }
     }
 }
@@ -218,8 +215,7 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             defaultModel: requestedModel,
             defaultEffort: requestedEffort,
             supportedEfforts: supportedEfforts,
-            defaultAccess: defaultAccess,
-            models: models
+            defaultAccess: defaultAccess
         )
         let requestedCount = intValue(
             firstPresent(input, keys: ["agentCount", "agent_count", "count", "n", "numAgents", "num_agents"])
@@ -241,11 +237,10 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
         let workers: [AgentSwarmWorkerSpec]
         if explicitWorkers.isEmpty {
             workers = (0..<workerCount).map { idx in
-                let model = modelFor(index: idx, explicitModel: nil, defaultModel: requestedModel, models: models)
                 return AgentSwarmWorkerSpec(
                     name: "worker-\(idx + 1)",
                     role: "independent analyst \(idx + 1)",
-                    model: model,
+                    model: requestedModel,
                     reasoningEffort: requestedEffort,
                     access: defaultAccess
                 )
@@ -320,8 +315,7 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
         defaultModel: String,
         defaultEffort: String,
         supportedEfforts: [String],
-        defaultAccess: String,
-        models: [String]
+        defaultAccess: String
     ) throws -> [AgentSwarmWorkerSpec] {
         // Optional strict-binding placeholders must not hide a populated
         // compatibility alias. A malformed supplied list is not permission
@@ -337,7 +331,6 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
         guard let values = selected else { return [] }
         var out: [AgentSwarmWorkerSpec] = []
         for (idx, value) in values.enumerated() {
-            let model = modelFor(index: idx, explicitModel: nil, defaultModel: defaultModel, models: models)
             switch value {
             case .string(let role):
                 let trimmedRole = role.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -347,14 +340,12 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
                 out.append(AgentSwarmWorkerSpec(
                     name: "worker-\(idx + 1)",
                     role: trimmedRole,
-                    model: model,
+                    model: defaultModel,
                     reasoningEffort: defaultEffort,
                     access: defaultAccess
                 ))
             case .object(let obj):
                 let role = firstString(obj, keys: ["role", "name", "title"]) ?? "independent analyst \(idx + 1)"
-                let explicitModel = firstString(obj, keys: ["model", "requestedModel", "requested_model"])
-                let workerModel = modelFor(index: idx, explicitModel: explicitModel, defaultModel: defaultModel, models: models)
                 let effort = try parseEffort(obj, defaultEffort: defaultEffort, supportedEfforts: supportedEfforts)
                 let access = try workerAccess(obj, fallback: defaultAccess)
                 let brief = try checkedWorkerText(obj, keys: ["prompt", "lensBrief", "lens_brief", "instructions"], index: idx)
@@ -363,7 +354,7 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
                     name: firstString(obj, keys: ["name", "id"]) ?? "worker-\(idx + 1)",
                     role: role,
                     prompt: brief ?? "",
-                    model: workerModel,
+                    model: defaultModel,
                     reasoningEffort: effort,
                     access: access,
                     contextSlice: context,
@@ -451,16 +442,6 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             if selected == nil { selected = effort }
         }
         return selected ?? defaultEffort
-    }
-
-    private static func modelFor(index: Int, explicitModel: String?, defaultModel: String, models: [String]) -> String {
-        if let explicit = explicitModel?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
-            return explicit
-        }
-        if !models.isEmpty {
-            return models[index % models.count]
-        }
-        return defaultModel
     }
 
     private static func workerAccess(

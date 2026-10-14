@@ -2,7 +2,7 @@ import SwiftUI
 import NativeAgentShared
 
 struct MobileAgentsView: View {
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairing: PairingStore
     @State private var error: String?
 
@@ -37,9 +37,9 @@ struct MobileAgentsView: View {
 
 private struct MobileAgentThreadView: View {
     let agent: MobileAgentRow
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairing: PairingStore
-    @EnvironmentObject private var chatStore: ChatStore
+    @Environment(ChatStore.self) private var chatStore
     @State private var thread: MobileAgentThread?
     @State private var draft = ""
     @State private var message: String?

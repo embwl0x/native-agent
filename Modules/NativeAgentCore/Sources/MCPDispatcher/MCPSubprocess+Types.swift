@@ -149,9 +149,10 @@ final class MCPFrameReader: @unchecked Sendable {
         // Drain as many complete `\n`-terminated lines as possible from
         // `buffer` into `pending`. A trailing partial line stays buffered
         // until its newline arrives in a later chunk.
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            var line = Data(buffer[buffer.startIndex..<newline])
-            buffer = Data(buffer[buffer.index(after: newline)...])
+        var consumed = buffer.startIndex
+        while let newline = buffer[consumed...].firstIndex(of: 0x0A) {
+            var line = Data(buffer[consumed..<newline])
+            consumed = buffer.index(after: newline)
             // Tolerate `\r\n` line endings — trim a single trailing `\r`.
             if line.last == 0x0D { line.removeLast() }
             if line.isEmpty { continue }
@@ -178,6 +179,7 @@ final class MCPFrameReader: @unchecked Sendable {
                 malformedFrameNotice = "non-JSON line on stdout (\(line.count) bytes)"
             }
         }
+        if consumed != buffer.startIndex { buffer = Data(buffer[consumed...]) }
         // No newline yet — cap the partial-line buffer so a server that
         // never sends `\n` can't grow it without bound.
         if buffer.count > MCPFrameReader.maxFrameBytes {

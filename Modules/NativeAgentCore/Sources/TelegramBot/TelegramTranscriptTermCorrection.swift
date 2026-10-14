@@ -15,9 +15,7 @@ import Foundation
 ///   retrievable in the receipt row, and the `[transcript corrected: N terms]`
 ///   marker goes to metadata — never into the user-visible message.
 enum TelegramTranscriptTermCorrection {
-    /// The single extension point. Add a `(heard, canonical)` pair and both
-    /// the correction pass and its tests pick it up. Keep entries specific
-    /// enough that they cannot fire on ordinary English.
+    /// Keep entries specific enough that they cannot fire on ordinary English.
     static let table: [(heard: String, canonical: String)] = [
         // Codex. NOTE: "codecs" is deliberately absent — it is ordinary
         // English in exactly the audio context these transcripts come from.
@@ -51,6 +49,8 @@ enum TelegramTranscriptTermCorrection {
         ("sparkle", "Sparkle"),
     ]
 
+    private static let compiledTable = compile(table)
+
     struct Result: Sendable, Equatable {
         /// Transcript with canonical spellings substituted.
         let text: String
@@ -70,17 +70,15 @@ enum TelegramTranscriptTermCorrection {
     /// Apply the table to a transcript. Longer phrases run first so a
     /// multi-word mangling ("git hub") is consumed before any single-word
     /// entry can bite a piece of it.
-    static func correct(_ transcript: String, extra: [(heard: String, canonical: String)] = []) -> Result {
+    static func correct(_ transcript: String, terms: [(expression: NSRegularExpression, canonical: String)] = compiledTable) -> Result {
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return Result(text: transcript, correctedCount: 0, original: transcript)
         }
         var text = transcript
         var corrected = 0
-        let ordered = (table + extra).sorted { $0.heard.count > $1.heard.count }
-        for entry in ordered {
-            guard let regex = boundaryRegex(for: entry.heard) else { continue }
+        for entry in terms {
             let range = NSRange(text.startIndex..., in: text)
-            let matches = regex.matches(in: text, range: range)
+            let matches = entry.expression.matches(in: text, range: range)
             guard !matches.isEmpty else { continue }
             // Count only the occurrences that are not already canonical, so a
             // correctly-spelled "GitHub" in the transcript costs nothing.
@@ -100,7 +98,7 @@ enum TelegramTranscriptTermCorrection {
     /// transcriber mishears it: `<dataRoot>/config/transcript_terms.json`,
     /// `{"terms": [{"heard": "ayla", "canonical": "Agent"}]}`. Cached by file
     /// modification date; a missing or malformed file contributes nothing.
-    static func installTerms(dataRoot: URL) -> [(heard: String, canonical: String)] {
+    static func installTerms(dataRoot: URL) -> [(expression: NSRegularExpression, canonical: String)] {
         let url = dataRoot.appendingPathComponent("config", isDirectory: true).appendingPathComponent("transcript_terms.json")
         let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
         return installTermsLock.withLock {
@@ -117,12 +115,19 @@ enum TelegramTranscriptTermCorrection {
                     terms.append((heard, canonical))
                 }
             }
-            installTermsCache = (url.path, modified, terms)
-            return terms
+            let compiled = terms.isEmpty ? compiledTable : compile(table + terms)
+            installTermsCache = (url.path, modified, compiled)
+            return compiled
         }
     }
     private static let installTermsLock = NSLock()
-    nonisolated(unsafe) private static var installTermsCache: (path: String, modified: Date?, terms: [(heard: String, canonical: String)])?
+    nonisolated(unsafe) private static var installTermsCache: (path: String, modified: Date?, terms: [(expression: NSRegularExpression, canonical: String)])?
+
+    private static func compile(_ terms: [(heard: String, canonical: String)]) -> [(expression: NSRegularExpression, canonical: String)] {
+        terms.sorted { $0.heard.count > $1.heard.count }.compactMap { entry in
+            boundaryRegex(for: entry.heard).map { ($0, entry.canonical) }
+        }
+    }
 
     private static func boundaryRegex(for heard: String) -> NSRegularExpression? {
         let escaped = NSRegularExpression.escapedPattern(for: heard)

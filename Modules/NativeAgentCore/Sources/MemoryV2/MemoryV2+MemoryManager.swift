@@ -92,6 +92,7 @@ public struct MemoryManagerRequest: Sendable, Equatable {
     /// The person's configured name, so a memory is about "User", never "the person".
     public let personName: String?
     public let standingAgent: Bool
+    public let appAuthored: Bool
 
     public init(
         userMessage: String,
@@ -99,7 +100,8 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         existing: [MemoryManagerExistingMemory] = [],
         pending: [String] = [],
         personName: String? = nil,
-        standingAgent: Bool = false
+        standingAgent: Bool = false,
+        appAuthored: Bool = false
     ) {
         self.userMessage = userMessage
         self.assistantMessage = assistantMessage
@@ -107,6 +109,7 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         self.pending = pending
         self.personName = personName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? personName : nil
         self.standingAgent = standingAgent
+        self.appAuthored = appAuthored
     }
 }
 

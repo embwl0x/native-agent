@@ -29,10 +29,6 @@ enum PairingSkipPresentation {
         if isPaired { return .paired }
         return pairingSkipped ? .skipped : .pairingRequired
     }
-
-    static func showsRecoveryAffordance(isPaired: Bool) -> Bool {
-        !isPaired
-    }
 }
 
 /// Process-local simulator hook for a single launch-injected chat turn. The
@@ -238,7 +234,7 @@ struct NativeAgentMobileApp: App {
     @UIApplicationDelegateAdaptor(NativeAgentMobilePushDelegate.self) private var pushDelegate
     @StateObject private var pairingStore = PairingStore()
     @StateObject private var bridgeClient = MacBridgeClient()
-    @StateObject private var chatStore = ChatStore.shared
+    @State private var chatStore = ChatStore.shared
     // PERF-2026-08-05: `@Observable` controller — `@State`/`.environment` is the
     // Observation idiom (`@StateObject`/`.environmentObject` require ObservableObject).
     @State private var voiceInput = VoiceInputController()
@@ -275,22 +271,36 @@ struct NativeAgentMobileApp: App {
         ) != .pairingRequired
     }
 
-    // Opening the app must refresh every Mac-published snapshot group, rather
-    // than advancing freshness through Activity alone while other tabs retain
-    // overnight data. The full engine refresh coalesces repeated activations
-    // and performs its reads off the main actor.
     @Environment(\.scenePhase) private var scenePhase
+    @State private var foregroundRefreshTask: Task<Void, Never>?
+    @State private var foregroundRefreshID: UUID?
+    @State private var foregroundRefreshPairing: Data?
 
     private func refreshOnForeground() {
         PhoneTurnActivity.shared.resume()
         guard pairingStore.usesICloudTransport else { return }
+        let pairing = pairingStore.iCloudPairingSecret
+        guard foregroundRefreshTask == nil || foregroundRefreshPairing != pairing else { return }
+        foregroundRefreshTask?.cancel()
+        let generation = UUID()
+        foregroundRefreshID = generation
+        foregroundRefreshPairing = pairing
         // The Mac's beat is re-read on activation (iCloudBridge); until it
         // lands, an old sighting reads as finding the Mac, not losing it.
         bridgeClient.connectingStartedAt = Date()
         bridgeClient.refreshBridgeStatus()
         PhonePlaces.shared.resume()
-        Task { @MainActor in
-            await iCloudSyncEngine.shared.refreshSnapshots()
+        foregroundRefreshTask = Task { @MainActor in
+            defer { if foregroundRefreshID == generation { foregroundRefreshTask = nil } }
+            await iCloudBridge.shared.deviceIncomingSetupTask?.value
+            await iCloudBridge.shared.setupTask?.value
+            guard !Task.isCancelled, pairing == pairingStore.iCloudPairingSecret else { return }
+            let sync = iCloudSyncEngine.shared
+            await sync.refreshLightweightSnapshots()
+            guard !Task.isCancelled, pairing == pairingStore.iCloudPairingSecret else { return }
+            let group = sync.foregroundSnapshotGroup
+            if group == .advanced { _ = await sync.refreshCatalogSnapshot() }
+            await sync.refreshSnapshotGroup(group)
         }
     }
 
@@ -301,7 +311,7 @@ struct NativeAgentMobileApp: App {
                     ContentView()
                         .environmentObject(pairingStore)
                         .environmentObject(bridgeClient)
-                        .environmentObject(chatStore)
+                        .environment(chatStore)
                         .environment(voiceInput)
                         .environmentObject(voiceOutput)
                         .onAppear {
@@ -328,13 +338,21 @@ struct NativeAgentMobileApp: App {
                         .onChange(of: pairingStore.isICloudPaired) { _, _ in
                             configureTransport()
                             configureNotifications()
+                            refreshOnForeground()
                         }
                         .onChange(of: pairingStore.iCloudPairingSecret) { _, _ in
                             configureTransport()
                             configureNotifications()
+                            refreshOnForeground()
                         }
                         // 2026-07-04 foreground-refresh fix (see refreshOnForeground).
                         .onChange(of: scenePhase) { _, newPhase in
+                            if newPhase != .active {
+                                Task {
+                                    do { try await chatStore.storage.flush() }
+                                    catch { chatStore.errorBanner = error.localizedDescription }
+                                }
+                            }
                             if newPhase == .active { refreshOnForeground() }
                         }
                 } else {

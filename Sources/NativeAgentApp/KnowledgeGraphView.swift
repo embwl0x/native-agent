@@ -1,3 +1,6 @@
+import PersistenceCore
+import MemoryV2
+import Foundation
 import SwiftUI
 import KnowledgeGraph
 
@@ -65,6 +68,7 @@ struct KnowledgeGraphView: View {
         memory.graphLoadError != nil ? .graphLoad : errorOrigin
     }
     @State var policyReadError: String? = nil
+    @State private var filterProjection = KnowledgeGraphPresentation.FilterProjection()
     @State var searchText = ""
     @State var filterType: String = "all"
     @State var isEnablingGraph = false
@@ -155,34 +159,19 @@ struct KnowledgeGraphView: View {
     /// date-only `YYYY-MM-DD`. Both must parse so the time-window filter
     /// doesn't silently drop entities with the older shape.
     ///
-    /// Formatters are instantiated locally (not `static let`) because
-    /// ISO8601DateFormatter is not `Sendable` and Swift 6 strict-concurrency
-    /// rejects shared mutable static state. The cost of allocating two
-    /// formatters per parse is negligible compared to the filter sweep itself.
     static func parseKGDate(_ s: String?) -> Date? {
         guard let s, !s.isEmpty else { return nil }
-        let isoFull = ISO8601DateFormatter()
-        isoFull.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = isoFull.date(from: s) { return d }
-        let isoNoFrac = ISO8601DateFormatter()
-        isoNoFrac.formatOptions = [.withInternetDateTime]
-        if let d = isoNoFrac.date(from: s) { return d }
+        if let date = UserDisplayFormatters.parseFoundationISOTimestamp(s) { return date }
         let dateOnly = DateFormatter()
         dateOnly.locale = Locale(identifier: "en_US_POSIX")
         dateOnly.timeZone = TimeZone(secondsFromGMT: 0)
         dateOnly.dateFormat = "yyyy-MM-dd"
-        if let d = dateOnly.date(from: String(s.prefix(10))) { return d }
-        return nil
+        return dateOnly.date(from: String(s.prefix(10)))
     }
 
     var displayEntities: [KnowledgeGraphEntity] {
-        KnowledgeGraphPresentation.filteredEntities(
-            entities,
-            filterType: filterType,
-            selectedKinds: selectedKinds,
-            cutoff: timeWindow.cutoff,
-            query: searchText
-        )
+        filterProjection.entities(entities, type: filterType, kinds: selectedKinds,
+                                  window: timeWindow, query: searchText)
     }
 
     var viewMode: KGViewMode {
@@ -588,6 +577,514 @@ struct KnowledgeGraphView: View {
             id, visibleIDs: displayedEntityIDs
         ) else { return }
         selectedId = destination
+    }
+
+}
+
+/// Presentation state for the Knowledge Graph opt-out action. A policy
+/// write is not a graph read: success means the canonical Memory Policy
+/// committed, even if the follow-up graph load later has no rows or fails.
+enum KnowledgeGraphEnableActionPresentation: Equatable {
+    case idle
+    case enabling
+    case enabled
+    case disabling
+    case disabled
+    case failed(String)
+
+    struct ButtonControl: Equatable {
+        let title: String
+        let systemImage: String
+        let isDisabled: Bool
+    }
+
+    static func buttonControl(isEnabling: Bool, isEnabled: Bool = false) -> ButtonControl {
+        ButtonControl(
+            title: isEnabling
+                ? (isEnabled ? "Disabling..." : "Enabling...")
+                : (isEnabled ? "Disable Knowledge Graph" : "Enable Knowledge Graph"),
+            systemImage: isEnabling ? "hourglass" : (isEnabled ? "pause.circle" : "checkmark.circle"),
+            isDisabled: isEnabling
+        )
+    }
+
+    static func failure(statusText: String, enabling: Bool = false) -> Self {
+        let detail = statusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let action = enabling ? "enabled" : "disabled"
+        return .failed(
+            detail.isEmpty
+                ? "Knowledge Graph could not be \(action) because the memory settings could not be saved."
+                : "Knowledge Graph could not be \(action). \(detail)"
+        )
+    }
+
+    var completionMessage: String? {
+        if case .disabled = self {
+            return "Knowledge Graph disabled. New conversations will no longer contribute entity links."
+        }
+        if case .enabled = self {
+            return "Knowledge Graph enabled. New conversations can now contribute entity links."
+        }
+        return nil
+    }
+
+    var failureMessage: String? {
+        if case let .failed(detail) = self {
+            return detail
+        }
+        return nil
+    }
+}
+
+/// The policy operation is separate from graph loading: its durable success
+/// condition is the checked Memory Policy write. Keeping the action here lets
+/// the mounted page and non-UI callers share one outcome contract.
+enum KnowledgeGraphEnableAction {
+    @MainActor
+    static func perform(using appModel: AppModel, enabled: Bool = true) async -> KnowledgeGraphEnableActionPresentation {
+        guard await appModel.patchMemoryPolicy(knowledgeGraphEnabled: enabled),
+              appModel.engine.trust.policy?.memoryPolicy?.knowledge_graph_enabled == enabled else {
+            return .failure(statusText: appModel.statusText, enabling: enabled)
+        }
+        return enabled ? .enabled : .disabled
+    }
+}
+
+/// Presentation-ready result of the explicit orphan-sweep preview. Keeping
+/// the operation's error translation at the action boundary lets every UI
+/// surface show the same concrete failure without depending on detached
+/// SwiftUI `@State` storage.
+enum KnowledgeGraphMaintenancePresentation {
+    /// The complete visible state of the explicit sweep action. The view
+    /// copies this state into SwiftUI storage; tests can observe the same
+    /// result without constructing a detached view whose `@State` is inert.
+    struct State: Equatable {
+        let status: String?
+        let candidates: [KnowledgeGraphGCCandidate]
+        let candidateIDs: Set<String>
+        let presentsConfirmation: Bool
+        let errorMessage: String?
+        let requiresGraphReload: Bool
+    }
+
+    enum PreviewOutcome: Equatable {
+        case noCandidates
+        case candidates([KnowledgeGraphGCCandidate])
+        case failed(String)
+    }
+
+    enum ApplyOutcome: Equatable {
+        case applied(KnowledgeGraphGCReport)
+        case previewDiverged([KnowledgeGraphGCCandidate])
+        case failed(String)
+    }
+
+    static func preview(
+        actions: KnowledgeGraphMaintenanceActions = .init()
+    ) async -> PreviewOutcome {
+        do {
+            let report = try await actions.previewOrphanSweep()
+            return report.candidates.isEmpty
+                ? .noCandidates
+                : .candidates(report.candidates)
+        } catch {
+            return .failed(UserFacingError.message(error, action: "sweep orphaned entities"))
+        }
+    }
+
+    static func previewState(
+        actions: KnowledgeGraphMaintenanceActions = .init()
+    ) async -> State {
+        switch await preview(actions: actions) {
+        case .noCandidates:
+            return State(
+                status: "No orphaned entities.", candidates: [], candidateIDs: [],
+                presentsConfirmation: false, errorMessage: nil, requiresGraphReload: false
+            )
+        case let .candidates(candidates):
+            return State(
+                status: nil, candidates: candidates, candidateIDs: Set(candidates.map(\.id)),
+                presentsConfirmation: true, errorMessage: nil, requiresGraphReload: false
+            )
+        case let .failed(message):
+            return State(
+                status: nil, candidates: [], candidateIDs: [],
+                presentsConfirmation: false, errorMessage: message, requiresGraphReload: false
+            )
+        }
+    }
+
+    static func apply(
+        expectedCandidateIDs: Set<String>,
+        actions: KnowledgeGraphMaintenanceActions = .init()
+    ) async -> ApplyOutcome {
+        do {
+            switch try await actions.applyOrphanSweep(expectedCandidateIDs: expectedCandidateIDs) {
+            case let .applied(report):
+                return .applied(report)
+            case let .previewDiverged(currentCandidates):
+                return .previewDiverged(currentCandidates)
+            }
+        } catch {
+            return .failed(UserFacingError.message(error, action: "sweep orphaned entities"))
+        }
+    }
+
+    static func applyState(
+        expectedCandidateIDs: Set<String>,
+        actions: KnowledgeGraphMaintenanceActions = .init()
+    ) async -> State {
+        switch await apply(expectedCandidateIDs: expectedCandidateIDs, actions: actions) {
+        case let .applied(report):
+            return State(
+                status: "Removed \(report.entitiesDeleted) entities · \(report.edgesDeleted) edges.",
+                candidates: [], candidateIDs: [], presentsConfirmation: false,
+                errorMessage: nil, requiresGraphReload: true
+            )
+        case let .previewDiverged(candidates):
+            return State(
+                status: nil, candidates: candidates, candidateIDs: Set(candidates.map(\.id)),
+                presentsConfirmation: true,
+                errorMessage: "Orphan set changed before deletion. Review the updated candidates and confirm again.",
+                requiresGraphReload: false
+            )
+        case let .failed(message):
+            return State(
+                status: nil, candidates: [], candidateIDs: [],
+                presentsConfirmation: false, errorMessage: message, requiresGraphReload: false
+            )
+        }
+    }
+}
+
+extension KnowledgeGraphView {
+    /// Policy authority is read separately from graph contents so unreadable
+    /// bytes cannot leave the mounted page indefinitely saying "Checking".
+    /// The enable action remains unavailable until this checked read succeeds.
+    func loadKnowledgeGraphPolicy() async -> Bool {
+        if appModel.engine.trust.policy != nil {
+            policyReadError = nil
+            return true
+        }
+        do {
+            appModel.engine.trust.policy = try await appModel.engine.trust.load()
+            policyReadError = nil
+            return true
+        } catch {
+            policyReadError = UserFacingError.message(error, action: "read the trust policy")
+            return false
+        }
+    }
+
+    func reloadKnowledgeGraphPolicyAndGraph() async {
+        guard await loadKnowledgeGraphPolicy() else { return }
+        await loadGraph()
+    }
+
+    func loadGraph() async {
+        guard !Task.isCancelled else { return }
+        // ui-honesty 2026-06-10: clear the previous error at the start of
+        // every load — a stale failure message used to persist over a
+        // subsequent successful refresh.
+        errorMsg = nil
+        errorOrigin = nil
+        // U5 W-C fix-round: a failed read keeps whatever loaded previously
+        // (the banner marks it stale) — but the error is rendered FIRST,
+        // never under a fabricated healthy empty state. The read's own error
+        // lives on the shared graph (`shownError`).
+        await memory.loadGraph()
+        guard !Task.isCancelled, memory.graphLoadError == nil else { return }
+        let status = await KGNativeStackStatus.load(entityCount: totalEntities)
+        guard !Task.isCancelled else { return }
+        nativeStack = status
+    }
+
+    func enableKnowledgeGraph(enabled: Bool = true) async {
+        guard !isEnablingGraph else { return }
+        isEnablingGraph = true
+        defer { isEnablingGraph = false }
+        enableActionPresentation = enabled ? .enabling : .disabling
+        errorMsg = nil
+        errorOrigin = nil
+        let outcome = await KnowledgeGraphEnableAction.perform(using: appModel, enabled: enabled)
+        enableActionPresentation = outcome
+        guard outcome == .enabled || outcome == .disabled else { return }
+        await loadGraph()
+    }
+
+    // U5 W-C: GC sweep — dry-run preview, then user-confirmed apply.
+
+    func previewGCSweep(actions: KnowledgeGraphMaintenanceActions = .init()) async {
+        guard !gcRunning else { return }
+        gcRunning = true
+        defer { gcRunning = false }
+        applyGCSweepPresentation(
+            await KnowledgeGraphMaintenancePresentation.previewState(actions: actions)
+        )
+    }
+
+    func applyGCSweep(actions: KnowledgeGraphMaintenanceActions = .init()) async {
+        guard !gcRunning else { return }
+        gcRunning = true
+        defer { gcRunning = false }
+        let presentation = await KnowledgeGraphMaintenancePresentation.applyState(
+            expectedCandidateIDs: gcPreviewCandidateIDs,
+            actions: actions
+        )
+        applyGCSweepPresentation(presentation)
+        if presentation.requiresGraphReload {
+            await loadGraph()
+        }
+    }
+
+    private func applyGCSweepPresentation(
+        _ presentation: KnowledgeGraphMaintenancePresentation.State
+    ) {
+        gcStatus = presentation.status
+        gcCandidates = presentation.candidates
+        gcPreviewCandidateIDs = presentation.candidateIDs
+        showGCConfirm = presentation.presentsConfirmation
+        errorMsg = presentation.errorMessage
+        errorOrigin = presentation.errorMessage == nil ? nil : .maintenance
+    }
+}
+
+enum KnowledgeGraphFilterCatalog {
+    static let entityTypes = [
+        "all", "person", "organization", "project", "concept", "place", "event", "tool", "fact",
+    ]
+    static let selectableKinds = Array(entityTypes.dropFirst())
+}
+
+/// The single type picker and the multi-kind menu intersect. An empty
+/// intersection is a filter contradiction, not evidence that the graph has no
+/// data, and must be presented before the generic filtered-empty state.
+enum KnowledgeGraphFilterConflict: Equatable {
+    case none
+    case incompatible(type: String, kinds: [String])
+
+    static func resolve(filterType: String, selectedKinds: Set<String>) -> Self {
+        guard filterType != "all", !selectedKinds.isEmpty,
+              !selectedKinds.contains(filterType) else { return .none }
+        return .incompatible(type: filterType, kinds: selectedKinds.sorted())
+    }
+
+    var message: String? {
+        switch self {
+        case .none:
+            return nil
+        case let .incompatible(type, kinds):
+            let selected = kinds.map(\.capitalized).joined(separator: ", ")
+            return "Type \(type.capitalized) conflicts with kind filter \(selected)."
+        }
+    }
+}
+
+/// Keeps the segmented picker and the graph renderer on one explicit routing
+/// contract. A selected Graph segment is a request, rather than a claim that
+/// a graph has actually been rendered.
+enum KGViewModePickerPreference {
+    static let key = "knowledgeGraphViewMode"
+
+    static func resolve(persistedValue: String?) -> KGViewMode {
+        guard let persistedValue,
+              let mode = KGViewMode(rawValue: persistedValue) else {
+            return .list
+        }
+        return mode
+    }
+
+    static func persistedValue(for mode: KGViewMode) -> String {
+        mode.rawValue
+    }
+
+
+}
+
+/// The picker has a tiny value-state owner so both the persisted preference
+/// and the renderer route through one canonical mode. Keeping this outside
+/// the SwiftUI view makes an unmounted view incapable of fabricating picker
+/// state in an eval.
+struct KGViewModePickerState: Equatable {
+    let selectedMode: KGViewMode
+
+    init(persistedValue: String?) {
+        selectedMode = KGViewModePickerPreference.resolve(persistedValue: persistedValue)
+    }
+
+    var persistedValue: String {
+        KGViewModePickerPreference.persistedValue(for: selectedMode)
+    }
+}
+
+enum KGViewModePickerPresentation {
+    /// Mirror the actual canvas owner. The picker is a helpful early route;
+    /// `KGGraphCanvasLayout` still enforces this cap for every direct caller.
+    static let maximumGraphEntities = KGGraphCanvasLayout.maximumRenderableEntities
+
+    enum Route: Equatable {
+        case list
+        case graph
+        case graphSafetyFallback(entityCount: Int)
+    }
+
+    static func route(requested: KGViewMode, displayedEntityCount: Int) -> Route {
+        guard requested == .graph else { return .list }
+        guard displayedEntityCount <= maximumGraphEntities else {
+            return .graphSafetyFallback(entityCount: displayedEntityCount)
+        }
+        return .graph
+    }
+
+    static func pickerNotice(requested: KGViewMode, displayedEntityCount: Int) -> String? {
+        guard case let .graphSafetyFallback(entityCount) = route(
+            requested: requested,
+            displayedEntityCount: displayedEntityCount
+        ) else { return nil }
+        return "Graph view is unavailable for \(entityCount) shown entities; the list is displayed instead. Narrow the filters to use the graph."
+    }
+}
+
+@MainActor
+enum KnowledgeGraphPresentation {
+    /// Selection and drawing reuse the same filter result until an input or
+    /// the next timestamp boundary changes. Dates are parsed once per source.
+    final class FilterProjection {
+        private var source: [KnowledgeGraphEntity] = []
+        private var dates: [Date?] = []
+        private var type = ""
+        private var kinds: Set<String> = []
+        private var window: KGTimeWindow = .all
+        private var query = ""
+        private var rows: [KnowledgeGraphEntity] = []
+        private var validUntil = Date.distantPast
+        private var evaluatedAt = Date.distantPast
+        private var calendar = Calendar.current
+
+        func entities(_ entities: [KnowledgeGraphEntity], type: String, kinds: Set<String>,
+                      window: KGTimeWindow, query: String) -> [KnowledgeGraphEntity] {
+            let now = Date()
+            let currentCalendar = Calendar.current
+            let changed = source != entities
+            if !changed, self.type == type, self.kinds == kinds,
+               self.window == window, self.query == query, calendar == currentCalendar,
+               now >= evaluatedAt, now < validUntil { return rows }
+            if changed {
+                source = entities
+                dates = entities.map {
+                    KnowledgeGraphView.parseKGDate($0.lastSeen) ?? KnowledgeGraphView.parseKGDate($0.firstSeen)
+                }
+            }
+            self.type = type
+            self.kinds = kinds
+            self.window = window
+            self.query = query
+            calendar = currentCalendar
+            evaluatedAt = now
+            let cutoff = window.cutoff
+            rows = zip(entities, dates).compactMap { entity, date in
+                guard (type == "all" || entity.type == type),
+                      (kinds.isEmpty || kinds.contains(entity.type)),
+                      cutoff == nil || date.map({ $0 >= cutoff! }) == true,
+                      query.isEmpty || entity.name.localizedCaseInsensitiveContains(query)
+                        || (entity.summary ?? "").localizedCaseInsensitiveContains(query) else { return nil }
+                return entity
+            }
+            let days = window == .day ? 1 : window == .week ? 7 : 30
+            validUntil = cutoff == nil ? .distantFuture : dates.compactMap { date in
+                date.flatMap { currentCalendar.date(byAdding: .day, value: days, to: $0) }
+            }.filter { $0 > now }.min() ?? .distantFuture
+            return rows
+        }
+    }
+
+    enum Content: Equatable { case loading, unavailable(String), policyUnavailable, policyUnreadable(String), disabled, empty, filteredEmpty, list, graph, graphSafetyNet(count: Int) }
+    enum ErrorPlacement: Equatable { case none, emptyState(String), retainedDataBanner(message: String, isStale: Bool) }
+    /// Error provenance is retained with the message so the mounted banner
+    /// never labels a maintenance-action error as stale graph data.  A boolean
+    /// from an earlier load attempt is insufficient: a later GC failure can
+    /// replace the visible message while retained graph rows are still current.
+    enum ErrorOrigin: Equatable { case graphLoad, policyAction, maintenance }
+    static func content(
+        isLoading: Bool,
+        error: String?,
+        entityCount: Int,
+        displayedEntityCount: Int,
+        renderableGraphEntityCount: Int? = nil,
+        isEnabled: Bool?,
+        viewMode: KGViewMode,
+        policyReadError: String? = nil
+    ) -> Content {
+        if let error, entityCount == 0 { return .unavailable(error) }
+        // Retained rows are still useful while a refresh is in flight. Do not
+        // replace them with an unlabelled spinner; the error presentation
+        // above the graph carries the failure/provenance instead.
+        if isLoading && entityCount == 0 { return .loading }
+        if isEnabled == nil,
+           let policyReadError,
+           !policyReadError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .policyUnreadable(policyReadError)
+        }
+        if isEnabled == nil { return .policyUnavailable }
+        if entityCount == 0 { return isEnabled == true ? .empty : .disabled }
+        if displayedEntityCount == 0 { return .filteredEmpty }
+        switch KGViewModePickerPresentation.route(
+            requested: viewMode,
+            displayedEntityCount: renderableGraphEntityCount ?? displayedEntityCount
+        ) {
+        case .list:
+            return .list
+        case .graph:
+            return .graph
+        case let .graphSafetyFallback(entityCount):
+            return .graphSafetyNet(count: entityCount)
+        }
+    }
+
+    static func errorPlacement(
+        isLoading _: Bool,
+        error: String?,
+        entityCount: Int,
+        errorOrigin: ErrorOrigin?
+    ) -> ErrorPlacement {
+        // A maintenance action can fail while another graph operation is
+        // loading. The error is still evidence and must remain visible; the
+        // content classifier decides whether an empty graph shows a full
+        // unavailable state or retained rows stay on screen.
+        guard let error else { return .none }
+        return entityCount == 0
+            ? .emptyState(error)
+            : .retainedDataBanner(message: error, isStale: errorOrigin == .graphLoad)
+    }
+
+    /// A filter change may remove the selected node from the rendered graph.
+    /// Keep the transition explicit so a second layout/update cannot be
+    /// mistaken for another user-visible clear.
+    enum SelectionReconciliation: Equatable {
+        case alreadyEmpty
+        case retained(String)
+        case cleared(String)
+
+        var selectedID: String? {
+            switch self {
+            case .alreadyEmpty, .cleared:
+                return nil
+            case let .retained(id):
+                return id
+            }
+        }
+    }
+
+    static func reconcileSelection(
+        _ selectedID: String?,
+        visibleIDs: Set<String>
+    ) -> SelectionReconciliation {
+        guard let selectedID else { return .alreadyEmpty }
+        return visibleIDs.contains(selectedID) ? .retained(selectedID) : .cleared(selectedID)
+    }
+
+    static func reconciledSelection(_ selectedID: String?, visibleIDs: Set<String>) -> String? {
+        reconcileSelection(selectedID, visibleIDs: visibleIDs).selectedID
     }
 
 }

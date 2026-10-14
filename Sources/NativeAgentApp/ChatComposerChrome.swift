@@ -1,3 +1,4 @@
+import EngineRuntime
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -536,7 +537,7 @@ enum NextGenActionChipsPresentation {
             let actionID = normalizedID(action.id)
             return action.dryRunAvailable == true
                 && action.status?.lowercased() != "completed"
-                && AppModel.isNextGenActionBacked(actionID)
+                && NativeAgentEngine.isNextGenActionBacked(actionID)
                 && seenIDs.insert(actionID).inserted
         }
     }
@@ -557,7 +558,7 @@ enum NextGenActionChipsPresentation {
     ) -> Bool {
         let id = normalizedID(actionID)
         return !id.isEmpty
-            && AppModel.isNextGenActionBacked(id)
+            && NativeAgentEngine.isNextGenActionBacked(id)
             && !isGlobalActionRunning
             && !isTracked(actionID, in: runningIDs)
             && !isTracked(actionID, in: completedIDs)

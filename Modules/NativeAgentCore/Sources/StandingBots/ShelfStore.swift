@@ -119,20 +119,6 @@ public struct ShelfStore: Sendable {
         }
     }
 
-    /// Last successful append, including a successful check that found nothing new.
-    public func lastGood(bot: UUID) throws -> ShelfEntry? {
-        try disk.locked {
-            let index = try loadIndex()
-            guard let id = index.lastGood[bot] else { return nil }
-            guard let book = try disk.read(Book.self, at: indexedPath(id)), book.entry.botId == bot,
-                  [.ok, .nothingNew].contains(book.entry.runHealth) else {
-                throw StandingBotsError.corruptStore("last-good index")
-            }
-            try validate(book.entry)
-            return book.entry
-        }
-    }
-
     /// Ascending append order by default; newestFirst browses recent history.
     /// `since` is an exclusive run-time filter; `topic` is a literal,
     /// case-insensitive search of headline/findings/change/uncertainties. Cursors are query-bound.
@@ -214,11 +200,6 @@ public struct ShelfStore: Sendable {
         }
     }
 
-    public func readCursor(readerId: String) throws -> ShelfReaderCursor {
-        try validateReader(readerId)
-        return try disk.locked { try readerState(readerId) }
-    }
-
     /// Acknowledge exactly the IDs actually consumed, never a high-water mark or an entire page token.
     /// Repeated acknowledgement is idempotent; unknown IDs reject the whole transaction.
     public func acknowledge(readerId: String, entryIds: [UUID]) throws {
@@ -274,7 +255,6 @@ public struct ShelfStore: Sendable {
 
     private struct Index: Codable {
         var sequence: UInt64 = 0
-        var lastGood: [UUID: UUID] = [:]
         var lastEntry: UUID? = nil
         var latestByBot: [UUID: UUID]? = nil
     }
@@ -297,7 +277,6 @@ public struct ShelfStore: Sendable {
                 index.sequence = book.sequence
                 index.lastEntry = book.entry.id
                 index.latestByBot?[book.entry.botId] = book.entry.id
-                if [.ok, .nothingNew].contains(book.entry.runHealth) { index.lastGood[book.entry.botId] = book.entry.id }
             }
             try disk.write(index, at: indexPath)
         }
@@ -321,10 +300,6 @@ public struct ShelfStore: Sendable {
         try validate(book.entry)
         try disk.write(book, at: indexedPath(book.entry.id))
         if book.sequence >= index.sequence { index.sequence = book.sequence; index.lastEntry = book.entry.id }
-        if [.ok, .nothingNew].contains(book.entry.runHealth) {
-            let previous = try index.lastGood[book.entry.botId].flatMap { try disk.read(Book.self, at: indexedPath($0)) }
-            if previous == nil || previous!.sequence <= book.sequence { index.lastGood[book.entry.botId] = book.entry.id }
-        }
         if index.latestByBot != nil {
             let previous = try index.latestByBot?[book.entry.botId].flatMap { try disk.read(Book.self, at: indexedPath($0)) }
             if previous == nil || previous!.sequence <= book.sequence { index.latestByBot?[book.entry.botId] = book.entry.id }

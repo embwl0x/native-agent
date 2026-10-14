@@ -111,19 +111,6 @@ actor ChatTranscriptAgingCoordinator {
     }
 }
 
-/// Decides which of {the pass finishing, the pass deadline} gets to release the
-/// coordinator's claim. Exactly one of them wins, so a hung pass that finishes
-/// long after its deadline can never release a LATER pass's claim.
-actor ChatTranscriptAgingPassFinish {
-    private var finished = false
-
-    func claimFinish() -> Bool {
-        guard !finished else { return false }
-        finished = true
-        return true
-    }
-}
-
 public struct ChatSessionAgingConsolidation: Sendable {
     let dataRoot: URL
     let autocompactionConfig: ChatSessionAutocompactionConfig
@@ -161,7 +148,7 @@ public struct ChatSessionAgingConsolidation: Sendable {
         runId: String?
     ) {
         let config = autocompactionConfig
-        guard config.enabled, config.agingEnabled else { return }
+        guard config.agingEnabled else { return }
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             return
         }
@@ -187,50 +174,30 @@ public struct ChatSessionAgingConsolidation: Sendable {
         let llm = self.llm
         Task.detached(priority: .background) {
             guard await ChatTranscriptAgingCoordinator.shared.claim(safeSessionId) else { return }
-            // The claim MUST come back, whatever the body does. Previously a
-            // throw, a cancellation, or an inline distiller that never returned
-            // skipped the release and disabled aging for this session for the
-            // life of the process. Two racers, exactly one release: whichever
-            // of {completion, deadline} gets there first.
-            let finish = ChatTranscriptAgingPassFinish()
-            let pass = Task.detached(priority: .background) {
-                await Self.runTranscriptAging(
-                    sessionId: safeSessionId,
-                    model: model,
-                    surface: surface,
-                    runId: runId,
-                    providerID: providerID,
-                    boundaryTokens: boundaryTokens,
-                    dataRoot: dataRoot,
-                    config: config,
-                    llm: llm,
-                    now: clock
-                )
-            }
-            // The deadline is DETACHED from the pass on purpose: cancelling a
-            // task that ignores cancellation (an LLM call inside the distiller's
-            // task group can) would otherwise hold the release hostage forever.
-            // We cancel, release, and move on without waiting for it to notice.
-            let deadline = Task.detached(priority: .background) {
-                do {
-                    try await Task.sleep(
-                        nanoseconds: UInt64(Self.agingPassDeadlineSeconds * 1_000_000_000)
+            var exceededDeadline = false
+            do {
+                try await TurnDeadline.withThrowingDeadline(seconds: Self.agingPassDeadlineSeconds) {
+                    await Self.runTranscriptAging(
+                        sessionId: safeSessionId,
+                        model: model,
+                        surface: surface,
+                        runId: runId,
+                        providerID: providerID,
+                        boundaryTokens: boundaryTokens,
+                        dataRoot: dataRoot,
+                        config: config,
+                        llm: llm,
+                        now: clock
                     )
-                } catch {
-                    return  // the pass finished first
                 }
-                pass.cancel()
-                if await finish.claimFinish() {
-                    await ChatTranscriptAgingCoordinator.shared.release(safeSessionId)
-                    FileHandle.standardError.write(Data(
-                        "ChatSessionAging: pass exceeded \(Int(Self.agingPassDeadlineSeconds))s for \(safeSessionId); claim released\n".utf8
-                    ))
-                }
+            } catch {
+                exceededDeadline = error is TurnDeadline.DeadlineExceeded
             }
-            await pass.value
-            deadline.cancel()
-            if await finish.claimFinish() {
-                await ChatTranscriptAgingCoordinator.shared.release(safeSessionId)
+            await ChatTranscriptAgingCoordinator.shared.release(safeSessionId)
+            if exceededDeadline {
+                FileHandle.standardError.write(Data(
+                    "ChatSessionAging: pass exceeded \(Int(Self.agingPassDeadlineSeconds))s for \(safeSessionId); claim released\n".utf8
+                ))
             }
         }
     }
@@ -247,13 +214,10 @@ public struct ChatSessionAgingConsolidation: Sendable {
         dataRoot: URL,
         config: ChatSessionAutocompactionConfig,
         llm: any LLMClient,
-        now: @escaping @Sendable () -> Date,
-        // Production passes the process-wide gate; a test passes its own so a
-        // suite never has to mutate (or race on) the installed one.
-        gate: BackgroundConsolidationGate = .shared,
-        coordinator: ChatTranscriptAgingCoordinator = .shared
+        now: @escaping @Sendable () -> Date
     ) async {
-        switch await gate.evaluate(reason: agingGateReason) {
+        let coordinator = ChatTranscriptAgingCoordinator.shared
+        switch await BackgroundConsolidationGate.shared.evaluate(reason: agingGateReason) {
         case .deferred(let why):
             // Not a failure: the body is hot, asleep or conserving. The next
             // append past the boundary asks again.
@@ -332,7 +296,6 @@ public struct ChatSessionAgingConsolidation: Sendable {
             backupPath: backupPath,
             messagesReplaced: outcome.messagesReplaced,
             turnModel: model,
-            providerID: providerID,
             surface: surface,
             runId: runId
         )

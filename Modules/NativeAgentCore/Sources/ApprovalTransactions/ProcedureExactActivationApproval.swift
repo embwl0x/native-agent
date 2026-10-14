@@ -17,29 +17,27 @@ extension ApprovalTransactionCoordinator {
             .procedureExactActivationApprovalAction,
               record.status == "resolved" else { return }
         guard record.decision == ApprovalDecision.approved.rawValue else {
-            try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                id: record.id,
+            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                record.id,
                 executedAction: .object([
                     "action": .string(record.action),
                     "decision": .string(record.decision ?? "unknown"),
                     "activated": .bool(false),
                 ]),
-                detail: "Exact procedure activation \(record.decision ?? "not approved"); active routing unchanged.",
-                root: dataRoot
+                detail: "Exact procedure activation \(record.decision ?? "not approved"); active routing unchanged."
             )
             return
         }
         guard let proposal = SwiftNativeApprovalInbox
             .procedureExactActivationProposal(from: record) else {
-            try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                id: record.id,
+            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                record.id,
                 executedAction: .object([
                     "action": .string(record.action),
                     "status": .string("failed"),
                     "error": .string("invalid activation proposal binding"),
                 ]),
-                detail: "FAILED: exact procedure activation proposal binding is invalid.",
-                root: dataRoot
+                detail: "FAILED: exact procedure activation proposal binding is invalid."
             )
             return
         }
@@ -63,8 +61,8 @@ extension ApprovalTransactionCoordinator {
                     )
                 }
             )
-            try await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                id: record.id,
+            try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                record.id,
                 executedAction: .object([
                     "action": .string(record.action),
                     "status": .string("activated"),
@@ -74,19 +72,17 @@ extension ApprovalTransactionCoordinator {
                     "selection_mode": .string(manifest.selectionMode),
                     "permission_authority": .bool(false),
                 ]),
-                detail: "Activated exact typed routing for \(manifest.proposal.procedureID); TrustCenter and canonical verification remain mandatory.",
-                root: dataRoot
+                detail: "Activated exact typed routing for \(manifest.proposal.procedureID); TrustCenter and canonical verification remain mandatory."
             )
         } catch {
-            try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                id: record.id,
+            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                record.id,
                 executedAction: .object([
                     "action": .string(record.action),
                     "status": .string("failed"),
                     "error": .string(String(describing: error)),
                 ]),
-                detail: "FAILED: exact procedure activation was not installed (\(error.localizedDescription)).",
-                root: dataRoot
+                detail: "FAILED: exact procedure activation was not installed (\(error.localizedDescription))."
             )
         }
     }

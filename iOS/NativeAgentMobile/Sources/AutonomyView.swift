@@ -56,7 +56,7 @@ enum AutonomyScreenPresentation {
 /// state and relies on the engine's KVS/push/foreground refresh owner.
 struct AutonomyView: View {
     @EnvironmentObject private var pairingStore: PairingStore
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
 
     private var trainingProposals: [TrainingProposalSummary] {
         MobileDesignSamples.rows(sync.trainingProposals)

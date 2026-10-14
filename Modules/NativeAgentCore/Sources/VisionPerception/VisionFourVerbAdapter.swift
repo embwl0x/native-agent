@@ -512,7 +512,7 @@ extension VisionPercept {
             contents.append(MacScreenRender.Content(
                 kind: .grid,
                 rows: contentRows,
-                totalRows: contentRows.count + abstain.droppedBeyondCap,
+                totalRows: contentRows.count + droppedBeyondCap,
                 scrollable: true
             ))
         }

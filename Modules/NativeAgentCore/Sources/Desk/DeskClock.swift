@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // Shared UTC formatting for Desk and TaskLedger; monotonic issuance belongs to Desk.
@@ -6,41 +7,14 @@ import PersistenceCore
 public enum DeskClock {
     private final class FormatterCache: @unchecked Sendable {
         private let lock = NSLock()
-        private let timestampWriter: DateFormatter
-        private let fractionalReader: ISO8601DateFormatter
-        private let plainReader: ISO8601DateFormatter
         private let dayFormatter: DateFormatter
 
         init() {
-            let writer = DateFormatter()
-            writer.locale = Locale(identifier: "en_US_POSIX")
-            writer.timeZone = TimeZone(identifier: "UTC")
-            writer.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'+00:00'"
-            timestampWriter = writer
-
-            let fractional = ISO8601DateFormatter()
-            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            fractionalReader = fractional
-
-            let plain = ISO8601DateFormatter()
-            plain.formatOptions = [.withInternetDateTime]
-            plainReader = plain
-
             let day = DateFormatter()
             day.locale = Locale(identifier: "en_US_POSIX")
             day.timeZone = TimeZone(identifier: "UTC")
             day.dateFormat = "yyyy-MM-dd"
             dayFormatter = day
-        }
-
-        func timestamp(from date: Date) -> String {
-            lock.lock(); defer { lock.unlock() }
-            return timestampWriter.string(from: date)
-        }
-
-        func date(from timestamp: String) -> Date? {
-            lock.lock(); defer { lock.unlock() }
-            return fractionalReader.date(from: timestamp) ?? plainReader.date(from: timestamp)
         }
 
         func day(from date: Date) -> String {
@@ -110,13 +84,13 @@ public enum DeskClock {
     /// TaskLedgerClock.nowISO so Desk timestamps sort lexicographically and
     /// align with the other Swift-native event feeds.
     public static func nowISO(_ date: Date) -> String {
-        formatters.timestamp(from: date)
+        NativeTimestampFormat.sixDigitUTCOffset(date)
     }
 
     /// Parse an ISO-8601 timestamp produced by `nowISO`. Tolerant of both the
     /// microsecond `+00:00` form and a bare-seconds fallback.
     public static func parseISO(_ s: String) -> Date? {
-        formatters.date(from: s)
+        NativeTimestampFormat.parseISO8601FractionalFirst(s)
     }
 
     /// Parse a bare `yyyy-MM-dd` UTC day stamp (its midnight).

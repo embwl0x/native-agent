@@ -5,6 +5,13 @@ import PersistenceCore
 /// Small comparison receipts, never another content store or unread-message
 /// owner. The caller records a stamp only after presenting a successful read.
 enum AgentWorkspaceChanges {
+    static func workspaceChangeObservation(_ row: AgentConversationRecord,
+                                          location: AgentWorkspaceLocation,
+                                          previous: Stamp?) -> Observation? {
+        evaluate(location: location,
+            result: AgentWorkspacePorts.current.conversations.presentation(row), previous: previous)
+    }
+
     struct Stamp: Sendable, Equatable, Codable {
         let identity: String
         let fingerprint: String

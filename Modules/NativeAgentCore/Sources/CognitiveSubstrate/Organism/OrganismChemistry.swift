@@ -3,21 +3,11 @@ import PersistenceCore
 
 public enum OrganismChemistry {
     public static func applying(
-        signal rawSignal: SomaticSignal,
+        signal: SomaticSignal,
         to state: ChemicalState,
         bodySchema: BodySchema,
         elapsedSinceLastSignal: TimeInterval? = nil
     ) -> (chemicalState: ChemicalState, bodySchema: BodySchema) {
-        let signal = SomaticSignal(
-            id: rawSignal.id,
-            kind: rawSignal.kind,
-            sourceOrgan: rawSignal.sourceOrgan,
-            occurredAt: rawSignal.occurredAt,
-            intensity: rawSignal.intensity,
-            valence: rawSignal.valence,
-            arousal: rawSignal.arousal,
-            metadata: rawSignal.metadata
-        )
         let i = signal.intensity
         // HOMEOSTASIS (2026-09-01). Every signal both moves the body AND lets it
         // relax a little toward its own resting value. Before this, relaxation
@@ -159,6 +149,8 @@ public enum OrganismChemistry {
         case .deskItemClosed:
             next.confidence = raise(next.confidence, by: 0.05 * i)
             next.urgency = lower(next.urgency, by: 0.08 * i)
+        case .deskItemCancelled:
+            break
         case .memoryCommitted, .memoryHygieneCompleted:
             body.memoryHealthy = true
             next.coherence = raise(next.coherence, by: 0.06 * i)
@@ -538,13 +530,13 @@ public enum OrganismChemistry {
     public static func raise(_ current: Double, by amount: Double) -> Double {
         // A non-positive "raise" is a plain add (a negative amount lowers);
         // only the positive branch saturates toward the ceiling.
-        guard amount > 0 else { return ChemicalState.clamp(current + amount) }
+        guard amount > 0 else { return (current + amount).clamped01() }
         // Saturates toward `axisHighRail`, not 1.0: in floating point the
         // old form reached exactly 1.0 after a few hundred successes, and an
         // axis sitting at 1.0 is a stuck gauge wearing the costume of a mood
         // (turn regression, 2026-09-02: confidence 1.0 after 600 wins).
         let headroom = max(0, axisHighRail - current.clamped01()) / axisHighRail
-        return min(axisHighRail, ChemicalState.clamp(current + amount * headroom))
+        return min(axisHighRail, (current + amount * headroom).clamped01())
     }
 
     /// The most any raised axis may hold. Below it there is always somewhere
@@ -552,8 +544,8 @@ public enum OrganismChemistry {
     public static let axisHighRail = 0.94
 
     static func lower(_ current: Double, by amount: Double) -> Double {
-        guard amount > 0 else { return ChemicalState.clamp(current - amount) }
-        return ChemicalState.clamp(current - amount * current.clamped01())
+        guard amount > 0 else { return (current - amount).clamped01() }
+        return (current - amount * current.clamped01()).clamped01()
     }
 
     /// TENDERNESS, MADE REACHABLE (2026-09-01). Measured after 37,801 signals it
@@ -625,16 +617,16 @@ public enum OrganismChemistry {
         underCanonicalWarmth warmth: Double,
         elapsed: TimeInterval
     ) -> Double {
-        let clamped = ChemicalState.clamp(current)
+        let clamped = current.clamped01()
         guard warmth >= tendernessWarmthGate else { return clamped }
         let window = min(max(0, elapsed), maximumTendernessIntegrationWindow)
         guard window > 0, tendernessTimeConstant > 0 else { return clamped }
         // Never overshoot the share of the warmth that earned it, and never pull
         // DOWN from a level the caring events earned — the settle owns the fade.
-        let target = ChemicalState.clamp(warmth) * tendernessWarmthContribution
+        let target = warmth.clamped01() * tendernessWarmthContribution
         guard target > clamped else { return clamped }
         let approach = 1 - exp(-window / tendernessTimeConstant)
-        return ChemicalState.clamp(clamped + (target - clamped) * approach)
+        return (clamped + (target - clamped) * approach).clamped01()
     }
 
     /// FADE OVER DAYS (2026-09-11). Being cared for on Monday is still true on
@@ -711,7 +703,7 @@ public enum OrganismChemistry {
         guard rate > 0 else { return state }
         let neutral = ChemicalState.neutral
         func toward(_ value: Double, _ target: Double) -> Double {
-            ChemicalState.clamp(value + (target - value) * rate)
+            (value + (target - value) * rate).clamped01()
         }
         // TENDERNESS IS NOT SETTLED HERE (2026-09-11, Astra finding 8). Its one
         // decay owner is the elapsed-time curve in `OrganismPersistentState
@@ -877,7 +869,7 @@ public enum OrganismChemistry {
             wakefulnessAccrualPerHour * hours,
             wakefulnessShareCap - relaxed
         ))
-        return (ChemicalState.clamp(relaxed + gain), gain)
+        return ((relaxed + gain).clamped01(), gain)
     }
 
     /// Fatigue relaxed over quiet wall time. `elapsed` is the gap the caller is
@@ -885,9 +877,9 @@ public enum OrganismChemistry {
     /// that a tiring day relaxes on fatigue's own clock.
     public static func relaxedFatigue(_ value: Double, elapsed: TimeInterval) -> Double {
         guard elapsed > 0, fatigueRelaxationHalfLife > 0 else {
-            return ChemicalState.clamp(value)
+            return value.clamped01()
         }
-        return ChemicalState.clamp(value * pow(0.5, elapsed / fatigueRelaxationHalfLife))
+        return (value * pow(0.5, elapsed / fatigueRelaxationHalfLife)).clamped01()
     }
 
     private static func resourcePressure(from metadata: [String: JSONValue]) -> OrganismResourcePressure? {
@@ -996,9 +988,9 @@ public enum OrganismCircadian {
         let read = read(at: date, clock: clock)
         var next = state
         let delta = read.curiosityOffset
-        next.curiosity = ChemicalState.clamp(
+        next.curiosity = (
             delta >= 0 ? state.curiosity + delta * state.curiosity : state.curiosity + delta
-        )
+        ).clamped01()
         return (next, read)
     }
 }

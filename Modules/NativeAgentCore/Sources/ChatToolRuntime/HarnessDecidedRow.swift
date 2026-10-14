@@ -3,6 +3,7 @@ import ChatTurnContracts
 import NotificationInbox
 import PersistenceCore
 import PersonaEngine
+import AgentConversations
 
 /// User 10-01: Agent is the boss. Where the harness used to card the person for
 /// a peer's, a helper's or a driven agent's step and now lets her decide, it
@@ -21,9 +22,20 @@ public enum HarnessDecidedRow {
     public static func record(
         requester: String, tool: String, sessionID: String?, dataRoot: URL, ran: Bool = false
     ) async -> (id: String, decisions: Int)? {
-        guard !PeerDataTaint.trustedTurn, !PeerDataTaint.ownerTrusts(requester) else { return nil }
+        let envelope = TurnEnvelope.current(surface: "")
+        let requester: String = {
+            guard let work = ChatToolSessionContext.envelope?.workIdentity,
+                  work.hasPrefix("carry."), work.count > 6 else { return requester }
+            return "house." + work.dropFirst(6)
+        }()
+        guard requester.hasPrefix("house.") && envelope.agent == "self"
+            || (!PeerDataTaint.trustedTurn && !PeerDataTaint.ownerTrusts(requester)) else { return nil }
+        let peerID = requester.hasPrefix("peer:") ? String(requester.dropFirst(5)) : envelope.verifiedUserId
+        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        let peer = peers.first { $0.id == peerID || $0.name.caseInsensitiveCompare(requester) == .orderedSame }
+        let displayName = peer?.name ?? (requester.hasPrefix("peer:") || requester == "a remote peer" ? "another agent" : requester)
         let key = "harness_decided.\(requester).\(tool)"
-        let title = "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) \(ran ? "ran" : "allowed"): \(requester) → \(tool)"
+        let title = "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) \(ran ? "ran" : "allowed"): \(displayName) → \(tool)"
         let id = key + "." + UUID().uuidString.prefix(8).lowercased()
         let row: JSONValue = .object([
             "id": .string(id),
@@ -33,6 +45,8 @@ public enum HarnessDecidedRow {
             "title": .string(String(title.prefix(200))),
             "summary": .string(""),
             "detail": .string(sessionID ?? ""),
+            "principal": .object(["peerID": peer.map { .string($0.id) } ?? peerID.map(JSONValue.string) ?? .null,
+                                   "displayName": .string(displayName)]),
             "actions": .array([]),
             "status": .string("unread"),
         ])

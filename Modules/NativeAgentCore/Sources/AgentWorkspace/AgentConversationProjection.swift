@@ -237,12 +237,13 @@ public enum ContactThread {
     /// The contact's lines are the turns it sent and its saved replies; hers
     /// are her sends (each carries its send id) and her answers to turns it
     /// started. Her turn on one of its replies is her own: it went nowhere.
-    public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil) throws -> [Line] {
-        let identity = AgentContactIdentity(dataRoot: dataRoot)
+    public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil, identity: AgentContactIdentity? = nil,
+                                   transcripts: [(String, URL)]? = nil) throws -> [Line] {
+        let identity = identity ?? AgentContactIdentity(dataRoot: dataRoot)
         let owners = identity.owners(owner)
         var seen: Set<String> = []
         return try owners.flatMap { door -> [Line] in
-            try lines(dataRoot: dataRoot, owner: door, tailBytes: tailBytes).map { line in
+            try lines(dataRoot: dataRoot, owner: door, tailBytes: tailBytes, transcripts: transcripts).map { line in
                 var line = line
                 if owners.count > 1 { line.door = identity.doors[identity.aliases["peer:" + door] == nil ? door : "peer:" + door] }
                 return line
@@ -251,9 +252,14 @@ public enum ContactThread {
     }
 
     /// Exact route history; directory counts must not include another door.
-    public static func lines(dataRoot: URL, owner: String, tailBytes: Int? = nil) throws -> [Line] {
-        let archived = tailBytes == nil ? try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) : [:]
-        let plan = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, prefix: prefix(owner: owner), archived: archived)
+    public static func lines(dataRoot: URL, owner: String, tailBytes: Int? = nil, transcripts: [(String, URL)]? = nil) throws -> [Line] {
+        let ownerPrefix = prefix(owner: owner)
+        let plan: [(String, URL)]
+        if let transcripts { plan = transcripts.filter { $0.0.hasPrefix(ownerPrefix) } }
+        else {
+            let archived = tailBytes == nil ? try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) : [:]
+            plan = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, prefix: ownerPrefix, archived: archived)
+        }
         let key = "\(dataRoot.path)|\(owner)|\(tailBytes.map(String.init) ?? "")"
         let stamp = (plan.map(\.1) + [ContactReplyReads.url(dataRoot)]).map { fileStamp($0.path) }
         if let hit = cache.withLock({ $0[key] }), hit.stamp == stamp { return hit.lines }

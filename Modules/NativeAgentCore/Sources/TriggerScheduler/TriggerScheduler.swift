@@ -18,17 +18,12 @@ import WorkshopExecution
 // Wave 21 (2026-06-01) closes the execution side of the carve once
 // SwiftNativeWorkshopRunner landed:
 //
-//   - Inbox fire_now with `stub=true` builds evidence-backed time and idle
-//     content natively. A5.2
+//   - Inbox fire_now builds the evidence-backed morning brief natively. A5.2
 //     (2026-07-24): the built card lands in `notifications/inbox.jsonl`
-//     via the app-side mirror seam; ProactiveInboxStore only runs the
+//     via the app-side mirror seam; TriggerNotificationInbox also runs the
 //     active-duplicate check (the legacy `<root>/inbox/` silo is retired).
 //     Unknown kinds
 //     return `not_found` instead of falling through to a generic stub.
-//   - Inbox fire_now with `stub=false` is not yet Swift-native. The non-stub
-//     branches invoke codex / connector actions / execution-queue scans /
-//     personality_runtime reads that are still being ported, so production
-//     returns an explicit error envelope.
 //   - Workshop fire_now is Swift-native. SwiftNativeTriggerScheduler resolves the
 //     execution trigger row from
 //     <root>/missions/triggers.json, builds the execution spec via the
@@ -46,25 +41,16 @@ import WorkshopExecution
 /// Errors raised by the trigger-scheduler subsystem. Mirrors the small set of
 /// failure cases the daemon's two schedulers return (proactive_triggers.py
 /// `ProactiveTriggerScheduler` and missions.py `TriggerScheduler`):
-///   - notFound: no trigger with that name in the persisted config.
 ///   - invalidRequest: empty name / malformed payload.
 ///   - persistenceFailure: IO error reading/writing the trigger configs file.
-///   - unavailable: legacy error case retained for API compatibility.
-///   - underlying: pass-through for other subsystem errors.
 public enum TriggerSchedulerError: Error, LocalizedError {
-    case notFound(String)
     case invalidRequest(String)
     case persistenceFailure(String)
-    case unavailable
-    case underlying(String)
 
     public var errorDescription: String? {
         switch self {
-        case .notFound(let name): return "trigger not found: \(name)"
         case .invalidRequest(let msg): return "invalid request: \(msg)"
         case .persistenceFailure(let m): return "persistence failure: \(m)"
-        case .unavailable: return "trigger scheduler unavailable"
-        case .underlying(let m): return m
         }
     }
 }
@@ -283,12 +269,10 @@ public protocol TriggerSchedulerClient: Sendable {
     func enableInboxTrigger(name: String) async throws -> TriggerStatus
     func disableInboxTrigger(name: String) async throws -> TriggerStatus
     func configureInboxTrigger(name: String, config: JSONValue) async throws -> TriggerStatus
-    func fireInboxTrigger(name: String, isStub: Bool) async throws -> TriggerFireResult
+    func fireInboxTrigger(name: String) async throws -> TriggerFireResult
 
     // Workshop triggers — backed by <root>/missions/triggers.json
     func listWorkshopTriggers() async throws -> [TriggerConfig]
-    func enableWorkshopTrigger(name: String) async throws -> TriggerStatus
-    func disableWorkshopTrigger(name: String) async throws -> TriggerStatus
     func fireWorkshopTrigger(name: String) async throws -> TriggerFireResult
 }
 
@@ -299,14 +283,9 @@ public protocol TriggerSchedulerClient: Sendable {
 /// the retired daemon::TriggerScheduler.
 ///
 /// SCOPE NARROWING (WAVE 12 + WAVE 21) — Swift impl now covers fire_now end-to-end:
-///   - fireInboxTrigger(isStub: true)  — FULLY native. Builds the per-kind
-///     evidence-backed morning brief or idle check-in, dedups it
-///     via ProactiveInboxStore against the live inbox, and lands the card in
+///   - fireInboxTrigger(name:) — builds the evidence-backed morning brief,
+///     dedups it against the live inbox, and lands the card in
 ///     notifications/inbox.jsonl through the app-side mirror seam (A5.2).
-///   - fireInboxTrigger(isStub: false) — explicit unsupported envelope unless
-///     a caller injects a compatibility fallback for tests.
-///     Non-stub branches invoke codex / connectors / execution-queue scans /
-///     personality_runtime reads — not Swift-native.
 ///   - fireMissionTrigger(name:) — native execution enqueue through
 ///     SwiftNativeWorkshopRunner.
 ///
@@ -328,7 +307,7 @@ public protocol TriggerSchedulerClient: Sendable {
 public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     let root: URL
     let persistence: any PersistenceCoreProtocol
-    private let workshopRunner: any WorkshopRunnerClient
+    private let workshopRunner: SwiftNativeWorkshopRunner
     let now: @Sendable () -> Date
     let uuid: @Sendable () -> String
     let connectorActionIDs: Set<String>?
@@ -358,7 +337,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     public init(
         root: URL = PersistenceCore.defaultDataRoot(),
         persistence: (any PersistenceCoreProtocol)? = nil,
-        workshopRunner: (any WorkshopRunnerClient)? = nil,
+        workshopRunner: SwiftNativeWorkshopRunner? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
         uuid: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         connectorActionIDs: Set<String>? = nil,
@@ -437,17 +416,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     static let periodicFireCapPerTick = 3
 
     private static let logger = Logger(subsystem: "com.nativeagent.core", category: "trigger-scheduler")
-
-    /// Test-only seam: returns the injected execution runner's planner type
-    /// name when it's a `SwiftNativeWorkshopRunner`, else nil. Lets factory-
-    /// level tests assert that the PRODUCTION trigger-factory wiring
-    /// (`makeTriggerScheduler` → `makeWorkshopRunner`) hands in
-    /// `HTTPCodexMissionPlannerLLM` instead of the `StubWorkshopPlannerLLM`
-    /// default. See BLOCKING #1 of the wave-24-amendment. Mirrors the same-
-    /// purpose seam on SwiftNativeWorkshopRunner in WorkshopExecution.swift.
-    nonisolated var _testWorkshopRunnerPlannerTypeName: String? {
-        (workshopRunner as? SwiftNativeWorkshopRunner)?._testPlannerTypeName
-    }
 
     // MARK: legacy-path migration (2026-08-13)
 
@@ -563,36 +531,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         }
     }
 
-    // MARK: enable / disable — Workshop executions
-
-    public func enableWorkshopTrigger(name: String) async throws -> TriggerStatus {
-        try await _setEnabledWorkshopExecution(name: name, enabled: true)
-    }
-
-    public func disableWorkshopTrigger(name: String) async throws -> TriggerStatus {
-        try await _setEnabledWorkshopExecution(name: name, enabled: false)
-    }
-
-    private func _setEnabledWorkshopExecution(name: String, enabled: Bool) async throws -> TriggerStatus {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
-        return try await runSerialized { [persistence, workshopExecutionsPath] in
-            let work: @Sendable () async throws -> TriggerStatus = {
-                try await Self._setEnabledImpl(
-                    name: name, enabled: enabled,
-                    path: workshopExecutionsPath, defaultValue: Self._defaultWorkshopExecutionConfigs,
-                    persistence: persistence
-                )
-            }
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            return try await persistence.withFileLock(workshopExecutionsPath, work)
-        }
-    }
-
     /// Mirrors daemon proactive_triggers.set_enabled + executions.set_enabled:
     ///   - load list (with defaults if missing)
     ///   - flip enabled on matching name; not_found if no match
@@ -699,18 +637,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     // MARK: fire_now — Swift-native
 
     /// Mirrors daemon proactive_triggers.py::ProactiveTriggerScheduler.fire_now.
-    /// - isStub=true  → Time/Idle build evidence-backed InboxItems natively.
-    /// - isStub=false → explicit error envelope because the non-stub
-    ///   `build_inbox_item` branches invoke codex/connectors/runtime reads
-    ///   that are not Swift-native yet.
-    /// - name not found → {status:"not_found", name, stub:isStub}.
-    /// - any Swift-side throw (stub path) → {status:"error", name, stub, error}.
-    public func fireInboxTrigger(name: String, isStub: Bool) async throws -> TriggerFireResult {
+    public func fireInboxTrigger(name: String) async throws -> TriggerFireResult {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
         guard inboxMasterOn else {
             return TriggerFireResult(
-                status: "disabled", name: name, stub: isStub,
+                status: "disabled", name: name, stub: true,
                 error: "Raising things unasked is off (Notifications), so no trigger fires."
             )
         }
@@ -724,46 +656,30 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 defaultValue: Self._defaultInboxConfigs
             )
         } catch {
-            return TriggerFireResult(status: "error", name: name, stub: isStub,
+            return TriggerFireResult(status: "error", name: name, stub: true,
                                      error: String(describing: error))
         }
         guard let row = configs.first(where: { ExecutionEventVocabulary.matches($0.name, name) }) else {
-            return TriggerFireResult(status: "not_found", name: name, stub: isStub)
-        }
-
-        // Non-stub needs codex/connectors/runtime-state branches that have not
-        // been ported.
-        if !isStub {
-            return TriggerFireResult(
-                status: "error",
-                name: name,
-                stub: false,
-                error: "non-stub inbox trigger firing is not yet Swift-native"
-            )
+            return TriggerFireResult(status: "not_found", name: name, stub: true)
         }
 
         // Canonical-kind guard: unknown kinds return not_found (matches Python
         // which would have no per-kind trigger class to fire). Don't fall
         // through to a generic stub.
-        guard let rowKind = row.kind, rowKind == "time" || rowKind == "idle" else {
+        guard let rowKind = row.kind, rowKind == "time" else {
             return TriggerFireResult(status: "not_found", name: name, stub: true)
         }
 
-        // Swift-native fire path. Only `morning_brief` (time) and
-        // `idle_checkin` (idle) reach this point, and both carry real content.
+        // Swift-native fire path for the morning brief.
         do {
-            let item = try await _buildInboxItem(kind: rowKind)
+            let item = await _buildMorningBriefItem()
             guard inboxMasterOn else {
                 return TriggerFireResult(
-                    status: "disabled", name: name, stub: isStub,
+                    status: "disabled", name: name, stub: true,
                     error: "Raising things unasked is off (Notifications), so no trigger fires."
                 )
             }
-            let store = ProactiveInboxStore(
-                root: root,
-                persistence: persistence
-            )
-            let id = try await store.surface(item)
+            let id = try await TriggerNotificationInbox.surface(item, dataRoot: root)
 
             // `surface` SUPPRESSES an active duplicate (same source+title+summary,
             // still unread/read, within 7 days) and hands back the EXISTING id
@@ -844,7 +760,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 item: deduped ? nil : item, notified: notified
             )
         } catch {
-            return TriggerFireResult(status: "error", name: name, stub: isStub,
+            return TriggerFireResult(status: "error", name: name, stub: true,
                                      error: String(describing: error))
         }
     }
@@ -1019,7 +935,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         } catch let err as WorkshopExecutionError {
             // errorDescription, not String(describing:) — this string is the
             // user/API surface for Workshop execution-trigger failures, and the typed
-            // cases (executorUnavailable, forbidden, ...) carry actionable
+            // cases (forbidden, workshopExecutionsBusy, ...) carry actionable
             // messages there.
             return TriggerFireResult(status: "error", name: name, error: err.errorDescription ?? String(describing: err))
         } catch {
@@ -1037,8 +953,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// missing-objective execution triggers are skipped without being reported as
     /// fired. Inbox triggers fire as stubs (the only fully Swift-native path).
     /// Errors from a single trigger do not block evaluation of the others.
-    /// Names of the triggers this tick fired. Thin wrapper over
-    /// `evaluateAndFireDetailed()` for callers that only need the names.
     /// Notifications ▸ "Let her raise things unasked", read fresh off saved
     /// authority. Off, no inbox trigger fires — not on the tick, not by hand —
     /// whatever each trigger's own switch says. It was written and shown and
@@ -1046,10 +960,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// Shipped on (TrustCenter+Defaults); damaged policy fails closed.
     nonisolated var inboxMasterOn: Bool {
         SavedTrustPolicyAuthority.flag(block: "inboxPolicy", key: "enabled", default: true, dataRoot: root)
-    }
-
-    public func evaluateAndFire() async -> [String] {
-        await evaluateAndFireDetailed().compactMap(\.name)
     }
 
     /// The full fire envelopes for this tick, in fire order. The periodic tick
@@ -1102,7 +1012,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                     // Claimed — the occurrence is stamped. AT-MOST-ONCE from here:
                     // a failed/throwing fire is NOT un-claimed and NOT retried.
                     do {
-                        let res = try await fireInboxTrigger(name: cfg.name, isStub: true)
+                        let res = try await fireInboxTrigger(name: cfg.name)
                         if res.status == "fired" {
                             fired.append(res)
                         } else {
@@ -1188,7 +1098,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         }
         return configs.compactMap { cfg in
             guard cfg.enabled else { return nil }
-            let lastFired = Self.lastFiredFromState(state, name: cfg.name)
             switch cfg.kind {
             case "time":
                 guard let hour = Self.intField(cfg.config, "hour"), (0...23).contains(hour)
@@ -1206,15 +1115,15 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                         minute: minute,
                         on: reference
                       ) else { return nil }
-                if let lastFired, lastFired >= today {
+                if Self.hasFired(cfg, state: state, scheduled: today) {
                     var calendar = Calendar(identifier: .gregorian)
-                    calendar.timeZone = TimeZone.current
+                    calendar.timeZone = .autoupdatingCurrent
                     var components = DateComponents()
                     components.hour = hour
                     components.minute = minute
                     components.second = 0
                     return calendar.nextDate(
-                        after: max(reference, lastFired),
+                        after: max(reference, today),
                         matching: components,
                         matchingPolicy: .nextTime,
                         repeatedTimePolicy: .first,
@@ -1223,31 +1132,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 }
                 if today > reference { return today }
                 return reference.addingTimeInterval(60)
-            case "idle":
-                guard let minutes = Self.intField(cfg.config, "idle_minutes"), minutes > 0,
-                      let lastActivity = TriggerContentBuilder.lastActivityInstant(
-                        root: root, reference: reference
-                      )
-                else { return nil }
-                let scheduled = lastActivity.addingTimeInterval(TimeInterval(minutes) * 60)
-                let crossing: Date
-                if scheduled > reference {
-                    crossing = scheduled
-                } else if let lastFired, lastFired >= scheduled {
-                    return nil
-                } else {
-                    crossing = reference.addingTimeInterval(60)
-                }
-                // 2026-09-06: quiet hours now gate DELIVERY, so the projection
-                // gates the crossing rather than the episode instant. A crossing
-                // inside quiet hours becomes the moment quiet hours end — the
-                // dueness check would refuse it until then, and a 60-second
-                // recovery crossing would otherwise re-wake the loop all night.
-                guard let start = Self.intField(cfg.config, "quiet_start_hour"),
-                      let end = Self.intField(cfg.config, "quiet_end_hour"),
-                      Self.inQuietHours(crossing, startHour: start, endHour: end)
-                else { return crossing }
-                return Self.quietHoursEnd(after: crossing, endHour: end)
             default:
                 return nil
             }
@@ -1268,22 +1152,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     ///     daily execution `morning_brief` enqueue and the daily inbox brief. A
     ///     missing / out-of-range / fractional hour makes the trigger DORMANT
     ///     (returns nil), never a crash.
-    ///
-    ///   - `idle` — LIT (2026-07-09). The activity signal the old note said was
-    ///     missing now exists: `max(updatedAt)` over `<root>/chat/sessions.json`
-    ///     and — 2026-09-06 — the human-presence stamp
-    ///     `<root>/activity_watch/last_input.json`, whichever is LATER, so an
-    ///     idle check-in waits for the person to leave the Mac and not merely
-    ///     for the chat to go quiet (`TriggerContentBuilder.lastActivityInstant`;
-    ///     an absent or stale stamp falls back to chat quiet alone). Eligible when
-    ///     `lastActivity + idle_minutes` has passed and NOW is not inside the
-    ///     configured quiet hours (2026-09-06: quiet hours gate delivery, not
-    ///     the instant the idle window opened). Returning the EPISODE INSTANT
-    ///     (not now()) is what makes `claimIfDue` re-arm for free: it stamps
-    ///     `last_fired_at = scheduled` and refuses to refire while
-    ///     `last >= scheduled`, so one fire per idle episode — and a new user
-    ///     message advances lastActivity, which advances the next episode's
-    ///     instant, which un-holds the claim. No activity signal ⇒ still dark.
     ///
     /// `nonisolated` so `claimIfDue`'s locked RMW body (a `@Sendable` closure)
     /// can recompute it INSIDE the flock — it touches only the immutable
@@ -1317,74 +1185,9 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 return nil
             }
             return scheduled
-        case "idle":
-            // A non-positive / unparseable idle_minutes keeps the trigger
-            // DORMANT rather than firing on every tick.
-            guard let minutes = Self.intField(cfg.config, "idle_minutes"), minutes > 0 else {
-                return nil
-            }
-            // No persisted activity signal ⇒ idleness is unknowable ⇒ stay dark.
-            // `current` is hoisted above the read because the presence stamp's
-            // staleness is judged against this same instant.
-            let current = now()
-            guard let last = TriggerContentBuilder.lastActivityInstant(
-                root: root, reference: current
-            ) else {
-                return nil
-            }
-            let scheduled = last.addingTimeInterval(TimeInterval(minutes) * 60)
-            guard current >= scheduled else { return nil }
-            // Quiet hours suppress DELIVERY, and delivery happens now — not at
-            // the instant the idle window opened (2026-09-06). Testing the
-            // scheduled instant got it wrong in both directions: an episode that
-            // came due at 22:50 fired at 03:00 because 22:50 is not quiet, and
-            // one that came due at 23:10 stayed suppressed at 09:00 because
-            // 23:10 is. Nothing accumulates either way: a suppressed tick stamps
-            // no claim, so the same episode is still eligible when quiet hours
-            // end.
-            if let start = Self.intField(cfg.config, "quiet_start_hour"),
-               let end = Self.intField(cfg.config, "quiet_end_hour"),
-               Self.inQuietHours(current, startHour: start, endHour: end) {
-                return nil
-            }
-            return scheduled
         default:
             return nil
         }
-    }
-
-    /// Local-wall-clock quiet-hours test. Wraps midnight when `startHour >
-    /// endHour` (the default 23→08). Out-of-range or equal bounds mean "no
-    /// quiet hours configured" rather than "always quiet" — a misconfiguration
-    /// must not silence a trigger forever.
-    /// The next local `endHour:00` strictly after `date` — the first instant a
-    /// quiet-hours-suppressed episode can be delivered. Only meaningful when
-    /// `inQuietHours` already said yes, which is also what proves the bounds
-    /// are in range.
-    static func quietHoursEnd(after date: Date, endHour: Int) -> Date? {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone.current
-        var components = DateComponents()
-        components.hour = endHour
-        components.minute = 0
-        components.second = 0
-        return cal.nextDate(
-            after: date,
-            matching: components,
-            matchingPolicy: .nextTime,
-            repeatedTimePolicy: .first,
-            direction: .forward
-        )
-    }
-
-    static func inQuietHours(_ date: Date, startHour: Int, endHour: Int) -> Bool {
-        guard (0...23).contains(startHour), (0...23).contains(endHour),
-              startHour != endHour else { return false }
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone.current
-        let h = cal.component(.hour, from: date)
-        if startHour < endHour { return h >= startHour && h < endHour }
-        return h >= startHour || h < endHour
     }
 
     // MARK: periodic-fire helpers (W3c)
@@ -1471,6 +1274,9 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             guard case .object(let entry) = value,
                   case .string(let stamp)? = entry["last_fired_at"],
                   parseISOTimestamp(stamp) != nil else { return false }
+            if let occurrence = entry["last_fired_occurrence"] {
+                guard case .string(let key) = occurrence, SchedulerJobRuntime.civilEpoch(key) != nil else { return false }
+            }
             return true
         }) else { return .corrupt }
         return .parsed(o)
@@ -1484,6 +1290,23 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             return nil
         }
         return parseISOTimestamp(s)
+    }
+
+    private static func hasFired(_ cfg: TriggerConfig, state: [String: JSONValue], scheduled: Date) -> Bool {
+        guard let last = lastFiredFromState(state, name: cfg.name) else { return false }
+        guard cfg.kind == "time" else { return last >= scheduled }
+        let occurrence = timeOccurrence(cfg, scheduled: scheduled)
+        if case .object(let entry)? = state[cfg.name], case .string(let completed)? = entry["last_fired_occurrence"] {
+            return completed >= occurrence
+        }
+        // Older claims retain the firing date; their configured clock time is still known.
+        let date = SchedulerJobRuntime.occurrence(at: last, zone: .autoupdatingCurrent).prefix(10)
+        return date + occurrence.dropFirst(10) >= occurrence
+    }
+
+    private static func timeOccurrence(_ cfg: TriggerConfig, scheduled: Date) -> String {
+        let date = SchedulerJobRuntime.occurrence(at: scheduled, zone: .autoupdatingCurrent).prefix(10)
+        return date + String(format: " %02d:%02d", intField(cfg.config, "hour")!, intField(cfg.config, "minute") ?? 0)
     }
 
     /// Atomic CLAIM of a trigger's current scheduled occurrence (Finding 1).
@@ -1523,11 +1346,15 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             }
             // Re-check under the lock: another instance may have just claimed
             // this same occurrence.
-            if let last = Self.lastFiredFromState(state, name: name), last >= scheduled {
+            if Self.hasFired(cfg, state: state, scheduled: scheduled) {
                 return false
             }
             // Win the claim: stamp THIS occurrence's scheduled instant.
-            state[name] = .object(["last_fired_at": .string(stamp)])
+            var entry: [String: JSONValue] = ["last_fired_at": .string(stamp)]
+            if cfg.kind == "time" {
+                entry["last_fired_occurrence"] = .string(Self.timeOccurrence(cfg, scheduled: scheduled))
+            }
+            state[name] = .object(entry)
             try await persistence.writeJSON(.object(state), to: statePath)
             return true
         }
@@ -1566,7 +1393,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// nil only if the components can't form a valid date.
     static func scheduledInstantToday(hour: Int, minute: Int, on reference: Date) -> Date? {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone.current
+        cal.timeZone = .autoupdatingCurrent
         let day = cal.dateComponents([.year, .month, .day], from: reference)
         var dc = DateComponents()
         dc.year = day.year
@@ -1586,54 +1413,15 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     // MARK: InboxItem builder
 
-    /// Build an inbox item from current runtime evidence.
-    private func _buildInboxItem(kind: String) async throws -> JSONValue {
+    private func _buildMorningBriefItem() async -> JSONValue {
         let id = uuid()
         let createdAt = Self.isoTimestamp(now())
-        let source: String
-        let severity: String
-        let title: String
-        let summary: String
-        let detail: JSONValue
 
         let content = TriggerContentBuilder(
             root: root, persistence: persistence, now: now, worklogPath: worklogPath
         )
 
-        switch kind {
-        case "idle":
-            // REAL content. Quiet duration from max(updatedAt) over
-            // chat/sessions.json + one live fact (open desk count, else the
-            // last thread's title). Honest when no activity signal resolves.
-            let built = await content.idleCheckin()
-            source = "idle_checkin"
-            severity = "info"
-            title = built.title
-            summary = built.summary
-            detail = built.detail
-        case "time":
-            // REAL content. Desk + worklog + Workshop executions + unread + last session,
-            // every section fail-open. Title keeps its "%A, %B %-d" label.
-            //
-            // L5 G3 + G1: when a synthesizer is injected (live root only), the
-            // brief LEADS with the tool-capable turn's read and keeps these
-            // deterministic sections below it as the evidence layer. The turn
-            // failing is not the trigger failing — `morningBrief(synthesizer:)`
-            // returns the deterministic brief unchanged on any nil.
-            let built = await content.morningBrief(synthesizer: morningBriefSynthesizer)
-            source = "trigger:morning_brief"
-            severity = "important"
-            title = built.title
-            summary = built.summary
-            detail = built.detail
-        default:
-            // Defensive: the caller's canonical-kind guard should make this
-            // unreachable, but a guarded fatalError would crash the whole
-            // scheduler if that invariant ever breaks. Fail loud + honest
-            // instead — the caller's do/catch turns this into an
-            // {status:"error"} envelope, never a crash.
-            throw TriggerSchedulerError.invalidRequest("unhandled trigger kind: \(kind)")
-        }
+        let built = await content.morningBrief(synthesizer: morningBriefSynthesizer)
 
         // Match _STANDARD_ACTIONS shape.
         let actions: JSONValue = .array([
@@ -1646,11 +1434,11 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         let item: JSONValue = .object([
             "id": .string(id),
             "created_at": .string(createdAt),
-            "source": .string(source),
-            "severity": .string(severity),
-            "title": .string(title),
-            "summary": .string(summary),
-            "detail": detail,
+            "source": .string("trigger:morning_brief"),
+            "severity": .string("important"),
+            "title": .string(built.title),
+            "summary": .string(built.summary),
+            "detail": built.detail,
             "related_mission_id": .null,
             "related_approval_id": .null,
             "related_paths": .null,
@@ -1689,20 +1477,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// ever changes what a FRESH root starts with.
     nonisolated static let _defaultInboxConfigs: [JSONValue] = [
         .object([
-            "name": .string("idle_checkin"),
-            "kind": .string("idle"),
-            "enabled": .bool(false),
-            "config": .object([
-                "idle_minutes": .int(30),
-                "quiet_start_hour": .int(23),
-                "quiet_end_hour": .int(8),
-                // Ships quiet: the idle condition is newly lit, so the item
-                // surfaces in the inbox but does not push until User opts in.
-                "notify": .bool(false),
-            ]),
-            "description": .string("Check in after a period of silence."),
-        ]),
-        .object([
             "name": .string("morning_brief"),
             "kind": .string("time"),
             // Ships OFF, like every other proactive lane. A fresh root should
@@ -1740,9 +1514,6 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         ]),
     ]
 
-    public nonisolated static func defaultDataRoot() -> URL {
-        PersistenceCore.defaultDataRoot()
-    }
 }
 
 // MARK: - Factory

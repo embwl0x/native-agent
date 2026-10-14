@@ -142,6 +142,7 @@ public enum DreamREMCycleError: Error, LocalizedError {
     case invalidResponse(status: Int)
     case unavailable
     case underlying(String)
+    case remDecodeFailure(String)
     /// WAVE 35 W15: the cycle's gate is off. Mirrors the daemon POST routes'
     /// 403 (`dream_cycle_disabled` / `rem_cycle_disabled`,
     /// the retired daemon). `detail` carries the SAME message the
@@ -155,22 +156,10 @@ public enum DreamREMCycleError: Error, LocalizedError {
         case .notFound: return "dream/rem: entry not found"
         case .invalidResponse(let s): return "dream/rem: native implementation returned unexpected status \(s)"
         case .unavailable: return "dream/rem: unavailable"
-        case .underlying(let m): return "dream/rem: \(m)"
+        case .underlying(let m), .remDecodeFailure(let m): return "dream/rem: \(m)"
         case .cycleDisabled(_, let detail): return "dream/rem: \(detail)"
         }
     }
-}
-
-// MARK: - Protocol
-
-/// DreamREMCycle surface. SwiftNative owns the file-backed read endpoints and
-/// the manual dream/REM cycle triggers.
-public protocol DreamREMCycleProtocol: Sendable {
-    func listDreamDiary(limit: Int?) async throws -> [DreamEntry]
-    func getDreamForToday() async throws -> DreamEntry?
-    func getDreamForDate(_ date: String) async throws -> DreamEntry?
-    func runDream(force: Bool) async throws -> DreamRunResult
-    func runREM(force: Bool) async throws -> REMRunResult
 }
 
 // MARK: - DreamREMGate / DreamREMSchedule
@@ -183,10 +172,8 @@ public protocol DreamREMCycleProtocol: Sendable {
 //      Keeping the gate in Swift lets UI and manual runs explain why a run is
 //      blocked before launching a cycle.
 //
-//   2. THE SCHEDULE — nightly dream at 03:30 Central, written under the
-//      previous Central calendar day, and weekly REM on the app schedule.
-//      Pure date arithmetic lets the UI show "next dream pass at ..." without
-//      crossing a runtime boundary.
+//   2. THE SCHEDULE — shared local-clock times and diary date keys. The
+//      scheduler owns the next run; nightly dreams use the previous local day.
 //
 // The cycle body is Swift too: DreamCycleRunner owns dream synthesis and
 // dream_diary writes; REMConsolidator owns weekly REM distillation, proposal
@@ -294,12 +281,16 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
         "Enable the REM cycle toggle in Dreams to run REM consolidation."
 }
 
-/// Pure-compute next-run schedule for the dream + REM loops. NO LLM, NO I/O.
+/// Shared schedule values for the dream + REM loops. NO LLM, NO I/O.
 /// Nightly dreams run at 03:30 on the MACHINE's own clock and write the
 /// previous local calendar day's diary key.
 public enum DreamREMSchedule {
     /// The Mac's current time zone for both scheduling and diary date keys.
-    public static var timeZoneIdentifier: String { TimeZone.current.identifier }
+    /// The stored schedule follows the Mac: "local" is the scheduler's own
+    /// follow-the-Mac zone, resolved at fire time. A pinned identifier was
+    /// rewritten over the person's edit on every bootstrap pass and went stale
+    /// the moment the Mac moved.
+    public static var timeZoneIdentifier: String { "local" }
 
     /// Dream loop fire time.
     public static let dreamHour = 3
@@ -307,11 +298,9 @@ public enum DreamREMSchedule {
 
     /// REM loop fire time. SINGLE SOURCE OF TRUTH — the App-side scheduler
     /// (NativeAgentDreamCycleSchedule) forwards to these; do not duplicate the
-    /// literals there. Legacy weekday numbering is Monday=0 ... Sunday=6, so
-    /// weekday 6 is Sunday.
+    /// literals there.
     public static let remHour = 4
     public static let remMinute = 30
-    public static let remLegacySundayWeekday = 6
 
     public static func localCalendar() -> Calendar {
         var cal = Calendar(identifier: .gregorian)
@@ -337,67 +326,12 @@ public enum DreamREMSchedule {
         let previous = calendar.date(byAdding: .day, value: -1, to: now) ?? now.addingTimeInterval(-86_400)
         return todayKey(now: previous, calendar: calendar)
     }
-
-    /// Today at HH:MM; if that's already past (`target <= now`), roll to
-    /// tomorrow. Returns nil only if calendar arithmetic fails.
-    public static func nextDreamRun(
-        after now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> Date? {
-        nextDailyRun(hour: dreamHour, minute: dreamMinute, after: now, calendar: calendar)
-    }
-
-    /// The next occurrence of Sunday at HH:MM. If that target is today but
-    /// already passed, bump a full week.
-    public static func nextREMRun(
-        after now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> Date? {
-        // Translate legacy weekday numbering (Mon=0...Sun=6) to the SAME day
-        // by matching on the actual weekday, not Calendar's component number
-        // (Calendar weekday is 1=Sunday…7=Saturday and depends on locale's
-        // firstWeekday — we avoid that by stepping day-by-day until the
-        // Python weekday matches, which is locale-independent).
-        guard let todayTarget = calendar.date(
-            bySettingHour: remHour, minute: remMinute, second: 0, of: now
-        ) else { return nil }
-
-        func legacyWeekday(of date: Date) -> Int {
-            // Calendar.component(.weekday) -> 1=Sun...7=Sat. Legacy -> Mon=0...Sun=6.
-            // Map: Sun(1)->6, Mon(2)->0, Tue(3)->1, … Sat(7)->5.
-            let calWd = calendar.component(.weekday, from: date) // 1…7
-            return (calWd + 5) % 7
-        }
-
-        let daysAhead = ((remLegacySundayWeekday - legacyWeekday(of: now)) % 7 + 7) % 7
-        if daysAhead == 0 {
-            // Same weekday: fire today unless HH:MM already passed → +7 days.
-            if todayTarget > now { return todayTarget }
-            return calendar.date(byAdding: .day, value: 7, to: todayTarget)
-        }
-        return calendar.date(byAdding: .day, value: daysAhead, to: todayTarget)
-    }
-
-    /// Shared daily-cron helper: today at HH:MM, rolled to tomorrow if past.
-    private static func nextDailyRun(
-        hour: Int, minute: Int, after now: Date, calendar: Calendar
-    ) -> Date? {
-        guard let target = calendar.date(
-            bySettingHour: hour, minute: minute, second: 0, of: now
-        ) else { return nil }
-        if target > now { return target }
-        return calendar.date(byAdding: .day, value: 1, to: target)
-    }
 }
 
 // MARK: - FileBackedDreamDiary (true read-path port)
 
-/// WAVE 33 W20: Swift-native dream-diary READ surface preserving retired behavior
-/// (`the retired daemon` `list_entries` / `latest_entry` / `get_entry`).
-/// These three are PURE FILE I/O on the daemon side — they glob
-/// `<data_root>/dream_diary/*.md`, read the text, and stat size/mtime. No LLM,
-/// no scheduler, no persona. The Dreams-tab read path is native; heavy
-/// LLM-driven cycles run through Swift cycle runners.
+/// File-backed diary listing and by-date reads, including archived entries.
+/// No LLM, scheduler or persona is needed to read a dream.
 ///
 /// Semantics pinned against the daemon source:
 ///   - list: `sorted(self._diary_dir.glob("*.md"), reverse=True)[:limit]`.
@@ -470,13 +404,6 @@ public struct FileBackedDreamDiary: Sendable {
         listEntriesChecked(limit: limit).entries
     }
 
-    /// Every diary filename the listing draws from (archive included),
-    /// newest-first. A count of the diary must come from here, or it disagrees
-    /// with the list once REM has archived older nights.
-    public func entryFileNames() -> [String] {
-        diaryFiles().files.map(\.name).sorted(by: >)
-    }
-
     /// The same listing, with what it could not read carried out alongside it.
     public func listEntriesChecked(limit: Int) -> DiaryListing {
         let clamped = max(1, limit)
@@ -512,11 +439,6 @@ public struct FileBackedDreamDiary: Sendable {
         return DiaryListing(
             entries: out, totalEntries: scan.files.count,
             storageUnreadable: scan.unreadableDirectory, unreadableEntries: skipped)
-    }
-
-    /// Mirror `latest_entry()` == `list_entries(limit=1)` first element.
-    public func latestEntry() -> DreamEntry? {
-        listEntries(limit: 1).first
     }
 
     /// Outcome of a by-date read so the caller can distinguish the daemon's
@@ -579,9 +501,7 @@ public struct FileBackedDreamDiary: Sendable {
         return .entry(DreamEntry(date: trimmed, filename: url.lastPathComponent, content: text, size: size))
     }
 
-    /// Convenience: nil for badPath/notFound, the entry otherwise. Kept for the
-    /// `DreamREMCycleProtocol.getDreamForDate` shape which can't distinguish
-    /// 400 from 404 (both render as "no entry" in the Dreams UI). Read errors
+    /// Convenience: nil for badPath/notFound, the entry otherwise. Read errors
     /// still propagate.
     public func getEntry(_ dateKey: String) throws -> DreamEntry? {
         switch try getEntryResult(dateKey) {
@@ -591,28 +511,16 @@ public struct FileBackedDreamDiary: Sendable {
     }
 }
 
-// MARK: - SwiftNative impl (file-backed reads; HTTP for the LLM cycle)
+// MARK: - SwiftNative cycle runners
 
-/// SwiftNative DreamREMCycle: file-backed reads plus native manual runners.
-public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
-    private let dataRoot: URL
-    private let reader: FileBackedDreamDiary
-    private let cycleDelegate: (any DreamREMCycleProtocol)?
-    private let dreamRunner: DreamCycleRunner?
-    private let remConsolidator: REMConsolidator?
-    /// WAVE 35 W15: optional pure-compute gate. When supplied, run requests are
-    /// pre-checked against the daemon's `is_enabled()` logic; a disabled cycle
-    /// throws `DreamREMCycleError.cycleDisabled` WITHOUT a doomed POST (the
-    /// daemon would have returned 403 anyway). When nil (the default), behavior
-    /// is unchanged: the request is delegated and the daemon enforces the gate
-    /// server-side, so the gate is never weakened — only short-circuited early.
-    private let gate: DreamREMGatePolicy?
+/// Native dream/REM runners with the same gate for prechecks and execution.
+public actor SwiftNativeDreamREMCycle {
+    private let dreamRunner: DreamCycleRunner
+    private let remConsolidator: REMConsolidator
+    private let gate: DreamREMGatePolicy
 
     public init(
         dataRoot: URL,
-        cycleDelegate: (any DreamREMCycleProtocol)? = nil,
-        dreamRunner: DreamCycleRunner? = nil,
-        remConsolidator: REMConsolidator? = nil,
         gate: DreamREMGatePolicy? = nil,
         dreamMemoryDeltaProvider: DreamMemoryDeltaProvider? = nil,
         dreamFeltSummaryProvider: DreamFeltSummaryProvider? = nil,
@@ -622,84 +530,35 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
         remStageApproval: REMApprovalStager? = nil,
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
     ) {
-        self.dataRoot = dataRoot
-        self.reader = FileBackedDreamDiary(dataRoot: dataRoot)
-        self.cycleDelegate = cycleDelegate
-        let effectiveGate = gate ?? (cycleDelegate == nil ? Self.loadGatePolicy(dataRoot: dataRoot) : nil)
+        let effectiveGate = gate ?? Self.loadGatePolicy(dataRoot: dataRoot)
         self.gate = effectiveGate
-        if cycleDelegate == nil {
-            let llm = Self.makeDefaultLLMClient(lifecycleObserver: lifecycleObserver)
-            let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-            // 2026-06-05 dream-design-restore (pass 2): thread the
-            // memory-delta provider through so the scheduler-driven run
-            // (BackgroundLoopsAssembly.runDream → SwiftNativeDreamREMCycle) gets the
-            // same Self-half wiring as the BackgroundLoopsAssembly path.
-            // Without this, the scheduler bypasses the assembly and the
-            // Self-half is permanently empty for the nightly run.
-            let resolvedDeltaProvider: DreamMemoryDeltaProvider =
-                dreamMemoryDeltaProvider ?? { [] }
-            // Felt-tone provider threads through for the SAME reason as the
-            // delta provider above (2026-07-02): the scheduler-driven run
-            // builds its runner HERE, not in BackgroundLoopsAssembly — without
-            // this the scheduled nightly dream would silently never feel.
-            let resolvedFeltProvider: DreamFeltSummaryProvider =
-                dreamFeltSummaryProvider ?? { nil }
-            // The dream's mood flows BACK into her slow disposition layer (U2a,
-            // 2026-07-09). Threaded here for the same reason as the two providers
-            // above: the scheduler-driven nightly builds its runner HERE, not in
-            // BackgroundLoopsAssembly — unwired, the scheduled dream would feel the
-            // day but the day would never feel the dream.
-            let resolvedMoodSink: DreamDatedMoodSink = dreamMoodSink ?? { _, _ in true }
-            self.dreamRunner = dreamRunner ?? DreamCycleRunner(
-                dataRoot: dataRoot,
-                personaRoot: personaRoot,
-                llm: llm,
-                memoryDeltaProvider: resolvedDeltaProvider,
-                feltSummaryProvider: resolvedFeltProvider,
-                feltOriginProvider: dreamFeltOriginProvider ?? { [] },
-                receiptSink: dreamReceiptSink ?? { _, _ in },
-                datedMoodSink: resolvedMoodSink,
-                // The runner re-checked the gate by re-reading policy.json raw,
-                // which overrode the normalized gate this type was handed. Pass
-                // the resolved gate down so there is exactly one decision.
-                gate: effectiveGate
-            )
-            // remStageApproval is app-wired (ApprovalInbox + inbox card) so
-            // the manual /v1/rem/run path stages approvals like the loop does.
-            self.remConsolidator = remConsolidator ?? REMConsolidator(
-                dataRoot: dataRoot,
-                personaRoot: personaRoot,
-                llm: llm,
-                gate: effectiveGate ?? DreamREMGatePolicy(),
-                stageApproval: remStageApproval
-            )
-        } else {
-            self.dreamRunner = dreamRunner
-            self.remConsolidator = remConsolidator
-        }
+        let llm = Self.makeDefaultLLMClient(lifecycleObserver: lifecycleObserver)
+        let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
+        // Both scheduler and manual paths carry memory, felt tone and the
+        // returning mood through these same runners.
+        self.dreamRunner = DreamCycleRunner(
+            dataRoot: dataRoot,
+            personaRoot: personaRoot,
+            llm: llm,
+            memoryDeltaProvider: dreamMemoryDeltaProvider ?? { [] },
+            feltSummaryProvider: dreamFeltSummaryProvider ?? { nil },
+            feltOriginProvider: dreamFeltOriginProvider ?? { [] },
+            receiptSink: dreamReceiptSink ?? { _, _ in },
+            datedMoodSink: dreamMoodSink ?? { _, _ in true },
+            gate: effectiveGate
+        )
+        // The app wires the same approval stager for manual and scheduled REM.
+        self.remConsolidator = REMConsolidator(
+            dataRoot: dataRoot,
+            personaRoot: personaRoot,
+            llm: llm,
+            gate: effectiveGate,
+            stageApproval: remStageApproval
+        )
     }
 
-    public func listDreamDiary(limit: Int?) async throws -> [DreamEntry] {
-        // nil limit == daemon route default of 30 (the HTTP shell omitted the
-        // query param and the daemon route applied 30).
-        reader.listEntries(limit: limit ?? 30)
-    }
-
-    public func getDreamForToday() async throws -> DreamEntry? {
-        reader.latestEntry()
-    }
-
-    public func getDreamForDate(_ date: String) async throws -> DreamEntry? {
-        try reader.getEntry(date)
-    }
-
-    public func runDream(force: Bool) async throws -> DreamRunResult {
-        try await runDream(force: force, trigger: .schedule)
-    }
-
-    /// The single dream path, with the waking lane named. `runDream(force:)`
-    /// (the protocol requirement) is the `.schedule` case of exactly this; a
-    /// manual pass calls it with `.manual`. Same gate, same
+    /// The single dream path, with the waking lane named. A manual pass calls
+    /// it with `.manual`. Same gate, same
     /// runner, same dedupe — only the receipt and the target day differ.
     public func runDream(force: Bool, trigger: DreamTrigger) async throws -> DreamRunResult {
         // WAVE 35 W15: pure-compute pre-check mirrors the retired daemon
@@ -707,17 +566,11 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
         // `force` flag re-runs even if the target entry exists — it does NOT
         // bypass the gate (the daemon checks the gate BEFORE reading `force`),
         // so we don't let it bypass here either.
-        if let gate, !gate.dreamEnabled {
+        if !gate.dreamEnabled {
             throw DreamREMCycleError.cycleDisabled(
                 error: "dream_cycle_disabled",
                 detail: DreamREMGatePolicy.dreamDisabledDetail
             )
-        }
-        if let cycleDelegate {
-            return try await cycleDelegate.runDream(force: force)
-        }
-        guard let dreamRunner else {
-            throw DreamREMCycleError.underlying("native dream runner unavailable")
         }
         let report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger)
         var response: [String: JSONValue] = [
@@ -740,17 +593,11 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
         // WAVE 35 W15: pure-compute pre-check mirrors the retired daemon
         // (the POST route 403s when `_rem_cycle.is_enabled()` is false). As
         // with dream, `force` does not bypass the gate.
-        if let gate, !gate.remEnabled {
+        if !gate.remEnabled {
             throw DreamREMCycleError.cycleDisabled(
                 error: "rem_cycle_disabled",
                 detail: DreamREMGatePolicy.remDisabledDetail
             )
-        }
-        if let cycleDelegate {
-            return try await cycleDelegate.runREM(force: force)
-        }
-        guard let remConsolidator else {
-            throw DreamREMCycleError.underlying("native REM consolidator unavailable")
         }
         // Manual runs (force) bypass the weekly idempotency marker —
         // without this, /v1/rem/run within 6 days of the scheduled pass
@@ -808,15 +655,13 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
 // `dreamMoodSink` threads through so a factory-built cycle that RUNS a dream
 // participates in the slow disposition layer (U2a) — without it, the default
 // no-op sink means the dream feels the day but the day never feels the dream.
-// Today's factory callers are diary reads + REM (no dream), but the parameter
-// keeps the U2 path impossible to bypass silently from a future call site.
 public func makeDreamREMCycle(
     root: URL = PersistenceCore.defaultDataRoot(),
     gate: DreamREMGatePolicy? = nil,
     remStageApproval: REMApprovalStager? = nil,
     dreamMoodSink: DreamDatedMoodSink? = nil,
     lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
-) -> any DreamREMCycleProtocol {
+) -> SwiftNativeDreamREMCycle {
     return SwiftNativeDreamREMCycle(
         dataRoot: root, gate: gate,
         dreamMoodSink: dreamMoodSink, remStageApproval: remStageApproval,

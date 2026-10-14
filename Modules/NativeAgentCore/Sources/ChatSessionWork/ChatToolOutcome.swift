@@ -5,6 +5,148 @@ import PersistenceCore
 
 /// Exact result evidence shared by transcript projection and live turn receipts.
 public enum ChatToolOutcome {
+    /// The same truth for an inline interaction: a boundary that raised a need
+    /// DID NOT RUN. It is waiting on a person, so it is neither progress nor a
+    /// failure — the tool loop stops here and the turn suspends, exactly as it
+    /// does for an approval, and the no-progress guard must not read a card as
+    /// a round that achieved something.
+    public static func isWaitingInteraction(_ output: JSONValue) -> Bool {
+        guard case .object(let object) = output,
+              case .string(let raw)? = object["status"] else { return false }
+        guard raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == "needs_input" else { return false }
+        // A canonical typed need and nothing else. An envelope that says
+        // `needs_input` while carrying an error, `ok: false`, or
+        // `isError: true` is a call that FAILED wearing a waiting label, and
+        // reading it as a question hid the failure on every surface: the pill
+        // drew "needs you", the fold counted it as open, and the trace filed
+        // it without an error class. Explicit failure evidence outranks
+        // waiting.
+        return !carriesFailureEvidence(output)
+    }
+
+    /// Explicit evidence, in the envelope itself, that the call did not
+    /// succeed. Never prose: only the wire fields the dispatch boundary
+    /// actually writes. The single predicate the pill, the chat fold, and the
+    /// trace all ask, so the three can never disagree about one row.
+    public static func carriesFailureEvidence(_ output: JSONValue) -> Bool {
+        guard case .object(let object) = output else { return false }
+        if let error = object["error"], error != .null {
+            if case .string(let text) = error {
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+            } else {
+                return true
+            }
+        }
+        if object["ok"] == .bool(false) { return true }
+        if object["isError"] == .bool(true) { return true }
+        if object["is_error"] == .bool(true) { return true }
+        if object["success"] == .bool(false) { return true }
+        return false
+    }
+
+    public enum DisplayOutcome: String, Equatable, Sendable {
+        case pending = "Running"
+        case succeeded = "Completed"
+        case refused = "Refused"
+        case partial = "Partial"
+        case connectionFailed = "Connection failed"
+        case unknown = "Outcome unknown"
+        case failed = "Failed"
+        /// A raised inline card. The call asked the person a question; it did
+        /// not fail, and it has not run (2026-09-14).
+        case needsYou = "Needs you"
+    }
+
+    /// Pure projection of the dispatch envelope, never of the transport success bit.
+    /// The catch boundary projects AutonomyGateError and MCPSubprocessError to
+    /// these exact wire forms; do not search arbitrary result prose for errors.
+    public static func displayOutcome(result: JSONValue?, ok: Bool?, hasResult: Bool) -> DisplayOutcome {
+        guard hasResult else { return ok == false ? .failed : (ok == nil ? .pending : .unknown) }
+        guard let value = result else { return ok == false ? .failed : .unknown }
+        let classification = ChatToolOutcome.recordedResultClass(value) ?? ChatToolOutcome.exactResultClass(value)
+        let macOutcome = MacControlReceiptOutcome.projecting(envelope: value)
+        let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
+        let status = string(fields["status"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let error = string(fields["error"])
+        switch classification {
+        case .succeeded:
+            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
+            if fields["partial"] == .bool(true) { return .partial }
+            return .succeeded
+        case .refused: return .refused
+        case .failed:
+            if macOutcome == .refused { return .refused }
+            if status == "failed", let error, error.hasPrefix("tool denied: "), fields["reason"] == .string(error) {
+                return .refused
+            }
+            if status == "failed", error == "streamClosed", fields["reason"] == .string("streamClosed") {
+                return .connectionFailed
+            }
+            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
+            return .failed
+        case .cancelled, .timeout: return .unknown
+        case .unknown:
+            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
+            if ChatToolOutcome.isWaitingInteraction(value) { return .needsYou }
+            if status == "partial" || fields["partial"] == .bool(true) { return .partial }
+            if status == "running" || macOutcome == .running { return .pending }
+            return .unknown
+        }
+    }
+
+    public static func displaySummary(outcome: DisplayOutcome, input: JSONValue?, result: JSONValue?) -> String {
+        let value = result
+        let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
+        let reason = value.flatMap(ChatToolOutcome.explanation)
+        let macOutcome = value.flatMap { MacControlReceiptOutcome.projecting(envelope: $0) }
+        switch outcome {
+        case .pending: return "No result yet"
+        // A question, not a result. The envelope's own one-liner is the reason
+        // the card exists, so it is what the pill says.
+        case .needsYou:
+            return string(fields["detail"]) ?? "Waiting on your answer"
+        case .unknown:
+            if let macOutcome, macOutcome == .effectUnconfirmed || macOutcome == .timedOut {
+                return MacControlReceiptOutcome.effectUnconfirmed.sentence
+            }
+            return "Response received · completion not confirmed"
+        case .connectionFailed: return "Connection lost · completion unknown"
+        case .refused:
+            if reason == "tool denied: fileAccess=read_only blocks write_file" {
+                return "Reading only is allowed; file not written."
+            }
+            return reason ?? "The request was refused."
+        case .partial:
+            var count = "Partially completed"
+            if case .array(let created)? = fields["created"], case .object(let args)? = input,
+               case .array(let children)? = args["children"] {
+                count = "\(created.count) of \(children.count) tasks created"
+            }
+            // Desk breakdown reports "creating child N 'Title': <error>"; say what
+            // did not happen and why. The raw reason stays verbatim in Details.
+            var why = reason
+            if let reason, reason.hasPrefix("creating child "),
+               let open = reason.firstIndex(of: "'"),
+               let close = reason[reason.index(after: open)...].firstIndex(of: "'") {
+                let title = reason[reason.index(after: open)..<close]
+                let rest = reason[close...].dropFirst()
+                let error = rest.hasPrefix(": ") ? rest.dropFirst(2) : rest
+                why = "\(title) not created: \(error)"
+            }
+            return count + (why.map { " · \($0)" } ?? "")
+        case .failed: return reason ?? "The request failed."
+        case .succeeded:
+            if case .string(let text) = value { return text }
+            return string(fields["summary"]) ?? string(fields["message"]) ?? "Completed"
+        }
+    }
+
+    private static func string(_ value: JSONValue?) -> String? {
+        guard case .string(let value)? = value else { return nil }
+        return value
+    }
+
     public static func explanation(_ output: JSONValue) -> String? {
         sentence(output, keys: ["detail", "message", "summary", "reason", "error"], limit: 600)
     }
@@ -59,7 +201,7 @@ public enum ChatToolOutcome {
     ]
 
     package static let failureStatuses: Set<String> = [
-        "denied", "error", "failed", "failure", "rejected", "refused", "blocked", "unavailable",
+        "denied", "error", "failed", "failure", "rejected", "refused", "blocked", "unavailable", "needs_permission", "not_found",
     ]
 
     /// Statuses that are not final: nothing is known to have finished.

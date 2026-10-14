@@ -97,8 +97,7 @@ public struct WorkshopCompiledProcedureInvocationExecutor: ProcedureCanonicalExe
         }
         let replay = ProcedureReplayEngine.replay(
             artifact,
-            against: trajectory,
-            mode: .historicalExact
+            against: trajectory
         )
         guard replay.status == .matched,
               replay.matchedStepCount == artifact.transitionTable.count,

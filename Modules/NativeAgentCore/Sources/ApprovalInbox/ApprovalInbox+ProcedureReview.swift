@@ -15,27 +15,6 @@ extension SwiftNativeApprovalInbox {
     public static let procedureReviewApprovalAction = "living_fabric.procedure_review"
     private static let procedureReviewApprovalSchema = "living-fabric-procedure-review.v1"
 
-    @discardableResult
-    public func stageProcedureReviewApproval(
-        _ proposal: ProcedureReviewProposal
-    ) async throws -> ApprovalRecord {
-        guard proposal.validates else { throw ProcedureReviewApprovalError.invalidProposal }
-        return try await create(.object([
-            "title": .string("Review compiled procedure candidate"),
-            "action": .string(Self.procedureReviewApprovalAction),
-            "risk": .string("high"),
-            "reason": .string(
-                "Approve this exact payload-free procedure evidence set for manual review scope. The artifact grants no permission, cannot send externally, and cannot auto-activate."
-            ),
-            "remoteResolvable": .bool(false),
-            "localOnly": .bool(true),
-            "payloadPreview": .string(
-                "Procedure \(proposal.candidateShapeIdentity.prefix(12)); \(proposal.trajectoryCount) verified trajectories; scope \(proposal.scope.rawValue)."
-            ),
-            "payload": procedureReviewBinding(proposal),
-        ]))
-    }
-
     /// Mints the only production-capable reviewer decision. The compiler later
     /// recomputes `candidateEvidenceDigest`, so even an approved stale proposal
     /// cannot compile a changed candidate.

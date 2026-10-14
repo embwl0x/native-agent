@@ -17,6 +17,7 @@ public enum SomaticSignalKind: String, Codable, Sendable, Equatable, CaseIterabl
     case deskItemCreated
     case deskItemBlocked
     case deskItemClosed
+    case deskItemCancelled
     case memoryCommitted
     case memoryCorrected
     case memoryHygieneCompleted
@@ -76,14 +77,11 @@ public struct SomaticSignal: Codable, Sendable, Equatable, Identifiable {
         let cleanSource = sourceOrgan.trimmingCharacters(in: .whitespacesAndNewlines)
         self.sourceOrgan = cleanSource.isEmpty ? "unknown" : String(cleanSource.prefix(80))
         self.occurredAt = occurredAt
-        self.intensity = Self.clamp01(intensity)
-        self.valence = valence.map(Self.clampSigned)
-        self.arousal = arousal.map(Self.clamp01)
+        self.intensity = intensity.clamped01()
+        self.valence = valence.map { $0.clampedSigned() }
+        self.arousal = arousal.map { $0.clamped01() }
         self.metadata = Self.boundedMetadata(metadata, bounds: bounds)
     }
-
-    static func clamp01(_ value: Double) -> Double { value.clamped01() }
-    static func clampSigned(_ value: Double) -> Double { value.clampedSigned() }
 
     public static func boundedMetadata(
         _ metadata: [String: JSONValue],
@@ -99,7 +97,6 @@ public struct SomaticSignal: Codable, Sendable, Equatable, Identifiable {
             out[cleanKey] = JSONValueBounding.bounded(
                 metadata[key] ?? .null,
                 bounds: bounds,
-                redactSecrets: true,
                 keyPath: cleanKey.lowercased(),
                 depth: 0
             )
@@ -153,23 +150,19 @@ public struct ChemicalState: Codable, Sendable, Equatable {
         novelty: Double = 0,
         urgency: Double = 0
     ) {
-        self.warmth = Self.clamp(warmth)
-        self.vigilance = Self.clamp(vigilance)
-        self.curiosity = Self.clamp(curiosity)
-        self.fatigue = Self.clamp(fatigue)
-        self.coherence = Self.clamp(coherence)
-        self.agency = Self.clamp(agency)
-        self.tenderness = Self.clamp(tenderness)
-        self.confidence = Self.clamp(confidence)
-        self.novelty = Self.clamp(novelty)
-        self.urgency = Self.clamp(urgency)
+        self.warmth = warmth.clamped01()
+        self.vigilance = vigilance.clamped01()
+        self.curiosity = curiosity.clamped01()
+        self.fatigue = fatigue.clamped01()
+        self.coherence = coherence.clamped01()
+        self.agency = agency.clamped01()
+        self.tenderness = tenderness.clamped01()
+        self.confidence = confidence.clamped01()
+        self.novelty = novelty.clamped01()
+        self.urgency = urgency.clamped01()
     }
 
     public static let neutral = ChemicalState()
-
-    public static func clamp(_ value: Double) -> Double {
-        (value).clamped01()
-    }
 
     public var isNeutral: Bool {
         self == .neutral
@@ -400,20 +393,17 @@ public struct OrganismSnapshot: Sendable, Equatable {
 /// only its projection/posture while the live kernel remains untouched.
 public struct OrganismFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
-    public let revisionFingerprint: String
     public let snapshot: OrganismSnapshot
     public let projection: OrganismProjection
     public let posture: OrganismBehaviorPosture?
 
     public init(
         fixedAt: Date,
-        revisionFingerprint: String,
         snapshot: OrganismSnapshot,
         projection: OrganismProjection,
         posture: OrganismBehaviorPosture?
     ) {
         self.fixedAt = fixedAt
-        self.revisionFingerprint = revisionFingerprint
         self.snapshot = snapshot
         self.projection = projection
         self.posture = posture
@@ -423,9 +413,6 @@ public struct OrganismFrozenRead: Sendable, Equatable {
 public struct OrganismConfiguration: Sendable, Equatable {
     public var enabled: Bool
     public var metadataBounds: OrganismMetadataBounds
-    public var fieldLimits: OrganismFieldLimits
-    public var predictionLimits: OrganismPredictionLimits
-    public var dreamRepairLimits: OrganismDreamRepairLimits
     /// Item 4 (2026-09-02). Nil = no clock, and the diurnal curve is then a
     /// no-op end to end. Pushed by the app layer from the user's already-declared
     /// quiet hours; never read from a config file of its own.
@@ -434,16 +421,10 @@ public struct OrganismConfiguration: Sendable, Equatable {
     public init(
         enabled: Bool = false,
         metadataBounds: OrganismMetadataBounds = .defaults,
-        fieldLimits: OrganismFieldLimits = .defaults,
-        predictionLimits: OrganismPredictionLimits = .defaults,
-        dreamRepairLimits: OrganismDreamRepairLimits = .defaults,
         diurnalClock: OrganismDiurnalClock? = nil
     ) {
         self.enabled = enabled
         self.metadataBounds = metadataBounds
-        self.fieldLimits = fieldLimits
-        self.predictionLimits = predictionLimits
-        self.dreamRepairLimits = dreamRepairLimits
         self.diurnalClock = diurnalClock
     }
 

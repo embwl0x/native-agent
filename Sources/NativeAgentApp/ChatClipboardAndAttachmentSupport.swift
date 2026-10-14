@@ -1,11 +1,12 @@
 import AppKit
 import NativeAgentShared
+import ChatOrchestration
 import UniformTypeIdentifiers
 
-enum ChatComposerSupport {
+typealias ChatComposerSupport = NativeAgentShared.ChatAttachmentTypeResolver
+
+extension NativeAgentShared.ChatAttachmentTypeResolver {
     static let attachmentContentTypes: [UTType] = [.fileURL, .image]
-    static let attachmentByteLimit = ChatAttachmentTypeResolver.fileByteLimit
-    static let clipboardImageByteLimit = 10 * 1024 * 1024
 
     /// Each surface captures its destination before asynchronous intake starts.
     @MainActor
@@ -17,20 +18,30 @@ enum ChatComposerSupport {
     ) {
         let pasteboard = NSPasteboard.general
         if let type = imageType(in: (pasteboard.types ?? []).map(\.rawValue)) {
-            switch imageAttachment(pasteboard.data(forType: .init(type)), typeIdentifier: type) {
-            case .success(let attachment):
-                appendImage(attachment)
-                showToast("Image pasted from clipboard")
-                return
-            case .failure:
-                showToast("Clipboard image could not be pasted; choose a file instead")
+            let data = pasteboard.data(forType: .init(type))
+            Task {
+                switch await Task.detached(priority: .userInitiated, operation: {
+                    imageAttachment(data, typeIdentifier: type)
+                }).value {
+                case .success(let attachment):
+                    appendImage(attachment)
+                    showToast("Image pasted from clipboard")
+                case .failure:
+                    showToast("Clipboard image could not be pasted; choose a file instead")
+                    pickFiles()
+                }
             }
+            return
         }
-        guard let urls = pickAttachmentFiles() else { return }
-        if urls.isEmpty, let emptySelectionMessage {
-            showToast(emptySelectionMessage)
+        pickFiles()
+
+        func pickFiles() {
+            guard let urls = pickAttachmentFiles() else { return }
+            if urls.isEmpty, let emptySelectionMessage {
+                showToast(emptySelectionMessage)
+            }
+            for url in urls { attachFile(url) }
         }
-        for url in urls { attachFile(url) }
     }
 
     @MainActor
@@ -58,11 +69,7 @@ enum ChatComposerSupport {
         for provider in providers {
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    let url: URL?
-                    if let value = item as? URL { url = value }
-                    else if let value = item as? Data { url = URL(dataRepresentation: value, relativeTo: nil) }
-                    else if let value = item as? String { url = URL(string: value) }
-                    else { url = nil }
+                    let url = localFileURL(item)
                     Task { @MainActor in
                         guard let url, url.isFileURL else {
                             showToast("Couldn't read the attached file")
@@ -92,62 +99,6 @@ enum ChatComposerSupport {
         }
     }
 
-    static func imageType(in identifiers: [String]) -> String? {
-        let preferred = [UTType.png.identifier, UTType.jpeg.identifier, UTType.tiff.identifier]
-        return preferred.first(where: identifiers.contains)
-            ?? identifiers.first { UTType($0)?.conforms(to: .image) == true }
-    }
-
-    static func imageAttachment(
-        _ data: Data?, typeIdentifier: String
-    ) -> Result<MultimodalAttachment, AttachmentRefusal> {
-        guard let data else { return .failure(.init(message: "Couldn't read the attached image")) }
-        guard data.count <= clipboardImageByteLimit else {
-            return .failure(.init(message: "Image too large (limit: 10 MB)"))
-        }
-        let bytes: Data
-        let mime: String
-        switch typeIdentifier {
-        case UTType.png.identifier: bytes = data; mime = "image/png"
-        case UTType.jpeg.identifier: bytes = data; mime = "image/jpeg"
-        default:
-            guard let rep = NSBitmapImageRep(data: data),
-                  let png = rep.representation(using: .png, properties: [:]) else {
-                return .failure(.init(message: "Couldn't read the attached image"))
-            }
-            bytes = png; mime = "image/png"
-        }
-        guard bytes.count <= clipboardImageByteLimit else {
-            return .failure(.init(message: "Image too large (limit: 10 MB)"))
-        }
-        return .success(MultimodalAttachment(
-            type: "image", base64: bytes.base64EncodedString(), mime: mime, byteSize: bytes.count
-        ))
-    }
-
-    /// Read one overflow byte so a growing file cannot bypass the attachment
-    /// cap or allocate an unbounded buffer before it is rejected.
-    static func readAttachmentFile(_ url: URL) throws -> Data {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let bound = attachmentByteLimit + 1
-        var data = Data()
-        while data.count < bound {
-            guard let chunk = try handle.read(upToCount: bound - data.count),
-                  !chunk.isEmpty else { break }
-            data.append(chunk)
-        }
-        return data
-    }
-
-    static func voiceDraft(base: String, transcript: String) -> String {
-        let base = base.trimmingCharacters(in: .whitespacesAndNewlines)
-        let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if base.isEmpty { return spoken }
-        if spoken.isEmpty { return base }
-        return "\(base) \(spoken)"
-    }
-
     @MainActor
     static func pickAttachmentFiles() -> [URL]? {
         let panel = NSOpenPanel()
@@ -161,8 +112,7 @@ enum ChatComposerSupport {
         return panel.urls
     }
 
-    /// Validate synchronously, then read off the main actor. Keep the captured
-    /// destination across suspension; each surface retains its availability rule.
+    /// Capture the destination before metadata reads and conversion suspend.
     @MainActor
     static func attachLocalFile(
         _ url: URL,
@@ -172,14 +122,16 @@ enum ChatComposerSupport {
         canAttach: @escaping @MainActor () -> Bool = { true },
         showToast: @escaping @MainActor (String) -> Void
     ) {
-        let kind: (type: String, mime: String)
-        switch attachmentKind(url, resolveType: resolveType) {
-        case .success(let resolved): kind = resolved
-        case .failure(let refusal): showToast(refusal.message); return
-        }
+        let resolved = resolveType(url.pathExtension.lowercased())
         let destination = sessionId()
         Task {
-            switch await readAttachment(url, kind: kind) {
+            let result = await Task.detached(priority: .userInitiated) {
+                switch attachmentKind(url, resolveType: { _ in resolved }) {
+                case .failure(let refusal): return Result<MultimodalAttachment, AttachmentRefusal>.failure(refusal)
+                case .success(let kind): return await readAttachment(url, kind: kind)
+                }
+            }.value
+            switch result {
             case .failure(let refusal):
                 showToast(refusal.message)
             case .success(let att):
@@ -190,45 +142,6 @@ enum ChatComposerSupport {
         }
     }
 
-    struct AttachmentRefusal: Error { let message: String }
-
-    /// Type and size, decided before any read. Shared with the agent's own
-    /// composer verbs so a file she attaches meets the same rules.
-    static func attachmentKind(
-        _ url: URL, resolveType: (String) -> (type: String, mime: String)?
-    ) -> Result<(type: String, mime: String), AttachmentRefusal> {
-        let ext = url.pathExtension.lowercased()
-        guard let attachmentInfo = resolveType(ext) else {
-            return .failure(.init(message: "Unsupported file type: \(ext.isEmpty ? "(no extension)" : ext)"))
-        }
-        if let attrs = try? url.resourceValues(forKeys: [.fileSizeKey]),
-           let size = attrs.fileSize, size > attachmentByteLimit {
-            return .failure(.init(message: "File too large (limit: 10 MB): \(url.lastPathComponent)"))
-        }
-        return .success(attachmentInfo)
-    }
-
-    /// The bounded read, off the main actor.
-    static func readAttachment(
-        _ url: URL, kind: (type: String, mime: String)
-    ) async -> Result<MultimodalAttachment, AttachmentRefusal> {
-        let data = await Task.detached(priority: .utility) { () -> Data? in
-            try? readAttachmentFile(url)
-        }.value
-        guard let data else {
-            return .failure(.init(message: "Couldn't read file: \(url.lastPathComponent)"))
-        }
-        guard data.count <= attachmentByteLimit else {
-            return .failure(.init(message: "File too large (limit: 10 MB): \(url.lastPathComponent)"))
-        }
-        return .success(MultimodalAttachment(
-            type: kind.type,
-            base64: data.base64EncodedString(),
-            mime: kind.mime,
-            name: url.lastPathComponent,
-            byteSize: data.count
-        ))
-    }
 }
 
 enum ChatClipboard {

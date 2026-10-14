@@ -1,46 +1,20 @@
+import EngineRuntime
+import Transcripts
 import ChatOrchestration
 import Foundation
 import SwiftUI
+import MultimodalTTS
 
-/// The state transition behind the Voice Auto-Read setting. Keeping the
-/// decision separate from the speaker prevents SwiftUI re-renders from
-/// changing what "new reply" means and makes every refusal inspectable.
-enum ChatVoiceAutoReadGate {
-    enum Decision: Equatable {
-        case speak(messageID: String, text: String)
-        case disabled
-        case unprimedSession
-        case noMessage
-        case messageFromAnotherSession
-        case notAssistant
-        case emptyReply
-        case alreadyRead
+extension VoiceOutputController {
+    static func forChat() -> VoiceOutputController {
+        VoiceOutputController(
+            failureMessage: { UserFacingError.message($0, action: $1) },
+            failureCause: { UserFacingError.cause($0, action: $1) }
+        )
     }
 
-    static func decide(
-        enabled: Bool,
-        sessionID: String,
-        isSessionPrimed: Bool,
-        lastMessage: ChatMessage?,
-        lastReadMessageID: String?
-    ) -> Decision {
-        guard enabled else { return .disabled }
-        guard isSessionPrimed else { return .unprimedSession }
-        guard let lastMessage else { return .noMessage }
-
-        let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanSessionID.isEmpty else { return .messageFromAnotherSession }
-        if let messageSessionID = lastMessage.sessionId {
-            guard messageSessionID.trimmingCharacters(in: .whitespacesAndNewlines) == cleanSessionID else {
-                return .messageFromAnotherSession
-            }
-        }
-        guard lastMessage.role == "assistant" else { return .notAssistant }
-        let text = lastMessage.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return .emptyReply }
-        guard lastMessage.id != lastReadMessageID else { return .alreadyRead }
-        return .speak(messageID: lastMessage.id, text: text)
-    }
+    // Manual message playback is globally singular; auto-read has its mounted owner.
+    static let sharedMessagePlayback = forChat()
 }
 
 extension ChatView {
@@ -93,11 +67,11 @@ extension ChatView {
 
     func speakLatestAssistantIfReady() {
         let sessionID = appModel.activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let decision = ChatVoiceAutoReadGate.decide(
+        let decision = VoiceOutputModeSelection.autoReadDecision(
             enabled: voiceAutoRead,
             sessionID: sessionID,
             isSessionPrimed: autoReadPrimedSessionIds.contains(sessionID),
-            lastMessage: appModel.chatMessages.last,
+            lastMessage: appModel.chatMessages.last.map { ($0.id, $0.sessionId, $0.role, $0.content) },
             lastReadMessageID: lastAutoReadMessageIds[sessionID]
         )
         guard case .speak(let messageID, let text) = decision else { return }
@@ -107,7 +81,8 @@ extension ChatView {
         Task {
             await voiceOutput.speak(
                 text: text,
-                trust: appModel.engine.trust
+                policy: appModel.engine.trust.policy,
+                loadPolicy: { try await appModel.engine.trust.load() }
             )
         }
     }
@@ -115,22 +90,23 @@ extension ChatView {
     // PATCH-2026-06-06: chat-upgrades — dump current session messages as
     // Markdown into ~/Downloads/NativeAgent-chat-<sid>-<ts>.md
     func exportCurrentChatToDownloads() {
-        do {
-            _ = try ChatExportService.export(
-                session: activeSession,
-                sessionId: appModel.activeChatSessionId,
-                messages: appModel.chatMessages
-            )
-            appModel.systemToasts.push(success: "Chat exported to Downloads")
-        } catch let error as ChatExportError {
-            switch error {
-            case .noActiveSession, .noMessages:
-                showToast(error.localizedDescription)
-            case .downloadsUnavailable:
-                appModel.systemToasts.push(error: error.localizedDescription)
+        let session = activeSession
+        let sessionId = appModel.activeChatSessionId
+        let messages = appModel.chatMessages
+        Task {
+            do {
+                _ = try await ChatExportService.export(session: session, sessionId: sessionId, messages: messages)
+                appModel.systemToasts.push(success: "Chat exported to Downloads")
+            } catch let error as ChatExportError {
+                switch error {
+                case .noActiveSession, .noMessages:
+                    showToast(error.localizedDescription)
+                case .downloadsUnavailable:
+                    appModel.systemToasts.push(error: error.localizedDescription)
+                }
+            } catch {
+                appModel.systemToasts.push(error: UserFacingError.message(error, action: "export the chat"))
             }
-        } catch {
-            appModel.systemToasts.push(error: UserFacingError.message(error, action: "export the chat"))
         }
     }
 }
@@ -153,7 +129,8 @@ extension ChatTurnCardInset {
         MacChatTurnCardProjection.isVisible(
             appModel.engine.turns.lifecycle(for: appModel.activeChatSessionId),
             sessionId: appModel.activeChatSessionId,
-            approvals: appModel.engine.approvals.records
+            approvals: appModel.engine.approvals.records,
+            parseTimestamp: UserDisplayFormatters.parseFoundationISOTimestamp
         )
     }
 }

@@ -8,7 +8,6 @@ struct CodexImageReference: Sendable, Equatable {
     var data: Data
     var mimeType: String
     var sha256: String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
-    var dataURL: String { "data:\(mimeType);base64,\(data.base64EncodedString())" }
 
     static let maximumBytes = 8 * 1024 * 1024
     static let maximumTotalBytes = 20 * 1024 * 1024

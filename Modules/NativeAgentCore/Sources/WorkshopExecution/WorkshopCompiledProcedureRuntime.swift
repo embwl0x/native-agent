@@ -111,10 +111,8 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
         self.deskHandle = existingDesk
         self.store = store ?? ProcedureArtifactStore(dataRoot: dataRoot)
         self.runner = SwiftNativeWorkshopRunner(
-            executorAvailable: true,
             root: dataRoot,
             planner: planner,
-            enableAutonomy: true,
             uuid: { executionID }
         )
     }
@@ -216,7 +214,6 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
             }
         )
         let context = ProcedureDryRunContext(
-            invocationMode: .manual,
             taskFamily: planner.contract.taskFamily,
             inputClass: planner.contract.inputClass,
             parameterSchemaIdentity: planner.contract.parameterSchemaIdentity,

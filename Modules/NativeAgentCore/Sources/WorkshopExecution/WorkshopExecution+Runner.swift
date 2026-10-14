@@ -9,59 +9,26 @@ import TrustCenter
 
 // MARK: - SwiftNative impl
 
-public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
+public actor SwiftNativeWorkshopRunner {
     private let root: URL
     private let persistence: any PersistenceCoreProtocol
     private let planner: any WorkshopPlannerLLM
-    private let enableAutonomy: Bool
-    private let executorAvailable: Bool
-    private let workshopExecutionSlotsCapOverride: Int?
     private let now: @Sendable () -> Date
     private let uuid: @Sendable () -> String
     private static let logger = Logger(subsystem: "com.nativeagent.workshop", category: "runner")
 
-    /// `executorAvailable` is declared FIRST so test call sites can opt in
-    /// uniformly regardless of which other params they pass. Default TRUE
-    /// since the executor port landed (2026-06-10,
-    /// docs/build_plans/missions-executor-port.md): WorkshopExecutorLoop
-    /// (WorkshopExecution+Executor.swift) drains queued executions, so submit() is
-    /// honest again. Pass `false` explicitly to restore the honest-refusal
-    /// gate (e.g. an embedding that registers no executor loop).
     public init(
-        executorAvailable: Bool = true,
         root: URL = PersistenceCore.defaultDataRoot(),
         persistence: (any PersistenceCoreProtocol)? = nil,
         planner: (any WorkshopPlannerLLM)? = nil,
-        enableAutonomy: Bool = true,
-        workshopExecutionSlotsCapOverride: Int? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
         uuid: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() }
     ) {
         self.root = root
         self.persistence = persistence ?? SwiftNativePersistenceCore()
         self.planner = planner ?? StubWorkshopPlannerLLM()
-        self.enableAutonomy = enableAutonomy
-        self.executorAvailable = executorAvailable
-        self.workshopExecutionSlotsCapOverride = workshopExecutionSlotsCapOverride
         self.now = now
         self.uuid = uuid
-    }
-
-    /// Test-only seam: returns the runtime planner's type name so factory-level
-    /// tests can assert that the PRODUCTION factory path wires the real
-/// `SwiftNativeWorkshopPlannerLLM` and NOT the `StubWorkshopPlannerLLM`
-    /// default. Without this seam, the planner field is private and the only
-    /// observable difference at the factory level (in a test, with no provider
-    /// credentials) is the failure reason string — too brittle to test on.
-    /// See BLOCKING #1 of the wave-24-amendment.
-    public nonisolated var _testPlannerTypeName: String {
-        return String(describing: type(of: planner))
-    }
-
-    /// Confirms factory root threading reaches the planner's RunLedger owner,
-    /// not only the runner's execution directory.
-    public nonisolated var _testPlannerRunLedgerDataRoot: URL? {
-        (planner as? SwiftNativeWorkshopPlannerLLM)?._testRunLedgerDataRoot
     }
 
     public nonisolated var executionRecordsRoot: URL {
@@ -118,13 +85,6 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     //       Activity view shows execution events.
     // Execution state stays under the same data root. Saved authority is read
     // by TrustCenter's checked owner so corrupt policy cannot bootstrap work.
-
-    /// `Runtime.trust_path`: `<root>/trust/policy.json`.
-    nonisolated var trustPolicyPath: URL {
-        root
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-    }
 
     /// `Runtime.activity_path`:
     /// `<root>/activity/events.jsonl`.
@@ -222,27 +182,18 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // spellings are the public 0.3.x contract and still win when both are
         // set, so a launch agent that pins the old name is never silently
         // overridden. Reading one logs a single deprecation line.
-        let active = max(1, Int(
-            ExecutionEnvVocabulary.value(canonical: "NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS") ?? ""
-        ) ?? 3)
+        let active = WorkshopExecutorLoop.defaultMaxActive()
         let pending = max(0, Int(
             ExecutionEnvVocabulary.value(canonical: "NATIVE_AGENT_MAX_PENDING_EXECUTIONS") ?? ""
         ) ?? 32)
         return active + pending
     }
 
-    private func effectiveWorkshopExecutionSlotsCap() -> Int {
-        if let workshopExecutionSlotsCapOverride {
-            return max(1, workshopExecutionSlotsCapOverride)
-        }
-        return Self.workshopExecutionSlotsCap()
-    }
-
     /// Refuse if the queue is at capacity. Mirrors the
     /// `if not self._mission_slots.acquire(blocking=False): raise MissionsBusyError()`
     /// guard at the TOP of submit().
     private func assertSlotAvailable() async throws {
-        let cap = effectiveWorkshopExecutionSlotsCap()
+        let cap = Self.workshopExecutionSlotsCap()
         let active = Self.activeRecords(try await scanAllQueueWorkshopExecutionsChecked().map(\.record))
         if let corrupt = active.first(where: { $0.status == "corrupt" }) {
             throw WorkshopExecutionError.persistenceFailure(String(describing: corrupt.result))
@@ -346,27 +297,10 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
     // MARK: planWorkshopExecution
 
-    public func planWorkshopExecution(spec: WorkshopExecutionSpec) async throws -> WorkshopExecutionPlan {
-        try Task.checkCancellation()
-        let (plan, _) = try await _planWorkshopExecutionWithReason(spec: spec)
-        return plan
-    }
-
-    /// Same as planWorkshopExecution, but also returns the failure reason (or nil)
-    /// when the LLM path falls back to the deterministic stub for any reason
-    /// OTHER than the clean autonomy-disabled / autonomy-not-applicable case.
-    /// submit() uses this to emit the Python `planner_fallback` timeline
-    /// event before `enqueued`.
-    func _planWorkshopExecutionWithReason(spec: WorkshopExecutionSpec) async throws -> (WorkshopExecutionPlan, String?) {
+    /// Return steps and any planner failure for the `planner_fallback` receipt.
+    private func _planWorkshopExecutionWithReason(spec: WorkshopExecutionSpec) async throws -> ([WorkshopExecutionStep], String?) {
         try Task.checkCancellation()
         let stub = Self.stubFallback(spec: spec)
-
-        // Autonomy gate — the retired daemon. Not a "failure";
-        // no planner_fallback event is emitted here (Python only emits the
-        // event on the codex exception path).
-        if !enableAutonomy {
-            return (WorkshopExecutionPlan(steps: stub, fromStub: true), nil)
-        }
 
         // Build tools_summary. Always include chat.synthesize.
         let connectorActions = await planner.availableConnectorActions()
@@ -459,7 +393,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            return (WorkshopExecutionPlan(steps: stub, fromStub: true), String(describing: error))
+            return (stub, String(describing: error))
         }
         try Task.checkCancellation()
 
@@ -470,14 +404,14 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         do {
             let steps = try Self.parsePlanJSON(raw, validTools: Set(availableTools.map(\.id)), schemas: schemas)
             if steps.isEmpty {
-                return (WorkshopExecutionPlan(steps: stub, fromStub: true), "codex returned 0 valid steps")
+                return (stub, "codex returned 0 valid steps")
             }
-            return (WorkshopExecutionPlan(steps: steps, fromStub: false), nil)
+            return (steps, nil)
         } catch let error as WorkshopExecutionError {
             if case .invalidRequest = error { throw error }
-            return (WorkshopExecutionPlan(steps: stub, fromStub: true), String(describing: error))
+            return (stub, String(describing: error))
         } catch {
-            return (WorkshopExecutionPlan(steps: stub, fromStub: true), String(describing: error))
+            return (stub, String(describing: error))
         }
     }
 
@@ -485,22 +419,6 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
     public func submit(spec: WorkshopExecutionSpec) async throws -> WorkshopExecutionEnqueueResult {
         try Task.checkCancellation()
-
-        // EXECUTOR GATE (2026-06-10, overnight-audit Tier-1 disposition;
-        // default flipped to TRUE the same day when the executor port
-        // landed): WorkshopExecutorLoop (WorkshopExecution+Executor.swift, registered
-        // via BackgroundLoopsAssembly) now transitions queued→running, so a
-        // default-constructed runner accepts submits. The gate stays for
-        // callers that explicitly construct with `executorAvailable: false`
-        // (no executor loop registered) — accepting a submit there would
-        // queue an execution that can never run while burning a planner LLM
-        // call, the "fabricated success" shape the audit closed everywhere
-        // else.
-        guard executorAvailable else {
-            throw WorkshopExecutionError.executorUnavailable(
-                "Workshop executor unavailable; submission is disabled"
-            )
-        }
 
         // WAVE 41 W01 (a) missionPolicy gate — FIRST, matching the daemon's
         // POST /v1/missions route ORDER: the route checks `_missions_allowed()`
@@ -561,9 +479,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
                 expectedOutputs: spec.expectedOutputs
             )
         )
-        let exactPlanningProviderCallCount: Int? = enableAutonomy
-            ? planner.directProviderCallCountPerInvocation
-            : 0
+        let exactPlanningProviderCallCount = planner.directProviderCallCountPerInvocation
 
         // Check cancellation AFTER planning, BEFORE file IO. Without this gate
         // a cancel that lands between the planner returning and the directory
@@ -642,7 +558,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             objective: objectiveTrunc,
             createdAt: nowStr,
             status: "queued",
-            plan: plan.steps,
+            plan: plan,
             stepsCompleted: [],
             receiptsDir: receipts.path,
             triggerSource: spec.triggerSource,
@@ -771,23 +687,6 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // pass (BackgroundLoops-registered, gated on enableAutonomy +
         // missionPolicy) claims and runs it.
         return WorkshopExecutionEnqueueResult(status: "queued", executionId: id, record: record)
-    }
-
-    // MARK: start
-
-    public func start(executionId: String) async throws -> WorkshopExecutionStartResult {
-        let trimmed = executionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            throw WorkshopExecutionError.invalidRequest("empty missionId")
-        }
-        // Execution lives on WorkshopExecutorLoop (WorkshopExecution+Executor.swift),
-        // which carries the injected LLM/tool/approval closures this runner
-        // deliberately doesn't hold (module stays dependency-clean). Callers
-        // that want an explicit start should call
-        // WorkshopExecutorLoop.start(missionId:); the background loop drains
-        // queued executions on its own. This protocol stub keeps surfacing a
-        // typed error rather than silently no-op (W6).
-        throw WorkshopExecutionError.unavailable
     }
 
     // MARK: cancel (WAVE 33 W07 — execution-lifecycle WRITE)
@@ -985,9 +884,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             }
             if let r = patch.result {
                 // Python: `str(body.get("summary") or body.get("result") or qm.result or "")`.
-                // The body contribution (`r`) already had `summary or result`
-                // resolved with retired truthiness in fromBody. Here we apply the
-                // remaining `... or qm.result or ""` falsy-fallback chain:
+                // Preserve the existing result when the patch is empty:
                 //   - non-empty body result  → use it verbatim.
                 //   - empty body result + TRUTHY existing result → KEEP existing
                 //     (gpt-5.5 finding #2: do NOT clobber an existing
@@ -1177,9 +1074,17 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
     /// Only an absent execution root is empty; failed reads cannot prove inactivity.
     private func scanAllQueueWorkshopExecutionsChecked() async throws -> [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
+        try await Self.readQueueRecords(dataRoot: root, persistence: persistence).compactMap { id, raw in
+            guard case .object(let obj) = raw,
+                  case .string(let gotId)? = obj["id"], gotId == id else { return nil }
+            return (Self.recordFromJSON(obj), obj)
+        }
+    }
+
+    static func readQueueRecords(dataRoot: URL, persistence: any PersistenceCoreProtocol) async throws -> [(id: String, raw: JSONValue)] {
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: dataRoot)
         let fm = FileManager.default
-        let queueRoot = executionRecordsRoot
+        let queueRoot = dataRoot.appendingPathComponent("workshop/executions", isDirectory: true)
         let entries: [URL]
         do {
             entries = try fm.contentsOfDirectory(
@@ -1188,17 +1093,13 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         } catch CocoaError.fileReadNoSuchFile {
             return []
         }
-        var out: [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] = []
+        var out: [(id: String, raw: JSONValue)] = []
         for sub in entries {
             let isDir = try sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false
             guard isDir else { continue }
             let mp = ExecutionRecordFile.resolve(in: sub, fileManager: fm)
             let raw = await Self.readQueueRecord(mp, id: sub.lastPathComponent, persistence: persistence)
-            guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == sub.lastPathComponent else {
-                continue
-            }
-            out.append((Self.recordFromJSON(obj), obj))
+            out.append((sub.lastPathComponent, raw))
         }
         return out
     }
@@ -1231,23 +1132,6 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// by created_at DESC.
     public func listAll() async -> [WorkshopExecutionRecord] {
         await scanAllQueueWorkshopExecutions().sorted { $0.record.createdAt > $1.record.createdAt }.map(\.record)
-    }
-
-    /// `TaskQueue.list_active`: queued / running /
-    /// blocked_on_approval. Python does NOT re-sort list_active (returns
-    /// _scan_all order); we preserve _scan_all (directory) order to match —
-    /// the `active=true` query branch of GET /v1/missions.
-    public func listActive() async -> [WorkshopExecutionRecord] {
-        Self.activeRecords(await scanAllQueueWorkshopExecutions().map(\.record))
-    }
-
-    /// `TaskQueue.list_history`: terminal executions,
-    /// sorted by updated_at DESC, capped at 20 — the `active=false` query
-    /// branch of GET /v1/missions.
-    public func listHistory() async -> [WorkshopExecutionRecord] {
-        let records = await scanAllQueueWorkshopExecutions().map(\.record)
-        if records.contains(where: { $0.status == "unavailable" }) { return records }
-        return Self.recentRecords(records)
     }
 
     /// One observed set for the status tool's active/recent sections. Each
@@ -1583,9 +1467,5 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// Same shape as MCPDispatcher.isoTimestamp and TriggerScheduler.isoTimestamp.
     public static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
-    }
-
-    public nonisolated static func defaultDataRoot() -> URL {
-        PersistenceCore.defaultDataRoot()
     }
 }

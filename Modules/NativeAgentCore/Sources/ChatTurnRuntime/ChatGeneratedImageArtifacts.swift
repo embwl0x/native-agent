@@ -68,24 +68,6 @@ public enum ChatGeneratedImageArtifacts {
         return out
     }
 
-    public static func imageDataAttachment(
-        from attachment: MultimodalAttachment
-    ) -> MultimodalAttachment? {
-        guard attachment.type.lowercased() == "image" else { return nil }
-        guard let path = attachment.path, !path.isEmpty else { return nil }
-        let url = URL(fileURLWithPath: path)
-        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
-        return MultimodalAttachment(
-            id: attachment.id,
-            type: attachment.type,
-            base64: data.base64EncodedString(),
-            mime: attachment.mime,
-            name: attachment.name,
-            byteSize: data.count,
-            path: attachment.path
-        )
-    }
-
     private static func imageMimeType(for url: URL) -> String? {
         switch url.pathExtension.lowercased() {
         case "jpg", "jpeg": return "image/jpeg"

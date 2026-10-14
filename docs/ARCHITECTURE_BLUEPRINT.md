@@ -19,17 +19,29 @@ engine through their adapters.
 | Location | Responsibility |
 |---|---|
 | `Sources/NativeAgentApp/` | SwiftUI app, Mac platform adapters and live engine assembly |
-| `Sources/NativeAgentSenseHost/` | Isolated JavaScriptCore sense plug and Swift plug-program launcher; app supplies source/material and owns supervision |
+| `Sources/NativeAgentSenseHost/` | Shared isolated JavaScriptCore executor for senses, tools, skills and ad hoc scripts; app supplies source/material and owns supervision |
 | `Modules/NativeAgentCore/Sources/` | Engine, turn execution, domain stores, tools and policy |
-| `Modules/NativeAgentCore/Sources/NativeAgentCore/AgentBridgeCompletionRoute.swift` | Shared completion route, surface classification and redelivery eligibility for the router and checkpoints |
+| `Modules/NativeAgentCore/Sources/NativeAgentCore/AgentBridgeCompletionRoute.swift` | Shared completion route and requester identity; lifecycle decision projection for recovery, journal retention and reporting; exact answer admission makes let_go terminal for lifecycle and direct route-journal sends |
 | `Modules/NativeAgentShared/Sources/NativeAgentShared/` | Shared Mac/iPhone declarations |
 | `iOS/NativeAgentMobile/Sources/` | iPhone UI and sync adapters |
+
+Native reply entries use `TurnQuietHoursWindow` before dispatching a send. A
+resident answer waits in its saved completion and pre-send route journal;
+deferral writes nothing. Delegation's exact quiet-hours end deadline runs the
+existing saved-delivery reconcile. `LiveNotificationInbox` retains notification
+intent, including Mac metadata and sound, for `AttentionRouter.releaseHeld`.
+The router's defer decision also owns scheduled banners, posting them before
+push transport so either channel can fail independently. Held Mac dispatch is
+claimed on its inbox row; an unconfirmed attempt is never automatically replayed.
+iOS asking-chat publication follows its native send verdict, before completion
+settlement. An explicit Telegram resend clears its saved refusal once, even
+when quiet hours delay the wire. Work and wakes continue.
 
 ### Sense Helper Boundary
 
 | File | Responsibility |
 |---|---|
-| `Sources/NativeAgentSenseHost/main.swift` | JSON-line entry loop, bundled SDK loading, `/usr/bin/swift` launch with private compiler scratch |
+| `Sources/NativeAgentSenseHost/main.swift` | JSON-line entry loop and bundled SDK loading for the shared JavaScript executor |
 | `Sources/NativeAgentSenseHost/PlugIO.swift` | Bounded JSON-line transport and active-reply stall window |
 | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Persistent per-sense context, synchronous sense API, shared Swift fragment-redaction binding, page/news checks, JSC execution watchdog |
 | `Modules/NativeAgentCore/Sources/Senses/SenseHostLocator.swift` | Installed helper address |
@@ -62,18 +74,65 @@ context and state. Their file maps below identify the owning declarations.
 off. `page`, `item`, `find` and `action` reach the app's pages, saved places,
 settings and actions. `AppToolExecutor+AppDoor` owns that interface;
 `AppActionRegistry` defines `AppAction` and the `AppActions` registry.
-At executor assembly it supplies `AppActionPolicy` flags and argument-dependent
-read conditions to TrustCenter; discovery and receipts use the same classification.
+At executor assembly it supplies `AppActionPolicy` flags, lifecycle action classes
+and argument-dependent read conditions to TrustCenter; discovery and receipts
+use the same classification. Declared lifecycle writes refuse peer steering before
+dispatch; legacy routes resolve from each action's declared tool and fixed input.
+`AbilityStore` owns `data/abilities/`: current, previous and proposed files plus
+run accounting in `state.json`. Its mutations use the engine's task-local
+origin/taint reader through `CapabilityLifecycle`. Only known peers
+whose existing elevation switch is off refuse; unbound launch, owner and helper
+turns remain allowed. `CapabilityLifecycle.Store` declares ability directories
+for their owners and the shared raw-file mutation fence; raw mutations require
+lifecycle actions, including case aliases. `AgentBridgePrincipal.turnRequest` supplies the common
+principal binding for peer chat, named message lanes and raw bridge tools through `TurnRequest.bind`.
+Carried work retains every steering principal, including currently trusted peers;
+ability writes read the current elevation switch after resume.
+Usage accounting and material reads remain allowed; growth writes use the same refusal. Owner-attributed off state
+survives agent/peer restore, enable, rollback and publication; only explicit owner
+command paths may clear it.
 Receipts report execution separately: preview, not_run, executed or attempted.
 the peer floor, SecurityCenter and receipt redaction read that projection.
 Unregistered non-folded actions require approval. Folded actions keep approval on
 their underlying call. Domain capabilities and saved legacy Trust keys remain
 TrustCenter policy.
 `AgentWorkspace` supplies home's navigation and retained places.
+Home labels its snapshot time and each section's source coverage; the turn glance
+and inner capsule label their snapshot time and omitted live-state coverage.
 
-`app {script}` runs JavaScriptCore through `AppScriptRunner`. Its generated
-`app.*` and `app.call(id, args)` calls re-enter the app dispatch path; scripts have no direct filesystem,
-network or process API. Script limits and refusal handling live in that owner.
+`AppScriptRunner` adapts the app door to the shared `OwnedProgramRunner`.
+`AppActions` owns dependency contract projection and frozen legacy pin identities;
+argument/result schemas and revision are pinned independently of discovery prose.
+Admitted authored tools are scriptable actions, including routine dependencies;
+their calls retain ordinary skill checks and capture validation substitutes fixtures.
+Their pinned action contract supplies the routine's read-before-act knowledge;
+execution does not require a diagnostics-page version. Skill run accepts input
+and its legacy args spelling; capture input errors report an argument remedy.
+Script and authored-tool app calls re-enter the turn's ordinary dispatch chain;
+tool permissions constrain `host.files`, `host.network` and `host.apps.call`
+primitives. App primitive writes use local system-control authority; an ask files
+the canonical inbox card, whose verified replay runs only that version's blocked
+app primitive, preserving earlier effects. MacControl's `SystemAppleScriptAdapter` is the single in-process OSA
+execution owner for authored app calls and the built-in `MacAppleScriptBridge`:
+URL-bound process resolution, Automation preflight, native send/active callbacks,
+per-event system reply timeouts, cancellation and error mapping live there;
+timeouts check the existing Accessibility reader for a sheet/dialog before
+claiming one blocked the app. Authored bodies disable
+scripting additions and refuse resource imports, script objects and self/app
+target syntax. The runner wraps each body in the declared bundle id's app tell,
+refuses early closure and maps error locations to body lines; every send must
+address the resolved app's exact PID. Built-in
+integration scripts retain their trusted Foundation/OSAX environment. An app's
+response to its own events remains that app's broad reach, including opening
+other apps. ToolExecution depends on MacControl; Senses receives a read closure
+from app assembly that first re-enters the ordinary Trust gate at read tier,
+avoiding a reverse dependency. Only an owner card tap may request macOS consent.
+Candidate validation intercepts all host calls before dispatch or primitive IO.
+Resume compares journaled content digests: result owners declare volatile
+envelopes through the runner's call-scoped `ReadContent`, retaining subject
+identity as a dependency. The journal never guesses volatility from key names.
+The same normalization compares replay arguments using saved and fresh read
+projections; call identity, source line and meaningful arguments still match.
 
 Native executors in `ChatToolRuntime` and `AppToolRuntime` sit behind the app
 interface. Their implementation names are not additional model tools.
@@ -100,7 +159,7 @@ before Xcode embeds it; development and release signing seal it.
 `TrustCenter` and `SecurityCenter` retain effect-time authority. Full Mac uses
 the operator's selected autonomy; macOS privacy-permission resets still require
 explicit approval. `PeerTurnEffectPolicy` retains owner approval for
-peer-steered deletes/irreversible acts, sends in the owner's name, persona
+peer-steered app primitive writes, deletes/irreversible acts, sends in the owner's name, persona
 writes and the protected app approval actions. `ApprovalTransactions` owns the
 corresponding approval execution paths. Authenticated turns from agents enabled
 in Trust → Connected agents carry User's authority and skip extra peer approvals;
@@ -118,8 +177,9 @@ restating their storage formats.
 ## Background Loops
 
 `BackgroundLoops/BackgroundLoopsManager` owns registration, execution and
-status. The app's `BackgroundLoopsAssembly` files construct the concrete loop
-registrations and dependencies.
+status. Core `EngineLaunch` constructs the concrete loop registrations and
+dependencies through installed native host effects. Each failure outcome refreshes one keyed Desk
+finding; receipts and execution backoff remain with the scheduler.
 
 ## Source Map Convention
 
@@ -143,88 +203,41 @@ this grant, and `script/verify_release_artifact.sh` checks the signed entitlemen
 | File | Owns |
 |---|---|
 | `AdvancedPageComponents.swift` | `AdvancedEyebrow` struct |
-| `AgentDisplayName.swift` | `canonicalAgentDisplayName` |
-| `AppAttentionDelivery.swift` | `AttentionRouter`: extension |
-| `AppApprovalTransactionEffects.swift` | `AppApprovalTransactionEffects` struct; `ApprovalTransactionCoordinator.app`, external-send production bindings |
-| `AppConnectorPlatform.swift` | `TrustCenterMacControlPolicyProvider` (with `run`), `AppConnectorStatusPlatform`, `AppConnectorActionPlatform` structs |
-| `AppDoctorPort.swift` | `AppDoctorPort` struct (Doctor's `DoctorActionPort`): `runDoctor`, `liveDoctorCoverageChecks`, `doctorLiveRepair`, `getHealthCard`, `wakeDoctorForPendingTransitions` |
-| `AppDoctorPort+Cognition.swift` | `AppDoctorPort`: `doctorCognitionChecks`, `doctorCognitionRepair` |
+| `AppApprovalTransactionEffects.swift` | `AppApprovalTransactionEffects` struct and `ApprovalTransactionCoordinator.app`: app-bound approval factory and live executor/platform bindings; external-send production composition lives in EngineRuntime; `AppApprovalTransactionEffects` struct; `ApprovalTransactionCoordinator.app`, external-send production bindings |
+| `AppConnectorPlatform.swift` | live voice, notification, Mac control and device-sync bindings over core connector/integration policy and status owners; remaining composition belongs to Area 1; notification, EventKit and connector platform bindings over core policy/status owners |
 | `AppDelegate+BackgroundTasks.swift` | `AppDelegate`: `registerBackgroundTaskHandlers` |
-| `AppDelegate+ICloudRuntimeForwarding.swift` | `AppDelegate`: `forwardToSwiftRuntime` |
 | `AppDelegate+Launch.swift` | `AppDelegate`: `applicationDidFinishLaunching`, `applicationShouldTerminateAfterLastWindowClosed`, `application` |
 | `AppDelegate+ProcessLifecycle.swift` | `AppDelegate`: `claimSingleAppInstance`, `presentSingleInstanceWedgedAlert`, `presentPublicReleaseDataRootError` |
-| `AppDeviceSyncHost+Connectors.swift` | `AppDeviceSyncHost`: `mobileConnectors`, `setConnectorEnabled`, `disconnectConnector` |
-| `AppDeviceSyncHost+Helpers.swift` | `AppDeviceSyncHost`: `helpersSnapshot`, `helperAction`, `agentThreadAction` |
-| `AppDeviceSyncHost+Providers.swift` | `AppDeviceSyncHost`: `startProviderSignIn`, `providerSignInStates` |
-| `AppDeviceSyncHost+Telegram.swift` | `AppDeviceSyncHost`: `telegramSnapshot`, `changeTelegram` |
-| `AppDeviceSyncHost+Trust.swift` | `AppDeviceSyncHost`: `applyMobileTrustAction` |
-| `AppDeviceSyncHost.swift` | `AppDeviceSyncHost` struct; `retryRequestedResults`, `getWorkshopExecutions` |
-| `AppGitHubOAuthCredentials.swift` | `AppGitHubOAuthCredentials` struct; `saveToken`, `saveOAuthToken` |
-| `AppGrokBotConnectionPort.swift` | `AppGrokBotConnectionPort` struct; `ensureRunning`, `send` |
-| `AppMacSyncRemoteMacControlPort.swift` | `AppMacSyncRemoteMacControlPort` struct; `loadTrustPolicy`, `run` |
-| `AppModel+BaseURLSettings.swift` | `AppModel`: `saveSearXNGBaseURL`, `applyRefreshedSearXNGBaseURL` |
 | `AppModel+ChatActions.swift` | `AppModel`: `compactActiveChat`, `clearActiveChatMessages`, `regenerateAssistantMessage`; `NativeChatTurnOptions` struct |
 | `AppModel+ChatSessions.swift` | `AppModel`: `loadChatState`, `refreshForSidebarItem`, `recordPanelRefresh` |
 | `AppModel+ChatState.swift` | `AppModel`: `receiveMacScreenPreview`, `loadDetachedSessionMessages` |
-| `AppModel+FirstRunWelcome.swift` | `AppModel`: `firstRunMessages`, `markFirstRunWelcomePending`, `maybeSendFirstRunGreeting` |
 | `AppModel+GraphCapabilityActions.swift` | `AppModel`: `searchGraph`, `refreshGraph`, `runResearchLab` |
-| `AppModel+HealthEmbeddings.swift` | `AppModel`: `fetchEmbeddingsStatus`, `toggleEmbeddingsBackend`, `setEmbeddingsMemoryMode` |
-| `AppModel+MacChatSessionPort.swift` | `AppModel`: `noteChatSessionUserChoice`, `hasCachedChatTranscript`, `containsChatSession` |
+| `AppModel+HealthEmbeddings.swift` | `AppModel`: `embeddingsStatus`, `toggleEmbeddingsBackend`, `setEmbeddingsMemoryMode` |
 | `AppModel+MacChatTurnPort.swift` | `AppModel`: `resumeMacChatTurn` reconnects checkpoint progress to the existing stream adapter and lifecycle; `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
 | `AppModel+MemoryActions.swift` | `AppModel`: `pinMemory`, `deleteMemory`, `consolidateMemory`, `runMemoryConsolidation`, `memoryHygieneReport` |
-| `AppModel+NextGen.swift` | `AppModel`: `nextGenActionResponse`, `isNextGenActionBacked` (the Capabilities NextGen probes and their receipts) |
 | `AppModel+PersonalitySelfImprovement.swift` | `AppModel`: `savePersonality`, `savePersonalityChecked`, `savePersonalityName` |
-| `AppModel+ProviderReadiness.swift` | `AppModel`: `missingProviderChatGuidance`, `hasAnyUsableProvider` |
-| `AppModel+ProvidersAuth.swift` | `AppModel`: `refreshToolsFromToolbar`, `refreshModelCatalog` |
 | `AppModel+Refresh.swift` | `AppModel`: `setIfChanged`, `refreshAll` |
 | `AppModel+RoutingWorkflowMCP.swift` | `AppModel`: `search`, `routeIntent` |
-| `AppModel+SkillsIntegrations.swift` | `AppModel`: `deleteSkill`, `loadSkillManifests`, `installReviewedSkill` |
-| `AppModel+Telegram.swift` | `AppModel`: `configureTelegram`, `discoverTelegramSenders`, `sendTelegramTestReply`, `clearTelegramDiagnostics`; `TelegramConfigurationError` enum |
-| `AppModel+ViewClientOps.swift` | `AppModel`: `resolveApproval`, `readConfig`, `getSessionContext`, onboarding, Mac control, provider writes |
-| `AppModel+WidgetStatus.swift` | `AppModel`: `publishWorkStatus` |
-| `AppModel+WorkshopPolicy.swift` | `AppModel`: `refreshSchedulerJobs`, `setSchedulerJobEnabled`, `createDreamJob` |
+| `AppModel+SkillsIntegrations.swift` | `AppModel`: `deleteSkill`, `loadSkillManifests`, `installReviewedSkill`; exact candidate code/fixture review |
 | `AppQuietSettingsHost.swift` | `AppQuietSettingsHost` class; `saveChatBrainDefaultsFailure`, `saveMacControlPolicy` |
 | `AppQuietToolHost+Mind.swift` | `AppQuietToolHost`: `runMind`, `manageSkill` |
 | `AppQuietToolHost.swift` | `AppQuietToolHost`: `inboxFence`, `inbox`, `provider` |
-| `AppQuietToolPresentation.swift` | `page`, `contextReceiptRead`, `agentViewRead` |
-| `AppRelauncher.swift` | `AppRelauncher`: `spawnDetached` |
-| `AppSchedulerExecutionPlatform.swift` | `AppSchedulerExecutionPlatform` struct; `postNotification`, `sendTelegramMessage` |
-| `AppToolHealthHost.swift` | `AppToolHealthHost` enum; `doctorStatus`, `telegramStatus` |
-| `AppToolPlatform.swift` | `AppToolExecutor`: `defaultBrowserActionRunner`, `decideBlockedWorkshopStep`, `macPersonAway` |
-| `AppWorkshopPumpPlatform.swift` | `AppWorkshopPumpPlatform` struct; `isUnderResourcePressure`, `artifactIsReadable` |
-| `AppWorkshopSessionEffects.swift` | `AppWorkshopSessionEffects` struct; `makeToolDispatcher`, `productionTurnExecutor` |
-| `BackgroundLoopsAssembly+Autonomy.swift` | `BackgroundLoopsAssembly`: `trustPolicyPath`, `makeAutonomyPromotionLoop` |
-| `BackgroundLoopsAssembly+ChatSurfaces.swift` | `BackgroundLoopsAssembly`: `makeSlackSocketModeLane`, `makeTelegramPollLoopIfConfigured`, `fileSystemPermissionNotice` |
-| `BackgroundLoopsAssembly+Cognition.swift` | `BackgroundLoopsAssembly`: `makeCognitionMaintenanceLoop`, `makeCognitionReplayLoop`, `makeCognitionReflectionLoop` |
-| `BackgroundLoopsAssembly+Continuation.swift` | `BackgroundLoopsAssembly`: platform bindings for Core's `TurnContinuationRuntime`, `makeDeskContinuationScheduler` |
-| `BackgroundLoopsAssembly+Delegation.swift` | `BackgroundLoopsAssembly`: `makeDelegationOutcomeLoop` |
-| `BackgroundLoopsAssembly+DeskNotify.swift` | `BackgroundLoopsAssembly`: `makeDeskNotifyLoop` |
-| `BackgroundLoopsAssembly+DreamsMemory.swift` | `BackgroundLoopsAssembly`: `stagePendingREMProposalsAtLaunch`, `makeREMProposalStager`, `makeMemoryConsolidationLoop`, `runDream`, `runRem` |
-| `BackgroundLoopsAssembly+GitHubTracking.swift` | `BackgroundLoopsAssembly`: `githubTrackingWatchedPaths`, `makeGitHubTrackingLoop` |
-| `BackgroundLoopsAssembly+Heartbeat.swift` | `BackgroundLoopsAssembly`: `makeHeartbeatLoop`, `repairHeartbeatInboxItem` |
-| `BackgroundLoopsAssembly+Maintenance.swift` | `BackgroundLoopsAssembly`: `makeAutoDoctorLoop`, `makeTurnTraceRetentionLoop`, `makeOffDiskBackupLoop` |
-| `BackgroundLoopsAssembly+TriggerScheduler.swift` | `BackgroundLoopsAssembly`: `makeTriggerSchedulerLoop`, `makeMorningBriefSynthesizer` |
-| `BackgroundLoopsAssembly+UnconfiguredLane.swift` | `BackgroundLoopsAssembly`: `unconfiguredLanePlaceholder` |
-| `BackgroundLoopsAssembly+Workshop.swift` | `BackgroundLoopsAssembly`: `makeWorkshopPump`, `unattendedWorkAllowed`, `isFullMacPolicy` |
-| `BackgroundLoopsAssembly+WorkshopExecution.swift` | `BackgroundLoopsAssembly`: `makeWorkshopExecutor`, `makeWorkshopExecutionRunner`, `isWideOpenTrust`, `workshopExecutorGate` |
+| `AppToolPlatform.swift` | live executor/browser/Doctor bindings over core policy; workshop decisions and away sensing live in core; `AppToolExecutor`: `defaultBrowserActionRunner`, `decideBlockedWorkshopStep`, `macPersonAway` |
 | `BotsEditorSheet.swift` | `BotsEditorSheet` struct |
-| `BotsShelfPresentation.swift` | `DeskMissedBot`, `DeskTimedBot` structs; `BotsShelfUnattended` enum |
 | `BotsShelfView.swift` | `BotsShelfView` struct |
 | `BrowserWindow.swift` | `NavResult` struct; `BrowserActionRoutes.app` over the visible window's route effects |
 | `CapabilitiesView.swift` | `CapabilitiesView` struct |
 | `SensesView.swift` | `SensesSurfaceState`, `SensesView`; contract-only read projection and per-sense lifecycle switch |
 | `WorkPaneSenseView.swift` | `WorkPaneSenseView`; separate offline script-enabled WebKit host, one version-bound sense event channel |
-| `CapabilityPackInstall+Lifecycle.swift` | `CapabilityPackInstall`: `installDemo`, `rollback` (signed capability packs across the catalog, workflow and skill registries) |
 | `CapabilityProductionHardeningPanel.swift` | `CapabilityProductionHardeningPanel` struct |
 | `ChatComposerChrome.swift` | `ComposerTabKeyHandler` struct; `makeNSView`, `updateNSView` |
-| `ChatContentCache.swift` | `ChatContentCache` class; `lookup`, `insertIfAbsent` |
-| `ChatInlineApprovalCard.swift` | `InlineApprovalPresentation` enum; `state` |
+| `ChatInlineApprovalCard.swift` | mounted approval card, local state and approval copy |
 | `ChatMessageListView.swift` | `ChatMessageListView` struct |
 | `ChatShellPresentation.swift` | `ChatShellConversationRow`: `isWorking`, `preview`, `isBridgeRouted` |
 | `ChatShellViews.swift` | `ShellRoomHeader` struct |
 | `ChatSlashCommandMenu.swift` | `SlashCommandMenu` struct |
-| `ChatSlashCommandRegistry.swift` | `ChatSlashCommandRegistry` enum; `descriptor`, `helpText` |
-| `ChatToolPillView.swift` | `ToolPillPresentation` enum; `outcome`, `title` |
+| `ChatToolPillView.swift` | `ToolPillPresentation` struct; retained metadata projection, `outcome`, `title` |
+| `ChatView.swift` | `ChatView` struct; `ChatTurnNoticePresentation` |
 | `ChatView+Attachments.swift` | `ChatView`: `endDictation`, `toggleVoice`, `captureScreen` |
 | `ChatView+DetachedSessionMenu.swift` | `ChatView`: `detachedSessionMenu` |
 | `ChatView+PinnedSessions.swift` | `ChatView`: `humanPinnedSessionIds`, `savePinnedSessionIds`, `prunePinnedSessions` |
@@ -234,66 +247,35 @@ this grant, and `script/verify_release_artifact.sh` checks the signed entitlemen
 | `ChromeExtensionFolder.swift` | `ChromeExtensionFolder` enum; `setUp`, `isComplete` |
 | `ComposerContextReceipt.swift` | `ComposerContextReceipt` struct |
 | `ConnectorsView.swift` | `ConnectorsView` struct |
-| `ClaudeBridge+AgentLive.swift` | `ClaudeBridge`: `installAgentLivePublisher`, `agentLivePayload`, `handleAgentLive` |
-| `ClaudeBridge+StandingViews.swift` | `ClaudeBridge`: `standingViewBodyPreview`, `standingViewJSON`, `standingViewListJSON` |
-| `ClaudeBridge+StateProjection.swift` | `ClaudeBridge`: `handleState`, `readActivePersona`, `readBridgeActiveSession` |
-| `ClaudeBridge.swift` | `ClaudeBridge` class; `eventStreamFrame`, `eventRouteSnapshot` |
 | `DeskItemInspector.swift` | `DeskItemInspector` struct |
-| `DeskLanePresentation.swift` | `DeskHerHourPresentation` enum; `state`, `symbol` |
 | `DeskLiveReloader.swift` | `DeskLiveReloader` class; `trace`, `resolveGlanceVisibility` |
 | `EmbeddingModelDownloadRow.swift` | `EmbeddingModelDownloadRow` struct |
-| `EventKitPIMStore.swift` | `EventKitPIMStore` class; `authorizationState`, `requestCalendarAccess`, `makeReminderCalendar` |
 | `GitHubPlatformPorts.swift` | `GitHubApprovalEdgeNotifier`: extension |
-| `ICloudInboxDidProcessRoute.swift` | `ICloudInboxDidProcessRoute` enum; `resolve` |
-| `InboxCardActions.swift` | `InboxCardActions` enum; `perform` (a card's buttons), `resolvePrimaryAction`, `updateVisibleStatus` |
+| `InboxCardActions.swift` | `AppInboxCardActionEffects`: mounted navigation and live composition bindings; callers use the core inbox transaction directly |
 | `InteractionCardDelivery.swift` | `InteractionCardDelivery` enum; `pointer`, `observe` |
 | `KGGraphCanvas.swift` | `KGGraphCanvas` struct |
-| `KnowledgeGraphEnableActionPresentation.swift` | `KnowledgeGraphEnableActionPresentation` enum; `buttonControl`, `failure` |
 | `KnowledgeGraphRows.swift` | `KGEntityRow` struct |
 | `KnowledgeGraphStatusHeader.swift` | `KGNativeStackStatus` struct; `load` |
-| `KnowledgeGraphView+Maintenance.swift` | `KnowledgeGraphView`: `loadKnowledgeGraphPolicy`, `reloadKnowledgeGraphPolicyAndGraph`, `loadGraph` |
+| `KnowledgeGraphView.swift` | `KnowledgeGraphView`: mounted graph, filters, policy and maintenance presentation; `loadKnowledgeGraphPolicy`, `reloadKnowledgeGraphPolicyAndGraph`, `loadGraph` |
 | `LivingStatusPanel.swift` | `LivingStatusPanel` struct |
-| `MacAgentACPProcess.swift` | `MacAgentACPProcess` struct; `spawn`, `finish` |
-| `MacAppleScriptBridge+Mail.swift` | `MacAppleScriptBridge`: `mailListRecent`, `mailSearch`, `mailSend`, `mailDraft` |
-| `MacAppleScriptBridge+MailWorkspace.swift` | `MacAppleScriptBridge`: `mailWorkspaceRead`, `mailReadScope`, `mailIndexDatabase`, `mailSenders` (exact grouped sender counts), `mailFileRead`, `mailAttachment` (paired-identity .emlx bodies, MIME/table decoding and local attachments) |
-| `MacAppleScriptBridge+MessagesNotes.swift` | `MacAppleScriptBridge`: `messagesRecentThreads`, `parseMessagesMetadata`, `messagesSend`, `notesModify` (exact-note update or reversible deletion) |
-| `MacAppleScriptBridge+Music.swift` | `MacAppleScriptBridge`: `musicSearchLibrary`, `musicListLibrary`, `musicListPlaylists` |
-| `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge`: `runAppleScript`, `isMusicNoCurrentTrackError`, `deniedEnvelope` |
 | `MacChatTranscriptSearch.swift` | `MacChatTranscriptSearch` enum |
-| `MacControlBridge.swift` | `MacControlBridge` class; `startGateAllows`, `start` |
-| `MacControlBridgeProcesses.swift` | `MacControlBridgeProcesses` class; `requestCancellation`, `consumeCancellation` |
-| `MacPIMConnectorActions.swift` | `MacPIMConnectorActions` enum; `calendarListUpcoming`, `calendarCalendars` |
-| `MacPinnedChatSessionStore.swift` | `MacPinnedChatSessionStore` enum; `normalized`, `decode` |
 | `MemoriesPageView.swift` | `MemoriesPageView` struct |
 | `MemoryAppIntents.swift` | `QueryMemoryIntent` struct; `perform` |
 | `MemoryRepairPresentation.swift` | `AppMemoryRepairPresentation` struct; `ensureInboxCard` |
-| `NativeAgentApp.swift` | SwiftUI app and scene declarations; app lifecycle wiring; startup pre-opens `logs/crash-breadcrumbs.log` for the tiny C `CrashBreadcrumbs` fatal-signal handler (best-effort unwinding, default re-raise) |
+| `NativeAgentApp.swift` | SwiftUI app and scene declarations; coordinator-gated async restore/recovery before model and ingress, off-main engine/layout preparation; startup pre-opens `logs/crash-breadcrumbs.log` for the tiny C `CrashBreadcrumbs` fatal-signal handler (best-effort unwinding, default re-raise) |
 | `NativeAgentDesign.swift` | `View`: `settingsCardSurface`, `capsuleTag`, `appShimmer` |
 | `NativeAgentDesignTokens.swift` | `Color`: `NativeAgentFont`, `NativeAgentSpacing`, `NativeAgentRadius` |
-| `NativeAgentEmbeddingWarmup.swift` | `maybeWarmEmbeddingsForFastMode`, `reconcileMemoryEmbeddingEpochAtLaunch`, `writeReceipt` |
-| `NativeAgentEnginePorts+App.swift` | Mac platform-port bindings and construction of `NativeAgentEngine.live` |
 | `NativeAgentIntents.swift` | `NativeAgentChatIntent`: `perform`, `reply` |
-| `NativeAgentNotificationActions.swift` | `NativeAgentNotificationActions` enum; `register`, `category` |
-| `NativeAgentWidgetSnapshot.swift` | `NativeAgentWidgetSnapshot` struct; `status`, `fileURL` |
+| `NativeAgentNotificationActions.swift` | Native response mapping, notification categories and mounted window/conversation dispatch; effects stay in EngineNotificationActions |
 | `NativeAgentWindowChrome.swift` | `AppRelauncher` enum; `relaunchHelperScript`, `relaunchHelperArguments` |
-| `NativeLoopbackListenerParameters.swift` | `NativeLoopbackListenerParameters` enum; `tcp`, `makeListener` |
-| `NativeOAuthLoopbackCallbackServer.swift` | `NativeOAuthLoopbackCallbackServer` class; `wait`, `cancel` |
-| `NativeOAuthPlatform+Loopback.swift` | `NativeOAuthPlatform`: `runLoopbackAuthSession` |
 | `NativeOAuthPlatform+SessionRunner.swift` | `NativeOAuthPlatform`: `runAuthSession` |
 | `NativeOAuthPlatform.swift` | `NativeOAuthPlatform` enum; `makeLoopbackSession`, `openBrowser` |
-| `NativeOAuthSessionSupport.swift` | `OAuthSessionBox` class; `set`, `session` |
 | `OnboardingWizard.swift` | `OnboardingWizard` struct |
 | `PersonalityView.swift` | `PersonalityView` struct |
-| `ProductionExport+Archive.swift` | `ProductionExport`: `createArchive`, `createSupportBundle` (checksummed tar.gz exports and their registry rows) |
-| `ProvidersFacade+Probe.swift` | `ProvidersFacade`: `testProvider`, `clearProvider` |
 | `ProviderSettingsComponents.swift` | `ProviderRowView` struct |
 | `ProviderSettingsView.swift` | `ProviderSettingsView` struct |
-| `QuietChatSessionVerbs.swift` | `QuietChatSessionVerbs` enum; `run`, `fence` |
-| `QuietComposerVerbs.swift` | `QuietComposerVerbs` enum; `state`, `fence` |
 | `SimpleShellView.swift` | `SimpleShellView` struct |
-| `TriggerNotifierBinding.swift` | `TriggerNotifierBinding` enum; `mirrorNonNotifiedFire`, `makeNotifyingTriggerScheduler` |
 | `TrustCenterView.swift` | `TrustCenterView` struct |
-| `ViewFileRefreshTask.swift` | `ViewFileRefreshTask` enum; `run` |
 | `WorkshopObservatoryPanel.swift` | `WorkshopObservatoryPanel` struct |
 
 ### Models
@@ -302,9 +284,7 @@ Directory: `Sources/NativeAgentApp/Models/`
 
 | File | Owns |
 |---|---|
-| `ConfigProviderDoctorModels.swift` | `TrustTrainingPolicy`: `AppConfig`, `AutoDoctorConfig`, `TelegramTestResponse` |
-| `ImprovementNextGenModels.swift` | `NextGenReceipt`: `ImprovementGauntletRun` (with `run`), `GauntletCheck`, `ProductionHardeningSummary` |
-| `TolerantDisplayStringDecoding.swift` | `decodeTolerantDisplayString` |
+| `ImprovementNextGenModels.swift` | Core model aliases for `ImprovementGauntletRun`, `GauntletCheck`, `ProductionHardeningSummary` and `NextGenReceipt`; app extensions `ImprovementGauntletRun.run` and `NextGenReceipt.humanized` |
 
 ## Core Runtime Map
 
@@ -314,9 +294,11 @@ Directory: `Modules/NativeAgentCore/Sources/Senses/`
 
 | File | Owns |
 |---|---|
-| `SensesContract.swift` | Shared native form, entry-local progress admission, registry/runner protocols, `SensesHub`, catalog and bounded private restart-durable unread news board with durable acknowledgement and separate update lines |
-| `HelperSenseRunner.swift` | Isolated plug supervision with validated progress-based stall detection excluding app-served reply waits, read-to-watch idle holds, subscription-owned lifetime, passive watch/source callbacks and restarts, serialized notebooks, versioned use and visible live failure news, sealed view events, detached site following and app change deduplication/news |
-| `SenseDoor.swift` | Registry-first reads, bundled-kind ownership, exact served provenance and file-material envelopes; distinct private web/visible browser/group-owned Chrome provenance, same-corner act verification without re-entry, wrong-version reporting, captured native/JS site action material, Chrome envelope continuations and native screen continuation snapshots |
+| `OwnedProgramStore.swift` | Candidate identity, sealed capture/proof and publication through AbilityStore headers; source-bound sense reads bind captured-material proof; OwnedProgramFixtures intercepts tool/routine calls and decisions |
+| `OwnedProgramRunner.swift` | Shared program execution, call journal and resume freshness; authored tools receive frozen `host.paths.home` from the helper's current user and `host.paths.workspace` prepared by `NativeAgentWorkspaceRoot` for the requesting data root; `ReadContent` collects owner-declared envelope projections and content dependencies, sharing normalization with replay argument comparisons without changing replies |
+| `SensesContract.swift` | sense records/contracts, SensesHub registry projection and exact view-event admission, native catalog, memory provenance and durable unread news |
+| `HelperSenseRunner.swift` | Isolated plug supervision with validated progress-based stall detection excluding app-served reply waits, read-to-watch idle holds, subscription-owned lifetime, passive watch/source callbacks and restarts, serialized notebooks, versioned use and visible live failure news, sealed view events, detached site following and app change deduplication/news; app reads use assembly's Trust-admitted read closure |
+| `SenseDoor.swift` | Registry-first reads, bundled-kind ownership, exact served provenance and file-material envelopes; captured views retain the turn's growth refusal, discarding refused file bytes while preserving screen/site read and action snapshots; distinct private web/visible browser/group-owned Chrome provenance, same-corner act verification without re-entry, wrong-version reporting, captured native/JS site action material, Chrome envelope continuations and native screen continuation snapshots |
 | `SenseScreenThings.swift` | Exact screen thing selections, captured related-action bindings on composite rows, and in-turn mac.act verb requests |
 
 ### ActivityWatch
@@ -325,7 +307,9 @@ Directory: `Modules/NativeAgentCore/Sources/ActivityWatch/`
 
 | File | Owns |
 |---|---|
-| `HumanPresenceStamp.swift` | `HumanPresenceStamp` struct; `url`, `transitionURL` |
+| `ActivityWatchController.swift` | `ActivityWatchController`, `ActivityCaptureIssue`; capture lifecycle, serialized off-main policy reads/writes, exact policy-file invalidation and one retention schedule using the runner's completed-run stamp and effective clamped capture policy; issue state with injected platform error and notification presentation |
+| `ActivitySpanStore.swift` | `ActivitySpanStore`; asynchronous per-root store acquisition shared by capture, retention and queries |
+| `HumanPresenceStamp.swift` | `HumanPresenceStamp` enum; durable present/away crossings at `ActivityWatchPaths.presenceTransitionURL`, shared with the scheduler through `transitionURL` |
 
 ### AgentConversations
 
@@ -338,8 +322,8 @@ NativeAgent approval cards cover only requests the agent submits.
 
 | File | Owns |
 |---|---|
-| `AgentACPApproval.swift` | `AgentACPApproval` enum; `renewExecutable`, `request` |
-| `AgentBridgeRuntime.swift` | `AgentBridgeRuntime` enum; `codexHelperURL`, `claudeHelperURL` |
+| `AgentACPApproval.swift` | `AgentACPApproval` enum; `connect`, `request` |
+| `AgentBridgeRuntime.swift` | `AgentBridgeRuntime` enum; helper discovery and shared execution; wake-runner process identity; OMP reply-job recovery |
 | `AgentConversationExchange.swift` | `AgentConversationExchange`: `started`, `absorb`, `validate` |
 | `AgentConversationHistoryView.swift` | `AgentConversationHistoryView` enum; `adding` |
 | `AgentConversationLive.swift` | `AgentConversationLive` struct; `projection` |
@@ -357,7 +341,7 @@ NativeAgent approval cards cover only requests the agent submits.
 | `AgentMailActions.swift` | `AgentMailActions` enum; `listRecent`, `readMessage` |
 | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery` enum; `authenticatedInterface`, `a2aCheck` (an A2A call's card held to its recipe; its dry run), `listTasks`, `localCandidates` (ports from every recipe) |
 | `AgentPeerPolicy.swift` | `AgentPeerPolicy` enum; `peerFailure`, `peerAuthorizeInterface` |
-| `AgentPeerStore.swift` | Canonical contacts and proof: app bundle/version and recipe version/digest at round trip; `list`, `namesMentioned` |
+| `AgentPeerStore.swift` | Canonical contacts and proof: app bundle/version and recipe version/digest at round trip; `list`, `contactSummaries` includes every saved contact with reachability and owner trust separately |
 | `AgentPeerTransport.swift` | `AgentPeerCredentials` enum; `resolve`, `isAvailable` |
 | `AgentRecipeStore.swift` | `AgentRecipeStore` enum: one recipe per agent host under agents/recipes/, seeded from the host tables, read by `AgentHostDirectory.rows`, and one per A2A contact under its id (`AgentHostRow.A2A`, `recipe(for:)` seeds a missing one on the spot); `load`, `recipe`, `launch` (Trust's reader), `read`/`write` (the door's, one shape check, under the file lock), `learn` (a dry run's findings, source "learned"), `dryRun` |
 | `ChatGPTDotIPCTransport.swift` | `ChatGPTDotIPCTransport` enum; `listen`, `reconnect`, `readiness` |
@@ -379,7 +363,7 @@ Directory: `Modules/NativeAgentCore/Sources/AgentLinkTransport/`
 | `AgentA2AWire.swift` | `AgentA2AWire` enum; `selectInterface`, `messageRequest` |
 | `AgentACPClient.swift` | `AgentACPClient` actor; `startupTimeoutReceipt`, `turn` (recipe-driven; no message is a dry run), `learned`; `Mismatch`: nothing sent |
 | `AgentACPExecutable.swift` | `AgentACPExecutable` struct; `capture`, `verify` |
-| `AgentACPProcess.swift` | `AgentACPProcess` enum; `installHost`, `spawn` |
+| `AgentACPProcess.swift` | `AgentACPProcess` approved spawn, process-group termination and reap |
 | `AgentPeerHTTP.swift` | `AgentPeerHTTP` enum; `send`, `get` |
 
 ### AgentLinkTransport/Generated
@@ -400,13 +384,13 @@ Home navigation behind `app`; this module is not a separate model tool.
 | File | Owns |
 |---|---|
 | `AgentConversationProjection.swift` | `AgentConversationRecord` struct; `ContactThread.lines` reads full history through the shared transcript resolver and propagates unavailable history |
-| `AgentWorkspace.swift` | `AgentWorkspace` enum; `dispatch` |
+| `AgentWorkspace.swift` | `AgentWorkspace` enum; `dispatch`; `AgentWorkspaceNavigation.Session` retains the conversation's last undo receipt alongside its navigation, scoped by data root and session, never in a second ledger |
 | `AgentWorkspaceActionReadback.swift` | `AgentWorkspaceActionReadback` enum; `dispatchEffect`, `followUp` |
 | `AgentWorkspaceActivity.swift` | `AgentWorkspaceActivity` enum; `project`, `today` |
 | `AgentWorkspaceApps.swift` | `AgentWorkspaceApps` enum; `quickAction`, `project` |
 | `AgentWorkspaceArrivals.swift` | `AgentWorkspaceArrivals` enum; `pending`, `hash` |
 | `AgentWorkspaceAwareness.swift` | `AgentWorkspaceNavigation`: `observationStamps`, `observe`, `bindCurrent` |
-| `AgentWorkspaceChanges.swift` | `AgentWorkspaceChanges` enum; `evaluate`, `evaluateHumanListing` |
+| `AgentWorkspaceChanges.swift` | `AgentWorkspaceChanges` enum; `evaluate`, `evaluateHumanListing`, conversation change observations through the bound owner port |
 | `AgentWorkspaceConversation.swift` | `AgentWorkspaceConversation` enum; `project` |
 | `AgentWorkspaceConversations.swift` | `AgentWorkspaceConversations` enum; `project` |
 | `AgentWorkspaceDesktopNavigation.swift` | `AgentWorkspaceNavigation`: `restoredSession`, `canEvict`, `draftAttemptIsDurable` |
@@ -427,10 +411,10 @@ Home navigation behind `app`; this module is not a separate model tool.
 | `AgentWorkspaceSavedReply.swift` | `AgentWorkspaceSavedReply` struct; `title`, `evidence` |
 | `AgentWorkspaceWork.swift` | `AgentWorkspaceWork` enum; `desk`, `continuation` |
 | `AgentWorkspaceWorkOverview.swift` | `AgentWorkspaceNavigation`: `workReceiptKey`, `placeAction`, `focusWork` |
-| `DelegationStatusProjection.swift` | `DelegationDeliveryCache` class; `read` |
-| `HerQueue.swift` | `MyQueueReady` enum; `ready`; `HerScreen`: `queueRows`, `resume` |
-| `HerScreen.swift` | `HerScreen` enum; `withNames`, `resolve`, compact Senses home projection and readable full senses item from registry/news |
-| `HerScreenPreview.swift` | `AgentWorkspaceScreenPreview` enum; `glance`, `render` |
+| `DelegationStatusProjection.swift` | `DelegationDeliveryCache` class; `read`; consumes lifecycle decisions with their known principal and source |
+| `HerQueue.swift` | `MyQueueTurnProjectionProviding` protocol over cognition's Desk-revision-checked candidates and explicit refresh-pending-after-write state; `MyQueueReady.ready` owns unattended eligibility, `forTurn` admits only the recorded session; `HerScreen`: `queueContext`, `queueRows`, `resume` |
+| `HerScreen.swift` | `HerScreen` enum; `withNames`, `resolve`, compact Senses home projection and readable full senses item from registry/news, sharing the live built-ability line with turn context |
+| `HerScreenPreview.swift` | shared screen/room text projection |
 | `HerScreenRooms+Agents.swift` | `HerScreen`: `agentsTarget`, `crewsRoom`, `delegationsRoom`; crews share the SwarmRuns projection with the Mac view |
 | `HerScreenRooms+Build.swift` | `HerScreen`: `buildRoom`, `buildTarget`, `buildRecordRoom` |
 | `HerScreenRooms+Comms.swift` | `HerScreen`: `sendTrouble`, `roomCounts`, `notConnected` |
@@ -439,12 +423,11 @@ Home navigation behind `app`; this module is not a separate model tool.
 | `HerScreenRooms+Life.swift` | `HerScreen`: `lifeRoom`, `lifePulse`, `opening` |
 | `HerScreenRooms+Web.swift` | `HerScreen`: `tabName`, `tabTitle`, `webTabCell` |
 | `HerScreenRooms.swift` | `HerScreen`: `room`, `names`, `screen` |
-| `HarnessQueue.swift` | `HarnessQueue` enum, `HarnessFinding` struct; `file`, `resolve`, `standing`: the app files its own findings as `harness` Desk items |
-| `HerWorld.swift` | `HerWorld` struct; live crews use the canonical SwarmRuns projection |
+| `HarnessQueue.swift` | `HarnessQueue` enum, `HarnessFinding` struct; `file`, `resolve`, `fold`: keyed findings refresh in place, preserving closure and person ownership; repeated loop failures refresh evidence under the keyed Desk lock; per-record findings fold into their rollup with one Desk transaction per item through the same settlement path; wake carry opportunities and pending items share the existing ledger |
+| `HerWorld.swift` | `HerWorld` struct; one display peer/identity snapshot shared by contacts and threads; live crews use the canonical SwarmRuns projection; `HerMemo` retains stamp-aware name books under the names lock |
 | `HumanConversationIndex.swift` | `HumanConversationIndex` enum; `string`, `object` |
 | `MacScreenPreviewBus.swift` | `MacScreenPreviewBus` enum |
-| `ResidentWake.swift` | `ResidentWake` class; `request`, `claim`, `take` |
-| `StandingBotSchedule.swift` | `StandingBotSchedule` enum; `parse`, `words` |
+| `ResidentWake.swift` | `ResidentWake` class; `request`, `claim`, `take`; `checkedRead` exposes pending/recent arrivals read-only through the existing Arrivals room; exact free-time deadlines, turn-terminal waits and conversation-event route waits share its ledger |
 | `SurfaceLayoutStore.swift` | `SurfaceLayoutStore` enum: ui/layout.json under the host's data root (cached per root), seeded from `SurfaceLayout.vocabulary`; `layout` (what the window, their home and the page index draw, re-read when the file changes), `read`/`write` (the door's `layout.read`/`layout.write`: one shape check, version `layoutVersion@digest`, the replaced file kept for undo, a file that does not read never written over), `setExpanded` (the person's fold); `SurfaceLayoutLive` (the window's observed copy, `attach`ed to the app's root) |
 | `ToolSignature.swift` | `ToolSignature` enum; `call`, `doorArgs` |
 | `WorkContextQuery.swift` | `WorkContextQuery` struct; `matchedTerms`, `score` |
@@ -455,14 +438,20 @@ Directory: `Modules/NativeAgentCore/Sources/Agents/`
 
 | File | Owns |
 |---|---|
-| `AgentBridgeCompletionRouter.swift` | Completion-route adapters and destination validation; `AgentBridgeCompletionRouter`: `isValidIOSDeviceRouteKey`, `deliverAnswer` |
-| `ChatGPTDotConversation.swift` | `ChatGPTDotConversation` actor; `refresh`, `conversation`; cached failed-admission peer IDs gate link recovery before peer/file reads; room cleanup keeps the first revised message per ID |
-| `CodexCompletionLifecycle.swift` | `CodexCompletionLifecycle` struct; `claim`, `markNotStarted` |
-| `ClaudeBridgeDenyDispatcher.swift` | `ClaudeBridgeDenyDispatcher` class; `builtInAgentLaneUsable`, `preApprovalRefusal` |
+| `AgentContactRoutes.swift` | Authenticated contact ingress, MCP/A2A requests, retained reply pagination, event waits and transport-confirmed fetch acknowledgements |
+| `ClaudeBridgeRuntime.swift` | Authenticated HTTP/contact routes, state deadlines, live payload publication, retained clients, reply recovery and event transport |
+| `ClaudeBridgeRuntime+StandingViews.swift` | Standing-view request codec and HTTP routes through Cognition review authority |
+| `DesktopChatRoute.swift` | Recipe-bound conversation selection, send confirmation, learned reads and uncertain delivery without automatic resend |
+| `NativeAgentMCPWire.swift` | MCP negotiation, parsing, caller-supplied request identity and reply projection |
+| `NativeAgentA2AGRPCListener.swift` | gRPC loopback listener generation, endpoint publication and lifecycle |
+| `NativeAgentA2AGRPCService.swift` | gRPC authentication, protocol/error projection and acknowledged stream delivery |
+| `AgentBridgeCompletionRouter.swift` | Completion-route adapters and destination validation; saved let-go delivery stops at admission before asking-chat rows or dispatch; `AgentBridgeCompletionRouter`: `isValidIOSDeviceRouteKey`, `deliverAnswer` |
+| `ChatGPTDotConversation.swift` | `ChatGPTDotConversation` actor; `refresh`, `conversation`; saved arrivals wait on `TurnAdmission` capacity signals; cached failed-admission peer IDs gate link recovery before peer/file reads; room cleanup keeps the first revised message per ID |
+| `CodexCompletionLifecycle.swift` | `CodexCompletionLifecycle` struct; claims require the pinned response run; digest-bound answer and exact return intent; remote settlement delegates to the route journal; launch/event reconciliation isolates corrupt jobs and appends JS reply-job settlements under the ledger.lock flock shared with JS append and rotation; closed peer reply findings settle covered records as let_go; delivery admission, artifact reservation and dispatch transition reject let-go records before transport |
 | `ClaudeBridgeMessageRuntime+AgentLive.swift` | `ClaudeBridgeMessageRuntime`: `agentLiveJobActive`, `handleAgentLive` |
-| `ClaudeBridgeMessageRuntime.swift` | `ClaudeBridgeMessageRuntime` class; `handleMessage`, `validGenericAgentMessage` |
+| `ClaudeBridgeMessageRuntime.swift` | Bridge message admission/delivery and the retained chat client; event publication is a weak callback to the HTTP runtime |
 | `ClaudeBridgeStateProjection.swift` | `ClaudeBridgeStateProjection` enum; `procedureStatusJSON`, `microcycleTelemetryJSON` |
-| `GrokBotConnection.swift` | `GrokBotConnection` enum; `perform`, `result` |
+| `GrokBotConnection.swift` | Grok connection coordination and secure Bot selection/credential transactions |
 | `GrokBotConnectionPort.swift` | `GrokBotConnectionPort` protocol; `ensureRunning`, `send` |
 
 ### AppToolRuntime
@@ -471,34 +460,42 @@ Directory: `Modules/NativeAgentCore/Sources/AppToolRuntime/`
 
 | File | Owns |
 |---|---|
-| `AppActionRegistry.swift` | App action definitions and registry (`AppAction`, `AppActions`); MCP and authored action lookup; blended semantic/lexical ranking and model-epoch action vectors; file Trash, recurring tasks and named contacts route to their owners |
+| `AppActionRegistry.swift` | App action definitions and registry (`AppAction`, `AppActions`); MCP and authored action lookup; one schema-aware semantic/lexical ranking for declared page items, built-ins, admitted tools, enabled skills and current senses, with shared retrieval stop words, a semantic relevance floor and model-epoch action vectors; explicitly requested retired tools are labeled read-only records; file Trash, recurring tasks and named contacts route to their owners |
 | `AppChatToolDispatcher.swift` | Composed tool dispatch, Security Center admission and settled-result observers |
-| `AppScriptRunner.swift` | JavaScriptCore scripts, generated app API, bounded execution and gated call handling |
-| `AppToolExecutor+AppDoor.swift` | The `app` schema and home/page/item/find/action/actions/script dispatch, compact expandable action catalogs and preserved domain execution receipts |
+| `AppScriptRunner.swift` | Shared-runner app host adapter, dependency shapes and ordinary turn-chain re-entry; declarations grant no action authority |
+| `AppToolExecutor+AppDoor.swift` | The `app` schema and home/page/item/find/action/actions/script dispatch, compact expandable action catalogs, read-only conversion census and preserved domain execution receipts; `undo` re-enters the receipted layout, recipe or setting action's gates and restores through that owner |
 | `AppToolExecutor+Senses.swift` | Sense corner reads, served verb discovery and gated in-turn acts |
 | `AppToolExecutor+Browser.swift` | `AppToolExecutor`: `runBrowserTool`, `freshChromePage`, `chromeFollowUpAllowed`, `runChromeHistory`; history reads a private SQLite copy of Chrome's Default profile under Full Mac/file-read authority, with bounded rows and query deadline; `RetainedBrowserRead` keeps the visible read's full capture and receipt beside its rejected view; scroll readback carries the tab-bound viewport observation, with no timed delta retries |
 | `AppToolExecutor+ChromeFields.swift` | `AppToolExecutor`: `resolveChromeTarget`, `chromeFields`, `runChromeFieldsCall` |
 | `AppToolExecutor+Health.swift` | `AppToolExecutor`: `doctorStatus`, `boundedDoctorDetail`, `doctorStatusEnvelope` |
-| `AppToolExecutor+MyQueue.swift` | `AppToolExecutor`: `runMyQueue` |
-| `AppToolExecutor+Weather.swift` | `AppToolExecutor`: `runWeatherForecast`; read-only Open-Meteo place resolution and locale-unit forecast |
+| `AppToolExecutor+MyQueue.swift` | `AppToolExecutor`: `runMyQueue`, `runHouseFile`; filing receipts report the stored owner and explicitly say when a requested reassignment was not made |
+| `AppToolExecutor+Weather.swift` | `AppToolExecutor`: `runWeatherForecast`; Open-Meteo place resolution and locale-unit forecast; omitted place re-enters the gated phone.request current-location action, with phone-open guidance on refusal |
 | `AppToolExecutor+Photos.swift` | `AppToolExecutor`: `runPhotosRead`; read-only PhotoKit counts and recent asset metadata, with action-time macOS authorization |
-| `AppToolExecutor+SkillRun.swift` | `AppToolExecutor`: `doorSkill` (skill.run, skill.resume), `doorWouldCard`; `SkillRunStore` |
+| `AppToolExecutor+SkillRun.swift` | `AppToolExecutor`: `doorSkill` (skill.validate, skill.run, skill.resume), routine dependency/input/version checks for shared validation, `doorWouldCard`; `SkillRunStore` |
 | `AppToolExecutor+InteractionAct.swift` | `AppToolExecutor`: `cardRefusal`, `runCardAction`, `applyMacControlCategoryGrant` |
 | `AppToolExecutor+QuietSelfAdmin.swift` | `AppToolExecutor`: `performMacSelfAppRoute`, `quietPosture`, `freshQuietPosture` |
-| `AppToolExecutor+ToolSchemas.swift` | `AppToolExecutor`: `appToolSchemas` |
-| `AppToolExecutor.swift` | `AppToolExecutor` class; `defaultReflexReviewerIdentity`, `execute` |
+| `AppToolExecutor+PagePresentation.swift` | screenshot results and quiet page/read rendering |
+| `AppToolExecutor+QuietMind.swift` | quiet mind commands and decision receipts |
+| `AppToolExecutor+UpkeepTarget.swift` | backup restore target validation |
+| `AppToolExecutor+ToolSchemas.swift` | `AppToolExecutor`: immutable non-door schemas and independently lazy door schema via `appToolSchemas`, preserving the registry initialization boundary |
+| `AppToolExecutor.swift` | `AppToolExecutor` class; shared immutable descriptors; `execute` |
 | `AppToolNotificationInput.swift` | `NativeAgentNotificationDefaults`: `parseInput` |
 | `AppToolPorts.swift` | `BrowserToolPlatformPort` struct |
-| `ChromePageText.swift` | `ChromePageText` enum; ordered inline prose with link proofs retained as addressable things, section-named continuation headers, `render`, `rows`, page and folded-control `next`, content-hash `envelope` |
+| `ChromePageText.swift` | `ChromePageText` enum; one `Projection` shares rendered text and addressable rows with the mirror and envelope; ordered inline prose with link proofs, section-named continuation headers, `project`, `rows`, page and folded-control `next`; `contentVersion` shared by the envelope and Chrome news without rendering |
 | `ExistingCornersReaders.swift` | `ExistingCornersSourceProvider`: gated raw readers for screen, files, documents, connectors, private web, visible browser and Chrome; event-backed Chrome material for ordinary reads/following; `NativeChromeNews` observes from tab navigation, owns one tab-bound native reader subscription into `SenseNewsBoard`, and sends capture failures to Chrome status without consuming its successful baseline |
 | `NativeActionRoutes.swift` | `NativeActionRoutes` enum; `runNativeAction`, `swiftNativeActionRecords` |
-| `NativeAgentNotificationPostResult.swift` | `NativeAgentNotificationPostResult` struct; `deliveryFields` |
+| `NativeAgentNotificationPostResult.swift` | Re-exports `AttentionRouting` notification result contracts |
 | `NativeRegistryEvaluation.swift` | `NativeRegistryEvaluation` enum; `appendBoundedRun` |
-| `NativeSkillRegistryActions.swift` | `NativeSkillRegistryActions` enum; `deleteSkill`, `enableSkill`, `disableSkill` |
-| `QuietAdminPreferences.swift` | `VoicePreference` enum; `quiet`, `name` |
-| `QuietSelfAdminSettings.swift` | `QuietSettingsHostProvider` typealias |
+| `NativeSkillRegistryActions.swift` | native skill lifecycle actions and signed capability-pack script-host binding; `NativeSkillRegistryActions` enum; `deleteSkill`, `enableSkill`, `disableSkill` |
+| `QuietAdminPreferences.swift` | `VoicePreference` enum; `quiet`, `name`; Shared UI preference keys including MomentsLaneSetting; appearance/view preferences; voice preferences belong to MultimodalTTS |
+| `QuietInboxCommands.swift` | `QuietInboxHost`: inbox fences and commands |
+| `QuietSelfAdminSettings.swift` | `QuietSettingsHostProvider` typealias; static-first settings lookup and read-scoped bot projections, with fresh mutation readers |
+| `QuietSelfAdminSettings+LowerOnly.swift` | lower-only settings rows and cognition/provider controls |
+| `QuietSelfAdminSettings+Mobile.swift` | mobile settings projection and writes |
 | `QuietSettingsHost.swift` | `QuietSettingsHost` protocol; `saveChatBrainDefaultsFailure`, `saveMacControlPolicy` |
-| `QuietTrustPolicyPreset.swift` | `TrustPolicyPreset` enum; `save` |
+| `QuietTrustPolicyPreset.swift` | `TrustPolicyPreset` enum; `save`, effective-policy preset matching |
+| `QuietTrustPolicyPreset+Action.swift` | trust preset action receipts |
+| `ToolInteractionResolving+Transactions.swift` | interaction lookup and transaction resolution |
 
 ### ApprovalInbox
 
@@ -506,8 +503,7 @@ Directory: `Modules/NativeAgentCore/Sources/ApprovalInbox/`
 
 | File | Owns |
 |---|---|
-| `ApprovalExecutionAnnotation.swift` | `ApprovalExecutionAnnotation` enum; `annotateApprovalExecution` |
-| `ApprovalInbox+InjectionSpend.swift` | `SwiftNativeApprovalInbox`: `consumeInjectionApproval`, `injectionApprovalSpend`, `loadSpends` |
+| `ApprovalInbox+InjectionSpend.swift` | `SwiftNativeApprovalInbox`: `consumeInjectionApproval`, `loadSpends` |
 
 ### ApprovalTransactions
 
@@ -515,12 +511,14 @@ Directory: `Modules/NativeAgentCore/Sources/ApprovalTransactions/`
 
 | File | Owns |
 |---|---|
-| `ApprovalTransactionCoordinator+Effects.swift` | `ApprovalTransactionEffects` protocol; `runMemoryHygiene`, `disableSkill` |
+| `DeskClickApprovalFiler.swift` | Package-scoped local-click approval filing under `ApprovalTransactions` |
+| `ApprovalTransactionCoordinator+Effects.swift` | effect port and workshop-step decision/approval transaction |
 | `ApprovalTransactionCoordinator.swift` | `ApprovalTransactionCoordinator` struct; `jsonString`, `memoryHygieneReceipt` |
 | `ExternalSendApprovalTransactions.swift` | `ExternalSendApprovalTransactions` enum; `applyResolvedExternalSend`, `externalSendReceiptsPath` |
 | `InlineInteractionPlatformPort.swift` | `InlineInteractionPlatformPort` protocol; `probeAppleEventApp`, `mailListRecent` |
 | `InlineInteractionResolver.swift` | `InlineInteractionResolver` enum; `takeContinuationHandBack`, `interactions` |
-| `MemoryApprovalTransactions.swift` | `MemoryApprovalTransactions` enum; `applyResolvedMemoryRepair`, `reconcileUnappliedMemoryRepairs` |
+| `MacChatTurnApproval.swift` | canonical turn approval projection, card visibility and inline authority state |
+| `MemoryApprovalTransactions.swift` | `MemoryApprovalTransactions` enum; `applyResolvedKindBackfill`, `reconcileUnappliedMemoryRepairs` |
 | `ProcedureExactActivationApproval.swift` | `ApprovalTransactionCoordinator`: `applyResolvedProcedureExactActivation` |
 | `TelegramApprovalCoordinator.swift` | `TelegramApprovalFiler` actor; `fileApprovalRequest`, `awaitResolution`; expiry guidance names from PersonaEngine |
 
@@ -530,9 +528,13 @@ Directory: `Modules/NativeAgentCore/Sources/AttentionRouting/`
 
 | File | Owns |
 |---|---|
+| `NativeAgentNotificationActions.swift` | `NativeAgentNotificationActions` |
+| `NativeAgentNotificationPostResult.swift` | `NativeAgentNotificationPostResult`: confirmed native delivery fields |
+| `InboxPushNotifier.swift` | `AttentionRouter.notifyIfAttentionWorthy`: severity and live-root notification routing |
+| `AttentionRouter+MacNotifications.swift` | Native UserNotifications transport, message-route binding and notification admission/receipts |
 | `AttentionDeliveryPorts.swift` | `AttentionDeliveryPorts` struct |
 | `AttentionRouter+RequestedResults.swift` | `AttentionRouter`: `retryRequestedResults`, `deliverRequestedResult` |
-| `AttentionRouter.swift` | `AttentionRouter` actor; `delivery`, `allowed` |
+| `AttentionRouter.swift` | `AttentionRouter` actor; `delivery`, `allowed`, `releaseHeld` retain notification destinations and routing metadata through quiet hours |
 | `NativeAgentScheduledProactiveScan.swift` | `NativeAgentScheduledProactiveScan` enum; `inboxActions`, `evaluate` |
 | `NotificationChannelPreference.swift` | `NotificationChannelPreference` enum; `push`, `telegram` |
 | `TriggerNotificationDelivery.swift` | `TriggerNotificationDelivery` enum; `importance`, `notify` |
@@ -551,25 +553,27 @@ Directory: `Modules/NativeAgentCore/Sources/BackgroundWork/`
 
 | File | Owns |
 |---|---|
-| `AutonomyBackgroundWork.swift` | `AutonomyBackgroundWork` enum; `trustPolicyPath`, `makeAutonomyPromotionLoop` |
+| `DelegationOutcomeLoop.swift` | Delegation terminal snapshots, exact durable cursor, outcome/liveness classification and settlement runner |
+| `AutonomyBackgroundWork.swift` | `AutonomyBackgroundWork` enum; `trustPolicyPath`, `makeAutonomyPromotionLoop`; `AutonomyPromotionLoop` owns promotion work |
 | `BackgroundWorkClients.swift` | `PersonaBackedBackgroundLLMClient` struct; `complete`, `completeMessages` |
 | `BackgroundWorkPorts.swift` | `BackgroundWorkEventPort` protocol; `storeAndFileEvents` |
 | `ChatSurfaceBackgroundWork.swift` | `ChatSurfaceBackgroundWork` enum; `makeTelegramChatHandler`, `fileSystemPermissionNotice` |
-| `DelegationBackgroundWork.swift` | `DelegationBackgroundWork` struct; `makeDelegationOutcomeLoop`, `delegationJobSnapshot` |
-| `BodyReport.swift` | `BodyReport` struct; `read`, `writeDaily`: the day's crashes, loop failures, overdue organs, peers, first replies, cuts, misses, retired jobs, repairs, rounds per turn |
+| `DelegationBackgroundWork.swift` | `DelegationBackgroundWork` struct; `makeDelegationOutcomeLoop`, `delegationJobSnapshot`; one owed-answer notice per peer, retires the duplicate Codex backlog card; one failed-before-answer finding per peer or human route, dated counts and bounded newest-first file refs; per-peer findings persist and refresh every covered delivery ID as a trace ref; closed peer findings settle only those IDs before reply reconciliation; Telegram's index and exact iOS events retain settlement ownership |
+| `BodyReport.swift` | Crash breadcrumb paths and fatal-signal/process-exit logging |
 | `DeskContinuationScheduler.swift` | `DeskContinuationScheduler` actor; `nextDeadline`, `runDue`; checkpointed runs retain their process-resume owner |
 | `DeskNotifyRunner.swift` | `DeskNotifyRunner` struct; `physiologyEvents`, `nextMeaningfulDeadline` |
-| `DreamBackgroundWork.swift` | `DreamBackgroundWork` enum; `stagePendingREMProposalsAtLaunch`, `makeREMProposalStager` |
+| `DreamBackgroundWork.swift` | `DreamBackgroundWork` enum; `runREM` routes typed decode failures and healthy settlement to the shared finding sink; `stagePendingREMProposalsAtLaunch`, `makeREMProposalStager` |
+| `DoctorLoopHealth.swift` | `DoctorLoopHealth`, `LoopHealthVerdict`; direct `LoopStatus` health, dormancy and schedule interpretation |
+| `DoctorLoopRecovery.swift` | `DoctorLoopRecovery` enum; `checks`, `repair` over core loop-manager state |
 | `GitHubTrackingBackgroundWork.swift` | `GitHubTrackingBackgroundWork` enum; `githubTrackingWatchedPaths`, `makeGitHubTrackingLoop` |
-| `HeartbeatBackgroundWork.swift` | `HeartbeatBackgroundWork` struct; `makeHeartbeatLoop` uses per-condition templates without a model call |
+| `HeartbeatBackgroundWork.swift` | `HeartbeatBackgroundWork` struct; `makeHeartbeatLoop` uses per-condition templates without a model call; `HeartbeatLoop` owns heartbeat work |
 | `HeartbeatCardAction.swift` | `HeartbeatCardAction` enum; `cardActions` |
 | `InboxRewriteGuard.swift` | `InboxRewriteGuard` enum; `readLines`, `writeLines` |
-| `MaintenanceBackgroundWork.swift` | `MaintenanceBackgroundWork` struct; `makeAutoDoctorLoop`, `makeTurnTraceRetentionLoop` |
+| `MaintenanceBackgroundWork.swift` | `MaintenanceBackgroundWork` struct; Doctor scheduling and findings, disk hygiene, weekly self-improvement, retention and backup work, manual weekly-run token lifecycle and digest reads; archived Doctor findings count as routed and clear their wake, while filing failures remain pending |
 | `MemoryConsolidationHygieneRunner.swift` | `MemoryConsolidationHygieneRunner` struct; `tick`, `tickOutcome` |
 | `TelegramBackgroundBridges.swift` | `TelegramAccountModelCatalogPort` struct |
 | `TriggerSchedulerBackgroundWork.swift` | `TriggerSchedulerBackgroundWork` enum; `makeJobWork`, `makeMorningBriefSynthesizer` |
-| `UnconfiguredBackgroundLane.swift` | `UnconfiguredBackgroundLane` enum; `unconfiguredLanePlaceholder` |
-| `WorkshopBackgroundWork.swift` | `WorkshopBackgroundWork` enum; `makeWorkshopExecutor`, `unattendedWorkAllowed` |
+| `WorkshopBackgroundWork.swift` | `WorkshopBackgroundWork` enum; `makeWorkshopExecutor`, `unattendedWorkAllowed`, Full Mac unattended override |
 | `WorkshopExecutorDrainRunner.swift` | `WorkshopExecutorDrainRunner` struct; `physiologyEvents`, `nextMeaningfulDeadline` |
 | `WorkshopPumpLoopRunner.swift` | `WorkshopPumpLoopRunner` struct; `physiologyEvents`, `nextMeaningfulDeadline` |
 
@@ -579,10 +583,14 @@ Directory: `Modules/NativeAgentCore/Sources/Browser/`
 
 | File | Owns |
 |---|---|
+| `Browser+ActiveRuns.swift` | process-local run cancellation registry and attachment latch |
+| `BrowserActionRoutes+DOM.swift` | DOM scripts, bounded reads, result decoding and browser errors |
+| `BrowserActionRoutes+IPC.swift` | authenticated IPC route decisions over window effects |
+| `BrowserIPCServer.swift` | browser IPC routing and shared NativeLoopbackListener transport conformance |
 | `BrowserActionRoutes+NativeActions.swift` | `BrowserActionRoutes`: `runBrowserNativeAction`, `stringInput` |
-| `BrowserActionRoutes.swift` | `BrowserActionRoutes` struct; `observeBrowserMotorAction`, `runBrowser`, task-local `retainRead` delivery of the exact visible read capture |
+| `BrowserActionRoutes.swift` | `BrowserActionRoutes` struct; `observeBrowserMotorAction`, `runBrowser`, direct dry-run/cancel commands to the canonical operation store, task-local `retainRead` delivery of the exact visible read capture |
 | `BrowserLink.swift` | `BrowserLink` struct |
-| `BrowserRouteEffects.swift` | `BrowserRouteEffects` protocol; `beginNavigation`, `cancelNavigation` |
+| `BrowserRouteEffects.swift` | visible browser port; shared begin/finish/cancel lifecycle over BrowserActiveRunRegistry |
 | `BrowserRouteModels.swift` | `BrowserRun`, `NativeActionReceipt`; failed navigation receipts expose the retained openError as detail |
 
 ### ChatOrchestration
@@ -604,6 +612,8 @@ aging alone requests a fixed keep-tail. Provider distillation runs outside the t
 
 | File | Owns |
 |---|---|
+| `TranscriptSearch.swift` | `TranscriptSearchDocument`, `TranscriptSearchResult`, `TranscriptSearchResponse`, `TranscriptSearch` |
+| `SessionMessageProvenance.swift` | `SessionMessageProvenance` |
 | `CarriedAnchorRecollection.swift` | `CarriedAnchorRecollection` enum; `isEnabled`, `seeded` |
 | `ChatCompactionBackupRetention.swift` | `ChatCompactionBackupRetention` enum; `enforce` |
 | `ChatCompactionDistiller.swift` | `ChatCompactionDistiller` struct; `maxSummaryChars`, `thirdPersonSubjectCount` |
@@ -612,16 +622,15 @@ aging alone requests a fixed keep-tail. Provider distillation runs outside the t
 | `ChatSessionAutocompactor.swift` | `ChatSessionAutocompactor` struct; `compactIfNeeded`, `pruneCompactBackups`; `ChatSessionAutocompactionConfig` owns `effectiveWindowTokens` and the read-only `contextWindowReadout` used by page reads and runtime introspection. |
 | `ChatSessionDirective.swift` | `ChatSessionDirective` enum; `safeComponent`, `recordURL` |
 | `ChatSessionIndexReconciler.swift` | `ChatSessionIndexReconciler` actor; `reconcile` |
-| `ChatSessionLockSidecarCleanup.swift` | `reapOrphanedChatSessionLockSidecars` |
-| `ChatToolOutcome.swift` | `ChatToolOutcome` enum; `errorMessage`, `exactResultClass` |
+| `ChatToolOutcome.swift` | exact/display result classes, explanation and common waiting/failure predicates |
 | `ChatTranscriptEvidenceRendering.swift` | `ChatTranscriptEvidenceRendering` enum; `recordedPendingToolStatus`, `recordedToolStatus` |
 | `ChatTranscriptToolMessageKind.swift` | `ChatTranscriptToolMessageKind` enum; `pendingApprovalID`, `pendingApprovalReason` |
-| `ContextBudgetPolicy.swift` | `ContextBudgetPolicy` enum; `compactionHistoryCharacters`, `floors` |
-| `HistoryWindowCursor.swift` | `HistoryWindowCursor` struct |
+| `ContextBudgetPolicy.swift` | Shared model-input budgets for every door; `compactionHistoryCharacters`, `floors` |
+| `HistoryWindowCursor.swift` | `HistoryWindowCursor`, `HistoryWindowCursorStore`; locked advancement persists only changed boundaries |
 | `OutcomeFeedbackStore.swift` | `OutcomeFeedbackStore` struct; `record`, `recordConversationContinuation` |
 | `OutcomeTissueV2.swift` | `OutcomeEvidenceState` enum |
 | `OutcomeTraceIdentity.swift` | `OutcomeTraceIdentity` enum; `normalized` |
-| `SessionDigestProvider.swift` | `SessionDigestProvider` struct; `pointerSentence`, `digest` |
+| `SessionDigestProvider.swift` | Participant-bound prior-conversation selection and frozen handoff; `pointerSentence`, `digest`; peer identity is independent of session-id shape |
 | `SessionHistoryMessageProjection.swift` | `SessionHistoryMessageProjection` enum; `admission`, `project` |
 | `SessionHistoryPromptRenderer.swift` | `SessionHistoryPromptRenderer` enum; `renderDetailed`, `recallQuery` |
 | `SessionHistoryReader.swift` | `SessionHistoryReader` actor; `messages`, `messagesWithStats` |
@@ -641,13 +650,13 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 
 | File | Owns |
 |---|---|
-| `AgentWorkspaceBinding.swift` | `ChatWorkspaceBinding` enum; `pending`, `glance` |
-| `AppRestartCoordinator.swift` | `AppRestartCoordinator` actor; `configure`, `relauncherArgv` |
-| `BotChatContract.swift` | `BotChatContract` struct; `checked` |
+| `AgentWorkspaceBinding.swift` | `ChatWorkspaceBinding` enum; `pending`, `glance`; workspace tool port derives bounded built/recent ability names from canonical tool, skill and sense availability |
+| `AppRestartCoordinator.swift` | Shared detached relauncher spawning; tool restart audit/cooldown/grace, bounded operator menu/restore exit wait and termination injection |
+| `BotChatContract.swift` | `BotChatContract` struct; `checked`, `choice`; helpers follow Providers for Chat unless explicitly pinned, including legacy definitions without a pin field |
 | `BotRunConversation.swift` | `BotRunConversation` enum; `enqueueRequestedCheck`, `dispatch` |
 | `BuilderWorktreeAllocator.swift` | `BuilderWorktreeAllocator` actor; `resolve`, `bind` |
 | `BuiltInToolSchemaFactory+AgentCommunication.swift` | `BuiltInToolSchemaFactory`: `agentCommunicationSchemas` |
-| `BuiltInToolSchemaFactory+CoreSchemas.swift` | `BuiltInToolSchemaFactory`: `coreSchemas` |
+| `BuiltInToolSchemaFactory+CoreSchemas.swift` | `BuiltInToolSchemaFactory`: `coreSchemas`, unchanged `context_expand` descriptor |
 | `BuiltInToolSchemaFactory+Descriptions.swift` | `BuiltInToolSchemaFactory`: extension |
 | `BuiltInToolSchemaFactory+MacSchemas.swift` | `BuiltInToolSchemaFactory`: `appendOptionalSchemas` |
 | `BuiltInToolSchemaFactory+StandingBots.swift` | `BuiltInToolSchemaFactory`: `standingBotSchemas` |
@@ -667,9 +676,8 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 | `InlineInteractionModelOverride.swift` | `InlineInteractionModelOverride` enum; `binding` |
 | `InlineInteractionNeed.swift` | `InlineInteractionNeed` enum; `blocksTurn`, `envelope` |
 | `InlineInteractionRegistry.swift` | `InlineInteractionRegistry` enum; `connectorSetup`, `canonicalConnectorID` |
-| `MCPToolCatalogWarmer.swift` | `MCPToolCatalogWarmer` actor; `kickDetached`, `kickIfDue` |
-| `MemoryRecallPersonaFilter.swift` | `memoryRecallPersonaFilter` |
-| `PeerDataTaintDispatcher.swift` | `PeerDataTaintDispatcher` class; `dispatch`, `peerLine`, `memoryBoundary`, `memorySources` preserve web and memory read provenance |
+| `MCPToolCatalogWarmer.swift` | `MCPToolCatalogWarmer` actor; `kickDetached`, `kickIfDue`; bounded sweeps use `TurnDeadline`, marks retain per-server discovery selection |
+| `PeerDataTaintDispatcher.swift` | `PeerDataTaintDispatcher` class; `peerApproval` shares live trusted-turn and peer-floor decisions between preview and execution; declared lifecycle writes apply CapabilityLifecycle's turn refusal before dispatch; memory notes retain attribution checks; `peerLine` preserves peer read provenance |
 | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`: `impl_tool_result_page` |
 | `SwiftToolDispatcher+AgentBridgeTools.swift` | `SwiftToolDispatcher`: `drivenAgentLaunch`, `drivenAgentContact`, `stampDelegationProducer` |
 | `SwiftToolDispatcher+AgentCommunication.swift` | `SwiftToolDispatcher`: `closeACPConnections`, `builtInAgentLaneUsable`, `impl_agentCommunication` |
@@ -698,20 +706,20 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 | `SwiftToolDispatcher+MacIntegration.swift` | `SwiftToolDispatcher`: `dispatchMacIntegrationTool`, read-only MapKit directions, distance-fraction place lookup and radius-bounded nearby place search via `impl_maps_route` / `impl_maps_search`, sharing `place` / `describe` |
 | `SwiftToolDispatcher+Markets.swift` | `SwiftToolDispatcher`: `impl_market_status`, `impl_market_watchlists`, `impl_tradingview_watchlist`, `impl_market_quote`; quote-provider recovery retains answering provider and failures |
 | `SwiftToolDispatcher+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` retain taint on readback; `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory`, `impl_rebuild_knowledge_graph` |
-| `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`: `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata`, `memoryReadProvenance` |
+| `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`: `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata` |
 | `SwiftToolDispatcher+MomentTools.swift` | `SwiftToolDispatcher`: `impl_memory_moments_pending`, `impl_memory_moment_review` |
 | `SwiftToolDispatcher+OMPBridgeTools.swift` | `SwiftToolDispatcher`: `runOMPMessage`, `ompSessionSaved` |
 | `SwiftToolDispatcher+PersonaTools.swift` | `SwiftToolDispatcher`: `impl_get_persona_doc`, `impl_persona_read`, `impl_persona_write` |
 | `SwiftToolDispatcher+RemoteNodes.swift` | `SwiftToolDispatcher`: `impl_remote_node_list`, `impl_remote_node_execute` |
 | `SwiftToolDispatcher+Sandbox.swift` | `SwiftToolDispatcher`: `resolveSandboxed`, `stringArray`, `normalizeFullMacPathArgument` |
 | `SwiftToolDispatcher+Senses.swift` | `SwiftToolDispatcher`: sense corner resolution and authorized raw material adapters |
-| `SwiftToolDispatcher+SchemaBuilders.swift` | `SwiftToolDispatcher`: `modelVisibleMCPTools`, `modelVisibleMCPToolNames`, `modelVisibleToolNames` |
+| `SwiftToolDispatcher+SchemaBuilders.swift` | `SwiftToolDispatcher`: `modelVisibleMCPTools`, `mountedMCPToolSchemas`, `mcpToolSchemas` |
 | `SwiftToolDispatcher+SkillTools.swift` | `SwiftToolDispatcher`: `impl_list_skills`, `impl_read_skill`, `impl_save_skill` |
 | `SwiftToolDispatcher+StandingBots.swift` | `SwiftToolDispatcher`: `standingBotApprovalReason`, `standingBotsArgumentRefusal`, `impl_standingBots` |
 | `SwiftToolDispatcher+StandingViewTools.swift` | `SwiftToolDispatcher`: `impl_hold_view`, `impl_release_view` |
 | `SwiftToolDispatcher+StudioCanonTools.swift` | `SwiftToolDispatcher`: `impl_studio_canon`, `impl_studio_canon_resolve` |
 | `SwiftToolDispatcher+StudioTools.swift` | `SwiftToolDispatcher`: `impl_studio_shelf`, `studioImageInvitation`, `impl_studio_consult` |
-| `SwiftToolDispatcher+SubprocessSupport.swift` | `SwiftToolDispatcher`: `armSubprocessTimeout`, `interruptThenTerminate`, `reapLaunchedTree` |
+| `SwiftToolDispatcher+SubprocessSupport.swift` | `SwiftToolDispatcher`: `armSubprocessTimeout`, `interruptThenTerminate`, `reapLaunchedTree`, shared bounded invoke/image pipe capture with adapter-specific limits and decoding |
 | `SwiftToolDispatcher+SwarmTools.swift` | `SwiftToolDispatcher`: `impl_agent_swarm` |
 | `SwiftToolDispatcher+ToolCatalog.swift` | Internal executor inventory, model visibility and the single `app` always-on floor |
 | `SwiftToolDispatcher+ToolImplHelpers.swift` | `SwiftToolDispatcher`: `optionalNumber`, `jsonString`, `jsonInt` |
@@ -720,7 +728,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 | `SwiftToolDispatcher+WorkContext.swift` | `SwiftToolDispatcher`: `impl_work_context`, `workContextDeskItem`, `boundedWorkContextValue` |
 | `SwiftToolDispatcher+WorkshopTools.swift` | `SwiftToolDispatcher`: `impl_workshop_submit`, `impl_workshop_status`, `impl_task_ledger_post` |
 | `SwiftToolDispatcher+WorkspaceDesk.swift` | `SwiftToolDispatcher`: `workspaceDesk` |
-| `SwiftToolDispatcher.swift` | Native dispatcher construction and built-in, registry and MCP schemas |
+| `SwiftToolDispatcher.swift` | Native dispatcher construction and built-in, registry and MCP catalogs; named schema construction consumes parsed registry rows and selects before encoding |
 | `ToolCausalBoundary.swift` | `ToolCausalBoundary` enum; `hasCanonicalMotorOwner`, `motorReference` |
 | `ToolResultSections.swift` | `ToolResultSections` enum; `pages` |
 | `WorkshopSynthesizeToolDispatcher.swift` | `WorkshopSynthesizeReadOnlyToolDispatcher` struct; `dispatch`, `listAvailableTools` |
@@ -734,14 +742,13 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnContracts/`
 | `ChatApprovalContracts.swift` | `AutonomyDecision` enum |
 | `ChatPersistenceContext.swift` | `ChatPersistenceContext` enum |
 | `ChatToolBridges.swift` | `PureToolArgumentValidating` protocol; `argumentRefusal` |
-| `ChatToolSessionContext.swift` | `ChatToolSessionContext` enum; `rendersInlineCards`, `withReplyRoute` |
+| `ChatToolSessionContext.swift` | `ChatToolSessionContext` enum; `rendersInlineCards`, `withReplyRoute`; `TurnEnvelope.workIdentity` carries attribution through the active turn and persisted envelope |
 | `ChatTurnExecution.swift` | `ChatTurnExecution` class; `bindHistoryRunID`, `keepCapabilityNote` |
-| `PeerDataTaint.swift` | `PeerDataTaint` class; `withScope`, `markConsumed` |
+| `PeerDataTaint.swift` | `PeerDataTaint` class; `withScope`, `markConsumed`; ability write refusal reads current origin principal and live/carried peer steering |
 | `SwarmChatClientFactory.swift` | `SwarmChatClientFactory` protocol; `makeClient` |
 | `ToolDispatchRecord.swift` | `ToolDispatchRecord` struct |
 | `ToolNoticeBus.swift` | `ToolNoticeBus` enum |
 | `ToolTurnContracts.swift` | `ToolDispatchClient`: `dispatch`, `listAvailableTools`, `listAvailableToolSchemas` |
-| `TurnToolSchemaCatalogSeed.swift` | `TurnToolSchemaCatalogSeed` struct |
 
 ### ChatTurnRuntime
 
@@ -749,12 +756,13 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 
 | File | Owns |
 |---|---|
+| `ChatUpdateNote.swift` | Version note selection and launch transaction with supplied bundle resource/version inputs |
 | `AgentConversationsExports.swift` | Re-exports `AgentConversations` |
 | `AgentWorkspaceExports.swift` | Re-exports `AgentWorkspace` |
 | `ChatLiveTap.swift` | `ChatLiveTap` enum; `observe` (every turn's deltas and saved answer, for the phone) |
 | `ChatOrchestration+Continuation.swift` | `SwiftNativeTurnEngine`: `executeTurnWithStreamingToolLoop`; `TurnCheckpointScope`, serialized `TurnCheckpointWriter`; same-turn transcript/receipt recovery and finished-run cleanup |
 | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory`, `fireAssemblyStageEvent`, `injectingSessionDigest` |
-| `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody`, `joinedProse` |
+| `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody`, `joinedProse`; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; live first-output cuts carry wall-only retry scope until the round succeeds |
 | `ChatOrchestration+ToolDispatch.swift` | Shared per-iteration tool dispatch and refusal of unoffered folded calls |
 | `ChatOrchestration+ToolLoop.swift` | `TurnContext`: `withToolSchemas` |
 | `ChatOrchestration+TurnEngine.swift` | `SwiftNativeTurnEngine`: turn context preparation and provider execution |
@@ -762,12 +770,12 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `ChatOrchestrationClient+Client.swift` | `SwiftNativeChatOrchestrationClient` actor; `drainDeferredMemoryPromotion`, `chat` |
 | `ChatOrchestrationClient+DispatchWrappers.swift` | `FileAccessGatedDispatcher` class; `preApprovalRefusal`, `approvalCardReason` |
 | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`: `runEphemeralToolTurn` |
-| `ChatOrchestrationClient+Factories.swift` | `complete`, `makeChatOrchestrationClient`, `makeGatedToolDispatchClient`, canonical `makeResidentProviderLLMClient` shared by turns and background body work; stall-only calls share a transport without a resource wall |
+| `ChatOrchestrationClient+Factories.swift` | `complete`, `makeChatOrchestrationClient`, `makeGatedToolDispatchClient`, canonical `makeResidentProviderLLMClient` shared by turns and background body work; stall-only calls share a transport without a resource wall; `SwiftNativeMemoryV2RecallingAdapter`: disclosure-aware recall and served-hit credit |
 | `ChatOrchestrationClient+HumanConversationReply.swift` | `SwiftNativeChatOrchestrationClient`: `appendHumanConversationReply` |
 | `ChatOrchestrationClient+MessagePersistence.swift` | `SwiftNativeChatOrchestrationClient`: `reportTranscriptWriteFailure`, `persistPartialIfNeeded`, `appendToolMessage` |
-| `ChatOrchestrationClient+RuntimeHelpers.swift` | `SwiftNativeChatOrchestrationClient`: `personaFingerprint`, `contextFingerprint`, `iso8601` |
+| `ChatOrchestrationClient+RuntimeHelpers.swift` | `SwiftNativeChatOrchestrationClient`: `contextFingerprint`, `iso8601` |
 | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`: `chatStream`, `chatStreamExecution` |
-| `ChatOrchestrationClient+StructuredChat.swift` | `SwiftNativeChatOrchestrationClient`: `emitMetacognitiveTerminalTrace`, `emitTurnFailedTrace`, `emitTurnCancelledTrace` |
+| `ChatOrchestrationClient+StructuredChat.swift` | `SwiftNativeChatOrchestrationClient`: turn-bound carried offers before provider input; `metacognitiveTerminalEvent`, `turnFailedEvent`, `turnCancelledEvent` |
 | `ChatOrchestrationClient+ToolDispatching.swift` | `SwiftNativeChatOrchestrationClient`: `makeTracedGatedDispatcher` |
 | `ChatOrchestrationClient+ToolReceipts.swift` | `SwiftNativeChatOrchestrationClient`: `persistToolReceipt` |
 | `ChatOrchestrationClient+Types.swift` | `ChatOrchestrationClient` protocol; `drainDeferredMemoryPromotion`, `enqueueUserMessage` |
@@ -775,14 +783,15 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `ChatStreamErrorText.swift` | `ChatStreamErrorText` enum; `normalize` |
 | `ChatToolRuntime.swift` | Re-exports `ChatToolRuntime`, `ChatTurnContracts` |
 | `ChatTurnExecution.swift` | `SwiftNativeChatOrchestrationClient`: `chat` |
+| `ChatTurnSteering.swift` | `ChatTurnSteering` actor; open turns and turn-activity clock; atomic resident claim/reservation under the common free-time law; person admission opens immediately |
 | `ChatWrittenFileArtifacts.swift` | `ChatWrittenFileArtifacts`: whole-file receipt selection and canonical recovery references |
 | `ConversationPrefixSeeding.swift` | `ConversationPrefixSeeding` enum; `isOpenAIResponsesLane`, `delivery` |
 | `FirstRunWelcomeTransaction.swift` | `FirstRunWelcomeTransaction` class; `hasConversationRows`, `isPersistedFailureRow` |
-| `HerScreenPreview.swift` | `HerScreenPreview` enum; `glance`, `render` |
+| `HerScreenPreview.swift` | shared screen/room text projection |
 | `InjectionApprovalVerifier.swift` | `ApprovalInboxInjectionApprovalVerifier` struct; `verifyInjectionApproval` |
 | `MacChatRetrySnapshot.swift` | `MacChatRetrySnapshot` struct; `capture`, `stillMatchesLocal` |
-| `MacChatSessionTransactions.swift` | `MacChatSessionTransactions` class; `existingMainSession`, `create` |
-| `MacChatStreamAccumulator.swift` | `ChatStreamAccumulator` actor; `consume` |
+| `MacChatSessionTransactions.swift` | selection intent/transactions, load-completion waiter and running-session navigation |
+| `MacChatStreamAccumulator.swift` | `ChatStreamAccumulator` actor; `consume`; changed-text publication retires while idle and restarts on deltas |
 | `MacChatStreamAdapter.swift` | `MacChatStreamAdapter` enum; `stream`, `bridgeChatStreamEvents` |
 | `MacChatTurnActivity.swift` | `MacChatTurnActivity` struct |
 | `MacChatTurnAdmission.swift` | `MacChatTurnPresentationPort`: `rejectMacChatTurn`, `startChatTurn`, `stopChatStream` |
@@ -791,6 +800,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `MacChatTurnPresentationPort.swift` | `MacChatTurnPresentationPort` protocol; `chatHasConversationRows`, `captureMacWorkContinuation` |
 | `MacChatTurnRetry.swift` | `MacChatTurnPresentationPort`: `admitMacChatRetry`, `runAdmittedMacChatRetry`, `settleMacChatRetry` |
 | `MacChatTurnRuntime.swift` | Canonical Mac admission and lifecycle/Send-next projection; async queue transitions persist through `MacChatTurnLifecycleStore` |
+| `VoiceInputCapture.swift` | native speech/microphone driver and observable capture lifecycle with host consent callbacks |
 | `MacChatTurnStreamConsumer.swift` | `MacChatTurnPresentationPort`: `consumeMacChatStream` |
 | `MacChatTurnStreamSettlement.swift` | `MacChatTurnPresentationPort`: `completeMacChatStream`, `joinFailedMacChatStream`, `settleMacChatStream` |
 | `MindMemoryManager.swift` | `MindMemoryManager` struct; `interpret`, `relevantRecallIDs`; incremental ranked evidence and catalog-budgeted relevance batches |
@@ -801,9 +811,10 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `SwiftToolDispatcherConstruction.swift` | `SwiftToolDispatcher`: extension |
 | `TextMarkerCodec.swift` | `TextMarkerCodec` struct; `calls`, `throughLastMarker` |
 | `ToolLoopSupport.swift` | `ToolLoopTraceObservation`, `ToolDispatchDeadline`, `ToolLoopNoProgressGuard` |
-| `TurnEngineContracts.swift` | `MemoryRecalling`: `recall`, `recordServedContextHits` |
+| `TurnEngineContracts.swift` | `TurnContext` value projections with module-scoped setters and immutable admitted routing; `TurnEngineResult`; `SharedAdaptiveMemoryPromoter`: full turn evidence and telemetry |
 | `TurnObservation.swift` | `TurnObservation` enum; `text`, `apply`, shared trace emission in `record` |
-| `TurnSettle.swift` | `TurnSettle` enum; `requestedResultIntent`, `isWaitingOnCard` |
+| `TurnSettle.swift` | `TurnSettle` enum; `requestedResultIntent`, `waitingOnCard` |
+| `TurnRequest.swift` | `TurnRequest`: shared turn binding; `TurnAdmission`: per-session serialization, bounded admission queues and release/cancellation capacity signals for durable arrivals |
 
 ### ChromeControl
 
@@ -811,6 +822,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChromeControl/`
 
 | File | Owns |
 |---|---|
+| `ChromeExtensionFolder.swift` | extension completeness, staged replacement and registered-host refresh |
 | `ChromeControlRuntime.swift` | `ChromeControlRuntime` actor; authenticated relay and extension attach readiness, manifest-backed extension versions and reconnect-confirmed self-reload; Chrome NativeAgent group membership is tab authority, user-touch ungroups a tab, each conversation remembers its last tab and rebuilds from the group; numeric tab addresses, per-tab reading views, snapshot/element/user-sequence safety and bounded mutation-backed page change streams; only explicit tab.close removes a tab; shutdown and reload leave all tabs open; connection transitions, relay diagnostics, extension errors and browser signature preflight remain |
 
 ### Cognition
@@ -822,8 +834,9 @@ Directory: `Modules/NativeAgentCore/Sources/Cognition/`
 | `CognitiveBackgroundLoops.swift` | `CognitiveMaintenanceLoop` struct; `tick`, `tickOutcome` |
 | `NativeCognitionRuntime+Replay.swift` | `NativeCognitionRuntime`: `makeReplayIntegrationInput` |
 | `NativeCognitionRuntime+StudioWander.swift` | `NativeCognitionRuntime`: `considerStudioWander`, `studioWanderIsInstalled`, `studioWanderInstallationNow` |
-| `NativeCognitionRuntime.swift` | `NativeCognitionRuntime` actor; `markSessionDebug`, `rememberNonLiveTurnKind`; settled live turns trigger one held-memory drain at idle |
-| `NativeCognitionRuntimeModels.swift` | `NativeCognitionPreferenceDefaults` struct |
+| `StudioWanderLane.swift` | `StudioWanderLane` enum; installation, eligibility, carried-hour state and prompt for studio wandering |
+| `NativeCognitionRuntime.swift` | `NativeCognitionRuntime` actor; `rememberNonLiveTurnKind`; Desk candidates/approval context publish together with the read's Desk revision, checked at turn and wake admission; generation orders refreshes; settled live turns trigger one held-memory drain at idle |
+| `NativeCognitionRuntimeModels.swift` | `CognitiveObservatoryDetail` and runtime read models; shared affect validity and organism sample freshness/validity |
 | `SignedPeerEvidence.swift` | `SignedPeerEvidence` struct |
 
 ### CognitiveSubstrate
@@ -833,18 +846,18 @@ Directory: `Modules/NativeAgentCore/Sources/CognitiveSubstrate/`
 | File | Owns |
 |---|---|
 | `CognitiveMetadataSignals.swift` | `CognitiveMetadataSignals` enum; `stringSignals` |
-| `CognitiveSQLiteStore+Reads.swift` | `CognitiveSQLiteStore`: `loadNodes`, `loadRestoreBundle`, `loadArtifacts` |
+| `CognitiveSQLiteStore+Reads.swift` | `CognitiveSQLiteStore`: `loadRestoreBundle`, `loadReceiptRecords` |
 | `CognitiveSQLiteStore.swift` | `CognitiveSQLiteStore` actor; `backupForDoctor`, `saveNodes` |
 | `CognitiveSubstrate+Affect.swift` | `CognitiveSubstrate`: `canonicalAffectProjection`, `decayAffectInMemory`, `applyAffectFromEvent` |
-| `CognitiveSubstrate+Capsule.swift` | `CognitiveSubstrate`: `compileCapsule`, `compileFrozenCapsule`, `compileFrozenCapsulePresentation` |
+| `CognitiveSubstrate+Capsule.swift` | `CognitiveSubstrate`: `compileCapsule`, `compileFrozenCapsulePresentation` |
 | `CognitiveSubstrate+CapsuleCadence.swift` | `CognitiveSubstrate`: `selectInnerLine`, `innerTakeawayCadenceKey`, `threadKindPhrase` |
 | `CognitiveSubstrate+CapsuleFeltSignals.swift` | `CognitiveSubstrate`: `feltTintNodes`, `feltDominantNode`, `feltObjectLabel` |
 | `CognitiveSubstrate+CapsuleSoundEcho.swift` | `CognitiveSubstrate`: `soundEchoRegisterScore`, `soundEchoLandingFactor`, `capsuleCadenceShouldSpeak` |
 | `CognitiveSubstrate+ConversationalAppraisal.swift` | `CognitiveSubstrate`: `relationalWarmthBoost`, `isUserAuthored`, `conversationalAppraisal` |
 | `CognitiveSubstrate+Ingest.swift` | `CognitiveSubstrate`: `ingest`, `ingestResident`, `reconsolidatePendingCompletion` |
-| `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistSnapshot`, `recordReceipt`, `recordReceiptChecked` |
-| `CognitiveSubstrate+Reflection.swift` | `CognitiveSubstrate`: `planReflectionChecked`, `reflectionSourceExcerpts`, `planReflection` |
-| `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplay`, `integrateReplayChecked`, `recordEpisode` |
+| `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistSnapshot`, `recordReceipt` |
+| `CognitiveSubstrate+Reflection.swift` | `CognitiveSubstrate`: `planReflectionChecked`, `reflectionSourceExcerpts` |
+| `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`, `recordEpisode` |
 | `CognitiveSubstrate+Research.swift` | `CognitiveSubstrate`: `setAblation`, `facultyMeasurementSnapshot`, `runResearchExperiment` |
 | `CognitiveSubstrate+Restore.swift` | `CognitiveSubstrate`: `backupPersistentStateForDoctor`, `restorePersistentState`, `stringArrayValue` |
 | `CognitiveSubstrate+Serialization.swift` | `CognitiveSubstrate`: `cleanedSessionId` |
@@ -852,7 +865,7 @@ Directory: `Modules/NativeAgentCore/Sources/CognitiveSubstrate/`
 | `CognitiveSubstrate+StudioEvents.swift` | `CognitiveSubstrate`: `studioJournalFelt`, `studioJournalEvent`, `ingestStudioJournalEntry` |
 | `CognitiveSubstrate+ThoughtSeeds.swift` | `CognitiveSubstrate`: `boundedThoughtSeedSources`, `addThoughtSeed`, `decayThoughtSeedsInMemory` |
 | `CognitiveSubstrate+Values.swift` | `CognitiveSubstrate`: `metadataString`, `isConversationalPresenceStatement`, `isOperationalSubconsciousNoise` |
-| `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead`, `frozenRevisionToken` |
+| `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` |
 | `CognitiveSubstrate.swift` | `CognitiveSubstrate` actor; `waitForMaintenanceTransition`, `beginMaintenanceTransition` |
 | `CognitiveSubstrateContracts.swift` | `CognitiveSubstrateDependencies` struct |
 
@@ -869,13 +882,13 @@ Directory: `Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/`
 | `OrganismDreamRepair.swift` | `OrganismDreamRepair` enum; `applying`, `applyingResidualPressure` |
 | `OrganismField.swift` | `OrganismField` struct; `summary`, `edge` |
 | `OrganismKernel.swift` | `OrganismKernel` actor; `configure`, `admitAfterTurnReaction` |
-| `OrganismLivingDynamics.swift` | `OrganismAnalyticDecay` struct; `value`, `crossingDate` |
+| `OrganismLivingDynamics.swift` | `OrganismAnalyticDecay` struct; `value` |
 | `OrganismModels.swift` | `SomaticSignalKind` enum |
 | `OrganismPrediction+Horizon.swift` | `OrganismPredictiveBody`: `applyingHorizonRefresh` |
 | `OrganismPrediction.swift` | `OrganismPredictiveBody` enum; `predictionID`, `applying` |
 | `OrganismPredictionModels.swift` | `OrganismPredictionKind` enum |
 | `OrganismResidualRepair.swift` | `OrganismResidualRepair` enum; `combinedPressure`, `opportunity` |
-| `OrganismSignalBus.swift` | `OrganismKernel`: `observe` |
+| `OrganismSignalBus.swift` | `SomaticSignalBus` actor; `observe`, `configure` |
 | `OrganismToken.swift` | `OrganismToken` enum; `canonicalToken` |
 
 ### Connectors
@@ -884,20 +897,21 @@ Directory: `Modules/NativeAgentCore/Sources/Connectors/`
 
 | File | Owns |
 |---|---|
+| `LocalPIMConnectorActions+Authorization.swift` | calendar read/write authorization interpretation and EventKit permission prompts; wizard status |
 | `ConnectorActionPlatform.swift` | `ConnectorActionPlatform` protocol; `attentionRouter`, `macAction` |
 | `ConnectorActionReceipt.swift` | `ConnectorActionReceipt` struct |
 | `ConnectorActions.swift` | `ConnectorActions` struct; `runConnectorAction`, `fullMacYoloAdmitted` |
 | `ConnectorOAuthConfig.swift` | `ConnectorOAuthConfig` struct |
 | `ConnectorOAuthRegistry.swift` | `ConnectorOAuthRegistry` enum; `mutateConnectorRegistryEntry`, `checkedConnectorRows` |
-| `ConnectorRegistryActions.swift` | `ConnectorRegistryActions` enum; `updateConnector`, `addWorkspace`, `listWorkspaces`, `searchWorkspace` |
-| `ConnectorWizardActions.swift` | `ConnectorWizardActions` enum; `getConnectorRegistrationStatus`, `registerConnectorApp` |
-| `Connectors+Auth.swift` | `ConnectorAuthClient` protocol; `revokeConnector`, `connectConnector` |
-| `GitHubOAuthCredentialPort.swift` | `GitHubOAuthCredentialPort` protocol; `saveToken`, `saveOAuthToken` |
+| `ConnectorRegistryActions.swift` | connector/workspace registry operations and ordered workspace readback verification |
+| `ConnectorWizardActions.swift` | connector setup registration and verified skill OAuth route mapping |
+| `Connectors+Auth.swift` | `SwiftNativeConnectorAuthClient`: `revokeConnector` |
+| `GitHubOAuthCredentialPort.swift` | GitHub OAuth credential contract; canonical credential-store conformance |
 | `LocalPIMConnectorActions.swift` | `LocalPIMConnectorActions` enum; `calendarListUpcoming`, `calendarCalendars`, `remindersListWrite` |
-| `LocalPIMStore.swift` | `LocalPIMEntity` enum |
+| `LocalPIMStore.swift` | concrete `LocalPIMStore` EventKit session; main-actor mutations, queue-confined reads |
 | `NativeOAuthFlow+ConnectorCredentials.swift` | `NativeOAuthFlow`: `connectorOAuthAppCredentials`, `saveConnectorOAuthApp`, `saveNotionToken` |
-| `NativeOAuthFlow+Connectors.swift` | `NativeOAuthFlow`: `startConnectorOAuthFlow`, `connectorTokenPath` |
-| `NativeOAuthFlow+GitHub.swift` | `NativeOAuthFlow`: `saveGitHubToken`, `completeGitHubDeviceFlow`, `loadGitHubToken` |
+| `NativeOAuthFlow+Connectors.swift` | connector OAuth flows and client credential validation |
+| `NativeOAuthFlow+GitHub.swift` | `NativeOAuthFlow`: `saveGitHubToken`, `completeGitHubDeviceFlow` |
 | `NativeOAuthFlow+Slack.swift` | `NativeOAuthFlow`: `saveSlackToken` |
 
 ### Context
@@ -909,7 +923,9 @@ Directory: `Modules/NativeAgentCore/Sources/Context/`
 | `ContextSelection.swift` | `ContextSelector` struct; `select` |
 | `ContextSelectionContracts.swift` | `ContextOriginClass` enum; `ContextPacketItem` retains memory untrusted sources through body/summary selection |
 | `ContextMemoryLead.swift` | `ContextMemoryLead`: memory age, provenance and stored untrusted-source extraction |
-| `ContextMarkdownCompiler.swift` | `ContextMarkdownCompiler`: bounded Markdown atom compilation; persona GROWTH uses the PersonaEngine episodic-log filter before hashing and parsing |
+| `ContextMarkdownCompiler.swift` | `ContextMarkdownCompiler`: bounded Markdown atom compilation and exact unchanged-source reuse; persona GROWTH uses the PersonaEngine episodic-log filter before hashing and parsing |
+| `ContextFlowCoordinator.swift` | Immutable arena publication and trim rehydration; feedback replay reused only for matching generation, events and decay bucket |
+| `ContextPrewarm.swift` | Bounded advisory admission and planning; immediate usefulness statistics and bounded health count |
 
 ### ContextFlow
 
@@ -917,7 +933,7 @@ Directory: `Modules/NativeAgentCore/Sources/ContextFlow/`
 
 | File | Owns |
 |---|---|
-| `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime` actor; `start`, `stop` |
+| `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime` actor; `start`, `stop`; persona registrations and mirrors share a compiler batch |
 | `NativeMemoryContextProjection.swift` | `NativeMemoryContextProjection`: canonical memory projection, including immutable untrusted-source entities and source hashes |
 | `NativeContextProjectionText.swift` | `NativeContextProjectionText` enum; `clean`, `bounded` |
 | `SensesContextProjection.swift` | `SensesContextProjection`: four bounded unread `news` atoms from `SenseNewsBoard`, reconciled before turn selection, separately rendered and acknowledged only on provider output; expiry/seen exclusion also protects retained generations |
@@ -928,7 +944,6 @@ Directory: `Modules/NativeAgentCore/Sources/Senses/`
 
 | File | Owns |
 |---|---|
-| `SensesContract.swift` | Shared native world types, hub, catalog and bounded private restart-durable unread news board; memory provenance sink seam |
 | `SenseTurnReads.swift` | `SenseTurnReads`: bounded turn-local served-version evidence |
 
 ### Desk
@@ -937,14 +952,17 @@ Directory: `Modules/NativeAgentCore/Sources/Desk/`
 
 | File | Owns |
 |---|---|
+| `DeskParking.swift` | `DeskDeferPreset`; deferred-work interpretation |
+| `DeskNagConfig.swift` | `DeskNagLane`, `DeskNagPanelModel`; canonical nag scope interpretation |
+| `DeskProjection.swift` | `DeskBoardLayout`, `DeskPaletteRow`, `DeskPaletteQuery`, `DeskFuzzy`, `DeskPaletteCommandApplication`, `DeskQuickAction`, `DeskRefAction`, `DeskRefAffordance`; attention, freshness and date interpretation |
 | `DeskClock.swift` | `DeskClock` enum; `nowISO`, `commitStamp` |
 | `DeskContinuation.swift` | `DeskContinuation` struct; `receiptIsUnresolved`, `toJSON` |
 | `DeskModels.swift` | `DeskStatus`: `DeskKind`, `CadenceMode`, `NotifyLevel` |
-| `DeskOperations.swift` | `DeskOpBody` enum |
+| `DeskOperations.swift` | `DeskOpBody` enum; `updateTitle` optionally replaces refs with the same replayable summary update |
 | `DeskStore+Reduction.swift` | `SwiftNativeDeskStore`: `compact`, `aliasSeq`, `orderByAlias` |
-| `DeskStore.swift` | `SwiftNativeDeskStore` struct; `continuation`, `setContinuation` |
+| `DeskStore.swift` | `SwiftNativeDeskStore` struct; process-wide `currentRevision` advances before and after each awaited canonical append under the ops lock; `continuation`, `setContinuation`, `heldBy` (nonacquiring hold read); keyed system findings persist findingKey through create, compaction and archive, preserve closure and person ownership under their filing lock; explicit reopening refreshes evidence in that transaction or files anew after archive, with opt-in ref replacement on the same `updateTitle` op |
 | `DeskStoreRecords.swift` | `DeskError` enum |
-| `MyQueue.swift` | `MyQueue` enum; `entries`, `add`, `isReady` |
+| `MyQueue.swift` | `MyQueue` enum; `entries`, `add`, `isReady`; `Entry.owedToPerson` derives reply obligation from recorded origin, independent of readiness and taint |
 
 ### DeviceSync
 
@@ -971,9 +989,12 @@ start reservation. Mac Integration permissions ride in the core CloudKit snapsho
 as a canonical read projection. Generated phone replies carry JPEG previews
 sharing the chat record budget; full image artifacts remain on the Mac.
 
+`MobileSnapshotBuilder` owns snapshot encoding and post-history session-index
+reads. Heavy snapshot reads start together; publication retains its ordering.
+
 | File | Owns |
 |---|---|
-| `CKLandmine.swift` | `CloudKitHealth` actor; `likelyHealthy` |
+| `CKLandmine.swift` | CloudKit entitlement probes, guarded account-status projection and `withCKTimeout` |
 | `DeviceSyncHost.swift` | `DeviceSyncHost` protocol; `helpersSnapshot`, `helperAction` |
 | `ICloudIncomingTurnForwarder.swift` | `ICloudIncomingTurnForwarder` struct; `redactedRemoteErrorDetail`, `iCloudChatFileAccess` |
 | `ICloudIncomingTurnPort.swift` | `ICloudIncomingTurnPort` protocol; `residentChatClient`, `publishReply` |
@@ -985,6 +1006,7 @@ sharing the chat record budget; full image artifacts remain on the Mac.
 | `MacSyncActionRouter+Scheduler.swift` | `MacSyncActionRouter`: `schedulerAction` |
 | `MacSyncActionRouter+Telegram.swift` | `MacSyncActionRouter`: `telegramAction` |
 | `MacSyncActionRouter+Trust.swift` | `MacSyncActionRouter`: `applyTrustAction` |
+| `MacSyncActionRouter+TrustCommand.swift` | `MobileTrustAction`: checked trust writes |
 | `MacSyncActionRouter.swift` | `MacSyncActionRouter` struct; `surfaceSelection` |
 | `MacSyncEngine+Helpers.swift` | `MacSyncEngine`: `startHelpersSnapshotObservation`, `helpersSnapshotData` |
 | `MacSyncEngine+Inbox.swift` | `MacSyncEngine`: `authenticateInboxFile`, `startInboxQuery`, `quarantineUnauthenticatedInboxFile` |
@@ -994,8 +1016,8 @@ sharing the chat record budget; full image artifacts remain on the Mac.
 | `MacSyncEngine+Notifications.swift` | `MacSyncEngine`: `sendNotificationToPairedDevices` |
 | `MacSyncEngine+Scheduler.swift` | `MacSyncEngine`: `schedulerSnapshotData`, `startSchedulerSnapshotObservation` |
 | `MacSyncEngine+Security.swift` | `MacSyncEngine`: `beginPairingSecretRotation`, `finishPairingSecretRotation`, `actionResponse`, `signedResponse` |
-| `MacSyncEngine+Snapshots.swift` | `MacSyncEngine`: `writeSnapshots`, `encodeSnapshot`, `publishChangedSnapshots` |
-| `MacSyncEngine+Storage.swift` | `MacSyncEngine`: `recordProcessed`, `loadProcessedIds`, `cappedPreservingMarkers` |
+| `MacSyncEngine+Snapshots.swift` | `MacSyncEngine`: `writeSnapshots`, `encodeSnapshot`, `publishChangedSnapshots`; phone turn summaries read directly from `TurnTrace` |
+| `MacSyncEngine+Storage.swift` | `MacSyncEngine`: `recordProcessed`, `restoreState`, `cappedPreservingMarkers`; consolidated replay/digest restoration and device bookkeeping await the shared `DeviceSyncStorage` actor in `DeviceSync.swift` before admission/acknowledgement |
 | `MacSyncEngine+Telegram.swift` | `MacSyncEngine`: `telegramSnapshotData` |
 | `MacSyncEngine+WorkActivity.swift` | `MacSyncEngine`: `startWorkActivityObservation`, `projectWorkshopWorkActivities`, `requestWorkActivityPublication` |
 | `MacSyncInboxAction.swift` | `InboxAction` struct |
@@ -1004,7 +1026,7 @@ sharing the chat record budget; full image artifacts remain on the Mac.
 | `MacSyncRemoteMacControlPort.swift` | `MacSyncRemoteMacControlPort` protocol; `loadTrustPolicy`, `run` |
 | `SecretActionEnvelope.swift` | `SecretActionEnvelope` enum; `open` |
 | `iCloudBridge+DeliveryReceipts.swift` | `iCloudBridge`: `appendChatDeliveryReceipt`, `appendActionResponseDeliveryReceipt`, `appendInboundSuccessReceipt` |
-| `iCloudBridge.swift` | `iCloudBridge` class; `setup`, `startDeviceDrainFallback`, `cloudKitActionResponseMessage` (sending and sizing) |
+| `iCloudBridge.swift` | `iCloudBridge` class; `setup`, `startDeviceDrainFallback`, `cloudKitActionResponseMessage` (sending and sizing), `failedReplyClaims` (startup snapshot or exact delivery event) |
 
 ### Dispatcher
 
@@ -1012,8 +1034,8 @@ Directory: `Modules/NativeAgentCore/Sources/Dispatcher/`
 
 | File | Owns |
 |---|---|
-| `Dispatcher.swift` | `DispatchResult`, `SwiftNativeDispatcher`, `makeDispatcher`; `dispatchSlashCommand` (a chat slash command over the read-only local actions) |
-| `NativeActionDispatch.swift` | `NativeActionDispatch` enum; `swiftNativeDispatcherActions`, `dispatchNativeAction` |
+| `Dispatcher.swift` | `DispatchResult`, read-only `SwiftNativeDispatcher` with a fail-closed writable-handler boundary, `makeDispatcher`; `dispatchSlashCommand` |
+| `NativeActionDispatch.swift` | `NativeActionDispatch` enum; `dispatchNativeAction` uses `LocalConnectorActions.nativeReadOnly` |
 
 ### Dispatcher/Actions
 
@@ -1021,7 +1043,8 @@ Directory: `Modules/NativeAgentCore/Sources/Dispatcher/Actions/`
 
 | File | Owns |
 |---|---|
-| `FileSystemActions.swift` | `FileSystemActions` enum; `resolvePath`, `allowedRoots`, shared mutation fences and reversible `trashFile`; `listDir` owns budgeted allocated disk usage with named partial results; `gitLog`/`gitDiff` own dated repository reads; `FileReadSourceMaterial` descriptor-only source port |
+| `FileSystemActions.swift` | `FileSystemActions` enum; `resolvePath`, `allowedRoots`, shared mutation fences and reversible `trashFile`; `listDir` owns budgeted allocated disk usage with named partial results; `gitLog`/`gitDiff` own dated repository reads; shared Git status parsing and process capture/settlement for Foundation and descriptor-pinned launches; `FileReadSourceMaterial` descriptor-only source port |
+| `LocalConnectorActions.swift` | Canonical file/system handlers and verification flags; `nativeReadOnly` selects the exact seven native/slash tools |
 
 ### DoctorChecks
 
@@ -1029,12 +1052,14 @@ Directory: `Modules/NativeAgentCore/Sources/DoctorChecks/`
 
 | File | Owns |
 |---|---|
-| `AutoDoctorConfig.swift` | `AutoDoctorConfig` struct |
+| `TurnTraceWindowReader.swift` | Measurement-window policy and coverage through canonical TurnTrace framing |
+| `DoctorRunsInspectorChecks.swift` | Inspector health verdict from primitive subscription state; repair eligibility |
+| `SupportDiagnostics.swift` | support diagnostics read model |
 | `DoctorActionRuntime.swift` | `DoctorActionRuntime` struct; `safeDetail`, `mergeReport` |
 | `DoctorChecks.swift` | `SwiftNativeDoctorChecks` actor; `makeDoctorChecks`, `runAll` |
 | `DoctorHealthCard.swift` | `HealthCardSubsystem` struct |
 | `DoctorSafeRepairPolicy.swift` | `DoctorSafeRepairPolicy` enum; `checkIDs`, `appliedRepairCount` |
-| `DoctorStatusProjection+Config.swift` | `DoctorStatusProjection`: `readAutoDoctorConfig`, `boolValue`, `intValue` |
+| `DoctorStatusProjection+Config.swift` | `AutoDoctorConfig`; `DoctorStatusProjection`: `readAutoDoctorConfig`, `boolValue`, `intValue` |
 | `DoctorStatusProjection+Hardening.swift` | `DoctorStatusProjection`: `getProductionHardening` |
 | `DoctorStatusProjection.swift` | `DoctorStatusProjection` enum; `makeHealthCard`, `persistDoctorSnapshot` |
 | `ProductionHardeningSummary.swift` | `ProductionHardeningSummary` struct |
@@ -1052,9 +1077,9 @@ Directory: `Modules/NativeAgentCore/Sources/DreamREMCycle/`
 | `DreamPayload.swift` | `DreamPayload` struct |
 | `DreamRunReservation.swift` | `DreamRunReservation` struct; `acquire`, `release` |
 | `REMConsolidator+GrowthEviction.swift` | `REMConsolidator`: `runGrowthEviction` |
-| `REMConsolidator.swift` | `REMConsolidator` actor; `runWeeklyREM`, `rankedByRecurrence` |
+| `REMConsolidator.swift` | `REMConsolidator` actor; `runWeeklyREM` shares one checked diary window with distillation and filters a fresh tombstone batch; `rankedByRecurrence` |
 | `REMPinsReader.swift` | `REMPinsReader` enum; `read`, `latest` |
-| `REMReport.swift` | `REMReport` struct |
+| `REMReport.swift` | `REMReport`, `REMRunReportPayload`; manual completion counter validation |
 
 ### EngineRuntime
 
@@ -1062,67 +1087,96 @@ Directory: `Modules/NativeAgentCore/Sources/EngineRuntime/`
 
 | File | Owns |
 |---|---|
+| `WorkOverviewRead+Today.swift` | `TodayRow`, `TodayWords`, `TodayDreamDigest`, `TodaySnapshot`, `TodayCollaboration`, `TodayEarlierNote`, `WorkOverviewRead` |
+| `EngineApprovalNotifications.swift` | `ApprovalNotificationDelivery`: approval discovery, pending-state selection and notification delivery coordination |
+| `TranscriptReadProjection.swift` | transcript/read caches, conversation and running-session routes, turn card/trouble projection, opening line and naming |
+| `EngineNotificationActions.swift` | `NativeAgentEngine.handleNotificationAction`: native owner-response interpretation, approval reread and composer admission |
+| `EngineLaunch.swift` | `NativeAgentEngine`: canonical memory migration and launch recovery; root-bound derived-state invalidation; NativeAgentEngine launch/recovery ordering, background loop manifest and surface/workshop/scheduler composition; native effects arrive through EngineBackgroundWorkHost |
+| `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceiptProjection`; Shared context trace/receipt facts and checked Composer receipt reader |
+| `AgentContactRow.swift` | Contact row policy and detached dispatcher/credential/thread assembly; Contact restrictions, canonical identity and health folding for the composed contact facade |
+| `EngineContactThreads.swift` | Contact snapshots, conversation/flight reads and cache validation |
+| `EngineContactCommands.swift` | Person-initiated sends, verified-session stop commands and held-message withdrawal through engine dispatch; Contact sends/stops and core bridge/A2A construction over injected engine and GitHub owners |
+| `EngineDeviceSyncHelpers.swift` | Phone helper edit validation, revisions, provider pin/follow semantics and contact commands; Phone helper/contact actions and Bots shelf policy/provider/run join |
+| `ConnectorStatusProjection+LocalIntegrations.swift` | connector platform actions, EventKit status, proof cache, local PIM and phone readiness; connector proof cache, local PIM and phone push readiness, action evidence |
+| `ConnectorStatusProjection+Actions.swift` | connector action registry, records and checked capability statuses |
+| `ConnectorStatusProjection+Mobile.swift` | mobile connector projection and commands |
+| `MacIntegrationDeliveryActions.swift` | Mac integration protocol execution, scheduler and Spotlight routing, Mac/phone envelopes and phone result routing; Mac/phone notification tool receipts and the native MacControl notification adapter |
 | `BrowserLink.swift` | `BrowserLink` typealias |
 | `CapabilityTraceFeed.swift` | `CapabilityTraceFeed` enum; `path`, `read` |
 | `ChatModels.swift` | `ChatMessage`: `NativeAppChatMessage`, `ChatMessageMetadata`, `CodingKeys` |
 | `ChatStreamingTailBox.swift` | `ChatStreamingTailBox` class |
 | `CodexSelectableModelCatalog.swift` | `CodexSelectableModelCatalog` typealias |
-| `CognitionObservatoryRefreshCoordinator.swift` | `CognitionObservatoryRefreshCoordinator` class; `begin`, `settle` |
-| `ConnectorRecord.swift` | `ConnectorRecord` struct |
-| `ConnectorStatusProjection.swift` | `ConnectorStatusProjection` enum; `connectorRowWithRuntimeOverlay`, `readConnectorRecords`, `updateConnector` |
+| `ConnectorRecord.swift` | `ConnectorRecord`, `ConnectorActionRecord` and descriptor readiness projection |
+| `ConnectorStatusProjection.swift` | `ConnectorStatusProjection` enum; `connectorRowWithRuntimeOverlay`, `readConnectorRecords`, `updateConnector`; connector pages share decayed action/HTTP receipt evidence, including Slack's Web API reads |
 | `DefaultReasoningEffortOptions.swift` | `defaultReasoningEffortOptions` |
 | `DeskBoardRead.swift` | `DeskBoardRead` struct |
-| `EngineApprovals.swift` | `ApprovalRecord`: `ApprovalsFacade` |
-| `EngineCognitionModels.swift` | `CognitionProposalsFeed` enum |
-| `EngineCognitionView.swift` | `DreamEntry`: `CognitionViewFacade`, `DreamDiary` |
-| `EngineDesk.swift` | `DeskFacade` class; `loadBoard`, `taskRows` |
+| `DoctorEmbeddingDownloadCheck.swift` | `DoctorFacade`: embedding download health reading |
+| `DoctorProviderPathReading.swift` | `DoctorProviderPathReading` enum; checked active-provider route and injected platform probe |
+| `EngineApprovals.swift` | `ApprovalsFacade`: approval state, single-flight resolution and outcome/preflight checks; production Slack/AgentMail external-send bindings; `ApprovalRecord`: `ApprovalsFacade` |
+| `EngineCognitionModels.swift` | `CognitionProposalsFeed` enum; `CognitionProposalsFeed`; `DreamRunResult` completion and status interpretation |
+| `EngineCognitionView.swift` | `CognitionViewFacade`: refresh state and `LatestAsyncRequestGate`; `DreamDiary`: diary entry reads go directly through `FileBackedDreamDiary`; CognitionViewFacade snapshot admission, Living Status watched paths and coalesced refresh coordination; `CognitionViewFacade`: composite observatory reads, refresh state and `LatestAsyncRequestGate`; `DreamDiary`: diary entry reads go directly through `FileBackedDreamDiary` |
+| `EngineDesk.swift` | `DeskFacade`: `loadBoard`, `loadOverview`, `taskRows`, scheduler mutation/default repair/publication; parallel independent reads and shared checked overview/phone authority lanes; `DeskToolInvoking`, `DeskToolDispatchRouter`, `DeskActionOutcome`, `DeskActionResultReader`; gated command routing and resident-hour reads; DeskFacade, DeskToolDispatchRouter.perform, native execution admission, page reads and Workshop veto mutation; `DeskFacade`: `loadBoard`, `loadOverview`, `taskRows`; parallel independent reads and shared checked overview/phone authority lanes; `DeskToolInvoking`, `DeskToolDispatchRouter`, `DeskActionOutcome`, `DeskActionResultReader`; gated command routing and resident-hour reads |
 | `EngineDeskFailure.swift` | `DeskFacade`: `boundedLoadFailure`, `loadFailure` |
-| `EngineDeskReadModels.swift` | `DeskLaneState` enum; `boundedReason`, `failed` |
-| `EngineDeskRecordProbe.swift` | `DeskFacade`: `probeExecutionRecords` |
-| `EngineDoctor.swift` | `WatchdogStatus`: `DoctorFacade`, `DoctorReport` |
-| `EngineInbox.swift` | `InboxItemRecord`: `InboxFacade`; proactive `triggers`, `setTrigger`, `configureTrigger` |
+| `EngineDeskReadModels.swift` | Desk movement, live activity, program-family eligibility and execution slices; `DeskPageSnapshot`, `DeskPageContent`, `DeskAttentionStrip`, `DeskGitHubBucket`, `DeskGitHubWaitingRollup` and `DeskPageWords`; Desk movement/activity projections and WorkStatusPublication; each AppModel retains its own publication/coalescing lifetime and supplies only WidgetKit reload; Shared DeskPageContent facts, project/deadline projection and execution verification values |
+| `EngineDoctor.swift` | Doctor observable state, run outcome and tool status envelope; `WatchdogStatus`: `DoctorFacade`, `DoctorReport` |
+| `EngineDoctor+Cognition.swift` | `EngineDoctorRuntime`: cognition health and repair |
+| `EngineDoctor+FirstTurnRefresh.swift` | `DoctorFacade`: one launch refresh after a persisted terminal turn trace |
+| `EngineDoctor+StatusChecks.swift` | `DoctorFacade`: Desk attention and activity status checks |
+| `EngineDoctorRuntime.swift` | `EngineDoctorRuntime`, `EngineDoctorPlatformPort`; live health interpretation, repair admission and pending-transition wake ownership; `EngineDoctorRuntime`, `EngineDoctorPlatformPort`; live health interpretation, repair admission, Support Snapshot result reuse and pending-transition wake ownership |
+| `EngineInbox.swift` | Inbox facade, card action/proactive projections and cross-lane prominence; global OwnerAttentionPolicy count remains distinct; `InboxItemRecord`: `InboxFacade`; proactive `triggers`, `setTrigger`, `configureTrigger` |
 | `EngineMCPActions.swift` | `MCPUIActionAuthority`: `runtime` |
-| `EngineMemory.swift` | `ProposalRecord`: `MemoryFacade`; `graphView`, `searchGraph`, `KnowledgeGraphViewRead` |
-| `EnginePresentationModels.swift` | `TelegramPresentationSnapshot`: `TelegramVoiceTranscriptionStatus`, `TelegramReceipt`, `CodingKeys` |
-| `EngineProviderHelpers.swift` | `ProvidersFacade`: `readJSONObject`, `readModelRoutingConfig`, `stringValue` |
+| `EngineMemory.swift` | `ProposalRecord`: `MemoryFacade`; `graphView`, `searchGraph`, `KnowledgeGraphViewRead`; `MemoryFacade`: proposal read status, durable review-reminder crossing, `graphView`, `searchGraph`; `ProposalRecord`, `KnowledgeGraphViewRead` |
+| `EnginePresentationModels.swift` | `TelegramPresentationSnapshot`: `TelegramVoiceTranscriptionStatus`, `TelegramReceipt`, `CodingKeys`; Shared route vocabulary, SidebarItem, PageTab, UserDisplayFormatters and temporal/receipt presentation values; transport snapshots; shared inline card vocabulary/projection and setup fields; identity grammar, tool summaries and message provenance |
+| `NativeAgentWidgetSnapshot.swift` | Shared widget wire and stale-activity interpretation; compiled directly into the widget extension |
+| `EngineProviderHelpers.swift` | `ProvidersFacade`: checked settings refresh, credential verdicts, provider/model/inheritance/readback selection, auth normalization and CLI credential transactions; `ProvidersFacade`: `readModelRoutingConfig`, `stringValue`; ProvidersFacade routing reads, model grouping/cache/effort eligibility and quiet provider policy |
 | `EngineProviders.swift` | `ProvidersFacade`: `connections`, `modelCatalog`, `list`, `configureProvider`, `saveSurfaceSelection`; presentation and writes over ProviderRouting |
-| `EngineRouteError.swift` | `DaemonError` enum |
+| `EngineDeviceSync+Snapshots.swift` | Phone snapshot/action adapter, memory-proposal Codable projection, signed incoming-turn delivery and handoff ordering; native presentation and cross-area assembly arrive through ports |
+| `EngineProviders+Adoption.swift` | blank-surface provider adoption, connect/consent sequencing and serialized chat-brain save generation/rollback |
+| `EngineProviders+Probe.swift` | `ProvidersFacade`: `testProvider`, `clearProvider` |
+| `EngineRouteError.swift` | Engine route failures and shared UserFacingError interpretation |
 | `EngineSync.swift` | `SyncFacade` class; `observeStatus`, `setStatus` |
-| `EngineTelegram.swift` | `TelegramFacade` class; `configuration`, `loadStatus`, `load` |
-| `EngineTelegramRouting.swift` | `TelegramBrainResolution` struct |
-| `EngineTools.swift` | `ToolsFacade` class; `mcp`, `listMCPSessions`, `loadManifest`, `promote`, `quarantine`, `updateTool` |
+| `EngineTelegram.swift` | Telegram facade and tool status envelope; `TelegramFacade` class; `configuration`, `loadStatus`, `load` |
+| `EngineTelegram+Commands.swift` | Telegram configuration and mobile commands; Telegram token admission, settings and delivery commands, typed diagnostic-clear receipt |
+| `EngineTelegram+Reply.swift` | Telegram reply delivery and result models |
+| `EngineTools.swift` | ToolsFacade: tools/MCP state, slash manifest projection and planning, post-write verification |
 | `EngineCapabilityLifecycle.swift` | `CapabilityLifecycleCommands` struct; skill/tool commands, approval filing and decision receipts; `CapabilityCommandOutcome` invalidates UI projections |
-| `EngineTurnContinuation.swift` | `TurnContinuationRuntime` struct; process checkpoint resume, Desk verification/resumption and approval follow-up share turn admission and reply settlement; composes existing TurnTrace state and helper ownership |
-| `EngineTranscripts.swift` | `TranscriptsFacade`: `messages`, `setMessages`, `streamingTailBox` |
-| `EngineTrust.swift` | `TrustFacade` class; `loadCapabilities`, `load`; capability `catalog`, `catalogSources`, `packInstalls`, `saveCatalogSource` |
-| `EngineTurns.swift` | `TurnsFacade` class; `lifecycle`, `screenPreview` |
-| `EngineWorkshopObservatory.swift` | `WorkshopScoreView` struct |
+| `EngineTurnContinuation.swift` | `TurnContinuationRuntime` struct; process checkpoint resume, Desk verification/resumption and approval follow-up share turn admission and reply settlement; caller-result recovery registers with the retained task's worker and cancellation owner; completion destination recovery uses the bound engine and attention router; composes existing TurnTrace state and helper ownership; retains anchor mirror intent and reconciles its lifecycle with injected platform senders; `TurnContinuationRuntime` struct; process checkpoint resume, Desk verification/resumption and approval follow-up share turn admission and reply settlement; caller-result recovery registers with the retained task's worker and cancellation owner; composes existing TurnTrace state and helper ownership; retains anchor mirror intent and reconciles its lifecycle with injected platform senders |
+| `EngineTranscripts.swift` | `TranscriptsFacade`: per-session observable structure slots, `messages`, `setMessages`, `streamingTailBox`, presentation index warming, first-conversation receipt/person lookup; `ChatTranscriptCache`: off-main shell reads and shared file-identity cache for transcript projections and raw context statistics; TranscriptsFacade per-session structural slots; ChatTranscriptCache and CommandPaletteMessageIndex saved transcript reads; observable transcript slots/cache, session transactions/unread accounting, stream/resume/settlement, mutation, session naming and slash execution |
+| `EngineTrust.swift` | Checked `TrustFacade`; `loadCapabilities`, `load`, backup read publication; capability `catalog`, `catalogSources`, `packInstalls`, `saveCatalogSource`; inbox enabled policy read/patch; `TrustFacade` class; `loadCapabilities`, `load`; capability `catalog`, `catalogSources`, `packInstalls`, `saveCatalogSource` |
+| `EngineTurns.swift` | `TurnsFacade` class; `lifecycle`, `screenPreview`; TurnsFacade lifecycle/screen preview/busy predicate; compaction, slash dispatch and workshop session composition |
+| `EngineWorkshopObservatory.swift` | `WorkshopScoreView`, `DeskPursuitVetoRationale`; Workshop read projections |
 | `LatestAsyncRequestGate.swift` | `LatestAsyncRequestGate` struct; `begin`, `accepts` |
 | `LivingStatusRefreshCoalescer.swift` | `LivingStatusRefreshCoalescer` struct; `requestRefresh`, `completePass` |
 | `MacChatScreenPreview.swift` | `MacChatScreenPreview` struct; `merged` |
 | `NativeAgentAppChatSurfaceProfile.swift` | `NativeAgentAppChatSurfaceProfile` enum |
 | `NativeAgentChatApprovalFiler.swift` | `NativeAgentChatApprovalFiler` actor; `fileApprovalRequest`, `peerRequesterName` |
-| `NativeAgentEngine.swift` | Core composition root; chat clients, tool dispatch chains and resident service facades |
-| `NativeAgentEnginePorts.swift` | Platform ports consumed by the core composition root |
+| `NativeAgentEngine.swift` | Core live/isolated root selection, chat/tool composition and resident service facades |
+| `NativeAgentEnginePorts.swift` | Once-installed native host factories, body effects and shared EngineCognitionHost defaults |
 | `NextGenStatusModels.swift` | `NextGenSummary` struct |
-| `NextGenStatusProjection.swift` | `NextGenStatusProjection` struct; `getNextGenSummary`, `getNextGenPhases` |
+| `NextGenStatusProjection.swift` | NextGen snapshot, phase projection and receipt merge |
 | `PanelRefreshStatus.swift` | `PanelRefreshStatus` struct |
 | `PersonalityGrowthSummary.swift` | `PersonalityGrowthSummary` struct |
 | `RuntimeReadProjection+Feeds.swift` | `RuntimeReadProjection`: `getNotificationStatus`, `getBrowserStatus`, `skills`, `runs`, `tailJSONL` |
 | `RuntimeReadProjection+Improvement.swift` | `RuntimeReadProjection`: `swiftImprovementGauntlet` |
 | `RuntimeReadProjection+Personality.swift` | `RuntimeReadProjection`: `swiftPersonalityGrowth` |
+| `RuntimeReadProjection+QuietPages.swift` | quiet page and item read projections |
+| `NextGenActionExecution.swift` | capability action probes and execution receipts |
 | `RuntimeReadProjection+Traces.swift` | `RuntimeReadProjection`: `getTraces`; `RuntimeReadError` enum |
 | `RuntimeReadProjection.swift` | `RuntimeReadProjection` enum; `getSessionContext` |
 | `RuntimeSummaryModels.swift` | `KernelGuardrail` struct |
 | `RuntimeTrace.swift` | `RuntimeTrace` struct |
 | `SessionContextStatus.swift` | `SessionContextStatus` struct |
 | `SurfaceRuntimeStatusModels.swift` | `NotificationRuntimeStatus` struct |
-| `TolerantDisplayStringDecoding.swift` | `decodeTolerantDisplayString` |
+| `TolerantDisplayStringDecoding.swift` | `JSONValue.nextGenDisplayString` |
 | `WorkOverviewRead.swift` | `WorkOverviewRead` enum; `project`, `text` |
 
 ### GitHubConnector
 
 Directory: `Modules/NativeAgentCore/Sources/GitHubConnector/`
+
+Direct GitHub HTTP reads append transport verdicts to the shared connector-action
+proof ledger. `FeedPolicy` supplies that ledger's existing retention budget;
+connector surfaces continue to read `ConnectorStatusProjection`.
 
 | File | Owns |
 |---|---|
@@ -1143,8 +1197,11 @@ Directory: `Modules/NativeAgentCore/Sources/KnowledgeGraph/`
 | File | Owns |
 |---|---|
 | `KnowledgeGraph+CanonicalRebuild.swift` | `SwiftNativeKnowledgeGraphIndexer`: `rebuildMemoryDerivedGraphFromCanonicalStore`, `reconcileMemoryIndexFingerprints` |
-| `KnowledgeGraph+MemoryIndexing.swift` | `KnowledgeGraphMemoryFact` struct |
-| `KnowledgeGraph+PrimaryUserIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: `resolvePrimaryUserName`, `consolidatePrimaryUserEntities`, `removeUnreferencedPrimaryUserRole` |
+| `KnowledgeGraph+MemoryIndexing.swift` | `KnowledgeGraphMemoryFact`; ID-only canonical indexing and generation/mode-fenced projection reconciliation |
+| `KnowledgeGraph+PrimaryUserIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: shared `profileNames`, `resolvePrimaryUserName`, `consolidatePrimaryUserEntities`, `removeUnreferencedPrimaryUserRole` |
+| `KnowledgeGraph+SQLite.swift` | Checked prepared-pool boundary and shared entity/edge serialization for canonical graph reads and legacy import; batched entity reads retain per-entity relationship limits and failures in one transaction |
+| `KnowledgeGraphReader.swift` | `SwiftNativeKnowledgeGraphReader`: one checked backend admission for bounded single and batched SQLite reads, optional entity enrichment and immutable legacy snapshots |
+| `KnowledgeGraphTypedRead.swift` | Typed checked projections on `SwiftNativeKnowledgeGraphReader` |
 | `KnowledgeGraphProjectionModels.swift` | `AgentGraphNode` struct |
 | `KnowledgeGraphReadProjection.swift` | `KnowledgeGraphReadProjection` enum; `canonicalAgentGraphProjection`, `canonicalKnowledgeGraphSnapshotData` |
 | `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` | `SwiftNativeKnowledgeGraphIndexer`: `extractEntities`, `taggedNameIsCredible` |
@@ -1156,9 +1213,37 @@ Directory: `Modules/NativeAgentCore/Sources/MCPDispatcher/`
 | File | Owns |
 |---|---|
 | `MCPActionModels.swift` | `MCPConsentRecord`, `MCPResource` structs |
-| `MCPResultEvidence.swift` | `MCPResultEvidence` enum; `project`, `activityReceipt` |
+| `MCPDispatcher.swift` | `SwiftNativeMCPDispatcher` actor; checked consent storage, selected-server identity validation and shared `ToolAdmission` decisions for chat and UI; each surface retains refusal/card presentation |
+| `MCPSubprocess+LiveCache.swift` | Shared tools/resources discovery and generation-fenced live cache; tools alone publish the persisted catalog |
+| `MCPSubprocess+Pool.swift` | Generation/identity-fenced subprocess ownership, crash backoff and one idle-deadline arming path |
+| `MCPSubprocess+Process.swift` | Stdio framing, native writes and remove-once RPC waiters owning their cancellable deadlines |
+| `MCPResultEvidence.swift` | MCP result evidence and Activity receipt reads |
 | `MCPUIActions+Registry.swift` | `MCPUIActions`: `mapConsent`, `grantConsent`, `revokeConsent`, `listTools`, `listResources` |
-| `MCPUIActions.swift` | `MCPUIActions` enum; `evaluateMCPUIAdmission`, `callMCPTool` |
+| `MCPUIActions.swift` | MCP configuration actions, input schema validation and argument conversion |
+
+### MacIntegration
+
+Directory: `Modules/NativeAgentCore/Sources/MacIntegration/`
+
+| File | Owns |
+|---|---|
+| `MacAppleScriptBridge+Mail.swift` | `MacAppleScriptBridge`: `mailListRecent`, `mailSearch`, `mailSend`, `mailDraft` |
+| `MacAppleScriptBridge+MailWorkspace.swift` | `MacAppleScriptBridge`: `mailWorkspaceRead`, `mailReadScope`, `mailIndexDatabase`, `mailSenders` (exact grouped sender counts), `mailFileRead`, `mailAttachment` (paired-identity .emlx bodies, MIME/table decoding and local attachments) |
+| `MacAppleScriptBridge+MessagesNotes.swift` | `MacAppleScriptBridge`: `messagesRecentThreads`, `messagesSend`, `notesModify` (exact-note update or reversible deletion) |
+| `MacAppleScriptBridge+Music.swift` | `MacAppleScriptBridge`: `musicSearchLibrary`, `musicListLibrary`, `musicListPlaylists` |
+| `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge`: delegates `runAppleScript` to MacControl, skill hand-back and integration envelopes; `isMusicNoCurrentTrackError`, `deniedEnvelope` |
+| `MacAppleScriptBridge.swift` | integration executor namespace; OSA remains in SystemAppleScriptAdapter |
+| `MacContactsExecutor.swift` | concrete `CNContactStore` ownership, authorization, selection, mutation validation, name cache and projection |
+| `MacMessagesHistory.swift` | bounded Messages SQLite reads and folded matching |
+| `MacMessagesTypedString.swift` | bounded attributed-body archive decoding |
+
+### MultimodalTTS
+
+Directory: `Modules/NativeAgentCore/Sources/MultimodalTTS/`
+
+| File | Owns |
+|---|---|
+| `MultimodalTTS+VoiceSelection.swift` | voice authority/routing, native/cloud playback, generations/cancellation, voice preference and auto-read decision |
 
 ### MacControl
 
@@ -1166,9 +1251,12 @@ Directory: `Modules/NativeAgentCore/Sources/MacControl/`
 
 | File | Owns |
 |---|---|
-| `MacAXAttributeRead.swift` | `MacAXAttributeRead` enum; visible list/table/outline child ordering shared by reads and action paths, on-screen/total counts; `copyTextRange`, `copyRaw`, shared identity `copyLabel` retaining redaction captions, separate display names with help cleanup and explicit AX title-element captions |
+| `MacControlActionRoutes+PlatformPolicy.swift` | checked Trust policy provider and bounded process-result interpretation |
+| `MacControl+Adapters.swift` | system adapters, Automation targets and permission status |
+| `MacControlBridge.swift` | authenticated core loopback listener, admission, connection lifecycle and recovery gating |
+| `MacControlBridgeProcesses.swift` | `MacControlBridgeProcesses` class; `requestCancellation`, `consumeCancellation` |
+| `MacAXAttributeRead.swift` | `MacAXAttributeRead` enum; visible list/table/outline child ordering shared by reads and action paths, on-screen/total counts; `copyTextRange`, `copyRaw`, `copyWindowIdentity`, shared identity `copyLabel` retaining redaction captions, separate display names with help cleanup and explicit AX title-element captions |
 | `MacScreenPageCompiler.swift` | `MacScreenPageCompiler` enum; complete nested AX reading order, structural/activation alias folding, adjacent checkbox captions in structured and aggregate documents, document title ownership, sentence-first links including aggregate document text, AX landmark and card sections, live-region text with duplicate container folding, display cleanup after full-context redaction, composite rows with status details and exact related-action bindings |
-| `MacAXWindowIdentityRead.swift` | `MacAXWindowIdentityRead` enum; `copy` |
 | `MacAppSourceEvents.swift` | `MacAppSourceEvents` class; event-backed running-app AX observation, coalescing, cancellation and notification-stall completion for cold reads |
 | `MacAppWindowText.swift` | `MacAppWindowText` enum; one positional-redacting on-device recognizer for current app-window capture and ephemeral whole-window shots before text-only retention |
 | `MacVisionTextGeometry.swift` | `VisionRect`, `VisionSize`, `VisionTextBox`; shared image-pixel OCR geometry |
@@ -1183,19 +1271,19 @@ Directory: `Modules/NativeAgentCore/Sources/MacControl/`
 | `MacControl+OperationSupport.swift` | `SwiftNativeMacControl`: `attachingOperation`, `replayResult`, `unknownResult` |
 | `MacControl+Perception.swift` | `SwiftNativeMacControl`: `handleRead`, `documentPath` |
 | `MacControl+SystemActions.swift` | `SwiftNativeMacControl`: `handleFileRead`, `handleFileWrite`, `handleFileList`, `handleMedia` (Now Playing system keys and running-player observations) |
-| `MacControlActionRoutes.swift` | `MacControlActionRoutes` enum; `auditPath`, `run` |
+| `MacControlActionRoutes.swift` | Mac control dispatch receipts plus workbench availability and category policy |
 | `MacControlBridgeContracts.swift` | `MacControlBridgeInfoRouteResponse` struct; `responseObject` |
 | `MacControlBridgeRuntime.swift` | `MacControlBridgeRuntime` class; `recoverInterruptedOperations`, `infoRouteResponse` |
 | `MacFourVerbs+Act.swift` | `MacFourVerbs`: `act`, `addAttention`, `frontChangedWords` |
 | `MacFourVerbs+Navigation.swift` | `MacFourVerbs`: `go`, `applicationURL`, `webURL` |
-| `MacFourVerbs+Observation.swift` | `MacFourVerbs`: `screen`, `observedReply`, `sight` |
+| `MacFourVerbs+Observation.swift` | `MacFourVerbs`: `screen`, `observedReply`, `sight`; call-local complete AX read shared with pixel capture under window identity and frame-generation validation |
 | `MacFourVerbs+PerceptReconstruction.swift` | `MacFourVerbs`: `percept`, `partition`, `supplementalDuplicateIndex` |
 | `MacFourVerbs+PhysicalActions.swift` | `MacFourVerbs`: `performPhysical` |
 | `MacFourVerbs+ScreenPresentation.swift` | `MacFourVerbs`: supplemental AX native-page merge, `zoom`, `parseVerb`, `isRightClick` |
 | `MacFourVerbs+TargetResolution.swift` | `MacFourVerbs`: `resolve`, `answers`, `bareNumberNote` |
 | `MacFourVerbs+Wait.swift` | `MacFourVerbs`: `wait` |
 | `MacFourVerbs.swift` | `MacFourVerbs` struct |
-| `MacFourVerbsContracts.swift` | `SwiftNativeMacControl`: `MacFourVerbsHost`, `MacFourVerbsSupplementalTarget`, `MacFourVerbsSupplement` |
+| `MacFourVerbsContracts.swift` | `MacFourVerbsSupplementalTarget`, `MacFourVerbsSupplement`, `MacFourVerbsSupplementalPerceptionSource`; four verbs dispatch through `MacControlClient` |
 | `MacScreenView.swift` | `MacScreenShot`: `cropped` |
 | `MacScreenViewCapture.swift` | Window/display capture selection and `SystemMacScreenCaptureSource`; exactly-once callback cancellation invalidates results and resumes immediately, with no cancellation-ignoring join on an unabortable ScreenCaptureKit callback |
 | `MacScreenViewRenderer.swift` | `CoreGraphicsMacScreenImageRenderer` struct; `renderPNG`, `encodePNG` |
@@ -1206,37 +1294,40 @@ Directory: `Modules/NativeAgentCore/Sources/MemoryV2/`
 
 | File | Owns |
 |---|---|
-| `EmbeddingModelDownload.swift` | `EmbeddingModelDownload` actor; `ranges`, `assemble` |
+| `EmbeddingModelDownload.swift` | `EmbeddingModelDownload` actor; `ranges`, `assemble`; shared status text and progress projection |
 | `EmbeddingStatusReadiness.swift` | `EmbeddingStatusReadiness` struct |
-| `InMemoryMemoryStorage.swift` | `InMemoryMemoryStorage` actor; `lookupMemoryRecord`, `listMemory` |
 | `LegacyCorrectionScopeMigration.swift` | `LegacyCorrectionScopeMigration` enum; `runIfNeeded`, `migrationsDir` |
 | `MemoryConsolidationGate+Database.swift` | `MemoryConsolidationGate`: `transactionalTableSwap`, `backupLiveStore`, `sweepBackups` |
 | `MemoryConsolidationGate+Receipts.swift` | `MemoryConsolidationGate`: `writeManifest`, `readManifest`, `readReceipt` |
 | `MemoryConsolidationGateContracts.swift` | `MemoryConsolidationDiff` struct |
-| `MemoryConsolidationHygiene.swift` | `MemoryConsolidationHygiene` enum; `runOnce`, `lastRunPath` |
+| `MemoryConsolidationHygiene.swift` | `MemoryConsolidationHygiene` enum; `runOnce`, `lastRunPath`, consolidation and hygiene report projection |
+| `MemoryEmbeddingEpoch.swift` | `MemoryEmbeddingEpoch`, `MemoryEmbeddingBatch`; launch epoch reconciliation on the canonical memory owner |
 | `MemoryHygieneReport.swift` | `MemoryHygieneReport` struct |
 | `MemoryRecallScoring.swift` | `MemoryRecallScoring` enum; `parseTimestamp`, `decayFactor` |
 | `MemoryRepairOneShot.swift` | `MemoryRepairOneShot` enum; `stageIfNeeded`, `stageLegacyNoteDupPurge` |
 | `MemoryStatusModels.swift` | `MemoryVectorStatus` struct |
-| `MemoryStatusProjection.swift` | `MemoryStatusProjection` enum; `getMemoryVectorStatus`, `getMemoryV2Status` |
+| `MemoryStatusProjection.swift` | `MemoryStatusProjection` enum; vector, MemoryV2 and embedding runtime status/action envelopes and recent misses; `MemoryV2NativeStackSnapshot` reads native stack health |
+| `MemoryStatusProjection+WireModels.swift` | memory status wire models |
 | `MemoryStorage+Codecs.swift` | `MemoryStorage`: `validateTemporalEvidence`, `contentHash`, `nowISO8601` |
-| `MemoryStorage+EmbeddingEpoch.swift` | `MemoryStorage`: `embeddingCorpusSnapshot`, `frozenCopy`, `embeddingEpochState` |
+| `MemoryStorage+EmbeddingEpoch.swift` | `MemoryStorage`: `embeddingCorpusSnapshot`, `embeddingEpochState` |
 | `MemoryStorage+Integrity.swift` | `MemoryStorage`: `requireSemanticIntegrity`, `projectionGenerationFingerprint`, `createConsistentBackup` |
 | `MemoryStorage+Migrations.swift` | `MemoryStorage`: `adoptLedgerlessGraphStoreIfNeeded` |
-| `MemoryStorage+Proposals.swift` | `MemoryStorage`: `repairSupersededTombstones`, `insertProposal`, `stagePendingProposal` |
-| `MemoryStorage+Recall.swift` | `MemoryStorage`: `invalidateRecallCache`, `recall`, `recallReportingKeywordFallback` |
+| `MemoryStorage+Proposals.swift` | `MemoryStorage`: `repairSupersededTombstones`, `stagePendingProposal`, `updateProposalMetadata` |
+| `MemoryStorage+Recall.swift` | `MemoryStorage`: `invalidateRecallCache`, shared `rankedRecall` scoring and bounded `recall` deduplication, canonical recall-generation cache |
 | `MemoryStorage+Tombstones.swift` | `MemoryStorage`: `addTombstone`, `removeTombstone`, `upsertTombstone` |
 | `MemoryStorageModels.swift` | `MemoryV2Defaults` enum |
 | `MemoryV2+ConsolidationGate.swift` | `MemoryConsolidationGate` enum; `gateLockTarget`, `withGateLock` |
 | `MemoryV2+ConsolidationStorageSupport.swift` | `MemoryConsolidationGate`: `consolidationDir`, `candidatesDir`, `candidateRoot` |
-| `MemoryV2+EmbeddingRuntime.swift` | `EmbeddingRuntimeSnapshot` struct |
+| `MemoryV2+EmbeddingRuntime.swift` | `EmbeddingRuntimeSnapshot`; canonical runtime embedding backend with performance residency |
 | `MemoryV2+PolicyGate.swift` | `MemoryPolicyGate` enum; `isEnabled`, `knowledgeGraphEnabled` |
 | `MemoryV2+Proposals.swift` | `SwiftNativeMemoryV2`: `propose`, `acceptProposal`, `supersedingAcceptance` |
-| `MemoryV2+Recall.swift` | `SwiftNativeMemoryV2`: `recordRecallHits`, `recall`, `readMemoryRecord` |
-| `MemoryV2+Storage.swift` | `MemoryStorage` actor; `attachUserMDGenerator`, `attachSpotlightHook` |
+| `MemoryV2+Recall.swift` | `SwiftNativeMemoryV2`: `recordRecallHits`, `recall`, `readMemoryRecord`; invocation-local ranked voices reused for disclosure refill |
+| `MemoryV2+SharedInstance.swift` | Concrete `MemoryStorageBridge` translates canonical records; attachment readiness, projection hooks and unavailable-storage admission |
+| `MemoryV2+Spotlight.swift` | Canonical generation-proven rebuild shared by launch and repair; isolated roots never alter system Spotlight |
+| `MemoryV2+Storage.swift` | `MemoryStorage` actor; atomic legacy import and conversion, ordered graph hooks, projection attachment, scalar `statusCounts`, checked `curationPage` |
 | `MemoryV2+Wiring.swift` | `SwiftNativeMemoryV2`: `duplicateProvenancePatch`, `store`, `isRejected` |
-| `MemoryV2.swift` | `SwiftNativeMemoryV2` actor; `setDiagnosticSink`, `emitDiagnostic` |
-| `MemoryV2Contracts.swift` | `MemoryStorageProtocol`: `listMemory`, `insert`, `updateMemory`; `MemoryPatchContract` preserves untrusted sources through rewrites and duplicate collapse |
+| `MemoryV2.swift` | `SwiftNativeMemoryV2` actor; `emitDiagnostic` |
+| `MemoryV2Contracts.swift` | Current recall/proposal contracts; `MemoryPatchContract` preserves untrusted sources through rewrites and duplicate collapse |
 | `MemorySenseProvenance.swift` | `MemorySenseProvenance`; `MemoryStorage.markVersionWrong`: durable sense-version warning metadata |
 | `MemoryDataProvenance.swift` | `MemoryDataProvenance`: stamp, retain and consume untrusted memory sources across writes and readbacks |
 
@@ -1246,14 +1337,16 @@ Directory: `Modules/NativeAgentCore/Sources/NativeAgentCore/`
 
 | File | Owns |
 |---|---|
+| `BridgeCore.swift` | Shared HTTP framing, loopback/authentication admission and response transport |
+| `NativeLoopbackListenerParameters.swift` | Loopback listener construction, generation and rebind lifecycle |
 | `LLMCompatibilityPrompt.swift` | `llmCompatibilityPrompt` |
 | `ModuleLogging.swift` | `ModuleLog`: shared formatted, credential-redacted public diagnostics with each module's existing category |
 | `ContextSecretContentPolicy.swift` | Shared derived-context secret policy; linear nested percent decoding and ordered URL extraction with authoritative whole-text and query-assignment redaction before and after news composition; Context compiler, native news and JavaScript helper use this same owner |
 | `NativeActionRecord.swift` | `NativeActionRecord` struct |
-| `NativeAgentBuildIdentity.swift` | `NativeAgentBuildIdentity` struct; `from`, `writeLaunchStamp` |
+| `NativeAgentBuildIdentity.swift` | process-cached current identity, injectable `from`, `writeLaunchStamp` |
 | `NativeTimestampFormat.swift` | `NativeTimestampFormat` enum; `flooredOptionalMicrosecondUTCOffset`, `utcDay` |
 | `ProviderFamilyIdentity.swift` | `ProviderFamilyIdentity` enum; `normalize` |
-| `SSEEventStream.swift` | Shared SSE framing and `ProviderStreamContext`; transport opening and activity for every event/comment |
+| `SSEEventStream.swift` | Shared SSE framing and `ProviderStreamContext`; transport opening and activity for every event/comment; optional round-scoped diagnostic event capture before provider decoding and live first-output retry scope |
 | `TurnDeadline.swift` | `TurnDeadline` enum; `withDeadline` |
 | `TurnTokenBudget.swift` | `TurnTokenBudget` class; `take`, `beginRequest` |
 
@@ -1263,7 +1356,7 @@ Directory: `Modules/NativeAgentCore/Sources/Onboarding/`
 
 | File | Owns |
 |---|---|
-| `Onboarding.swift` | `JSONValue`: `fromObject` |
+| `Onboarding.swift` | Typed onboarding client; durable completion and reset transactions, profile repair, recovery/reset verdicts and once-only tour replay; Typed onboarding client; durable completion and reset transactions, starter-notes sequencing, profile repair |
 | `PersonaTemplates.swift` | `PersonaTemplates` enum; `nowISO`, `generate` |
 
 ### PersistenceCore
@@ -1272,13 +1365,15 @@ Directory: `Modules/NativeAgentCore/Sources/PersistenceCore/`
 
 | File | Owns |
 |---|---|
+| `InstallPaths.swift` | Install-owned paths, public release preparation and login-item location admission |
 | `ConnectorInputValue.swift` | `ConnectorInputValue` enum; `bool` |
 | `ConnectorCredentialFile.swift` | Google, Notion and X credentials: checked metadata, path-bound device Keychain references, verified legacy migration; revocation keeps the reference until Keychain deletion succeeds |
 | `DeviceSecretKeychain.swift` | Verified device-only Keychain secret bytes; callers own locked reference commits and migration |
 | `JSONLRetention.swift` | `JSONLCapCheckCounter` class; `isFullCheckDue`, `isFullCheckDueOnNextAppend` |
 | `JSONValue.swift` | `JSONValue` enum; `fromEncodable`, `mapStrings`, `decodedExactly` (a store's one shape check, naming the field), `digest`, `differences`; `JSONRow` checked row reads for typed owner records |
 | `NativeActionRouteSupport.swift` | `NativeActionRouteSupport` enum; `jsonValueBody`, `notImplemented` |
-| `PersistenceCore.swift` | Shared JSON/JSONL reads and writes, atomic/durable persistence and transaction directory sync; `VerifiedPath` owns descriptor-relative file IO and transfers for connectors and Mac control |
+| `AbilityStore.swift` | One folder/file catalog for tools, skills and senses; current/prev/next lifecycle, independent run state, unique ids, owner-off/peer-write guards and verified forward migration of all three old stores into one retained .old-layout archive |
+| `PersistenceCore.swift` | Shared JSON/JSONL atomic/durable persistence, raw physical-line tails and directory sync; CapabilityLifecycle guards ability changes and reconciles owner-off attribution; VerifiedPath owns descriptor-relative IO and transfers |
 | `PersistenceDataRoot.swift` | `ResolvedDataRootCache` class; `resolve` |
 | `RegistryTimestampSortKey.swift` | `RegistryTimestampSortKey` enum; `sortKey` |
 
@@ -1289,9 +1384,10 @@ Directory: `Modules/NativeAgentCore/Sources/PersonaEngine/`
 | File | Owns |
 |---|---|
 | `PersonaCompiler+Normalization.swift` | `PersonaCompiler`: `normalize` |
-| `PersonaEngine+Compiler.swift` | `PersonaCompiler`: `compile`, `fingerprint`, `renderPrompt`; shared chat/background/reflection persona rendering, including USER core projection |
+| `PersonaEngine+Compiler.swift` | `PersonaCompiler`: `compile`, `fingerprint`, `renderPrompt`; batched context surfaces share canonical persona documents and identity, with separate surface overrides; USER core projection |
 | `PersonaEngine.swift` | `SwiftNativePersonaEngine`: shared persona-document reads and GROWTH episodic-log filtering; `PersonaSelection`: installation-wide selection for every door |
-| `PersonaEngine+GrowthVoiceWrites.swift` | `SwiftNativePersonaEngine`: locked persona mutations and private backups; skill writes delegate to Skills draft/version lifecycle |
+| `PersonaEngine+GrowthVoiceWrites.swift` | `SwiftNativePersonaEngine`: locked persona mutations and private backups; ordinary persona mutations; skill-specific aliases are retired |
+| `PersonaEngine+Writes.swift` | `SwiftNativePersonaEngine`: shared typed profile fields for persistence and onboarding normalization, fixed document specs and guarded writes |
 
 ### Privacy
 
@@ -1300,6 +1396,7 @@ Directory: `Modules/NativeAgentCore/Sources/Privacy/`
 | File | Owns |
 |---|---|
 | `NativeAppSecretRedactor.swift` | `NativeAppSecretRedactor` enum; `redactText`, `redactValue` |
+| `PrivacyMap.swift` | privacy state read model |
 
 ### Procedures
 
@@ -1309,7 +1406,7 @@ Directory: `Modules/NativeAgentCore/Sources/Procedures/`
 |---|---|
 | `ProcedureCompilation.swift` | `ProcedureTerminalClass` enum |
 | `ProcedureExactActivationExecutor.swift` | `ProcedureExactActivationExecutor` enum; `activate` |
-| `ProcedureReplay.swift` | `ProcedureReplayMode` enum |
+| `ProcedureReplay.swift` | replay status/count and manual dry-run eligibility; canonical executor retains dispatch |
 
 ### ProviderRouting
 
@@ -1317,40 +1414,50 @@ Directory: `Modules/NativeAgentCore/Sources/ProviderRouting/`
 
 | File | Owns |
 |---|---|
+| `NativeOAuthLoopbackCallbackServer.swift` | shared ChatGPT/xAI loopback callback socket lifecycle, original protocol-specific admission/response shape, state validation and exactly-once completion |
 | `ChatCompletionsMessageEncoding.swift` | `chatCompletionsMessages` |
-| `CodexAccountModelCatalog.swift` | `CodexAccountModelCatalog` enum; `load`, `signedCacheLists` |
+| `CodexAccountModelCatalog.swift` | `CodexAccountModelCatalog` enum; `load`, `signedCacheLists`; one decoded catalog for account matching and separate Codex/OAuth projections, invalidated by file attributes with auth identity checked on selection |
+| `LLMClient+CodexAdapter.swift` | `CodexAdapter`: streaming and buffered Codex runners; MacControl owns their pipe capture through the ProviderRouting → MacControl dependency |
 | `GoogleOAuthCredentials.swift` | `GoogleOAuthCredentials` enum; `credentialStatus`, `accountSubject` |
-| `LLMClient+AnthropicOAuthDirectAdapter.swift` | `AnthropicOAuthDirectAdapter`: `requestMaxTokens`, `clearAtBeta`, `installedClaudeCodeVersion` |
+| `LLMClient+AnthropicOAuthDirectAdapter.swift` | `AnthropicOAuthDirectAdapter`: `requestMaxTokens`, `clearAtBeta`, `installedClaudeCodeVersion`; indexed content-block validation shared by OAuth text and Anthropic native-tool streams, keeping text/thinking/signature/tool deltas on their own blocks |
+| `LLMClient+AnthropicNativeTools.swift` | `AnthropicAdapter`: native-tool stream decoding and shared Anthropic event type, wire errors, usage and stop-reason accumulation; text and tool lanes keep their own output handling |
 | `LLMClient+AnthropicOAuthRequestBody.swift` | `AnthropicOAuthDirectAdapter`: `ephemeralCacheControl`, `currentTurnUserIndex`, `currentBoundaryIndex` |
 | `LLMClient+OpenAIOAuthCredentials.swift` | `OpenAIOAuthDirectAdapter`: `authPathCandidates`, `boundRootReadAuthPath`, `preferredAuthPath` |
 | `LLMClient+OpenAIOAuthDirectAdapter.swift` | `CodexOAuthAccessContext` struct |
 | `LLMClient+OpenAIResponsesDecoding.swift` | `OpenAIOAuthDirectAdapter`: `consumeResponsesStream`, `incompleteReasonText`, `incompleteNote` |
-| `LLMClient+Real.swift` | `SwiftNativeLLMClient` shared routing, stream guard admission before adapter creation, and failed-call telemetry before error normalization |
+| `LLMClient+Real.swift` | `SwiftNativeLLMClient` shared routing and non-streaming execution envelope, stream guard admission before adapter creation, and failed-call telemetry before error normalization |
 | `LLMCallTelemetry.swift` | `LLMCallTraceRecorder`; successful/failed call receipts with purpose, timing, provider identity and redacted underlying failure detail; memory, digest and probe telemetry retain their own surfaces when routing inherits Chat |
 | `NativeOAuthCallbackPolicy.swift` | `NativeOAuthFlow`: `handleCallbackURL`, `validateCallback`, `parseCallback` |
 | `NativeOAuthCallbackRegistry.swift` | `PendingCallbacks` class; `register`, `forget` |
 | `NativeOAuthFlow+Configs.swift` | `ProviderOAuthConfig` struct; `buildAuthURL`, `exchangeCode` |
 | `NativeOAuthFlow+Helpers.swift` | `PKCE` struct; `generate` |
 | `NativeOAuthFlow+Loopback.swift` | `NativeOAuthFlow`: `startOpenAILoopbackFlow`, `callbackTarget`, `callbackHasResult` |
-| `NativeOAuthFlow+TokenStatus.swift` | `NativeOAuthFlow`: `clearTokens`, `hasRefreshToken`, `expiresAt` |
+| `NativeOAuthFlow+TokenStatus.swift` | `NativeOAuthFlow`: `clearTokens`, `expiresAt`, credential health/status and shared connection verdict |
 | `NativeOAuthFlow+XAI.swift` | `NativeOAuthFlow`: `startXAIOAuthFlow` |
-| `NativeOAuthFlow.swift` | `NativeOAuthFlow` enum; `validateSignInDestination`, `startOAuthFlow` |
+| `NativeOAuthFlow.swift` | `NativeOAuthFlow` enum; `validateSignInDestination`, `startOAuthFlow`, Anthropic setup-token normalization/admission/write |
 | `NativeOAuthPlatformPort.swift` | `NativeOAuthPlatformPort` protocol; `runLoopbackAuthSession`, `isCanceledLogin` |
 | `OAuthContinuationGate.swift` | `OAuthContinuationGate` class; `install`, `resume` |
-| `OAuthCredentialDecoding.swift` | `OAuthRefreshBinding` enum; `string`, `identity` |
+| `OAuthCredentialDecoding.swift` | Shared JWT payload and OAuth expiry decoding; `OAuthRefreshBinding`: account identity and refresh continuity |
 | `OAuthCredentialDestinations.swift` | `OAuthCredentialDestinations` enum; `xAIProvider`, `xConnector` |
 | `OAuthCredentialHealth.swift` | `OAuthCredentialHealth` struct |
 | `OAuthLoopbackCallbackPolicy.swift` | `OAuthLoopbackCallbackPolicy` enum; `callbackMatchesState`, `validCallbackURL` |
 | `OAuthProductionSession.swift` | `OAuthProductionSession` enum; `make` |
 | `OAuthRefreshQueueRegistry.swift` | `OAuthRefreshQueueRegistry` class; `queue` |
+| `ModelCatalogTTLCache.swift` | shared live fetch and TTL/backoff state machine; `ModelCatalogDecodeCache` memoizes each provider's decoded rows and authority stamps by canonical file path and mtime |
 | `ProviderAPIKeyStore.swift` | `ProviderAPIKeyStore` enum; `insert`, `read` |
 | `XAIOAuthCredentialStore.swift` | Locked xAI token migration, immutable Keychain references, refresh reads and sign-out cleanup |
-| `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence through recovery and normalization |
-| `ProviderStreamGuard.swift` | Configured idle/wall cuts on wire activity for every provider stream, typed no-reply failure, cancellation-owned stream forwarding and uncapped model URLSession; wall-off streams forward without a watchdog |
+| `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence and live first-output cuts through recovery and normalization |
+| `ProviderRecoveryPolicy.swift` | Shared recovery classification and backoff; `retryOverload` owns non-streaming overload recovery for `complete` and `completeMessages`, including dreams and reflections |
+| `ProviderStreamGuard.swift` | Configured idle/wall cuts on wire activity for every provider stream, typed no-reply failure, cancellation-owned stream forwarding and uncapped model URLSession; retries after a learned first-output cut with wire activity use only the call wall; wall-off streams forward without a watchdog |
 | `ProviderRouting.swift` | `SwiftNativeProviderRouting` actor; `checkedProviderSnapshot`, `checkedRoutingSnapshot`, `saveGroupSelection`, `catalogContextLength`; provider interpretation and recoverable group writes |
 | `ProviderRoutingContracts.swift` | `ProviderRoutingProtocol`: `listProviders`, `getProvider`, `configureProvider` |
 | `ProviderStateValidation.swift` | `ProviderStateValidation` enum; `dataIfPresent`, `credential` |
 | `ProviderTurnChoice.swift` | `ProviderTurnChoice` struct |
+| `LLMProviderStatusFeed.swift` | live provider status feed |
+| `ProviderConnectionProbe.swift` | provider connection probes |
+| `ProviderReasoningSelection.swift` | provider reasoning selection |
+| `ProviderSignInHandoff.swift` | provider sign-in handoff state |
+| `ProviderTurnChoice+ModelSelection.swift` | provider turn model selection |
 | `SwiftCodexDeviceLoginManager.swift` | `SwiftCodexDeviceLoginManager` enum; CLI executable readiness |
 
 ### Research
@@ -1365,7 +1472,7 @@ Directory: `Modules/NativeAgentCore/Sources/Research/`
 | `Research+Helpers.swift` | `SwiftNativeResearchClient`: `trimTrailingSlash`, `makeURL`, `isoTimestamp` |
 | `Research+Lab.swift` | `SwiftNativeResearchClient`: `researchLabRuns`, `runResearchLab`, `buildResearchBrief` |
 | `Research+SearchFetch.swift` | `SwiftNativeResearchClient`: `localServerIsDown`, `search`, `fetchURL` |
-| `ResearchTransports.swift` | `URLSessionResearchHTTPClient` class; `getBounded`, `get` |
+| `ResearchTransports.swift` | `URLSessionResearchHTTPClient.getBounded`; Docker discovery/start; subprocesses delegate to `MacControl.SystemProcessAdapter` with full output capture |
 
 ### SchedulerExecution
 
@@ -1373,14 +1480,15 @@ Directory: `Modules/NativeAgentCore/Sources/SchedulerExecution/`
 
 | File | Owns |
 |---|---|
+| `SchedulerDueJobRunner+DreamCommands.swift` | canonical recurring-dream command selection and job receipts |
 | `NativeAgentDreamCycleSupport.swift` | `NativeAgentDreamCycleSchedule` enum; `runDateKey`, `dreamEntryDateKey` |
-| `SchedulerDueJobRunner+CycleHelpers.swift` | `SchedulerDueJobRunner`: `upsertDefaultCycleJob`, `pruneCompletedOneShotRows`, `nextEpoch` |
+| `SchedulerDueJobRunner+CycleHelpers.swift` | `SchedulerDueJobRunner`: `upsertDefaultCycleJob`, `pruneRetiredRows`, `nextEpoch` |
 | `SchedulerDueJobRunner+Execution.swift` | `SchedulerDueJobRunner`: `execute`, `channelIsSwitchedOn`, `disabledDreamResult` |
-| `SchedulerDueJobRunner+Persistence.swift` | `SchedulerDueJobRunner`: `update`, `pruneCompletedOneShotJobs`, `appendActivity` |
+| `SchedulerDueJobRunner+Persistence.swift` | `SchedulerDueJobRunner`: execution-result adaptation to canonical scheduler settlement; `appendActivity` |
 | `SchedulerDueJobRunner+ProactiveScan.swift` | `SchedulerDueJobRunner`: `surfaceProactiveScan` |
-| `SchedulerDueJobRunner+Selection.swift` | `SchedulerDueJobRunner`: `nextMeaningfulDeadline`, `selectDueJobs`, `claimDueJobs` |
+| `SchedulerDueJobRunner+Selection.swift` | `SchedulerDueJobRunner`: `nextMeaningfulDeadline`, `claimDueJobs`, `dueJobs` |
 | `SchedulerDueJobRunner+Timeout.swift` | `SchedulerDueJobRunner`: `jobTimeoutSeconds`, `executeWithTimeout` |
-| `SchedulerDueJobRunner.swift` | `SchedulerDueJobRunner` actor; `readJobRowsChecked`, `runDueJobs` |
+| `SchedulerDueJobRunner.swift` | `SchedulerDueJobRunner` actor; `runDueJobs`; reads canonical job rows through `SchedulerJobs` |
 | `SchedulerExecutionPlatform.swift` | `SchedulerExecutionPlatform` protocol; `postNotification`, `sendTelegramMessage` |
 
 ### SelfImprovement
@@ -1390,7 +1498,7 @@ Directory: `Modules/NativeAgentCore/Sources/SelfImprovement/`
 | File | Owns |
 |---|---|
 | `ImprovementGauntletReadModels.swift` | `ImprovementGauntletStatus`: `ImprovementGauntletRun`, `GauntletCheck` |
-| `SelfImprovement+TrainingReads.swift` | `SwiftNativeSelfImprovement`: `evals`, `listEvalsLocal`; `EvalRun`, `EvalCheck` structs |
+| `SelfImprovement+TrainingReads.swift` | `SwiftNativeSelfImprovement`: `evals`, `listEvalsLocal`; `EvalRun`, `EvalCheck`, `HarnessBenchmarkRun`, `HarnessBenchmarkCheck` models and benchmark execution |
 
 ### Senses
 
@@ -1398,12 +1506,11 @@ Directory: `Modules/NativeAgentCore/Sources/Senses/`
 
 | File | Owns |
 |---|---|
-| `SensesContract.swift` | Native form, sense records, shared registry/runner protocols, hub, native catalog and bounded private restart-durable unread news board |
-| `FileSenseRegistry.swift` | Locked version publication, corner lookup, per-version use/correction/quality counters and material references, rollback and CapabilityLifecycle archive/restore |
-| `FileSenseRegistry+Storage.swift` | Registry validation, bounded code manifests and path/symlink fences |
+| `FileSenseRegistry.swift` | Sense adapter to AbilityStore files and state; bundle defaults, corner lookup, proposal keep, previous-version swap, final override drop and owner-off preservation |
+| `FileSenseRegistry+Storage.swift` | Registry validation, candidate/version-folder source resolution, bounded code manifests and path/symlink fences |
 | `FileSenseRegistry+Sharing.swift` | Approval-gated portable code/record export and sandboxed shared import |
 | `ExistingCornersSourceProvider.swift` | `ExistingCornersSourceProvider`: contract ports for today's raw material and native pages; `SenseNativePages` owns readable Chrome places, bounded conversation/tab-scoped private continuation bindings, structural things/verbs and existing raw UTF-8 windows |
-| `BuiltInSenses.swift` | `BuiltInSenses`: native adapters (including grounded Chrome verbs) and bundled JavaScript registration, preserving lifecycle state |
+| `BuiltInSenses.swift` | Bundle-owned native adapters and JavaScript defaults; file overrides win and accounting lives in AbilityStore state |
 
 ### Skills
 
@@ -1411,9 +1518,9 @@ Directory: `Modules/NativeAgentCore/Sources/Skills/`
 
 | File | Owns |
 |---|---|
-| `InstalledSkillInventory.swift` | `InstalledSkillInventory`: checked identity, body resolution and availability for UI, discovery and recall |
-| `Skills.swift` | `SkillRecord`, `SkillsClient`, `SwiftNativeSkillsClient`: registry/manifest lifecycle, agent skill management and capability-pack skill mutations |
-| `SkillsJSON.swift` | `JSONValue`: `SkillsRegistry`, `SkillManifestRegistry`, `SkillMutation` |
+| `InstalledSkillInventory.swift` | Shared skill file scan and bundled guidance; same-id overrides suppress bundle selections; review/install eligibility, canonical digest/source and checked runnable admission, source metadata and installed-skill projections |
+| `Skills.swift` | Skill records/client over AbilityStore; exact candidate admission and reads/runs, final drop, previous-version swap, owner-only built-in overrides and separate run accounting |
+| `SkillsJSON.swift` | Checked skill record decoding and JSON convenience; no registry, shared version ownership or manifest storage |
 
 ### SlackBot
 
@@ -1421,10 +1528,10 @@ Directory: `Modules/NativeAgentCore/Sources/SlackBot/`
 
 | File | Owns |
 |---|---|
-| `SlackInboundDeliveryJournal.swift` | `SlackInboundDeliveryJournal` actor; `path`, `recoverySummary` |
+| `SlackInboundDeliveryJournal.swift` | `SlackInboundDeliveryJournal` actor; socket/history/recovery admission, active-handler exclusion and terminal delivery truth; `path`, `recoverySummary`, `failedReplyClaims`, `confirmReplyPart` retain confirmed text/image progress across holds |
 | `SlackRuntimeDiagnostics.swift` | `SlackRuntimeStateWriteOutcome` enum |
 | `SlackSessionStore.swift` | `SlackSessionStore` struct; `activeSessionId`, `ensureSessionRow` |
-| `SlackSocketModeConfig.swift` | `SlackSocketModeConfig` struct; `loadIngressPolicy`, `load` |
+| `SlackSocketModeConfig.swift` | Slack socket configuration and ID parsing |
 | `SlackSocketModeLoop+SessionClassification.swift` | `SlackSocketModeLoop`: `classifySessionClosure`, `disconnectDisposition`, `classifyReceiveLoopReturn` |
 | `SlackSocketModeLoop.swift` | `SlackSocketModeLoop` struct; `tick`, `tickOutcome` |
 | `SlackSocketModeSupport.swift` | `SlackConversationRef` struct |
@@ -1436,7 +1543,9 @@ Directory: `Modules/NativeAgentCore/Sources/StandingBots/`
 
 | File | Owns |
 |---|---|
-| `BotDefinitionStore.swift` | `BotDefinitionStore` struct; `create`, `check` |
+| `BotsShelfRead.swift` | Shelf, helper schedule and approval read models; run-feed projection |
+| `StandingBotSchedule.swift` | `StandingBotSchedule` enum; `parse`, `words` |
+| `BotDefinitionStore.swift` | Definition persistence and editor model/budget/schedule/event admission |
 | `BotEventIntake.swift` | `BotEventIntake` enum; `router`, `slackMessage` |
 | `BotHeadline.swift` | `BotHeadline` enum; `make` |
 | `BotLegacyHistory.swift` | `ShelfStore`: `legacyHistory` |
@@ -1472,6 +1581,7 @@ Directory: `Modules/NativeAgentCore/Sources/SystemOps/`
 
 | File | Owns |
 |---|---|
+| `SoftwareUpdateState.swift` | `SoftwareUpdateState` |
 | `SystemGitActions.swift` | `SystemGitActions` enum; `processDetail` |
 
 ### TelegramBot
@@ -1482,10 +1592,11 @@ Directory: `Modules/NativeAgentCore/Sources/TelegramBot/`
 |---|---|
 | `TelegramAssistantDeliveryDriver.swift` | `TelegramAssistantDeliveryDriver` actor; `onDelta`, `finalize` |
 | `TelegramBot+Config.swift` | `TelegramConfigurationSummary` struct |
+| `TelegramBot+Settings.swift` | Telegram settings and saved routing |
 | `TelegramPollLoop+Approvals.swift` | `TelegramPollLoop`: `handleApprovalSlashCommand`, `handleApprovalCallback`, `importLegacyApprovalContinuations` |
 | `TelegramPollLoop+ChatProgress.swift` | `TelegramPollLoop`: `makeTurnProgressCard`, `makeAssistantDelivery`, `makeProgressSink` |
 | `TelegramPollLoop+Commands.swift` | `TelegramPollLoop`: `handleControlHandoff`, `clearQueueAcknowledgement`, `handleSlashCommand` |
-| `TelegramPollLoop+Media.swift` | `TelegramPollLoop`: `photoAttachment`, `caption`, `unsupportedAttachmentKind` |
+| `TelegramPollLoop+Media.swift` | `TelegramPollLoop`: `chatAttachment`, `caption`, `unsupportedAttachmentKind` |
 | `TelegramPollLoop+QueuedTurnControls.swift` | `TelegramPollLoop`: `handleQueuedTurnControlCallback` |
 | `TelegramPollLoop+StateReceipts.swift` | `TelegramPollLoop`: `inferDataRoot`, `writeStatePatch`, `botTokenFingerprint`, `discoverSenders`; bounded setup pages persist in the canonical inbox before the bot cursor advances |
 | `TelegramPollLoop+Transport.swift` | `TelegramPollLoop`: `answerRecordedCallback`, `_tgDestinationFields`, `_tgDestinationBody` |
@@ -1494,7 +1605,7 @@ Directory: `Modules/NativeAgentCore/Sources/TelegramBot/`
 | `TelegramRichMessage.swift` | `TelegramInputRichBlock` enum |
 | `TelegramTurnCardLedger.swift` | `TelegramTurnCardLedger` actor; `upsert`, `remove`; `TelegramTurnCardRestartRepairer` owns one repair task and shutdown |
 | `TelegramTurnPresentation.swift` | `TelegramTurnPresentationPhase` typealias |
-| `TelegramUpdateInbox.swift` | `TelegramUpdateInbox` struct; `snapshots`, `ensurePending` |
+| `TelegramUpdateInbox.swift` | `TelegramUpdateInbox` struct; `snapshots`, `ensurePending`, `failedReplyClaims`; maintained claim index emits delivery invalidations; recovery exceptions retain a terminal quarantined claim and reason, excluded from automatic replay |
 
 ### ToolRegistry
 
@@ -1502,7 +1613,7 @@ Directory: `Modules/NativeAgentCore/Sources/ToolRegistry/`
 
 | File | Owns |
 |---|---|
-| `ToolRegistryActions.swift` | `ToolRegistryActions` enum; `updateTool`, `upsertProposal` |
+| `ToolRegistryActions.swift` | Checked tool mutations, version-stamped terminal/effect receipts, code-fault quarantine, archive, restore, reversible drop and shared version/validation reads with retained Swift original / JS rollback counterpart references |
 | `ToolApprovalEligibility.swift` | `ToolApprovalEligibility` enum; shared authored-tool activation refusal |
 
 ### Transcripts
@@ -1512,6 +1623,9 @@ Directory: `Modules/NativeAgentCore/Sources/Transcripts/`
 | File | Owns |
 |---|---|
 | `ChatSessionIndexFile.swift` | `ChatSessionIndexFile` enum; `recordContinuityParticipant`, `recordConversationChange` |
+| `ChatSessionRecollections.swift` | Recollection row/coverage parsing, incremental scans and lock-protected timestamp formatters |
+| `ChatSessionRetention.swift` | Checked archive-index reader shared by discovery/restoration; locked pruning/enforcement snapshot, nonblocking transcript admission and exact acknowledged-version guard |
+| `ChatExportService.swift` | Snapshot-based Markdown rendering and atomic export write outside the main actor; completion follows the file write |
 
 ### TriggerScheduler
 
@@ -1519,8 +1633,8 @@ Directory: `Modules/NativeAgentCore/Sources/TriggerScheduler/`
 
 | File | Owns |
 |---|---|
-| `ProactiveInboxStore.swift` | `ProactiveInboxStore` actor; `surface`, `activeDuplicateId` |
-| `TriggerNotificationInbox.swift` | `TriggerNotificationInbox` enum; `mirrorCardIntoRealInbox`, `archiveSupersededMorningBriefs` |
+| `SchedulerJobs.swift` | Canonical bounded job storage, occurrence claims, unknown-outcome recovery and settlement; `claimDueJobs`, `settleOccurrence`, `pruneJobs` |
+| `TriggerNotificationInbox.swift` | `TriggerNotificationInbox`: proactive identity matcher, checked locked mirror, `archiveSupersededMorningBriefs` |
 | `TriggerScheduler.swift` | `SwiftNativeTriggerScheduler` actor; `listInboxTriggers`, `listWorkshopTriggers` |
 
 ### TrustCenter
@@ -1533,7 +1647,7 @@ registry merging to `WorkflowOrchestration`; this reader does not write back.
 | File | Owns |
 |---|---|
 | `MacInjectionRedaction.swift` | `MacInjectionArgRedaction` enum; `carriesSecretArgs`, `appDoorSecretKeys` |
-| `PeerTurnEffectPolicy.swift` | Peer-origin approval floors and attributed memory-note policy |
+| `PeerTurnEffectPolicy.swift` | Peer-origin approval floors and provenance requirements for attributed memory notes; ability changes/growth capture use CapabilityLifecycle's common write guard |
 | `SecurityCenter+FullMacPolicy.swift` | `SwiftNativeSecurityCenter`: `fullMacActive`, `fullMacYoloAuthority`, `drivenAgentLaunchPermission` |
 | `SecurityCenter+InputScanning.swift` | `SwiftNativeSecurityCenter`: `promptInjectionKeys`, `secretKeys`, `redactValue` |
 | `SecurityCenter+JSONUtilities.swift` | `SwiftNativeSecurityCenter`: `maxDecision`, `object`, `string` |
@@ -1544,15 +1658,16 @@ registry merging to `WorkflowOrchestration`; this reader does not write back.
 | `SecurityCenter+ToolProfiles.swift` | `AppActionPolicy` registry projection; `SwiftNativeSecurityCenter`: `canonicalToolRisk`, `appActionOldTool`, `profile` |
 | `SecurityCenter.swift` | `SwiftNativeSecurityCenter`: security decisions, including permission-reset approval |
 | `SwiftNativeManifestSigner.swift` | `SwiftNativeManifestSigner` actor; `canonicalBytes`, `compactCanonicalJSON` |
-| `TrustAccessModeCapabilityCatalog.swift` | `TrustAccessModeCapabilityCatalog` enum; `normalizedMode`, `macControlPolicy` |
+| `TrustAccessModeCapabilityCatalog.swift` | `TrustAccessModeCapabilityCatalog` enum; `normalizedMode`, `macControlPolicy` and Mac integration preset recognition |
+| `TrustAccessModeCapabilityCatalog+Read.swift` | trust capability catalog reads, effective file/Mac authority and approval/risk groups |
 | `TrustCenter+AppAdapter.swift` | `SwiftNativeTrustCenter`: `loadTrustPolicyJSON` |
 | `TrustCenter+Autonomy.swift` | `SwiftNativeTrustCenter`: `autonomyForTool`, `autonomyForExactToolName`, `explicitAutonomyOverride` |
 | `TrustCenter+ChromeControl.swift` | `SwiftNativeTrustCenter`: `authorizeChromeControlEffect`, `chromeControlEnabledChecked` |
 | `TrustCenter+Defaults.swift` | `SwiftNativeTrustCenter`: `defaultTrustPolicy` |
 | `TrustCenter+PolicyLoading.swift` | `SwiftNativeTrustCenter`: `loadRawPolicyChecked`, `validateAuthorityPolicyShape`, `validateKnownAuthorityPolicyTypes` |
-| `TrustCenter+PolicyModels.swift` | `AutonomyPolicy` struct |
-| `TrustCenter.swift` | `SwiftNativeTrustCenter` actor; `getTrust`, `updateTrust` |
-| `TrustPolicy.swift` | `TrustPolicy` struct |
+| `TrustCenter+PolicyModels.swift` | `TrustCenterDefaultWorkspaceRoots`, `TrustCenterError` |
+| `TrustCenter.swift` | `SwiftNativeTrustCenter` actor; `getTrust`, `applyPolicyPatchChecked` |
+| `TrustPolicy.swift` | `TrustPolicy`, `TrustTrainingPolicy` structs |
 | `TrustPolicyActions.swift` | `TrustPolicyActions` struct; `developerModePatchBody`, `saveMemoryPolicy`, `saveAgentAccessMode` |
 | `TrustPolicyToolWriter.swift` | `TrustPolicyToolWriter` enum; `applyTrustPolicyPatch` |
 
@@ -1562,8 +1677,9 @@ Directory: `Modules/NativeAgentCore/Sources/TrustPersistence/`
 
 | File | Owns |
 |---|---|
+| `ProductionExport+Archive.swift` | production archives, support bundles and registry rows |
 | `TrustBackupFoundation.swift` | `JSONDecoder`: extension |
-| `TrustBackupHost.swift` | `TrustBackupHost` struct |
+| `TrustBackupHost.swift` | `TrustBackupHost`; running-bundle version factory |
 | `TrustBackupModels.swift` | `BackupRecord` struct |
 | `TrustBackupPersistence.swift` | `TrustBackupPersistence` enum; `createBackup`, `offDiskAutomaticBackups` |
 
@@ -1573,9 +1689,12 @@ Directory: `Modules/NativeAgentCore/Sources/TurnTrace/`
 
 | File | Owns |
 |---|---|
-| `AbandonedTurnReconciler.swift` | `TurnCheckpoint` durable run state; `AbandonedTurnReconciler` checkpoint discovery and guarded legacy terminals |
-| `AbandonedTurnReconciliationHook.swift` | `AbandonedTurnReconciliationHook` enum; `arm`; excludes active turns and claims checkpoint resumes |
-| `TurnTrace.swift` | `TurnTraceBus` durable terminal delivery before checkpoint retirement |
+| `TurnTraceReadProjection.swift` | TurnTraceRow, grouping/replay readers and shared TurnInspectorProjection/trace evidence |
+| `TurnSummaryRecord.swift` | `TurnSummaryRecord`, `TurnSummaryFile`, `TurnSummaryComputer`, `TurnSummarySource` |
+| `TurnInspectorFeed.swift` | `TurnInspectorLiveDropState`, `TurnInspectorFeed` |
+| `AbandonedTurnReconciler.swift` | `TurnCheckpoint` durable run state; `AbandonedTurnReconciler` checkpoint discovery, sweep-local day terminal index and guarded legacy terminals |
+| `AbandonedTurnReconciliationHook.swift` | `AbandonedTurnReconciliationHook` enum; `arm`; excludes active turns and claims checkpoint resumes; terminal settlement awaits the installed anchor-intent adapter |
+| `TurnTrace.swift` | durable terminal delivery before checkpoint retirement; bounded ingress/disk workers, JSONL/file reads and first-render correlation/publication |
 
 ### WorkshopExecution
 
@@ -1587,12 +1706,147 @@ Directory: `Modules/NativeAgentCore/Sources/WorkshopExecution/`
 | `WorkshopExecution+OutcomeVerification.swift` | `WorkshopExecutorLoop`: `unmetSuccessCriterion`, `verifyCompletedOutcome` |
 | `WorkshopExecutorContracts.swift` | `WorkshopStepApprovalRequest` struct |
 | `WorkshopPump.swift` | `WorkshopPump` struct; `tick`, `hasLiveAttempt` |
-| `WorkshopPumpPlatform.swift` | `WorkshopPumpPlatform` protocol; `isUnderResourcePressure`, `artifactIsReadable` |
 | `WorkshopSession.swift` | `WorkshopSession` struct; `run`, `trimSummary` |
 | `WorkshopSessionContracts.swift` | `WorkshopSessionStatus` enum |
 | `WorkshopSessionEffects.swift` | `WorkshopSessionEffects` protocol; `makeToolDispatcher`, `productionTurnExecutor` |
 | `WorkshopSessionResultStore.swift` | `WorkshopSessionResultStore` struct; `path`, `save` |
 | `WorkshopToolProfile.swift` | `WorkshopToolProfile` struct; `permits`, `isPermitted` |
+
+### MacIntegration
+
+Directory: `Modules/NativeAgentCore/Sources/MacIntegration/`
+
+Checked Mac integration permission storage and mail read locations.
+
+| File | Owns |
+|---|---|
+| `MacIntegrationPermissions.swift` | integration authority store plus system-permission taxonomy, reads, card admission and framework vocabulary |
+| `MailReadLocator.swift` | `MailReadLocator` |
+
+### NotificationInbox
+
+Directory: `Modules/NativeAgentCore/Sources/NotificationInbox/`
+
+Notification records, checked live inbox storage and status reads.
+
+| File | Owns |
+|---|---|
+| `InboxItemRecord.swift` | `InboxSourceReadState`, `InboxItemRecord`, `InboxRelatedGroup` |
+| `LiveNotificationInbox.swift` | `LiveNotificationInbox` |
+| `NotificationInbox.swift` | `NotificationInboxClock` |
+
+### GrokLink
+
+Directory: `Modules/NativeAgentCore/Sources/GrokLink/`
+
+Grok connection credentials and reply input.
+
+| File | Owns |
+|---|---|
+| `GrokLinkCredential.swift` | `GrokLinkCredential`, `GrokReplyInput` |
+
+### MacAssistantStatus
+
+Directory: `Modules/NativeAgentCore/Sources/MacAssistantStatus/`
+
+Mac assistant readiness and platform capability status projections.
+
+| File | Owns |
+|---|---|
+| `MacAssistantStatus.swift` | assistant status client, result, Mail readiness projection and watch evidence |
+
+### MultimodalTTS
+
+Directory: `Modules/NativeAgentCore/Sources/MultimodalTTS/`
+
+Speech synthesis contracts and provider implementation.
+
+| File | Owns |
+|---|---|
+| `MultimodalTTS.swift` | `MultimodalTTSError`, `SwiftOpenAITTSClient` |
+
+### FeedPolicy
+
+Directory: `Modules/NativeAgentCore/Sources/FeedPolicy/`
+
+Path-owned bounded JSONL feed retention policy.
+
+| File | Owns |
+|---|---|
+| `FeedPolicy.swift` | `JSONLLineCaps`, `JSONLPathOwnedCapPolicy` |
+
+### ScreenVision
+
+Directory: `Modules/NativeAgentCore/Sources/ScreenVision/`
+
+Screen capture, screen-understanding operations and permission observation.
+
+| File | Owns |
+|---|---|
+| `ScreenVision.swift` | Screen vision owner; NativeScreenCapture encoding and capture error mapping |
+
+### VisionPerception
+
+Directory: `Modules/NativeAgentCore/Sources/VisionPerception/`
+
+Image perception, OCR, geometry, redaction aliases and stable visual handles.
+
+| File | Owns |
+|---|---|
+| `VisionColorRegionLayer.swift` | `VisionColorRegionResult`, `VisionPixelGrid`, `VisionColorRegionLayer` |
+| `VisionFourVerbAdapter.swift` | `VisionImageDecoder`, `VisionImageCrop`, `VisionImageCropper`, `VisionLiveRegionIdentity`, `VisionLiveOccludedRegion`, `VisionPercept` |
+| `VisionHandles.swift` | `VisionHandles` |
+| `VisionPercept.swift` | `VisionAffordanceRow`, `VisionReadoutRow`, `VisionRecognizedText`, `VisionPercept` |
+| `VisionPerceptionCompiler.swift` | `VisionPerceptionError`, `VisionRowDraft`, `VisionPerceptionCompiler` |
+| `VisionPerceptionTypes.swift` | `VisionConfidence`, `VisionStateGuess`, `VisionEvidenceSource`, `VisionCandidate` |
+| `VisionRoleGuess.swift` | `VisionRoleGuess` |
+| `VisionSaliencyLayer.swift` | `VisionSaliencyLayer`, `VisionKitSalienceProvider` |
+| `VisionTextBandLayer.swift` | `VisionTextBand`, `VisionTextBandLayer` |
+| `VisionTextLayer.swift` | `VisionTextLayerResult`, `VisionTextLayer`, `VisionKitTextRecognizer` |
+| `VisionTextRedaction.swift` | `VisionRedactedText`, `VisionRedactionConfig`, `VisionTextRedaction` |
+
+### SlackConnector
+
+Directory: `Modules/NativeAgentCore/Sources/SlackConnector/`
+
+Slack credential persistence and connector actions.
+
+| File | Owns |
+|---|---|
+| `SlackConnectorActions.swift` | `SlackConnectorActions`, `SlackConnectorCredentialsMissing` |
+| `SlackCredentials.swift` | `SlackCredentials` |
+
+### XConnector
+
+Directory: `Modules/NativeAgentCore/Sources/XConnector/`
+
+X connector actions.
+
+| File | Owns |
+|---|---|
+| `XConnectorActions.swift` | `XConnectorActions` |
+
+### WorkflowOrchestration
+
+Directory: `Modules/NativeAgentCore/Sources/WorkflowOrchestration/`
+
+Workflow registry, records, default migration and merge policy.
+
+| File | Owns |
+|---|---|
+| `WorkflowOrchestration.swift` | `WorkflowStep`, `WorkflowRecord`, `SwiftNativeWorkflowOrchestrationClient`, `WorkflowOrchestrationClock`, `WorkflowDefaults`, `WorkflowMerge` |
+
+### ToolExecution
+
+Directory: `Modules/NativeAgentCore/Sources/ToolExecution/`
+
+Tool execution, sandbox primitive broker and promotion boundary.
+
+| File | Owns |
+|---|---|
+| `ToolExecution+Promote.swift` | `SwiftNativeToolExecution`, `ToolHost` |
+| `ToolExecution+RunSandbox.swift` | `ToolPrimitiveBroker` |
+| `ToolExecution.swift` | `ToolExecutionError`, `ProposalRecord`, `ProposalValidationResult`, concrete `SwiftNativeToolExecution` proposal validation, promotion, execution and rollback |
 
 ## Shared Source Map
 
@@ -1605,14 +1859,14 @@ Directory: `Modules/NativeAgentShared/Sources/NativeAgentShared/`
 | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver` enum; `typeAndMime`, `fileByteLimit` |
 | `ChatRichContentParser.swift` | `ChatRichContentParser` enum; `blocks`, `listRows`; shared fence, list marker and continuation grammar |
 | `CloudKitDeviceTransport.swift` | `CloudKitDeviceTransport` class; `observeAccountFailures`, `shouldPersistPullCursor` |
-| `CloudKitTimeoutResultLatch.swift` | `CloudKitTimeoutResultLatch` actor; `wait`, `finish` |
+| `CloudKitTimeoutResultLatch.swift` | `CloudKitTimeoutResultLatch` actor; `wait`, `finish`, `race`; shared timeout race for detached diagnostics and budget-inheriting transport tasks |
 | `DetachedCloudKitTimeoutRace.swift` | `DetachedCloudKitTimeoutOutcome` enum |
 | `MobileHelpers.swift` | `MobileHelpersSnapshot` struct |
 | `MobileSchedulerSnapshot.swift` | `MobileSchedulerSnapshot` struct |
 | `MobileSnapshotStatus.swift` | `NAMobileSnapshotGroup` enum; `groups` |
 | `MobileTelegramSnapshot.swift` | `MobileTelegramSnapshot` struct |
 | `MobileTrustAction.swift` | `MobileTrustAction` enum |
-| `SurfaceLayout.swift` | `SurfaceLayout` struct: the layout document's shape, vocabulary and seed; `addMissing`, `shown`, `arranged` for the Mac and the phone |
+| `SurfaceLayout.swift` | `SurfaceLayout` struct: the layout document's shape, vocabulary and seed; `addMissing`, `shown`, `arranged` for the Mac and the phone; `AppDoorNames` shares page/item aliases, including doctor → diagnostics/doctor |
 | `MobileWorkActivity.swift` | `MobileWorkActivity` struct |
 
 ## iOS Companion Map
@@ -1627,7 +1881,7 @@ Directory: `iOS/NativeAgentMobile/Sources/`
 | `AdvancedView.swift` | `AdvancedView` struct |
 | `ChatBubbleViews.swift` | `BubbleView` struct |
 | `ChatPresentation.swift` | `ChatSessionTabPresentation` enum; `isSelectionDisabled` |
-| `ChatView.swift` | `ChatView` struct; `ChatTurnNoticePresentation` |
+| `ChatView.swift` | `ChatView` struct |
 | `InboxModels.swift` | `InboxItemRecord`: `replacingStatus` |
 | `InboxView.swift` | `InboxView` struct |
 | `MacToolsPresentation.swift` | `MacSystemQuickAction` enum |
@@ -1639,7 +1893,7 @@ Directory: `iOS/NativeAgentMobile/Sources/`
 | `MobileHelpersView.swift` | `MobileHelpersView` struct |
 | `MobileIntentRuntime.swift` | `MobileIntentRuntime` enum; `prepare`, `agent` |
 | `MobileNotificationActions.swift` | `MobileNotificationActions` enum; `handle` |
-| `MobilePushNotifications.swift` | `NativeAgentPushTokenSyncCache` struct; `load`, `hasFreshSyncedRegistration` |
+| `MobilePushNotifications.swift` | `NativeAgentPushTokenSyncCache` struct; `load`, `shouldSync` |
 | `MobileSchedulerView.swift` | `MobileSchedulerView` struct |
 | `MobileTrustEditor.swift` | `MobileTrustEditor` struct |
 | `NativeAgentDesign.swift` | `View`: `appShimmer` |
@@ -1651,8 +1905,7 @@ Directory: `iOS/NativeAgentMobile/Sources/`
 | `TelegramView.swift` | `TelegramView` struct |
 | `iCloudBridge.swift` | `iCloudBridge` class; `recordMacConfirmation`, `clearMacConfirmationForConnectionRepair` |
 | `iCloudSyncEngine+Actions.swift` | `iCloudSyncEngine`: `requireIdleActionForConnectionRepair`, `reconcileActionsForConnectionRepair`, `persistCloudKitActionResponse` |
-| `iCloudSyncEngine+Helpers.swift` | `iCloudSyncEngine`: `refreshHelpersSnapshot` |
-| `iCloudSyncEngine+Scheduler.swift` | `iCloudSyncEngine`: `applySchedulerSnapshot`, `refreshSchedulerSnapshot` |
+| `iCloudSyncEngine+Snapshots.swift` | `iCloudSyncEngine`: `refreshHelpersSnapshot`, `applySchedulerSnapshot`, `refreshSchedulerSnapshot`, `applyProviderState` |
 
 ### Diagnostics
 
@@ -1661,3 +1914,114 @@ Directory: `iOS/NativeAgentMobile/Sources/Diagnostics/`
 | File | Owns |
 |---|---|
 | `CKLandmine.swift` | `withCKTimeout` |
+
+## Executable Architecture Policy
+
+`script/check_architecture_blueprint.swift` reads the following JSON block. Change
+ownership rules here in the same commit as the source change; the script contains
+only parsing, file enumeration and validation mechanics. Paths are repository-relative.
+`files` are required, `optionalFiles` are checked when present, and `roots` select
+Swift sources recursively. Literal contracts are case-sensitive; pattern rules may
+declare case-insensitivity. Import rules inspect import declarations.
+
+Every app source must import SwiftUI or AppKit. The temporary per-file allowlist
+below records the area responsible for extracting existing nonplatform work. An
+exception is an outstanding ownership item, not a permanent exemption; remove it
+when its file moves or is colocated with its genuine UI/platform owner. Missing files
+and exceptions that already satisfy the rule fail so the list tightens with each wave.
+Area numbers absent from the supplied map remain explicitly unmapped.
+
+```json architecture-policy
+{
+  "sourceRoots": ["Sources", "Modules/NativeAgentCore/Sources", "Modules/NativeAgentShared/Sources", "iOS/NativeAgentMobile/Sources"],
+  "families": [
+    {"label": "AppDelegate", "directories": ["Sources/NativeAgentApp"], "prefix": "AppDelegate+"},
+    {"label": "AppModel", "directories": ["Sources/NativeAgentApp"], "prefix": "AppModel+"},
+    {"label": "EngineRuntime", "directories": ["Modules/NativeAgentCore/Sources/EngineRuntime"], "prefix": "Engine"},
+    {"label": "ApprovalTransactionCoordinator", "directories": ["Modules/NativeAgentCore/Sources/ApprovalTransactions"], "prefix": "ApprovalTransactionCoordinator"},
+    {"label": "SchedulerDueJobRunner", "directories": ["Modules/NativeAgentCore/Sources/SchedulerExecution"], "prefix": "SchedulerDueJobRunner+"},
+    {"label": "NativeOAuthFlow", "directories": ["Modules/NativeAgentCore/Sources/ProviderRouting", "Modules/NativeAgentCore/Sources/Connectors"], "prefix": "NativeOAuthFlow+"},
+    {"label": "NativeOAuthPlatform", "directories": ["Sources/NativeAgentApp"], "prefix": "NativeOAuthPlatform+"},
+    {"label": "MacSyncEngine", "directories": ["Modules/NativeAgentCore/Sources/DeviceSync"], "prefix": "MacSyncEngine+"},
+    {"label": "MacAppleScriptBridge", "directories": ["Modules/NativeAgentCore/Sources/MacIntegration"], "prefix": "MacAppleScriptBridge+"},
+    {"label": "ChatView", "directories": ["Sources/NativeAgentApp"], "prefix": "ChatView+"},
+    {"label": "KnowledgeGraphView", "directories": ["Sources/NativeAgentApp"], "prefix": "KnowledgeGraphView+"},
+    {"label": "TrustCenter", "directories": ["Modules/NativeAgentCore/Sources/TrustCenter"], "prefix": "TrustCenter+"},
+    {"label": "SecurityCenter", "directories": ["Modules/NativeAgentCore/Sources/TrustCenter"], "prefix": "SecurityCenter+"},
+    {"label": "TelegramPollLoop", "directories": ["Modules/NativeAgentCore/Sources/TelegramBot"], "prefix": "TelegramPollLoop+"},
+    {"label": "ChatOrchestrationClient", "directories": ["Modules/NativeAgentCore/Sources/ChatTurnRuntime"], "prefix": "ChatOrchestrationClient+"},
+    {"label": "Research", "directories": ["Modules/NativeAgentCore/Sources/Research"], "prefix": "Research+"},
+    {"label": "SwiftToolDispatcher", "directories": ["Modules/NativeAgentCore/Sources/ChatToolRuntime"], "prefix": "SwiftToolDispatcher+"},
+    {"label": "BuiltInToolSchemaFactory", "directories": ["Modules/NativeAgentCore/Sources/ChatToolRuntime"], "prefix": "BuiltInToolSchemaFactory+"}
+  ],
+  "forbiddenFiles": [
+    "Modules/NativeAgentCore/Sources/PersistenceCore/OperationalTransitionShadowModel.swift",
+    "Modules/NativeAgentCore/Sources/ApprovalInbox/ApprovalInbox+TransitionShadowAuthorization.swift",
+    "Modules/NativeAgentCore/Sources/ApprovalInbox/ApprovalInbox+AdaptiveReasoningEffort.swift",
+    "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+AdaptiveReasoningEffort.swift",
+    "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+AdaptiveReasoningEffort.swift",
+    "Modules/NativeAgentCore/Sources/PersistenceCore/AdaptiveReasoningEffortStore.swift"
+  ],
+  "rules": [
+    {"id": "retired-identity", "files": ["README.md", "AGENTS.md", "SECURITY.md", "PROJECT_STATUS.md", "docs/ARCHITECTURE_BLUEPRINT.md", "docs/PROJECT_DIRECTION.md", "docs/data-bounds.md", "docs/mobile_companion.md", "docs/approval-schema.md", "docs/threat-model.md", "docs/apns-push.md"], "optionalFiles": ["docs/HANDOFF_CURRENT.md"], "forbiddenPatterns": ["\\bJen(?:na)\\b"], "caseInsensitive": true},
+    {"id": "retired-daemon-http", "files": ["AGENTS.md"], "forbiddenPatterns": ["127\\.0\\.0\\.1:8765|/v1/consolidation/audit"], "caseInsensitive": true, "message": "agent instructions must not call retired daemon HTTP endpoints"},
+    {"id": "retired-smoke-runtime", "files": ["script/smoke_all.sh"], "forbiddenPatterns": ["127\\.0\\.0\\.1:8765|native_agentd\\.py|daemon HTTP"], "caseInsensitive": true, "message": "the active smoke workflow must not direct operators to the retired daemon runtime"},
+    {"id": "retired-codex-environment", "files": [".codex/environments/environment.toml"], "forbiddenPatterns": ["\\bdaemon\\b"], "caseInsensitive": true, "message": "Codex environment actions must describe the Swift-native app"},
+    {"id": "retired-security-model", "files": ["SECURITY.md"], "forbiddenPatterns": ["daemon port|LAN with pairing token|LAN[^`]*daemon"], "caseInsensitive": true, "message": "security policy must describe the current Swift/iCloud trust model"},
+    {"id": "retired-prune-owner", "files": ["docs/data-bounds.md"], "forbiddenPatterns": ["native_agentd\\.py|_prune_unbounded_state\\(\\)|Same prune pass"], "caseInsensitive": true, "message": "data bounds must attribute live retention to Swift app-owned paths"},
+    {"id": "retired-mobile-transport", "files": ["docs/mobile_companion.md"], "forbiddenPatterns": ["daemon forwarding|from daemon|daemon HTTP|/v1/missions` from daemon"], "caseInsensitive": true, "message": "mobile companion docs must stay iCloud/Swift-runtime oriented"},
+    {"id": "retired-approval-runtime", "files": ["docs/approval-schema.md"], "forbiddenPatterns": ["Mac daemon|running daemon|native_agentd\\.py|_internal_approval_token|daemon's live process|local loopback HTTP path"], "caseInsensitive": true, "message": "approval docs must describe durable Swift-owned approval execution"},
+    {"id": "retired-ios-project-comment", "files": ["iOS/NativeAgentMobile/project.yml"], "forbiddenPatterns": ["LAN daemon|Tailscale.*server URL"], "caseInsensitive": true, "message": "iOS project comments must not describe retired LAN daemon setup"},
+    {"id": "retired-ios-action-routing", "files": ["iOS/NativeAgentMobile/Sources/iCloudSyncEngine.swift"], "forbiddenPatterns": ["dispatches to daemon|daemon endpoint"], "caseInsensitive": true, "message": "iOS sync comments must route to MacSyncEngine and Swift runtime"},
+    {"id": "retired-ios-action-routing", "files": ["iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift"], "forbiddenPatterns": ["dispatches to daemon|daemon endpoint"], "caseInsensitive": true, "message": "iOS action comments must route to MacSyncEngine and Swift runtime"},
+    {"id": "retired-ios-action-routing", "files": ["iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Setup.swift"], "forbiddenPatterns": ["dispatches to daemon|daemon endpoint"], "caseInsensitive": true, "message": "iOS setup comments must route to MacSyncEngine and Swift runtime"},
+    {"id": "retired-ios-action-routing", "files": ["iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Snapshots.swift"], "forbiddenPatterns": ["dispatches to daemon|daemon endpoint"], "caseInsensitive": true, "message": "iOS snapshot comments must route to MacSyncEngine and Swift runtime"},
+    {"id": "retired-ios-pairing-comment", "files": ["iOS/NativeAgentMobile/Sources/PairingStore.swift"], "forbiddenPatterns": ["<lan-ip>:8765|LAN daemon"], "caseInsensitive": true, "message": "iOS pairing comments must not document retired LAN pairing as current setup"},
+    {"id": "retired-ios-kg-comment", "files": ["iOS/NativeAgentMobile/Sources/KnowledgeGraphView.swift"], "forbiddenPatterns": ["Mac daemon|old daemon /v1"], "caseInsensitive": true, "message": "iOS knowledge graph comments must describe iCloud snapshots and retired envelopes accurately"},
+    {"id": "retired-ios-onboarding-comment", "files": ["iOS/NativeAgentMobile/Sources/NativeAgentMobileApp.swift"], "forbiddenPatterns": ["/v1/onboarding/start|now-dead daemon|post-wave-20 daemon"], "caseInsensitive": true, "message": "iOS onboarding comments must not point to retired onboarding HTTP routes"},
+    {"id": "retired-ios-provider-routing", "files": ["iOS/NativeAgentMobile/Sources/ProviderSettingsView.swift"], "forbiddenPatterns": ["daemon /v1|daemon/native_agentd\\.py"], "caseInsensitive": true, "message": "iOS provider comments must point to Swift provider handlers"},
+    {"id": "retired-ios-http-runtime", "files": ["iOS/NativeAgentMobile/Sources/MacBridgeClient.swift"], "forbiddenPatterns": ["daemon HTTP server|Mac daemon returned HTTP"], "caseInsensitive": true, "message": "iOS bridge facade must not describe a live daemon HTTP runtime"},
+    {"id": "retired-skill-manifest-runtime", "files": ["docs/skill_manifest_spec.md"], "forbiddenPatterns": ["(?i)\\bdaemon\\b|native_agentd\\.py|daemon's venv Python|Daemon-Side"], "caseInsensitive": true, "message": "skill manifest spec must describe the Swift runtime rather than daemon-owned skills"},
+    {"id": "retired-release-migration-instructions", "files": ["docs/release-migration.md"], "forbiddenPatterns": ["127\\.0\\.0\\.1:8765|native_agentd\\.py|Verify daemon started|Bundled Python hash verification"], "caseInsensitive": true, "message": "release migration docs must not prescribe retired daemon/Python runtime checks"},
+    {"id": "retired-example-oauth-callback", "files": ["docs/example_manifests/slack.json"], "forbiddenPatterns": ["127\\.0\\.0\\.1:8765"], "caseInsensitive": true, "message": "example OAuth manifests must use current nativeagent:// callback URIs"},
+    {"id": "retired-example-oauth-callback", "files": ["docs/example_manifests/gmail.json"], "forbiddenPatterns": ["127\\.0\\.0\\.1:8765"], "caseInsensitive": true, "message": "example OAuth manifests must use current nativeagent:// callback URIs"},
+    {"id": "retired-example-oauth-callback", "files": ["docs/example_manifests/google_calendar.json"], "forbiddenPatterns": ["127\\.0\\.0\\.1:8765"], "caseInsensitive": true, "message": "example OAuth manifests must use current nativeagent:// callback URIs"},
+    {"id": "retired-example-oauth-callback", "files": ["docs/example_manifests/notion.json"], "forbiddenPatterns": ["127\\.0\\.0\\.1:8765"], "caseInsensitive": true, "message": "example OAuth manifests must use current nativeagent:// callback URIs"},
+    {"id": "cognitive-traceability", "files": ["docs/COGNITIVE_SUBSTRATE_TRACEABILITY.md"], "required": ["CCS-P0-D1", "CCS-P0-D2", "CCS-P0-D3", "CCS-P0-D4", "CCS-P0-D5", "CCS-P0-D6", "CCS-P0-A1", "CCS-P0-A2", "CCS-P0-A3", "CCS-P0-A4", "CCS-P1-D1", "CCS-P1-D2", "CCS-P1-D3", "CCS-P1-D4", "CCS-P1-D5", "CCS-P1-D6", "CCS-P1-D7", "CCS-P1-D8", "CCS-P1-D9", "CCS-P1-D10", "CCS-P1-D11", "CCS-P1-D12", "CCS-P1-D13", "CCS-P1-D14", "CCS-P1-D15", "CCS-P1-A1", "CCS-P1-A2", "CCS-P1-A3", "CCS-P1-A4", "CCS-P1-A5", "CCS-P2-D1", "CCS-P2-D2", "CCS-P2-D3", "CCS-P2-D4", "CCS-P2-D5", "CCS-P2-D6", "CCS-P2-A1", "CCS-P2-A2", "CCS-P2-A3", "CCS-P2-A4", "CCS-P2-A5", "CCS-P3-D1", "CCS-P3-D2", "CCS-P3-D3", "CCS-P3-D4", "CCS-P3-D5", "CCS-P3-D6", "CCS-P3-A1", "CCS-P3-A2", "CCS-P3-A3", "CCS-P3-A4", "CCS-P3-A5", "CCS-P4-D1", "CCS-P4-D2", "CCS-P4-D3", "CCS-P4-D4", "CCS-P4-D5", "CCS-P4-D6", "CCS-P4-A1", "CCS-P4-A2", "CCS-P4-A3", "CCS-P4-A4", "CCS-P4-A5", "CCS-P4-A6", "CCS-P5-D1", "CCS-P5-D2", "CCS-P5-D3", "CCS-P5-D4", "CCS-P5-D5", "CCS-P5-D6", "CCS-P5-A1", "CCS-P5-A2", "CCS-P5-A3", "CCS-P5-A4", "CCS-P6-D1", "CCS-P6-D2", "CCS-P6-D3", "CCS-P6-D4", "CCS-P6-D5", "CCS-P6-A1", "CCS-P6-A2", "CCS-P6-A3", "CCS-P6-A4", "CCS-P6-A5", "CCS-P7-D1", "CCS-P7-D2", "CCS-P7-D3", "CCS-P7-D4", "CCS-P7-D5", "CCS-P7-D6", "CCS-P7-A1", "CCS-P7-A2", "CCS-P7-A3", "CCS-P7-A4", "CCS-P7-A5", "CCS-P8-D1", "CCS-P8-D2", "CCS-P8-D3", "CCS-P8-D4", "CCS-P8-D5", "CCS-P8-D6", "CCS-P8-A1", "CCS-P8-A2", "CCS-P8-A3", "CCS-P8-A4", "CCS-P9-D1", "CCS-P9-D2", "CCS-P9-D3", "CCS-P9-D4", "CCS-P9-D5", "CCS-P9-D6", "CCS-P9-D7", "CCS-P9-A1", "CCS-P9-A2", "CCS-P9-A3", "CCS-P9-A4", "CCS-P9-A5", "CCS-P10-D1", "CCS-P10-D2", "CCS-P10-D3", "CCS-P10-D4", "CCS-P10-D5", "CCS-P10-D6", "CCS-P10-A1", "CCS-P10-A2", "CCS-P10-A3", "CCS-X1", "CCS-X2", "CCS-X3", "CCS-X4", "CCS-X5", "CCS-X6", "CCS-X7", "CCS-X8", "CCS-X9", "Status Rules", "Next Execution Order"]},
+    {"id": "retired-core-machinery", "roots": ["Modules/NativeAgentCore/Sources"], "forbidden": ["OperationalTransitionShadow", "personal_trace_shadow", "WorkshopTerminalOutcomeInterpreter"]},
+    {"id": "retired-adaptive-effort", "files": ["Modules/NativeAgentCore/Sources/ApprovalInbox/ApprovalInbox.swift", "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+Client.swift", "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestration+ToolLoop.swift", "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+Factories.swift", "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+MessagePersistence.swift", "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift", "Modules/NativeAgentCore/Sources/AppToolRuntime/AppChatToolDispatcher.swift", "Sources/NativeAgentApp/AppModel.swift", "Modules/NativeAgentCore/Sources/EngineRuntime/EngineTurns.swift", "Sources/NativeAgentApp/ChatView+SlashCommands.swift", "Sources/NativeAgentApp/AppApprovalTransactionEffects.swift", "Modules/NativeAgentCore/Sources/ApprovalTransactions/ApprovalTransactionCoordinator.swift"], "forbiddenPatterns": ["adaptiveReasoningEffort"], "caseInsensitive": true},
+    {"id": "resident-mind-convergence", "files": ["Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+Client.swift"], "required": ["checkedRouteAdmission"], "forbidden": []},
+    {"id": "resident-mind-convergence", "files": ["Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+StreamFacade.swift"], "required": ["checkedRouteAdmission"], "forbidden": []},
+    {"id": "resident-mind-convergence", "files": ["Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestration+TurnEngine.swift"], "required": ["provider.admissionReused"], "forbidden": []},
+    {"id": "resident-mind-convergence", "files": ["Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+PlannerLLM.swift"], "required": ["checkedRoutingSnapshot"], "forbidden": ["computeModelPreferences"]},
+    {"id": "resident-mind-convergence", "files": ["Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate+Workspace.swift"], "required": ["persistMaintenanceTransition"], "forbidden": ["try await persistSnapshot(", "try await persistThoughtSeedFamily(", "try await recordReceiptChecked("]},
+    {"id": "resident-mind-convergence", "files": ["Modules/NativeAgentCore/Sources/TurnTrace/TurnTrace.swift"], "required": ["_PersistPump", "capacity: 4096"], "forbidden": []},
+    {"id": "core-does-not-import-app", "roots": ["Modules/NativeAgentCore/Sources"], "forbiddenImports": ["NativeAgentApp"]},
+    {
+      "id": "app-is-a-platform-door",
+      "roots": ["Sources/NativeAgentApp"],
+      "requiredAnyImports": ["SwiftUI", "AppKit"],
+      "allowlist": {
+        "Sources/NativeAgentApp/InboxCardActions.swift": "Area 4 — approval transaction app effects and presentation assembly",
+        "Sources/NativeAgentApp/ActivityWatchController.swift": "App presentation/platform integration — area number unmapped",
+        "Sources/NativeAgentApp/AppApprovalTransactionEffects.swift": "Trust and shared model projections — area number unmapped",
+        "Sources/NativeAgentApp/AppConnectorPlatform.swift": "Area 1 composition handoff — live connector/integration bindings; policy and execution in core",
+        "Sources/NativeAgentApp/AppQuietLowerOnly.swift": "Chat and surface integration — area number unmapped",
+        "Sources/NativeAgentApp/AppQuietSettingsHost.swift": "Chat and surface integration — area number unmapped",
+        "Sources/NativeAgentApp/AppQuietToolHost+Mind.swift": "Chat and surface integration — area number unmapped",
+        "Sources/NativeAgentApp/AppQuietToolHost.swift": "Chat and surface integration — area number unmapped",
+        "Sources/NativeAgentApp/AppToolPlatform.swift": "Area 1 composition handoff — live executor/browser/Doctor bindings",
+        "Sources/NativeAgentApp/ChatConsolidationGateInstall.swift": "Chat and surface integration — area number unmapped",
+        "Sources/NativeAgentApp/GitHubPlatformPorts.swift": "Area 1 composition handoff — live GitHub notification and cognition bindings",
+        "Sources/NativeAgentApp/MemoryAppIntents.swift": "MemoryV2 / KnowledgeGraph — area number unmapped",
+        "Sources/NativeAgentApp/MemoryRepairPresentation.swift": "MemoryV2 / KnowledgeGraph — area number unmapped",
+        "Sources/NativeAgentApp/Models/ImprovementNextGenModels.swift": "Trust and shared model projections — area number unmapped",
+        "Sources/NativeAgentApp/Models/TrainingImprovementModels.swift": "Trust and shared model projections — area number unmapped",
+        "Sources/NativeAgentApp/NativeAgentIntents.swift": "App presentation/platform integration — area number unmapped",
+        "Sources/NativeAgentApp/SensesAssembly.swift": "Area 1 composition handoff — live sense runner/provenance bindings"
+      },
+      "message": "Engine logic belongs in NativeAgentCore; the app retains views and platform adapters."
+    }
+  ]
+}
+```

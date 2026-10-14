@@ -253,20 +253,7 @@ public final class MoonshotAdapter: LLMAdapter {
         }
         var body: [String: Any] = ["model": model, "messages": apiMessages, "stream": stream]
         if stream { body["stream_options"] = ["include_usage": true] }
-        if let tools, !tools.isEmpty {
-            body["tools"] = try tools.map { schema in
-                [
-                    "type": "function",
-                    "function": [
-                        "name": schema.name,
-                        "description": schema.description,
-                        "parameters": try JSONSerialization.jsonObject(with: schema.parametersJSON),
-                    ],
-                ]
-            }
-            body["tool_choice"] = "auto"
-            body["parallel_tool_calls"] = true
-        }
+        try OpenAIAdapter.applyTools(to: &body, tools: tools)
         applyReasoningControls(to: &body, model: model)
         return body
     }

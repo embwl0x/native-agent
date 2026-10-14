@@ -55,29 +55,14 @@ public enum ErrorFeeds {
         ErrorFeed(label: "legacy", relativePath: "logs/errors.jsonl"),
     ]
 
-    /// What one watched feed currently says. `silent` is the honesty flag: a
-    /// missing or long-unwritten feed proves nothing, so a zero `recentCount`
-    /// on a silent feed must never be reported as "no errors".
+    /// Bounded recent evidence from one watched feed.
     public struct ErrorFeedStatus: Sendable {
         public let feed: ErrorFeed
-        /// Last modification time, or nil when the file does not exist.
-        public let lastWriteAt: Date?
         /// Rows inside `errorBurstWindow` (always 0 for a silent feed — it is
         /// not read at all).
         public let recentCount: Int
         /// Up to 30 of those rows, oldest-first, truncated for evidence.
         public let recentLines: [String]
-        /// Missing, unreadable, or unwritten for `feedSilentAfter`.
-        public let silent: Bool
-
-        /// Human phrasing for the heartbeat line — "no signal" for a silent
-        /// feed, a row count for a live one.
-        public func summary(now: Date) -> String {
-            guard silent else { return "\(recentCount) row(s)" }
-            guard let lastWriteAt else { return "no signal (never written)" }
-            let days = Int(now.timeIntervalSince(lastWriteAt) / 86_400)
-            return "no signal (last write \(days)d ago)"
-        }
     }
 
     /// Max bytes read from the END of each feed per tick. The files are
@@ -102,15 +87,13 @@ public enum ErrorFeeds {
             let silent = lastWriteAt.map { now.timeIntervalSince($0) > feedSilentAfter } ?? true
             guard !silent else {
                 return ErrorFeedStatus(
-                    feed: feed, lastWriteAt: lastWriteAt,
-                    recentCount: 0, recentLines: [], silent: true)
+                    feed: feed, recentCount: 0, recentLines: [])
             }
             let kept = recentRows(at: path, now: now)
             return ErrorFeedStatus(
-                feed: feed, lastWriteAt: lastWriteAt,
+                feed: feed,
                 recentCount: kept.count,
-                recentLines: Array(kept.prefix(30).reversed()),
-                silent: false)
+                recentLines: Array(kept.prefix(30).reversed()))
         }
     }
 

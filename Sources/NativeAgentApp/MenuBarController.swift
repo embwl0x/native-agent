@@ -7,7 +7,7 @@ import Carbon.HIToolbox
 
 /// Registers a global hotkey using Carbon's RegisterEventHotKey.
 /// Default: ⌘-⇧-J (configurable via AppStorage "globalHotkey").
-/// Tap = bring the main window forward. Hold >200ms = voice push-to-talk (wired to VoiceInputController).
+/// Tap = bring the main window forward. Hold >200ms = voice push-to-talk (wired to VoiceInputCapture).
 @MainActor
 final class GlobalHotkeyManager: NSObject {
     enum RegistrationTransition: Equatable, Sendable {

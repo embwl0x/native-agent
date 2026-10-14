@@ -5,7 +5,7 @@ import TrustCenter
 
 // MARK: - SwiftNative — RouterPlan
 
-public struct SwiftNativeRouterPlanClient: RouterPlanClient {
+public struct SwiftNativeRouterPlanClient: Sendable {
     private let now: @Sendable () -> Date
     private let idFactory: @Sendable () -> String
 
@@ -218,8 +218,7 @@ public struct SwiftNativeRouterPlanClient: RouterPlanClient {
         let matched = selectContextCapabilities(
             records: swiftNativeCapabilityRecords(nowISO: createdAt),
             message: trimmed,
-            mode: routeMode,
-            limit: 8
+            mode: routeMode
         )
         let hasMatch = !matched.isEmpty
         let nextActions = Self.routeNextActions(

@@ -1,97 +1,96 @@
 import Foundation
+@preconcurrency import EventKit
+import PersistenceCore
 
-public enum LocalPIMEntity { case event, reminder }
 public enum LocalPIMCalendarAccess { case read, write }
 
-/// Live objects remain confined to the platform store's main-actor session.
-@MainActor public protocol LocalPIMCalendar {
-    var title: String { get set }
-    var calendarIdentifier: String { get }
-    var sourceTitle: String { get }
-    var allowsContentModifications: Bool { get }
-}
+/// One EventKit session per action. Live objects never leave the main actor;
+/// enumeration uses its own store and callback queues render Core results
+/// inline before exporting Sendable values.
+@MainActor
+final class LocalPIMStore {
+    private let store = EKEventStore()
 
-@MainActor public protocol LocalPIMEvent: AnyObject {
-    associatedtype Calendar: LocalPIMCalendar
-    var eventIdentifier: String? { get }
-    var title: String? { get set }
-    var startDate: Date? { get set }
-    var endDate: Date? { get set }
-    var notes: String? { get set }
-    var location: String? { get set }
-    var calendar: Calendar { get set }
-}
+    static func authorizationState(for entity: EKEntityType) -> String {
+        LocalPIMConnectorActions.authorizationState(EKEventStore.authorizationStatus(for: entity))
+    }
 
-@MainActor public protocol LocalPIMReminder: AnyObject {
-    associatedtype Calendar: LocalPIMCalendar
-    var calendarItemIdentifier: String { get }
-    var title: String? { get set }
-    var notes: String? { get set }
-    var dueDateComponents: DateComponents? { get set }
-    var isCompleted: Bool { get set }
-    var completionDate: Date? { get set }
-    var calendar: Calendar { get set }
-}
+    static var calendarIsWriteOnly: Bool {
+        EKEventStore.authorizationStatus(for: .event) == .writeOnly
+    }
 
-/// Queue-confined read views, deliberately not Sendable. Core filters and
-/// renders inline, accessing detail only after applying the existing limits.
-public protocol LocalPIMEventRead: SendableMetatype {
-    var eventIdentifier: String? { get }
-    var title: String? { get }
-    var calendarTitle: String { get }
-    var calendarIdentifier: String { get }
-    var availability: String { get }
-    var isCancelled: Bool { get }
-    var isAllDay: Bool { get }
-    var startDate: Date? { get }
-    var endDate: Date? { get }
-    var location: String? { get }
-    var notes: String? { get }
-}
+    func requestCalendarAccess(_ intent: LocalPIMCalendarAccess) async throws -> Bool {
+        switch intent {
+        case .read: return try await LocalPIMConnectorActions.requestCalendarReadAccess(store: store)
+        case .write: return try await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: store)
+        }
+    }
 
-public protocol LocalPIMReminderRead: SendableMetatype {
-    var calendarItemIdentifier: String { get }
-    var title: String? { get }
-    var calendarTitle: String { get }
-    var calendarIdentifier: String { get }
-    var isCompleted: Bool { get }
-    var priority: Int { get }
-    var dueDateComponents: DateComponents? { get }
-    var completionDate: Date? { get }
-    var notes: String? { get }
-}
+    func requestReminderAccess() async throws -> Bool {
+        let status = EKEventStore.authorizationStatus(for: .reminder)
+        if LocalPIMConnectorActions.authorizationAllowsRead(status) { return true }
+        guard status == .notDetermined, !SkillRunContext.handsBack else { return false }
+        return try await store.requestFullAccessToReminders()
+    }
 
-/// EventKit access and permission prompts. Core owns interpretation, selection,
-/// matching and receipts; adapters only access platform objects and map values.
-@MainActor public protocol LocalPIMStore: Sendable {
-    associatedtype Calendar: LocalPIMCalendar
-    associatedtype Event: LocalPIMEvent where Event.Calendar == Calendar
-    associatedtype Reminder: LocalPIMReminder where Reminder.Calendar == Calendar
-    associatedtype EventRead: LocalPIMEventRead
-    associatedtype ReminderRead: LocalPIMReminderRead
+    func calendars(for entity: EKEntityType) -> [EKCalendar] {
+        store.calendars(for: entity)
+    }
 
-    init()
-    static func authorizationState(for entity: LocalPIMEntity) -> String
-    static var calendarIsWriteOnly: Bool { get }
-    func requestCalendarAccess(_ intent: LocalPIMCalendarAccess) async throws -> Bool
-    func requestReminderAccess(allowPrompt: Bool) async throws -> Bool
-    func calendars(for entity: LocalPIMEntity) -> [Calendar]
-    var defaultCalendarForNewEvents: Calendar? { get }
-    func defaultCalendarForNewReminders() -> Calendar?
-    func event(withIdentifier id: String) -> Event?
-    func reminder(withIdentifier id: String) -> Reminder?
-    func makeEvent() -> Event
-    func makeReminder() -> Reminder
-    func makeReminderCalendar(in calendar: Calendar) -> Calendar
-    func save(_ calendar: Calendar) throws
-    func save(_ event: Event) throws
-    func save(_ reminder: Reminder) throws
-    func remove(_ event: Event) throws
-    func remove(_ reminder: Reminder) throws
-    func fetchReminders(in calendars: [Calendar]?, incompleteOnly: Bool,
-                        completion: @escaping @Sendable ([ReminderRead]?) -> Void)
+    var defaultCalendarForNewEvents: EKCalendar? {
+        store.defaultCalendarForNewEvents
+    }
+
+    func defaultCalendarForNewReminders() -> EKCalendar? {
+        store.defaultCalendarForNewReminders()
+    }
+
+    func event(withIdentifier id: String) -> EKEvent? {
+        store.event(withIdentifier: id)
+    }
+
+    func reminder(withIdentifier id: String) -> EKReminder? {
+        store.calendarItem(withIdentifier: id) as? EKReminder
+    }
+
+    func makeEvent() -> EKEvent { EKEvent(eventStore: store) }
+    func makeReminder() -> EKReminder { EKReminder(eventStore: store) }
+    func makeReminderCalendar(in calendar: EKCalendar) -> EKCalendar {
+        let list = EKCalendar(for: .reminder, eventStore: store)
+        list.source = calendar.source
+        return list
+    }
+    func save(_ calendar: EKCalendar) throws { try store.saveCalendar(calendar, commit: true) }
+    func save(_ event: EKEvent) throws { try store.save(event, span: .thisEvent, commit: true) }
+    func save(_ reminder: EKReminder) throws { try store.save(reminder, commit: true) }
+    func remove(_ event: EKEvent) throws { try store.remove(event, span: .thisEvent, commit: true) }
+    func remove(_ reminder: EKReminder) throws { try store.remove(reminder, commit: true) }
+
+    func fetchReminders(in calendars: [EKCalendar]?, incompleteOnly: Bool,
+                        completion: @escaping @Sendable ([EKReminder]?) -> Void) {
+        let predicate = incompleteOnly
+            ? store.predicateForIncompleteReminders(withDueDateStarting: nil, ending: nil, calendars: calendars)
+            : store.predicateForReminders(in: calendars)
+        store.fetchReminders(matching: predicate) { reminders in
+            // EventKit invokes this on its private queue. Never capture an
+            // actor-isolated processor (the 2026-06-07 isolation SIGTRAP).
+            // Objects stay on this queue; Core resumes with Sendable values.
+            completion(reminders)
+        }
+    }
+
     nonisolated static func withEvents<Result: Sendable>(
         start: Date, end: Date, calendarIDs: [String]?, calendarMatches: (@Sendable (String) -> Bool)?,
-        read: @Sendable ([EventRead], [String]) -> Result
-    ) -> Result
+        read: @Sendable ([EKEvent], [String]) -> Result
+    ) -> Result {
+        let store = EKEventStore()
+        // Preserve enumeration even when no calendar filter was supplied.
+        let available = store.calendars(for: .event)
+        let calendars = available.filter { calendar in
+            (calendarIDs == nil || calendarIDs!.contains(calendar.calendarIdentifier))
+                && (calendarMatches == nil || calendarMatches!(calendar.title))
+        }
+        let predicate = store.predicateForEvents(withStart: start, end: end, calendars: calendars)
+        return read(store.events(matching: predicate), calendars.map(\.calendarIdentifier))
+    }
 }

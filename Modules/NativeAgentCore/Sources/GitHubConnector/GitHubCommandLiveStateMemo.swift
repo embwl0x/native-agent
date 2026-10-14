@@ -24,7 +24,6 @@ actor GitHubCommandLiveStateMemo {
     private var entries: [String: Entry] = [:]
     private var order: [String] = []
     private var pending: [String: Pending] = [:]
-    private var counters: [String: (hits: Int, misses: Int, coalesced: Int)] = [:]
 
     func value(
         key: String,
@@ -33,15 +32,12 @@ actor GitHubCommandLiveStateMemo {
     ) async throws -> GitHubCommandState {
         guard let stamp else { return try await loader().state }
         if let entry = entries[key], entry.stamp == stamp {
-            note(key, hit: 1)
             return entry.state
         }
         if let existing = pending[key], existing.stamp == stamp {
-            note(key, coalesced: 1)
             return try await existing.task.value.state
         }
 
-        note(key, miss: 1)
         let task = Task { try await loader() }
         pending[key] = Pending(stamp: stamp, task: task)
         do {
@@ -72,29 +68,5 @@ actor GitHubCommandLiveStateMemo {
     func prime(key: String, stamp: FeedStamp?, state: GitHubCommandState) {
         guard let stamp else { return }
         store(key: key, stamp: stamp, state: state)
-    }
-
-    private func note(_ key: String, hit: Int = 0, miss: Int = 0, coalesced: Int = 0) {
-        if counters[key] == nil, counters.count >= Self.maxEntries * 4 {
-            counters.removeAll()
-        }
-        var value = counters[key] ?? (0, 0, 0)
-        value.hits += hit
-        value.misses += miss
-        value.coalesced += coalesced
-        counters[key] = value
-    }
-
-    func forget(key: String) {
-        entries[key] = nil
-        order.removeAll { $0 == key }
-        pending[key]?.task.cancel()
-        pending[key] = nil
-        counters[key] = nil
-    }
-
-    func _testStats(key: String) -> (hits: Int, misses: Int, coalesced: Int, entries: Int) {
-        let value = counters[key] ?? (0, 0, 0)
-        return (value.hits, value.misses, value.coalesced, entries.count)
     }
 }

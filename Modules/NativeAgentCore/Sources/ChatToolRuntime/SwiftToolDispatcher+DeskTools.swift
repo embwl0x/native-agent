@@ -23,10 +23,8 @@ import Desk
 extension SwiftToolDispatcher {
 
     static func latchDeskPeers(_ items: [DeskItem]) {
-        for item in items where item.project == MyQueue.project {
-            guard let step = item.refs.reversed().lazy.compactMap({ ref -> DeskStep? in
-                if case .step(let step) = ref.kind { return step }; return nil
-            }).first else { continue }
+        for item in items {
+            guard let step = item.step else { continue }
             step.peers.forEach { PeerDataTaint.markConsumed(peer: $0) }
             step.elevated.forEach { PeerDataTaint.markElevated(peer: $0) }
         }
@@ -151,7 +149,7 @@ extension SwiftToolDispatcher {
     }
 
     /// Map a handle-or-alias string to a CURRENT stable handle, or throw.
-    private static func deskMatches(_ raw: String, in state: DeskState) throws -> [DeskItem] {
+    package static func deskMatches(_ raw: String, in state: DeskState) throws -> [DeskItem] {
         let reference = deskAlias(raw)
         let exact = state.items.filter { $0.alias == reference || $0.handle == reference }
         let matches = exact.isEmpty ? state.items.filter {
@@ -289,7 +287,7 @@ extension SwiftToolDispatcher {
             let archiveText = archived.map {
                 "  \($0.handle) \($0.finalStatus.rawValue) \($0.project) · \($0.title) — \($0.summary)"
             }.joined(separator: "\n")
-            let start = min(archiveText.count, max(0, optionalInt(input, "archived_offset") ?? 0))
+            let start = min(archiveText.count, max(0, Self.jsonInt(input["archived_offset"]) ?? 0))
             let window = String(archiveText.dropFirst(start).prefix(12_000))
             let end = start + window.count
             archivedIsBounded = start > 0 || end < archiveText.count
@@ -379,6 +377,8 @@ extension SwiftToolDispatcher {
             "projection": .string(text),
             "liveItemCount": .int(Int64(state.items.count)),
             "topLevelItemCount": .int(Int64(state.topLevel.count)),
+            "count_scope": .string("liveItemCount includes parts and MY QUEUE; topLevelItemCount excludes parts but includes MY QUEUE; both include closed items and exclude archives"),
+            "board_counts": .string(state.boardCountSummary),
             "projectionTopLevelCap": .int(Int64(DeskProjection.topLevelCap)),
             "projectionIsBounded": .bool(defaultProjectionIsBounded || archivedIsBounded),
             "next_archive_read": nextArchiveRead,
@@ -485,8 +485,8 @@ extension SwiftToolDispatcher {
             why: why,
             evidence: dossier,
             doneLooksLike: doneLooksLike,
-            maxSessions: optionalInt(input, "max_sessions") ?? Pursuit.defaultMaxSessions,
-            maxDays: optionalInt(input, "max_days") ?? Pursuit.defaultMaxDays,
+            maxSessions: Self.jsonInt(input["max_sessions"]) ?? Pursuit.defaultMaxSessions,
+            maxDays: Self.jsonInt(input["max_days"]) ?? Pursuit.defaultMaxDays,
             abandonCondition: abandonCondition,
             privateName: (privateName?.isEmpty == false) ? privateName : nil
         )
@@ -644,7 +644,7 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "desk_note: text is empty")
         }
         let store = deskStore()
-        _ = try await store.appendNote(handle, text: text)
+        _ = try await store.appendNote(handle, text: text, author: "agent")
         return await deskConfirm(store, handle: handle, prefix: "noted")
     }
 
@@ -701,21 +701,31 @@ extension SwiftToolDispatcher {
 
     // MARK: - desk_close
 
+    static func validateDeskClose(_ input: [String: JSONValue]) throws {
+        let fields = ["handle", "outcome_summary", "canceled", "subtree", "expected_updated_at"]
+        for key in input.keys.sorted() where !key.hasPrefix("__") {
+            guard fields.contains(key) else {
+                throw ToolFailureError("desk.close takes no \(key). Nothing was closed.", argumentPath: "$.\(key)", effects: .none)
+            }
+            let flag = ["canceled", "subtree"].contains(key)
+            switch input[key] {
+            case .string? where !flag, .bool? where flag: break
+            default:
+                throw ToolFailureError("desk.close \(key) must be a \(flag ? "boolean" : "string"). Nothing was closed.",
+                    argumentPath: "$.\(key)", effects: .none)
+            }
+        }
+    }
+
     func impl_desk_close(input: [String: JSONValue]) async throws -> JSONValue {
+        try Self.validateDeskClose(input)
         let handle = try await resolveDeskHandle(input)
         let outcome = try requireString(input, "outcome_summary").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !outcome.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "desk_close: outcome_summary must be non-empty")
         }
-        func flag(_ key: String) -> Bool {
-            switch input[key] {
-            case .some(.bool(let b)): return b
-            case .some(.string(let s)): return ["true", "1", "yes", "y", "on"].contains(s.lowercased())
-            default: return false
-            }
-        }
-        let canceled = flag("canceled")
-        let subtree = flag("subtree")
+        let canceled = input["canceled"] == .bool(true)
+        let subtree = input["subtree"] == .bool(true)
         let store = deskStore()
         let expectedUpdatedAt = optionalString(input, "expected_updated_at")?.trimmingCharacters(
             in: .whitespacesAndNewlines
@@ -1136,7 +1146,7 @@ extension SwiftToolDispatcher {
             return v
         }
         func reqInt(_ k: String) throws -> Int {
-            guard let v = optionalInt(input, k) else {
+            guard let v = Self.jsonInt(input[k]) else {
                 throw AutonomyGateError.toolDenied(reason: "desk_add_ref: ref_kind '\(refKind)' requires integer '\(k)'")
             }
             return v
@@ -1144,7 +1154,7 @@ extension SwiftToolDispatcher {
         let kind: DeskRefKind
         switch refKind {
         case "file":
-            kind = .file(path: try req("path"), line: optionalInt(input, "line"), label: optionalString(input, "label"))
+            kind = .file(path: try req("path"), line: Self.jsonInt(input["line"]), label: optionalString(input, "label"))
         case "commit":
             kind = .commit(sha: try req("sha"), repo: optionalString(input, "repo"), label: optionalString(input, "label"), status: optionalString(input, "status"))
         case "gh_issue":

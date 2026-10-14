@@ -64,7 +64,7 @@ public struct OutcomeFeedbackStore: Sendable {
         guard let sessionID = NativeAgentChatSessionID.normalizedPathComponent(rawSessionID) else {
             throw OutcomeFeedbackError.invalidSessionID
         }
-        guard let messageID = Self.closedToken(rawMessageID, maximum: 128) else {
+        guard let messageID = OutcomeTraceIdentity.normalized(rawMessageID) else {
             throw OutcomeFeedbackError.invalidMessageID
         }
         let rating = rawRating.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -102,15 +102,15 @@ public struct OutcomeFeedbackStore: Sendable {
                   case .string(let anchoredSessionID)? = outcome["sessionID"],
                   anchoredSessionID == sessionID,
                   case .string(let surface)? = outcome["surface"],
-                  Self.closedToken(turnID, maximum: 128) != nil,
-                  Self.closedToken(surface, maximum: 128) != nil else {
+                  OutcomeTraceIdentity.normalized(turnID) != nil,
+                  OutcomeTraceIdentity.normalized(surface) != nil else {
                 throw OutcomeFeedbackError.messageMissingOutcomeAnchor
             }
             let selectionReceiptID: String? = {
                 guard case .string(let value)? = outcome["contextSelectionReceiptID"] else {
                     return nil
                 }
-                return Self.closedToken(value, maximum: 128)
+                return OutcomeTraceIdentity.normalized(value)
             }()
             return (turnID, surface, selectionReceiptID)
         }
@@ -119,16 +119,12 @@ public struct OutcomeFeedbackStore: Sendable {
             .appendingPathComponent("context", isDirectory: true)
             .appendingPathComponent("feedback.jsonl")
         let rawEventID = makeEventID()
-        let eventID = Self.closedToken(rawEventID, maximum: 128)
+        let eventID = OutcomeTraceIdentity.normalized(rawEventID)
             ?? CausalTransitionEvidence.opaqueIdentity(rawEventID)
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let observedAt = formatter.string(from: clock())
+        let observedAt = NativeTimestampFormat.fractionalZulu(clock())
         let reaction = rating == "up" ? "thumbs_up" : "thumbs_down"
         return try await persistence.withFileLock(feedbackPath) {
-            try Self.validateExistingFeedbackFile(feedbackPath)
-            let existing = FileManager.default.fileExists(atPath: feedbackPath.path)
-                ? (try await persistence.readJSONL(feedbackPath)) : []
+            let existing = try Self.readExistingFeedbackFile(feedbackPath)
             let prior = existing.reversed().first { row in
                 guard case .object(let object) = row else { return false }
                 return object["schema"] == .string(Self.schema)
@@ -188,7 +184,7 @@ public struct OutcomeFeedbackStore: Sendable {
         guard let sessionID = NativeAgentChatSessionID.normalizedPathComponent(rawSessionID) else {
             throw OutcomeFeedbackError.invalidSessionID
         }
-        guard let reactionMessageID = Self.closedToken(rawReactionMessageID, maximum: 128) else {
+        guard let reactionMessageID = OutcomeTraceIdentity.normalized(rawReactionMessageID) else {
             throw OutcomeFeedbackError.invalidMessageID
         }
         let transcript = dataRoot
@@ -221,9 +217,9 @@ public struct OutcomeFeedbackStore: Sendable {
                   outcome["sessionID"] == .string(sessionID),
                   case .string(let turnID)? = outcome["turnID"],
                   case .string(let surface)? = outcome["surface"],
-                  Self.closedToken(messageID, maximum: 128) != nil,
-                  Self.closedToken(turnID, maximum: 128) != nil,
-                  Self.closedToken(surface, maximum: 128) != nil else {
+                  OutcomeTraceIdentity.normalized(messageID) != nil,
+                  OutcomeTraceIdentity.normalized(turnID) != nil,
+                  OutcomeTraceIdentity.normalized(surface) != nil else {
                 return nil
             }
             return (messageID, turnID, surface)
@@ -232,10 +228,8 @@ public struct OutcomeFeedbackStore: Sendable {
 
         let feedbackPath = dataRoot.appendingPathComponent("context/feedback.jsonl")
         let rawEventID = makeEventID()
-        let eventID = Self.closedToken(rawEventID, maximum: 128)
+        let eventID = OutcomeTraceIdentity.normalized(rawEventID)
             ?? CausalTransitionEvidence.opaqueIdentity(rawEventID)
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let record: JSONValue = .object([
             "schema": .string(Self.continuationSchema),
             "eventId": .string(eventID),
@@ -245,15 +239,13 @@ public struct OutcomeFeedbackStore: Sendable {
             "surface": .string(anchor.surface),
             "reaction": .string("conversation_continued"),
             "reactionMessageId": .string(reactionMessageID),
-            "observedAt": .string(formatter.string(from: clock())),
+            "observedAt": .string(NativeTimestampFormat.fractionalZulu(clock())),
             "observedBy": .string("canonical_transcript_adjacency"),
             "payloadFree": .bool(true),
             "controlAuthority": .bool(false),
         ])
         return try await persistence.withFileLock(feedbackPath) {
-            try Self.validateExistingFeedbackFile(feedbackPath)
-            let existing = FileManager.default.fileExists(atPath: feedbackPath.path)
-                ? (try await persistence.readJSONL(feedbackPath)) : []
+            let existing = try Self.readExistingFeedbackFile(feedbackPath)
             if let prior = existing.first(where: { row in
                 guard case .object(let object) = row else { return false }
                 return object["schema"] == .string(Self.continuationSchema)
@@ -282,7 +274,7 @@ public struct OutcomeFeedbackStore: Sendable {
         sessionID: String,
         runID: String
     ) -> Bool {
-        guard closedToken(runID, maximum: 128) != nil else { return false }
+        guard OutcomeTraceIdentity.normalized(runID) != nil else { return false }
         for value in precedingRows {
             guard case .object(let row) = value,
                   row["sessionId"] == .string(sessionID),
@@ -298,9 +290,8 @@ public struct OutcomeFeedbackStore: Sendable {
     public func reactionEvidenceKeys() async throws -> Set<OutcomeReactionEvidenceKey> {
         let path = dataRoot.appendingPathComponent("context/feedback.jsonl")
         return try await persistence.withFileLock(path) {
-            guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-            try Self.validateExistingFeedbackFile(path)
-            return Set(try await persistence.readJSONL(path).compactMap { row in
+            let existing = try Self.readExistingFeedbackFile(path)
+            return Set(existing.compactMap { row in
                 guard case .object(let object) = row,
                       object["schema"] == .string(Self.schema)
                         || object["schema"] == .string(Self.continuationSchema),
@@ -314,8 +305,8 @@ public struct OutcomeFeedbackStore: Sendable {
         }
     }
 
-    private static func validateExistingFeedbackFile(_ path: URL) throws {
-        guard FileManager.default.fileExists(atPath: path.path) else { return }
+    private static func readExistingFeedbackFile(_ path: URL) throws -> [JSONValue] {
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path.path),
               let number = attributes[.size] as? NSNumber,
               number.intValue <= maximumExistingBytes,
@@ -326,7 +317,7 @@ public struct OutcomeFeedbackStore: Sendable {
         guard lines.count <= maximumExistingRows else {
             throw OutcomeFeedbackError.feedbackStoreCorrupt
         }
-        for line in lines {
+        return try lines.compactMap { line -> JSONValue? in
             guard let value = try? JSONValue.parse(Data(line)), case .object(let object) = value else {
                 throw OutcomeFeedbackError.feedbackStoreCorrupt
             }
@@ -335,19 +326,19 @@ public struct OutcomeFeedbackStore: Sendable {
                       case .string(let turnID)? = object["turnId"],
                       case .string(let messageID)? = object["messageId"],
                       case .string(let reaction)? = object["reaction"],
-                      closedToken(eventID, maximum: 128) != nil,
-                      closedToken(turnID, maximum: 128) != nil,
-                      closedToken(messageID, maximum: 128) != nil,
+                      OutcomeTraceIdentity.normalized(eventID) != nil,
+                      OutcomeTraceIdentity.normalized(turnID) != nil,
+                      OutcomeTraceIdentity.normalized(messageID) != nil,
                       (object["contextSelectionReceiptId"] == nil || {
                           guard case .string(let receiptID)? = object["contextSelectionReceiptId"] else {
                               return false
                           }
-                          return closedToken(receiptID, maximum: 128) != nil
+                          return OutcomeTraceIdentity.normalized(receiptID) != nil
                       }()),
                       reaction == "thumbs_up" || reaction == "thumbs_down",
                       (object["supersedesEventId"] == nil || {
                           guard case .string(let prior)? = object["supersedesEventId"] else { return false }
-                          return closedToken(prior, maximum: 128) != nil
+                          return OutcomeTraceIdentity.normalized(prior) != nil
                       }()),
                       object["payloadFree"] == .bool(true),
                       object["controlAuthority"] == .bool(false) else {
@@ -361,13 +352,13 @@ public struct OutcomeFeedbackStore: Sendable {
                       case .string(let surface)? = object["surface"],
                       case .string(let reactionMessageID)? = object["reactionMessageId"],
                       case .string(let observedAt)? = object["observedAt"],
-                      closedToken(eventID, maximum: 128) != nil,
-                      closedToken(turnID, maximum: 128) != nil,
-                      closedToken(messageID, maximum: 128) != nil,
+                      OutcomeTraceIdentity.normalized(eventID) != nil,
+                      OutcomeTraceIdentity.normalized(turnID) != nil,
+                      OutcomeTraceIdentity.normalized(messageID) != nil,
                       NativeAgentChatSessionID.normalizedPathComponent(sessionID) == sessionID,
-                      closedToken(surface, maximum: 128) != nil,
-                      closedToken(reactionMessageID, maximum: 128) != nil,
-                      Self.parseDate(observedAt) != nil,
+                      OutcomeTraceIdentity.normalized(surface) != nil,
+                      OutcomeTraceIdentity.normalized(reactionMessageID) != nil,
+                      NativeTimestampFormat.parseISO8601FractionalFirst(observedAt) != nil,
                       object["reaction"] == .string("conversation_continued"),
                       object["observedBy"] == .string("canonical_transcript_adjacency"),
                       object["payloadFree"] == .bool(true),
@@ -384,21 +375,8 @@ public struct OutcomeFeedbackStore: Sendable {
                     throw OutcomeFeedbackError.feedbackStoreCorrupt
                 }
             }
+            // Match readJSONL's UTF-8 admission after validating every row.
+            return String(data: Data(line), encoding: .utf8) == nil ? nil : value
         }
-    }
-
-    private static func closedToken(_ raw: String?, maximum: Int) -> String? {
-        guard let raw else { return nil }
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._:"))
-        guard raw == value, !value.isEmpty, value.count <= maximum,
-              value.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
-        return value
-    }
-
-    private static func parseDate(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
     }
 }

@@ -33,12 +33,4 @@ extension SwiftNativeChatOrchestrationClient {
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f.string(from: date)
     }
-
-    nonisolated static func inputWithSessionIfNeeded(
-        toolName: String,
-        input: [String: JSONValue],
-        sessionId: String?
-    ) -> [String: JSONValue] {
-        ChatToolSessionInjection.apply(toolName: toolName, input: input, sessionId: sessionId)
-    }
 }

@@ -1,3 +1,4 @@
+import EngineRuntime
 import Foundation
 import AppToolRuntime
 import Observation
@@ -139,12 +140,12 @@ extension AppModel {
         let fetchedMemories = await refreshPreserving("getMemories", current: engine.memory.memories) {
             try await engine.memory.activeMemories()
         }
-        let fetchedPersonality = await refreshPreserving("getPersonality", current: personality) { try await Self.readPersonality(dataRoot: engine.dataRoot) }
+        let fetchedPersonality = await refreshPreserving("getPersonality", current: personality) { try await SwiftNativePersonaEngine.readPersonality(dataRoot: engine.dataRoot) }
         let fetchedPersonalityDocs = await decodeLogged("getPersonalityDocs", { try await persona.listPersonaDocSpecs() })
         let fetchedSkills = await refreshPreserving("getSkills", current: skills) { try await RuntimeReadProjection.skills(dataRoot: engine.dataRoot) }
         let fetchedTools = await refreshPreserving("getTools", current: engine.tools.authored) { try await engine.tools.listAuthored() }
         let fetchedCapabilitySummary = await refreshPreserving("getCapabilities", current: engine.trust.capabilitySummary) { try await engine.trust.loadCapabilities() }
-        let fetchedWorkflows = await refreshPreserving("getWorkflows", current: workflows) { try await makeWorkflowOrchestrationClient(root: engine.dataRoot).listWorkflowRecords() }
+        let fetchedWorkflows = await refreshPreserving("getWorkflows", current: workflows) { try await SwiftNativeWorkflowOrchestrationClient(root: engine.dataRoot).listWorkflowRecords() }
         let fetchedApprovals = await refreshPreserving("getApprovals", current: engine.approvals.records) { try await engine.approvals.list() }
         // An unavailable inbox read is not an honest empty inbox. Keep the
         // last model snapshot on failure so InboxView receives `[]` only when
@@ -247,14 +248,14 @@ extension AppModel {
         let fetchedCapabilityPackInstalls = await decodeLogged("getCapabilityPackInstalls") { try await engine.trust.packInstalls() }
         let fetchedCapabilityTrust = await decodeLogged("getCapabilityTrust") { try await engine.trust.loadCapabilityNetwork() }
         let fetchedNextGenPhases = await refreshPreserving("getNextGenPhases", current: nextGenPhases) { try await NextGenStatusProjection(dataRoot: engine.dataRoot).getNextGenPhases() }
-        let fetchedPersonalityGrowth = await decodeLogged("getPersonalityGrowth") { try await Self.readPersonalityGrowth() }
+        let fetchedPersonalityGrowth = await decodeLogged("getPersonalityGrowth") { try await RuntimeReadProjection.swiftPersonalityGrowth(runtime: NativeAgentEngine.liveCognition) }
         let fetchedNativeActions = await refreshPreserving("getNativeActionRegistry", current: nativeActions) { NativeActionRoutes.swiftNativeActionRecords() }
         let fetchedNativeActionReceipts = await refreshPreserving("getNativeActionReceipts", current: nativeActionReceipts) { await RuntimeReadProjection.tailJSONL(path: NativeActionRoutes.nativeActionReceiptsPath(dataRoot: engine.dataRoot), limit: 50) }
         let fetchedNotificationStatus = await decodeLogged("getNotificationStatus") { try await RuntimeReadProjection.getNotificationStatus(dataRoot: engine.dataRoot) }
         let fetchedBrowserRuntimeStatus = await decodeLogged("getBrowserStatus") { try await RuntimeReadProjection.getBrowserStatus(dataRoot: engine.dataRoot) }
         let fetchedMemoryVectorStatus = await decodeLogged("getMemoryVectorStatus") { try await MemoryStatusProjection.getMemoryVectorStatus(dataRoot: engine.dataRoot) }
         let fetchedMemoryV2Status = await decodeLogged("getMemoryV2Status") { try await MemoryStatusProjection.getMemoryV2Status(dataRoot: engine.dataRoot) }
-        let fetchedConnectorActionRegistry = await decodeLogged("getConnectorActions") { try await ConnectorActionRegistry.read(dataRoot: engine.dataRoot) }
+        let fetchedConnectorActionRegistry = await decodeLogged("getConnectorActions") { try await ConnectorActionRegistry.read(dataRoot: engine.dataRoot, platform: AppConnectorStatusPlatform()) }
         let fetchedImprovementGauntletStatus = await decodeLogged("getImprovementGauntlet") { try await RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: engine.dataRoot) }
         let fetchedProductionHardening = await decodeLogged("getProductionHardening") { try await DoctorStatusProjection.getProductionHardening(dataRoot: engine.dataRoot) }
         let fetchedProductionExports = await refreshPreserving("getProductionExports", current: productionExports) { try await ProductionExport.list(dataRoot: engine.dataRoot) }
@@ -263,11 +264,9 @@ extension AppModel {
         let fetchedConnectors = await refreshPreserving("getConnectors", current: connectors) { try await ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform()) }
         let fetchedWorkspaces = await refreshPreserving("getWorkspaces", current: workspaces) { try await ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot) }
         let fetchedEvals = await refreshPreserving("getEvals", current: evals) { try await selfImprovement.evals() }
-        let fetchedReleaseChecklist = await decodeLogged("getReleaseChecklist") { try await Self.readReleaseChecklist(dataRoot: engine.dataRoot) }
-        let fetchedWatchdogStatus = await decodeLogged("getWatchdog") { await engine.doctor.readWatchdog(manager: backgroundLoopsManager.coreManager) }
-        let fetchedTrainingArtifacts = await refreshPreserving("getTrainingArtifacts", current: trainingArtifacts) { try await Self.readTrainingArtifacts(dataRoot: engine.dataRoot) }
+        let fetchedWatchdogStatus = await decodeLogged("getWatchdog") { await engine.doctor.readWatchdog(manager: backgroundLoopsManager) }
         let fetchedJobs = await refreshPreserving("getJobs", current: engine.desk.jobs) { try await engine.desk.listJobs() }
-        let fetchedTelegramStatus = await decodeLogged("getTelegramStatus") { try await engine.telegram.load(manager: backgroundLoopsManager.coreManager) }
+        let fetchedTelegramStatus = await decodeLogged("getTelegramStatus") { try await engine.telegram.load(manager: backgroundLoopsManager) }
         // No `await` from here to the end of the block: one MainActor turn.
         setIfChanged(\.engine.desk.researchRuns, fetchedResearchLabRuns)
         setIfChanged(\.capabilityTraceTimeline, fetchedTraceTimeline)
@@ -314,9 +313,7 @@ extension AppModel {
         setIfChanged(\.connectors, fetchedConnectors)
         setIfChanged(\.workspaces, fetchedWorkspaces)
         setIfChanged(\.evals, fetchedEvals)
-        setIfChanged(\.releaseChecklist, fetchedReleaseChecklist)
         setIfChanged(\.engine.doctor.watchdog, fetchedWatchdogStatus)
-        setIfChanged(\.trainingArtifacts, fetchedTrainingArtifacts)
         setIfChanged(\.engine.desk.jobs, fetchedJobs)
         setIfChanged(\.engine.telegram.status, fetchedTelegramStatus)
         if fetchedTelegramStatus != nil {
@@ -343,12 +340,12 @@ extension AppModel {
         let fetchedCompiledPersonality = await decodeLogged("getCompiledPersonality") { try await PersonaCompiler(engine: persona).compiledPacket(surface: "chat") }
         let telegramBeforeConfig = telegramSettingsDraftSnapshot
         let telegramBaselineConfig = telegramSettingsDraftBaseline
-        let fetchedConfig = await decodeLogged("getConfig", { try await Self.readConfig(dataRoot: engine.dataRoot) })
+        let fetchedConfig = await decodeLogged("getConfig", { try await RuntimeReadProjection.configuration(dataRoot: engine.dataRoot) })
         // Apply the fetched UI state in one MainActor turn before publishing the widget.
         setIfChanged(\.compiledPersonality, fetchedCompiledPersonality)
         if let config = fetchedConfig {
             setIfChanged(\.engine.providers.codexAuth, config.codexAuth)
-            _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
+            applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
             if let telegram = config.telegram {
                 setIfChanged(\.telegramTokenConfigured, telegram.tokenConfigured)
                 applyTelegramDraft(TelegramSettingsDraftSnapshot(
@@ -358,7 +355,8 @@ extension AppModel {
                 telegramModel = telegram.model ?? telegramModel
                 telegramReasoningEffort = telegram.reasoningEffort ?? telegramReasoningEffort
             }
-            if let routing = config.modelRouting {
+            do {
+                let routing = config.modelRouting
                 // PATCH-2026-05-07: model-autosave Don't clobber the user's
                 // picker selection on every refresh. The picker auto-saves
                 // to daemon now (onChange → saveChatBrainDefaults), so the

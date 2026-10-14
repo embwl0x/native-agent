@@ -173,11 +173,11 @@ extension SwiftNativeMacControl {
             output: result.output,
             error: result.error,
             durationMs: result.durationMs,
-            viaSwift: result.viaSwift,
             httpStatus: result.httpStatus,
             operationId: record.operationId,
             operationState: record.state,
-            verification: record.verification
+            verification: record.verification,
+            nativePage: result.nativePage
         )
     }
 
@@ -200,7 +200,6 @@ extension SwiftNativeMacControl {
             ]),
             error: ok ? nil : record.outcomeCode,
             durationMs: 0,
-            viaSwift: true,
             httpStatus: status,
             operationId: record.operationId,
             operationState: record.state,
@@ -221,7 +220,6 @@ extension SwiftNativeMacControl {
             ]),
             error: "Mac Control stopped waiting, but the external effect could not be verified; do not retry automatically",
             durationMs: 0,
-            viaSwift: true,
             httpStatus: 409,
             operationId: record.operationId,
             operationState: record.state,
@@ -239,7 +237,6 @@ extension SwiftNativeMacControl {
             output: .object(["status": .string("cancel_acknowledged")]),
             error: "cancelled",
             durationMs: 0,
-            viaSwift: true,
             operationId: record.operationId,
             operationState: record.state,
             verification: record.verification
@@ -259,7 +256,6 @@ extension SwiftNativeMacControl {
             ]),
             error: "Mac Control deadline exceeded",
             durationMs: 0,
-            viaSwift: true,
             httpStatus: 408,
             operationId: record.operationId,
             operationState: record.state,

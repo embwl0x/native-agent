@@ -8,12 +8,6 @@ import PersonaEngine
 import PersistenceCore
 import ProviderRouting
 
-public struct NativeCognitionPreferenceDefaults: @unchecked Sendable {
-    public let defaults: UserDefaults
-
-    public static let standard = Self(defaults: .standard)
-}
-
 public struct CognitiveObservatoryDetail: Sendable {
     public var configuration: CognitiveConfiguration
     public var summary: CognitiveObservatorySnapshot
@@ -167,18 +161,6 @@ public struct NativeReflectionRouteStatus: Sendable, Equatable {
     public var isReady: Bool { providerReady && modelKnown != false }
 }
 
-struct NativeFrozenMindRead: Sendable {
-    let fixedAt: Date
-    let cognition: CognitiveFrozenRead
-    let organism: OrganismFrozenRead
-    let capsule: CognitiveCapsule
-}
-
-enum NativeFrozenMindReadError: Error, Sendable, Equatable {
-    case runtimeNotBootstrapped
-    case bootstrapFailed(String)
-}
-
 public enum CognitiveTransientStateClearOutcome: Sendable, Equatable {
     case cleared
     case persistenceFailed(String)
@@ -271,17 +253,45 @@ public struct CognitiveMicrocycleTelemetry: Sendable, Equatable {
     }
 }
 
-/// Execution ownership for the dirty-settlement coalescer. Production uses the
-/// trailing-edge task. The manual mode exists solely for deterministic proof:
-/// tests can advance Agent's analytic clock by days and flush the exact same
-/// settlement path without sleeping, adding a timer, or recruiting a model.
-public enum CognitiveMicrocycleSchedulingMode: Sendable {
-    case automatic
-    case manuallyFlushed
-}
-
 // internal for +Reflection extension (move-only Wave C)
 public enum CognitiveBackgroundGate: Sendable, Equatable {
     case allowed
     case skipped(String)
+}
+
+extension CognitiveAffectState {
+    public var observatoryValuesAreValid: Bool {
+        [arousal, uncertainty, taskPressure, socialWarmth].allSatisfy {
+            $0.isFinite && (0...1).contains($0)
+        }
+    }
+}
+
+extension OrganismSnapshot {
+    public func observatorySampleIsCurrent(now: Date, maximumSampleAge: TimeInterval) -> Bool {
+        let age = now.timeIntervalSince(generatedAt)
+        return generatedAt.timeIntervalSinceReferenceDate.isFinite
+            && now.timeIntervalSinceReferenceDate.isFinite
+            && age >= -60 && age <= maximumSampleAge
+    }
+
+    public var observatoryValuesAreValid: Bool {
+        [
+            chemicalState.warmth,
+            chemicalState.vigilance,
+            chemicalState.coherence,
+            chemicalState.confidence,
+            chemicalState.fatigue,
+            chemicalState.agency,
+            fieldSummary.strongestEdgeWeight,
+            fieldSummary.totalCharge,
+            fieldSummary.averageUncertainty,
+            predictionSummary.peripheralUncertainty,
+            predictionSummary.strategyCaution,
+            predictionSummary.bodyConfidence.toolPath,
+            predictionSummary.bodyConfidence.providerPath,
+            predictionSummary.bodyConfidence.phonePath,
+            residualRepairOpportunity.pressure,
+        ].allSatisfy(\.isFinite)
+    }
 }

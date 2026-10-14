@@ -1,7 +1,7 @@
 import Foundation
 
 public struct StoreChange: Sendable, Equatable {
-    public enum Store: String, Sendable { case desk, githubCommand }
+    public enum Store: String, Sendable { case desk, githubCommand, replyDelivery }
     public let store: Store
     public let path: URL
     public init(store: Store, path: URL) { self.store = store; self.path = path }

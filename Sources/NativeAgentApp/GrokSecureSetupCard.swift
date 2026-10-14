@@ -24,10 +24,7 @@ struct GrokSecureSetupCard: View {
                         do {
                             let name = botName.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !name.isEmpty else { return }
-                            try AgentPeerStore(dataRoot: dataRoot).updateGrok(contact.id) { current in
-                                guard current.grokConversation == nil else { throw GrokLinkCredential.Failure.invalid }
-                                current.conversationLabel = name
-                            }
+                            try GrokBotConnection.selectBot(peer: contact.id, name: name, dataRoot: dataRoot)
                             status = "Bot selected. Connect again to send the routine request."
                         } catch { status = "Could not save the Bot selection." }
                     }.disabled(busy || botName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -57,19 +54,8 @@ struct GrokSecureSetupCard: View {
     private func save(_ contact: AgentPeerContact) {
         defer { paste = "" }
         do {
-            guard paste.utf8.count <= 16_384, let data = paste.data(using: .utf8),
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: String],
-                  Set(object.keys) == ["url", "key"], let url = object["url"], let key = object["key"] else {
+            guard try GrokBotConnection.saveSecureCredentials(peer: contact.id, paste: paste, dataRoot: dataRoot) else {
                 status = "Paste one JSON object with url and key. Nothing was saved."; return
-            }
-            let store = AgentPeerStore(dataRoot: dataRoot)
-            try store.updateGrok(contact.id) { current in
-                guard ["creating", "secure-paste"].contains(current.grokSetup ?? "") else { throw GrokLinkCredential.Failure.invalid }
-                var credential = try GrokLinkCredential.read(peer: contact.id)
-                try credential.importWebhook(url: url, key: key)
-                try credential.write(peer: contact.id)
-                current.grokSetup = "set up"
-                current.grokBootstrapConfirmed = true
             }
             ready()
         } catch { status = "Could not save the routine credentials securely. Nothing was sent." }
@@ -79,12 +65,10 @@ struct GrokSecureSetupCard: View {
         Task { @MainActor in
             defer { busy = false }
             do {
-                guard let current = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == contact.id }),
-                      ["creating", "secure-paste"].contains(current.grokSetup ?? "") else { return }
-                try await NativeAgentEngine.live.agents.desktop.importGrokRoutine(peer: contact.id, dataRoot: dataRoot, waitForCreation: true)
+                guard try await GrokBotConnection.importSecureCredentials(peer: contact.id, dataRoot: dataRoot,
+                    desktop: NativeAgentEngine.live.agents.desktop) else { return }
                 ready()
             } catch {
-                try? AgentPeerStore(dataRoot: dataRoot).updateGrok(contact.id) { $0.grokSetup = "secure-paste" }
                 status = (error as? GrokRoutineAccessibility.Blocker)?.rawValue ?? "The credentials could not be imported securely."
             }
         }

@@ -42,10 +42,8 @@ extension SwiftToolDispatcher {
         case .failure(let envelope): return envelope
         }
 
-        if ompMessageWakeupOverride == nil, ompMessageWakeupHelperOverride == nil {
-            let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: agentBridgeConfigRoot)
-            guard returnPath.isReady else { return Self.returnBridgeUnavailableEnvelope(returnPath) }
-        }
+        let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: agentBridgeConfigRoot)
+        guard returnPath.isReady else { return Self.returnBridgeUnavailableEnvelope(returnPath) }
 
         let directory = Self.bridgeConfigDirectory(
             named: "omp-bridge",
@@ -78,8 +76,7 @@ extension SwiftToolDispatcher {
         // The wake refuses a continuation whose saved session is gone
         // (continuation_unavailable) a moment after this returned "queued"
         // (walk 09-25). Its own rule, checked here first: failed now, nothing written.
-        if ompMessageWakeupOverride == nil, ompMessageWakeupHelperOverride == nil,
-           Self.builderConversationReferenceSupplied(in: input),
+        if Self.builderConversationReferenceSupplied(in: input),
            !Self.ompSessionSaved(topic: topic, directory: directory) {
             return .object([
                 "status": .string("unavailable"), "sent": .bool(false), "reason": .string("continuation_unavailable"),
@@ -280,10 +277,8 @@ extension SwiftToolDispatcher {
         if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
         if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
         Self.stampDelegationProducer(on: &payload)
-        if let ompMessageWakeupOverride { return await ompMessageWakeupOverride(payload) }
         // L1#14 replay guard — see postClaudeThreadWakeup for the four
-        // conditions, why a lost/failed prior run is never suppressed, and why
-        // this sits after the override.
+        // conditions and why a lost/failed prior run is never suppressed.
         if !WakeupReplayGuard.isDisabled(),
            let match = WakeupReplayGuard.terminalDuplicate(
                store: .omp,
@@ -305,7 +300,6 @@ extension SwiftToolDispatcher {
             ])
         }
         guard let helper = AgentBridgeRuntime.ompHelperURL(
-            override: ompMessageWakeupHelperOverride,
             dataRoot: dataRoot
         ) else {
             return .object([
@@ -313,7 +307,6 @@ extension SwiftToolDispatcher {
                 "reason": .string("helper_not_found"),
                 "expected": .string(AgentBridgeRuntime.expectedHelperPath(
                     named: "omp_thread_wakeup.js",
-                    override: ompMessageWakeupHelperOverride,
                     dataRoot: dataRoot
                 ).path),
                 "fix": .string("Rebuild or reinstall NativeAgent so omp_thread_wakeup.js is at the expected path."),

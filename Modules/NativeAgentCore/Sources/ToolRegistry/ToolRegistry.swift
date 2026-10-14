@@ -256,8 +256,11 @@ extension ToolRecord {
     public var autoCreated: Bool? { extraBool("autoCreated") }
     public var autoRun: Bool? { extraBool("autoRun") }
 
-    public var quarantinePath: String? { extraString("quarantinePath") }
     public var language: String? { extraString("language") }
+    public var pendingCandidate: Bool {
+        guard let candidate = extraString("candidateDigest") else { return false }
+        return candidate != codeFingerprint
+    }
 
     public var useCount: Int? {
         switch extra("useCount") {
@@ -303,9 +306,9 @@ extension ToolRecord {
         guard let description = extra("description"), isString(description) else { return "description" }
         guard let triggers = extra("triggers"), isStrings(triggers) else { return "triggers" }
         let optional: [(String, (JSONValue) -> Bool)] = [
-            ("language", isString), ("entrypoint", isString), ("permissions", isStrings),
+            ("language", isString), ("entrypoint", isString), ("permissions", isStrings), ("actions", isStrings),
             ("autoCreated", isBool), ("autoPromote", isBool), ("autoRun", isBool), ("autoPromotable", isBool),
-            ("validationErrors", isStrings), ("quarantinePath", isString), ("quarantineReason", isString),
+            ("validationErrors", isStrings), ("disabledReason", isString),
             ("sourceRunId", isString), ("useCount", isCount),
         ]
         for (key, reads) in optional {
@@ -328,55 +331,27 @@ public protocol ToolRegistryProtocol: Sendable {
     func listTools(filter: ToolFilter) async throws -> [ToolRecord]
     func getTool(id: String) async throws -> ToolRecord?
     @discardableResult
-    func quarantine(id: String, reason: String) async throws -> ToolRecord
+    func quarantine(id: String, reason: String, ownerAuthorized: Bool) async throws -> ToolRecord
 }
 
 // MARK: - SwiftNative impl
 
-/// File-backed tool registry for listing and quarantine. Promotion belongs to
-/// SwiftNativeToolExecution. Actor-isolated for R-M-W serialization on
-/// `<root>/tools/registry.json`.
-///
-/// HARD SCOPE CARVE-OUTS — Swift impl deliberately does NOT touch:
-///   - manifestSignature / signedAt / signatureVersion       (HMAC signing)
-///   - codeFingerprint                                       (hash of tool code on disk)
-///   - activePath / proposalPath                             (copytree work)
-///   - validationStatus / validationErrors / lastValidatedAt (validate_tool pipeline)
-///   - autoPromotable / autoRun / autoPromote                (policy fields)
-///   - manualApprovalRequired                                (policy)
-///   - riskAcknowledgedAt / riskAcknowledgedBy / userRequestedActivation
-/// All carve-outs round-trip via `extras` untouched.
-/// Quarantine copies the active body to the quarantine directory and records
-/// the resulting `quarantinePath`.
+/// Checked ability-file reads; mutations use the canonical storage owner.
 public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
     private let root: URL
-    private let persistence: any PersistenceCoreProtocol
     private let clock: @Sendable () -> Date
-    private var mutationTail: Task<Void, Never>? = nil
-
     public init(
         root: URL = PersistenceCore.defaultDataRoot(),
-        persistence: (any PersistenceCoreProtocol)? = nil,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.root = root
-        self.persistence = persistence ?? SwiftNativePersistenceCore()
         self.clock = clock
-    }
-
-    public var registryPath: URL {
-        root
-            .appendingPathComponent("tools", isDirectory: true)
-            .appendingPathComponent("registry.json")
     }
 
     // MARK: list / get
 
     public func listTools(filter: ToolFilter) async throws -> [ToolRecord] {
-        let raw = try await persistence.readJSON(registryPath, ifMissing: .array([]))
-        guard case .array(let items) = raw else {
-            throw ToolRegistryError.registryUnreadable(reason: "registry must be an array")
-        }
+        let items = try ToolRegistryActions.entries(dataRoot: root)
         let records = try items.enumerated().map { index, item in
             guard let record = ToolRecord(json: item) else {
                 throw ToolRegistryError.registryUnreadable(reason: "row \(index + 1) has missing or invalid required fields")
@@ -405,196 +380,17 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
         return all.first { $0.id == id }
     }
 
-    // MARK: mutating ops — R-M-W serialization gate
-
-    private func runSerialized<T: Sendable>(
-        _ body: @Sendable @escaping () async throws -> T
-    ) async throws -> T {
-        let prior = mutationTail
-        let task = Task<T, Error> {
-            _ = await prior?.value
-            return try await body()
-        }
-        mutationTail = Task { _ = try? await task.value }
-        return try await task.value
-    }
-
-    /// Resolve the first exact-ID row while the caller owns the mutation lock.
-    private static func editableRecord(
-        id: String, persistence: any PersistenceCoreProtocol, registryPath: URL
-    ) async throws -> ([JSONValue], Int, [String: JSONValue]) {
-        let raw = try await persistence.readJSON(registryPath, ifMissing: .array([]))
-        guard case .array(let items) = raw else {
-            throw ToolRegistryError.toolNotFound(id)
-        }
-        for (idx, item) in items.enumerated() {
-            guard case .object(let obj) = item,
-                  case .string(let rid) = obj["id"] ?? .null,
-                  rid == id else { continue }
-            return (items, idx, obj)
-        }
-        throw ToolRegistryError.toolNotFound(id)
-    }
-
     @discardableResult
-    public func quarantine(id: String, reason: String) async throws -> ToolRecord {
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            throw ToolRegistryError.invalidRequest("empty id")
+    public func quarantine(id: String, reason: String, ownerAuthorized: Bool = false) async throws -> ToolRecord {
+        try await ToolRegistryActions.mutate(id: id, dataRoot: root, ownerAuthorized: ownerAuthorized) { current in
+            guard var fields = current else { throw ToolRegistryError.toolNotFound(id) }
+            fields["status"] = .string("disabled"); fields["phase"] = .string("disabled")
+            fields["updatedAt"] = .string(Self.isoTimestamp(self.clock()))
+            fields["disabledReason"] = .string(reason)
+            return fields
         }
-        return try await runSerialized { [persistence, registryPath, clock] in
-            try await Self._quarantineImpl(
-                id: id,
-                reason: reason,
-                persistence: persistence,
-                registryPath: registryPath,
-                now: clock()
-            )
-        }
-    }
-
-    private static func _quarantineImpl(
-        id: String,
-        reason: String,
-        persistence: any PersistenceCoreProtocol,
-        registryPath: URL,
-        now: Date
-    ) async throws -> ToolRecord {
-        // APPROVAL GATE — intentionally absent.
-        //
-        // SwiftNativeToolRegistry mirrors the business-logic layer. Dispatcher
-        // approval gates must be applied before callers invoke this method.
-        let work: @Sendable () async throws -> ToolRecord = {
-            var (mutated, idx, obj) = try await Self.editableRecord(
-                id: id, persistence: persistence, registryPath: registryPath
-            )
-
-            // File move — mirror daemon L34020-34026:
-            //   source_dir = tool_dir_for_record(record)
-            //   quarantine_dir = <root>/tools/quarantine/<id>
-            //   if quarantine_dir.exists(): shutil.rmtree(quarantine_dir)
-            //   if source_dir.exists(): shutil.copytree(source_dir, quarantine_dir)
-            // Atomic-ish: copy into a tmp sibling, then renameItem into place.
-            let toolsRoot = registryPath.deletingLastPathComponent() // <root>/tools
-            let quarantineRoot = toolsRoot.appendingPathComponent("quarantine", isDirectory: true)
-            let quarantineDir = quarantineRoot.appendingPathComponent(id, isDirectory: true)
-            let sourceDir = try Self._resolveSourceDir(record: obj, toolsRoot: toolsRoot, id: id)
-            let fm = FileManager.default
-            try fm.createDirectory(at: quarantineRoot, withIntermediateDirectories: true)
-            // Keep the old body until the REGISTRY commit succeeds, not just
-            // until the incoming directory lands. The registry and directory
-            // replacement are one transaction under the enclosing file lock.
-            var incoming: URL?
-            var backup: URL?
-            var installedReplacement = false
-            defer {
-                // copyItem can leave a partial destination before throwing.
-                // Cleanup must cover that failure as well as later failures.
-                if let incoming, fm.fileExists(atPath: incoming.path) {
-                    try? fm.removeItem(at: incoming)
-                }
-            }
-            do {
-                if let src = sourceDir, fm.fileExists(atPath: src.path) {
-                    let incomingPath = quarantineRoot.appendingPathComponent(
-                        ".incoming-\(id)-\(UUID().uuidString)", isDirectory: true)
-                    incoming = incomingPath
-                    try fm.copyItem(at: src, to: incomingPath)
-                    if fm.fileExists(atPath: quarantineDir.path) {
-                        let backupPath = quarantineRoot.appendingPathComponent(
-                            ".backup-\(id)-\(UUID().uuidString)", isDirectory: true)
-                        try fm.moveItem(at: quarantineDir, to: backupPath)
-                        backup = backupPath
-                    }
-                    try fm.moveItem(at: incomingPath, to: quarantineDir)
-                    installedReplacement = true
-                }
-                // If sourceDir is nil or missing, do NOT touch an existing
-                // quarantine dir — preserving prior body is strictly safer than
-                // mirroring the old delete-only branch.
-
-                let stamp = isoTimestamp(now)
-                // Flip status + phase to quarantined; stamp quarantinedAt + reason
-                // + quarantinePath. Mirrors daemon L34027-34034.
-                obj["status"] = .string("quarantined")
-                obj["phase"] = .string("quarantined")
-                obj["updatedAt"] = .string(stamp)
-                obj["quarantinedAt"] = .string(stamp)
-                obj["quarantineReason"] = .string(reason)
-                obj["quarantinePath"] = .string(quarantineDir.path)
-                // CARVED OUT (NOT TOUCHED):
-                //   manifestSignature / signedAt / codeFingerprint — the signing
-                //                    block is invariant under quarantine; it's
-                //                    proof of WHAT was quarantined, not metadata
-                //                    about the quarantine.
-                mutated[idx] = .object(obj)
-                guard let rec = ToolRecord(json: .object(obj)) else {
-                    throw ToolRegistryError.registryUnreadable(reason: "post-quarantine record unparseable")
-                }
-                try await persistence.writeJSON(.array(mutated), to: registryPath)
-                // Durable registry commit is the point at which the old backup
-                // becomes disposable. A failed cleanup only leaves recoverable
-                // litter; it cannot destroy the authoritative body.
-                if let backup { try? fm.removeItem(at: backup) }
-                return rec
-            } catch {
-                let mutationError = error
-                do {
-                    if installedReplacement { try fm.removeItem(at: quarantineDir) }
-                    if let backup { try fm.moveItem(at: backup, to: quarantineDir) }
-                } catch {
-                    // Never delete the only old copy when rollback fails.
-                    let recoveryPath = backup?.path ?? quarantineDir.path
-                    throw ToolRegistryError.underlying(
-                        "quarantine failed: \(mutationError.localizedDescription); rollback failed: \(error.localizedDescription); recovery body retained at \(recoveryPath)"
-                    )
-                }
-                throw mutationError
-            }
-        }
-
-        // Hold the cross-process lock across the registry mutation and file move.
-        return try await persistence.withFileLock(registryPath, work)
-    }
-
-    /// Mirror of daemon.native_agentd.NativeAgentRuntime.tool_dir_for_record
-    /// (L33358-33368). Returns nil only if no candidate string was usable —
-    /// the daemon falls back to `<root>/tools/proposals/<id>` in that case
-    /// and we do the same, so the caller can existence-check it.
-    private static func _resolveSourceDir(
-        record: [String: JSONValue],
-        toolsRoot: URL,
-        id: String
-    ) throws -> URL? {
-        func str(_ k: String) -> String? {
-            if case .string(let s) = record[k] ?? .null, !s.isEmpty { return s }
-            return nil
-        }
-        let status = str("status") ?? ""
-        // Finding #6 — Python raises if status=="active" but activePath is
-        // missing; falling through to proposalPath would quarantine stale
-        // bytes. Match the hard-raise.
-        if status == "active" {
-            guard let ap = str("activePath") else {
-                throw ToolRegistryError.invalidState(
-                    "active record missing activePath: \(id)")
-            }
-            return URL(fileURLWithPath: ap)
-        }
-        if status == "quarantined", let qp = str("quarantinePath") {
-            let url = URL(fileURLWithPath: qp)
-            if FileManager.default.fileExists(
-                atPath: url.appendingPathComponent("manifest.json").path
-            ) {
-                return url
-            }
-        }
-        if let pp = str("proposalPath") {
-            return URL(fileURLWithPath: pp)
-        }
-        return toolsRoot
-            .appendingPathComponent("proposals", isDirectory: true)
-            .appendingPathComponent(id, isDirectory: true)
+        guard let updated = try await getTool(id: id) else { throw ToolRegistryError.toolNotFound(id) }
+        return updated
     }
 
     // MARK: ISO timestamp helper

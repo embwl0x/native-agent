@@ -28,10 +28,8 @@ public struct MacSyncRemoteMacControl {
         for (key, value) in payload where key != "method" && key != "trigger" {
             body[key] = value
         }
-        let requestedTimeout = Double(payload["timeout"] ?? "") ?? 60
-        let runTimeout = min(max(requestedTimeout + 30, 60), 660)
         let bodyData = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
-        let run = try await port.run(path: endpoint, bodyData: bodyData, timeout: runTimeout)
+        let run = try await port.run(path: endpoint, bodyData: bodyData)
         let result: [String: Any]
         if let json = run.json {
             result = json

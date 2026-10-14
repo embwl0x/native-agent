@@ -23,7 +23,6 @@ public enum GitHubOAuthDeviceFlow {
         public var accessToken: String
         public var refreshToken: String?
         public var expiresAt: Date?
-        public var refreshTokenExpiresAt: Date?
         public var accountID: Int64?
         public var refreshTokenAccountID: Int64?
 
@@ -140,8 +139,7 @@ public enum GitHubOAuthDeviceFlow {
         return Token(
             accessToken: access,
             refreshToken: (object["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-            expiresAt: number(object["expires_in"]).map { now.addingTimeInterval($0) },
-            refreshTokenExpiresAt: number(object["refresh_token_expires_in"]).map { now.addingTimeInterval($0) }
+            expiresAt: number(object["expires_in"]).map { now.addingTimeInterval($0) }
         )
     }
 

@@ -4,7 +4,7 @@ import NativeAgentShared
 
 // MARK: - Bubble
 
-struct BubbleView: View {
+struct BubbleView: View, Equatable {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let message: ChatMessage
@@ -16,6 +16,13 @@ struct BubbleView: View {
     /// A turn another door (the Mac, Telegram) is streaming into this chat.
     /// It paces like her own live reply until its saved answer lands.
     var isLiveTurn = false
+    @State private var images: [(summary: ChatAttachmentSummary, image: UIImage)] = []
+    @State private var attachmentCountWithoutPreview = 0
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message && lhs.streamingHint == rhs.streamingHint
+            && lhs.isTimedOut == rhs.isTimedOut && lhs.isLiveTurn == rhs.isLiveTurn
+    }
 
     /// The Mac Simple thread: the agent's words are plain large text with
     /// room between the lines, no bubble; the person's own lines are quieter
@@ -27,8 +34,8 @@ struct BubbleView: View {
                    let session = message.interactionSessionID {
                     MobileInteractionCard(card: card, descriptor: descriptor, sessionID: session)
                 }
-                ForEach(imageAttachments) { attachment in
-                    AttachmentImagePreview(summary: attachment)
+                ForEach(images, id: \.summary.id) { attachment in
+                    AttachmentImagePreview(summary: attachment.summary, image: attachment.image)
                 }
                 if attachmentCountWithoutPreview > 0 {
                     HStack(spacing: 6) {
@@ -50,7 +57,7 @@ struct BubbleView: View {
                                 .transition(.opacity)
                         }
                         if phase == 2 {
-                            ChatMarkdownView(blocks: MobileChatMarkdown.blocks(id: message.id, content: message.text))
+                            PreparedChatMarkdownView(id: message.id, content: message.text)
                                 .layoutValue(key: ChatCrossfadePhase.self, value: 2)
                                 .transition(.opacity)
                         } else {
@@ -78,6 +85,12 @@ struct BubbleView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.trailing, isUser && !dynamicTypeSize.isAccessibilitySize ? 24 : 0)
+        .task(id: message.attachments) {
+            let prepared = await ChatAttachmentPresentation.shared.images(in: message.attachments)
+            guard !Task.isCancelled else { return }
+            images = prepared
+            attachmentCountWithoutPreview = message.attachments.count - prepared.count
+        }
     }
 
     /// 0 waiting for the first words, 1 plain (the live reply, the person's
@@ -127,13 +140,6 @@ struct BubbleView: View {
 
     private var isUser: Bool { message.role == .user }
 
-    private var imageAttachments: [ChatAttachmentSummary] {
-        ChatAttachmentPresentation.previewableImages(in: message.attachments)
-    }
-
-    private var attachmentCountWithoutPreview: Int {
-        ChatAttachmentPresentation.fallbackCount(in: message.attachments)
-    }
 }
 
 private struct MobileInteractionCard: View {
@@ -277,9 +283,9 @@ private struct MobileInteractionCard: View {
 
 private struct AttachmentImagePreview: View {
     let summary: ChatAttachmentSummary
+    let image: UIImage
 
     var body: some View {
-        if let image {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFit()
@@ -290,16 +296,6 @@ private struct AttachmentImagePreview: View {
                         .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8)
                 }
                 .accessibilityLabel(summary.name)
-        }
-    }
-
-    private var image: UIImage? {
-        guard let raw = summary.base64?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty,
-              let data = Data(base64Encoded: raw) else {
-            return nil
-        }
-        return UIImage(data: data)
     }
 }
 

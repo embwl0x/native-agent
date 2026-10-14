@@ -6,23 +6,8 @@ import Privacy
 extension SwiftNativeResearchClient {
     // MARK: research lab (wave 30 W17)
 
+    /// Lock-free so the read-modify-write below can hold the file lock.
     public func researchLabRuns() async throws -> [JSONValue] {
-        // Pure lock-free read. The daemon writes runs.json atomically (tmp +
-        // os.replace), so a reader never observes a torn file even while the
-        // Python writer or the Swift R-M-W is mid-flight — only the
-        // read-modify-WRITE side needs the flock (see runResearchLab below).
-        // Kept lock-free deliberately so the R-M-W in runResearchLab can call
-        // this inner reader WHILE holding withFileLock(labRunsPath) without a
-        // flock self-deadlock.
-        return try await readLabRunsSorted()
-    }
-
-    /// Lock-free read of `runs.json` sorted newest-first. Callers that already
-    /// hold `withFileLock(labRunsPath)` use this directly so they do not
-    /// re-acquire the lock (flock LOCK_EX is not recursive across fds within a
-    /// process — re-acquiring would self-deadlock). Mirrors the daemon's
-    /// `_catalog_sources_unlocked` lock-free-inner precedent.
-    private func readLabRunsSorted() async throws -> [JSONValue] {
         let raw = try await persistence.readJSON(labRunsPath, ifMissing: .array([]))
         guard case .array(let rows) = raw else {
             throw PersistenceCoreError.ioFailure(
@@ -96,7 +81,7 @@ extension SwiftNativeResearchClient {
         }
 
         let run = ResearchLabRun(
-            id: receiptIDFactory(),
+            id: UUID().uuidString.lowercased(),
             objective: objective,
             status: needsConnector ? "needs_connector" : (searchError.isEmpty ? "completed" : "failed"),
             query: objective,
@@ -104,7 +89,7 @@ extension SwiftNativeResearchClient {
             brief: enginesFailed ? searchError : (needsConnector
                 ? "Research connector needs setup before this can run fully: \(searchError)"
                 : Self.buildResearchBrief(objective: objective, results: results, error: searchError)),
-            createdAt: Self.isoTimestamp(now()),
+            createdAt: Self.isoTimestamp(Date()),
             connector: connector,
             error: searchError.isEmpty ? nil : searchError
         )
@@ -115,13 +100,10 @@ extension SwiftNativeResearchClient {
         // so the freshly-inserted run lands first.
         //
         // The WHOLE read-insert-write is wrapped in withFileLock(labRunsPath)
-        // so multiple Swift callers cannot lose updates. The inner read uses
-        // lock-free readLabRunsSorted() (NOT public researchLabRuns(), which is
-        // identical but kept separate to document the no-re-acquire contract)
-        // so there is no flock self-deadlock.
+        // so multiple Swift callers cannot lose updates. The reader stays lock-free.
         let labRunsPath = self.labRunsPath
         let writeBack: @Sendable () async throws -> Void = {
-            var existing = try await self.readLabRunsSorted()
+            var existing = try await self.researchLabRuns()
             existing.insert(run.toJSON(), at: 0)
             let capped = Array(existing.prefix(100))
             try Task.checkCancellation()

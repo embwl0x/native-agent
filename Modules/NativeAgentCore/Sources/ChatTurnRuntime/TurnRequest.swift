@@ -23,6 +23,7 @@ public struct TurnRequest: Sendable {
     public var sessionID: String?
     public var model: String
     public var reasoningEffort: String
+    /// Request restriction; the shared turn owner also applies the saved choice.
     public var fileAccess: String
     public var attachments: [MultimodalAttachment]
     public var persona: String?
@@ -120,8 +121,8 @@ public struct TurnRequest: Sendable {
                         _ operation: () async throws -> T) async rethrows -> T {
         if case .some(.some(let origin)) = origin, let sources = origin.peerSources {
             let taint = PeerDataTaint.current ?? PeerDataTaint()
-            for source in sources { taint.mark(peer: source, attested: false) }
-            for source in origin.elevatedPeerSources ?? [] { taint.markElevated(peer: source, attested: false) }
+            for source in sources { taint.mark(peer: source) }
+            for source in origin.elevatedPeerSources ?? [] { taint.markElevated(peer: source) }
             // Recorded steering, including an empty record, is authoritative.
             return try await Self.bound(PeerDataTaint.$current, taint) {
                 try await bindContext(operation)
@@ -133,7 +134,7 @@ public struct TurnRequest: Sendable {
         }
         let taint = PeerDataTaint.current ?? PeerDataTaint()
         if agent != "agent" {
-            taint.mark(peer: agent, line: message)
+            taint.mark(peer: (envelope ?? nil)?.verifiedUserId.map { "peer:" + $0 } ?? agent, line: message)
         } else if PeerTurnEffectPolicy.isPeerBridge(surface: surface) {
             taint.keep(line: message)
         } else {
@@ -235,17 +236,19 @@ public actor TurnAdmission {
     }
     private var active: [String: UUID] = [:]
     private var waiting: [String: [Waiter]] = [:]
+    private var capacityWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
 
     public struct Full: LocalizedError {
         public var errorDescription: String? { "This chat has too many waiting turns. No new turn was started." }
     }
 
     /// Nil session = a new chat nobody else can be in; runs at once.
-    public func run<T>(sessionID: String?, isolation: isolated (any Actor)? = #isolation,
+    /// Durable arrivals wait for queue capacity; unsaved requests still fail full.
+    public func run<T>(sessionID: String?, waitForCapacity: Bool = false, isolation: isolated (any Actor)? = #isolation,
                        operation: () async throws -> T) async throws -> T {
         guard let sessionID else { return try await operation() }
         let id = UUID()
-        try await acquire(sessionID, id: id)
+        try await acquire(sessionID, id: id, waitForCapacity: waitForCapacity)
         do {
             try Task.checkCancellation()
             let result = try await Self.$token.withValue(id, operation: operation)
@@ -259,41 +262,54 @@ public actor TurnAdmission {
         }
     }
 
-    private func acquire(_ key: String, id: UUID) async throws {
+    private func acquire(_ key: String, id: UUID, waitForCapacity: Bool) async throws {
         try Task.checkCancellation()
-        if active[key] == nil {
-            active[key] = id
-            return
-        }
-        guard (waiting[key]?.count ?? 0) < 8,
-              waiting.values.reduce(0, { $0 + $1.count }) < 32 else { throw Full() }
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                if Task.isCancelled {
-                    continuation.resume(throwing: CancellationError())
-                } else {
-                    waiting[key, default: []].append(Waiter(id: id, continuation: continuation))
+        while active[key] != nil {
+            let hasCapacity = (waiting[key]?.count ?? 0) < 8 && waiting.values.reduce(0, { $0 + $1.count }) < 32
+            guard hasCapacity || waitForCapacity else { throw Full() }
+            // Registration and the capacity check share this actor. A release
+            // cannot slip between them; cancellation also wakes the subscriber.
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
+                    else if hasCapacity { waiting[key, default: []].append(Waiter(id: id, continuation: continuation)) }
+                    else { capacityWaiters[id] = continuation }
                 }
+            } onCancel: {
+                Task { await self.cancel(key, id: id) }
             }
-        } onCancel: {
-            Task { await self.cancel(key, id: id) }
+            if hasCapacity { return }
+            try Task.checkCancellation()
         }
+        active[key] = id
     }
 
     private func cancel(_ key: String, id: UUID) {
+        if let continuation = capacityWaiters.removeValue(forKey: id) {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
         guard let index = waiting[key]?.firstIndex(where: { $0.id == id }),
               let waiter = waiting[key]?.remove(at: index) else { return }
         if waiting[key]?.isEmpty == true { waiting.removeValue(forKey: key) }
         waiter.continuation.resume(throwing: CancellationError())
+        signalCapacity()
     }
 
     private func release(_ key: String, id: UUID) {
         guard active[key] == id else { return }
+        defer { signalCapacity() }
         active.removeValue(forKey: key)
         guard var queue = waiting.removeValue(forKey: key), !queue.isEmpty else { return }
         let next = queue.removeFirst()
         if !queue.isEmpty { waiting[key] = queue }
         active[key] = next.id
         next.continuation.resume()
+    }
+
+    private func signalCapacity() {
+        let subscribers = capacityWaiters.values
+        capacityWaiters.removeAll()
+        for continuation in subscribers { continuation.resume() }
     }
 }

@@ -4,6 +4,7 @@ import Observation
 import MCPDispatcher
 import PersistenceCore
 import TrustCenter
+import MacControl
 
 /// `NativeAgentEngine.trust` (S10): the TrustCenter for one data root, in core
 /// types. The Trust Center pages, Setup, chat and the badges render `policy`;
@@ -34,6 +35,32 @@ public final class TrustFacade {
     ) {
         self.dataRoot = dataRoot
         self.connectorActionStatuses = connectorActionStatuses
+    }
+
+    public nonisolated func notify(
+        title: String, message: String, notificationCenterAdapter: any NotificationCenterAdapter
+    ) async throws -> Bool {
+        let impl = makeMacControl(
+            policyProvider: TrustCenterMacControlPolicyProvider(dataRoot: dataRoot),
+            auditAppendPath: MacControlActionRoutes.auditPath(dataRoot: dataRoot),
+            notificationCenterAdapter: notificationCenterAdapter
+        )
+        return try await impl.dispatch(action: "notify", body: [
+            "title": .string(title), "message": .string(message),
+        ]).ok
+    }
+
+    public nonisolated func runMacControl(
+        path: String, bodyData: Data, notificationCenterAdapter: any NotificationCenterAdapter
+    ) async throws -> MacControlRunResult {
+        try await MacControlActionRoutes.run(
+            path: path, bodyData: bodyData, dataRoot: dataRoot, localWorkbench: true
+        ) { operatorOrigin, auditPath in
+            makeMacControl(
+                policyProvider: TrustCenterMacControlPolicyProvider(dataRoot: dataRoot, operatorOrigin: operatorOrigin),
+                auditAppendPath: auditPath, notificationCenterAdapter: notificationCenterAdapter
+            )
+        }
     }
 
     nonisolated private var center: SwiftNativeTrustCenter {
@@ -102,6 +129,10 @@ public final class TrustFacade {
         try TrustBackupPersistence.readBackupRecords(root: dataRoot)
     }
 
+    public func refreshBackups() async throws {
+        backups = try await listBackups()
+    }
+
     /// The capability trust network: roots, catalog sources and one trust
     /// record per capability.
     public nonisolated func loadCapabilityNetwork() async throws -> CapabilityTrustNetwork {
@@ -164,5 +195,19 @@ extension TrustFacade {
 
     nonisolated private var catalogWrites: SwiftNativeCatalogWrites {
         SwiftNativeCatalogWrites(dataRoot: dataRoot, persistence: SwiftNativePersistenceCore())
+    }
+}
+
+extension TrustFacade {
+    public nonisolated func inboxEnabled() async throws -> Bool {
+        let object = try await rawPolicy()
+        if case .object(let policy)? = object["inboxPolicy"], case .bool(let enabled)? = policy["enabled"] {
+            return enabled
+        }
+        return true
+    }
+    public nonisolated func setInboxEnabled(_ enabled: Bool) async throws {
+        _ = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
+            body: ["inboxPolicy": ["enabled": enabled]], dataRoot: dataRoot)
     }
 }

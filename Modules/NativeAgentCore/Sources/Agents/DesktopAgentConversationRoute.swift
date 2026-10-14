@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import GrokLink
 import ChatOrchestration
 import NativeAgentCore
 import MacControl
@@ -365,4 +366,20 @@ actor DesktopConversationTools: ToolDispatchClient {
         problem = reason
         return NSError(domain: "DesktopConversation", code: 403, userInfo: [NSLocalizedDescriptionKey: reason])
     }
+}
+
+extension DesktopAgentConversationRoute: GrokBotConnectionPort {
+    public nonisolated func ensureRunning() async -> Bool {
+        await GrokRoutineAccessibility.ensureRunning()
+    }
+
+    public nonisolated func send(peer: AgentPeerContact, text: String, conversation: String,
+              messageID: String, dataRoot: URL, quiet: Bool) async throws -> JSONValue {
+        try await GrokBotRoute.send(
+            peer: peer, text: text, conversation: conversation,
+            messageID: messageID, dataRoot: dataRoot,
+            credential: GrokLinkCredential.read(peer: peer.id), quiet: quiet
+        )
+    }
+
 }

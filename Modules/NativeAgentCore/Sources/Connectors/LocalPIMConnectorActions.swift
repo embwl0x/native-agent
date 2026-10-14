@@ -1,11 +1,12 @@
 import Foundation
+@preconcurrency import EventKit
 import NativeAgentCore
 import PersistenceCore
 import Privacy
 import MacIntegration
 
 @MainActor
-public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
+public enum LocalPIMConnectorActions {
     struct CalendarListWindow: Equatable, Sendable {
         let start: Date
         let end: Date
@@ -15,7 +16,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
 
     public static func calendarListUpcoming(input: [String: JSONValue]) async throws -> JSONValue {
         let window = try calendarListWindow(input: input)
-        let store = Store()
+        let store = LocalPIMStore()
         let granted = try await store.requestCalendarAccess(.read)
         guard granted else {
             return permissionEnvelope(
@@ -72,7 +73,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
                 let needle = name.lowercased()
                 return { $0.lowercased().contains(needle) }
             }
-            return Store.withEvents(start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ in
+            return LocalPIMStore.withEvents(start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ in
                 events
                     .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
                     .prefix(limit)
@@ -82,13 +83,13 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     }
 
     public static func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue {
-        let store = Store()
+        let store = LocalPIMStore()
         guard try await store.requestCalendarAccess(.read) else {
             return permissionEnvelope(actionId: "mac.calendar_calendars", source: "calendar", status: calendarAuthorizationState())
         }
         return .object(["status": .string("completed"), "calendars": .array(store.calendars(for: .event).map {
             .object(["calendarId": .string($0.calendarIdentifier), "title": .string($0.title),
-                     "source": .string($0.sourceTitle), "writable": .bool($0.allowsContentModifications)])
+                     "source": .string($0.source.title), "writable": .bool($0.allowsContentModifications)])
         })])
     }
 
@@ -105,7 +106,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
               end > start, end.timeIntervalSince(start) <= 31 * 86_400 else {
             return .object(["status": .string("failed"), "reason": .string("Provide a valid start/end window of at most 31 days, and optionally up to 50 exact calendar_ids (omit for all calendars).")])
         }
-        let store = Store()
+        let store = LocalPIMStore()
         guard try await store.requestCalendarAccess(.read) else {
             return permissionEnvelope(actionId: "mac.calendar_free_busy", source: "calendar", status: calendarAuthorizationState())
         }
@@ -117,17 +118,17 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             return .object(["status": .string("failed"), "reason": .string("Unknown calendar_id: \(unknown.joined(separator: ", ")). Omit calendar_ids to check every calendar.")])
         }
         let rows = await Task.detached(priority: .userInitiated) {
-            Store.withEvents(start: start, end: end, calendarIDs: calendarIDs, calendarMatches: nil) { events, observedCalendarIDs in
+            LocalPIMStore.withEvents(start: start, end: end, calendarIDs: calendarIDs, calendarMatches: nil) { events, observedCalendarIDs in
                 calendarIDs.map { calendarID -> JSONValue in
-                    let intervals = events.filter { $0.calendarIdentifier == calendarID && !$0.isCancelled && $0.availability != "free" }
+                    let intervals = events.filter { $0.calendar.calendarIdentifier == calendarID && $0.status != .canceled && $0.availability != .free }
                     let unknown = !observedCalendarIDs.contains(calendarID)
-                        || intervals.contains { $0.availability == "unknown" || $0.startDate == nil || $0.endDate == nil }
+                        || intervals.contains { eventAvailability($0.availability) == "unknown" || $0.startDate == nil || $0.endDate == nil }
                     return .object(["calendarId": .string(calendarID), "availability": .string(unknown ? "unknown" : intervals.isEmpty ? "free" : "busy"),
                         "intervals": .array(intervals.map { event in .object([
                             "start": event.startDate.map { .string(iso(max(start, $0))) } ?? .null,
                             "end": event.endDate.map { .string(iso(min(end, $0))) } ?? .null,
                             "timeZone": .string(TimeZone.current.identifier),
-                            "availability": .string(event.availability)]) })])
+                            "availability": .string(eventAvailability(event.availability))]) })])
                 }
             }
         }.value
@@ -135,8 +136,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     }
 
     public static func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue {
-        let store = Store()
-        let granted = try await store.requestReminderAccess(allowPrompt: true)
+        let store = LocalPIMStore()
+        let granted = try await store.requestReminderAccess()
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.reminders_list_due_today",
@@ -200,8 +201,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             return .object(["status": .string("failed"), "actionId": .string(actionId),
                 "reason": .string("Provide valid due_start/due_end with start before end; undated_only cannot be combined with a due range.")])
         }
-        let store = Store()
-        guard try await store.requestReminderAccess(allowPrompt: true) else {
+        let store = LocalPIMStore()
+        guard try await store.requestReminderAccess() else {
             return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
         }
         let includeCompleted = inputBool(input["include_completed"], defaultValue: false)
@@ -219,7 +220,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
                 }
                 let matching = reminders.filter { reminder in
                     if !includeCompleted && reminder.isCompleted { return false }
-                    if let listName, !listName.isEmpty, !reminder.calendarTitle.localizedCaseInsensitiveContains(listName) { return false }
+                    if let listName, !listName.isEmpty, !reminder.calendar.title.localizedCaseInsensitiveContains(listName) { return false }
                     if !query.isEmpty && !(reminder.title ?? "").localizedCaseInsensitiveContains(query)
                         && !(reminder.notes ?? "").localizedCaseInsensitiveContains(query) { return false }
                     let due = reminder.dueDateComponents?.date
@@ -253,8 +254,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         guard let id = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else {
             return .object(["status": .string("failed"), "actionId": .string(actionId), "reason": .string("Provide an exact reminder id.")])
         }
-        let store = Store()
-        guard try await store.requestReminderAccess(allowPrompt: true) else {
+        let store = LocalPIMStore()
+        guard try await store.requestReminderAccess() else {
             return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
         }
         guard let reminder = store.reminder(withIdentifier: id) else {
@@ -320,8 +321,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         let arguments: ReminderUpdateArguments
         do { arguments = try reminderUpdateArguments(input: input) }
         catch { return error.result }
-        let store = Store()
-        guard try await store.requestReminderAccess(allowPrompt: true) else {
+        let store = LocalPIMStore()
+        guard try await store.requestReminderAccess() else {
             return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
         }
         guard let reminder = store.reminder(withIdentifier: arguments.id) else {
@@ -344,7 +345,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             "reminderId": .string(reminder.calendarItemIdentifier), "reminder": liveReminderJSON(reminder)])
     }
 
-    private static func liveReminderJSON(_ reminder: Store.Reminder) -> JSONValue {
+    private static func liveReminderJSON(_ reminder: EKReminder) -> JSONValue {
         .object([
             "id": .string(reminder.calendarItemIdentifier),
             "title": .string(NativeAppSecretRedactor.redactText(reminder.title ?? "(Untitled reminder)")),
@@ -358,7 +359,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     }
 
     public static func calendarCreateEvent(input: [String: JSONValue]) async throws -> JSONValue {
-        let store = Store()
+        let store = LocalPIMStore()
         let granted = try await store.requestCalendarAccess(.write)
         guard granted else {
             return permissionEnvelope(
@@ -408,8 +409,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             ])
         }
 
-        let isWriteOnly = Store.calendarIsWriteOnly
-        let pickedCalendar: Store.Calendar?
+        let isWriteOnly = LocalPIMStore.calendarIsWriteOnly
+        let pickedCalendar: EKCalendar?
         if let calendarID = inputString(input["calendar_id"]), !calendarID.isEmpty {
             let calendars = isWriteOnly ? store.defaultCalendarForNewEvents.map { [$0] } ?? [] : store.calendars(for: .event)
             guard let matched = calendars.first(where: { $0.calendarIdentifier == calendarID }),
@@ -587,7 +588,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         let arguments: CalendarModifyArguments
         do { arguments = try calendarModifyArguments(input: input) }
         catch { return error.result }
-        let store = Store()
+        let store = LocalPIMStore()
         // gpt-5.5 review NEEDS_FIX: modify requires READING the existing event
         // (`store.event(withIdentifier:)` is a read op), so `.writeOnly` users
         // can't actually fetch it. Require full access for modify (vs the
@@ -663,7 +664,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         let expected: (id: String, title: String, start: Date)
         do { expected = try calendarDeleteExpectation(input: input) }
         catch { return error.result }
-        let store = Store()
+        let store = LocalPIMStore()
         guard try await store.requestCalendarAccess(.read) else {
             return permissionEnvelope(actionId: actionId, source: "calendar", status: calendarAuthorizationState())
         }
@@ -687,6 +688,14 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         ])
     }
 
+    public static func remindersListRename(input: [String: JSONValue]) async throws -> JSONValue {
+        try await remindersListWrite(input: input, rename: true)
+    }
+
+    public static func remindersListCreate(input: [String: JSONValue]) async throws -> JSONValue {
+        try await remindersListWrite(input: input, rename: false)
+    }
+
     public static func remindersListWrite(input: [String: JSONValue], rename: Bool) async throws -> JSONValue {
         let actionId = rename ? "reminders.list_rename" : "reminders.list_create"
         func failed(_ reason: String) -> JSONValue {
@@ -698,8 +707,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         }
         let requested = inputString(input["list"])?.trimmingCharacters(in: .whitespacesAndNewlines)
         if rename, (requested ?? "").isEmpty { return failed("The exact existing list name is required.") }
-        let store = Store()
-        guard try await store.requestReminderAccess(allowPrompt: true) else {
+        let store = LocalPIMStore()
+        guard try await store.requestReminderAccess() else {
             return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
         }
         let lists = store.calendars(for: .reminder)
@@ -707,7 +716,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             title.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
                 == name.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         }
-        var list: Store.Calendar
+        let list: EKCalendar
         if rename, let requested {
             let matches = lists.filter { sameName($0.title, requested) }
             guard matches.count == 1, let match = matches.first else {
@@ -739,14 +748,14 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         }
         var result: [String: JSONValue] = ["status": .string("completed"), "actionId": .string(actionId),
             "source": .string("eventkit"), "list_id": .string(saved.calendarIdentifier),
-            "name": .string(saved.title), "account": .string(saved.sourceTitle)]
+            "name": .string(saved.title), "account": .string(saved.source.title)]
         if let previousName { result["previous_name"] = .string(previousName) }
         return .object(result)
     }
 
     public static func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue {
-        let store = Store()
-        let granted = try await store.requestReminderAccess(allowPrompt: true)
+        let store = LocalPIMStore()
+        let granted = try await store.requestReminderAccess()
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.reminders_create",
@@ -796,7 +805,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
 
         // 2026-09-06: same contract as calendar_create_event — the default list
         // applies when `list_name` is OMITTED, not when a supplied name misses.
-        let pickedList: Store.Calendar?
+        let pickedList: EKCalendar?
         if let listName, !listName.isEmpty {
             let lists = store.calendars(for: .reminder)
             let matches = lists.filter { $0.title.lowercased() == listName.lowercased() }
@@ -870,8 +879,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     }
 
     public static func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue {
-        let store = Store()
-        let granted = try await store.requestReminderAccess(allowPrompt: true)
+        let store = LocalPIMStore()
+        let granted = try await store.requestReminderAccess()
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.reminders_complete",
@@ -948,8 +957,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         let expected: (id: String, title: String)
         do { expected = try reminderDeleteExpectation(input: input) }
         catch { return error.result }
-        let store = Store()
-        guard try await store.requestReminderAccess(allowPrompt: true) else {
+        let store = LocalPIMStore()
+        guard try await store.requestReminderAccess() else {
             return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
         }
         guard let reminder = store.reminder(withIdentifier: expected.id) else { return failed("reminder_not_found") }
@@ -966,7 +975,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     }
 
     /// Open reminders' ids and titles, made Sendable on EventKit's queue.
-    private static func openReminderTitles(store: Store) async -> [(id: String, title: String)] {
+    private static func openReminderTitles(store: LocalPIMStore) async -> [(id: String, title: String)] {
         return await withCheckedContinuation { continuation in
             store.fetchReminders(in: nil, incompleteOnly: true) { reminders in
                 continuation.resume(returning: (reminders ?? []).map { ($0.calendarItemIdentifier, $0.title ?? "") })
@@ -1018,11 +1027,11 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     }
 
     private static func calendarAuthorizationState() -> String {
-        Store.authorizationState(for: .event)
+        LocalPIMStore.authorizationState(for: .event)
     }
 
     private static func reminderAuthorizationState() -> String {
-        Store.authorizationState(for: .reminder)
+        LocalPIMStore.authorizationState(for: .reminder)
     }
 
     private static func statusPayload(source: String, state: String) -> [String: JSONValue] {
@@ -1070,7 +1079,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         ])
     }
 
-    private static func filteredCalendars(_ calendars: [Store.Calendar], matching name: String?) -> [Store.Calendar]? {
+    private static func filteredCalendars(_ calendars: [EKCalendar], matching name: String?) -> [EKCalendar]? {
         guard let name, !name.isEmpty else { return nil }
         let needle = name.lowercased()
         let filtered = calendars.filter { $0.title.lowercased().contains(needle) }
@@ -1078,13 +1087,13 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     }
 
     private static func fetchDueReminderJSON(
-        store: Store,
-        calendars: [Store.Calendar]?,
+        store: LocalPIMStore,
+        calendars: [EKCalendar]?,
         includeCompleted: Bool,
         endOfToday: Date,
         limit: Int
     ) async -> (rows: [JSONValue], total: Int)? {
-        // Read views stay on EventKit's queue; filter and render to Sendable
+        // Objects stay on EventKit's queue; filter and render to Sendable
         // values before resuming Core, preserving the platform's isolation.
         await withCheckedContinuation { continuation in
             store.fetchReminders(in: calendars, incompleteOnly: false) { reminders in
@@ -1105,7 +1114,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
 
     /// Process reminder values on the platform completion queue.
     nonisolated private static func processReminders(
-        _ reminders: [Store.ReminderRead],
+        _ reminders: [EKReminder],
         includeCompleted: Bool,
         endOfToday: Date,
         limit: Int
@@ -1122,16 +1131,26 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         return (matching.prefix(limit).map { reminderJSON($0) }, matching.count)
     }
 
-    nonisolated private static func eventJSON(_ event: Store.EventRead) -> JSONValue {
+    nonisolated private static func eventAvailability(_ availability: EKEventAvailability) -> String {
+        switch availability {
+        case .free: "free"
+        case .busy: "busy"
+        case .tentative: "tentative"
+        case .unavailable: "unavailable"
+        default: "unknown"
+        }
+    }
+
+    nonisolated private static func eventJSON(_ event: EKEvent) -> JSONValue {
         var obj: [String: JSONValue] = [
             // gpt-5.5 review BLOCKING: include eventIdentifier so callers can
             // pass it back into mac_calendar_modify_event. Without this the
             // modify tool requires an `id` that the list tool never exposed.
             "id": .string(event.eventIdentifier ?? ""),
             "title": .string(NativeAppSecretRedactor.redactText(event.title ?? "(Untitled event)")),
-            "calendar": .string(event.calendarTitle),
-            "calendarId": .string(event.calendarIdentifier),
-            "availability": .string(event.availability),
+            "calendar": .string(event.calendar.title),
+            "calendarId": .string(event.calendar.calendarIdentifier),
+            "availability": .string(eventAvailability(event.availability)),
             "allDay": .bool(event.isAllDay),
             "timeZone": .string(TimeZone.current.identifier),
         ]
@@ -1146,11 +1165,11 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         return .object(obj)
     }
 
-    nonisolated private static func reminderJSON(_ reminder: Store.ReminderRead) -> JSONValue {
+    nonisolated private static func reminderJSON(_ reminder: EKReminder) -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(reminder.calendarItemIdentifier),
             "title": .string(NativeAppSecretRedactor.redactText(reminder.title ?? "(Untitled reminder)")),
-            "list": .string(reminder.calendarTitle),
+            "list": .string(reminder.calendar.title),
             "completed": .bool(reminder.isCompleted),
             "priority": .int(Int64(reminder.priority)),
             "timeZone": .string(TimeZone.current.identifier),

@@ -126,17 +126,6 @@ enum GitHubCommandObservationBuilder {
         return String(repositoryOwner).caseInsensitiveCompare(actor) == .orderedSame
     }
 
-    /// Author login of the first row of an issue-comments response fetched
-    /// with per_page=1&page=<comment count> — the per-ISSUE comments endpoint
-    /// IGNORES sort/direction (verified empirically 2026-07-16 on a
-    /// 133-comment issue: desc returned the OLDEST row) and always lists
-    /// ascending, so the newest comment is the last page at page size 1. The
-    /// issue-comment COUNT rides on the pull/issue object itself.
-    static func latestCommentAuthor(_ comments: Any) -> String? {
-        let rows = comments as? [[String: Any]] ?? []
-        return (rows.first?["user"] as? [String: Any])?["login"] as? String
-    }
-
     /// Automation accounts whose comments never re-arm the decision-delivered
     /// rule (2026-07-21 audit): a bot reply after the actor's answer is not a
     /// maintainer response, so it must not bounce the PR back to needs_user.
@@ -558,7 +547,7 @@ enum GitHubCommandObservationBuilder {
         return String(flattened.prefix(limit))
     }
 
-    private static func isStale(_ timestamp: String, hours: Int) -> Bool {
+    static func isStale(_ timestamp: String, hours: Int) -> Bool {
         guard let date = DeskClock.parseISO(timestamp) else { return false }
         return Date().timeIntervalSince(date) >= Double(hours * 3_600)
     }
@@ -619,37 +608,6 @@ public extension GitHubConnectorActions {
                     pull["mergeable"] = mergeability.mergeableState == "clean"
                 }
             }
-            // Reviews/review-comments paginate (bounded at 3 pages,
-            // 2026-07-21 audit): page-1-only reads hid a late
-            // CHANGES_REQUESTED past the first 100 rows and items settled
-            // prematurely.
-            let reviews = try await paginatedArray(
-                path: "repos/\(item.repository)/pulls/\(item.number)/reviews",
-                dataRoot: dataRoot
-            )
-            let comments = try await paginatedArray(
-                path: "repos/\(item.repository)/pulls/\(item.number)/comments",
-                dataRoot: dataRoot
-            )
-            var runs: Any = ["check_runs": []]
-            var status: Any = ["statuses": []]
-            if let sha = (pull["head"] as? [String: Any])?["sha"] as? String, !sha.isEmpty {
-                runs = try await completeCheckRuns(
-                    path: "repos/\(item.repository)/commits/\(sha)/check-runs",
-                    dataRoot: dataRoot
-                )
-                status = try await call(
-                    path: "repos/\(item.repository)/commits/\(sha)/status", dataRoot: dataRoot
-                )
-            }
-            // Only decision-labeled PRs need the newest NON-BOT issue
-            // comment (the decision-delivered rule); everything else skips
-            // the call. The per-issue endpoint lists ASCENDING and ignores
-            // sort/direction, so the newest comments are the LAST page —
-            // read it at per_page=10 and skip bot authors (2026-07-21 audit:
-            // a bot reply after the actor's answer must not re-arm needs_user).
-            var latestIssueCommentAuthor: String? = nil
-            var issueComments: Any = []
             let expectedIssueComment = item.observation?.actionableEvidence?.last {
                 $0.signal == .issueComment
             }?.identifier
@@ -660,27 +618,22 @@ public extension GitHubConnectorActions {
             let decisionArmed = GitHubCommandObservationBuilder.labelDecisionArmed(
                 pull: pull, repository: item.repository, actor: actor
             )
-            if issueCommentCount > 0, decisionArmed || expectedIssueComment != nil {
-                // Exact verification must survive the expected comment sliding
-                // off the last page (cross-review MED, 2026-08-17).
-                issueComments = try await issueCommentsIncludingExpected(
-                    repository: item.repository,
-                    number: item.number,
-                    commentCount: issueCommentCount,
-                    expectedIdentifier: expectedIssueComment,
-                    dataRoot: dataRoot
-                )
-                if decisionArmed {
-                    latestIssueCommentAuthor = GitHubCommandObservationBuilder.latestNonBotCommentAuthor(issueComments)
-                }
-            }
+            let sha = (pull["head"] as? [String: Any])?["sha"] as? String
+            let detail = try await pullRequestDetails(
+                repository: item.repository, number: item.number, sha: sha.flatMap { $0.isEmpty ? nil : $0 },
+                issueCommentCount: issueCommentCount,
+                includeIssueComments: decisionArmed || expectedIssueComment != nil,
+                expectedIssueCommentIdentifier: expectedIssueComment, dataRoot: dataRoot
+            )
+            let latestIssueCommentAuthor = decisionArmed
+                ? GitHubCommandObservationBuilder.latestNonBotCommentAuthor(detail.issueComments) : nil
             return GitHubCommandObservationBuilder.pullRequest(
                 repository: item.repository, number: item.number, pull: pull,
-                reviews: reviews, reviewComments: comments, checkRuns: runs,
-                combinedStatus: status, actor: actor, staleAfterHours: staleAfterHours,
+                reviews: detail.reviews, reviewComments: detail.reviewComments, checkRuns: detail.checkRuns,
+                combinedStatus: detail.combinedStatus, actor: actor, staleAfterHours: staleAfterHours,
                 reviewThreads: threadEvidence,
                 latestIssueCommentAuthor: latestIssueCommentAuthor,
-                issueComments: issueComments,
+                issueComments: detail.issueComments,
                 expectedIssueCommentIdentifier: expectedIssueComment,
                 expectedIssueCommentHeadSHA: expectedIssueCommentHead
             )

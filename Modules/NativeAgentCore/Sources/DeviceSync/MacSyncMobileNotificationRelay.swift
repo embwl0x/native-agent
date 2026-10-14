@@ -20,6 +20,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
 
     static func storePushToken(
         deviceId: String,
+        pairedDeviceID: String,
         token: String,
         environment: String,
         bundleId: String,
@@ -56,6 +57,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             var entry: [String: JSONValue]
             if case .object(let existing)? = root[deviceId] { entry = existing } else { entry = [:] }
             entry["deviceId"] = .string(deviceId)
+            entry["pairedDeviceID"] = .string(pairedDeviceID)
             entry["token"] = .string(token)
             entry["environment"] = .string(environment)
             entry["sandbox"] = .string(environment)
@@ -64,6 +66,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             root[deviceId] = .object(entry)
             let legacyEntry: [String: JSONValue] = [
                 "deviceId": .string(deviceId),
+                "pairedDeviceID": .string(pairedDeviceID),
                 "token": .string(token),
                 "environment": .string(environment),
                 "bundleId": .string(bundleId),

@@ -4,18 +4,6 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 
-/// Physical subprocess effects supplied by the Mac app. Policy, admission,
-/// durable operation transitions and response interpretation belong to Core.
-public protocol MacControlBridgeProcessPort: Sendable {
-    /// Project the result before releasing the process registration, preserving
-    /// cancellation acknowledgement ordering through response interpretation.
-    func runProcess(argv: [String], stdin: String?, timeout: Double, operationId: String,
-                    project: (MacControlBridgeProcessResult) -> [String: Any]) -> [String: Any]
-    func requestCancellation(operationId: String) -> Bool
-    func consumeCancellation(operationId: String) -> (requested: Bool, signalled: Bool)
-    func stopAllProcesses() -> Int
-}
-
 public enum MacControlBridgeProcessResult: Sendable {
     case spawnFailed(String)
     case exited(stdout: Data, stderr: Data, exit: Int, timedOut: Bool,
@@ -25,10 +13,10 @@ public enum MacControlBridgeProcessResult: Sendable {
 /// Transport-independent owner of the existing Mac Control bridge protocol.
 public final class MacControlBridgeRuntime: @unchecked Sendable {
     private let dataRoot: URL
-    private let processes: any MacControlBridgeProcessPort
+    private let processes: MacControlBridgeProcesses
     private let operationStore: MacControlOperationStore
 
-    public init(dataRoot: URL, processes: any MacControlBridgeProcessPort) {
+    public init(dataRoot: URL, processes: MacControlBridgeProcesses) {
         self.dataRoot = dataRoot
         self.processes = processes
         self.operationStore = MacControlOperationStore(dataRoot: dataRoot)
@@ -182,7 +170,7 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
         guard let macPolicy = policyJSON?["macControlPolicy"] as? [String: Any] else {
             return false
         }
-        // STRICT — see BridgeCore.strictBool: a numeric `1` must NOT open a
+        // A numeric `1` must NOT open a
         // gate that binds a port and mints a bearer token.
         guard let number = macPolicy["enabled"] as? NSNumber,
               CFGetTypeID(number) == CFBooleanGetTypeID() else { return false }

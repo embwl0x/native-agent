@@ -105,6 +105,17 @@ extension NativeOAuthFlow {
         return OAuthFlowResult(ok: true, error: nil)
     }
 
+    /// The browser tab's one line once the callback lands. The token exchange
+    /// hasn't run yet, so the tab claims nothing; the app comes forward with
+    /// the real result (OAuthSignInButton.runFlow).
+    public static func callbackPageMessage(_ url: URL) -> String {
+        let declined = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.contains { $0.name == "error" } == true
+        return declined
+            ? "Sign-in didn't finish — return to NativeAgent to try again."
+            : "Finishing sign-in — return to NativeAgent."
+    }
+
     /// From `GET /auth/callback?code=…&state=… HTTP/1.1`, return the request
     /// target (path+query) ONLY when the path is EXACTLY `/auth/callback`.
     public static func callbackTarget(from requestLine: String) -> String? {

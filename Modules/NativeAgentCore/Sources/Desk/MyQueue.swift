@@ -15,15 +15,14 @@ public enum MyQueue {
         /// Queued on a turn a peer steered. Opening it re-latches that peer on
         /// the turn (`desk_read`), so a floor act it leads to still cards User.
         public var peerBorn: Bool { !(step.peers.isEmpty && step.elevated.isEmpty) }
+        public var owedToPerson: Bool { step.owedToPerson }
     }
 
     /// The open queue step an item is, or nil. Its newest step ref wins: a
     /// step queued again with a new condition, or re-filed on her own turn.
     public static func entry(_ item: DeskItem) -> Entry? {
         guard item.project == project, !item.status.isTerminal else { return nil }
-        guard let step = item.refs.reversed().lazy.compactMap({ ref -> DeskStep? in
-            if case .step(let step) = ref.kind { return step } else { return nil }
-        }).first else { return nil }
+        guard let step = item.step else { return nil }
         return Entry(item: item, step: step)
     }
 
@@ -36,8 +35,7 @@ public enum MyQueue {
 
     public enum When: Equatable, Sendable {
         case nextTurn, ownTurn
-        /// Ready on her next ordinary turn, and never wakes her: a noticed
-        /// repeat (`SkillPatterns`) costs no turn of its own.
+        /// A noticed repeat waits for the same free time as her own turn.
         case quiet
         case userWrites(door: String?)
         case afterCard(String)
@@ -117,8 +115,8 @@ public enum MyQueue {
 
     public static func isReady(_ entry: Entry, _ context: Context) -> Bool {
         switch when(entry) {
-        case .nextTurn, .quiet: return true
-        case .ownTurn: return context.ownTurn
+        case .nextTurn: return true
+        case .ownTurn, .quiet: return context.ownTurn
         case .afterCard(let id): return context.completedCards.contains(id)
         case .at(let date): return context.now >= date
         case .userWrites(let door):
@@ -133,7 +131,7 @@ public enum MyQueue {
 
     /// Queue a step. The same words already open answer with that item; a
     /// new condition, card or call she gives them herself is recorded on it,
-    /// and the peers who steered either filing stay on it (re-filing never
+    /// with its originating conversation and every recorded peer (re-filing never
     /// launders a steer). An inferred repeat never overrides: a promise said
     /// again on a later turn must not unlink the card it waits on.
     public static func add(_ step: DeskStep, store: SwiftNativeDeskStore) async throws -> (entry: Entry, change: Change) {

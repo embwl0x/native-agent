@@ -1,22 +1,53 @@
 import ChatOrchestration
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import Senses
 
 extension AppActions {
+    static func matchingSenses(_ query: String, records: [SenseRecord]) -> [SenseRecord] {
+        let asked = intentWords(query)
+        return records.filter { record in
+            intentWords(record.corner.key + " " + record.id + " " + record.verbs.joined(separator: " "))
+                .contains { asked.contains($0) }
+        }
+    }
+
     /// A sense's offered verbs use the same action vocabulary as every page.
-    static func senses() -> [AppAction] {
+    static func senses(records: [SenseRecord]? = nil) -> [AppAction] {
         guard SensesHub.shared.registry != nil else { return [] }
         let scope = ChatToolSessionContext.verifiedSessionId ?? ""
         var seen: Set<String> = []
-        return SenseDoorViews.shared.latest.filter { $0.scope == scope && $0.record.verbsEnabled }.flatMap { view in
+        let views = SenseDoorViews.shared.latest.filter { view in
+            view.scope == scope && view.record.verbsEnabled && (records == nil || records!.contains {
+                $0.id == view.record.id && $0.version == view.record.version && $0.verbsEnabled && $0.disabledBy != "owner"
+            })
+        }
+        let reads = (records ?? []).filter { $0.status == .on && $0.disabledBy != "owner" }.map { record in
+            let id: String
+            let input: [String: JSONValue]
+            switch record.corner {
+            case .app(let bundle): id = "mac.look"; input = bundle == "*" ? [:] : ["app": .string(bundle)]
+            case .fileKind(let kind): id = "files.read"; input = ["path": .string("<absolute path to .\(kind) file>")]
+            case .site(let host): id = "web.read"; input = ["url": .string("https://\(host)/<path>")]
+            default: id = "sense.versions"; input = ["sense_id": .string(record.id)]
+            }
+            let reader = all.first { $0.id == id }!
+            return AppAction(id, record.corner.key, "Read \(record.id) · \(record.corner.key)", reader.args,
+                warn: reader.warn, tool: reader.tool, input: reader.input.merging(input) { _, bound in bound },
+                scriptable: reader.scriptable, read: true,
+                scope: ([record.id, record.corner.key, record.grownBecause ?? ""] + record.verbs).joined(separator: " "),
+                schema: schema(reader).map { LLMToolSchema(name: reader.tool,
+                    description: "Read \(record.id) · \(record.corner.key)", parametersJSON: $0.parametersJSON) })
+        }
+        return reads + views.flatMap { view in
             view.page.things.flatMap { thing in
                 thing.verbs.compactMap { verb -> AppAction? in
                     let id = "sense.\(view.record.id).\(verb)"
                     guard seen.insert(id).inserted else { return nil }
                     return AppAction(id, view.page.corner.key, verb + " " + thing.name, ["address", "args?:object"],
                         tool: "sense_act", input: ["sense_id": .string(view.record.id), "verb": .string(verb)],
-                        scriptable: false)
+                        scriptable: false, scope: ([view.record.id, view.record.corner.key, view.page.title, thing.detail ?? ""] + view.record.verbs).joined(separator: " "))
                 }
             }
         }
@@ -102,13 +133,10 @@ extension AppToolExecutor {
         case .app(let bundleID):
             action = "mac.look"; args["app"] = .string(bundleID)
             if !item.isEmpty, view == nil { args["part"] = .string(item) }
-        case .fileKind(let ext):
+        case .fileKind:
             action = "files.read"
             let named = item.isEmpty || item.hasPrefix("{") ? Self.doorText(args["path"]) : item
             let path = view?.materialRef ?? (URL(string: named)?.isFileURL == true ? URL(string: named)!.path : named)
-            guard ext == "*" || URL(fileURLWithPath: path).pathExtension.lowercased() == ext else {
-                return Self.failure("invalid_address", "Read this corner with a file path of its kind.")
-            }
             args["path"] = .string(path)
         case .site(let host):
             let url = siteURL ?? view?.materialRef ?? (item.isEmpty ? Self.doorText(args["url"]) : item)

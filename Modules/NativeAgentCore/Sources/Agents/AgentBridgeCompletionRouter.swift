@@ -13,7 +13,8 @@ extension AgentBridgeCompletionRoute {
     self.init(surface: saved["surface"] ?? row.sourceSurface, sessionId: row.scopeSessionID,
               destinationId: saved["destinationId"], threadId: saved["threadId"], sourceKey: saved["sourceKey"],
               replyTo: saved["replyTo"], correlationId: saved["correlationId"],
-              turnSessionId: turnSessionId == row.scopeSessionID ? nil : turnSessionId)
+              turnSessionId: turnSessionId == row.scopeSessionID ? nil : turnSessionId,
+              requesterUserId: saved["requesterUserId"])
   }
 
   public init(origin: [String: Any]?, sessionId: String?) {
@@ -32,7 +33,8 @@ extension AgentBridgeCompletionRoute {
       threadId: value("threadId"),
       sourceKey: value("sourceKey"),
       replyTo: value("replyTo"),
-      correlationId: value("correlationId")
+      correlationId: value("correlationId"),
+      requesterUserId: value("requesterUserId")
     )
   }
 
@@ -49,7 +51,8 @@ extension AgentBridgeCompletionRoute {
       threadId: threadId,
       sourceKey: sourceKey,
       replyTo: replyTo,
-      correlationId: correlationId
+      correlationId: correlationId,
+      requesterUserId: requesterUserId
     )
   }
 }
@@ -61,6 +64,11 @@ public struct AgentBridgeCompletionDelivery: Sendable, Equatable, Codable {
   public let artifactCount: Int
   public let attempts: Int
   public let reason: String?
+
+  public init(status: String, surface: String, delivery: String, artifactCount: Int, attempts: Int, reason: String?) {
+    self.status = status; self.surface = surface; self.delivery = delivery
+    self.artifactCount = artifactCount; self.attempts = attempts; self.reason = reason
+  }
 
   public var jsonObject: [String: Any] {
     var object: [String: Any] = [
@@ -85,8 +93,6 @@ public struct AgentBridgeCompletionArtifact: Sendable, Equatable {
   public enum Payload: Sendable, Equatable {
     case text(String)
     case attachment(ChatOrchestration.MultimodalAttachment)
-    case iosBundle(String, [ChatOrchestration.MultimodalAttachment], String)
-    case iosNotification(String, String)
   }
 
   public let id: String
@@ -107,6 +113,8 @@ public enum AgentBridgeTransportResult: Sendable, Equatable {
 }
 
 public protocol AgentBridgeCompletionSending: Sendable {
+  func deliverReply(_ response: ChatResponse, deliveryId: String, route: AgentBridgeCompletionRoute,
+                    priorVerdict: String?, notifyRequestedResult: Bool) async throws -> AgentBridgeCompletionDelivery
   func refreshLocalChat(sessionId: String?) async
   func preflight(
     surface: String,
@@ -122,6 +130,70 @@ public protocol AgentBridgeCompletionSending: Sendable {
 }
 
 public enum AgentBridgeCompletionRouter {
+  public enum DeliveryError: LocalizedError {
+    case invalidTelegramDestination
+    case missingSlackDestination
+    case missingIOSSourceKey
+    case emptyCompletion
+    case notificationNotAccepted
+
+    public var errorDescription: String? {
+      switch self {
+      case .invalidTelegramDestination:
+        return "The originating Telegram chat id is missing or invalid."
+      case .missingSlackDestination: return "The originating Slack channel id is missing."
+      case .missingIOSSourceKey: return "The originating iOS device route key is missing."
+      case .emptyCompletion: return "The agent produced no completion text or attachment."
+      case .notificationNotAccepted: return "The requested result has not been accepted for phone delivery."
+      }
+    }
+  }
+
+  public static func deliverReply(
+    deliveryId: String, route: AgentBridgeCompletionRoute, notifyRequestedResult: Bool,
+    recoverTelegram: @Sendable () async throws -> String,
+    recoverSlack: @Sendable () async throws -> String,
+    recoverIOS: @Sendable () async throws -> String,
+    deliverRequestedResult: @Sendable () async throws -> Void
+  ) async throws -> AgentBridgeCompletionDelivery {
+    let verdict: String
+    switch route.kind {
+    case .telegram: verdict = try await recoverTelegram()
+    case .slack: verdict = try await recoverSlack()
+    case .ios: verdict = try await recoverIOS()
+    default: throw DeliveryError.emptyCompletion
+    }
+    var notificationDiagnostic: String?
+    if verdict != "owed", notifyRequestedResult {
+      do { try await deliverRequestedResult() }
+      catch {
+        notificationDiagnostic = error.localizedDescription
+        nativeLog("Requested result notification remains pending for %@: %@", deliveryId, error.localizedDescription)
+      }
+    }
+    return AgentBridgeCompletionDelivery(status: verdict, surface: route.surface, delivery: "route_journal",
+      artifactCount: verdict == "owed" ? 0 : 1, attempts: 0,
+      reason: verdict == "sent_unconfirmed" ? "Route journal retained an unconfirmed dispatch; automatic resend is disabled." : notificationDiagnostic)
+  }
+
+  public static func sendCallerResult(
+    artifact: AgentBridgeCompletionArtifact, idempotencyKey: String,
+    route: AgentBridgeCompletionRoute, tasks: @Sendable () -> AgentContactTasks
+  ) async -> AgentBridgeTransportResult {
+    do {
+      try validateAttachmentExpectations(artifact.attachmentExpectations)
+      guard route.kind == .callerResult else { throw DeliveryError.emptyCompletion }
+      let part: AgentContactPart
+      switch artifact.payload {
+      case .text(let text): part = .text(text)
+      case .attachment(let attachment):
+        part = try AgentContactPart.output(attachment, taskID: "na3.\(route.threadId ?? "").\(route.correlationId ?? "")")
+      }
+      try await tasks().appendCallerResult(part, artifactID: idempotencyKey, route: route)
+      return .accepted
+    } catch { return .rejected(reason: error.localizedDescription, retryable: false) }
+  }
+
   private struct RouteValidationFailure: Error, Equatable {
     let reason: String
   }
@@ -159,35 +231,18 @@ public enum AgentBridgeCompletionRouter {
         !sourceKey.isEmpty else {
           return .failure(RouteValidationFailure(reason: "missing_ios_source_key"))
       }
-      guard isValidIOSDeviceRouteKey(sourceKey) else {
+      guard AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(sourceKey) else {
         return .failure(RouteValidationFailure(reason: "invalid_ios_source_key"))
       }
     }
     return .success(kind)
   }
 
-  /// Current iOS clients mint an exact per-device route as `iphone` or
-  /// `iphone:<device name>`. The generic `mobile_app` source key is a session
-  /// identity shared by every mobile client, not a reply destination. Accepting
-  /// arbitrary non-empty strings (notably the old `app` fallback) can make an
-  /// iCloud write look successful while every device correctly filters it out.
-  public static func isValidIOSDeviceRouteKey(_ raw: String) -> Bool {
-    let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !value.isEmpty, value.utf8.count <= 200,
-          value.rangeOfCharacter(from: .controlCharacters) == nil else {
-      return false
-    }
-    if value == "iphone" { return true }
-    guard value.hasPrefix("iphone:") else { return false }
-    return !String(value.dropFirst("iphone:".count))
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-      .isEmpty
-  }
 
   /// User 10-01: a contact's conversation runs her turn in its own session,
   /// but when User asked from a chat at any door her answer reaches THAT chat:
-  /// a visible row in the Mac or phone chat that asked, then the route's own
-  /// delivery (the push, or Telegram's text). No row, no delivery.
+  /// a visible row in the chat that asked and the route's own delivery. Phone
+  /// rows wait for the native send verdict so a held answer stays unpublished.
   public static func deliverAnswer(
     deliveryId: String,
     requestDigest: String,
@@ -199,19 +254,9 @@ public enum AgentBridgeCompletionRouter {
     lifecycle: CodexCompletionLifecycle,
     notifyRequestedResult: Bool = true
   ) async -> AgentBridgeCompletionDelivery {
-    let surface = route.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    if route.turnSessionId != nil, let asking = route.sessionId,
-       ["chat", "app", "mac", "ios", "iphone", "mobile", "icloud"].contains(surface) {
-      do {
-        try await client.appendAnswerForAskingChat(sessionID: asking, text: text, attachments: attachments,
-                                                   surface: surface, deliveryID: deliveryId)
-      } catch {
-        return AgentBridgeCompletionDelivery(status: "failed_pre_dispatch", surface: surface, delivery: "asking_chat_row",
-          artifactCount: 0, attempts: 0, reason: "asking_chat_row_failed:\(error.localizedDescription)")
-      }
-    }
     return await deliver(deliveryId: deliveryId, requestDigest: requestDigest, text: text, attachments: attachments,
-                         route: route, sender: sender, lifecycle: lifecycle, notifyRequestedResult: notifyRequestedResult)
+                         route: route, sender: sender, lifecycle: lifecycle, notifyRequestedResult: notifyRequestedResult,
+                         askingChatClient: client)
   }
 
   public static func deliver(
@@ -222,9 +267,27 @@ public enum AgentBridgeCompletionRouter {
     route: AgentBridgeCompletionRoute,
     sender: any AgentBridgeCompletionSending,
     lifecycle: CodexCompletionLifecycle,
-    notifyRequestedResult: Bool = true
+    notifyRequestedResult: Bool = true,
+    askingChatClient: (any ChatOrchestrationClient)? = nil
   ) async -> AgentBridgeCompletionDelivery {
     let surface = route.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let admission: (response: ChatResponse?, priorVerdict: String?, letGo: AgentBridgeCompletionDelivery?)
+    do {
+      admission = try await lifecycle.deliveryAdmission(deliveryId: deliveryId, requestDigest: requestDigest)
+      if let letGo = admission.letGo { return letGo }
+    } catch {
+      return lifecycleUnavailable(surface: surface, delivery: "none", reason: error.localizedDescription)
+    }
+    if let askingChatClient, route.turnSessionId != nil, let asking = route.sessionId,
+       ["chat", "app", "mac"].contains(surface) {
+      do {
+        try await askingChatClient.appendAnswerForAskingChat(sessionID: asking, text: text, attachments: attachments,
+                                                   surface: surface, deliveryID: deliveryId)
+      } catch {
+        return AgentBridgeCompletionDelivery(status: "failed_pre_dispatch", surface: surface, delivery: "asking_chat_row",
+          artifactCount: 0, attempts: 0, reason: "asking_chat_row_failed:\(error.localizedDescription)")
+      }
+    }
     let validatedRoute = Self.validatedRoute(surface: surface, route: route)
     let delivery: String
     switch validatedRoute {
@@ -265,12 +328,23 @@ public enum AgentBridgeCompletionRouter {
       }
     }
 
-    if validatedRoute != .success(.callerResult) {
+    if validatedRoute != .success(.callerResult), validatedRoute != .success(.ios) {
       await sender.refreshLocalChat(sessionId: route.sessionId)
     }
     // A tool-authored reply to another human conversation is part of the
     // enclosing turn's work. That turn owns the single result notification.
-    if validatedRoute == .success(.local), !notifyRequestedResult {
+    if validatedRoute == .success(.local) {
+      if notifyRequestedResult {
+        do {
+          guard let response = admission.response,
+                let session = route.turnSessionId ?? response.sessionId else { throw CodexCompletionLifecycle.LifecycleError.responseMissing }
+          try await SwiftNativeChatOrchestrationClient.retainRequestedResult(dataRoot: lifecycle.dataRoot,
+            sessionId: session, runId: response.runId, deliveryId: "requested-result:" + deliveryId)
+        } catch {
+          return lifecycleUnavailable(surface: surface, delivery: delivery,
+            reason: "requested_result_intent_not_durable:\(error.localizedDescription)")
+        }
+      }
       let result = AgentBridgeCompletionDelivery(status: "completed", surface: surface, delivery: delivery,
         artifactCount: text.isEmpty ? attachments.count : attachments.count + 1, attempts: 0, reason: nil)
       do {
@@ -281,14 +355,40 @@ public enum AgentBridgeCompletionRouter {
           reason: "local_settlement_not_durable:\(error.localizedDescription)")
       }
     }
+    if [.success(.telegram), .success(.slack), .success(.ios)].contains(validatedRoute) {
+      do {
+        let admission = try await lifecycle.deliveryAdmission(deliveryId: deliveryId, requestDigest: requestDigest)
+        if let letGo = admission.letGo { return letGo }
+        guard var response = admission.response else {
+          throw CodexCompletionLifecycle.LifecycleError.responseMissing
+        }
+        response.output = text
+        response.attachments = attachments
+        let result = try await sender.deliverReply(response, deliveryId: deliveryId, route: route,
+          priorVerdict: admission.priorVerdict, notifyRequestedResult: notifyRequestedResult)
+        if result.status != "owed" {
+          if validatedRoute == .success(.ios) {
+            if route.turnSessionId != nil, let asking = route.sessionId, let askingChatClient {
+              try await askingChatClient.appendAnswerForAskingChat(sessionID: asking, text: text, attachments: attachments,
+                                                                  surface: surface, deliveryID: deliveryId)
+            }
+            await sender.refreshLocalChat(sessionId: route.sessionId)
+          }
+          try await lifecycle.recordDelivery(result, deliveryId: deliveryId, requestDigest: requestDigest)
+        }
+        return result
+      } catch {
+        return AgentBridgeCompletionDelivery(status: "owed", surface: surface, delivery: "route_journal",
+          artifactCount: 0, attempts: 0, reason: error.localizedDescription)
+      }
+    }
     let artifacts: [AgentBridgeCompletionArtifact]
     do {
       artifacts = try Self.artifacts(
         deliveryId: deliveryId,
         surface: surface,
         text: text,
-        attachments: attachments,
-        notifyRequestedResult: notifyRequestedResult
+        attachments: attachments
       )
     } catch {
       let result = AgentBridgeCompletionDelivery(
@@ -357,6 +457,8 @@ public enum AgentBridgeCompletionRouter {
       }
 
       switch decision {
+      case .settled(let delivery):
+        return delivery
       case .alreadyAccepted:
         acceptedCount += artifact.logicalCount
         continue artifactLoop
@@ -551,8 +653,7 @@ public enum AgentBridgeCompletionRouter {
     deliveryId: String,
     surface: String,
     text: String,
-    attachments: [ChatOrchestration.MultimodalAttachment],
-    notifyRequestedResult: Bool = true
+    attachments: [ChatOrchestration.MultimodalAttachment]
   ) throws -> [AgentBridgeCompletionArtifact] {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let validated = try attachments.map { attachment -> (
@@ -577,43 +678,12 @@ public enum AgentBridgeCompletionRouter {
         digest: dataDigest(data)
       ))
     }
-    if ["ios", "iphone", "mobile", "icloud"].contains(surface) {
-      guard !trimmed.isEmpty || !validated.isEmpty else { return [] }
-      let correlationId = stableUUID("\(deliveryId):ios_correlation")
-      let bundle = AgentBridgeCompletionArtifact(
-          id: "\(deliveryId):ios_bundle", kind: "ios_message", retrySafe: true,
-          logicalCount: (trimmed.isEmpty ? 0 : 1) + validated.count,
-          payload: .iosBundle(trimmed, validated.map(\.0), correlationId),
-          attachmentExpectations: validated.map(\.1)
-      )
-      guard notifyRequestedResult else { return [bundle] }
-      return [
-        bundle,
-        AgentBridgeCompletionArtifact(
-          id: "\(deliveryId):ios_notification",
-          kind: "ios_notification",
-          // Attention and phone publication share the saved result's stable
-          // event identity; retry only delivery, never the resident turn.
-          retrySafe: true,
-          logicalCount: 0,
-          payload: .iosNotification(trimmed, deliveryId),
-          attachmentExpectations: []
-        ),
-      ]
-    }
-    let notification = AgentBridgeCompletionArtifact(
-      id: "\(deliveryId):requested_result", kind: "requested_result", retrySafe: true,
-      logicalCount: 0, payload: .iosNotification(trimmed, deliveryId), attachmentExpectations: []
-    )
-    if notifyRequestedResult, ["chat", "app", "mac", "github-command", "mission", "missions", "workshop"].contains(surface) {
-      return [notification]
-    }
     var result: [AgentBridgeCompletionArtifact] = []
     if !trimmed.isEmpty {
       result.append(AgentBridgeCompletionArtifact(
         id: "\(deliveryId):text",
         kind: "text",
-        retrySafe: surface == "slack" || surface == "caller-result",
+        retrySafe: surface == "caller-result",
         logicalCount: 1,
         payload: .text(trimmed),
         attachmentExpectations: []
@@ -629,7 +699,6 @@ public enum AgentBridgeCompletionRouter {
         attachmentExpectations: [item.1]
       ))
     }
-    if notifyRequestedResult, surface != "caller-result" { result.append(notification) }
     return result
   }
 

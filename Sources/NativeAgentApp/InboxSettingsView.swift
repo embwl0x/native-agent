@@ -1,3 +1,4 @@
+import NativeAgentShared
 // PATCH-2026-05-07: proactive-inbox-1 InboxSettingsView — trigger config + master enable
 import SwiftUI
 import NotificationInbox
@@ -226,7 +227,7 @@ struct InboxSettingsView: View {
         let profileName = appModel.personality?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let chatName = appModel.chatPersona.trimmingCharacters(in: .whitespacesAndNewlines)
         if !profileName.isEmpty && profileName != "NativeAgent" { return profileName }
-        if !chatName.isEmpty { return canonicalAgentDisplayName(chatName, fallback: "the agent") }
+        if !chatName.isEmpty { return NativeAgentIdentity.displayName(chatName, fallback: "the agent") }
         return "the agent"
     }
 
@@ -387,12 +388,7 @@ struct InboxSettingsView: View {
         // PATCH-2026-05-29: surface-load-errors Do not swallow the /v1/trust fetch
         // with try?; a failed fetch left masterEnabled stale/false with no status.
         do {
-            let obj = try await appModel.engine.trust.rawPolicy()
-            // TrustCenter+Defaults ships inboxPolicy.enabled TRUE.
-            var loaded = true
-            if case .object(let ip)? = obj["inboxPolicy"], case .bool(let enabled)? = ip["enabled"] {
-                loaded = enabled
-            }
+            let loaded = try await appModel.engine.trust.inboxEnabled()
             withAnimation(triggersRead ? foldAnimation : nil) {
                 trustReadState = .loaded(enabled: loaded)
             }
@@ -434,9 +430,7 @@ struct InboxSettingsView: View {
             return !enabled
         }()
         do {
-            _ = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
-                body: ["inboxPolicy": ["enabled": enabled]], dataRoot: appModel.engine.dataRoot
-            )
+            try await appModel.engine.trust.setInboxEnabled(enabled)
             withAnimation(foldAnimation) { trustReadState = .loaded(enabled: enabled) }
             statusSlot.record(InboxPolicyStatus(.masterSaved(enabled: enabled)), from: .masterToggle)
         } catch {

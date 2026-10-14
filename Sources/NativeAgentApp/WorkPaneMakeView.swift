@@ -1,3 +1,4 @@
+import Cognition
 import AppKit
 import PersistenceCore
 import QuickLookUI
@@ -13,32 +14,54 @@ import WebKit
 struct WorkPaneMakeView: View {
     let ref: String?
     @Environment(AppModel.self) private var appModel
-    @State private var shelf = MakeShelf()
+    @State private var shelf = MakeStudio.Shelf.shared
+    @State private var preparedTitle = ""
+    @State private var preparedImage: NSImage?
+    @State private var preparedFile: URL?
+    @State private var preparedRevision = -1
+    @State private var revision = 0
     /// Index into the ref's versions; nil is the newest.
     @State private var shown: Int?
     @State private var making = false
+    @State private var saving = false
     @State private var note: String?
 
     private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
 
     var body: some View {
         Group {
-            if let meta = shelf.meta, !meta.versions.isEmpty {
+            if let meta = shelf.meta(ref), !meta.versions.isEmpty {
                 let index = min(shown ?? meta.versions.count - 1, meta.versions.count - 1)
                 let version = meta.versions[index]
                 let file = MakeStudio(dataRoot: root).url(meta.ref, version)
                 VStack(spacing: 0) {
-                    header(meta, index: index)
+                    header(meta, index: index, file: file)
                     Divider()
                     preview(file, folder: MakeStudio(dataRoot: root).folder(meta.ref))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if let prompt = version.prompt, Self.imageTypes.contains(file.pathExtension.lowercased()) {
+                    if let prompt = version.prompt, MakeStudio.imageTypes.contains(file.pathExtension.lowercased()) {
                         Divider()
                         imageActions(meta.ref, version, file: file, prompt: prompt)
                     }
                 }
-                .onChange(of: file) { shelf.watch(file) }
-                .onAppear { shelf.watch(file) }
+                .task(id: file) {
+                    await EventDeadlinePhysiology.refreshOnChanges(paths: [file]) { revision &+= 1 }
+                }
+                .onChange(of: version) { _, _ in revision &+= 1 }
+                .task(id: "\(file.path) \(revision)") {
+                    let revision = revision
+                    preparedTitle = ""
+                    preparedImage = nil
+                    preparedFile = nil
+                    let prepared = await Task.detached(priority: .userInitiated) {
+                        (MakeStudio.title(version, file: file), MakeStudio.imageTypes.contains(file.pathExtension.lowercased()) ? NSImage(contentsOf: file) : nil)
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    preparedTitle = prepared.0
+                    preparedImage = prepared.1
+                    preparedFile = file
+                    preparedRevision = revision
+                }
             } else {
                 Text("Nothing made yet.")
                     .font(ShellType.label)
@@ -49,15 +72,15 @@ struct WorkPaneMakeView: View {
         .task(id: ref) {
             shown = nil
             note = nil
-            shelf.open(ref, dataRoot: root)
+            shelf.open(dataRoot: root)
         }
         // A new version lands in front.
-        .onChange(of: shelf.meta.map { "\($0.ref) \($0.versions.count)" }) { shown = nil }
+        .onChange(of: shelf.meta(ref).map { "\($0.ref) \($0.versions.count)" }) { shown = nil }
     }
 
-    private func header(_ meta: MakeStudio.Meta, index: Int) -> some View {
+    private func header(_ meta: MakeStudio.Meta, index: Int, file: URL) -> some View {
         HStack(spacing: 8) {
-            Text(Self.title(meta.versions[index], file: MakeStudio(dataRoot: root).url(meta.ref, meta.versions[index])))
+            Text(preparedFile == file && preparedRevision == revision ? preparedTitle : "")
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
@@ -79,36 +102,23 @@ struct WorkPaneMakeView: View {
         .padding(.vertical, 8)
     }
 
-    /// What User reads in the header: a mockup's own <title>, else an image's
-    /// prompt, else the file's name. The ref stays in the tooltip.
-    static func title(_ version: MakeStudio.Version, file: URL) -> String {
-        if webTypes.contains(file.pathExtension.lowercased()),
-           let html = try? String(contentsOf: file, encoding: .utf8),
-           let open = html.range(of: "<title>", options: .caseInsensitive),
-           let close = html.range(of: "</title>", options: .caseInsensitive, range: open.upperBound..<html.endIndex) {
-            let text = html[open.upperBound..<close.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { return text }
-        }
-        if let prompt = version.prompt?.trimmingCharacters(in: .whitespacesAndNewlines), !prompt.isEmpty { return prompt }
-        return file.lastPathComponent
-    }
-
-    static let webTypes: Set = ["html", "htm", "xhtml", "svg"]
-    static let imageTypes: Set = ["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff"]
-
     @ViewBuilder
     private func preview(_ file: URL, folder: URL) -> some View {
         let type = file.pathExtension.lowercased()
-        if Self.webTypes.contains(type) {
-            MakeMockupView(file: file, folder: folder, revision: shelf.revision)
-        } else if Self.imageTypes.contains(type), let image = NSImage(contentsOf: file) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFit()
-                .padding(12)
-                .id(shelf.revision)
+        if MakeStudio.webTypes.contains(type) {
+            MakeMockupView(file: file, folder: folder, revision: revision)
+        } else if MakeStudio.imageTypes.contains(type) {
+            if preparedFile == file, preparedRevision == revision, let image = preparedImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(12)
+                    .id(revision)
+            } else if preparedFile == file, preparedRevision == revision {
+                MakeQuickLookView(file: file, revision: revision)
+            }
         } else {
-            MakeQuickLookView(file: file, revision: shelf.revision)
+            MakeQuickLookView(file: file, revision: revision)
         }
     }
 
@@ -128,6 +138,7 @@ struct WorkPaneMakeView: View {
                 .disabled(making)
                 Button("Variations") { variations(ref, version) }
                 Button("Use this") { use(file, ref: ref, version: version, prompt: prompt) }
+                    .disabled(saving)
                 Spacer()
             }
             .buttonStyle(.bordered)
@@ -177,45 +188,33 @@ struct WorkPaneMakeView: View {
     /// Into the conversation's project folder when it has one, else where
     /// User picks; the prompt rides beside it as <name>.prompt.txt.
     private func use(_ file: URL, ref: String, version: MakeStudio.Version, prompt: String) {
+        guard !saving else { return }
+        saving = true
         let name = "\(ref)-v\(version.n).\(file.pathExtension)"
-        let project = appModel.engine.transcripts.sessions
+        let projectPath = appModel.engine.transcripts.sessions
             .first { $0.id == appModel.activeChatSessionId }?.worktreePath
-            .flatMap { path -> URL? in
-                var isDirectory: ObjCBool = false
-                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
-                    ? URL(fileURLWithPath: path, isDirectory: true) : nil
+        Task {
+            defer { saving = false }
+            let (project, planned) = await Task.detached(priority: .userInitiated) {
+                MakeStudio.exportDestination(projectPath: projectPath, name: name)
+            }.value
+            var target = planned
+            if target == nil {
+                let panel = NSSavePanel()
+                panel.nameFieldStringValue = name
+                panel.directoryURL = project
+                if let type = UTType(filenameExtension: file.pathExtension) { panel.allowedContentTypes = [type] }
+                guard panel.runModal() == .OK, let picked = panel.url else { return }
+                target = picked
             }
-        var target = project?.appendingPathComponent(name)
-        // Never over a file already there: the panel asks first.
-        if let planned = target, FileManager.default.fileExists(atPath: planned.path)
-            || FileManager.default.fileExists(atPath: planned.deletingPathExtension().appendingPathExtension("prompt.txt").path) {
-            target = nil
-        }
-        if target == nil {
-            let panel = NSSavePanel()
-            panel.nameFieldStringValue = name
-            panel.directoryURL = project
-            if let type = UTType(filenameExtension: file.pathExtension) { panel.allowedContentTypes = [type] }
-            guard panel.runModal() == .OK, let picked = panel.url else { return }
-            target = picked
-        }
-        guard let target else { return }
-        // The same file by identity (a hard link or symlink too), not by path.
-        let identity = { (url: URL) in
-            try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
-        }
-        guard identity(target).map({ $0.isEqual(identity(file)) }) != true else {
-            note = "That is the studio's own file, so nothing was saved. Pick another place."
-            return
-        }
-        let sidecar = target.deletingPathExtension().appendingPathExtension("prompt.txt")
-        do {
-            // Written beside the target and swapped in: a failed save leaves what was there.
-            try Data(contentsOf: file).write(to: target, options: .atomic)
-            try prompt.write(to: sidecar, atomically: true, encoding: .utf8)
-            note = "Saved to \(target.path)"
-        } catch {
-            note = UserFacingError.message(error, action: "save that image")
+            guard let target else { return }
+            note = await Task.detached(priority: .userInitiated) {
+                do {
+                    return try MakeStudio.export(file, to: target, prompt: prompt)
+                } catch {
+                    return UserFacingError.message(error, action: "save that image")
+                }
+            }.value
         }
     }
 
@@ -227,61 +226,6 @@ struct WorkPaneMakeView: View {
             if case .string(let text)? = fields[key], !text.isEmpty { return text }
         }
         return "image.generate did not make an image."
-    }
-}
-
-/// One ref's meta, reread whenever its meta or the studio folder changes; a
-/// rewritten shown file bumps `revision`, so it reloads under the same path.
-@MainActor
-@Observable
-final class MakeShelf {
-    private(set) var meta: MakeStudio.Meta?
-    private(set) var revision = 0
-    private var asked: String?
-    private var studio: MakeStudio?
-    private var watcher: FileChangeWatcher?
-    private var watchedFile: URL?
-    private var armed: [URL] = []
-
-    func open(_ ref: String?, dataRoot: URL) {
-        asked = ref
-        let studio = MakeStudio(dataRoot: dataRoot)
-        self.studio = studio
-        try? FileManager.default.createDirectory(at: studio.root, withIntermediateDirectories: true)
-        watchedFile = nil
-        reload()
-    }
-
-    func watch(_ file: URL) {
-        guard file.standardizedFileURL != watchedFile, let studio else { return }
-        watchedFile = file.standardizedFileURL
-        rearm(studio)
-    }
-
-    private func changed(_ path: URL) {
-        if path == watchedFile { revision += 1 }
-        reload()
-    }
-
-    private func reload() {
-        guard let studio else { return }
-        let fresh = (asked ?? studio.newestRef()).flatMap(studio.meta)
-        if fresh != meta { meta = fresh }
-        rearm(studio)
-    }
-
-    /// Every ref's meta, not only the shown one's: a new version of another
-    /// ref is the new newest. A new ref changes the set, so it is re-armed.
-    private func rearm(_ studio: MakeStudio) {
-        let refs = ((try? FileManager.default.contentsOfDirectory(atPath: studio.root.path)) ?? []).filter(MakeStudio.isRef)
-        var paths = [studio.root] + refs.sorted().map { studio.folder($0).appendingPathComponent("meta.json") }
-        if let watchedFile { paths.append(watchedFile) }
-        guard paths != armed else { return }
-        armed = paths
-        watcher?.cancel()
-        watcher = FileChangeWatcher(paths: paths) { [weak self] path in
-            Task { @MainActor in self?.changed(path.standardizedFileURL) }
-        }
     }
 }
 

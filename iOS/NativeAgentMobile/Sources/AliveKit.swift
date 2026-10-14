@@ -169,7 +169,7 @@ struct AliveRoom: View {
 /// Reads the chat's turn state for the room's mood. Every input changes a few
 /// times per turn; the representable ignores anything that is not a change.
 struct AliveChatRoom: View {
-    @ObservedObject var store: ChatStore
+    var store: ChatStore
 
     var body: some View {
         AliveRoom(mood: mood)
@@ -1322,7 +1322,7 @@ extension View {
 /// dimmed state says the rest); a paired one hears this page's age when it
 /// is stale or never arrived.
 struct AliveFreshnessNote: View {
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var showsPairing = false
     let group: String

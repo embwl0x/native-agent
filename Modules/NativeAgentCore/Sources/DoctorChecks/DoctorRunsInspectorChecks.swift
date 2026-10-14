@@ -54,17 +54,15 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
     public let title = "Inspector saved traces"
     public let heartbeatEligible = false
     private let lane: TurnTracePersistLane
-    private let now: @Sendable () -> Date
 
-    public init(root: URL? = nil, now: @escaping @Sendable () -> Date = { Date() }) {
+    public init(root: URL? = nil) {
         self.lane = TurnTracePersistLane(dataRootOverride: root)
-        self.now = now
     }
 
     public func run(repair: Bool) async -> CheckResult {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .current
-        let today = calendar.startOfDay(for: now())
+        let today = calendar.startOfDay(for: Date())
         let firstDay = calendar.date(byAdding: .day, value: 1 - TurnTraceRetention.defaultKeepDays, to: today) ?? today
         let coverage = "Checked \(lane.path(for: firstDay).deletingPathExtension().lastPathComponent) through \(lane.path(for: today).deletingPathExtension().lastPathComponent); older Replay dates were not checked."
         let folder = lane.path(for: today).deletingLastPathComponent()
@@ -129,4 +127,34 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
     }
 
     private enum TraceReadError: Error { case oversized }
+}
+
+/// Health policy for the app-owned Inspector observation, supplied as primitive facts.
+public enum InspectorFeedHealth {
+    public static func check(isOpen: Bool, sinkActive: Bool, dropCount: Int?) -> CheckResult {
+        guard isOpen else {
+            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "ok",
+                detail: "Inspector is closed; no live sink is expected.")
+        }
+        switch dropCount {
+        case nil:
+            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "fail",
+                detail: "The Inspector live sink ended; its drop count is unavailable. Events since termination cannot be recovered.",
+                harm: "New live turn events are no longer reaching Inspector.",
+                human_action: "Open Diagnostics → Inspector after repair and inspect saved traces for the missing interval.")
+        case let count? where count > 0:
+            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "unmeasured",
+                detail: "Inspector dropped \(count) live event(s) under page backpressure; those live events cannot be recovered.",
+                human_action: "Open Diagnostics → Inspector → Replay and inspect today's saved trace for the affected turn.")
+        case .some:
+            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: sinkActive ? "ok" : "unmeasured",
+                detail: sinkActive
+                    ? "Inspector live sink is active with no measured drops."
+                    : "Inspector live sink is starting; no drop count is available yet.")
+        }
+    }
+
+    public static func canRepair(isOpen: Bool, dropCount: Int?) -> Bool {
+        isOpen && dropCount == nil
+    }
 }

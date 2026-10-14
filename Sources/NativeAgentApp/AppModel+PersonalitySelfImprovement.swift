@@ -1,4 +1,6 @@
+import EngineRuntime
 import Foundation
+import EngineRuntime
 import Observation
 import Darwin
 import AppKit
@@ -68,46 +70,6 @@ extension AppModel {
         dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? SwiftNativePersonaEngine()
     }
 
-    /// The saved profile, read and parsed off the main actor.
-    nonisolated static func readPersonality(dataRoot: URL) async throws -> PersonalityProfile {
-        try await Task.detached { try PersonaCompiler.compileProfile(dataRoot: dataRoot).sharedProfile }.value
-    }
-
-    /// The personality growth summary: the chat packet's fingerprint and
-    /// kind, the persona-feedback memory count, and this week's substrate
-    /// changes from the live mind.
-    nonisolated static func readPersonalityGrowth() async throws -> PersonalityGrowthSummary {
-        try await RuntimeReadProjection.swiftPersonalityGrowth {
-            await NativeAgentEngine.liveCognition.substrate.growthWeekLines()
-        }
-    }
-
-    /// `training/artifacts/index.json`; missing reads as `[]`.
-    nonisolated static func readTrainingArtifacts(dataRoot: URL) async throws -> [TrainingArtifact] {
-        let url = dataRoot
-            .appendingPathComponent("training", isDirectory: true)
-            .appendingPathComponent("artifacts", isDirectory: true)
-            .appendingPathComponent("index.json")
-        return try RuntimeReadProjection.readLocalJSON(url, fallbackJSON: "[]")
-    }
-
-    /// `release/checklist.json`; missing reads as an empty checklist (every
-    /// field decodes if present).
-    nonisolated static func readReleaseChecklist(dataRoot: URL) async throws -> ReleaseChecklist {
-        let url = dataRoot
-            .appendingPathComponent("release", isDirectory: true)
-            .appendingPathComponent("checklist.json")
-        return try RuntimeReadProjection.readLocalJSON(url, fallbackJSON: "{}")
-    }
-
-    @MainActor
-    func savePersonality(_ profile: PersonalityProfile) async {
-        // The page shows the failure in `statusText`; a caller that has to
-        // ANSWER for the save (app_setting_set's receipt) uses the throwing
-        // form, because a swallowed error there reads as a successful write.
-        try? await savePersonalityChecked(profile)
-    }
-
     /// The same save, with the persistence error left intact.
     @MainActor
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
@@ -128,36 +90,21 @@ extension AppModel {
 
     @discardableResult
     func savePersonalityName(_ rawName: String) async -> PersonalityNameSaveOutcome {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
-            let detail = "Enter a name before saving."
-            statusText = "Name save refused: \(detail)"
-            return .refused(detail)
-        }
-        // Generic persona labels are intentionally rendered as the fallback
-        // across the live app. Refuse them here so a claimed saved name cannot
-        // immediately disappear into "NativeAgent" on the next render.
-        guard !NativeAgentIdentity.displayName(name, fallback: "").isEmpty else {
-            let detail = "Choose a specific name instead of a generic persona label."
-            statusText = "Name save refused: \(detail)"
-            return .refused(detail)
-        }
         do {
-            let saved = try await personaEngine.savePersonality(body: ["name": .string(name)]).sharedProfile
+            let saved = try await personaEngine.saveName(rawName)
             personality = saved
             teachMemoryHygieneName()
             statusText = "Name saved as \(saved.name)"
             return .saved(saved)
+        } catch PersonaWriteError.invalidInput(let detail) {
+            statusText = "Name save refused: \(detail)"
+            return .refused(detail)
         } catch {
             let detail = UserFacingError.cause(error, action: "save the name")
             setFailureStatus("Couldn't save the name. " + detail, cause: error)
             return .failed(detail)
         }
     }
-
-    /// TTL for reusing a completed Doctor run when building the Support
-    /// Snapshot instead of re-running the whole offline pass (B2.6d).
-    nonisolated static let supportSnapshotDoctorReuseTTL: TimeInterval = 90
 
     enum SupportDiagnosticsLoadOutcome: Equatable {
         case unavailable(String)
@@ -180,15 +127,10 @@ extension AppModel {
             // B2.6d: if a full Doctor run finished within the TTL, reuse its
             // result (identical offline rollup) rather than re-running the
             // whole pass. Falls back to a fresh run when stale or never run.
-            let reuse: DoctorReport? = {
-                guard let report = engine.doctor.report,
-                      let completedAt = engine.doctor.reportCompletedAt else { return nil }
-                let age = Date().timeIntervalSince(completedAt)
-                guard age >= 0, age < Self.supportSnapshotDoctorReuseTTL
-                else { return nil }
-                return report
-            }()
-            let diagnostics = try await SupportDiagnostics.read(reusing: reuse)
+            let reuse = EngineDoctorRuntime<AppDoctorPort>.reusableSupportReport(
+                report: engine.doctor.report, completedAt: engine.doctor.reportCompletedAt
+            )
+            let diagnostics = try await SupportDiagnostics.read(reusingChecks: reuse?.checks)
             supportDiagnostics = diagnostics
             statusText = reuse != nil
                 ? "Support diagnostics refreshed (reused recent Doctor result)"
@@ -241,13 +183,6 @@ extension AppModel {
         }
     }
 
-    /// This ISO week's and last week's misses by lesson; nil when the ledger
-    /// could not be read.
-    nonisolated static func readMisses(dataRoot: URL) async -> [MemoryMissLesson]? {
-        try? await MemoryStatusProjection.misses(
-            dataRoot: dataRoot, weeks: [MemoryStatusProjection.isoWeek(), MemoryStatusProjection.isoWeek(ago: 1)])
-    }
-
     // PATCH-2026-05-07: living-memory AppModel methods for memory proposals
     // U5 W-A item 1 (2026-06-11): these five loaders previously swallowed
     // failures with bare `try? ... ?? []`, so a read/decode error rendered
@@ -280,7 +215,7 @@ extension AppModel {
 
     @MainActor
     func triggerMemoryConsolidation(dryRun: Bool = false) async throws -> [String: Any] {
-        let result = try await Self.runMemoryConsolidation(dataRoot: engine.dataRoot, dryRun: dryRun)
+        let result = try await MemoryConsolidationHygiene.runConsolidation(dataRoot: engine.dataRoot, dryRun: dryRun)
         await loadMemoryProposals()
         return result
     }
@@ -319,7 +254,7 @@ extension AppModel {
     func runRemPass() async -> DreamsREMActionFeedback {
         dreamError = nil
         do {
-            let feedback = DreamsREMActionFeedback.resolve(response: try await BackgroundLoopsAssembly.runRem(dataRoot: engine.dataRoot))
+            let feedback = DreamsREMActionFeedback.resolve(response: try await NativeAgentEngine.runRem(dataRoot: engine.dataRoot))
             if feedback.isSuccess {
                 statusText = feedback.message
             } else {
@@ -341,13 +276,7 @@ extension AppModel {
     func setDreamCycleEnabled(_ enabled: Bool) async -> Bool {
         dreamError = nil
         do {
-            let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
-                body: [
-                    "personalityPolicy": ["dream_cycle_enabled": enabled],
-                    "trainingPolicy": ["dream_scheduler": enabled],
-                ],
-                dataRoot: engine.dataRoot
-            )
+            let saved = try await engine.cognitionView.setDreamCycleEnabled(enabled)
             engine.trust.policy = saved
             statusText = enabled ? "Dream cycle enabled" : "Dream cycle disabled"
             return true
@@ -363,10 +292,7 @@ extension AppModel {
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool {
         dreamError = nil
         do {
-            // Change only the REM gate; preserve the dream scheduler.
-            let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
-                body: ["trainingPolicy": ["rem_cycle_enabled": enabled]], dataRoot: engine.dataRoot
-            )
+            let saved = try await engine.cognitionView.setRemCycleEnabled(enabled)
             engine.trust.policy = saved
             statusText = enabled ? "REM cycle enabled" : "REM cycle disabled"
             return true
@@ -384,36 +310,15 @@ extension AppModel {
     /// sentence that says why.
     @MainActor
     func setInnerLifeEnabled(_ enabled: Bool) async -> (state: NativeSubconsciousRuntimeState, problem: String?) {
-        let budget = UserDefaults.standard.object(forKey: "cognitiveSubstrateDailyReflectionBudget") as? Int ?? 2
-        let state = await NativeAgentEngine.liveCognition.setSubconsciousMasterEnabled(
+        let (state, contextFlowReady) = await engine.cognitionView.setInnerLifeEnabled(
             enabled,
-            reflectionBudget: enabled ? max(1, budget) : 0
+            runtime: NativeAgentEngine.liveCognition,
+            contextFlow: NativeAgentEngine.live.contextFlow
         )
-        engine.cognitionView.subconsciousRuntime = state
-        await NativeCognitionRuntime.reloadStudioWanderInstallation()
-        await engine.cognitionView.refreshVitals()
 
         var problem: String?
-        if enabled {
-            // User, 2026-09-06: this used to force Fluid Context to Active on
-            // every enable, silently undoing an Off the user had
-            // chosen. The identical switch in Slim Settings leaves the mode
-            // alone, so the two disagreed. Only an UNSET preference gets the
-            // Active default; an existing choice stands, and the warning below
-            // now compares against what was actually asked for.
-            let stored = UserDefaults.standard.string(
-                forKey: NativeContextFlowConfiguration.modeDefaultsKey
-            ).flatMap(ContextFlowMode.init(rawValue:))
-            let preferred = stored ?? .active
-            let status: NativeContextFlowModeStatus
-            if stored == nil {
-                status = await NativeAgentEngine.live.contextFlow.setMode(.active)
-            } else {
-                status = await NativeAgentEngine.live.contextFlow.modeStatus()
-            }
-            if status.effectiveMode != preferred {
-                problem = "Some of my inner life is held off by setup, safety, or provider health."
-            }
+        if enabled && !contextFlowReady {
+            problem = "Some of my inner life is held off by setup, safety, or provider health."
         }
         if enabled && !state.enabled {
             let voice = AgentVoice(name: agentDisplayName)
@@ -433,37 +338,19 @@ extension AppModel {
     func runDreamPassForDreams() async -> Bool {
         dreamError = nil
         do {
-            let result = try await BackgroundLoopsAssembly.runDream(dataRoot: engine.dataRoot, trigger: .manual)
-            let errors = result["errors"] as? [String] ?? []
-            guard DoctorStatusProjection.boolValue(result["ok"]) == true, errors.isEmpty else {
-                let detail = errors.isEmpty ? "The dream run did not complete successfully." : errors.joined(separator: "; ")
+            let result = try await NativeAgentEngine.runDream(dataRoot: engine.dataRoot, trigger: .manual)
+            if let detail = DreamRunResult.completionFailure(result) {
                 dreamError = "Dream cycle failed: \(detail)"
                 statusText = "Dream cycle failed"
                 return false
             }
-            statusText = Self.dreamRunStatusText(result)
+            statusText = DreamRunResult.statusText(result)
             return true
         } catch {
             dreamError = UserFacingError.message(error, action: "run the dream cycle")
             statusText = "Dream cycle failed"
             return false
         }
-    }
-
-    private static func dreamRunStatusText(_ result: [String: Any]) -> String {
-        let entries = DoctorStatusProjection.intValue(result["entriesWritten"]) ?? 0
-        let disabled = DoctorStatusProjection.boolValue(result["disabled"]) ?? false
-        if disabled { return "Dream cycle disabled" }
-        if let reason = result["skipReason"] as? String {
-            switch reason {
-            case "already_dreamt": return "Dream already ran for the target night"
-            case "already_running": return "A dream cycle is already running"
-            case "no_new_material": return "No new material to dream about"
-            default: return "Dream cycle skipped: \(reason)"
-            }
-        }
-        if entries <= 0 { return "Dream cycle wrote no entries" }
-        return entries == 1 ? "Dream cycle wrote 1 entry" : "Dream cycle wrote \(entries) entries"
     }
 
 }

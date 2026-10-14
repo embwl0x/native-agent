@@ -1,4 +1,5 @@
 import Foundation
+import TrustCenter
 
 public struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -42,5 +43,51 @@ public struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
         self.runtimeStatus = try c.decodeIfPresent(String.self, forKey: .runtimeStatus)
         self.runtimeDetail = try c.decodeIfPresent(String.self, forKey: .runtimeDetail)
         self.runtimeUpdatedAt = try c.decodeIfPresent(String.self, forKey: .runtimeUpdatedAt)
+    }
+}
+
+public struct ConnectorActionRecord: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var connectorId: String?
+    public var name: String
+    public var risk: String?
+    public var dryRunAvailable: Bool?
+    public var requiresApproval: Bool?
+    public var connectorStatus: String?
+    public var authState: String?
+    public var enabled: Bool?
+}
+
+extension ConnectorActionRecord {
+    /// One record per connector action descriptor, its readiness overlaid
+    /// from the connector registry (native connectors read as active).
+    public static func records(connectors: [ConnectorRecord]) -> [ConnectorActionRecord] {
+        var byID: [String: ConnectorRecord] = [:]
+        for connector in connectors {
+            byID[ConnectorStatusProjection.normalizedConnectorID(connector.id)] = connector
+        }
+        let nativeConnectors: Set<String> = [
+            "mobile", "scheduler", "mac", "mac_assistant",
+            "local_files", "codex_work", "codex_handoff",
+            "markets",
+        ]
+        return connectorActionDescriptors().map { descriptor in
+            let key = ConnectorStatusProjection.normalizedConnectorID(descriptor.connectorId)
+            let connector = byID[key]
+            let enabled = connector?.enabled ?? nativeConnectors.contains(key)
+            let connectorStatus = connector?.healthStatus ?? (enabled ? "active" : "needs_setup")
+            let authState = connector?.authState ?? (enabled ? "not_required" : "not_connected")
+            return ConnectorActionRecord(
+                id: descriptor.id,
+                connectorId: descriptor.connectorId,
+                name: descriptor.name ?? descriptor.id,
+                risk: descriptor.risk,
+                dryRunAvailable: descriptor.dryRunAvailable,
+                requiresApproval: descriptor.requiresApproval,
+                connectorStatus: connectorStatus,
+                authState: authState,
+                enabled: enabled
+            )
+        }
     }
 }

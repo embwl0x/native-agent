@@ -1,3 +1,4 @@
+import EngineRuntime
 import NativeAgentCore
 import SwiftUI
 
@@ -83,55 +84,6 @@ extension View {
 
 // MARK: - The display model
 
-/// What the card is for. Selects the symbol and which content appears —
-/// never a separate visual style.
-enum InlineCardKind: String, Sendable, Equatable, CaseIterable {
-    case needsConnector
-    case needsPermission
-    case needsModelChoice
-    case needsAPIKey
-    case needsCapability
-    case choose
-    case confirm
-    /// Work the app is doing on its own behalf: the working card and its receipt.
-    case work
-
-    var symbol: String {
-        switch self {
-        case .needsConnector: return "link"
-        case .needsPermission: return "lock.open"
-        case .needsModelChoice: return "sparkles"
-        case .needsAPIKey: return "key"
-        case .needsCapability: return "switch.2"
-        case .choose: return "questionmark.circle"
-        case .confirm: return "paperplane"
-        case .work: return "gearshape"
-        }
-    }
-}
-
-/// Where an interaction stands. Presentation only — derived from whatever owns
-/// the real lifecycle, never stored here.
-enum InlineCardState: String, Sendable, Equatable, CaseIterable {
-    case pending
-    case running
-    case settled
-    case declined
-    case failed
-    /// Terminal and honest about not knowing: neither done nor declined.
-    case unknown
-    /// A newer, identical ask replaced this one before anybody answered it.
-    /// One quiet line, "Asked earlier" — Agent's one-live-card-per-ask rule.
-    case superseded
-
-    var isTerminal: Bool {
-        switch self {
-        case .pending, .running: return false
-        case .settled, .declined, .failed, .unknown, .superseded: return true
-        }
-    }
-}
-
 /// The three receipt marks. Three colours, three meanings, no fourth.
 enum InlineCardMark {
     case done
@@ -155,153 +107,22 @@ enum InlineCardMark {
     }
 }
 
-struct InlineCardChoice: Identifiable, Sendable, Equatable {
-    let id: String
-    var title: String
-    /// The consequence that belongs to this row — "billed separately",
-    /// "needs an API key" — not a footnote at the bottom of the card.
-    var note: String?
-    /// What the PRIMARY says once this row is picked: "Use GPT-5.6 Sol".
-    /// Agent, 2026-09-13 — the button names the outcome, and with a list on
-    /// the card the outcome is the row the person chose. nil keeps the card's
-    /// own label, which is what the one row that is not a model needs.
-    var actionLabel: String?
-
-    init(id: String, title: String, note: String? = nil, actionLabel: String? = nil) {
-        self.id = id
-        self.title = title
-        self.note = note
-        self.actionLabel = actionLabel
+extension InlineCardKind {
+    var symbol: String {
+        switch self {
+        case .needsConnector: return "link"
+        case .needsPermission: return "lock.open"
+        case .needsModelChoice: return "sparkles"
+        case .needsAPIKey: return "key"
+        case .needsCapability: return "switch.2"
+        case .choose: return "questionmark.circle"
+        case .confirm: return "paperplane"
+        case .work: return "gearshape"
+        }
     }
 }
 
-/// One value the card collects. Secrets never become transcript content.
-struct InlineCardField: Sendable, Equatable {
-    var label: String
-    var placeholder: String
-    var helper: String?
-    var isSecret: Bool
-    /// The key the value travels under when a card collects several.
-    var id: String
-    /// An optional field never holds the primary back.
-    var isOptional: Bool
-
-    init(label: String, placeholder: String, helper: String? = nil, isSecret: Bool = true,
-         id: String = "value", isOptional: Bool = false) {
-        self.label = label
-        self.placeholder = placeholder
-        self.helper = helper
-        self.isSecret = isSecret
-        self.id = id
-        self.isOptional = isOptional
-    }
-}
-
-/// The display value. Every field the seven uses need, and nothing about how
-/// the interaction resolves.
-struct InlineCardModel: Identifiable, Sendable, Equatable {
-    /// Bound to the originating request, not to the last message: a second
-    /// observation of the same blocked request updates this card.
-    let id: String
-    var kind: InlineCardKind
-    /// What the interaction is about: "GitHub", "Desktop", "Work".
-    var target: String
-    var title: String
-    /// One sentence. A writing constraint, not a line limit — it wraps.
-    var why: String
-    var primaryLabel: String
-    var secondaryLabel: String
-    /// Required on every card: what taking the quiet option costs.
-    var consequence: String
-    var state: InlineCardState
-    /// "Stays on until you turn it off in Trust." — required on permissions.
-    var persistenceNote: String?
-    /// What the card collects, in order. Values never become transcript content.
-    var fields: [InlineCardField]
-    var field: InlineCardField? { fields.first }
-    /// "Sign in with ChatGPT": what the primary does while every field is
-    /// empty. Typing into a field turns the primary back into the paste.
-    var signInLabel: String?
-    /// A quiet link to the full setup sheet, for what the card can't express.
-    var fullSetupLabel: String?
-    var choices: [InlineCardChoice]
-    /// Scope, paths, recipients — the consequential detail, on the face of the
-    /// card rather than behind the fold.
-    var scopeLines: [String]
-    /// A monospaced identifier the card is about: a path, an address, a key id.
-    var identifier: String?
-    var detailsLabel: String?
-    var detailsBody: String?
-    /// What the primary button says while the work is in flight.
-    var busyLabel: String?
-    /// The honest note beside the spinner: "12 pages", "Usually about 20 seconds".
-    var busyNote: String?
-    /// The settled/declined/failed one-liner and its metadata.
-    var outcome: String?
-    var outcomeMeta: String?
-    /// Whether the running state still offers Stop.
-    var canStop: Bool
-    /// Whether a failure is safe to retry.
-    var canRetry: Bool
-
-    /// A retryable failure still needs the person's answer.
-    var needsAttention: Bool {
-        !state.isTerminal || (state == .failed && canRetry)
-    }
-
-    init(
-        id: String,
-        kind: InlineCardKind,
-        target: String = "",
-        title: String,
-        why: String,
-        primaryLabel: String,
-        secondaryLabel: String = "Not now",
-        consequence: String,
-        state: InlineCardState = .pending,
-        persistenceNote: String? = nil,
-        field: InlineCardField? = nil,
-        fields: [InlineCardField] = [],
-        signInLabel: String? = nil,
-        fullSetupLabel: String? = nil,
-        choices: [InlineCardChoice] = [],
-        scopeLines: [String] = [],
-        identifier: String? = nil,
-        detailsLabel: String? = nil,
-        detailsBody: String? = nil,
-        busyLabel: String? = nil,
-        busyNote: String? = nil,
-        outcome: String? = nil,
-        outcomeMeta: String? = nil,
-        canStop: Bool = false,
-        canRetry: Bool = false
-    ) {
-        self.id = id
-        self.kind = kind
-        self.target = target
-        self.title = title
-        self.why = why
-        self.primaryLabel = primaryLabel
-        self.secondaryLabel = secondaryLabel
-        self.consequence = consequence
-        self.state = state
-        self.persistenceNote = persistenceNote
-        self.fields = fields.isEmpty ? (field.map { [$0] } ?? []) : fields
-        self.signInLabel = signInLabel
-        self.fullSetupLabel = fullSetupLabel
-        self.choices = choices
-        self.scopeLines = scopeLines
-        self.identifier = identifier
-        self.detailsLabel = detailsLabel
-        self.detailsBody = detailsBody
-        self.busyLabel = busyLabel
-        self.busyNote = busyNote
-        self.outcome = outcome
-        self.outcomeMeta = outcomeMeta
-        self.canStop = canStop
-        self.canRetry = canRetry
-    }
-
+extension InlineCardModel {
     /// Which mark a terminal card wears. A failure is not a receipt, so it
     /// never reaches here as one — see `InlineCardView`.
     var mark: InlineCardMark {

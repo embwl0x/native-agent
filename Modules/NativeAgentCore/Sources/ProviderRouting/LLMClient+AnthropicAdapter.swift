@@ -683,9 +683,8 @@ public final class AnthropicAdapter: LLMAdapter {
                     // protocol semantics. `event: error` mid-stream (overloaded /
                     // rate-limit / server hiccup) throws; EOF without
                     // `message_stop` is a truncation.
-                    // U1 step 1 — streaming telemetry: usage from
-                    // message_start + message_delta, TTFT at first yielded
-                    // text delta, llm.call row recorded on message_stop.
+                    // Usage spans message_start and message_delta; TTFT includes
+                    // thinking output. The row is recorded on message_stop.
                     var usage = LLMUsage()
                     var ttftMs: Int?
                     var yieldedAnyText = false
@@ -703,24 +702,12 @@ public final class AnthropicAdapter: LLMAdapter {
                         // Dispatch by event type. Anthropic SSE always pairs event:
                         // with data:, so the event name is authoritative; the payload's
                         // own `type` field is a useful fallback for resilience.
-                        let payloadType = obj["type"] as? String ?? ""
                         let eventName = sse.event ?? ""
-                        let effectiveEvent = eventName.isEmpty ? payloadType : eventName
+                        let effectiveEvent = eventName.isEmpty
+                            ? AnthropicAdapter.streamEventType(obj, eventName: nil) : eventName
 
+                        try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
                         switch effectiveEvent {
-                        case "error":
-                            // {"type":"error","error":{"type":"overloaded_error","message":"..."}}
-                            let errObj = obj["error"] as? [String: Any]
-                            throw ProviderFailure.wireError(errObj ?? [:])
-                        case "message_start":
-                            let msg = obj["message"] as? [String: Any]
-                            usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))
-                        case "message_delta":
-                            usage.merge(LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]))
-                            if let delta = obj["delta"] as? [String: Any],
-                               let stop = delta["stop_reason"] as? String {
-                                lastStopReason = stop
-                            }
                         case "message_stop":
                             // Documented terminal event. Finish clean and return —
                             // don't trust any bytes after this.
@@ -749,6 +736,13 @@ public final class AnthropicAdapter: LLMAdapter {
                             }
                             continuation.finish()
                             return
+                        case "content_block_start":
+                            guard let block = obj["content_block"] as? [String: Any],
+                                  block["type"] as? String == "redacted_thinking" else { continue }
+                            if ttftMs == nil {
+                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                            }
+                            continuation.yield("")
                         case "content_block_delta":
                             guard let delta = obj["delta"] as? [String: Any] else { continue }
                             switch delta["type"] as? String {
@@ -783,18 +777,10 @@ public final class AnthropicAdapter: LLMAdapter {
                                     return
                                 }
                             case "thinking_delta", "input_json_delta":
-                                // Liveness (2026-07-21 audit; port of the OAuth
-                                // adapter's .keepAlive fix to this legacy String
-                                // stream): thinking/tool-arg deltas are real model
-                                // output but carry no user-visible reply text.
-                                // ProviderStreamGuard's idle clock only advances on
-                                // a yield, so without a signal here a healthy
-                                // long-thinking kimi-code turn gets KILLED at the
-                                // 90s idle default. A String stream has no
-                                // .keepAlive event, so yield an EMPTY string —
-                                // content-invisible (`accumulated += ""` is a
-                                // no-op and consumers' `!delta.isEmpty` guards skip
-                                // it) but it resets the guard's activity clock.
+                                if ttftMs == nil {
+                                    ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                                }
+                                // Provider output without reply text.
                                 continuation.yield("")
                             default:
                                 continue

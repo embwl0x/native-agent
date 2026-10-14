@@ -11,7 +11,7 @@ public protocol AgentContactClients: Sendable {
     /// The desktop operator's turn over its own fenced tools.
     func chatClient(tools: any ToolDispatchClient) -> SwiftNativeChatOrchestrationClient
     /// The app tool chain a queued follow-up is sent through.
-    func toolDispatchClient(denyExternalMcp: Bool, enforceAppAutonomy: Bool) -> any ToolDispatchClient
+    func toolDispatchClient(enforceAppAutonomy: Bool) -> any ToolDispatchClient
     /// The raw bridge tool chain a contact's reply is read through.
     func bridgeToolDispatchClient(fileAccess: String, verifiedSessionId: String?) -> any ToolDispatchClient
     /// Phase 5 E1: her reach wake's answer, to the mind that offered it.

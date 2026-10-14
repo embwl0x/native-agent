@@ -69,58 +69,33 @@ extension MacFourVerbs {
         case .blind(let reply): return reply
         case .seen(let seen): before = seen
         }
-        var resolution = Self.resolve(target, among: before.targets)
-        var reobservedAfterTransientMiss = false
-        if case .none = resolution, Self.isPotentialDynamicVisualReference(target) {
-            let temporal = Self.hasTemporalQualifier(target)
-            let sampledApp = before.bundleIdentifier ?? before.appName
-            var previousTargets = before.targets
-            for sample in 0..<(temporal ? 3 : 1) {
-                guard case .none = resolution else { break }
-                if sample == 2, !Self.canConfirmTemporalTurn(target, previous: previousTargets, current: before.targets) { break }
-                switch await resampleSight(temporal: temporal, expectedApp: sampledApp) {
-                case .blind(let reply): return reply
-                case .seen(let refreshed):
-                    previousTargets = before.targets
-                    before = refreshed
-                    resolution = Self.resolve(target, among: before.targets)
-                    reobservedAfterTransientMiss = true
-                }
-            }
+        let acquisition = await reacquireSight(for: target, sighting: &before) {
+            if case .none = Self.resolve(target, among: $0) { return true }
+            return false
         }
+        if let reply = acquisition.reply { return reply }
+        var reobservedAfterTransientMiss = acquisition.samples > 0
         if !reobservedAfterTransientMiss,
            verb == .drag,
            // fable51 item 32b — a cross-app destination is NOT expected in this
            // window, so "it dropped out of the frontmost sighting" is not a
            // transient miss to chase. Its own anchored sight resolves it.
            destinationApp == nil,
-           let destination,
-           case .hit = resolution,
-           case .none = Self.resolve(destination, among: before.targets),
-           Self.isPotentialDynamicVisualReference(destination) {
+           let destination {
             // A drag needs two current points. If only its moving destination
             // dropped out, refresh the entire sight and resolve both ends
             // again so an old source coordinate is never paired with a fresh
             // destination.
-            let temporal = Self.hasTemporalQualifier(destination)
-            let sampledApp = before.bundleIdentifier ?? before.appName
-            var previousTargets = before.targets
-            for sample in 0..<(temporal ? 3 : 1) {
-                guard case .hit = resolution,
-                      case .none = Self.resolve(destination, among: before.targets) else { break }
-                if sample == 2, !Self.canConfirmTemporalTurn(destination, previous: previousTargets, current: before.targets) { break }
-                switch await resampleSight(temporal: temporal, expectedApp: sampledApp) {
-                case .blind(let reply): return reply
-                case .seen(let refreshed):
-                    previousTargets = before.targets
-                    before = refreshed
-                    resolution = Self.resolve(target, among: before.targets)
-                    reobservedAfterTransientMiss = true
-                }
+            let acquisition = await reacquireSight(for: destination, sighting: &before) {
+                guard case .hit = Self.resolve(target, among: $0),
+                      case .none = Self.resolve(destination, among: $0) else { return false }
+                return true
             }
+            if let reply = acquisition.reply { return reply }
+            reobservedAfterTransientMiss = acquisition.samples > 0
         }
         let source: ActTarget
-        switch resolution {
+        switch Self.resolve(target, among: before.targets) {
         case .hit(let hit): source = hit
         case .none(let nearest):
             return unresolvedPhysical(target, nearest: nearest, screen: before.render)

@@ -857,35 +857,22 @@ extension MacFourVerbs {
         }
 
         // b. RESOLVE BY NAME.
-        var resolution = verb == .scroll
-            ? Self.resolveScrollTarget(target, among: sighting.targets)
-            : Self.resolve(target, among: sighting.targets, pressing: [.click, .select, .toggle, .open].contains(verb))
-        var reobservedAfterTransientMiss = false
+        func resolve(_ targets: [ActTarget]) -> Resolution {
+            verb == .scroll ? Self.resolveScrollTarget(target, among: targets)
+                : Self.resolve(target, among: targets, pressing: [.click, .select, .toggle, .open].contains(verb))
+        }
         var acquisitionSamples = 0
         // Motion sampling reads the FRONT screen; a background act never uses it.
-        if app == nil, case .none = resolution, Self.isPotentialDynamicVisualReference(target) {
-            // Fast appearance-only association needs a third frame to establish
-            // motion. Spend the same two-frame acquisition budget on a temporal
-            // name that cannot exist yet, without stripping its qualifier.
-            let temporal = Self.hasTemporalQualifier(target)
-            let sampledApp = sighting.bundleIdentifier ?? sighting.appName
-            var previousTargets = sighting.targets
-            for sample in 0..<(temporal ? 3 : 1) {
-                guard case .none = resolution else { break }
-                if sample == 2, !Self.canConfirmTemporalTurn(target, previous: previousTargets, current: sighting.targets) { break }
-                switch await resampleSight(temporal: temporal, expectedApp: sampledApp) {
-                case .blind(let reply): return reply
-                case .seen(let refreshed):
-                    previousTargets = sighting.targets
-                    sighting = refreshed
-                    resolution = verb == .scroll
-                        ? Self.resolveScrollTarget(target, among: sighting.targets)
-                        : Self.resolve(target, among: sighting.targets, pressing: [.click, .select, .toggle, .open].contains(verb))
-                    acquisitionSamples += 1
-                    reobservedAfterTransientMiss = true
-                }
+        if app == nil {
+            let acquisition = await reacquireSight(for: target, sighting: &sighting) {
+                if case .none = resolve($0) { return true }
+                return false
             }
+            if let reply = acquisition.reply { return reply }
+            acquisitionSamples = acquisition.samples
         }
+        let reobservedAfterTransientMiss = acquisitionSamples > 0
+        var resolution = resolve(sighting.targets)
         if app == nil, verb == .click || verb == .open {
             // A model round trip can leave only one usable motion sample.
             // Acquire at most two more, inside this act, and always resolve

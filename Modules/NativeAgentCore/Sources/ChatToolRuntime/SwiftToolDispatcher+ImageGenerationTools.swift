@@ -9,6 +9,26 @@ import ImageIO
 // Backend clients keep their default-deny policy for callers outside that turn.
 enum ImageGenerationAdmission {
     @TaskLocal static var fullMacAdmitted = false
+
+    static func allowed(dataRoot: URL) async throws -> Bool {
+        if ImageGenerationAdmission.fullMacAdmitted { return true }
+        let path = dataRoot
+            .appendingPathComponent("trust", isDirectory: true)
+            .appendingPathComponent("policy.json")
+        let policy = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
+        guard case let .object(root) = policy,
+              case let .object(mm)? = root["multimodalPolicy"],
+              case let .bool(allowed)? = mm["image_generation_openai"] else {
+            return false
+        }
+        return allowed
+    }
+
+    static func clippedPrompt(_ prompt: String) -> String {
+        let scalars = prompt.unicodeScalars
+        guard scalars.count > 16_000 else { return prompt }
+        return String(String.UnicodeScalarView(scalars.prefix(16_000)))
+    }
 }
 
 // MARK: - OpenAI image generation tool
@@ -92,7 +112,6 @@ struct CodexImageGenerationInvocation: Sendable, Equatable {
     var cwd: URL
     var timeoutSeconds: Int
     var startedAt: Date
-    var codexGeneratedImagesDir: URL
     var lastMessagePath: URL
     var environment: [String: String]
 }
@@ -111,28 +130,19 @@ struct CodexImageGenerationResult: Sendable, Equatable {
     var model: String
     var sourceImages: [URL]
     var reply: String
-    var stdout: String
     var stderr: String
     var exitCode: Int32
-    var timedOut: Bool
     var durationMs: Int
     var evidence: [JSONValue] = []
 }
 
-typealias CodexImageGenerationRunner = @Sendable (CodexImageGenerationInvocation) async throws -> CodexImageGenerationProcessResult
-
 final class SwiftCodexImageGenerationClient: @unchecked Sendable {
     static let modelLabel = "codex-imagegen"
-    static let maxPromptScalars = 16_000
     static let maxImageCount = 4
     static let defaultTimeoutSeconds = 600
 
-    private let executable: String
-    private let runner: CodexImageGenerationRunner
     private let codexHome: URL
     private let dataRoot: URL
-    private let cwd: URL
-    private let persistence: any PersistenceCoreProtocol
     /// The model the route this run belongs to is set to, passed to `codex
     /// exec` so the controller is the person's choice and not whatever the CLI
     /// defaults to (2026-09-13 comb item 2). Empty only when a caller named the
@@ -140,27 +150,17 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
     private let controllerModel: String
 
     init(
-        executable: String = "/usr/bin/env",
-        runner: @escaping CodexImageGenerationRunner = SwiftCodexImageGenerationClient.defaultRunner,
         codexHome: URL? = nil,
         dataRoot: URL? = nil,
-        cwd: URL? = nil,
-        controllerModel: String = "",
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        controllerModel: String = ""
     ) {
         self.controllerModel = controllerModel
-        self.executable = executable
-        self.runner = runner
         self.codexHome = codexHome ?? Self.defaultCodexHome()
         self.dataRoot = dataRoot ?? PersistenceCore.defaultDataRoot()
-        self.cwd = cwd ?? URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Projects", isDirectory: true)
-            .appendingPathComponent("NativeAgent", isDirectory: true)
-        self.persistence = persistence
     }
 
     func generate(_ request: CodexImageGenerationRequest) async throws -> CodexImageGenerationResult {
-        guard try await imageGenerationAllowed() else { throw ImageGenerationToolError.trustDenied }
+        guard try await ImageGenerationAdmission.allowed(dataRoot: dataRoot) else { throw ImageGenerationToolError.trustDenied }
 
         let trimmedPrompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { throw ImageGenerationToolError.missingPrompt }
@@ -195,19 +195,18 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
         )
         for path in referencePaths { arguments.insert(contentsOf: ["--image", path], at: arguments.count - 2) }
         let invocation = CodexImageGenerationInvocation(
-            executable: executable,
+            executable: "/usr/bin/env",
             arguments: arguments,
             cwd: isolatedCWD,
             timeoutSeconds: max(30, min(1800, request.timeoutSeconds)),
             startedAt: started,
-            codexGeneratedImagesDir: codexImagesDir,
             lastMessagePath: lastMessagePath,
             environment: Self.scrubbedEnvironment(codexHome: codexHome)
         )
 
         let processResult: CodexImageGenerationProcessResult
         do {
-            processResult = try await runner(invocation)
+            processResult = try await Self.defaultRunner(invocation)
         } catch {
             if error is CancellationError { throw CancellationError() }
             throw ImageGenerationToolError.transport(message: String(describing: error))
@@ -273,27 +272,11 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
             model: "unknown",
             sourceImages: Array(newImages),
             reply: processResult.lastMessage.trimmingCharacters(in: .whitespacesAndNewlines),
-            stdout: processResult.stdout,
             stderr: processResult.stderr,
             exitCode: processResult.exitCode,
-            timedOut: processResult.timedOut,
             durationMs: processResult.durationMs,
             evidence: evidence
         )
-    }
-
-    private func imageGenerationAllowed() async throws -> Bool {
-        if ImageGenerationAdmission.fullMacAdmitted { return true }
-        let path = dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        let policy = try await persistence.readJSON(path, ifMissing: .object([:]))
-        guard case let .object(root) = policy,
-              case let .object(mm)? = root["multimodalPolicy"],
-              case let .bool(allowed)? = mm["image_generation_openai"] else {
-            return false
-        }
-        return allowed
     }
 
     static func defaultCodexHome(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
@@ -369,7 +352,7 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
         // JSON quoting also prevents newlines/markup in data from impersonating
         // the surrounding instruction structure. Delimiting is not a sandbox.
         let encoded = try? JSONEncoder().encode([
-            "prompt": truncatedPrompt(prompt), "size": request.size ?? "auto",
+            "prompt": ImageGenerationAdmission.clippedPrompt(prompt), "size": request.size ?? "auto",
             "quality": request.quality ?? "auto", "output_format": request.outputFormat,
             "background": request.background,
         ])
@@ -385,28 +368,7 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
         process.currentDirectoryURL = invocation.cwd
         process.environment = invocation.environment
 
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-        let stdoutBuffer = SwiftToolDispatcher.BoundedBuffer(cap: 512 * 1024)
-        let stderrBuffer = SwiftToolDispatcher.BoundedBuffer(cap: 256 * 1024)
-        stdout.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-            } else {
-                stdoutBuffer.append(data)
-            }
-        }
-        stderr.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-            } else {
-                stderrBuffer.append(data)
-            }
-        }
+        let outputCapture = SwiftToolDispatcher.InvokeOutputCapture(process: process, stderrCap: 256 * 1024)
 
         let timedOutFlag = SwiftToolDispatcher.AtomicFlag()
         let started = Date()
@@ -415,15 +377,7 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
           await withCheckedContinuation { (cont: CheckedContinuation<CodexImageGenerationProcessResult, Never>) in
             let resumed = SwiftToolDispatcher.ResumeGuard()
             process.terminationHandler = { proc in
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-                SwiftToolDispatcher.drainPipeNonBlocking(stdout.fileHandleForReading, into: stdoutBuffer)
-                SwiftToolDispatcher.drainPipeNonBlocking(stderr.fileHandleForReading, into: stderrBuffer)
-
-                var stdoutText = String(data: stdoutBuffer.data, encoding: .utf8) ?? ""
-                var stderrText = String(data: stderrBuffer.data, encoding: .utf8) ?? ""
-                if stdoutBuffer.truncated { stdoutText += "\n[stdout truncated]" }
-                if stderrBuffer.truncated { stderrText += "\n[stderr truncated]" }
+                let (stdoutText, stderrText) = outputCapture.finish(strictUTF8: true)
                 let lastMessage = (try? String(contentsOf: invocation.lastMessagePath, encoding: .utf8)) ?? ""
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let didTimeOut = timedOutFlag.isSet && proc.terminationStatus != 0
@@ -442,8 +396,7 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
             do {
                 try cancellation.launch(process)
             } catch {
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
+                outputCapture.stopReading()
                 guard resumed.tryResume() else { return }
                 cont.resume(returning: CodexImageGenerationProcessResult(
                     exitCode: 127,
@@ -546,12 +499,6 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
               width > 0, height > 0 else { return nil }
         return width / height
     }
-
-    private static func truncatedPrompt(_ prompt: String) -> String {
-        let scalars = prompt.unicodeScalars
-        guard scalars.count > maxPromptScalars else { return prompt }
-        return String(String.UnicodeScalarView(scalars.prefix(maxPromptScalars)))
-    }
 }
 
 struct OpenAIImageGenerationRequest: Sendable, Equatable {
@@ -579,60 +526,30 @@ final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
     static let endpoint = URL(string: "https://api.openai.com/v1/images/generations")!
     static let userAgent = "NativeAgent/0.2.0"
     static let timeoutSeconds: TimeInterval = 180
-    static let maxPromptScalars = 16_000
     static let maxImageCount = 4
 
-    private let session: URLSession
-    private let endpoint: URL
-    private let apiKeyOverride: String?
     private let dataRoot: URL
-    private let persistence: any PersistenceCoreProtocol
 
-    init(
-        session: URLSession = .shared,
-        endpoint: URL = SwiftOpenAIImageGenerationClient.endpoint,
-        apiKeyOverride: String? = nil,
-        dataRoot: URL? = nil,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-    ) {
-        self.session = session
-        self.endpoint = endpoint
-        self.apiKeyOverride = apiKeyOverride
+    init(dataRoot: URL? = nil) {
         self.dataRoot = dataRoot ?? PersistenceCore.defaultDataRoot()
-        self.persistence = persistence
-    }
-
-    private func imageGenerationAllowed() async throws -> Bool {
-        if ImageGenerationAdmission.fullMacAdmitted { return true }
-        let path = dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        let policy = try await persistence.readJSON(path, ifMissing: .object([:]))
-        guard case let .object(root) = policy,
-              case let .object(mm)? = root["multimodalPolicy"],
-              case let .bool(allowed)? = mm["image_generation_openai"] else {
-            return false
-        }
-        return allowed
     }
 
     func generate(_ request: OpenAIImageGenerationRequest) async throws -> OpenAIImageGenerationResult {
-        guard try await imageGenerationAllowed() else { throw ImageGenerationToolError.trustDenied }
+        guard try await ImageGenerationAdmission.allowed(dataRoot: dataRoot) else { throw ImageGenerationToolError.trustDenied }
 
         let trimmedPrompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { throw ImageGenerationToolError.missingPrompt }
 
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
-                    providerConfigFile: "openai.json",
-                    dataRoot: dataRoot),
+        guard let key = LLMCredentialResolver.resolveAPIKey(
+            providerConfigFile: "openai.json",
+            dataRoot: dataRoot),
               !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ImageGenerationToolError.notConfigured
         }
 
         var body: [String: Any] = [
             "model": request.model,
-            "prompt": Self.truncatedPrompt(trimmedPrompt),
+            "prompt": ImageGenerationAdmission.clippedPrompt(trimmedPrompt),
             "n": max(1, min(Self.maxImageCount, request.count)),
             "output_format": request.outputFormat,
         ]
@@ -643,7 +560,7 @@ final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
             body["quality"] = quality
         }
 
-        var urlRequest = URLRequest(url: endpoint)
+        var urlRequest = URLRequest(url: Self.endpoint)
         urlRequest.httpMethod = "POST"
         urlRequest.timeoutInterval = Self.timeoutSeconds
         urlRequest.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -654,7 +571,7 @@ final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: urlRequest)
+            (data, response) = try await URLSession.shared.data(for: urlRequest)
         } catch {
             if error is CancellationError { throw CancellationError() }
             let nsError = error as NSError
@@ -701,12 +618,6 @@ final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
             images: images,
             usage: root["usage"]
         )
-    }
-
-    private static func truncatedPrompt(_ prompt: String) -> String {
-        let scalars = prompt.unicodeScalars
-        guard scalars.count > maxPromptScalars else { return prompt }
-        return String(String.UnicodeScalarView(scalars.prefix(maxPromptScalars)))
     }
 
     private static func apiErrorMessage(from data: Data) -> String? {
@@ -804,8 +715,8 @@ extension SwiftToolDispatcher {
                     size: jsonString(input["size"]),
                     quality: jsonString(input["quality"]),
                     outputFormat: jsonString(input["output_format"] ?? input["format"]) ?? "png",
-                    count: jsonInt(input["n"] ?? input["count"]) ?? 1,
-                    timeoutSeconds: jsonInt(input["timeout_seconds"]) ?? SwiftCodexImageGenerationClient.defaultTimeoutSeconds,
+                    count: Self.jsonInt(input["n"] ?? input["count"]) ?? 1,
+                    timeoutSeconds: Self.jsonInt(input["timeout_seconds"]) ?? SwiftCodexImageGenerationClient.defaultTimeoutSeconds,
                     action: jsonString(input["action"]) ?? "auto",
                     references: references,
                     background: jsonString(input["background"]) ?? "auto"
@@ -833,7 +744,7 @@ extension SwiftToolDispatcher {
                     size: jsonString(input["size"]),
                     quality: jsonString(input["quality"]),
                     outputFormat: outputFormat,
-                    count: jsonInt(input["n"] ?? input["count"]) ?? 1
+                    count: Self.jsonInt(input["n"] ?? input["count"]) ?? 1
                 )
                 let client = SwiftOpenAIImageGenerationClient(dataRoot: dataRoot)
                 let result = try await client.generate(request)
@@ -934,6 +845,24 @@ extension SwiftToolDispatcher {
         return references
     }
 
+    private func imageGenerationDirectory() throws -> URL {
+        let directory = dataRoot.appendingPathComponent("generated_images", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("receipts", isDirectory: true),
+                                                withIntermediateDirectories: true)
+        return directory
+    }
+
+    private func finalizeImageGenerationReceipt(_ receipt: [String: JSONValue], message: String) async throws -> JSONValue {
+        let id = try JSONRow(.object(receipt)).string("id")
+        let path = dataRoot.appendingPathComponent("generated_images/receipts/\(id).json")
+        try await SwiftNativePersistenceCore().writeJSON(.object(receipt), to: path)
+        var response = receipt
+        response["status"] = .string("ok")
+        response["receiptPath"] = .string(path.path)
+        response["message"] = .string(message)
+        return .object(response)
+    }
+
     private func persistOpenAIImageGenerationResult(
         _ result: OpenAIImageGenerationResult,
         request: OpenAIImageGenerationRequest,
@@ -941,11 +870,7 @@ extension SwiftToolDispatcher {
     ) async throws -> JSONValue {
         let runId = UUID().uuidString.lowercased()
         let createdAt = ISO8601DateFormatter().string(from: Date())
-        let baseDir = dataRoot
-            .appendingPathComponent("generated_images", isDirectory: true)
-        let receiptsDir = baseDir.appendingPathComponent("receipts", isDirectory: true)
-        try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: receiptsDir, withIntermediateDirectories: true)
+        let baseDir = try imageGenerationDirectory()
 
         var imageRows: [JSONValue] = []
         for image in result.images {
@@ -984,14 +909,8 @@ extension SwiftToolDispatcher {
             receipt["usage"] = usage
         }
 
-        let receiptPath = receiptsDir.appendingPathComponent("\(runId).json", isDirectory: false)
-        try await SwiftNativePersistenceCore().writeJSON(.object(receipt), to: receiptPath)
-
-        var response = receipt
-        response["status"] = .string("ok")
-        response["receiptPath"] = .string(receiptPath.path)
-        response["message"] = .string("Generated \(result.images.count) image\(result.images.count == 1 ? "" : "s") with \(result.model).")
-        return .object(response)
+        return try await finalizeImageGenerationReceipt(receipt,
+            message: "Generated \(result.images.count) image\(result.images.count == 1 ? "" : "s") with \(result.model).")
     }
 
     func persistCodexImageGenerationResult(
@@ -1001,11 +920,7 @@ extension SwiftToolDispatcher {
         provider: String = "codex"
     ) async throws -> JSONValue {
         let createdAt = ISO8601DateFormatter().string(from: Date())
-        let baseDir = dataRoot
-            .appendingPathComponent("generated_images", isDirectory: true)
-        let receiptsDir = baseDir.appendingPathComponent("receipts", isDirectory: true)
-        try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: receiptsDir, withIntermediateDirectories: true)
+        let baseDir = try imageGenerationDirectory()
 
         var imageRows: [JSONValue] = []
         for (idx, source) in result.sourceImages.enumerated() {
@@ -1115,21 +1030,16 @@ extension SwiftToolDispatcher {
             receipt["codexStderrPreview"] = .string(String(ChatSecretRedactor.redactText(result.stderr).prefix(2_000)))
         }
 
-        let receiptPath = receiptsDir.appendingPathComponent("\(result.runId).json", isDirectory: false)
-        try await SwiftNativePersistenceCore().writeJSON(.object(receipt), to: receiptPath)
-
-        var response = receipt
-        response["status"] = .string("ok")
-        response["receiptPath"] = .string(receiptPath.path)
+        let message: String
         let providerName = provider == "codex_cli" ? "Codex CLI" : "Codex OAuth"
         if case .string("not_fulfilled")? = receipt["qualityFulfillment"] {
-            response["message"] = .string("Generated \(imageRows.count) image\(imageRows.count == 1 ? "" : "s") through \(providerName), but the requested quality was not fulfilled. The artifact is available; inspect qualityWarning and providerToolReceipts.")
+            message = "Generated \(imageRows.count) image\(imageRows.count == 1 ? "" : "s") through \(providerName), but the requested quality was not fulfilled. The artifact is available; inspect qualityWarning and providerToolReceipts."
         } else if case .array(let warnings)? = receipt["controlWarnings"], !warnings.isEmpty {
-            response["message"] = .string("Generated \(imageRows.count) image(s) through \(providerName), but some requested controls were not fulfilled. Inspect controlWarnings and providerToolReceipts.")
+            message = "Generated \(imageRows.count) image(s) through \(providerName), but some requested controls were not fulfilled. Inspect controlWarnings and providerToolReceipts."
         } else {
-            response["message"] = .string("Generated \(imageRows.count) image\(imageRows.count == 1 ? "" : "s") through \(providerName).")
+            message = "Generated \(imageRows.count) image\(imageRows.count == 1 ? "" : "s") through \(providerName)."
         }
-        return .object(response)
+        return try await finalizeImageGenerationReceipt(receipt, message: message)
     }
 
     /// The three image-generation failures that are really NEEDS, and the one

@@ -98,11 +98,11 @@ enum OrganismProspectiveAffect {
         // alone: dreading Friday should not make her doubt her hands or feel
         // late. With no horizon rows both terms are 0 and every line below is
         // byte-identical to what it was.
-        out.vigilance = ChemicalState.clamp(out.vigilance + maxDelta * min(1, bracing + horizonDread))
-        out.confidence = ChemicalState.clamp(out.confidence - maxDelta * bracing * 0.7)
-        out.curiosity = ChemicalState.clamp(out.curiosity + maxDelta * min(1, lookingForward + horizonToward))
-        out.urgency = ChemicalState.clamp(out.urgency + maxDelta * bracing * 0.5)
-        out.warmth = ChemicalState.clamp(out.warmth + maxDelta * horizonWarmthShare * horizonToward)
+        out.vigilance = (out.vigilance + maxDelta * min(1, bracing + horizonDread)).clamped01()
+        out.confidence = (out.confidence - maxDelta * bracing * 0.7).clamped01()
+        out.curiosity = (out.curiosity + maxDelta * min(1, lookingForward + horizonToward)).clamped01()
+        out.urgency = (out.urgency + maxDelta * bracing * 0.5).clamped01()
+        out.warmth = (out.warmth + maxDelta * horizonWarmthShare * horizonToward).clamped01()
         return out
     }
 

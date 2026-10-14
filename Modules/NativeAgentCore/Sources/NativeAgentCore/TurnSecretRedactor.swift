@@ -15,19 +15,6 @@ public enum TurnSecretRedactor {
             // Scrub embedded JSON too, including JSON escaped inside another string.
             ("NAMED_SECRET", #"\\+""# + credentialName + #"\\+"\s*:\s*\\+".*?(?:\\+"(?=\s*[,}\]]|$)|$)"#, [.caseInsensitive, .dotMatchesLineSeparators]),
             ("NAMED_SECRET", #"["']"# + credentialName + #"["']\s*[:=]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,}\]]+)"#, [.caseInsensitive]),
-            (
-                "PRIVATE_KEY",
-                "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-                [.dotMatchesLineSeparators]
-            ),
-            ("GITHUB_TOKEN", "\\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,})\\b", []),
-            ("JWT", "\\beyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}", []),
-            ("OPENAI_KEY", "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\\b", []),
-            ("ANTHROPIC_KEY", "\\bsk-ant-[A-Za-z0-9_-]{20,}\\b", []),
-            ("STRIPE_KEY", "\\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\\b", []),
-            ("SLACK_TOKEN", "\\bxox[baprs]-[A-Za-z0-9-]{20,}\\b", []),
-            ("GOOGLE_API_KEY", "\\bAIza[0-9A-Za-z_-]{25,}\\b", []),
-            ("BEARER_TOKEN", "\\bBearer\\s+[A-Za-z0-9._~+/=-]{20,}\\b", [.caseInsensitive]),
             ("TELEGRAM_TOKEN", #"(?:\bbot\d+|\b\d{6,})(?::|%3[Aa])[A-Za-z0-9_-]+"#, []),
             // Agent on the glass, 2026-09-13: the unquoted form ate ordinary
             // prose — it had no leading boundary and `[\w]*` ran through the
@@ -45,12 +32,13 @@ public enum TurnSecretRedactor {
                 [.caseInsensitive]
             ),
         ]
-        return specs.map { kind, pattern, options in
+        let patterns = specs.map { kind, pattern, options in
             guard let expression = try? NSRegularExpression(pattern: pattern, options: options) else {
                 preconditionFailure("Turn presentation redaction pattern failed: \(kind)")
             }
             return (kind, expression)
         }
+        return Array(patterns.prefix(2)) + displaySecretPatterns + Array(patterns.suffix(2))
     }()
 
     /// A DISPLAY field's redactor: the proven-shape secrets only, plus a

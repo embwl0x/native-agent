@@ -1,3 +1,8 @@
+import Dispatcher
+import ApprovalInbox
+import Privacy
+import TurnTrace
+import Transcripts
 import DeviceSync
 import Foundation
 import Observation
@@ -524,5 +529,77 @@ extension ChatMessage: FirstRunWelcomeMessage {
     public var firstRunTurnCompleted: Bool {
         metadata?.completionState == "completed"
             && metadata?.partial != true && metadata?.cancelled != true
+    }
+}
+
+extension PersistedAttachment: ChatExportAttachment {}
+extension ChatMessageMetadata: ChatExportMetadata {}
+extension ChatMessage: ChatExportMessage {}
+extension ChatMessageMetadata: ChatTurnFailureMetadata {}
+extension ChatMessage: ChatTurnFailureMessage {}
+
+extension ChatMessage: MacChatRenderedMessage {
+    public var macChatHasMetadata: Bool { metadata != nil }
+    public var macChatPartial: Bool { metadata?.partial == true }
+    public var macChatCancelled: Bool { metadata?.cancelled == true }
+}
+
+extension ChatMessage {
+    public static func slashCommandReceipt(result: DispatchResult, tool: String, input: [String: Any]) -> ChatMessage {
+        let badge: String
+        switch result.status.lowercased() {
+        case "ok":               badge = "✅"
+        case "pending_approval": badge = "⏳"
+        case "failed":           badge = "❌"
+        case "blocked":          badge = "🚫"
+        case "dry_run":          badge = "🔍"
+        default:                 badge = "•"
+        }
+
+        var argSummary = ""
+        if !input.isEmpty {
+            if let data = try? JSONSerialization.data(withJSONObject: input),
+               let value = try? JSONValue.parse(data),
+               let json = try? TurnTraceRedactor.redactValue(value).serialize(pretty: false) {
+                let safe = NativeAppSecretRedactor.redactText(
+                    SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(tool: tool, json: json))
+                let preview = safe.count > 80 ? String(safe.prefix(77)) + "…" : safe
+                argSummary = "(\(preview))"
+            }
+        }
+
+        var outputBlock = ""
+        if result.ok, let out = result.output {
+            let json = (try? TurnTraceRedactor.redactValue(out.value).serialize(pretty: false)) ?? "{}"
+            let safe = NativeAppSecretRedactor.redactText(
+                SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(
+                    tool: tool, json: json))
+            let preview = safe.count > 400
+                ? String(safe.prefix(400)) + "\n…(truncated)"
+                : safe
+            outputBlock = "\n```\n\(preview)\n```"
+        }
+
+        var errorBlock = ""
+        if let err = result.error {
+            errorBlock = "\n`\(NativeAppSecretRedactor.redactText(err.code))` \(NativeAppSecretRedactor.redactText(err.message))"
+        }
+
+        let trace = "\n*\(result.durationMs)ms · autonomy: \(result.effectiveAutonomy)*"
+
+        let content = NativeAppSecretRedactor.redactText(
+            "\(badge) **\(tool)**\(argSummary)\(outputBlock)\(errorBlock)\(trace)")
+        return ChatMessage(role: "system", content: content)
+    }
+}
+
+
+extension ChatMessage {
+    public init(approval: ApprovalRecord) {
+        var metadata = ChatMessageMetadata()
+        metadata.kind = ChatMessageMetadata.approvalPendingKind
+        metadata.approvalId = approval.id
+        self.init(id: approval.id, role: "tool",
+                  content: "\(approval.title)\n\(approval.reason)\n\(approval.payloadPreview)", metadata: metadata)
     }
 }

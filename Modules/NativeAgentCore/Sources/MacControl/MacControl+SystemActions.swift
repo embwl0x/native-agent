@@ -58,8 +58,7 @@ extension SwiftNativeMacControl {
                 "sha256": .string(sha256Hex),
             ]),
             error: nil,
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 
@@ -99,8 +98,7 @@ extension SwiftNativeMacControl {
             throw MacControlError.ioFailure("write \(path): \(error)")
         }
         let verified: Bool = {
-            guard let verifier = fileManagerAdapter as? any FileStateVerificationAdapter,
-                  verifier.itemExists(at: url),
+            guard fileManagerAdapter.itemExists(at: url),
                   let observed = try? fileManagerAdapter.readData(at: url, maxBytes: 10_000_000) else {
                 return false
             }
@@ -118,8 +116,7 @@ extension SwiftNativeMacControl {
                 "verified": .bool(verified),
             ]),
             error: nil,
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 
@@ -155,8 +152,7 @@ extension SwiftNativeMacControl {
                 "count": .int(Int64(names.count)),
             ]),
             error: nil,
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 
@@ -203,8 +199,7 @@ extension SwiftNativeMacControl {
         } catch {
             throw MacControlError.ioFailure("move \(src) -> \(dst): \(error)")
         }
-        let verified = (fileManagerAdapter as? any FileStateVerificationAdapter)
-            .map { !$0.itemExists(at: srcURL) && $0.itemExists(at: dstURL) } ?? false
+        let verified = !fileManagerAdapter.itemExists(at: srcURL) && fileManagerAdapter.itemExists(at: dstURL)
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
         return MacControlResult(
             ok: true,
@@ -215,8 +210,7 @@ extension SwiftNativeMacControl {
                 "verified": .bool(verified),
             ]),
             error: nil,
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 
@@ -246,8 +240,7 @@ extension SwiftNativeMacControl {
         } catch {
             throw MacControlError.ioFailure("trash \(path): \(error)")
         }
-        let verified = (fileManagerAdapter as? any FileStateVerificationAdapter)
-            .map { !$0.itemExists(at: url) } ?? false
+        let verified = !fileManagerAdapter.itemExists(at: url)
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
         return MacControlResult(
             ok: true,
@@ -257,8 +250,7 @@ extension SwiftNativeMacControl {
                 "verified": .bool(verified),
             ]),
             error: nil,
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 
@@ -288,7 +280,7 @@ extension SwiftNativeMacControl {
         return MacControlResult(ok: true, action: "volume",
             output: .object(["level": .int(Int64(observed)), "muted": .bool(parts[1] == "true"),
                              "effects": .string(commands.count == 1 ? "none" : "occurred")]),
-            error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true)
+            error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
     }
 
     func handleMedia(_ body: [String: JSONValue]) async throws -> MacControlResult {
@@ -329,7 +321,7 @@ extension SwiftNativeMacControl {
             output: .object(["action": .string(action), "key_sent": .string(key == NX_KEYTYPE_PLAY ? "play_pause" : action == "previous" ? "previous" : "next"),
                 "before": .object(before), "after": .object(after), "playback_state_confirmed": .bool(false),
                 "message": .string("System media key sent to the Now Playing app. Play/pause is a toggle. Music and Spotify states, when available, are observations; the Now Playing owner and other apps' playback state cannot be confirmed.")]),
-            error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true)
+            error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
         #else
         throw MacControlError.malformedResponse("system media keys require macOS")
         #endif
@@ -351,8 +343,7 @@ extension SwiftNativeMacControl {
                 action: "applescript",
                 output: .object(["script": .string(String(script.prefix(200)))]),
                 error: "\(error)",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
@@ -364,8 +355,7 @@ extension SwiftNativeMacControl {
                 "stdout": .string(result),
             ]),
             error: nil,
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 
@@ -392,12 +382,12 @@ extension SwiftNativeMacControl {
             if let refusal = continuation.refusal() {
                 return MacControlResult(ok: false, action: "focus_app",
                     output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
-                    durationMs: 0, viaSwift: true)
+                    durationMs: 0)
             }
             guard let app = continuation.app else {
                 return MacControlResult(ok: false, action: "focus_app",
                     output: .object(["message": .string(continuation.modelContext)]), error: "continuation_unavailable",
-                    durationMs: 0, viaSwift: true)
+                    durationMs: 0)
             }
             return await handleFocusExact(pid: app.processIdentifier, body: body)
         }
@@ -411,29 +401,18 @@ extension SwiftNativeMacControl {
                 return MacControlResult(
                     ok: true, action: "focus_app",
                     output: appControlOutput(result, status: result.launched ? "launched" : "running", verified: false),
-                    error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true
+                    error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000)
                 )
             }
             let result = try await appControlAdapter.focusApp(named: app)
-            // A cold launch takes a few seconds to come forward; look again
-            // briefly before calling the switch failed.
-            let verifier = appControlAdapter as? any AppStateVerificationAdapter
             let resolvedApp = result.bundleIdentifier ?? result.matchedName ?? app
-            var observedFrontmost = await verifier?.isFrontmostApplication(matching: resolvedApp)
-            var looks = 0
-            while observedFrontmost == false, looks < 16 {
-                try await Task.sleep(nanoseconds: 500_000_000)
-                observedFrontmost = await verifier?.isFrontmostApplication(matching: resolvedApp)
-                looks += 1
-            }
+            let observedFrontmost = await appControlAdapter.isFrontmostApplication(matching: resolvedApp)
             try Task.checkCancellation()
             let ok = observedFrontmost == true
             let failureReason: String? = if ok {
                 nil
             } else if let reason = result.activationFailureReason {
                 reason
-            } else if observedFrontmost == nil {
-                "focus verification unavailable after activation request"
             } else {
                 "activation request returned \(result.activationRequestAccepted.map(String.init) ?? String(result.activated)); target was not observed frontmost"
             }
@@ -448,8 +427,7 @@ extension SwiftNativeMacControl {
                     failureReason: failureReason
                 ),
                 error: failureReason,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         } catch {
             return MacControlResult(
@@ -461,8 +439,7 @@ extension SwiftNativeMacControl {
                     "error": .string("\(error)"),
                 ]),
                 error: "\(error)",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
     }
@@ -489,7 +466,7 @@ extension SwiftNativeMacControl {
             return MacControlResult(
                 ok: ok, action: "focus_app", output: .object(output),
                 error: ok ? nil : reported,
-                durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         #if canImport(AppKit)
@@ -591,8 +568,7 @@ extension SwiftNativeMacControl {
                 "verified": .bool(false),
             ]),
             error: accepted ? nil : "Launch Services did not accept the open request",
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -602,8 +578,7 @@ extension SwiftNativeMacControl {
         do {
             let result = try await appControlAdapter.quitApp(named: app)
             let ok = result.terminated || result.alreadyInDesiredState
-            let observedRunning = await (appControlAdapter as? any AppStateVerificationAdapter)?
-                .isApplicationRunning(matching: app)
+            let observedRunning = await appControlAdapter.isApplicationRunning(matching: app)
             let verified = ok && observedRunning == false
             return MacControlResult(
                 ok: ok,
@@ -614,8 +589,7 @@ extension SwiftNativeMacControl {
                     verified: verified
                 ),
                 error: ok ? nil : "quit_app failed for \(app)",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         } catch {
             return MacControlResult(
@@ -627,8 +601,7 @@ extension SwiftNativeMacControl {
                     "error": .string("\(error)"),
                 ]),
                 error: "\(error)",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
     }
@@ -703,8 +676,7 @@ extension SwiftNativeMacControl {
             error: result.timedOut
                 ? "spotlight timed out"
                 : (result.exitCode == 0 ? nil : "mdfind exit \(result.exitCode) stderr=\(result.stderr.prefix(200))"),
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 
@@ -740,8 +712,7 @@ extension SwiftNativeMacControl {
             error: result.timedOut
                 ? "shell timed out"
                 : (result.exitCode == 0 ? nil : "shell exit \(result.exitCode)"),
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 }

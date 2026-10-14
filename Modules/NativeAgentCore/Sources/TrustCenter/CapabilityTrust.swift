@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ToolRegistry
 
 // MARK: - Subsystem #12b: Capability Trust Network
 //
@@ -423,58 +424,6 @@ public struct CapabilityRecord: Codable, Sendable, Hashable, Identifiable {
     }
 }
 
-/// Static subset of the Python aggregator `capability_records()`. Manifest-only.
-public func staticCapabilityRecordsFromManifests(nowISO: String) -> [CapabilityRecord] {
-    var out: [CapabilityRecord] = []
-
-    for fs in featureSurfaceRecords(nowISO: nowISO) {
-        out.append(CapabilityRecord(
-            id: fs.id,
-            sourceId: fs.sourceId,
-            name: fs.name,
-            kind: fs.kind,
-            status: fs.status,
-            description: fs.description,
-            triggers: fs.triggers,
-            permissions: fs.permissions,
-            riskClass: fs.riskClass,
-            autoload: fs.autoload,
-            useCount: fs.useCount,
-            lastUsedAt: fs.lastUsedAt,
-            updatedAt: fs.updatedAt
-        ))
-    }
-
-    for action in connectorActionDescriptors() {
-        let name = action.name ?? action.id
-        let description = action.description ?? "Connector action \(action.id)."
-        out.append(CapabilityRecord(
-            id: "connector_action:\(action.id)",
-            sourceId: action.id,
-            name: name,
-            kind: "tool",
-            status: "active",
-            description: description,
-            triggers: [action.id, action.connectorId, action.category ?? ""],
-            permissions: [action.risk],
-            riskClass: action.risk,
-            autoload: false,
-            useCount: 0,
-            lastUsedAt: nil,
-            updatedAt: nil
-        ))
-    }
-
-    let indexed = out.enumerated().map { ($0.offset, $0.element) }
-    out = indexed.sorted { lhs, rhs in
-        let l = lhs.1.updatedAt ?? lhs.1.name ?? ""
-        let r = rhs.1.updatedAt ?? rhs.1.name ?? ""
-        if l != r { return l > r }
-        return lhs.0 < rhs.0
-    }.map { $0.1 }
-    return out
-}
-
 // MARK: - Sources #8/#9: catalog_sources + capability_trust_roots
 //
 // The two on-disk-merge actors (`SwiftNativeCatalogSources` and
@@ -655,4 +604,177 @@ public func makeCapabilityTrust(
     return SwiftNativeCapabilityTrust(
         dataRoot: dataRoot, connectorActionStatuses: connectorActionStatuses, mcpServers: mcpServers
     )
+}
+extension CapabilityRecord {
+    /// One case style for every row: sentence case, proper nouns kept.
+    public static func title(for capability: CapabilityRecord) -> String {
+        sentenceCase(rawTitle(for: capability))
+    }
+
+    /// Records that are the same capability reached another way. The X
+    /// `_v1` actions call the same endpoint as their base action, signed with
+    /// OAuth1 instead of the OAuth2 bearer. Both tools stay registered; the
+    /// list shows one row.
+    public static let displayAliases: [String: String] = [
+        "x.timeline_home_v1": "x.timeline_home",
+        "x.user_tweets_v1": "x.user_tweets",
+    ]
+
+    /// The records to list: an alias is dropped only when its base is there.
+    /// Built-in features first, then each service's actions together
+    /// (`slack.*`, `x.*`, …), by title within a group.
+    public static func displayRecords(_ records: [CapabilityRecord]) -> [CapabilityRecord] {
+        let present = Set(records.compactMap(\.sourceId))
+        func service(_ record: CapabilityRecord) -> String {
+            let id = record.sourceId ?? ""
+            return id.contains(".") ? String(id.prefix { $0 != "." }).lowercased() : ""
+        }
+        return records.filter { record in
+            guard let source = record.sourceId, let base = displayAliases[source] else { return true }
+            return !present.contains(base)
+        }
+        .map { (service($0), title(for: $0), $0) }
+        .sorted { ($0.0, $0.1.lowercased()) < ($1.0, $1.1.lowercased()) }
+        .map(\.2)
+    }
+
+    /// "Slack List Channels" → "Slack list channels". Only a title written in
+    /// Title Case is lowered (anything else may carry names this can't know);
+    /// proper nouns, acronyms and mixed-case words (GitHub, iPhone, OAuth1)
+    /// keep their case.
+    public static func sentenceCase(_ title: String) -> String {
+        var words = title.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+        // Title-ish when at least half the later words are capitalised
+        // ("X Following timeline"); mixed-case words (iPhone) don't count against.
+        let later = words.dropFirst().filter { $0.first?.isLetter == true && !smallWords.contains($0) }
+        let capitalised = later.filter { $0.first?.isUppercase == true }
+        let isTitleCase = !later.isEmpty && capitalised.count * 2 >= later.count
+        if isTitleCase {
+            for index in words.indices.dropFirst() {
+                let word = words[index]
+                guard word.first?.isUppercase == true else { continue }
+                let keeps = properNouns.contains(word)
+                    || word.dropFirst().contains(where: { $0.isUppercase || $0.isNumber })
+                    || !word.allSatisfy(\.isLetter)
+                if !keeps { words[index] = word.lowercased() }
+            }
+        }
+        if let first = words.first, let letter = first.first, letter.isLowercase,
+           !first.dropFirst().contains(where: \.isUppercase) {
+            words[0] = letter.uppercased() + first.dropFirst()
+        }
+        return words.joined(separator: " ")
+    }
+
+    /// Words kept as written inside a sentence-cased title.
+    private static let properNouns: Set<String> = [
+        "X", "I", "Mac", "Slack", "Notion", "Gmail", "Google", "Telegram", "Apple",
+        "Spotlight", "Safari", "Chrome", "Finder", "Shortcuts", "Calendar",
+        "Swift", "Python", "Markdown", "Codex", "Claude",
+    ]
+
+    /// Small words a Title Case string leaves lowercase.
+    private static let smallWords: Set<String> = [
+        "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "via", "with",
+    ]
+
+    private static func rawTitle(for capability: CapabilityRecord) -> String {
+        switch capability.sourceId {
+        case "mac_assistant_watch_setup": return "Watch for changes on your Mac"
+        case "chat_sessions": return "Conversations"
+        case "memory_system": return "Memory"
+        case "personality_engine": return "Personality"
+        case "skills": return "Skills"
+        case "runnable_tools": return "Added tools"
+        case "capability_foundry": return "Available capabilities"
+        case "proactive_autonomy": return "Suggestions and updates"
+        case "workflows": return "Tasks with several steps"
+        case "agent_swarm": return "Help from other assistants"
+        case "mcp_runtime": return "Connected tools"
+        case "research_browser": return "Web research"
+        case "connectors": return "Connected apps and accounts"
+        case "trust_doctor": return "Trust and diagnostics"
+        case "nextgen_runtime": return "Feature readiness"
+        case "native_mac_power": return "Mac controls"
+        case "eval_release_ops": return "Update checks and support"
+        case "x.timeline_home", "x.timeline_home_v1": return "X Following timeline"
+        case "x.user_tweets", "x.user_tweets_v1": return "X user posts"
+        case "x.me", "x_me": return "Your X profile"
+        case "x.post_tweet", "x_post_tweet": return "Post on X"
+        case "mac.jxa": return "Automate Mac apps with JavaScript"
+        default:
+            let name = (capability.name ?? capability.id).withoutStaleNextGenPhaseCopy
+            // A skill has no title of its own, only its handle: "after-card-verify"
+            // reads "After card verify", not "After-card-verify".
+            guard capability.kind == "skill", !name.contains(" ") else { return name }
+            return name.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
+        }
+    }
+
+    public static func description(for capability: CapabilityRecord) -> String? {
+        let id = capability.sourceId ?? String(capability.id.split(separator: ":").last ?? "")
+        if capability.kind == "tool" { return ChatCatalogTool.toolDescription(id) }
+        switch id {
+        case "command_center": return "See recent activity and create tasks."
+        case "mac_assistant_watch_setup": return "Choose which apps and events I can watch for you."
+        case "chat_sessions": return "Keep separate conversations and return to them later."
+        case "memory_system": return "Find, organize, and manage what I remember."
+        case "personality_engine": return "Choose how I speak and work with you."
+        case "skills": return "Run reusable routines for familiar tasks."
+        case "runnable_tools": return "Add tools that help me complete tasks."
+        case "capability_foundry": return "See the skills, tools, and connections I can use."
+        case "proactive_autonomy": return "Let me suggest useful next steps and keep you updated."
+        case "workflows": return "View saved definitions for tasks with several steps."
+        case "agent_swarm": return "Ask several assistants to help with a task."
+        case "mcp_runtime": return "Connect tools from other apps and services."
+        case "research_browser": return "Research topics and read web pages."
+        case "connectors": return "Connect your accounts and apps."
+        case "trust_doctor": return "Manage permissions and check the app's health."
+        case "auto_improvement": return "Review and manage work to improve the app."
+        case "nextgen_runtime": return "See which app features are ready and what needs attention."
+        case "native_mac_power": return "Use Mac apps, controls, and notifications."
+        case "eval_release_ops": return "Check updates and prepare information for support."
+        case "after-card-verify":
+            return "Check that a skill you approved really went live, running the exact version you approved."
+        case "autonomous-delegation-loop":
+            return "Run Desk campaigns step by step: hand work off, recover it, check it independently, and go on to the next step without stopping to ask."
+        default:
+            guard let description = capability.description?.withoutStaleNextGenPhaseCopy else { return nil }
+            return capability.kind == "skill" ? plainSkillLine(description) : description
+        }
+    }
+
+    /// A skill's description is written for me to pick it by ("Use this when
+    /// you…"). For User, one clean line: its first sentence that is not that
+    /// trigger line; failing that, the trigger with its lead-in stripped and
+    /// said as me ("I'm shaping a helper…"). Always a capital first, a full
+    /// stop last, and "helper" where the skill says "bot".
+    public static func plainSkillLine(_ text: String) -> String {
+        let leadIns = ["use this skill when ", "use this whenever ", "use this when ", "use whenever ", "use when "]
+        func leadIn(_ sentence: String) -> String? {
+            leadIns.first { sentence.lowercased().hasPrefix($0) }
+        }
+        let sentences = text.components(separatedBy: ". ").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let first = sentences.first else { return text }
+        var line = first
+        if let lead = leadIn(first) {
+            if let plain = sentences.dropFirst().first(where: { !$0.isEmpty && leadIn($0) == nil }) {
+                line = plain
+            } else {
+                line = String(first.dropFirst(lead.count))
+                for (you, me) in [("you are ", "I'm "), ("you're ", "I'm "), ("you ", "I ")]
+                    where line.lowercased().hasPrefix(you) {
+                    line = me + line.dropFirst(you.count)
+                    for (later, mine) in [(" you are ", " I am "), (" you're ", " I'm "), (" your ", " my ")] {
+                        line = line.replacingOccurrences(of: later, with: mine)
+                    }
+                    break
+                }
+            }
+        }
+        line = line.replacing(/\bbots\b/, with: "helpers").replacing(/\bbot\b/, with: "helper")
+        if let first = line.first { line = String(first).uppercased() + line.dropFirst() }
+        return line.hasSuffix(".") || line.hasSuffix("!") || line.hasSuffix("?") ? line : line + "."
+    }
+
 }

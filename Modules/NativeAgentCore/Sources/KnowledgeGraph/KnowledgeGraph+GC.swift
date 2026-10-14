@@ -107,7 +107,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         approvedOverThreshold: Bool = false,
         expectedCandidateIDs: Set<String>? = nil
     ) async throws -> KnowledgeGraphGCReport {
-        let dbPool = try await gcPool()
+        let dbPool = try await pool()
         let primaryUserName = resolvedPrimaryUserName()
         let active = liveFacts.filter {
             $0.status == "active"
@@ -260,19 +260,10 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// leaked by unflushed delete hooks (the fire-and-forget Task can die
     /// with the process) or by external curation sit forever. The weekly
     /// approved hygiene run calls this so the bookkeeping table reconciles
-    /// on the same cadence as everything else. No-op (returns 0) when the
-    /// `memories` table is absent (KG-only fixtures).
+    /// on the same cadence as everything else.
     public func reconcileStaleMemoryIndexRows() async throws -> Int {
-        let dbPool = try await gcPool()
+        let dbPool = try await pool()
         return try await dbPool.write { db in
-            let memoryTableExists = (try Int.fetchOne(
-                db,
-                sql: """
-                    SELECT COUNT(*) FROM sqlite_master
-                    WHERE type = 'table' AND name = 'memories'
-                    """
-            ) ?? 0) > 0
-            guard memoryTableExists else { return 0 }
             // NOT EXISTS, not NOT IN: memories.id is TEXT PRIMARY KEY in a
             // rowid table, which SQLite (historical quirk) allows to hold
             // NULL — one NULL id would make a NOT IN subselect match nothing
@@ -289,12 +280,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    /// Pool access for GC — same shared-cache resolution as indexing, without
-    /// creating a missing database (GC against a missing DB is an error).
-    private func gcPool() async throws -> DatabasePool {
-        try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
-    }
-
     private struct OrphanScan {
         var candidates: [KnowledgeGraphGCCandidate]
         var legacyUntracked: Int
@@ -307,31 +292,19 @@ extension SwiftNativeKnowledgeGraphIndexer {
         liveKeys: Set<String>,
         graceCutoff: String
     ) throws -> OrphanScan {
-        let memoryTableExists = (try Int.fetchOne(
+        let rows = try Row.fetchAll(
             db,
             sql: """
-                SELECT COUNT(*) FROM sqlite_master
-                WHERE type = 'table' AND name = 'memories'
+                SELECT id FROM memories
+                WHERE status = 'active'
+                  AND TRIM(COALESCE(content, '')) <> ''
                 """
-        ) ?? 0) > 0
-        let currentActiveIDs: Set<String>
-        if memoryTableExists {
-            let rows = try Row.fetchAll(
-                db,
-                sql: """
-                    SELECT id FROM memories
-                    WHERE status = 'active'
-                      AND TRIM(COALESCE(content, '')) <> ''
-                    """
-            )
-            currentActiveIDs = Set(rows.compactMap { row in
-                let id: String = row["id"] ?? ""
-                let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : trimmed
-            })
-        } else {
-            currentActiveIDs = []
-        }
+        )
+        let currentActiveIDs = Set(rows.compactMap { row -> String? in
+            let id: String = row["id"] ?? ""
+            let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        })
 
         // Index rows: live, grace-kept, or stale. The grace window protects
         // the "memory inserted after caller snapshot, then indexed" race, but
@@ -350,10 +323,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
             if liveIDs.contains(mid) {
                 keptIndexIDs.insert(mid)
             } else if indexedAt >= graceCutoff
-                        && (!memoryTableExists || currentActiveIDs.contains(mid)) {
+                        && currentActiveIDs.contains(mid) {
                 // Indexed after (or near) the caller's snapshot — treat as
-                // live this pass if the memories table does not exist (unit
-                // harness / external KG-only DB) or the row is still active.
+                // live this pass if the row is still active.
                 // A later GC sees it as stale if still gone.
                 keptIndexIDs.insert(mid)
             } else {

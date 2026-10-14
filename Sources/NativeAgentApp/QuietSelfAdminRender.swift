@@ -1,7 +1,11 @@
+import Connectors
+import BackgroundWork
+import ApprovalTransactions
 import AppToolRuntime
 import AppKit
 import ChatOrchestration
 import Foundation
+import EngineRuntime
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -13,10 +17,9 @@ import StandingBots
 import SwiftUI
 import MacIntegration
 import MemoryV2
-import Studio
 import ToolRegistry
 import TrustCenter
-import PersonaEngine
+import TrustPersistence
 
 /// Only screenshots mount an offscreen copy of a page. Text reads load owner
 /// state directly. The screenshot's unordered host never touches the visible
@@ -338,14 +341,6 @@ enum QuietSelfAdminRender {
         }
     }
 
-    private static func bounded(_ raw: String) -> String {
-        let collapsed = raw
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-        guard collapsed.count > 200 else { return collapsed }
-        return String(collapsed.prefix(199)) + "\u{2026}"
-    }
 }
 
 // MARK: - The page in words, from the page's own data
@@ -364,123 +359,76 @@ extension QuietSelfAdminRender {
         } else if page.item == .telegram {
             await appModel.refreshTelegram()
         }
-        var content = await pageProjection(for: page, appModel: appModel)
-        if ["settings", "providers"].contains(page.id) {
-            let turn = ChatTurnRuntimeContext.current
-            let context = ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
-                forModel: turn?.model ?? appModel.chatModel, providerID: turn?.providerID ?? appModel.chatProvider,
-                dataRoot: dataRoot(appModel))
-            if case .string(let summary)? = context["summary"] { content.append(section("Context window", [summary])) }
-        }
-        let surfaces: [String] = switch page.id {
-        case "chat": ["chat", "compaction"]
-        case "memories": ["memory"]
-        case "desk": ["desk", "workshop", "swarms"]
-        case "diagnostics": ["diagnostics", "cognition_reflection", "training"]
-        case "settings": ["dream", "rem", "self_improvement", "studio_wander", "heartbeat", "autonomy"]
-        case "pairing": ["ios"]
-        case "telegram": ["telegram"]
-        case "slack": ["slack"]
-        default: []
-        }
-        if !surfaces.isEmpty {
-            do {
-                let routing = try await appModel.engine.providers.routing.checkedRoutingSnapshotReadOnly()
-                let members = ProviderSurfaceGroups.all.flatMap(\.members).filter { surfaces.contains($0.surface) }
-                content.append(section("Models", modelLines(members, routing: routing)))
-            } catch { content.append(section("Models", ["Models could not be read: \(error.localizedDescription)"])) }
-        }
-        return content
-    }
-
-    /// One section of the projection: a heading and the lines under it.
-    private static func section(_ heading: String, _ lines: [String]) -> JSONValue {
-        .object([
-            "heading": .string(heading),
-            "lines": .array(lines.map { .string(bounded($0)) }),
-        ])
+        return await RuntimeReadProjection.quietPageContext(
+            await pageProjection(for: page, appModel: appModel), pageID: page.id,
+            model: appModel.chatModel, providerID: appModel.chatProvider,
+            dataRoot: dataRoot(appModel), providers: appModel.engine.providers)
     }
 
     private static func proposalLine(_ proposal: ProposalRecord) -> String {
         proposal.content
     }
 
-    private static func countLine(_ count: Int, _ one: String, _ many: String) -> String {
-        count == 1 ? "1 \(one)" : "\(count) \(many)"
-    }
-
     /// The page, in the words of the records it draws from.
     static func pageProjection(for page: QuietPage, appModel: AppModel) async -> [JSONValue] {
-        if let read = virtualPageReads[page.id] {
-            let registered = AppActions.on(page: page.id).filter { $0.page == page.id }.map(\.id)
-            return [section(page.title, [page.summary, read,
-                "This version covers this page's guidance and registered actions, not a file, command, tab, URL or screen."]),
-                section("Registered actions", registered)]
+        if let content = RuntimeReadProjection.quietVirtualPage(
+            page.value) { return content }
+        if let service = RuntimeReadProjection.quietServicePages[page.id] {
+            return await RuntimeReadProjection.quietService(
+                page.value, service,
+                dataRoot: dataRoot(appModel), platform: AppConnectorStatusPlatform(),
+                statusText: connectorStatusText, osAccess: macOSAccess)
         }
-        if let service = servicePages[page.id] { return await serviceProjection(page, service, appModel: appModel) }
         switch page.item {
         case .chat: return await chatProjection(appModel: appModel)
-        case .bots: return await botsProjection(appModel: appModel)
+        case .bots: return await RuntimeReadProjection.quietBots(dataRoot: dataRoot(appModel)) {
+            BotState(record: $0, running: $1, queued: $2).word
+        }
         case .activity: return await todayProjection(appModel: appModel)
         case .providers: return await providersProjection(appModel: appModel)
-        case .trust: return trustProjection(appModel: appModel)
-        case .memories: return memoriesProjection(appModel: appModel)
-        case .desk: return await deskProjection(appModel: appModel)
-        case .inboxPolicy: return notificationsProjection(appModel: appModel)
+        case .trust: return RuntimeReadProjection.quietTrust(trust: appModel.engine.trust, dataRoot: dataRoot(appModel),
+            presetTitle: { TrustPolicyPreset.matching(policy: $0, accessMode: $1)?.title ?? "custom" }) { policy, mode in
+            TrustGuardrailSummary.rows(policy: policy, accessMode: mode).map { "\($0.title): \($0.value). \($0.detail)" }
+        }
+        case .memories: return RuntimeReadProjection.quietMemories(appModel.engine.memory,
+            keptLine: MemoriesPageContent.keptLine(appModel.engine.memory.memories.count), graphEntityCount: appModel.graphEntities.count)
+        case .desk: return await RuntimeReadProjection.quietDesk(desk: appModel.engine.desk)
+        case .inboxPolicy: return RuntimeReadProjection.quietNotifications(appModel.engine.inbox)
         case .diagnostics: return await diagnosticsProjection(appModel: appModel)
         case .tools: return toolsProjection(appModel: appModel)
-        case .capabilities: return capabilitiesProjection(appModel: appModel)
-        case .connectors where page.tab == "iphone": return pairingProjection(appModel: appModel)
-        case .connectors where page.tab == "agents": return agentsProjection(appModel: appModel)
-        case .connectors: return connectorsProjection(appModel: appModel)
-        case .telegram: return telegramProjection(appModel: appModel)
-        case .mcp: return mcpProjection(appModel: appModel)
-        case .macIntegration:
-            var capabilities: [JSONValue] = []
-            for mac in MacIntegrationID.all { capabilities.append(await macAccess(mac, appModel: appModel)) }
-            var overview: [JSONValue] = [.object(["heading": .string("Mac Integration"), "capabilities": .array(capabilities),
-                "note": .string("Supported routes, effective permission, connection readiness and verified OS access are separate facts. Unverified means this page has not checked access. No app or content was probed; no permission was requested.")])]
-            if appModel.panelRefreshStatus[.macIntegration]?.failedEndpoints.contains("connectors") == true {
-                overview.append(section("Connection readiness", ["Unavailable: the checked connector read failed; current connection status cannot be reported."]))
-            } else { overview += connectorsProjection(appModel: appModel) }
-            return overview
-        case .personality: return await personalityProjection(appModel: appModel)
-        case .settings: return settingsProjection(appModel: appModel)
+        case .capabilities: return RuntimeReadProjection.quietCapabilities(trust: appModel.engine.trust, approvals: appModel.engine.approvals,
+            workflowCount: appModel.workflows.count, mcpServerCount: appModel.mcpServers.count, actionCount: appModel.nativeActions.count)
+        case .connectors where page.tab == "iphone": return await RuntimeReadProjection.quietPairing(appModel.engine.sync, dataRoot: dataRoot(appModel))
+        case .connectors where page.tab == "agents": return RuntimeReadProjection.quietAgents(dataRoot: dataRoot(appModel))
+        case .connectors: return await RuntimeReadProjection.quietConnectors(
+            dataRoot: dataRoot(appModel), platform: AppConnectorStatusPlatform(), workspaceCount: appModel.workspaces.count,
+            telegramConfigured: appModel.engine.telegram.status?.tokenConfigured == true, statusText: connectorStatusText)
+        case .telegram: return RuntimeReadProjection.quietTelegram(appModel.engine.telegram)
+        case .mcp: return RuntimeReadProjection.quietMCP(servers: appModel.mcpServers, consents: appModel.mcpConsent)
+        case .macIntegration: return await RuntimeReadProjection.quietMacIntegration(
+            dataRoot: dataRoot(appModel), platform: AppConnectorStatusPlatform(), workspaceCount: appModel.workspaces.count,
+            telegramConfigured: appModel.engine.telegram.status?.tokenConfigured == true,
+            statusText: connectorStatusText, osAccess: macOSAccess)
+        case .personality: return await RuntimeReadProjection.quietPersonality(name: appModel.personality?.name,
+            currentPersona: appModel.chatPersona, documents: appModel.personalityDocs, dataRootOverride: appModel.dataRootOverride)
+        case .settings: return RuntimeReadProjection.quietSettings(agentName: appModel.agentDisplayName, providerID: appModel.chatProvider,
+            model: appModel.chatModel, fileAccess: appModel.chatFileAccess, status: appModel.statusForAgent)
         default: return []
         }
     }
-
-    private static let virtualPageReads = [
-        "files": "Read a folder with files.list {path}; read a file with files.read {path}. File and folder results carry their own versions and next arguments.",
-        "shell": "Read repository state with git.status {path}. Run commands with shell.run; a page read runs no command.",
-        "web": "Read a URL with web.read {url}; discover web.search with find. A page read fetches no URL and performs no search.",
-        "browser": "Read current browser state with browser.status, then read a tab with the browser or Chrome actions. A page read opens no tab.",
-        "mac": "Read the current screen with mac.look, or a document with mac.read. A page read captures no screen and moves no control.",
-        "markets": "Market research uses native routes. Read market.status for configured data sources; use market.watchlists, market.quote or market.tradingview for their results.",
-    ]
 
     private static func dataRoot(_ appModel: AppModel) -> URL {
         appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
+    private static let section = RuntimeReadProjection.quietPageSection
+
+    private static let countLine = RuntimeReadProjection.quietCountLine
+
     // MARK: Chat
 
-    /// The two things on the chat page that the accessibility tree cannot
-    /// say, said here instead.
-    ///
-    /// Both are deliberate AX silences. An inline card renders OFFSCREEN (the
-    /// transcript scrolls, and the quiet copy is never scrolled), and the
-    /// collapsed tool fold is `.accessibilityElement(children: .contain)` — a
-    /// single element wearing one label. Fighting either from the tree side is
-    /// a losing game and always was; the projection reads the same two records
-    /// the views read, so what Agent reads is what the person sees.
-    ///
-    ///  * Every inline card in the open conversation, exactly as
-    ///    `InlineCardProjection` hands it to the card view — title, why, the
-    ///    scope lines, both action labels, state, and the interaction id that
-    ///    `interaction_act` takes.
-    ///  * Every collapsed tool fold, by the same `ChatShellToolSummary`
-    ///    headline `ShellToolRow` prints when it is closed.
+    /// Project the transcript's cards and collapsed folds, which the offscreen
+    /// accessibility tree cannot expose, together with the mounted composer.
     private static func chatProjection(appModel: AppModel) async -> [JSONValue] {
         let sessionID = appModel.activeChatSessionId
         guard !sessionID.isEmpty else {
@@ -496,15 +444,11 @@ extension QuietSelfAdminRender {
         var sections: [JSONValue] = [section("Chat", [
             "Conversation: \(sessionID)",
             countLine(messages.count, "message", "messages") + " loaded.",
-            // Mood in the tint: the level the glass is actually wearing, so it
-            // can be read and driven headless.
             MoodTintProjection.line(),
         ])]
 
-        // The composer, from the SAME live objects the verbs write, so a
-        // set_draft or a set_model is on this page the moment it lands rather
-        // than at the next thing that happens to reload.
-        let composer = await QuietComposerVerbs.state(appModel: appModel)
+        // Read the same mounted draft and pane that composer verbs change.
+        let composer = await QuietComposerCommands.state(appModel: appModel)
         func line(_ label: String, _ key: String) -> String? {
             switch composer[key] {
             case .string(let value): return "\(label): \(value)"
@@ -513,9 +457,6 @@ extension QuietSelfAdminRender {
             default: return nil
             }
         }
-        // ONE section. The shell is one surface with one active pane, so the
-        // open pane and the rows it is showing belong under the same heading
-        // as the words they were opened from — never a second "Composer".
         let shell = QuietSelfAdmin.shared.composerCards
         let paneRows: [String] = shell.map { live in
             live.activePane.isOpen
@@ -560,172 +501,16 @@ extension QuietSelfAdminRender {
             sections.append(section("Tool folds", foldLines))
         }
 
-        // The cards. Read from the transcript, not from the binding: the quiet
-        // copy has no binding of its own, and the transcript is the authority
-        // the binding itself reads.
-        // Through the SAME two read-side collapses the chat binding applies, so
-        // a card that went quiet on the glass reads as quiet here too, and a
-        // run of identical answered asks is one counted line in both places.
-        // ONE FUNCTION WITH THE GLASS. The collapse and the count come out of
-        // the same call the chat binding makes, so a card that went quiet on
-        // the glass reads as quiet here, a run of identical answered asks is
-        // one counted line in both places, and the HEADING here cannot drift
-        // from the lines beneath it.
-        let collapsed = InlineInteractionChatBinding.collapsedCards(
+        // The shared collapse keeps the text read and the rendered card count aligned.
+        let collapsed = InlineInteractionResolver.collapsedCards(
             await InlineInteractionResolver.interactionsByRow(
                 sessionID: sessionID, dataRoot: root
             )
         )
-        let pairs = collapsed.pairs
-        guard !pairs.isEmpty else { return sections }
-        sections.append(section(
-            "Cards",
-            [collapsed.heading
-                + " in this conversation. card.answer answers one by its id."]
-        ))
-        for pair in pairs {
-            let descriptor = InlineInteractionResolver.descriptor(
-                for: pair.interaction, dataRoot: root
-            )
-            // The same live read as the glass: done elsewhere reads as done.
-            let card = InlineCardProjection.model(
-                await InlineInteractionResolver.liveProjection(pair.interaction, dataRoot: root),
-                descriptor: descriptor,
-                repeatCount: collapsed.counts[pair.interaction.id] ?? 1
-            )
-            // The glass does not draw a settled card as a card. It draws ONE
-            // line — the receipt, the refusal, or "Asked earlier" — and only a
-            // card still waiting on the person carries the reason, the scope
-            // lines and the two buttons. A projection that gave every row the
-            // full body told Agent there were six live questions in a
-            // conversation that shows one (Agent, 2026-09-13). The interaction
-            // id stays on every line: a quiet card is still addressable.
-            switch card.state {
-            case .superseded:
-                // "Asked earlier" is the superseded line and ONLY the
-                // superseded line: a newer identical ask took this one's
-                // place, so there is nothing to answer here.
-                sections.append(section(card.title, [
-                    // Every other branch leads with the state; this one read as
-                    // a bare "Asked earlier." with nothing saying what state
-                    // that is (Agent, 2026-09-14).
-                    "State: " + card.state.rawValue,
-                    "Asked earlier — a newer copy of this ask took its place.",
-                    "Interaction id: \(card.id)",
-                    "On message: \(pair.rowID)",
-                ]))
-                continue
-            case .unknown:
-                // Terminal, but not because anybody answered it: this build
-                // has no control for the thing. Say that, with the reason the
-                // glass shows, instead of "asked earlier".
-                var lines: [String] = ["State: unknown"]
-                if let outcome = card.outcome { lines.append(outcome) }
-                if let meta = card.outcomeMeta { lines.append(meta) }
-                lines.append("Interaction id: \(card.id)")
-                lines.append("On message: \(pair.rowID)")
-                sections.append(section(card.title, lines))
-                continue
-            case .declined, .settled:
-                var receipt: [String] = ["State: \(card.state.rawValue)"]
-                if let outcome = card.outcome { receipt.append(outcome) }
-                if let meta = card.outcomeMeta { receipt.append(meta) }
-                receipt.append("Interaction id: \(card.id)")
-                receipt.append("On message: \(pair.rowID)")
-                sections.append(section(card.title, receipt))
-                continue
-            case .pending, .running, .failed:
-                // A failure settled NOTHING — on the glass it keeps its card,
-                // its explanation, its field and its "Try again" — so it is
-                // projected with those too, not as a receipt.
-                break
-            }
-            var lines: [String] = ["State: \(card.state.rawValue)"]
-            if !card.why.isEmpty { lines.append("Why: \(card.why)") }
-            lines.append(contentsOf: card.scopeLines)
-            if card.state == .failed && !card.canRetry {
-                // The one failure with nothing to offer: no control on this
-                // build, so naming buttons that are not drawn would be a lie.
-                lines.append("There is no control for this on this build, so it can't be answered here.")
-            } else {
-                lines.append("Do: \(card.state == .failed ? "Try again" : card.primaryLabel)")
-                // Joined mid-sentence after a dash, so it takes the same
-                // lowercased lead the settled decline line takes — "Not now —
-                // Without Notion…" read as a new sentence beside "Not now —
-                // without Notion…" (Agent, 2026-09-14).
-                lines.append(
-                    "Or: \(card.secondaryLabel) — "
-                        + InlineInteraction.lowercasedLead(
-                            card.consequence.trimmingCharacters(in: .whitespacesAndNewlines)
-                        )
-                )
-            }
-            if let note = card.persistenceNote { lines.append(note) }
-            if let signIn = card.signInLabel { lines.append("Offers: \(signIn)") }
-            for field in card.fields {
-                lines.append(
-                    "Takes: \(field.label)\(field.isSecret ? " (secret — the person types it into the card, never into chat)" : "")"
-                )
-            }
-            for choice in card.choices {
-                lines.append("Choice \(choice.id): \(choice.title)"
-                    + (choice.note.map { " — \($0)" } ?? ""))
-            }
-            if let outcome = card.outcome { lines.append("Outcome: \(outcome)") }
-            if let meta = card.outcomeMeta { lines.append(meta) }
-            lines.append("Interaction id: \(card.id)")
-            lines.append("On message: \(pair.rowID)")
-            sections.append(section(card.title, lines))
-        }
+        sections += await RuntimeReadProjection.quietChatCards(collapsed, dataRoot: root)
         return sections
     }
 
-    // MARK: Bots
-
-    /// Every bot on the shelf, by the same lines its card prints.
-    ///
-    /// The shelf is not in `AppModel` — `refreshForSidebarItem(.bots)` is a
-    /// deliberate no-op and `BotsShelfView` loads its own `@State` — so this
-    /// takes the view's own loader, `BotsShelfView.readRecords`, off the main
-    /// actor exactly as `readShelfOnce` does. Read-only: the definition store,
-    /// the shelf, the scheduler's dates and misses, the event log, the queue.
-    private static func botsProjection(appModel: AppModel) async -> [JSONValue] {
-        let root = dataRoot(appModel)
-        let unattended = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
-        let loaded = try? await Task.detached(priority: .userInitiated) {
-            (records: try BotsShelfView.readRecords(root: root, unattended: unattended),
-             runs: try BotRunQueue(dataRoot: root).activeAndQueuedIDs())
-        }.value
-        guard let loaded else {
-            return [section("Helpers", ["The shelf could not be read."])]
-        }
-        var sections: [JSONValue] = []
-        var header = [countLine(loaded.records.count, "helper", "helpers") + " on the shelf."]
-        if !unattended { header.append(BotsShelfUnattended.pageLine) }
-        sections.append(section("Helpers", header))
-        for record in loaded.records {
-            let state = BotState(record: record, running: loaded.runs.active.contains(record.id),
-                                 queued: loaded.runs.queued.contains(record.id))
-            var lines: [String] = ["State: \(state.word)"]
-            let brief = record.definition.brief
-                .split(whereSeparator: \.isNewline)
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .first { !$0.isEmpty }
-            if let brief { lines.append("Brief: \(brief)") }
-            // "Sep 10 at 1:47 AM · Reply saved: …" — the dated first line of
-            // what it last said, exactly as the card prints it.
-            lines.append("Latest: \(record.lastOutcomeLine)")
-            lines.append("Schedule: \(record.scheduleLine)")
-            lines.append("Timing: \(record.timingLine)")
-            lines.append("Runs on: \(record.choiceLine)")
-            if let missed = record.missedLine { lines.append(missed) }
-            if let wake = record.wakeLine { lines.append(wake) }
-            if record.unread > 0 { lines.append(countLine(record.unread, "unread reply", "unread replies")) }
-            lines.append(countLine(record.entries.count, "run recorded", "runs recorded"))
-            sections.append(section(record.definition.name, lines))
-        }
-        return sections
-    }
 
     // MARK: Today
 
@@ -756,16 +541,16 @@ extension QuietSelfAdminRender {
             queues.append(section("Memories waiting", proposals.prefix(12).map(proposalLine)))
         }
         // The rest of the page from the readers it draws with (TodayView).
-        let (snapshot, collaboration, _) = await TodayView.readLanes(appModel)
-        let earlier = TodayView.earlierNotes(appModel)
+        let (snapshot, collaboration, _) = await WorkOverviewRead.readLanes(appModel.engine, fetchDiary: { await appModel.fetchDreamDiary(limit: 1) }, publishWorkStatus: { await appModel.publishWorkStatus() })
+        let earlier = WorkOverviewRead.earlierNotes(appModel.engine.inbox.items)
         func rows(_ heading: String, _ rows: [TodayRow]) -> [JSONValue] {
             rows.isEmpty ? [] : [section(heading, rows.map { [$0.time, $0.title, $0.line].filter { !$0.isEmpty }.joined(separator: " · ") })]
         }
         let blocks: [String: [JSONValue]] = [
             "waiting": [section("Waiting on you", waiting)],
             "earlier": TodayView.earlierNotesLine(earlier).map { [section("Earlier", [$0] + earlier.map { $0.title + ($0.count > 1 ? " ×\($0.count)" : "") })] } ?? [],
-            "did": rows("What I did today", TodayView.didTodayRows(appModel, snapshot, collaboration)),
-            "ahead": rows("Ahead", TodayView.aheadRows(snapshot)),
+            "did": rows("What I did today", WorkOverviewRead.didTodayRows(snapshot, collaboration, inbox: appModel.engine.inbox.items, sessions: appModel.engine.transcripts.sessions, surfaces: WorkOverviewRead.conversationSurfaces(appModel.engine.transcripts.sessions), activeSessionID: appModel.activeChatSessionId, messages: appModel.chatMessages, parseTimestamp: UserDisplayFormatters.parseISOTimestamp)),
+            "ahead": rows("Ahead", WorkOverviewRead.aheadRows(snapshot)),
             "queues": queues,
         ]
         return SurfaceLayoutStore.layout(dataRoot: dataRoot(appModel)).shown("today", profile: SimpleViewMode.advanced).flatMap { blocks[$0.name] ?? [] }
@@ -773,162 +558,35 @@ extension QuietSelfAdminRender {
 
     // MARK: Providers
 
-    private static func modelLines(_ members: [ProviderSurfaceMember], routing: ProviderRoutingSnapshot) -> [String] {
-        members.map { member in
-            if let issue = routing.unusablePickNotice(for: member.surface) { return "\(member.label): \(issue)" }
-            let provider = routing.activeProviders[member.surface] ?? "same as Chat"
-            guard let preference = routing.preferences[member.surface] else {
-                return "\(member.label): \(provider) · no model pinned"
-            }
-            let fast = preference.serviceTier == "priority" ? "Fast on" : "Fast off"
-            let think = preference.reasoningEffort.isEmpty ? "no thinking level" : "Think \(preference.reasoningEffort)"
-            return "\(member.label): \(provider) · \(preference.model) · \(think) · \(fast)"
-        }
-    }
-
     /// The three groups, each with the model its whole group runs on, and the
     /// accounts that are connected. User, 2026-09-13: every surface in a group
     /// runs on the group's model, so the projection reads the group's rows.
     private static func providersProjection(appModel: AppModel) async -> [JSONValue] {
-        let outcome = await ProviderSettingsRefreshAction.perform(appModel: appModel, refreshCatalog: false)
+        let outcome = await appModel.engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause)
         guard case .loaded(let snapshot) = outcome else {
             if case .failed(let reason) = outcome {
                 return [section("Providers", ["Providers could not be read: \(reason)"])]
             }
             return [section("Providers", ["Providers could not be read."])]
         }
-        var sections: [JSONValue] = []
-        for group in ProviderSurfaceGroups.all {
-            sections.append(section(group.title, modelLines(group.members, routing: snapshot.routing)))
-        }
-        let accounts = snapshot.providers.map { info -> String in
-            let mode = info.auth_mode.map { " via \($0)" } ?? ""
-            let line = ProviderAccountStateLinePresentation.pageLine(state: info.auth_status.state,
+        return RuntimeReadProjection.quietProviders(routing: snapshot.routing, providers: snapshot.providers) { info in
+            ProvidersFacade.accountStatusLine(state: info.auth_status.state,
                 detail: info.auth_status.detail, failedTest: snapshot.failedTests[info.provider_id])
-            return "\(info.display_name): \(line)\(mode)"
         }
-        sections.append(section("Accounts", accounts.isEmpty ? ["No providers listed."] : accounts))
-        return sections
     }
 
-    // MARK: Trust
-
-    private static func trustProjection(appModel: AppModel) -> [JSONValue] {
-        guard let policy = appModel.engine.trust.policy else {
-            return [section("Trust", ["No Trust policy has loaded."])]
-        }
-        let mode = AppModel.agentAccessMode(from: policy)
-        let preset = TrustCenterPolicyStatusPresentation.preset(policy: policy, accessMode: mode)
-        var head = ["Preset: \(preset?.title ?? "custom")", "Agent access: \(mode)"]
-        head.append("Mac control: \(policy.macControlPolicy?.enabled == true ? "on" : "off")")
-        var sections = [section("Trust", head)]
-        let rows = TrustGuardrailSummary.rows(policy: policy, accessMode: mode)
-        if !rows.isEmpty {
-            sections.append(section("Guardrails", rows.map { "\($0.title): \($0.value). \($0.detail)" }))
-        }
-        sections.append(section("Backup ids for backup.restore", appModel.engine.trust.backups.isEmpty ? ["None."]
-            : appModel.engine.trust.backups.map { "\($0.id): \($0.createdAt) · \($0.reason)" }))
-        return sections
-    }
-
-    // MARK: Memories
-
-    private static func memoriesProjection(appModel: AppModel) -> [JSONValue] {
-        let memories = appModel.engine.memory.memories
-        var head = [MemoriesPageContent.keptLine(memories.count)]
-        head.append(countLine(appModel.engine.memory.proposals.count, "proposal waiting", "proposals waiting"))
-        head.append(countLine(appModel.graphEntities.count, "thing in the graph", "things in the graph"))
-        head.append(contentsOf: MemoryStatusProjection.afterTurnRecovery(dataRoot: PersistenceCore.defaultDataRoot()).lines)
-        var sections = [section("Memories", head)]
-        if !memories.isEmpty {
-            sections.append(section("Kept", memories.prefix(20).map { record in
-                let first = record.text.split(whereSeparator: \.isNewline)
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .first { !$0.isEmpty } ?? record.text
-                return "\(record.layer ?? ""): \(first)"
-            }))
-        }
-        if !appModel.engine.memory.proposals.isEmpty {
-            sections.append(section("Waiting", appModel.engine.memory.proposals.prefix(12).map(proposalLine)))
-        }
-        return sections
-    }
-
-    // MARK: Desk
-
-    /// The Desk loads its own board too (`refreshForSidebarItem(.desk)` is a
-    /// no-op), so the projection takes the same read the page takes.
-    private static func deskProjection(appModel: AppModel) async -> [JSONValue] {
-        let desk = appModel.engine.desk
-        let snapshot = await Task.detached(priority: .userInitiated) {
-            await DeskPageSnapshot.load(desk: desk)
-        }.value
-        guard snapshot.loaded else {
-            return [section("Desk", [snapshot.deskUnavailable ?? "The board could not be read."])]
-        }
-        let items = snapshot.items
-        let waiting = DeskPageContent.waitingOnOwner(items)
-        let blocked = DeskPageContent.blocked(items)
-        let active = DeskPageContent.active(items)
-        // `stuckReason` answers "why is this stuck" and always answers; asking
-        // it about a row that is not stuck would print a blocked line over a
-        // healthy item. Only the two stuck lanes ask.
-        func rows(_ list: [DeskItem], stuck: Bool = false) -> [String] {
-            list.prefix(20).map { item in
-                let line = "\(item.alias) \(DeskPageContent.title(item)) [\(item.project)]"
-                guard stuck else { return line }
-                let reason = DeskPageContent.stuckReason(item, in: items)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return reason.isEmpty ? line : "\(line) — \(reason)"
-            }
-        }
-        var sections = [section("Desk", [
-            countLine(active.count, "open item, including parts; MY QUEUE separate", "open items, including parts; MY QUEUE separate"),
-            countLine(waiting.count, "item waiting on you", "items waiting on you"),
-            countLine(blocked.count, "item blocked", "items blocked"),
-        ])]
-        if !waiting.isEmpty { sections.append(section("Waiting on you", rows(waiting, stuck: true))) }
-        if !blocked.isEmpty { sections.append(section("Blocked", rows(blocked, stuck: true))) }
-        if !active.isEmpty { sections.append(section("In play", rows(active))) }
-        return sections
-    }
-
-    // MARK: Notifications
-
-    private static func notificationsProjection(appModel: AppModel) -> [JSONValue] {
-        let items = appModel.engine.inbox.items
-        var sections = [section("Notifications", [
-            countLine(items.count, "item in the inbox", "items in the inbox"),
-            countLine(items.filter { $0.status == "unread" }.count, "unread", "unread"),
-        ])]
-        if !items.isEmpty {
-            sections.append(section("Recent", items.prefix(15).map {
-                "\($0.created_at) · \($0.severity) · \($0.source): \($0.title) — \($0.summary)"
-            }))
-        }
-        return sections
-    }
 
     // MARK: The rest
 
     private static func diagnosticsProjection(appModel: AppModel) async -> [JSONValue] {
-        // The runtime line comes from the PROBE, like the status line does. A
-        // failed read leaves `health` on its cached row; printing "online" off
-        // that row under a "Health check failed" status is a claim about a
-        // reading that never came back.
-        let runtime: String
-        if appModel.engine.doctor.healthProbeFailed {
-            runtime = "unknown (last check failed)"
-        } else {
-            runtime = appModel.engine.doctor.health?.ok == true ? "online" : "not reachable"
-        }
+        let runtime = appModel.engine.doctor.health?.ok == true ? "online" : "not reachable"
         var head = ["Runtime: \(runtime)"]
         head.append("Status line: \(appModel.statusForAgent)")
         head.append(countLine(appModel.runs.count, "run recorded", "runs recorded"))
         var sections = [section("Diagnostics", head)]
         do {
             let tools = try await appModel.engine.tools.listAuthored()
-            for (title, targets) in [("Tool ids for tool.restore", tools.filter { $0.status == "archived" }),
+            for (title, targets) in [("Tool ids for tool.restore", tools.filter { ["archived", "quarantined"].contains($0.status) }),
                                      ("Tool ids for tool.approve", tools.filter { ToolApprovalEligibility.refusal(for: $0) == nil })] {
                 sections.append(section(title, targets.isEmpty ? ["None."] : targets.map { "\($0.id): \($0.name)" }))
             }
@@ -940,7 +598,7 @@ extension QuietSelfAdminRender {
                 ([run.id, RunKindVocabulary.displayName(run.kind, on: .mac),
                   RunStatusBadgePresentation.badge(for: run.status).label,
                   RunDetailPresentation.createdAtText(for: run)]
-                    + [run.durationSeconds.map(UserDisplayFormatters.humanizeDuration), run.model].compactMap { $0 }
+                    + [run.durationSeconds.map(CompactDurationFormatter.string), run.model].compactMap { $0 }
                         .filter { !$0.isEmpty })
                     .joined(separator: " · ") + ": " + RunPreviewPresentation.preview(for: run).text
             }))
@@ -951,6 +609,7 @@ extension QuietSelfAdminRender {
     private static func toolsProjection(appModel: AppModel) -> [JSONValue] {
         let tools = appModel.engine.tools
         let state = ChatToolCatalogPresentation.catalogState(catalog: tools.catalog,
+            authored: tools.authored,
             loadFailed: tools.catalogLoadError != nil, loadError: tools.catalogLoadError)
         var sections: [JSONValue] = []
         switch ToolsCatalogSurfacePresentation.state(for: state) {
@@ -961,7 +620,7 @@ extension QuietSelfAdminRender {
                 if case .stale(_, _, let detail) = state {
                     sections.append(section("Tools", [detail ?? "The tool list is stale. Press Refresh to try again."]))
                 }
-                sections += ChatToolCatalogPresentation.buckets(for: catalog).map { bucket in
+                sections += ChatToolCatalogPresentation.buckets(for: catalog, authored: tools.authored).map { bucket in
                     section(bucket.title, bucket.tools.map {
                         "\($0.name): \(ChatToolCatalogPresentation.toolStatusBadge(for: $0, in: catalog).title) · \($0.description)"
                     })
@@ -971,201 +630,198 @@ extension QuietSelfAdminRender {
             }
         }
         if !tools.authored.isEmpty {
-            sections.append(section("Tools I wrote", tools.authored.map {
-                "\($0.name): \(AuthoredToolPresentation.statusBadge(for: $0).title) · \($0.description)"
-            }))
+            sections.append(.object(["heading": .string("Tools I wrote"),
+                                     "tools": .array(tools.authored.map(ToolRegistryActions.read))]))
         }
         return sections
     }
 
-    private static func capabilitiesProjection(appModel: AppModel) -> [JSONValue] {
-        [section("Capabilities", [
-            countLine(appModel.engine.trust.capabilitySummary?.records.count ?? 0, "capability", "capabilities"),
-            countLine(appModel.workflows.count, "workflow", "workflows"),
-            countLine(appModel.mcpServers.count, "MCP server", "MCP servers"),
-            countLine(appModel.nativeActions.count, "action", "actions"),
-            countLine(appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }.count,
-                      "approval waiting", "approvals waiting"),
-        ])]
+
+    private static func connectorStatusText(_ connector: ConnectorRecord) -> String {
+        ConnectorsView.statusText(for: connector, uiState: ConnectorUIState.resolve(connector))
     }
 
-    private static func connectorsProjection(appModel: AppModel) -> [JSONValue] {
-        var sections = [section("Connectors", [
-            countLine(appModel.connectors.count, "connector", "connectors"),
-            countLine(appModel.workspaces.count, "workspace", "workspaces"),
-            "Telegram: \(appModel.engine.telegram.status?.tokenConfigured == true ? "configured" : "not configured")",
-        ])]
-        sections.append(section("Connector ids", appModel.connectors.isEmpty ? ["None."] : appModel.connectors.map {
-            // The same word the Connectors page shows (Connected / Needs sign-in / Off …),
-            // so she never has to open each connector to learn who needs a sign-in (10-10).
-            "\($0.id): \($0.name)\($0.kind.isEmpty ? "" : " (\($0.kind))"): \($0.enabled ? "on" : "off") · "
-                + ConnectorsView.statusText(for: $0, uiState: ConnectorUIState.resolve(authState: $0.authState, healthStatus: $0.healthStatus))
-        }))
-        return sections
-    }
-
-    private static func telegramProjection(appModel: AppModel) -> [JSONValue] {
-        guard let status = appModel.engine.telegram.status else {
-            return [section("Telegram", ["Telegram's status has not loaded."])]
+    private static func macOSAccess(_ mac: String) -> String {
+        switch mac {
+        case MacIntegrationID.contacts: MacContactsExecutor.currentAuthorizationStatus()
+        case MacIntegrationID.calendar: LocalPIMConnectorActions.currentCalendarAuthorizationStatus()
+        case MacIntegrationID.reminders: LocalPIMConnectorActions.currentReminderAuthorizationStatus()
+        default: "unverified"
         }
-        var lines = [
-            "Telegram: \(status.enabled ? "on" : "off") · bot token \(status.tokenConfigured ? "saved" : "not saved")",
-            "Only answers when mentioned in a group: \(status.requireMention ? "yes" : "no")",
-            countLine(status.allowedChatIds.count, "allowed chat", "allowed chats")
-                + ", " + countLine(status.allowedUserIds.count, "allowed user", "allowed users"),
-            "Model: \(status.model ?? "same as Chat") · Think \(status.reasoningEffort ?? "default")",
-        ]
-        if let at = status.lastReplyAt { lines.append("Last reply: \(at)") }
-        if let error = status.lastError, !error.isEmpty { lines.append("Last error: \(error)") }
-        return [section("Telegram", lines)]
-    }
-
-    private static func mcpProjection(appModel: AppModel) -> [JSONValue] {
-        var sections = [section("MCP", [
-            countLine(appModel.mcpServers.count, "server", "servers"),
-            countLine(appModel.mcpConsent.count, "consent", "consents"),
-        ])]
-        if !appModel.mcpServers.isEmpty {
-            sections.append(section("Servers", appModel.mcpServers.map {
-                "\($0.name) [\($0.id)]: \($0.status) · \($0.toolCount) tools"
-            }))
-        }
-        if !appModel.mcpConsent.isEmpty {
-            sections.append(section("Consents", appModel.mcpConsent.prefix(30).map {
-                "\($0.toolName ?? "a tool") on \($0.serverId ?? "a server"): \($0.status ?? "unknown") (\($0.risk ?? "risk unknown"))"
-            }))
-        }
-        return sections
-    }
-
-    private static func pairingProjection(appModel: AppModel) -> [JSONValue] {
-        let sync = appModel.engine.sync
-        var head = ["iCloud: \(sync.status)"]
-        if let error = sync.pairingError { head.append("Problem: \(error)") }
-        let phones = sync.phones.filter { $0.status != .removed }
-        head.append(countLine(phones.count, "phone", "phones"))
-        var sections = [section("iPhone pairing", head)]
-        if !phones.isEmpty {
-            sections.append(section("Phones", phones.map { "\($0.id): \($0.status.rawValue)" }))
-        }
-        return sections
-    }
-
-    /// A Mac app's or connector's page: the Mac app whose access it shows,
-    /// and the connectors behind its actions.
-    static let servicePages: [String: (mac: String?, connectors: [String])] = [
-        "mail": (MacIntegrationID.mail, ["local_mail", "gmail", "agentmail"]),
-        "calendar": (MacIntegrationID.calendar, ["local_calendar", "google_calendar"]),
-        "reminders": (MacIntegrationID.reminders, ["local_reminders"]),
-        "notes": (MacIntegrationID.notes, []), "contacts": (MacIntegrationID.contacts, []),
-        "messages": (MacIntegrationID.messages, []), "music": (MacIntegrationID.music, []),
-        "github": (nil, ["github"]), "slack": (nil, ["slack"]), "notion": (nil, ["notion"]), "x": (nil, ["x"]),
-    ]
-
-    private static func macAccess(_ mac: String, appModel: AppModel) async -> JSONValue {
-        let routes = AppActions.integrationRoutes(mac)
-        var access: [String: JSONValue] = ["integration": .string(mac), "name": .string(MacIntegrationID.displayName(for: mac)),
-            "supported_routes": .array(routes), "supported": .bool(!routes.isEmpty),
-            "verified_os_access": .string("unverified"), "setting": .string("trust.mac_integration_\(mac)")]
-        do {
-            let store = MacIntegrationPermissionStore(dataRoot: dataRoot(appModel))
-            let stored = try await store.currentChecked()[mac]!
-            let readiness = try await store.readinessChecked()
-            var origin = SecurityOriginContext.currentTurn(verifiedSessionId: ChatToolSessionContext.verifiedSessionId,
-                surface: ChatToolSessionContext.envelope?.surface ?? "chat")
-            origin.source = "native_client_direct_action"
-            let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot(appModel)).fullMacYoloAuthority(tool: "mac_integration", origin: origin)
-            access["full_mac_admission"] = .string(authority.state.rawValue)
-            access["full_mac_reason"] = .string(authority.reason)
-            if authority.state == .unavailable || authority.state == .explicitlyBlocked {
-                access["permission_state"] = .string(authority.state == .unavailable ? "unavailable" : "blocked")
-                access["blocker"] = .string(authority.reason)
-                return .object(access)
-            }
-            let admitted = authority.admitted
-            let read = await store.allows(mac, mode: .read, fullMacAdmitted: admitted)
-            let write = await store.allows(mac, mode: .write, fullMacAdmitted: admitted)
-            access["effective_permission"] = .object(["read": .bool(read), "write": .bool(write)])
-            access["stored_permission"] = .object(["read": .bool(stored.read), "write": .bool(stored.write)])
-            access["full_mac_admitted"] = .bool(admitted)
-            access["permission_state"] = .string(read || write ? "allowed" : "off")
-            access["permission_blockers"] = .array([MacIntegrationPermissionMode.read, .write].compactMap {
-                readiness.refusal(integration: mac, mode: $0).map(JSONValue.string)
-            })
-        } catch {
-            access["permission_state"] = .string("unavailable")
-            access["blocker"] = .string(error.localizedDescription)
-        }
-        return .object(access)
-    }
-
-    private static func serviceProjection(_ page: QuietPage, _ service: (mac: String?, connectors: [String]),
-                                          appModel: AppModel) async -> [JSONValue] {
-        var sections: [JSONValue] = []
-        var lines: [String] = []
-        if let mac = service.mac { sections.append(await macAccess(mac, appModel: appModel)) }
-        for connector in appModel.connectors where service.connectors.contains(connector.id) {
-            lines.append("\(connector.name.isEmpty ? connector.id : connector.name): \(connector.enabled ? "on" : "off") · "
-                + ConnectorsView.statusText(for: connector, uiState: ConnectorUIState.resolve(authState: connector.authState, healthStatus: connector.healthStatus))
-                + (connector.authState.map { " · \($0)" } ?? ""))
-        }
-        if lines.isEmpty, sections.isEmpty { lines.append("\(page.title) is not set up in Connectors.") }
-        if !lines.isEmpty { sections.append(section(page.title, lines)) }
-        return sections
     }
 
     /// The Agents tab's rows, as its own reload builds them.
-    private static func agentsProjection(appModel: AppModel) -> [JSONValue] {
-        let root = dataRoot(appModel)
-        let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
-        let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-        guard let peers = try? AgentPeerStore(dataRoot: root).list() else {
-            return [section("Agents", ["Contacts and trusted switches could not be read."])]
-        }
-        let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: usable, dataRoot: root)
-        var sections = [section("Agents", [countLine(rows.count, "contact", "contacts")])]
-        if !rows.isEmpty {
-            sections.append(section("Contacts", rows.map { "\($0.displayName): \($0.pillWord)" }))
-        }
-        if !peers.isEmpty {
-            sections.append(section("Trusted switches", peers.map { "\($0.name): trusted \($0.elevationAllowed ? "on" : "off")" }))
-        }
-        return sections
+
+}
+
+@MainActor
+final class QuietSelfAdmin {
+    static let shared = QuietSelfAdmin()
+
+    /// The live composer's own two objects. Both are view-local `@State` on
+    /// `ChatView` — the draft so a keystroke invalidates the composer alone,
+    /// the card state because the card DRAWS in the chat column — so neither
+    /// is reachable from `AppModel`. The chat page registers them while it is
+    /// mounted; weak, because the view owns them and a closed window must not
+    /// be kept alive by this. Nil simply means no composer is on screen, and
+    /// the composer verbs say so rather than inventing one.
+    private weak var draft: ChatComposerDraft?
+    private weak var cards: ComposerShellState?
+
+    private init() {}
+
+    func attach(composerDraft: ChatComposerDraft, cards: ComposerShellState) {
+        draft = composerDraft
+        self.cards = cards
     }
 
-    private static func personalityProjection(appModel: AppModel) async -> [JSONValue] {
-        var head: [String] = []
-        if let profile = appModel.personality { head.append("Name: \(profile.name)") }
-        head.append("Current persona name: \(appModel.chatPersona).")
-        head.append(countLine(appModel.personalityDocs.count, "document", "documents"))
-        var sections = [section("Personality", head)]
-        do {
-            let persona = appModel.dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? SwiftNativePersonaEngine()
-            let names = try PersonaCompiler.customPersonaNames(root: await persona.personaRoot)
-            sections.append(section("Custom names for persona.set", names.isEmpty ? ["None."] : names))
-        } catch { sections.append(section("Custom personas", ["Unavailable: \(error.localizedDescription)"])) }
-        do {
-            let consults = try await SwiftNativeStudioStore(dataRoot: dataRoot(appModel)).listConsults()
-            sections.append(section("Consult ids for studio.consult_read", consults.isEmpty ? ["None."]
-                : consults.map { "\($0.id): \($0.question) · \($0.descriptionOnly ? "description only" : "has artifacts")" }))
-        } catch { sections.append(section("Consults", ["Unavailable: \(error.localizedDescription)"])) }
-        if !appModel.personalityDocs.isEmpty {
-            sections.append(section("Documents", appModel.personalityDocs.map { doc in
-                let first = doc.content.split(whereSeparator: \.isNewline)
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .first { !$0.isEmpty } ?? ""
-                return "\(doc.title): \(first)"
-            }))
-        }
-        return sections
+    func detachComposer(draft candidate: ChatComposerDraft) {
+        guard draft === candidate else { return }
+        draft = nil
+        cards = nil
     }
 
-    private static func settingsProjection(appModel: AppModel) -> [JSONValue] {
-        [section("Settings", [
-            "Agent name: \(appModel.agentDisplayName)",
-            "Chat runs on: \(appModel.chatProvider) · \(appModel.chatModel)",
-            "File access: \(appModel.chatFileAccess)",
-            "Status line: \(appModel.statusForAgent)",
-        ])]
+    var composerDraft: ChatComposerDraft? { draft }
+    var composerCards: ComposerShellState? { cards }
+
+}
+
+// MARK: - Pages
+
+/// The rail route for a page from the shared catalog.
+struct QuietPage: Sendable, Equatable {
+    let value: QuietToolPage
+    var id: String { value.id }
+    var title: String { value.title }
+    var summary: String { value.summary }
+    var item: SidebarItem {
+        switch id {
+        case "chat", "simple", "simple_settings_menu": .chat
+        case "today": .activity
+        case "memories": .memories
+        case "desk": .desk
+        case "notifications": .inboxPolicy
+        case "bots": .bots
+        case "personality": .personality
+        case "providers": .providers
+        case "trust", "files", "shell", "browser", "mac": .trust
+        case "connectors", "pairing", "agents", "github", "slack", "notion", "x", "markets": .connectors
+        case "telegram": .telegram
+        case "mcp", "web": .mcp
+        case "mac_integration", "mail", "calendar", "reminders", "notes", "contacts", "messages", "music": .macIntegration
+        case "capabilities": .capabilities
+        case "diagnostics": .diagnostics
+        case "skills": .skills
+        case "tools": .tools
+        case "settings": .settings
+        default: preconditionFailure("The page has no rail route")
+        }
     }
+    var tab: String? {
+        switch id {
+        case "pairing": "iphone"
+        case "agents": "agents"
+        case "github", "slack", "notion", "x", "markets": "connectors"
+        case "skills": "skills"
+        case "tools": "tools"
+        default: nil
+        }
+    }
+}
+
+enum QuietPages {
+    static let all = QuietToolPage.all.map(QuietPage.init)
+    static var ids: [String] { QuietToolPage.ids }
+    static let drawOnly: [QuietPage] = [
+        QuietPage(value: QuietToolPage(id: "simple", title: "Simple view",
+                  summary: "The Simple shell: the sidebar with its pinned person row, and the chat.")),
+        QuietPage(value: QuietToolPage(id: "simple_settings_menu", title: "Simple view settings menu",
+                  summary: "The Simple shell with the person row's settings menu drawn open.")),
+    ]
+    static func page(named raw: String) -> QuietPage? {
+        QuietToolPage.page(named: raw).map(QuietPage.init)
+    }
+}
+
+@MainActor struct AppQuietToolPresentation: QuietToolPresentationPort {
+    /// The page index as the window shows it: a page whose rail row or place
+    /// the layout hides (ui/layout.json) leaves it, and still reads by name.
+    var pages: [QuietToolPage] {
+        let appModel = NativeAgentAppCoordinator.shared.appModel
+        return RuntimeReadProjection.quietPages(
+            dataRoot: appModel?.dataRootOverride ?? PersistenceCore.defaultDataRoot(), profile: SimpleViewMode.current)
+    }
+    var currentPage: QuietToolPage? { NativeAgentAppCoordinator.shared.currentPage.map(\.value) }
+    func page(named raw: String) -> QuietToolPage? { QuietToolPage.page(named: raw) }
+    /// `app {page: "context", item: session_id}`: the composer's context
+    /// receipt for a conversation, read from the turn traces by the same code
+    /// the popover uses, line for line — the popover need not be open.
+    /// Defaults to the conversation on screen.
+    @MainActor
+    func contextReceiptRead(input: [String: JSONValue]) async -> JSONValue {
+        guard let appModel = NativeAgentAppCoordinator.shared.appModel else { return AppToolExecutor.unattachedFailure() }
+        return await AppToolExecutor.contextReceiptRead(input: input, activeSessionID: appModel.activeChatSessionId) { sessionID in
+            let state = await ContextReceiptProjection.read(sessionId: sessionID, selectedModel: appModel.chatModel)
+            return ComposerContextReceiptPresentation.lines(state)
+        }
+    }
+
+    /// `app {page: "agent_view", item: room}`: one Agent-view tab's
+    /// text, from the pane's own render (read-only: nothing marked seen or
+    /// written, no tool run); no room lists the tabs. Defaults to the
+    /// conversation on screen, as the pane does.
+    @MainActor
+    func agentViewRead(input: [String: JSONValue]) async -> JSONValue {
+        guard let appModel = NativeAgentAppCoordinator.shared.appModel else { return AppToolExecutor.unattachedFailure() }
+        return await AppToolExecutor.agentViewRead(input: input, rooms: AgentScreenView.tabs,
+                                                   activeSessionID: appModel.activeChatSessionId) { room, scope in
+            await HerScreenPreview.paneText(room,
+                root: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(), scope: scope)
+        }
+    }
+
+    // MARK: - page.screenshot
+
+    @MainActor
+    func pageScreenshot(input: [String: JSONValue]) async -> JSONValue {
+        let requested = Self.text(input["page"])
+        guard let page = QuietPages.page(named: requested)
+                ?? QuietPages.drawOnly.first(where: { $0.id == requested.lowercased() }) else {
+            return AppToolExecutor.unknownPageFailure(requested, pages: QuietPages.ids)
+        }
+        // A tab by the key page.show takes (`QuietComposerCommands.tabs`), on
+        // this page's own rail page. Without one the page's default tab draws.
+        let tabKey = Self.text(input["tab"]).lowercased()
+        let railPage = SidebarItem.shellHome(for: page.item)?.parent ?? page.item
+        var tab: String?
+        if !tabKey.isEmpty {
+            guard let home = QuietComposerCommands.tabs[tabKey], home.page == railPage else {
+                let keys = QuietComposerCommands.tabs.filter { $0.value.page == railPage }.keys.sorted()
+                return AppToolExecutor.failure("unknown_tab", "This page has no tab called that.",
+                                               extra: ["requested": .string(tabKey), "tabs": .array(keys.map { .string($0) })])
+            }
+            tab = home.tab
+        }
+        guard let appModel = NativeAgentAppCoordinator.shared.appModel else { return AppToolExecutor.unattachedFailure() }
+        var size = QuietSelfAdminRender.defaultSize
+        switch input["height"] {
+        case .int(let value)?: size.height = CGFloat(value)
+        case .double(let value)?: size.height = CGFloat(value)
+        case .string(let value)?: size.height = Double(value).map { CGFloat($0) } ?? size.height
+        default: break
+        }
+        size.height = min(max(size.height, 400), 2400)
+        guard let rendered = await QuietSelfAdminRender.pageImagePNG(for: page, tab: tab, appModel: appModel, size: size) else {
+            return AppToolExecutor.failure("render_failed", "The page could not be drawn offscreen.")
+        }
+        return AppToolExecutor.pageScreenshotResult(
+            page: page.value, tabKey: tabKey,
+            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(), rendered: rendered)
+    }
+
+    private static func text(_ value: JSONValue?) -> String {
+        guard case .string(let raw)? = value else { return "" }
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
 }

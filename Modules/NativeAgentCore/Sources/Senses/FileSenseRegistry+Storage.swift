@@ -1,6 +1,49 @@
 import Foundation
+import NativeAgentCore
+import PersistenceCore
 
 extension FileSenseRegistry {
+    static func decode(_ value: JSONValue) throws -> Store {
+        let store = try JSONDecoder().decode(Store.self, from: value.serializedData(pretty: false))
+        try validate(store)
+        return store
+    }
+
+    public func sourceFiles(_ record: SenseRecord) throws -> [String: Data] {
+        if let digest = record.candidateDigest {
+            let candidate = try programs.load(id: record.id, digest: digest)
+            let saved = try Self.record(candidate)
+            guard saved.id == record.id, saved.version == record.version, saved.corner == record.corner,
+                  saved.entry == record.entry, saved.reach == record.reach, saved.mode == record.mode,
+                  saved.origin == record.origin, let entry = record.entry,
+                  case .object(let manifest) = candidate.manifest, let files = manifest["files"] else {
+                throw Self.failure("Selected sense metadata differs from its immutable candidate.")
+            }
+            var result = try JSONDecoder().decode([String: Data].self, from: files.serializedData(pretty: false))
+            if record.status == .on, manifest["scope"] != .string("") {
+                guard let key = try CheckedFixedSizeSecretFile.peekExisting(
+                    at: root.deletingLastPathComponent().appendingPathComponent("tools/.manifest_signing_key"), byteCount: 32) else {
+                    throw Self.failure("Validation authority is missing. Try and keep this sense in the installed app.")
+                }
+                _ = try programs.proof(candidate, key: key)
+            }
+            result[entry] = Data(candidate.program.source.utf8)
+            return result
+        }
+        for slot in [AbilityStore.Slot.current, .previous, .next] {
+            if let file = try abilities.read(id: record.id, slot: slot),
+               case .object(let saved)? = file.metadata["record"], saved["version"] == .int(Int64(record.version)),
+               let entry = record.entry {
+                var files: [String: Data] = [:]
+                if let value = file.metadata["sourceFiles"] { files = try JSONDecoder().decode([String: Data].self, from: value.serializedData(pretty: false)) }
+                files[entry] = Data(file.body.utf8)
+                return files
+            }
+        }
+        guard record.origin == .builtIn, let entry = record.entry else { throw Self.failure("Sense source is unavailable in its ability file.") }
+        return [entry: try Data(contentsOf: BuiltInSenses.resourceRoot().appendingPathComponent(entry))]
+    }
+
     static let maximumBundleBytes = 8_000_000
     static let maximumCodeBytes = 4_000_000
     private static let forbiddenComponents: Set<String> = ["data", "persona", "ledger", "wall-ledger", "secrets", "credentials"]
@@ -32,10 +75,15 @@ extension FileSenseRegistry {
     static func validate(_ version: Version) throws {
         let record = version.record
         try validateID(record.id)
+        if let digest = record.candidateDigest {
+            guard record.language == .javascript, digest.count == 64,
+                  digest.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { throw failure("Sense candidate identity is invalid.") }
+        }
         guard record.version > 0, record.uses >= 0, record.corrections >= 0,
               record.createdAt.timeIntervalSince1970.isFinite,
               record.enabledAt?.timeIntervalSince1970.isFinite != false,
               record.lastUsedAt?.timeIntervalSince1970.isFinite != false,
+              record.disabledBy == nil || ["owner", "agent"].contains(record.disabledBy!),
               let corner = SenseCorner(key: record.corner.key), corner == record.corner,
               version.files.count <= 128,
               Set(version.files.map { $0.precomposedStringWithCanonicalMapping.lowercased() }).count == version.files.count else {
@@ -93,41 +141,4 @@ extension FileSenseRegistry {
         return current
     }
 
-    static func readCode(at path: URL) throws -> Data {
-        let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes[.size] as? NSNumber, size.intValue <= maximumCodeBytes else {
-            throw failure("Sense source must be a bounded regular file.")
-        }
-        let bytes = try Data(contentsOf: path)
-        guard bytes.count <= maximumCodeBytes else { throw failure("Sense source exceeds the size limit.") }
-        return bytes
-    }
-
-    static func readSourceFiles(at folder: URL) throws -> [String: Data] {
-        var enumerationError: Error?
-        guard let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles], errorHandler: { _, error in enumerationError = error; return false }) else {
-            throw failure("Sense code folder cannot be read.")
-        }
-        var files: [String: Data] = [:]
-        var total = 0
-        for case let path as URL in enumerator {
-            let values = try path.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey])
-            guard values.isSymbolicLink != true else { throw failure("Sense code folder contains a symbolic link.") }
-            if values.isDirectory == true {
-                if forbiddenComponents.contains(path.lastPathComponent.lowercased()) { enumerator.skipDescendants() }
-                continue
-            }
-            guard values.isRegularFile == true, ["js", "swift"].contains(path.pathExtension.lowercased()) else { continue }
-            let name = String(path.path.dropFirst(folder.path.count + 1))
-            let bytes = try readCode(at: path)
-            try validateCode(name, bytes: bytes)
-            total += bytes.count
-            guard files.count < 128, total <= maximumCodeBytes else { throw failure("Sense source exceeds the size limit.") }
-            files[name] = bytes
-        }
-        if let enumerationError { throw enumerationError }
-        return files
-    }
 }

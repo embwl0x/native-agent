@@ -249,7 +249,7 @@ extension SwiftNativeMacControl {
             output["effects_may_have_occurred"] = .bool(emittedEvents > 0)
             return MacControlResult(ok: false, action: "hand", output: .object(output),
                                     error: refusal.error, durationMs: Int(now().timeIntervalSince(started) * 1000),
-                                    viaSwift: true, httpStatus: 409, verification: .unverified)
+                                    httpStatus: 409, verification: .unverified)
         }
         func interruptedResult() -> MacControlResult {
             let recoveryEvents = recoverNeutral()
@@ -269,7 +269,6 @@ extension SwiftNativeMacControl {
                 ]),
                 error: "gesture_cancelled",
                 durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true,
                 verification: .unverified
             )
         }
@@ -452,8 +451,7 @@ extension SwiftNativeMacControl {
                     : .null,
             ]),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -530,8 +528,7 @@ extension SwiftNativeMacControl {
                 ),
             ]),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -798,8 +795,7 @@ extension SwiftNativeMacControl {
             action: "wake",
             output: .object(output),
             error: view.error,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 }

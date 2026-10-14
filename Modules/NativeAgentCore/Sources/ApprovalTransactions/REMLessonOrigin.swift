@@ -77,22 +77,6 @@ public enum REMLessonOrigin {
         return !peer || peerSessionTrusted(session)
     }
 
-    /// A contact's sessions are `agent-<hash of its id>-…`; the contact is
-    /// trusted only when User elevated it (`PeerDataTaint.ownerTrusts`, which
-    /// the engine binds to `PeerTrust`; unbound, nothing is).
-    static func peerSessionTrusted(_ session: String, dataRoot: URL,
-                                   ownerTrusts: (String) -> Bool = { PeerDataTaint.ownerTrusts($0) }) -> Bool {
-        var owners = ["claude", "codex", "omp"]
-        if let data = try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")),
-           case .array(let peers)? = try? JSONValue.parse(data) {
-            for case .object(let peer) in peers { if case .string(let id)? = peer["id"] { owners.append(id) } }
-        }
-        guard let owner = owners.first(where: {
-            session.hasPrefix(ChatSessionRetention.contactSessionPrefix(owner: $0))
-        }) else { return false }
-        return ownerTrusts(owner)
-    }
-
     /// One origin per lesson: the memory id is the proposal's, so a second
     /// approval run or a launch reconcile finds the row instead of adding one.
     public static func memoryID(for proposalID: String) -> String { "lesson-origin:" + proposalID }
@@ -128,8 +112,20 @@ public enum REMLessonOrigin {
         let id = memoryID(for: row.id)
         if let kept = try await memory.authorityRecord(id: id) { return kept }
         let moments = try await memory.listMemory(kind: MemoryMoments.kind)
-        let behind = originMoments(for: row, moments: moments) {
-            peerSessionTrusted($0, dataRoot: dataRoot, ownerTrusts: ownerTrusts)
+        var peerOwners: [(id: String, prefix: String)]?
+        let behind = originMoments(for: row, moments: moments) { session in
+            // Read contacts once when a peer candidate needs them; trust is
+            // still checked for each candidate against the live authority.
+            if peerOwners == nil {
+                var owners = ["claude", "codex", "omp"]
+                if let data = try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")),
+                   case .array(let peers)? = try? JSONValue.parse(data) {
+                    for case .object(let peer) in peers { if case .string(let id)? = peer["id"] { owners.append(id) } }
+                }
+                peerOwners = owners.map { ($0, ChatSessionRetention.contactSessionPrefix(owner: $0)) }
+            }
+            guard let owner = peerOwners?.first(where: { session.hasPrefix($0.prefix) }) else { return false }
+            return ownerTrusts(owner.id)
         }
         guard let text = originText(for: row, moment: behind.first) else { return nil }
         var metadata: [String: JSONValue] = [

@@ -1,4 +1,5 @@
 import AgentWorkspace
+import Desk
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -24,7 +25,7 @@ public enum HumanConversationReader {
     public static func string(_ value: JSONValue?) -> String? { HumanConversationIndex.string(value) }
     public static func object(_ value: JSONValue?) -> [String: JSONValue] { HumanConversationIndex.object(value) }
     public static func rows(dataRoot: URL) throws -> [[String: JSONValue]] { try HumanConversationIndex.rows(dataRoot: dataRoot) }
-    public static func read(sessionID: String, dataRoot: URL) async throws -> HumanConversationSnapshot {
+    public static func read(sessionID: String, dataRoot: URL, replyBefore: Date? = nil) async throws -> HumanConversationSnapshot {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) != nil,
               let row = try rows(dataRoot: dataRoot).first(where: { string($0["id"]) == sessionID }) else {
             throw AutonomyGateError.toolDenied(reason: "This conversation is unavailable. Open the conversation list again.")
@@ -35,14 +36,21 @@ public enum HumanConversationReader {
             throw AutonomyGateError.toolDenied(reason: "This conversation is too large for an exact recent read. Search its history for a specific message instead.")
         }
         let result = try await SessionHistoryReader(dataRoot: dataRoot).messagesWithStats(
-            forSessionId: sessionID, limit: 128, strictEvidence: true)
+            forSessionId: sessionID, limit: replyBefore == nil ? 128 : nil, strictEvidence: true)
         let complete = !["missing", "read_failed", "invalid_encoding", "invalid_session_id"].contains(result.stats.mode)
             && result.stats.malformedRowCount == 0 && result.stats.invalidShapeRowCount == 0
-        let visible = result.messages.filter { ["user", "assistant"].contains($0.role) }
+        let recent = result.messages.suffix(128)
+        let visible = recent.filter { ["user", "assistant"].contains($0.role) }
         let lastID = result.messages.last.flatMap { string(object($0.extras)["id"]) }
-        let human = result.messages.last(where: { $0.role == "user" })
+        let human = result.messages.last { message in
+            message.role == "user" && (replyBefore.map {
+                (DeskClock.parseISO(message.timestamp) ?? .distantFuture) <= $0
+            } ?? true)
+        }
         var route: TurnEnvelope?
-        if let human, complete {
+        if let human, complete, replyBefore == nil || result.messages.filter({ $0.role == "user" }).allSatisfy({
+            DeskClock.parseISO($0.timestamp) != nil
+        }) {
             let metadata = object(object(human.extras)["metadata"])
             let candidate = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
             // Never infer User from a bridge/worker turn or decode a destination from a session id.
@@ -53,7 +61,7 @@ public enum HumanConversationReader {
             }
         }
         // 2026-09-22: a peer-opened session's words are peer data; label them so the taint latches.
-        let peerOrigin = result.messages.lazy.filter { $0.role == "user" }.compactMap { message -> String? in
+        let peerOrigin = recent.lazy.filter { $0.role == "user" }.compactMap { message -> String? in
             let metadata = object(object(message.extras)["metadata"])
             let origin = object(metadata["origin"])
             let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])

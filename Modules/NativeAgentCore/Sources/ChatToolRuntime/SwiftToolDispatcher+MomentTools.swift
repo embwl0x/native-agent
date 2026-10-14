@@ -54,7 +54,7 @@ extension SwiftToolDispatcher {
         guard status == "pending" || status == "rejected" else {
             return .object(["status": .string("refused"), "reason": .string("status must be \"pending\" or \"rejected\".")])
         }
-        let limit = min(50, max(1, optionalInt(input, "limit") ?? Self.maxPendingMomentsListed))
+        let limit = min(50, max(1, Self.jsonInt(input["limit"]) ?? Self.maxPendingMomentsListed))
         let listed: [ProposalRecord]
         do {
             listed = try await memoryV2.listProposals(status: status)
@@ -64,10 +64,9 @@ extension SwiftToolDispatcher {
                 "reason": .string("\(error)"),
             ])
         }
-        let persona = memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID)
         let allMoments = listed.filter {
             Self.permitsProposalDisclosure($0, surface: surface,
-                persona: persona) && (lane == "all"
+                persona: nil) && (lane == "all"
                 ? (status == "rejected" || Self.awaitsReview($0))
                 : MemoryMoments.isMoment($0.metadata))
         }
@@ -162,7 +161,7 @@ extension SwiftToolDispatcher {
             ])
         }
         guard Self.permitsProposalDisclosure(proposal, surface: surface,
-            persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID)) else {
+            persona: nil) else {
             return .object([
                 "status": .string("refused"),
                 "reason": .string("This proposal is not available on this surface; nothing changed."),

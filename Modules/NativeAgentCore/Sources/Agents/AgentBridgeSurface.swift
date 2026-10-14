@@ -79,14 +79,14 @@ public enum AgentBridgeSurface {
 /// The principal behind one inbound peer request.
 ///
 /// The bridge bearer is a TRANSPORT credential shared by every route; it says
-/// the caller reached the port, never who it is. A peer therefore earns an
-/// identity only by presenting its OWN scoped credential — the per-peer secret
-/// in `AgentPeerCredentials`, which `agent_connect` already mints — and earns
-/// authority only when the person has also turned that peer's elevation on in
-/// Trust Center. Either half missing means `agent-bridge`.
+/// the caller reached the port. The authenticated built-in Claude route binds
+/// it to Claude's contact; generic routes require a peer's scoped credential
+/// from `AgentPeerCredentials`. Explicit peer headers always bind as that peer.
+/// Authority comes from the contact's elevation in Trust Center; an unelevated
+/// caller remains on `agent-bridge`.
 public struct AgentBridgePrincipal: Sendable {
     /// Stable id used in the replay claim key. "shared-bearer" when the caller
-    /// presented nothing but the transport credential.
+    /// presented only a generic transport credential.
     public let id: String
     public let peerID: String?
     public let elevated: Bool
@@ -103,6 +103,23 @@ public struct AgentBridgePrincipal: Sendable {
     /// The surface this principal's turns run on. Elevation — and ONLY
     /// elevation — restores today's `chat` behaviour.
     public var surface: String { elevated ? "chat" : AgentBridgeSurface.id }
+
+    public func turnRequest(context: String?, plain: String, attachments: [MultimodalAttachment] = [],
+                            messageID: String? = nil, originID: String? = nil) -> TurnRequest {
+        let route = ChatToolSessionContext.ReplyRoute(surface: "caller-result", destinationId: id,
+                                                     threadId: context, correlationId: messageID)
+        let envelope = TurnEnvelope(surface: surface, agent: "peer", verifiedUserId: peerID,
+                                    commandSignatureVerified: peerID != nil, deliveryRoute: route,
+                                    declaredRemote: !elevated)
+        let text = AgentBridgeSurface.turnHeader(peerName: displayName, elevated: elevated)
+            + (plain.isEmpty ? "Please read the attached content." : AgentBridgeSurface.quotingImpersonation(plain))
+        var origin = ChatMessageOrigin(surface: "agent-bridge", agent: "agent", authored: .agent, replyTo: originID)
+        origin.peerSources = [peerID.map { "peer:" + $0 } ?? "another agent"]
+        return TurnRequest(message: text, sessionID: context.map(storedConversation), attachments: attachments,
+                           surface: surface, envelope: envelope, verifiedSessionID: .some(context.map(storedConversation)), replyRoute: route,
+                           origin: origin,
+                           queryUserMessage: plain)
+    }
 
     public static let peerIDHeader = "x-nativeagent-peer-id"
     public static let peerSecretHeader = "x-nativeagent-peer-secret"
@@ -131,26 +148,20 @@ public struct AgentBridgePrincipal: Sendable {
         }
     }
 
-    /// A CLAIM THAT DOES NOT RESOLVE IS A REJECTION, not a demotion.
-    ///
-    /// Falling back to the generic local agent here meant a key the person had
-    /// revoked went on working: the entry still sent it, the machine bearer
-    /// still opened the port, and the turn was served as if no identity had
-    /// been offered. A caller that says who it is must be right about it.
-    /// Saying nothing is unchanged — that is every hand-made entry, and it
-    /// stays the generic local agent it always was.
-    public static func rejectsIdentity(headers: [String: String], dataRoot: URL) -> Bool {
-        claimsIdentity(headers: headers) && resolve(headers: headers, dataRoot: dataRoot).peerID == nil
-    }
-
-    public static func resolve(headers: [String: String], dataRoot: URL,
+    /// `authenticatedLane` is supplied only after the listener verifies the built-in bearer.
+    public static func resolve(headers: [String: String], dataRoot: URL, authenticatedLane: String? = nil,
                         readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> AgentBridgePrincipal {
         if !claimsIdentity(headers: headers) {
             guard let authorization = headers["authorization"], authorization.hasPrefix("Bearer "),
                   let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return .anonymous }
             let secret = String(authorization.dropFirst(7))
-            guard let peer = AgentPeerCredentials.resolve(secret, peers: peers,
-                readCredential: readCredential) else { return .anonymous }
+            let peer: AgentPeerContact?
+            if let authenticatedLane {
+                peer = PeerTrust.contact(forLane: authenticatedLane, among: peers)
+            } else {
+                peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential)
+            }
+            guard let peer else { return .anonymous }
             return AgentBridgePrincipal(id: peer.id, peerID: peer.id,
                 elevated: peer.elevationAllowed, displayName: peer.name, replyOnly: peer.transport == .grokBot)
         }

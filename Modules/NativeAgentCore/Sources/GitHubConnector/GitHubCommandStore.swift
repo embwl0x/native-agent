@@ -6,9 +6,8 @@ import Desk
 // MARK: - GitHub Command
 //
 // GitHubCommandStore is the operational owner for tracked GitHub work. Its
-// append-only feed is canonical; github_command_state.json is only a derived
-// projection. Connector and app layers may supply evidence and perform side
-// effects, but they cannot choose or mutate an item's state directly.
+// append-only feed is canonical. Connector and app layers may supply evidence
+// and perform side effects, but they cannot choose or mutate an item's state directly.
 
 private struct GitHubCommandCallback: Codable, Sendable, Equatable {
     let messageIds: [String]
@@ -75,7 +74,6 @@ private struct GitHubCommandCompactionBase: Codable, Sendable {
 public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     public let dataRoot: URL
     public let opsPath: URL
-    public let statePath: URL
     /// Compaction snapshot the op-log replays FROM: the full reduced state
     /// (including the monotonic dispatched at-most-once ledger) as of
     /// `lastCompactedOpId`. Written atomically BEFORE the op-log truncate; a
@@ -83,8 +81,8 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     public let basePath: URL
     /// Op-log lines that trigger a snapshot+truncate on the next write. The
     /// feed grew unbounded with O(total-ops) replay per write (audit round 2,
-    /// F1: 15.9k ops in 6 days). Injectable for tests.
-    let opsCompactionThreshold: Int
+    /// F1: 15.9k ops in 6 days).
+    let opsCompactionThreshold = 2_048
     public static let logLabel = "GitHubCommandStore"
     private let persistence = SwiftNativePersistenceCore()
     private let changeBus: StoreChangeBus
@@ -105,61 +103,30 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     /// dispatchedEventKeys otherwise grew the reduced state — rewritten on
     /// every append and baked into ops_base — forever. Retirement is anchored
     /// to the feed's OWN newest stamp, never wall-clock, so the same feed
-    /// always folds to the same state. Injectable for tests.
-    let terminalItemRetentionSeconds: TimeInterval
+    /// always folds to the same state.
+    let terminalItemRetentionSeconds: TimeInterval = 30 * 24 * 60 * 60
     /// The dispatched at-most-once ledger keeps every key a live item still
     /// references (at-most-once + settle-bounce survive) plus this many of
     /// the most recently dispatched keys — the tail covers keys whose item
     /// cleared its reference when a superseding event arrived before the old
-    /// event settled. Injectable for tests.
-    let dispatchedEventKeysTailCap: Int
-
-    /// The `liveState()` replay memo this store consults. Defaults to the
-    /// process-wide one; injectable so a test can own an isolated memo rather
-    /// than racing every other suite for its 8 entries.
-    let liveStateMemo: GitHubCommandLiveStateMemo
+    /// event settled.
+    let dispatchedEventKeysTailCap = 512
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        changeBus: StoreChangeBus = .shared,
-        opsCompactionThreshold: Int = 2_048,
-        terminalItemRetentionSeconds: TimeInterval = 30 * 24 * 60 * 60,
-        dispatchedEventKeysTailCap: Int = 512
-    ) {
-        self.init(
-            dataRoot: dataRoot,
-            changeBus: changeBus,
-            opsCompactionThreshold: opsCompactionThreshold,
-            terminalItemRetentionSeconds: terminalItemRetentionSeconds,
-            dispatchedEventKeysTailCap: dispatchedEventKeysTailCap,
-            liveStateMemo: Self.sharedLiveStateMemo
-        )
-    }
-
-    init(
-        dataRoot: URL,
-        changeBus: StoreChangeBus = .shared,
-        opsCompactionThreshold: Int = 2_048,
-        terminalItemRetentionSeconds: TimeInterval = 30 * 24 * 60 * 60,
-        dispatchedEventKeysTailCap: Int = 512,
-        liveStateMemo: GitHubCommandLiveStateMemo
+        changeBus: StoreChangeBus = .shared
     ) {
         self.dataRoot = dataRoot
         self.changeBus = changeBus
-        self.opsCompactionThreshold = max(2, opsCompactionThreshold)
-        self.terminalItemRetentionSeconds = terminalItemRetentionSeconds
-        self.dispatchedEventKeysTailCap = max(0, dispatchedEventKeysTailCap)
-        self.liveStateMemo = liveStateMemo
         let directory = dataRoot.appendingPathComponent("workshop/github_command", isDirectory: true)
         self.opsPath = directory.appendingPathComponent("ops.jsonl")
-        self.statePath = directory.appendingPathComponent("github_command_state.json")
         self.basePath = directory.appendingPathComponent("ops_base.json")
     }
 
     public func liveState() async throws -> GitHubCommandState {
         let key = Self.memoKey(opsPath)
         let stamp = Self.feedStamp(opsPath: opsPath, basePath: basePath)
-        return try await liveStateMemo.value(key: key, stamp: stamp) {
+        return try await Self.sharedLiveStateMemo.value(key: key, stamp: stamp) {
             let feed = try await readFeedUnlocked()
             let state = try replay(base: feed.base, feed.ops)
             try Self.validate(state)
@@ -296,21 +263,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     }
 
     @discardableResult
-    public func detect(
-        repository: String,
-        number: Int,
-        kind: GitHubCommandItemKind,
-        title: String
-    ) async throws -> GitHubCommandItem {
-        let repository = repository.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard repository.split(separator: "/").count == 2, number > 0 else {
-            throw GitHubCommandStoreError.invalidObservation("identity must be owner/repo plus a positive number")
-        }
-        let id = GitHubCommandObservation.itemId(repository: repository, number: number)
-        return try await append(.detected(repository: repository, number: number, kind: kind, title: title), itemId: id)
-    }
-
-    @discardableResult
     public func observe(_ observation: GitHubCommandObservation) async throws -> GitHubCommandItem {
         // One code path, one no-change filter. `.observed` carries no
         // op-against-state precondition (see `validate(_:state:)`), so the
@@ -405,7 +357,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             let state = try replay(base: feed.base, feed.ops + newOps)
             try Self.validate(state)
             try await persistence.appendJSONLDurable(try newOps.map(JSONValue.fromEncodable), to: opsPath)
-            try await persistence.writeJSON(try JSONValue.fromEncodable(state), to: statePath)
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: feed.ops + newOps,
@@ -428,7 +379,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         // The writer already owns the exact reduced state for the final feed
         // stamp. Publish it before waking readers so the physiology/runtime
         // reaction does not immediately decode and replay the same ~1 MB feed.
-        await liveStateMemo.prime(
+        await Self.sharedLiveStateMemo.prime(
             key: Self.memoKey(opsPath), stamp: committed.stamp, state: state
         )
         changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
@@ -483,7 +434,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 updated.append(result)
             }
             try Self.validate(state)
-            try await persistence.writeJSON(try JSONValue.fromEncodable(state), to: statePath)
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: ops,
@@ -500,22 +450,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             .verificationReadFailed(itemId: itemId.lowercased(), detail: Self.bounded(detail, limit: 500)),
             itemId: itemId
         )
-    }
-
-    /// Claims before delivery so a crash can lose a notification but can never
-    /// duplicate it across restart. Claims exist only for terminal success or
-    /// a specific blocker with an owner.
-    public func claimNotification(itemId: String) async throws -> GitHubCommandNotificationIntent? {
-        try await persistence.withFileLock(opsPath) {
-            let feed = try await readFeedLocked()
-            let state = try replay(base: feed.base, feed.ops)
-            guard let item = state.item(itemId) else { throw GitHubCommandStoreError.unknownItem(itemId) }
-            guard let intent = Self.notificationIntent(for: item), !item.notificationClaims.contains(intent.dedupKey) else {
-                return nil
-            }
-            _ = try await appendUnlocked(.notificationClaimed(itemId: item.itemId, intent: intent), itemId: item.itemId, feed: feed)
-            return intent
-        }
     }
 
     /// Atomically claim every currently deliverable notification with one feed
@@ -542,8 +476,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             let state = try replay(base: feed.base, feed.ops + newOps)
             try Self.validate(state)
             try await persistence.appendJSONLDurable(try newOps.map(JSONValue.fromEncodable), to: opsPath)
-            changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
-            try await persistence.writeJSON(try JSONValue.fromEncodable(state), to: statePath)
+            defer { changeBus.emit(StoreChange(store: .githubCommand, path: opsPath)) }
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: feed.ops + newOps,
@@ -551,6 +484,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 // The physical row count came from the PRE-append read; these
                 // ops are now in the file too, so carry them (finding 2).
                 integrity: feed.integrity.appendingRows(newOps.count)
+            )
+            await Self.sharedLiveStateMemo.prime(
+                key: Self.memoKey(opsPath), stamp: Self.feedStamp(opsPath: opsPath, basePath: basePath), state: state
             )
             return intents
         }
@@ -591,10 +527,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         try Self.validate(body, state: prior)
         let op = GitHubCommandOp(id: UUID().uuidString.lowercased(), at: DeskClock.nowISO(), body: body)
         try await persistence.appendJSONLDurable(try JSONValue.fromEncodable(op), to: opsPath)
-        changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
+        defer { changeBus.emit(StoreChange(store: .githubCommand, path: opsPath)) }
         let state = try replay(base: feed.base, feed.ops + [op])
         try Self.validate(state)
-        try await persistence.writeJSON(try JSONValue.fromEncodable(state), to: statePath)
         try await compactIfNeededUnlocked(
             base: feed.base,
             rebasedOps: feed.ops + [op],
@@ -602,6 +537,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             integrity: feed.integrity.appendingRows(1)
         )
         guard let item = state.item(itemId) else { throw GitHubCommandStoreError.unknownItem(itemId) }
+        await Self.sharedLiveStateMemo.prime(
+            key: Self.memoKey(opsPath), stamp: Self.feedStamp(opsPath: opsPath, basePath: basePath), state: state
+        )
         return item
     }
 

@@ -18,7 +18,6 @@ public func makeResidentProviderLLMClient(
     providersRoot: URL? = nil,
     router suppliedRouter: (any ProviderRoutingProtocol)? = nil,
     lifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
-    codexAdapterFactory: (@Sendable ([String: String]?) -> any LLMAdapter)? = nil,
     streamGuard: ProviderStreamGuardConfig = .fromEnvironment()
 ) -> any LLMClient {
     let credentialRoot = providersRoot?.standardizedFileURL
@@ -63,8 +62,7 @@ public func makeResidentProviderLLMClient(
             // Codex child processes read CODEX_HOME / NATIVE_AGENT_DATA_ROOT; bind
             // both to the credential root so a secondary runtime never reads (or
             // refreshes) the operator's personal ~/.codex. (gpt-5.5 BLOCKING.)
-            codex: codexAdapterFactory?(codexEnvironment)
-                ?? CodexAdapter(processEnvironmentOverride: codexEnvironment),
+            codex: CodexAdapter(processEnvironmentOverride: codexEnvironment),
             anthropic: AnthropicAdapter(
                 session: stallSession ?? .shared,
                 dataRootOverride: credentialRoot,
@@ -185,8 +183,6 @@ public func makeChatOrchestrationClient(
 public func makeChatOrchestrationClient(
     tools: any ToolDispatchClient,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
-    // 2026-09-06: forward the engine's retry wait seam for factory fixtures.
-    providerRecoverySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
     continuationCapabilityProfile: String? = nil,
     /// OPTIONAL CREDENTIAL/ROUTING ROOT — token-refresh writes allowed there, nothing else (nil = today's behaviour,
     /// byte for byte). See `makeDefaultChatOrchestrationClient`.
@@ -206,16 +202,11 @@ public func makeChatOrchestrationClient(
     providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
     contextFlow: (any ContextTurnPreparing)? = nil,
     memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
-    clock: @escaping @Sendable () -> Date = { Date() },
-    // Factory seam for a controlled credential-root probe. Production takes
-    // nil and constructs CodexAdapter directly; tests can observe the exact
-    // child-process environment without launching a real Codex child.
-    codexAdapterFactory: (@Sendable ([String: String]?) -> any LLMAdapter)? = nil
+    clock: @escaping @Sendable () -> Date = { Date() }
 ) -> SwiftNativeChatOrchestrationClient {
     makeDefaultChatOrchestrationClient(
         tools: tools,
         approvalFiler: approvalFiler,
-        providerRecoverySleep: providerRecoverySleep,
         continuationCapabilityProfile: continuationCapabilityProfile,
         dataRoot: dataRoot,
         providersRoot: providersRoot,
@@ -226,8 +217,7 @@ public func makeChatOrchestrationClient(
         providerLifecycleObserver: providerLifecycleObserver,
         contextFlow: contextFlow,
         memoryAtomTranslator: memoryAtomTranslator,
-        clock: clock,
-        codexAdapterFactory: codexAdapterFactory
+        clock: clock
     )
 }
 
@@ -286,11 +276,9 @@ public func makeGatedToolDispatchClient(
     trust: (any AutonomyResolver)? = nil,
     verifiedSessionId: String? = nil,
     approvedReplay: ApprovedChatToolReplay? = nil,
-    injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil,
     approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil,
     tracePeerTurn: Bool = false,
-    allowsFirstConversationExemption: Bool = false,
-    restrictBeforeGates: ((any ToolDispatchClient) -> any ToolDispatchClient)? = nil
+    allowsFirstConversationExemption: Bool = false
 ) -> any ToolDispatchClient {
     let resolvedTrust: any AutonomyResolver = trust ?? SwiftNativeTrustCenter(dataRoot: dataRoot)
     let gate = AutonomyGate(trust: resolvedTrust, approvalFiler: approvalFiler)
@@ -303,16 +291,10 @@ public func makeGatedToolDispatchClient(
         gate: gate,
         approvalFiler: approvalFiler,
         securityCenter: SwiftNativeSecurityCenter(dataRoot: dataRoot),
-        hasFiler: approvalFiler != nil,
         approvalTimeoutSeconds: approvalTimeoutSeconds,
         verifiedSessionId: verifiedSessionId,
         approvedReplay: approvedReplay,
-        // W2/W3-FIX-R2 1 — every chain this factory builds can CHECK an
-        // injection approval id against the canonical inbox on the same data
-        // root. Callers may override for a hermetic inbox; nobody has to
-        // remember to pass one for production to be safe.
-        injectionApprovalVerifier: injectionApprovalVerifier
-            ?? ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot),
+        injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot),
         // 2026-09-06 — and every NON-injection replay is checked against the
         // same inbox: the record must exist, be approved for this tool and
         // body, have been spent by the executor just now, and it is good for
@@ -336,23 +318,12 @@ public func makeGatedToolDispatchClient(
         peerDirectoryDataRoot: dataRoot,
         fileAccess: fileAccess
     )
-    if tracePeerTurn {
-        // PeerDataTaintDispatcher sits under the tracer (so a refusal is still
-        // traced) and over the gates (so a peer's words cannot reach the gate
-        // machinery at all). See PeerDataTaint.
-        dispatcher = ChatToolDispatchTracer(
-            inner: PeerDataTaintDispatcher(
-                inner: dispatcher, peerStore: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot
-            ),
-            dataRoot: dataRoot
-        )
-    }
-    // 2026-09-18: raw bridge RPC deliberately rejects external MCP names
-    // before TrustCenter can be probed; chat's bridge guard stays in its app
-    // tools. Inject the app-owned restriction here without a second chain.
-    if let restrictBeforeGates { dispatcher = restrictBeforeGates(dispatcher) }
-    // 2026-09-06: canonicalize outside the deny guard as well — `tool.catalog`
-    // used to reach `tool_catalog` without the external-MCP name scrub.
+    // Provenance policy also binds approved replays and carried work, even
+    // when those dispatch chains do not record a chat trace.
+    dispatcher = PeerDataTaintDispatcher(
+        inner: dispatcher, peerStore: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot
+    )
+    if tracePeerTurn { dispatcher = ChatToolDispatchTracer(inner: dispatcher, dataRoot: dataRoot) }
     // 2026-09-18: every surface resolves saved peer names from this same root.
     return CanonicalToolNameDispatcher(inner: dispatcher, peerDataRoot: dataRoot,
         builtInLanes: tools as? any BuiltInAgentLaneProviding, conversationScope: verifiedSessionId)
@@ -364,17 +335,8 @@ func peerExternalToolEffectResolver(dataRoot: URL) -> @Sendable (String) -> Bool
         let lowered = name.lowercased()
         if !lowered.hasPrefix("mcp__") {
             guard !SwiftToolDispatcher.reservedBuiltInNames.contains(name) else { return false }
-            let registry = dataRoot.appendingPathComponent("tools/registry.json")
-            guard FileManager.default.fileExists(atPath: registry.path) else { return false }
-            guard let bytes = try? Data(contentsOf: registry),
-                  let raw = try? JSONSerialization.jsonObject(with: bytes) else { return true }
-            let records: [[String: Any]]
-            if let rows = raw as? [[String: Any]] { records = rows }
-            else if let object = raw as? [String: Any] {
-                if let rows = object["tools"] as? [[String: Any]] { records = rows }
-                else { return object.keys.contains { $0.lowercased() == lowered } }
-            } else { return true }
-            return records.contains { ($0["id"] as? String ?? $0["name"] as? String)?.lowercased() == lowered }
+            guard let files = try? AbilityStore(dataRoot: dataRoot).files(kind: .tool) else { return true }
+            return files.contains { $0.id.lowercased() == lowered }
         }
         guard let descriptor = MCPToolBridge.listMCPTools(dataRoot: dataRoot)
             .first(where: { $0.bridgedName.lowercased() == lowered })
@@ -386,7 +348,6 @@ func peerExternalToolEffectResolver(dataRoot: URL) -> @Sendable (String) -> Bool
 private func makeDefaultChatOrchestrationClient(
     tools: any ToolDispatchClient,
     approvalFiler: (any ApprovalFiler)?,
-    providerRecoverySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
     continuationCapabilityProfile: String? = nil,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     /// OPTIONAL CREDENTIAL/ROUTING ROOT. Reads credentials + routing there; the ONLY
@@ -422,11 +383,7 @@ private func makeDefaultChatOrchestrationClient(
     memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
     // Injectable so replay tooling (turn-replay bench) can pin assembly to a
     // fixture's capture instant; production callers take the Date() default.
-    clock: @escaping @Sendable () -> Date = { Date() },
-    // Kept at the production assembly boundary: a test observes the exact
-    // environment handed to the real Codex adapter, rather than reconstructing
-    // the expected dictionary beside the factory.
-    codexAdapterFactory: (@Sendable ([String: String]?) -> any LLMAdapter)? = nil
+    clock: @escaping @Sendable () -> Date = { Date() }
 ) -> SwiftNativeChatOrchestrationClient {
     // W-J hermeticity seam: a single dataRoot threads to every source-bound
     // singleton the factory constructs (persona/router/trust/adapters/engine/
@@ -478,7 +435,7 @@ private func makeDefaultChatOrchestrationClient(
     // `dataRoot` — reads from the named credential root, writes into the
     // caller's own (disposable) body.
     let llm = makeResidentProviderLLMClient(dataRoot: dataRoot, providersRoot: providersRoot,
-        router: router, lifecycleObserver: providerLifecycleObserver, codexAdapterFactory: codexAdapterFactory)
+        router: router, lifecycleObserver: providerLifecycleObserver)
     // Swift-native cutover/fix-memory-wiring: route recall through SwiftNativeMemoryV2.shared
     // (SQLite-backed MemoryStorage) instead of the legacy JSONL store. Same
     // SQLite db the rest of MemoryV2 — UserMDGenerator, consolidation, proposal
@@ -489,9 +446,7 @@ private func makeDefaultChatOrchestrationClient(
     // a silent MockEmbeddingProvider fallback is stale — that path was removed
     // by the fail-closed cutover.
     let recaller = makeChatMemoryRecaller(dataRoot: dataRoot)
-    // Both the turn engine and the text-compatibility client expose a
-    // promotion hook. They must share the same root decision or one path can
-    // still write an alternate-root turn into the live singleton.
+    // Alternate-root turns never feed the live memory singleton.
     let promoter = makeChatMemoryPromoter(dataRoot: dataRoot)
     let turnTraceBus = makeChatTurnTraceBus(dataRoot: dataRoot)
     // remPinsDataRoot wired so REM-approved persona drift pins reach the
@@ -503,7 +458,6 @@ private func makeDefaultChatOrchestrationClient(
         router: router,
         trust: trust,
         tools: tools,
-        providerRecoverySleep: providerRecoverySleep,
         clock: clock,
         remPinsDataRoot: dataRoot,
         memoryPromoter: promoter,
@@ -522,29 +476,23 @@ private func makeDefaultChatOrchestrationClient(
         trust: trust,
         approvalFiler: approvalFiler,
         continuationCapabilityProfile: continuationCapabilityProfile,
-        // AdaptiveMemoryPromoter.shared is rooted in the production MemoryV2
-        // singleton.  An alternate-root client must never feed a synthetic
-        // turn back into that live process-wide owner.
-        promoter: promoter,
         cognitiveObserver: cognitiveObserver,
         cognitiveContextProvider: cognitiveContextProvider,
         providerLifecycleObserverInstalled: providerLifecycleObserver != nil
     )
 }
 
-// MARK: - MemoryRecalling adapter over SwiftNativeMemoryV2.shared
+// MARK: - Memory recall adapter
 
-/// Bridges SwiftNativeMemoryV2.shared (MemoryV2 module) into the
-/// ChatOrchestration-module `MemoryRecalling` protocol.
-private struct SwiftNativeMemoryV2RecallingAdapter: MemoryRecalling {
-    let memory: SwiftNativeMemoryV2
+/// Disclosure-aware recall and served-hit credit against the same memory owner.
+public struct SwiftNativeMemoryV2RecallingAdapter: Sendable {
+    private let memory: SwiftNativeMemoryV2
 
-    func recall(_ query: String, k: Int) async throws -> [MemoryRecallHit] {
-        let inner = SwiftNativeMemoryV2Recaller(memory: memory)
-        return try await inner.recall(query, k: k)
+    public init(memory: SwiftNativeMemoryV2) {
+        self.memory = memory
     }
 
-    func recall(
+    public func recall(
         _ query: String,
         k: Int,
         persona: String?,
@@ -563,7 +511,7 @@ private struct SwiftNativeMemoryV2RecallingAdapter: MemoryRecalling {
     /// the legacy recall lane fires, reached from the packet-served path.
     /// Errors are logged, never thrown — a dropped bump self-heals on any
     /// later serve, matching the recall lane's proportionate response.
-    func recordServedContextHits(ids: [String]) async {
+    public func recordServedContextHits(ids: [String]) async {
         guard !ids.isEmpty else { return }
         do {
             try await memory.recordRecallHits(ids: ids)
@@ -582,15 +530,15 @@ private struct SwiftNativeMemoryV2RecallingAdapter: MemoryRecalling {
 /// SQLite-backed actor and managed embedder rooted at the exact injected URL.
 /// Opening that store may fail; the unwired actor preserves MemoryV2's existing
 /// fail-closed behavior instead of falling back to the live singleton.
-func makeChatMemoryRecaller(dataRoot: URL) -> any MemoryRecalling {
+func makeChatMemoryRecaller(dataRoot: URL) -> SwiftNativeMemoryV2RecallingAdapter {
     SwiftNativeMemoryV2RecallingAdapter(
         memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
     )
 }
 
-func makeChatMemoryPromoter(dataRoot: URL) -> (any MemoryPromoting)? {
+func makeChatMemoryPromoter(dataRoot: URL) -> SharedAdaptiveMemoryPromoter? {
     SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot)
-        ? AdaptiveMemoryPromoterAdapter()
+        ? SharedAdaptiveMemoryPromoter()
         : nil
 }
 
@@ -598,98 +546,4 @@ func makeChatTurnTraceBus(dataRoot: URL) -> TurnTraceBus {
     dataRoot == PersistenceCore.defaultDataRoot()
         ? .shared
         : TurnTraceBus(persistLane: TurnTracePersistLane(dataRootOverride: dataRoot))
-}
-
-// MARK: - MemoryPromoting adapter over AdaptiveMemoryPromoter.shared
-
-/// Bridges AdaptiveMemoryPromoter.shared into the chat client's
-/// MemoryPromoting hook. The shared promoter is auto-configured at app
-/// launch with SwiftNativeMemoryV2.shared as its backing store.
-private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting, MomentReviewQueueReporting {
-    /// The per-turn "moments waiting" nudge asks its promoter for a count and
-    /// stays silent when the promoter cannot answer. This adapter is the one
-    /// production injects (not `SharedAdaptiveMemoryPromoter`), so without
-    /// this conformance the nudge never rendered live (2026-09-02).
-    func pendingMomentCount() async -> Int {
-        await AdaptiveMemoryPromoter.shared.pendingMomentCount()
-    }
-
-    func observeTurn(userMessage: String, assistantMessage: String, sessionId: String) async {
-        _ = await observeTurnWithTelemetry(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            sessionId: sessionId
-        )
-    }
-
-    func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        sessionId: String
-    ) async -> MemoryPromotionTelemetry {
-        await observeTurnWithTelemetry(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            toolEvidence: [],
-            sessionId: sessionId
-        )
-    }
-
-    /// Sweep item 35: this is the PRODUCTION seat of the promoter. Without the
-    /// evidence overload here, the projection would be computed every turn and
-    /// dropped by the protocol's default — a wired-looking dead nerve.
-    func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String
-    ) async -> MemoryPromotionTelemetry {
-        await observeTurnWithTelemetry(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            toolEvidence: toolEvidence,
-            sessionId: sessionId,
-            surface: "chat"
-        )
-    }
-
-    /// THE SURFACE OVERLOAD, seated in production (Astra comb 3, lane2 finding
-    /// 4, 2026-09-12). Without it the protocol's default dropped `surface` on
-    /// the floor exactly as it once dropped evidence, so every moment staged
-    /// from Telegram recorded `metadata.surface = "chat"` — proposal
-    /// `D6A7E552-1D5C-414E-B278-4CD5D5D58A87`, staged 21:53:07 from a Telegram
-    /// turn, is the live row. "The night we shipped it over Telegram" is part
-    /// of the moment; a wired-looking dead nerve is not.
-    func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String,
-        surface: String
-    ) async -> MemoryPromotionTelemetry {
-        let observation = await AdaptiveMemoryPromoter.shared.observeTurnWithReport(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            toolEvidence: toolEvidence,
-            sessionId: sessionId,
-            surface: surface,
-            standingAgentName: StandingBotContinuity.currentBot?.name,
-            turnId: TurnTraceContext.turnId
-        )
-        let staged = observation.proposals
-        var telemetry = MemoryPromotionTelemetry(
-            stagedProposalCount: staged.count,
-            semanticStatus: observation.extraction.semanticStatus,
-            semanticCandidateCount: observation.extraction.semanticCandidateCount,
-            candidateCount: observation.extraction.candidates.count
-                + observation.toolEvidenceCandidateCount
-        )
-        telemetry.momentOutcome = observation.momentOutcome
-        telemetry.savedCorrectionCount = observation.savedCorrectionCount
-        telemetry.pendingCorrectionCount = observation.pendingCorrectionCount
-        telemetry.failedCorrectionCount = observation.failedCorrectionCount
-        telemetry.noveltySkipReason = observation.noveltySkipReason
-        telemetry.failure = observation.extraction.failure
-        return telemetry
-    }
 }

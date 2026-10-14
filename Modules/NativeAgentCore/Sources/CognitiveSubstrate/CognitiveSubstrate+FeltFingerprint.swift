@@ -88,10 +88,6 @@ extension CognitiveSubstrate {
         /// rather than silently losing a threshold test.
         func read(_ dim: FeltDim) -> Double { value(dim) ?? 0 }
 
-        /// Which of the five optional dims are known right now.
-        public var presentDims: Set<FeltDim> {
-            Set(FeltDim.allCases.filter { isPresent($0) })
-        }
     }
 
     /// One candidate feeling word: the `pick` closure scores how well the *within-
@@ -396,13 +392,16 @@ extension CognitiveSubstrate {
     /// the chip then shows nothing rather than inventing an aboutness.
     public func feltModeReading(
         for request: CognitiveCapsuleRequest,
-        workspace: CognitiveWorkspaceSnapshot
+        from read: CognitiveFrozenRead
     ) -> FeltMode? {
-        guard configuration.enabled, configuration.affectEnabled else { return nil }
-        let capsuleItems = workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
+        guard read.configuration.enabled else { return nil }
+        let capsuleItems = read.workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
         return Self.feltMode(
-            feltSignalsForCapsule(from: capsuleItems, request: request),
-            intensityFloor: dynamics.feltIntensityFloor)
+            feltSignalsForCapsule(
+                from: capsuleItems, request: request, at: read.fixedAt,
+                affect: read.affect, mood: read.mood, proxies: read.feltProxies,
+                dynamics: read.personalityDynamics),
+            intensityFloor: read.personalityDynamics.feltIntensityFloor)
     }
 
     /// The fingerprint, DECOMPOSED. `feltFingerprint` is this joined with ", " —

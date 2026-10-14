@@ -1,3 +1,4 @@
+import MemoryV2
 // THE REST OF THE FOUR THINGS, ON THE SETUP PAGE.
 //
 // Every switch here writes exactly the storage its old control wrote — the
@@ -13,6 +14,7 @@
 import Cognition
 import SwiftUI
 import Context
+import MemoryV2
 import TrustCenter
 
 struct SetupFeatureRows<InnerLife: View>: View {
@@ -277,7 +279,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
         savingEmbeddings = true
         embeddingsOn = value
         do {
-            let result = try await AppModel.toggleEmbeddingsBackend(enabled: value, dataRoot: appModel.engine.dataRoot)
+            let result = try await MemoryStatusProjection.toggleEmbeddingsBackend(enabled: value, dataRoot: appModel.engine.dataRoot)
             embeddingsStatus = result.status
             embeddingsOn = result.status.requestedEnabled
             if let error = result.error {
@@ -443,7 +445,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
 
     @MainActor
     private func refreshEmbeddings() async {
-        guard let status = try? await AppModel.embeddingsStatus(dataRoot: appModel.engine.dataRoot) else { return }
+        guard let status = try? await MemoryStatusProjection.embeddingsStatus(dataRoot: appModel.engine.dataRoot) else { return }
         embeddingsStatus = status
         if !savingEmbeddings {
             embeddingsOn = status.requestedEnabled

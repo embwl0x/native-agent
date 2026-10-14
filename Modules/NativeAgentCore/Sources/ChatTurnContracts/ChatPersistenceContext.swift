@@ -25,6 +25,14 @@ public enum ChatPersistenceContext {
     /// would silently change what the bridge is allowed to do. Stamped onto
     /// the USER row's metadata only; assistant rows are always hers.
     @TaskLocal public static var originProvenance: ChatMessageOrigin?
+    /// The originating principal, independent of the turn's door or carried steering.
+    public static var originPrincipal: String {
+        if let origin = originProvenance, origin.authored != .agent { return "person" }
+        if let agent = originProvenance?.agent ?? ChatToolSessionContext.envelope?.agent {
+            return agent == "self" ? "self" : "agent:" + agent
+        }
+        return originProvenance?.authored == .agent ? "agent:unknown" : "person"
+    }
     /// A room import keeps its source timestamp instead of the enqueue time.
     @TaskLocal public static var importedMessageCreatedAt: String?
 }

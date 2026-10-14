@@ -206,7 +206,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         if error is CancellationError || (error as? URLError)?.code == .cancelled { return CancellationError() }
         if admitted, let diagnostic = error as? Diagnostic {
             return Diagnostic(cause: diagnostic.cause, detail: diagnostic.detail,
-                              deadlineExpired: diagnostic.deadlineExpired, admitted: true)
+                              deadlineExpired: diagnostic.deadlineExpired, admitted: true,
+                              liveFirstOutputCut: diagnostic.liveFirstOutputCut)
         }
         if error is any ProviderFailureWrapping { return error }
         // Output truncation carries partial prose; routing/configuration failures
@@ -233,11 +234,14 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         public let deadlineExpired: Bool
         /// The provider began a response for this request.
         public let admitted: Bool
-        public init(cause: ProviderFailure, detail: String, deadlineExpired: Bool = false, admitted: Bool = false) {
+        public let liveFirstOutputCut: Bool
+        public init(cause: ProviderFailure, detail: String, deadlineExpired: Bool = false, admitted: Bool = false,
+                    liveFirstOutputCut: Bool = false) {
             self.cause = cause
             self.detail = String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
             self.deadlineExpired = deadlineExpired
             self.admitted = admitted
+            self.liveFirstOutputCut = liveFirstOutputCut
         }
         public var errorDescription: String? { cause.errorDescription }
         public var providerFailureCause: Error { cause }

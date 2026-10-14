@@ -51,15 +51,15 @@ public protocol DeviceSyncHost: Sendable {
     func agentThreadAction(action: String, payload: [String: String]) async throws -> [String: String]
     // Snapshot reads.
     func getWorkshopExecutions() async throws -> DeviceSyncSnapshotRows
-    /// One Desk read per pass: the overview and the board it was built from
-    /// (nil items when the Desk itself could not be read).
-    func workOverview() async -> (overview: WorkOverview, deskItems: [DeskItem]?)
+    /// One Desk/authority read per pass; failed lanes keep their own errors.
+    func workOverview() async -> (
+        overview: WorkOverview, deskItems: [DeskItem]?,
+        approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>
+    )
     func getChatSessions() async throws -> [NativeAgentShared.ChatSession]
     func getChatMessages(sessionId: String) async throws -> [any DeviceSyncTranscriptMessage & Sendable]
     func getHealth() async throws -> RuntimeHealth
     func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows
-    func getTrainingProposals() async throws -> DeviceSyncSnapshotRows
-    func getPromotionPending() async throws -> DeviceSyncSnapshotRows
     func getSkills() async throws -> DeviceSyncSnapshotRows
     func activeMemories() async throws -> [MemoryV2.MemoryRecord]
     func getConnectors() async throws -> DeviceSyncSnapshotRows
@@ -70,14 +70,8 @@ public protocol DeviceSyncHost: Sendable {
     func telegramSnapshot() async throws -> MobileTelegramSnapshot
     func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot
     func getPersonality() async throws -> PersonalityProfile
-    func approvals() async throws -> [ApprovalRequest]
-    func inboxItems() async throws -> [InboxItemRecord]
     func knowledgeGraphSnapshotData() async throws -> Data
     func getRunsStrict() async -> [RunRecord]?
-    /// The Turn Inspector's per-turn summaries, off the trace day files under
-    /// `root` (nil: the live trace root); nil only on encode failure.
-    func turnSummariesSnapshotData(root: URL?, now: Date) async -> Data?
-
     // The phone's signed actions.
     /// The Mac's settings registry: every row as its page reads it, and one
     /// row set through the write its page control calls.

@@ -36,6 +36,7 @@ public final class FileChangeEvents: @unchecked Sendable {
         private let lock = NSLock()
         private var paths: [URL] = []
         private var stopped = false
+        private var armed = false
 
         init() {
             let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
@@ -48,13 +49,21 @@ public final class FileChangeEvents: @unchecked Sendable {
             defer { lock.unlock() }
             guard !stopped, !paths.contains(path) else { return }
             paths.append(path)
-            continuation.yield(())
+            if armed { continuation.yield(()) }
         }
 
         func takeNext() -> URL? {
             lock.lock()
             defer { lock.unlock() }
-            return paths.isEmpty ? nil : paths.removeFirst()
+            return !armed || paths.isEmpty ? nil : paths.removeFirst()
+        }
+
+        func didArm() {
+            lock.lock()
+            armed = true
+            let ready = !stopped && !paths.isEmpty
+            lock.unlock()
+            if ready { continuation.yield(()) }
         }
 
         func finish() {
@@ -71,17 +80,31 @@ public final class FileChangeEvents: @unchecked Sendable {
     private let lock = NSLock()
     private var watcher: FileChangeWatcher?
     private var stopped = false
+    private var armingTask: Task<Void, Never>?
 
     public init(paths: [URL], emitInitial: Bool = true) {
         let normalized = Array(Set(paths.map(\.standardizedFileURL)))
         let pending = PendingChanges()
         stream = Stream(pending: pending)
-        watcher = FileChangeWatcher(paths: normalized) { path in
-            pending.insert(path.standardizedFileURL)
+        armingTask = Task.detached(priority: .utility) { [weak self] in
+            let watcher = FileChangeWatcher(paths: normalized) { path in
+                pending.insert(path.standardizedFileURL)
+            }
+            guard let self, self.adopt(watcher) else { watcher.cancel(); return }
+            if emitInitial { normalized.forEach { pending.insert($0) } }
+            pending.didArm()
         }
-        if emitInitial {
-            normalized.forEach { pending.insert($0) }
-        }
+    }
+
+    /// Consumers doing their own first read must await registration first.
+    public func waitUntilArmed() async { await armingTask!.value }
+
+    private func adopt(_ watcher: FileChangeWatcher) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return false }
+        self.watcher = watcher
+        return true
     }
 
     public func cancel() {

@@ -439,26 +439,6 @@ extension OpenAIOAuthDirectAdapter {
         }
     }
 
-    /// Decode the (unverified) payload of a JWT. Mirrors `_jwt_payload`
-    /// at L375-L385. We only use this to read claims for account_id + exp —
-    /// the JWT is still server-side validated on every API call.
-    static func jwtPayload(_ token: String) -> [String: Any]? {
-        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count >= 2 else { return nil }
-        var b64 = String(parts[1])
-        // base64url -> base64
-        b64 = b64.replacingOccurrences(of: "-", with: "+")
-                 .replacingOccurrences(of: "_", with: "/")
-        // Pad to multiple of 4
-        let pad = b64.count % 4
-        if pad != 0 { b64.append(String(repeating: "=", count: 4 - pad)) }
-        guard let data = Data(base64Encoded: b64),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return obj
-    }
-
     /// Read a persisted `expires_at` from the auth blob. Looks at both
     /// the top level (where some flows write) and `tokens.expires_at`
     /// (where others write). Accepts ISO basic / ISO with fractional / or
@@ -468,25 +448,14 @@ extension OpenAIOAuthDirectAdapter {
         guard let raw = raw else { return nil }
         if let i = raw as? Int { return i }
         if let d = raw as? Double { return Int(exactly: d.rounded(.towardZero)) }
-        guard let s = raw as? String, !s.isEmpty else { return nil }
-        if let unix = TimeInterval(s) { return Int(exactly: unix.rounded(.towardZero)) }
-        let basic = DateFormatter()
-        basic.calendar = Calendar(identifier: .iso8601)
-        basic.locale = Locale(identifier: "en_US_POSIX")
-        basic.timeZone = TimeZone(secondsFromGMT: 0)
-        basic.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-        if let d = basic.date(from: s) { return Int(d.timeIntervalSince1970) }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-        if let d = iso.date(from: s) { return Int(d.timeIntervalSince1970) }
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = iso.date(from: s) { return Int(d.timeIntervalSince1970) }
-        return nil
+        if let s = raw as? String, let unix = TimeInterval(s) { return Int(exactly: unix.rounded(.towardZero)) }
+        guard let expiry = parseExpiresAt(raw) else { return nil }
+        return Int(exactly: expiry.timeIntervalSince1970.rounded(.towardZero))
     }
 
     /// Read `exp` claim from a JWT payload. Returns nil when missing.
     static func tokenExpiresAt(_ token: String) -> Int? {
-        guard let payload = jwtPayload(token) else { return nil }
+        guard let payload = jwtPayload(token, omittingEmptySubsequences: false) else { return nil }
         if let exp = payload["exp"] as? Int { return exp }
         if let exp = payload["exp"] as? Double { return Int(exactly: exp.rounded(.towardZero)) }
         return nil
@@ -496,7 +465,7 @@ extension OpenAIOAuthDirectAdapter {
     /// `https://api.openai.com/auth` claim. Mirrors the lookup chain in
     /// `_account_id()` at L751-L764 + the persistence path at L678-L684.
     static func extractAccountIDFromJWT(_ token: String) -> String? {
-        guard let payload = jwtPayload(token) else { return nil }
+        guard let payload = jwtPayload(token, omittingEmptySubsequences: false) else { return nil }
         guard let authClaim = payload["https://api.openai.com/auth"] as? [String: Any] else {
             return nil
         }

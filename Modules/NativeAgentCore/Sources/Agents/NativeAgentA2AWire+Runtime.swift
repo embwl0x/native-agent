@@ -89,7 +89,7 @@ public struct AgentContactA2AEndpoint: Sendable {
 
     /// The transport invokes this only after writing the selected reply.
     private func replyAcknowledgement(_ task: AgentContactTask) -> (@Sendable () async -> Void)? {
-        guard !task.replyText.isEmpty else { return nil }
+        guard !task.text.isEmpty else { return nil }
         return { await tasks.recordReplyFetch(task) }
     }
 }
@@ -106,22 +106,6 @@ enum AgentContactRuntime {
             replyOnly: principal.replyOnly)
     }
 
-    static func inboundRequest(principal: AgentBridgePrincipal, context: String, plain: String,
-                               attachments: [MultimodalAttachment] = [], messageID: String? = nil,
-                               originID: String? = nil) -> TurnRequest {
-        let route = ChatToolSessionContext.ReplyRoute(surface: "caller-result", destinationId: principal.id,
-                                                     threadId: context, correlationId: messageID)
-        let envelope = TurnEnvelope(surface: principal.surface, agent: "peer", verifiedUserId: principal.peerID,
-                                    commandSignatureVerified: principal.peerID != nil, deliveryRoute: route,
-                                    declaredRemote: !principal.elevated)
-        let text = AgentBridgeSurface.turnHeader(peerName: principal.displayName, elevated: principal.elevated)
-            + (plain.isEmpty ? "Please read the attached content." : AgentBridgeSurface.quotingImpersonation(plain))
-        return TurnRequest(message: text, sessionID: principal.storedConversation(context), attachments: attachments,
-                           surface: principal.surface, envelope: envelope, replyRoute: route,
-                           origin: ChatMessageOrigin(surface: "agent-bridge", agent: "agent", authored: .agent, replyTo: originID),
-                           queryUserMessage: plain)
-    }
-
     static func run(_ turn: AgentContactTurn, client: SwiftNativeChatOrchestrationClient, dataRoot: URL,
                     enqueued acceptedMessage: EnqueuedUserMessage? = nil,
                     emit: @escaping @Sendable (AgentContactProgress) async -> Void) async throws -> AgentContactOutcome {
@@ -132,10 +116,10 @@ enum AgentContactRuntime {
         // One turn at a time in this conversation: a second message waits for
         // the first reply to finish instead of interleaving with it.
         do {
-            return try await TurnAdmission.shared.run(sessionID: session) {
+            return try await TurnAdmission.shared.run(sessionID: session, waitForCapacity: acceptedMessage != nil) {
                 try Task.checkCancellation()
                 let admitted = try revalidated(principal, dataRoot: dataRoot)
-                let acceptedRequest = inboundRequest(principal: admitted, context: turn.context, plain: plain,
+                let acceptedRequest = admitted.turnRequest(context: turn.context, plain: plain,
                     attachments: attachments, messageID: turn.requestID)
                 let enqueued: EnqueuedUserMessage
                 if let accepted = acceptedMessage { enqueued = accepted }
@@ -143,7 +127,7 @@ enum AgentContactRuntime {
                 try await turn.bindRun(session, enqueued.runId)
                 // Enqueue and run binding suspend too; bind only current authority.
                 let current = try revalidated(principal, dataRoot: dataRoot)
-                let request = inboundRequest(principal: current, context: turn.context, plain: plain,
+                let request = current.turnRequest(context: turn.context, plain: plain,
                     attachments: attachments, messageID: turn.requestID)
                 let text = request.message
                 if let peerID = principal.peerID { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true) }
@@ -151,7 +135,7 @@ enum AgentContactRuntime {
                     try Task.checkCancellation()
                     await emit(.working)
                     let execution = client.chatStreamExecution(message: text, sessionId: session, model: "", reasoningEffort: "",
-                        fileAccess: "auto", attachments: attachments, persona: nil, surface: current.surface, suppressUserAppend: true)
+                        fileAccess: request.fileAccess, attachments: attachments, persona: nil, surface: current.surface, suppressUserAppend: true)
                     let outcome = try await withTaskCancellationHandler {
                         var final: TurnEngineResult?
                         var waiting = false
@@ -206,8 +190,6 @@ enum AgentContactRuntime {
                 }
             }
         } catch let full as TurnAdmission.Full {
-            // An already-saved row still needs consumption; let its owner
-            // retain the receipt and retry admission without appending again.
             if acceptedMessage != nil { throw full }
             return AgentContactOutcome(state: .failed, parts: [], detail: (full.errorDescription ?? "") + " Work: nothing ran.")
         }

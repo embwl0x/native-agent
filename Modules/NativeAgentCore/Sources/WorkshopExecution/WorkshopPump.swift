@@ -21,7 +21,7 @@ import CognitiveSubstrate
 //      attempt BEFORE any session/LLM. A refused reservation means skip — zero
 //      provider spend, and the unused green-window lease is returned.
 //   5. RUN one bounded session (WorkshopSession) with an unforgeable
-//      triggerSource, then completeWorkSession + write a compact receipt (M8).
+//      reservation, then completeWorkSession + write a compact receipt (M8).
 
 /// A due item the pump chose to work. `promptSeed` carries only bounded strings
 /// (title / why / doneLooksLike) — no persona bytes.
@@ -60,8 +60,7 @@ public struct WorkshopPump: Sendable {
     let store: SwiftNativeDeskStore
     let lease: BackgroundWorkLease
     let receiptLog: WorkshopReceiptLog
-    let sessionRunner: any WorkshopSessionRunning
-    let platform: any WorkshopPumpPlatform
+    let sessionRunner: WorkshopSession
     /// Organism posture (H4). nil = organism disabled → the pump stays inert
     /// (workshop is organism-gated by construction; a Wave-C toggle could relax).
     let posture: @Sendable () async -> OrganismBehaviorPosture?
@@ -69,30 +68,25 @@ public struct WorkshopPump: Sendable {
     /// the Workshop execution executor gate.
     let isEnabled: @Sendable () async -> Bool
     let now: @Sendable () -> Date
-    let flushReservationLog: @Sendable (URL) -> Bool
 
     public init(
         dataRoot: URL,
         store: SwiftNativeDeskStore,
         lease: BackgroundWorkLease,
         receiptLog: WorkshopReceiptLog,
-        sessionRunner: any WorkshopSessionRunning,
-        platform: any WorkshopPumpPlatform,
+        sessionRunner: WorkshopSession,
         posture: @escaping @Sendable () async -> OrganismBehaviorPosture?,
         isEnabled: @escaping @Sendable () async -> Bool,
-        now: @escaping @Sendable () -> Date = { Date() },
-        flushReservationLog: @escaping @Sendable (URL) -> Bool = WorkshopReservationDurability.flush
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
         self.store = store
         self.lease = lease
         self.receiptLog = receiptLog
         self.sessionRunner = sessionRunner
-        self.platform = platform
         self.posture = posture
         self.isEnabled = isEnabled
         self.now = now
-        self.flushReservationLog = flushReservationLog
     }
 
     /// Why a tick did NOT run a session (used by tests + observability). `.ran`
@@ -178,7 +172,12 @@ public struct WorkshopPump: Sendable {
         // ---- 2. NEW-WORK GATES ----
         guard await isEnabled() else { return .disabled }
 
-        if platform.isUnderResourcePressure() { return .resourcePressure }
+        let process = ProcessInfo.processInfo
+        if process.isLowPowerModeEnabled { return .resourcePressure }
+        switch process.thermalState {
+        case .serious, .critical: return .resourcePressure
+        default: break
+        }
 
         guard let posture = await posture() else {
             return .organismUnavailable
@@ -226,7 +225,7 @@ public struct WorkshopPump: Sendable {
         // the unclaimed reservation now if storage is readable, or on its next
         // recovery edge.
         do {
-            guard flushReservationLog(store.opsPath) else {
+            guard WorkshopReservationDurability.flush(store.opsPath) else {
                 throw WorkshopExecutionError.persistenceFailure("Desk reservation log could not be flushed; restore Desk storage before continuing work")
             }
             let reservedState = try await store.liveState()
@@ -259,7 +258,6 @@ public struct WorkshopPump: Sendable {
         let request = WorkshopSessionRequest(
             handle: candidate.handle,
             reservationId: reservationId,
-            title: candidate.title,
             promptSeed: candidate.promptSeed
         )
         let receipt = await sessionRunner.run(request)
@@ -308,7 +306,7 @@ public struct WorkshopPump: Sendable {
         if deskSettled && receiptSettled {
             do {
                 try await store.handOffWorkReceipt(candidate.handle, reservationId: reservationId)
-                WorkshopSessionResultStore(dataRoot: dataRoot, platform: platform).remove(reservationId: reservationId)
+                WorkshopSessionResultStore(dataRoot: dataRoot).remove(reservationId: reservationId)
             } catch {
                 nativeLog("[workshop] receipt handoff acknowledgement failed for %@/%@: %@",
                       candidate.handle, reservationId, String(describing: error))
@@ -330,7 +328,8 @@ public struct WorkshopPump: Sendable {
 
     private func verifyArtifactRefs(_ refs: [String], handle: String) -> Bool {
         guard !refs.isEmpty else { return false }
-        return refs.allSatisfy { platform.artifactIsReadable(dataRoot: dataRoot, handle: handle, relativePath: $0) }
+        let reader = WorkshopArtifactWriter(dataRoot: dataRoot, handle: handle)
+        return refs.allSatisfy { reader.isReadable(relativePath: $0) }
     }
 
     private func settlePursuitDisposition(_ receipt: WorkshopSessionReceipt, disposition: DeskWorkDisposition) async throws {
@@ -358,7 +357,7 @@ public struct WorkshopPump: Sendable {
     }
 
     private func reconcileAttempts(from state: DeskState) async throws {
-        let results = WorkshopSessionResultStore(dataRoot: dataRoot, platform: platform)
+        let results = WorkshopSessionResultStore(dataRoot: dataRoot)
         let claims = WorkshopReservationClaimStore(dataRoot: dataRoot)
         var loggedReservations: [String: Set<String>]?
         for item in state.items {
@@ -535,7 +534,8 @@ public struct WorkshopPump: Sendable {
 
         // Else User items with a beating cadence that is due.
         let userDue = globalCapHit ? [] : state.items.filter { item in
-            guard !item.isPursuit, !item.status.isTerminal, item.status != .blocked,
+            guard !item.isPursuit, item.project != MyQueue.project, item.assignee != "agent",
+                  !item.status.isTerminal, item.status != .blocked,
                   sequencing.byHandle[item.handle]?.isReady == true
             else { return false }
             switch item.cadence.mode {
@@ -590,7 +590,8 @@ public struct WorkshopPump: Sendable {
             return pursuit.sessionsUsed < pursuit.maxSessions
         }
         let ownerCadenceItems = state.items.filter { item in
-            guard !item.isPursuit, !item.status.isTerminal else { return false }
+            guard !item.isPursuit, item.project != MyQueue.project, item.assignee != "agent",
+                  !item.status.isTerminal else { return false }
             return item.cadence.mode == .tick
                 || item.cadence.mode == .daily
                 || item.cadence.mode == .weekly

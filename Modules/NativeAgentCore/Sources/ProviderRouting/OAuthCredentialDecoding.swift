@@ -1,7 +1,7 @@
 import Foundation
 
-public func jwtPayload(_ token: String) -> [String: Any]? {
-    let parts = token.split(separator: ".")
+public func jwtPayload(_ token: String, omittingEmptySubsequences: Bool = true) -> [String: Any]? {
+    let parts = token.split(separator: ".", omittingEmptySubsequences: omittingEmptySubsequences)
     guard parts.count >= 2 else { return nil }
     var body = String(parts[1])
     while body.count % 4 != 0 { body.append("=") }
@@ -33,11 +33,11 @@ public enum OAuthRefreshBinding {
             let user = tokens["user_info"] as? [String: Any] ?? [:]
             return string(account["uuid"]) ?? string(user["id"]) ?? string(user["email"])
         case "openai_oauth_direct":
-            let access = string(tokens["access_token"]).flatMap(jwtPayload) ?? [:]
+            let access = string(tokens["access_token"]).flatMap { jwtPayload($0) } ?? [:]
             let auth = access["https://api.openai.com/auth"] as? [String: Any] ?? [:]
             return string(auth["chatgpt_account_id"]) ?? string(tokens["account_id"])
         default:
-            let claims = string(tokens["id_token"]).flatMap(jwtPayload) ?? [:]
+            let claims = string(tokens["id_token"]).flatMap { jwtPayload($0) } ?? [:]
             return string(claims["sub"])
         }
     }

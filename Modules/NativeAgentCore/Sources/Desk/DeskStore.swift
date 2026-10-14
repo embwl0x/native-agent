@@ -2,13 +2,12 @@ import FeedPolicy
 import Darwin
 import Foundation
 import PersistenceCore
+import Synchronization
 
 // MARK: - SwiftNativeDeskStore — append-under-flock event store for Agent Desk
 //
-// Mirrors SwiftNativeTaskLedger EXACTLY: stateless (all state on disk), every
-// mutation is an op appended under the events-feed flock, and the derived
-// state.json is RECOMPACTED FROM OPS IN THE SAME LOCK so the materialized view
-// can never lag a committed append and a concurrent recompaction can't race.
+// Canonical state is base + ops, with every mutation appended under the
+// ops-feed flock so replay and compaction cannot race a committed append.
 //
 // STORE PATHS (under <dataRoot>/desk/):
 //   • desk_ops.jsonl   (+ .lock) — append-only op events. The canonical TRUTH
@@ -16,7 +15,6 @@ import PersistenceCore
 //     first snapshots the FULL reduced state (plus the ledgers that live in
 //     raw op history) into desk_ops_base.json.
 //   • desk_ops_base.json         — compaction snapshot the replay seeds from.
-//   • desk_state.json            — derived materialized state (rebuilt in-lock).
 //   • desk_archive.jsonl         — append-only archived item records, capped
 //     at newest-5000 via appendJSONLCapped (audit 2026-07-21 — it was the
 //     module's only uncapped JSONL; the op-log base+tail is the truth, the
@@ -50,6 +48,9 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
     public static let logLabel = "DeskStore"
+    /// Shared by every store instance; admission reads it without Desk I/O.
+    private static let truthRevision = Mutex<UInt64>(0)
+    public static var currentRevision: UInt64 { truthRevision.withLock { $0 } }
     /// Default archive-grace window for done items (48h) before they become
     /// sweep-eligible.
     public static let defaultArchiveGrace: TimeInterval = 48 * 60 * 60
@@ -65,40 +66,17 @@ public struct SwiftNativeDeskStore: Sendable {
     public let persistence: any PersistenceCoreProtocol
     private let changeBus: StoreChangeBus
     /// Op-log lines that trigger a snapshot+truncate at the end of the next
-    /// locked write transaction (mirrors GitHubCommandStore). Injectable for
-    /// tests.
-    let opsCompactionThreshold: Int
-
-    /// The `liveState()` replay memo this store consults. Defaults to the
-    /// process-wide one; injectable so a test can own an isolated memo rather
-    /// than racing every other desk suite for its 8 entries.
-    let liveStateMemo: DeskLiveStateMemo
+    /// locked write transaction (mirrors GitHubCommandStore).
+    private let opsCompactionThreshold = 2_048
 
     public init(
         dataRoot: URL,
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
-        changeBus: StoreChangeBus = .shared,
-        opsCompactionThreshold: Int = 2_048
+        changeBus: StoreChangeBus = .shared
     ) {
         self.dataRoot = dataRoot
         self.persistence = persistence
         self.changeBus = changeBus
-        self.opsCompactionThreshold = max(2, opsCompactionThreshold)
-        self.liveStateMemo = SwiftNativeDeskStore.sharedLiveStateMemo
-    }
-
-    init(
-        dataRoot: URL,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
-        changeBus: StoreChangeBus = .shared,
-        opsCompactionThreshold: Int = 2_048,
-        liveStateMemo: DeskLiveStateMemo
-    ) {
-        self.dataRoot = dataRoot
-        self.persistence = persistence
-        self.changeBus = changeBus
-        self.opsCompactionThreshold = max(2, opsCompactionThreshold)
-        self.liveStateMemo = liveStateMemo
     }
 
     private var deskDir: URL { dataRoot.appendingPathComponent("desk", isDirectory: true) }
@@ -108,8 +86,6 @@ public struct SwiftNativeDeskStore: Sendable {
     /// op-log replays FROM. Written atomically BEFORE the op-log truncate; a
     /// crash between the two is healed by the replay prefix-drop.
     public var basePath: URL { deskDir.appendingPathComponent("desk_ops_base.json") }
-    /// `<dataRoot>/desk/desk_state.json`.
-    public var statePath: URL { deskDir.appendingPathComponent("desk_state.json") }
     /// `<dataRoot>/desk/desk_archive.jsonl`.
     public var archivePath: URL { deskDir.appendingPathComponent("desk_archive.jsonl") }
 
@@ -152,8 +128,8 @@ public struct SwiftNativeDeskStore: Sendable {
                         waitingOn: "owner", progress: nil, assignee: nil, laneOf: nil))
                 try Self.validateHierarchyTransition(ask, in: state, allowArchive: false)
                 try Self.validatePursuitInvariants(ask, in: state, viaGenericPath: true)
-                _ = try await appendAndRecompactUnlocked(ask, feed: feed)
-                feed = try await readFeedUnlocked()
+                let committed = try await appendAndRecompactUnlocked(ask, feed: feed)
+                feed = committed.feed
             }
             let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                             handle: handle, body: .setContinuation(record: record))
@@ -161,8 +137,7 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
 
-    /// Append one op under the ops-feed flock, then recompact the derived state
-    /// file IN THE SAME LOCK.
+    /// Append one op and compact if needed under the ops-feed flock.
     @discardableResult
     public func append(_ op: DeskOp) async throws -> DeskOp {
         try await persistence.withFileLock(opsPath) {
@@ -200,7 +175,7 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
 
-    /// Append one canonical op, rebuild + write the derived state, then run the
+    /// Append one canonical op, reduce the state, then run the
     /// end-of-transaction compaction check. The canonical truth is base+tail:
     /// an op only ever leaves the tail by being folded into the base snapshot
     /// first, so a live item can never vanish and a retired alias can never be
@@ -225,7 +200,7 @@ public struct SwiftNativeDeskStore: Sendable {
         default:
             break
         }
-        try await persistence.appendJSONLDurable(op.toJSON(), to: opsPath)
+        try await appendOpUnlocked(op)
         changeBus.emit(StoreChange(store: .desk, path: opsPath))
         // `integrity` CARRIES FORWARD: this is the post-append view of the SAME
         // file, so the rows the read could not decode are still in it. Dropping
@@ -238,7 +213,6 @@ public struct SwiftNativeDeskStore: Sendable {
         )
         next.noteAppendedRows(1)
         let state = Self.compact(base: next.base, next.ops)
-        try await persistence.writeJSON(state.toJSON(), to: statePath)
         if let newBase = try await compactIfNeededUnlocked(state: state, feed: next) {
             // Compaction ran ⇒ the gate passed ⇒ the rewritten feed is clean.
             next = DeskFeed(base: newBase, ops: [], fileOpCount: 0, integrity: .clean)
@@ -246,15 +220,14 @@ public struct SwiftNativeDeskStore: Sendable {
         return (state, next)
     }
 
-    /// Read all ops in the FILE (no lock, no base). JSONL appends are
-    /// line-atomic via O_APPEND so a reader sees whole lines. Post-compaction
-    /// this is only the tail (plus a stale prefix in the crash window) — use
-    /// `readFeedUnlocked`/`liveState` for anything semantic.
-    public func readOpsUnlocked() async throws -> [DeskOp] {
-        try await readOpsWithIntegrityUnlocked().ops
+    private func appendOpUnlocked(_ op: DeskOp) async throws {
+        // Reject projections read before or during the awaited write, even if it throws.
+        Self.truthRevision.withLock { $0 += 1 }
+        defer { Self.truthRevision.withLock { $0 += 1 } }
+        try await persistence.appendJSONLDurable(op.toJSON(), to: opsPath)
     }
 
-    /// `readOpsUnlocked` plus the accounting of what the scan threw away.
+    /// Read the op tail plus the accounting of what the scan threw away.
     /// `DeskOp.fromJSON` returns nil for an op token this build does not know
     /// (DeskModels' tolerant `default:` arm) — tolerant on READ, but the count
     /// has to survive to `compactIfNeededUnlocked`, which would otherwise
@@ -395,7 +368,7 @@ public struct SwiftNativeDeskStore: Sendable {
         }
         for op in ops {
             switch op.body {
-            case let .createItem(alias, _, _, _, parent, _, _, _, _, _):
+            case let .createItem(alias, _, _, _, parent, _, _, _, _, _, _):
                 if let parent {
                     bump(parent, seq: alias.split(separator: ".").last.flatMap { Int($0) })
                 } else {
@@ -485,24 +458,26 @@ public struct SwiftNativeDeskStore: Sendable {
     }
 
     /// Machine-filed work (origin system). `note`'s first line is the item's
-    /// key: the open item in `project` holding a note with that first line is
-    /// reused; otherwise the item is created with `note` and `refs`. Lookup
-    /// and writes share one flock transaction, so a repeat files nothing.
-    /// `reopen`: a closed item with that key is reopened rather than doubled.
+    /// key: repeats refresh the original item, preserving a closed or
+    /// person-owned finding. Lookup and writes share one flock transaction.
+    /// `reopen` explicitly reopens a closed item with that key.
     public func fileSystemItem(
         kind: DeskKind,
         project: String,
         title: String,
         summary: String?,
         assignee: String?,
+        findingKey: String,
         note: String,
         refs: [DeskRef],
-        reopen: Bool = false
+        reopen: Bool = false,
+        refreshRefs: Bool = false
     ) async throws -> CreateResult {
         try await createItemTransaction(
             kind: kind, project: project, title: title, parent: nil, summary: summary,
             assignee: assignee, laneOf: nil, reuseEquivalent: false,
-            origin: .system, keyNote: note, refs: refs, reopenKeyed: reopen
+            origin: .system, keyNote: note, findingKey: findingKey, refs: refs, reopenKeyed: reopen,
+            refreshRefs: refreshRefs
         )
     }
 
@@ -517,9 +492,9 @@ public struct SwiftNativeDeskStore: Sendable {
             var step = incoming
             if let same {
                 if incoming.source != nil { step = same.step }
-                step.peers = same.step.peers + incoming.peers.filter { !same.step.peers.contains($0) }
-                step.elevated = same.step.elevated + incoming.elevated.filter { !same.step.elevated.contains($0) }
-                step.filedAt = same.step.filedAt
+                step.peers = incoming.peers
+                step.elevated = incoming.elevated
+                step.preserveOrigin(of: same.step)
                 if incoming.source == nil, case .userWrites? = MyQueue.When(step.when, card: step.card) {
                     step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
                 }
@@ -573,8 +548,10 @@ public struct SwiftNativeDeskStore: Sendable {
         reuseEquivalent: Bool,
         origin: DeskOrigin = .owner,
         keyNote: String? = nil,
+        findingKey: String? = nil,
         refs: [DeskRef] = [],
-        reopenKeyed: Bool = false
+        reopenKeyed: Bool = false,
+        refreshRefs: Bool = false
     ) async throws -> CreateResult {
         guard Self.equivalentDeskText(project) != MyQueue.project else {
             throw DeskError.queueCreationRequiresQueuePath
@@ -607,20 +584,49 @@ public struct SwiftNativeDeskStore: Sendable {
                }) {
                 return CreateResult(item: existing, reusedEquivalent: true)
             }
-            let firstLine = { (text: String) in text.prefix { $0 != "\n" } }
-            let keyed = keyNote.map { keyNote in priorState.items.filter { item in
-                item.project == project && item.notes.contains { firstLine($0.text) == firstLine(keyNote) }
-            } } ?? []
-            if let existing = keyed.first(where: { !$0.status.isTerminal }) {
+            let keyed = findingKey.map { key in
+                priorState.items.filter { $0.project == project && $0.findingKey == key }
+            } ?? []
+            if !reopenKeyed, keyed.isEmpty, let findingKey,
+               let archived = try await self.archivedRecords().first(where: { $0.project == project && $0.findingKey == findingKey }) {
+                throw DeskError.findingArchived(handle: archived.handle)
+            }
+            if !reopenKeyed, let existing = keyed.first,
+               existing.status.isTerminal || existing.assignee == "owner" || existing.waitingOn == "owner" {
                 return CreateResult(item: existing, reusedEquivalent: true)
             }
-            if reopenKeyed, let closed = keyed.first {
-                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: closed.handle, body: .setStatus(
-                    status: .watch, blockedReason: nil, waitingOn: nil, progress: nil, assignee: nil, laneOf: nil))
-                try Self.validateHierarchyTransition(op, in: priorState, allowArchive: false)
-                let reopened = try await appendAndRecompactUnlocked(op, feed: feed).state
-                guard let item = reopened.items.first(where: { $0.handle == closed.handle }) else {
-                    throw DeskError.unknownHandle(closed.handle)
+            if let existing = keyed.first(where: { !$0.status.isTerminal }) ?? keyed.first {
+                var bodies: [DeskOpBody] = []
+                if existing.status.isTerminal {
+                    bodies.append(.setStatus(status: .watch, blockedReason: nil, waitingOn: nil,
+                        progress: nil, assignee: nil, laneOf: nil))
+                }
+                var incomingRefs = refs
+                if let index = incomingRefs.lastIndex(where: { $0.kind.token == "step" }),
+                   case .step(var step) = incomingRefs[index].kind {
+                    if let previous = existing.step { step.preserveOrigin(of: previous) }
+                    incomingRefs[index].kind = .step(step)
+                    if !refreshRefs && step != existing.step {
+                        bodies.append(.addRef(ref: DeskRef(kind: .step(step))))
+                    }
+                }
+                let nextTitle = existing.title != title ? title : nil
+                let nextSummary = summary?.isEmpty == false && existing.summary != summary ? summary : nil
+                let nextRefs = refreshRefs && existing.refs.map(\.kind) != incomingRefs.map(\.kind) ? incomingRefs : nil
+                // Only a change is written: an unchanged refile appended an empty
+                // op, and the delegation loop watches this log (a CPU loop, 10-12).
+                if nextTitle != nil || nextSummary != nil || nextRefs != nil {
+                    bodies.append(.updateTitle(title: nextTitle, summary: nextSummary, refs: nextRefs))
+                }
+                var (state, committedFeed) = (priorState, feed)
+                for body in bodies {
+                    let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs),
+                        handle: existing.handle, body: body)
+                    try Self.validateHierarchyTransition(op, in: state, allowArchive: false)
+                    (state, committedFeed) = try await appendAndRecompactUnlocked(op, feed: committedFeed)
+                }
+                guard let item = state.items.first(where: { $0.handle == existing.handle }) else {
+                    throw DeskError.unknownHandle(existing.handle)
                 }
                 return CreateResult(item: item, reusedEquivalent: true)
             }
@@ -634,7 +640,7 @@ public struct SwiftNativeDeskStore: Sendable {
             let create = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: .createItem(
                 alias: alias, kind: kind, project: project, title: title, parent: parent, summary: summary,
                 assignee: assignee, laneOf: laneOf,
-                origin: origin, pursuit: nil
+                origin: origin, pursuit: nil, findingKey: findingKey
             ))
             try Self.validateHierarchyTransition(create, in: priorState, allowArchive: false)
             try Self.validatePursuitInvariants(create, in: priorState, viaGenericPath: true)
@@ -952,8 +958,8 @@ public struct SwiftNativeDeskStore: Sendable {
     }
 
     @discardableResult
-    public func appendNote(_ handle: String, text: String) async throws -> DeskOp {
-        try await appendValidated(DeskOp(handle: handle, body: .appendNote(text: text)))
+    public func appendNote(_ handle: String, text: String, author: String = "system") async throws -> DeskOp {
+        try await appendValidated(DeskOp(handle: handle, body: .appendNote(text: text, author: author)))
     }
 
     enum ObservationNoteResult: Sendable { case appended, unchanged, raced, missing }
@@ -1482,11 +1488,9 @@ public struct SwiftNativeDeskStore: Sendable {
                     }
                     let archiveOp = DeskOp(ts: now, handle: node.handle, body: .archiveItem)
                     // The whole subtree was validated against one locked state.
-                    // Append every canonical op first, then fold/write the derived
-                    // state once; the previous per-node recompaction was O(K×N)
-                    // and wrote K transient projections that no reader could see
-                    // while this same flock was held.
-                    try await persistence.appendJSONLDurable(archiveOp.toJSON(), to: opsPath)
+                    // Append every canonical op first, then reduce once for
+                    // compaction while this same flock is held.
+                    try await appendOpUnlocked(archiveOp)
                     feed.ops.append(archiveOp)
                     feed.noteAppendedRows(1)
                     appendedCanonicalOp = true
@@ -1494,68 +1498,24 @@ public struct SwiftNativeDeskStore: Sendable {
                 }
             } catch {
                 // The two append-only feeds cannot be one filesystem
-                // transaction. Deepest-first keeps a partial commit valid, and
-                // this repair makes the materialized view match every canonical
-                // op already durably appended before rethrowing the real error.
+                // transaction. Deepest-first keeps a partial commit valid;
+                // readers must observe those committed ops even on failure.
                 if appendedCanonicalOp {
-                    do {
-                        let repairFeed = try await readFeedUnlocked()
-                        let repairedState = Self.compact(base: repairFeed.base, repairFeed.ops)
-                        try await persistence.writeJSON(repairedState.toJSON(), to: statePath)
-                        changeBus.emit(StoreChange(store: .desk, path: opsPath))
-                    } catch let repairError {
-                        FileHandle.standardError.write(Data(
-                            "DeskStore: partial archive projection repair failed: \(repairError)\n".utf8
-                        ))
-                    }
+                    changeBus.emit(StoreChange(store: .desk, path: opsPath))
                 }
                 throw error
             }
             let archivedState = Self.compact(base: feed.base, feed.ops)
-            try await persistence.writeJSON(archivedState.toJSON(), to: statePath)
             changeBus.emit(StoreChange(store: .desk, path: opsPath))
             _ = try await compactIfNeededUnlocked(state: archivedState, feed: feed)
             return targetRecord ?? Self.makeArchiveRecord(item, now: now)
         }
     }
 
-    /// archiveSweep — RETURN the handles eligible for archival (TERMINAL — done
-    /// OR canceled — not pinned, past the grace window, terminal children only,
-    /// not standing, no unresolved continuation steps). Does NOT mutate anything;
-    /// callers must call archiveItem explicitly. Pure query (state read +
-    /// deterministic predicate).
-    ///
-    /// The guard is `status.isTerminal`, matching archiveItem (which accepts any
-    /// terminal item) and makeArchiveRecord (which maps `.canceled` to a canceled
-    /// final record). A `.done`-only guard stranded every canceled top-level item
-    /// in live state forever — never swept, and (before the matching projection
-    /// fix) never capped, so canceled rows accumulated at the lowest aliases and
-    /// pushed live work off the 25-item desk. Both terminal paths stamp closedAt
-    /// (close_item always; set_status when `status.isTerminal`), so the grace
-    /// window below is well-defined for canceled rows too.
-    public func archiveSweep(now: Date = Date(), grace: TimeInterval = SwiftNativeDeskStore.defaultArchiveGrace) async throws -> [String] {
-        let state = try await liveState()
-        return state.items.compactMap { item -> String? in
-            guard item.parent == nil else { return nil }       // only sweep top-level
-            guard item.status.isTerminal, !item.pinned else { return nil }
-            guard item.kind != .standing else { return nil }
-            guard item.continuation?.pending.isEmpty ?? true else { return nil }
-            guard let closedAt = item.closedAt, let closed = DeskClock.parseISO(closedAt) else { return nil }
-            guard now.timeIntervalSince(closed) >= grace else { return nil }
-            // Parent cannot archive with a standing or non-terminal descendant (recursive —
-            // matches archiveItem's subtree check).
-            if Self.descendants(of: item.handle, in: state).contains(where: {
-                $0.kind == .standing || !$0.status.isTerminal || !($0.continuation?.pending.isEmpty ?? true)
-            }) { return nil }
-            return item.handle
-        }
-    }
-
     // MARK: - Queries
 
     /// The current live materialized state, recompacted from the replayable
-    /// feed — base + tail — (always current; does not read the cached
-    /// state.json). Reads UNDER THE FLOCK: an unlocked reader can race a
+    /// feed — base + tail. Reads UNDER THE FLOCK: an unlocked reader can race a
     /// compaction into (stale ops snapshot, new base) — the base's
     /// lastCompactedOpId is absent from the stale snapshot, so no prefix-drop
     /// happens and old ops replay on top of a base that already contains them
@@ -1592,14 +1552,14 @@ public struct SwiftNativeDeskStore: Sendable {
         try await persistence.withFileLock(opsPath) {
             let key = Self.memoKey(opsPath)
             let before = Self.feedStamp(opsPath: opsPath, basePath: basePath)
-            if let cached = await liveStateMemo.lookup(key: key, stamp: before) {
+            if let cached = await Self.sharedLiveStateMemo.lookup(key: key, stamp: before) {
                 return cached
             }
             let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
             let after = Self.feedStamp(opsPath: opsPath, basePath: basePath)
             if let before, after == before {
-                await liveStateMemo.store(key: key, stamp: before, state: state)
+                await Self.sharedLiveStateMemo.store(key: key, stamp: before, state: state)
             }
             return state
         }
@@ -1611,7 +1571,7 @@ public struct SwiftNativeDeskStore: Sendable {
     public func liveStateUnlocked() async throws -> DeskState {
         let key = Self.memoKey(opsPath)
         let before = Self.feedStamp(opsPath: opsPath, basePath: basePath)
-        if let cached = await liveStateMemo.lookup(key: key, stamp: before) { return cached }
+        if let cached = await Self.sharedLiveStateMemo.lookup(key: key, stamp: before) { return cached }
         let feed = try await readFeedUnlocked()
         let state = Self.compact(base: feed.base, feed.ops)
         guard let before, Self.feedStamp(opsPath: opsPath, basePath: basePath) == before else {
@@ -1684,7 +1644,7 @@ public struct SwiftNativeDeskStore: Sendable {
         viaGenericPath: Bool
     ) throws {
         switch op.body {
-        case let .createItem(_, kind, project, _, parent, _, _, _, origin, pursuit):
+        case let .createItem(_, kind, project, _, parent, _, _, _, origin, pursuit, _):
             if viaGenericPath, Self.equivalentDeskText(project) == MyQueue.project {
                 throw DeskError.queueCreationRequiresQueuePath
             }
@@ -1812,7 +1772,7 @@ public struct SwiftNativeDeskStore: Sendable {
         allowArchive: Bool
     ) throws {
         switch op.body {
-        case let .createItem(_, _, _, _, parent, _, _, _, _, _):
+        case let .createItem(_, _, _, _, parent, _, _, _, _, _, _):
             guard let parent else { return }
             guard state.items.contains(where: { $0.handle == parent }) else {
                 throw DeskError.unknownHandle(parent)
@@ -1929,7 +1889,8 @@ public struct SwiftNativeDeskStore: Sendable {
             summary: item.summary ?? "",
             refs: item.liveRefs(limit: 3),
             decisions: [],
-            artifacts: []
+            artifacts: [],
+            findingKey: item.findingKey
         )
     }
 
@@ -1947,7 +1908,7 @@ public struct SwiftNativeDeskStore: Sendable {
     static func nextAlias(parentHandle: String?, parentAlias: String?, base: DeskCompactionBase? = nil, ops: [DeskOp]) -> String {
         let siblingAliases: [String] = ops.compactMap { op in
             switch op.body {
-            case .createItem(let alias, _, _, _, let parent, _, _, _, _, _):
+            case .createItem(let alias, _, _, _, let parent, _, _, _, _, _, _):
                 return parent == parentHandle ? alias : nil
             case .openPursuit(let alias, _, _, _, _, _):
                 return parentHandle == nil ? alias : nil
@@ -2029,6 +1990,15 @@ extension SwiftNativeDeskStore {
     /// its own stopped run's. An item that is not open holds nothing.
     public func hold(_ ref: String, session: String, now: Date = Date()) async throws -> String? {
         try await hold([ref], session: session, now: now)
+    }
+
+    /// Read another conversation's hold without reserving this item's work.
+    public func heldBy(_ ref: String, session: String, now: Date = Date()) async throws -> String? {
+        try await editHolds(now: now) { holds, state in
+            guard let item = Self.holdItem(ref, state), let held = holds[item.handle],
+                  isLive(held, now: now, state: state), held.session != session else { return nil }
+            return held.by
+        }
     }
 
     /// Acquire the entire group only when none is held by another conversation.
@@ -2122,27 +2092,11 @@ actor DeskLiveStateMemo {
     private var entries: [String: Entry] = [:]
     /// Least-recently-stored first; the eviction order for `maxEntries`.
     private var order: [String] = []
-    /// PER-KEY hit/miss tallies. Test-only, and per-key on purpose: the memo is
-    /// process-wide, so global counters are polluted by every other desk suite
-    /// running concurrently in the same test process.
-    private var counters: [String: (hits: Int, misses: Int)] = [:]
-
     func lookup(key: String, stamp: FeedStamp?) -> DeskState? {
-        var tally = counters[key] ?? (0, 0)
-        defer { note(key: key, tally: tally) }
         guard let stamp, let entry = entries[key], entry.stamp == stamp else {
-            tally.misses += 1
             return nil
         }
-        tally.hits += 1
         return entry.state
-    }
-
-    private func note(key: String, tally: (hits: Int, misses: Int)) {
-        if counters[key] == nil, counters.count >= Self.maxEntries * 4 {
-            counters.removeAll()
-        }
-        counters[key] = tally
     }
 
     func store(key: String, stamp: FeedStamp, state: DeskState) {
@@ -2156,26 +2110,4 @@ actor DeskLiveStateMemo {
         entries[key] = Entry(stamp: stamp, state: state)
     }
 
-    /// Test seam: fresh-process equivalent for ONE feed. Key-scoped on
-    /// purpose — this memo is process-wide, so a global wipe from one test
-    /// silently re-warms every other test running beside it.
-    func forget(key: String) {
-        entries[key] = nil
-        order.removeAll { $0 == key }
-        counters[key] = nil
-    }
-
-    /// Test seam: fresh-process equivalent for everything. Only safe when no
-    /// other desk work is in flight.
-    func reset() {
-        entries.removeAll()
-        order.removeAll()
-        counters.removeAll()
-    }
-
-    /// Test seam: this key's tallies plus the live entry count.
-    func _testStats(key: String) -> (hits: Int, misses: Int, entries: Int) {
-        let tally = counters[key] ?? (0, 0)
-        return (tally.hits, tally.misses, entries.count)
-    }
 }

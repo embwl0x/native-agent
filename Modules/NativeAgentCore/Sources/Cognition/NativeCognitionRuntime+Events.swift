@@ -6,80 +6,6 @@ import PersistenceCore
 import TurnTrace
 
 enum NativeCognitiveEventFactory {
-    static func turnMessage(
-        surface: String,
-        role: String,
-        text: String,
-        sessionId: String?,
-        messageId: String?,
-        turnKind: CognitiveTurnKind? = nil,
-        now: Date = Date()
-    ) -> CognitiveEvent? {
-        let normalizedRole = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let kind: CognitiveEventKind
-        let sourceClass: CognitiveSourceClass
-        switch normalizedRole {
-        case "user":
-            kind = .userMessageReceived
-            sourceClass = .userStated
-        case "assistant":
-            kind = .assistantTurnCompleted
-            sourceClass = .observed
-        default:
-            return nil
-        }
-
-        let safeText = bounded(redact(text.trimmingCharacters(in: .whitespacesAndNewlines)), max: 700)
-        guard !safeText.isEmpty else { return nil }
-        let safeSurface = bounded(redact(surface), max: 80)
-        let safeSession = bounded(redact(sessionId ?? "unknown"), max: 180)
-        let safeMessage = bounded(redact(messageId ?? timestampID(now)), max: 180)
-
-        let resolvedTurnKind: CognitiveTurnKind = if let turnKind {
-            turnKind
-        } else {
-            switch CognitiveTurnKind.inferred(fromSignals: [safeSurface, safeText]) {
-            case .debug: .debug
-            case .verification: .verification
-            case .live, .system, .mechanical: .live
-            }
-        }
-
-        return CognitiveEvent(
-            id: "turn:\(safeSurface):\(normalizedRole):\(safeSession):\(safeMessage):\(timestampID(now))",
-            kind: kind,
-            subject: CognitiveSubjectReference(
-                type: "chat_turn",
-                id: "\(safeSession):\(safeMessage)",
-                // 2026-09-02 — A TOPIC, NOT A ROUTE. This label used to be
-                // "<surface> <role>" ("chat user"), which is where the turn
-                // came from, not what it was about; the felt line's object
-                // organ read subject labels and could only ever have said
-                // "warm — chat user" with it. The topic label is up to three
-                // salient content words from the already-redacted turn text,
-                // through the same extractor Fluid Context uses for attention
-                // terms, and nil when nothing is salient (then no object).
-                // The route itself is not lost: `surface` and `role` are
-                // already separate metadata keys below, and `routeLabel`
-                // preserves the exact composed string anything was reading.
-                label: CognitiveSubstrate.feltTopicLabel(from: safeText)
-            ),
-            sourceClass: sourceClass,
-            occurredAt: now,
-            summary: safeText,
-            importance: normalizedRole == "user" ? 0.62 : 0.48,
-            turnKind: resolvedTurnKind,
-            metadata: [
-                "surface": .string(safeSurface),
-                "role": .string(normalizedRole),
-                "sessionId": .string(safeSession),
-                "messageId": .string(safeMessage),
-                "event_class": .string(kind.rawValue),
-                "routeLabel": .string("\(safeSurface) \(normalizedRole)"),
-            ]
-        )
-    }
-
     static func remoteAction(
         surface: String,
         action: String,
@@ -351,12 +277,6 @@ enum NativeCognitiveEventFactory {
         return String(value.prefix(max)) + "..."
     }
 
-    fileprivate static func sessionKey(_ value: String?) -> String? {
-        let safeSession = bounded(redact(value ?? "unknown"), max: 180)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return safeSession.isEmpty || safeSession == "unknown" ? nil : safeSession
-    }
-
     private static func timestampID(_ date: Date) -> String {
         String(Int64(date.timeIntervalSince1970 * 1000))
     }
@@ -387,80 +307,6 @@ extension NativeCognitionRuntime {
             nil
         }
         return (resolved, completedRunId)
-    }
-
-    func observeTurnMessage(
-        surface: String,
-        role: String,
-        text: String,
-        sessionId: String? = nil,
-        messageId: String? = nil
-    ) async {
-        let normalizedRole = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let normalizedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let safeSession = NativeCognitiveEventFactory.sessionKey(sessionId)
-        let inheritedTurnKind: CognitiveTurnKind?
-        if let safeSession, debugSessionIds.contains(safeSession) {
-            inheritedTurnKind = .debug
-        } else if normalizedRole == "assistant",
-           let safeSession,
-           pendingDebugReplySessionIds.remove(safeSession) != nil {
-            inheritedTurnKind = .debug
-        } else {
-            inheritedTurnKind = nil
-            if normalizedRole == "user", let safeSession {
-                pendingDebugReplySessionIds.remove(safeSession)
-            }
-        }
-
-        guard let event = NativeCognitiveEventFactory.turnMessage(
-            surface: surface,
-            role: role,
-            text: text,
-            sessionId: sessionId,
-            messageId: messageId,
-            turnKind: inheritedTurnKind
-        ) else {
-            return
-        }
-        if normalizedRole == "user",
-           event.turnKind == .debug,
-           let safeSession,
-           Self.canTreatWholeSessionAsDebug(surface: normalizedSurface) {
-            markSessionDebug(safeSession)
-            pendingDebugReplySessionIds.insert(safeSession)
-        }
-        await observe(event)
-    }
-
-    func observeUserMessage(
-        surface: String,
-        text: String,
-        sessionId: String? = nil,
-        messageId: String? = nil
-    ) async {
-        await observeTurnMessage(
-            surface: surface,
-            role: "user",
-            text: text,
-            sessionId: sessionId,
-            messageId: messageId
-        )
-    }
-
-    func observeAssistantTurnCompleted(
-        surface: String,
-        text: String,
-        sessionId: String? = nil,
-        messageId: String? = nil
-    ) async {
-        await observeTurnMessage(
-            surface: surface,
-            role: "assistant",
-            text: text,
-            sessionId: sessionId,
-            messageId: messageId
-        )
     }
 
     public func observeRemoteAction(
@@ -496,26 +342,12 @@ extension NativeCognitionRuntime {
         guard let trace = NativeCognitiveEventFactory.motorActionTrace(model) else { return }
         TurnTraceBus.fire(trace)
     }
-
-    private static func canTreatWholeSessionAsDebug(surface: String) -> Bool {
-        surface == "chat" || surface == "codex_bridge" || surface.contains("codex")
-    }
 }
 
 extension NativeCognitionRuntime: LLMCallLifecycleObserving {
     public func observeProviderCall(_ event: LLMCallLifecycleEvent) async {
         await bootstrap()
         recordProviderLifecycleEvidence(event)
-        // Provider-path evidence remains useful exact operational truth, but a
-        // provider call caused by a Codex/debug bridge turn is not lived chat.
-        // The matching user/tool/reply events are already excluded from the
-        // somatic bus; excluding this parallel lifecycle edge prevents the
-        // diagnostic call from changing agency, vigilance, or confidence by
-        // itself while preserving the health belief above.
-        if let session = NativeCognitiveEventFactory.sessionKey(event.sessionId),
-           debugSessionIds.contains(session) || pendingDebugReplySessionIds.contains(session) {
-            return
-        }
         // INTEROCEPTION: passively feed the vitals sensor from the SAME lifecycle
         // event. Band transitions become graded felt sluggishness. Zero new
         // provider calls.

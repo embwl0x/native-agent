@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 // MARK: - Bounded reader for the per-day turn-trace feed
 //
@@ -22,16 +23,6 @@ import PersistenceCore
 //      be opened/decoded is an `unreadableDay`, never a zero. Absent day files
 //      are simply absent — that is a different fact, and the callers report it
 //      as UNMEASURED rather than as health.
-
-/// One parsed turn-trace row, reduced to the envelope the Doctor rows need.
-struct TurnTraceRow: Sendable {
-    let kind: String
-    let ts: Date
-    let turnId: String
-    let sessionId: String?
-    let surface: String?
-    let payload: [String: JSONValue]
-}
 
 /// What a window scan could and could not see. Every field here exists so a
 /// caller can say what it measured instead of implying it measured everything.
@@ -71,8 +62,6 @@ struct DoctorMeasurementWindow: Sendable {
     /// The clause the check prints, so the operator always knows what window
     /// produced the number.
     let describedAs: String
-    /// True when no usable build launch stamp was found.
-    let isFallback: Bool
 
     /// Day files worth opening for this floor, capped so a bogus stamp can
     /// never widen the bounded read.
@@ -89,23 +78,20 @@ enum DoctorWindowFloor {
 
     static func resolve(
         root: URL,
-        now: Date,
-        identity: NativeAgentBuildIdentity = .current
+        now: Date
     ) -> DoctorMeasurementWindow {
-        guard let stamp = launchStamp(root: root, identity: identity), stamp <= now else {
+        guard let stamp = launchStamp(root: root, identity: .current), stamp <= now else {
             return DoctorMeasurementWindow(
                 floor: now.addingTimeInterval(-fallbackWindow),
                 describedAs: "no launch stamp for the running build on disk, so the window"
-                    + " falls back to the last 24h",
-                isFallback: true
+                    + " falls back to the last 24h"
             )
         }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return DoctorMeasurementWindow(
             floor: stamp,
-            describedAs: "since this build launched at \(formatter.string(from: stamp))",
-            isFallback: false
+            describedAs: "since this build launched at \(formatter.string(from: stamp))"
         )
     }
 
@@ -126,7 +112,7 @@ enum DoctorWindowFloor {
               let value = try? JSONValue.parse(data),
               case .object(let object) = value,
               let writtenAt = object["writtenAt"]?.stringValue,
-              let stamp = TurnTraceWindowReader.parseISO8601(writtenAt)
+              let stamp = TurnTraceEvent.parseISO8601(writtenAt)
         else { return nil }
         guard object["build"]?.stringValue == identity.build,
               object["version"]?.stringValue == identity.version
@@ -185,105 +171,18 @@ enum TurnTraceWindowReader {
             let path = dir.appendingPathComponent("\(name).jsonl")
             guard FileManager.default.fileExists(atPath: path.path) else { continue }
 
-            guard let (text, truncated) = tail(path, budget: budgetPerDay) else {
-                // The file is THERE and unreadable. Rule 3.
+            guard let result = TurnTraceReplayReader.scan(
+                path, budget: budgetPerDay, floor: cutoff, kinds: kinds, handle: handle
+            ) else {
                 summary.unreadableDays.append(name)
                 continue
             }
             summary.daysPresent.append(name)
-            if truncated { summary.truncatedDays.append(name) }
-
-            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                guard kinds.contains(where: { line.contains($0) }) else { continue }
-                // The substring hit above is only a CANDIDATE: a valid
-                // context.ready or provider.requestStarted row can mention a
-                // requested kind inside its payload. Parse first, and decide
-                // "malformed" only on a line that genuinely failed to parse as
-                // a trace row. A row that parsed fine and simply carries a
-                // different top-level kind is someone else's row, not a defect.
-                guard let data = String(line).data(using: .utf8),
-                      let value = try? JSONValue.parse(data),
-                      case .object(let row) = value
-                else {
-                    summary.malformedLines += 1
-                    continue
-                }
-                guard case .string(let kind)? = row["kind"] else {
-                    // A trace row with no top-level kind really is malformed.
-                    summary.malformedLines += 1
-                    continue
-                }
-                // Not ours. Silence, not a corruption warning.
-                guard kinds.contains(kind) else { continue }
-                guard case .string(let ts)? = row["ts"],
-                      let stamp = parseISO8601(ts)
-                else {
-                    // One of ours, but undatable — that is a real defect.
-                    summary.malformedLines += 1
-                    continue
-                }
-                guard stamp >= cutoff else { continue }
-                var payload: [String: JSONValue] = [:]
-                if case .object(let object)? = row["payload"] { payload = object }
-                let turnId: String = {
-                    if case .string(let value)? = row["turnId"] { return value }
-                    return ""
-                }()
-                summary.matchedRows += 1
-                handle(
-                    TurnTraceRow(
-                        kind: kind,
-                        ts: stamp,
-                        turnId: turnId,
-                        sessionId: stringValue(row["sessionId"]),
-                        surface: stringValue(row["surface"]),
-                        payload: payload
-                    )
-                )
-            }
+            if result.truncated { summary.truncatedDays.append(name) }
+            summary.malformedLines += result.malformedLines
+            summary.matchedRows += result.matchedRows
         }
         return summary
-    }
-
-    /// Read at most `budget` bytes from the END of `path`. Returns nil only
-    /// when the file exists but cannot be read or decoded — the caller turns
-    /// that into a FAIL. The bool says whether the head was cut.
-    private static func tail(_ path: URL, budget: Int) -> (String, Bool)? {
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return nil }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd() else { return nil }
-        let base = size > UInt64(budget) ? size - UInt64(budget) : 0
-        let truncated = base > 0
-        // A byte-offset tail can land mid-UTF8. Nudge the start forward a few
-        // bytes rather than calling a perfectly readable day unreadable. A
-        // WHOLE-file read that will not decode really is unreadable, so the
-        // nudge only applies to a tailed read.
-        for nudge in 0...(truncated ? 4 : 0) {
-            let start = base + UInt64(nudge)
-            guard start <= size,
-                  (try? handle.seek(toOffset: start)) != nil,
-                  let data = try? handle.readToEnd(),
-                  var text = String(data: data, encoding: .utf8)
-            else { continue }
-            if truncated, let newline = text.firstIndex(of: "\n") {
-                // Drop the partial first line the byte cut produced.
-                text = String(text[text.index(after: newline)...])
-            }
-            return (text, truncated)
-        }
-        return nil
-    }
-
-    static func parseISO8601(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: raw) { return date }
-        return ISO8601DateFormatter().date(from: raw)
-    }
-
-    static func stringValue(_ value: JSONValue?) -> String? {
-        if case .string(let string)? = value, !string.isEmpty { return string }
-        return nil
     }
 }
 

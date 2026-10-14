@@ -1,5 +1,12 @@
 import Foundation
 
+enum CloudKitTimeoutOutcome<T: Sendable>: Sendable {
+    case success(T)
+    case failure(Error)
+    case timedOut
+    case cancelled
+}
+
 /// Per-operation result cell for a single timeout-race waiter.
 public actor CloudKitTimeoutResultLatch<T: Sendable> {
     private var result: Result<T, Error>?
@@ -10,6 +17,35 @@ public actor CloudKitTimeoutResultLatch<T: Sendable> {
     private var cancelled = false
 
     public init() {}
+
+    // Callers own task creation: diagnostics detach, transport inherits recovery budgets.
+    nonisolated func race(
+        workTask: Task<Void, Never>,
+        timeoutNanoseconds: UInt64,
+        timeoutOnCancellation: Bool = false
+    ) async -> CloudKitTimeoutOutcome<T> {
+        await withTaskGroup(of: CloudKitTimeoutOutcome<T>.self) { group in
+            group.addTask {
+                guard let result = await self.wait() else { return .cancelled }
+                switch result {
+                case .success(let value): return .success(value)
+                case .failure(let error): return .failure(error)
+                }
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    return .timedOut
+                } catch { return timeoutOnCancellation ? .timedOut : .cancelled }
+            }
+
+            let first = await group.next()
+            group.cancelAll()
+            workTask.cancel()
+            await self.cancelWaiter()
+            return first ?? .cancelled
+        }
+    }
 
     public func wait() async -> Result<T, Error>? {
         if let result {

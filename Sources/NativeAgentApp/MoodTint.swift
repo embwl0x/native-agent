@@ -74,6 +74,7 @@ final class MoodTintWeather {
     /// The room resumes where it was and moves only while the app is running.
     private var updatedAtUptime: TimeInterval
     private var timer: Timer?
+    private var consumers: Set<UUID> = []
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -86,10 +87,15 @@ final class MoodTintWeather {
     /// is not weather.
     static func uptime() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
-    /// Idempotent. The shell starts this when the window appears; a second
-    /// window does not start a second clock.
-    func begin() {
+    func setConsumer(_ id: UUID, enabled: Bool) {
+        if enabled { consumers.insert(id) } else { consumers.remove(id) }
+        refreshVisibility()
+    }
+
+    func refreshVisibility() {
+        guard !consumers.isEmpty else { stop(); return }
         guard timer == nil else { return }
+        updatedAtUptime = Self.uptime()
         let timer = Timer.scheduledTimer(withTimeInterval: Self.sampleSeconds, repeats: true) { _ in
             Task { @MainActor in await MoodTintWeather.shared.tick() }
         }
@@ -109,7 +115,9 @@ final class MoodTintWeather {
     /// curve of its own. Rest is not a state the tint is put into; it is where
     /// the filter goes when nothing holds it up.
     func tick(uptime now: TimeInterval = MoodTintWeather.uptime()) async {
+        guard let timer else { return }
         let reading = await Self.reading()
+        guard self.timer === timer else { return }
         let elapsedHours = max(0, now - updatedAtUptime) / 3600
         level = Self.damped(previous: level, reading: reading, elapsedHours: elapsedHours)
         updatedAtUptime = now
@@ -256,7 +264,10 @@ private struct MoodTintWindowPass: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.moodTintLevelOverride) private var levelOverride
-    @State private var weather = MoodTintWeather.shared
+
+    private var samples: Bool {
+        enabled && scheme == .dark && !reduceTransparency && contrast != .increased && levelOverride == nil
+    }
 
     private var level: Double {
         MoodTintGate.level(enabled: enabled, scheme: scheme,
@@ -279,7 +290,7 @@ private struct MoodTintWindowPass: ViewModifier {
                         .ignoresSafeArea()
                 }
             }
-            .onAppear { weather.begin() }
+            .background { MoodTintSampling(enabled: samples).allowsHitTesting(false) }
     }
 
     /// White where the warmth is allowed, punched out over the prose. The
@@ -300,6 +311,46 @@ private struct MoodTintWindowPass: ViewModifier {
             }
             .compositingGroup()
             .ignoresSafeArea()
+    }
+}
+
+private struct MoodTintSampling: NSViewRepresentable {
+    var enabled: Bool
+
+    func makeNSView(context: Context) -> Sampler { Sampler() }
+    func updateNSView(_ view: Sampler, context: Context) {
+        view.enabled = enabled
+        view.refresh()
+    }
+    static func dismantleNSView(_ view: Sampler, coordinator: ()) { view.detach() }
+
+    final class Sampler: NSView {
+        let id = UUID()
+        var enabled = false
+        private var observer: NSObjectProtocol?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            detach()
+            if let window {
+                observer = NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                    object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.refresh() }
+                }
+            }
+            refresh()
+        }
+
+        func refresh() {
+            MoodTintWeather.shared.setConsumer(id,
+                enabled: enabled && window?.isVisible == true && window?.occlusionState.contains(.visible) == true)
+        }
+
+        func detach() {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            observer = nil
+            MoodTintWeather.shared.setConsumer(id, enabled: false)
+        }
     }
 }
 

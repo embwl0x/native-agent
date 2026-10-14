@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
@@ -85,87 +86,6 @@ public enum PersonaRootResolver {
     }
 }
 
-// MARK: - Protocol
-
-public protocol PersonaEngineProtocol: Sendable {
-    /// All persona docs in the root, sorted by id ASC for determinism.
-    func listPersonaDocs() async throws -> [PersonaDoc]
-    /// Convenience accessor by id (filename without `.md`).
-    func getPersonaDoc(id: String) async throws -> PersonaDoc?
-}
-
-// MARK: - WRITE protocol (wave 33 W06)
-//
-// The native write impls landed wave-32 W19 on `SwiftNativePersonaEngine`
-// (PersonaEngine+Writes.swift) but were NOT on any protocol, so
-// `makePersonaEngine(runtime:)` callers could not reach them through the
-// factory — NativeClient had to either instantiate the concrete actor directly
-// (asymmetric with every other gated subsystem) or stay HTTP-only.
-//
-// The write methods are deliberately a SEPARATE protocol, not added to
-// `PersonaEngineProtocol`. The base read protocol is consumed by
-// ChatOrchestration's TurnEngine (`persona: any PersonaEngineProtocol`) purely
-// to compile the persona into a chat turn — a READ-ONLY consumer. Polluting
-// that contract with write methods would force every read-only consumer (and
-// every chat-path test stub) to implement persona WRITES it never calls. The
-// factory therefore returns a type that conforms to BOTH protocols, and the
-// NativeClient write gate refines to `PersonaEngineWriting` via the dedicated
-// `makePersonaEngineWriter(runtime:)` factory.
-public protocol PersonaEngineWriting: Sendable {
-    /// POST /v1/personality — merge `body` over the current profile, normalize,
-    /// atomically write `<dataRoot>/memory/profile.json` under a cross-process
-    /// flock. Returns the fully-normalized persisted profile. Mirrors the
-    /// daemon `save_personality`.
-    func savePersonality(body: [String: JSONValue]) async throws -> CompiledPersonalityProfile
-
-    /// POST /v1/personality/docs — onboarding-gated atomic write of a fixed
-    /// persona doc (SOUL/VOICE/GROWTH/AGENTS) under a cross-process flock.
-    /// USER.md is read-only here because MemoryV2 owns that projection. Returns
-    /// the `{**spec, path, content, updatedAt}` wire shape. Throws
-    /// `PersonaWriteError.onboardingRequired` pre-onboarding, `.unknownDocument`
-    /// for an id outside the fixed set, and `.invalidInput` for USER.
-    func savePersonalityDoc(id: String, content: String) async throws -> PersonaDocSpec
-
-    /// Mirror of the daemon's `personality_doc_contents(create_missing=True)`
-    /// PERSISTENCE behaviour: once SOUL.md
-    /// exists (the "persona is initialized" sentinel), any MISSING mutable fixed
-    /// doc (VOICE/GROWTH/AGENTS) is atomically WRITTEN to disk with its
-    /// `default_personality_doc_content` body, parameterized by the user's
-    /// profile.json. USER is skipped because MemoryV2 regenerates USER.md from
-    /// SQLite; persona scaffolding must not create a second source of truth.
-    /// The READ path (`listPersonaDocSpecs`) only renders these
-    /// defaults in-memory (updatedAt nil); this method actually persists them,
-    /// closing the wave-33 W19 "missing-doc default value persistence" gap —
-    /// without it, a flipped write subsystem would surface defaults forever but
-    /// never durably create the files (so a later daemon read would re-scaffold,
-    /// reintroducing the split-writer race). Pre-onboarding (SOUL.md absent) it
-    /// is a NO-OP so the first-run wizard still renders. Each write is held
-    /// under the same per-doc `<path>.lock` cross-process flock the route write
-    /// uses. Returns the ids that were newly persisted (empty if none).
-    @discardableResult
-    func scaffoldMissingDocs() async throws -> [String]
-
-    /// Mirror of the agent tool `_exec_persona_write` (builtin_tools.py
-    /// L3613-3703): full-doc REPLACE of a persona file with a timestamped
-    /// `.pre-<ts>-<uid>.bak` backup of the prior content, atomic temp+rename,
-    /// held under a cross-process flock on the target. `kind` is canonicalized
-    /// NFKC+strip+lower and must be in {soul,skill,voice,growth,agents};
-    /// USER.md is rejected because MemoryV2 owns that projection;
-    /// `skillName` is required + validated when kind=skill; `keeping` may
-    /// refuse the replacement after seeing the current document under the lock.
-    @discardableResult
-    func personaWrite(kind: String, content: String, skillName: String?,
-                      keeping: (@Sendable (_ current: String) throws -> Void)?) async throws -> PersonaToolWriteResult
-
-    /// Mirror of the agent tool `_exec_persona_append_section` (builtin_tools.py
-    /// L3948-4038): append `\n\n## <title>\n<content>` to a persona file
-    /// (after `existing.rstrip()`), with a timestamped backup, atomic temp+rename,
-    /// held under a cross-process flock. `kind` must be in
-    /// {soul,voice,growth,agents} (NO skill, no USER); `title` non-empty after strip.
-    @discardableResult
-    func personaAppendSection(kind: String, title: String, content: String) async throws -> PersonaToolWriteResult
-}
-
 /// Result of a `personaWrite` / `personaAppendSection` mutation, mirroring the
 /// daemon tool's `{ok, kind, path, backup_path, bytes_*}` dict. `bytesWritten`
 /// carries the full-file byte count for a replace; `bytesAppended` the appended
@@ -192,7 +112,7 @@ public struct PersonaToolWriteResult: Sendable, Equatable {
 /// disk contents; document snapshots are not cached. Write extensions own
 /// locked persona mutations, while MemoryV2 owns the USER.md projection.
 /// Actor isolation serializes access to this engine's state.
-public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriting {
+public actor SwiftNativePersonaEngine {
     private let root: URL
     private let fileManager: FileManager
     /// Data root used to resolve `<dataRoot>/memory/profile.json` when
@@ -292,11 +212,6 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
         return docs
     }
 
-    public func getPersonaDoc(id: String) async throws -> PersonaDoc? {
-        let all = try await listPersonaDocs()
-        return all.first { $0.id == id }
-    }
-
     /// Every persona reader excludes legacy episodic logs from GROWTH context.
     static func readPersonaDocument(at url: URL) throws -> String {
         let body = try String(contentsOf: url, encoding: .utf8)
@@ -338,17 +253,6 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
             iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             return iso.string(from: d)
         }
-        // Fixed spec list — matches the retired daemon
-        // `personality_doc_specs`. Order is load-bearing (AGENTS last so it
-        // lands freshest in the persona prompt).
-        let specsFixed: [(id: String, title: String, filename: String)] = [
-            ("SOUL",   "Soul",             "SOUL.md"),
-            ("VOICE",  "Voice",            "VOICE.md"),
-            ("GROWTH", "Growth",           "GROWTH.md"),
-            ("USER",   "User",             "USER.md"),
-            ("AGENTS", "Operating Manual", "AGENTS.md"),
-        ]
-
         // A missing root is the legitimate first-run state and therefore
         // produces the fixed, empty document specs below. A root *file* is
         // different: it cannot contain a persona and must not be rendered as
@@ -370,7 +274,7 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
         let soulInitialized = fileManager.fileExists(atPath: soulURL.path)
 
         var docs: [PersonaDocSpec] = []
-        for spec in specsFixed {
+        for spec in Self.personalityDocSpecsFixed {
             let url = root.appendingPathComponent(spec.filename)
             let exists = fileManager.fileExists(atPath: url.path)
             var content: String = ""
@@ -519,7 +423,7 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
 
             ## Runtime
             - Know the app's available tools, skills, memory layers, provider controls, approvals, and Mac/iOS/Telegram surfaces.
-            - Load detailed skill or tool instructions only when the current task needs them.
+            - Run a matching skill routine through skill.run; request its source only for authoring or review.
             - Keep context lean: prefer routed summaries, then look up deeper context on demand.
 
             ## Capability reference (look up details when needed)
@@ -578,20 +482,9 @@ public struct PersonaDocListing: Sendable, Equatable, Codable {
     }
 }
 
-// MARK: - Factory
-
-public func makePersonaEngine() -> any PersonaEngineProtocol {
-    return SwiftNativePersonaEngine()
-}
-
-/// Write-capable persona engine for the NativeClient persona WRITE gate
-/// (wave 33 W06). Typed as `any PersonaEngineWriting` so the write-gate call
-/// sites get the write methods without the read-only ChatOrchestration
-/// consumers being dragged onto the write contract.
-///
-/// CALLER CONTRACT: this factory always vends a writer that writes to the local
-/// on-disk persona path. There is no dormant daemon branch here; call sites must
-/// gate writes before reaching this factory when policy requires it.
-public func makePersonaEngineWriter() -> any PersonaEngineWriting {
-    return SwiftNativePersonaEngine()
+extension SwiftNativePersonaEngine {
+    /// The saved profile, read and parsed off the main actor.
+    public nonisolated static func readPersonality(dataRoot: URL) async throws -> PersonalityProfile {
+        try await Task.detached { try PersonaCompiler.compileProfile(dataRoot: dataRoot).sharedProfile }.value
+    }
 }

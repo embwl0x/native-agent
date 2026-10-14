@@ -12,9 +12,7 @@ extension SchedulerDueJobRunner {
     /// until the slow integrity sweep. Startup and source-change reconciliation
     /// still run immediately through BackgroundLoopsManager.
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        let rows = try? await persistence.withFileLock(jobsPath) {
-            try Self.readJobRowsChecked(at: jobsPath)
-        }
+        let rows = try? await schedulerJobs.jobRows()
         guard let rows else { return nil }
         let nowEpoch = now.timeIntervalSince1970
         var earliestFuture: Double?
@@ -22,8 +20,7 @@ extension SchedulerDueJobRunner {
         for row in rows {
             guard case .object(let obj) = row,
                   SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
-            guard let epoch = SchedulerJobRuntime.epoch(from: obj["nextRunAt"])
-                ?? SchedulerJobRuntime.epoch(from: obj["nextRunAtEpoch"]),
+            guard let epoch = SchedulerJobRuntime.scheduledEpoch(for: obj),
                   epoch.isFinite else { continue }
             if epoch <= nowEpoch {
                 hasOverdue = true
@@ -40,189 +37,24 @@ extension SchedulerDueJobRunner {
         return earliestFuture.map { Date(timeIntervalSince1970: $0) }
     }
 
-    /// Atomically selects and claims scheduled occurrences before any effect
-    /// executes. A claim surviving process restart is an ambiguous outcome,
-    /// not permission to repeat a notification, connector action, Desk task,
-    /// or other non-idempotent effect.
-    /// - Parameter excludingJobIds: rows the caller has already handled and
-    ///   cannot make progress on during this pass (2026-09-06: a recovered
-    ///   claim whose reconciliation notice could not be written). Selection
-    ///   claims one earliest-due row at a time, so without this the same row
-    ///   would be re-detected every iteration and later due jobs would starve.
-    func claimDueJobs(
-        now: Date,
-        maxJobs: Int,
-        excludingJobIds: Set<String> = []
-    ) async throws -> ClaimedDueJobs {
-        try await persistence.withFileLock(jobsPath) { () async throws -> ClaimedDueJobs in
-            var rows = try Self.readJobRowsChecked(at: jobsPath)
-            var rearmed = false
-            for index in rows.indices {
-                guard case .object(var object) = rows[index],
-                      Self.rearmFutureOneShot(&object, now: now) else { continue }
-                rows[index] = .object(object)
-                rearmed = true
-            }
-            let selected = Self.dueJobs(
-                in: rows,
-                nowEpoch: now.timeIntervalSince1970,
-                // An occurrence claim is intentionally one-at-a-time. Keep the
-                // legacy parameter for source compatibility, but make it
-                // impossible for a future caller to preclaim an untouched
-                // batch that would become falsely ambiguous after a crash.
-                maxJobs: min(max(0, maxJobs), 1),
-                excludingJobIds: excludingJobIds
-            )
-            var claimed: [DueJob] = []
-            var recovered: [OccurrenceRecovery] = []
-            for job in selected {
-                guard let index = rows.firstIndex(where: { row in
-                    guard case .object(let object) = row else { return false }
-                    return SchedulerJobRuntime.string(object["id"]) == job.id
-                }), case .object(var object) = rows[index] else { continue }
-
-                if let activeValue = object["activeOccurrence"] {
-                    let decodedPriorKey: String?
-                    if case .object(let active) = activeValue {
-                        decodedPriorKey = SchedulerJobRuntime.string(active["key"])
-                    } else {
-                        decodedPriorKey = nil
-                    }
-                    let priorKey = decodedPriorKey ?? job.occurrenceKey
-                    let detail: String
-                    if decodedPriorKey == nil {
-                        detail = "A prior scheduler occurrence claim was malformed. Its external effect "
-                            + "may have happened, so NativeAgent preserved the claim and did not repeat it."
-                    } else {
-                        detail = "A prior scheduler pass ended after claiming occurrence \(priorKey). "
-                            + "Its external effect may have happened, so NativeAgent did not repeat it."
-                    }
-                    // DETECTION ONLY (2026-09-06). The row is left exactly as
-                    // found — claim intact, next run unmoved — until the caller
-                    // has the reconciliation notice durably on record and calls
-                    // `settleUnknownOccurrence`. Clearing it here gave the
-                    // notice a ONE-ATTEMPT window: the claim and the old
-                    // schedule were already gone, so a failed notice write left
-                    // nothing for a later pass to find and reconcile. Either
-                    // way this job is not claimed on this pass, so nothing can
-                    // be replayed by waiting.
-                    recovered.append(OccurrenceRecovery(
-                        jobId: job.id,
-                        jobName: job.name,
-                        kind: job.kind,
-                        occurrenceKey: priorKey,
-                        detail: detail
-                    ))
-                    continue
-                }
-
-                object["activeOccurrence"] = .object([
-                    "key": .string(job.occurrenceKey),
-                    "dueEpoch": .int(Int64(job.dueEpoch.rounded())),
-                    "claimedAt": .string(Self.iso(now)),
-                    "state": .string("claimed"),
-                ])
-                rows[index] = .object(object)
-                claimed.append(job)
-            }
-            // 2026-09-06: detection is read-only, so a scan that only recovered
-            // stale claims changed no row. Rewriting jobs.json anyway rewrote
-            // canonical state for nothing and gave a read-only pass a write's
-            // failure surface.
-            if rearmed || !claimed.isEmpty {
-                try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
-            }
-            return ClaimedDueJobs(jobs: claimed, recoveredUnknown: recovered)
-        }
-    }
-
-    private static func rearmFutureOneShot(_ object: inout [String: JSONValue], now: Date) -> Bool {
-        guard SchedulerJobRuntime.bool(object["oneShot"], default: false),
-              SchedulerJobRuntime.bool(object["enabled"], default: true),
-              SchedulerJobRuntime.string(object["cancelledAt"]) == nil,
-              case .object(let claim)? = object["activeOccurrence"],
-              Set(claim.keys).isSubset(of: ["key", "dueEpoch", "claimedAt", "state"]),
-              SchedulerJobRuntime.string(claim["key"])?.isEmpty == false,
-              SchedulerJobRuntime.string(claim["state"]) == "claimed",
-              let claimedAt = SchedulerJobRuntime.string(claim["claimedAt"]).flatMap(parseISODate),
-              let claimedDue = SchedulerJobRuntime.epoch(from: claim["dueEpoch"]),
-              claimedDue.isFinite,
-              // A rewind cannot make a due-time claim evidence of non-execution.
-              // Round up to avoid mistaking the stored dueEpoch's rounding for it.
-              claimedDue > claimedAt.timeIntervalSince1970.rounded(.up),
-              let due = SchedulerJobRuntime.epoch(from: object["nextRunAt"])
-                ?? SchedulerJobRuntime.epoch(from: object["nextRunAtEpoch"]),
-              due > now.timeIntervalSince1970 else { return false }
-        object.removeValue(forKey: "activeOccurrence")
-        clearRetryState(&object)
-        return true
-    }
-
-    /// Release a recovered stale claim and advance the job — ONLY once its
-    /// reconciliation notice is on record. Re-reads the row under the lock and
-    /// does nothing if the claim is already gone, so a retry after a partial
-    /// pass is harmless.
-    func settleUnknownOccurrence(_ recovery: OccurrenceRecovery, now: Date) async throws {
-        try await persistence.withFileLock(jobsPath) { () async throws -> Void in
-            var rows = try Self.readJobRowsChecked(at: jobsPath)
-            guard let index = rows.firstIndex(where: { row in
-                guard case .object(let object) = row else { return false }
-                return SchedulerJobRuntime.string(object["id"]) == recovery.jobId
-            }), case .object(var object) = rows[index],
-                let activeValue = object["activeOccurrence"] else { return }
-            if Self.rearmFutureOneShot(&object, now: now) {
-                rows[index] = .object(object)
-                try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
-                return
-            }
-            var decodedPriorKey: String?
-            if case .object(let active) = activeValue {
-                decodedPriorKey = SchedulerJobRuntime.string(active["key"])
-            }
-            if decodedPriorKey == nil { object["lastInvalidOccurrenceClaim"] = activeValue }
-            object["lastRunAt"] = .string(Self.iso(now))
-            object["lastRunStatus"] = .string("unknown")
-            object["lastRunDetail"] = .string(recovery.detail)
-            object["lastRunError"] = .string(recovery.detail)
-            object["lastUnknownOccurrenceKey"] = .string(recovery.occurrenceKey)
-            object.removeValue(forKey: "activeOccurrence")
-            if SchedulerJobRuntime.bool(object["oneShot"], default: false) {
-                object["enabled"] = .bool(false)
-                object["disabledReason"] = .string("unknown outcome after restart; review before retry")
-            } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(
-                for: .object(object), now: { now }
-            ) {
-                Self.stampNextRun(&object, epoch: next)
-            } else {
-                object["enabled"] = .bool(false)
-                object["disabledReason"] = .string("unknown outcome and next run could not be computed")
-            }
-            // Unknown means "do not automatically replay." Any prior retry
-            // floor/counter would contradict that settlement and could re-arm
-            // the same occurrence through catch-up logic.
-            Self.clearRetryState(&object)
-            rows[index] = .object(object)
-            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
+    func claimDueJob(now: Date, excludingJobIds: Set<String> = []) async throws -> ClaimedDueJobs {
+        try await schedulerJobs.claimDueJobs(now: now) { rows in
+            Self.dueJobs(in: rows, nowEpoch: now.timeIntervalSince1970,
+                         excludingJobIds: excludingJobIds)
         }
     }
 
     private static func dueJobs(
         in rows: [JSONValue],
         nowEpoch: Double,
-        maxJobs: Int,
         excludingJobIds: Set<String> = []
     ) -> [DueJob] {
-        // The cap is applied AFTER an earliest-due-first sort. Walking file
-        // order and breaking at `maxJobs` meant a row late in jobs.json could
-        // starve behind head rows once the job list outgrew the cap, no matter
-        // how overdue it was. Ties keep file order (the index tiebreak makes
-        // the sort stable), so nothing else about selection changes.
-        var due: [(job: DueJob, index: Int)] = []
-        for (index, row) in rows.enumerated() {
+        // Claim only the earliest due occurrence; ties retain file order.
+        var earliest: (row: JSONValue, fields: [String: JSONValue], id: String, epoch: Double)?
+        for row in rows {
             guard case .object(let obj) = row else { continue }
             guard SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
-            let nextEpoch = SchedulerJobRuntime.epoch(from: obj["nextRunAt"])
-                ?? SchedulerJobRuntime.epoch(from: obj["nextRunAtEpoch"])
+            let nextEpoch = SchedulerJobRuntime.scheduledEpoch(for: obj)
             guard let nextEpoch, nextEpoch <= nowEpoch else { continue }
             // A scheduled effect without durable job identity cannot acquire a
             // stable occurrence claim or be settled safely. Job creation owns
@@ -231,21 +63,17 @@ extension SchedulerDueJobRunner {
             // Excluded BEFORE the cap, so a deferred row cannot consume the
             // one-at-a-time claim slot that a later due job needs.
             guard !excludingJobIds.contains(id) else { continue }
-            let name = SchedulerJobRuntime.string(obj["name"]) ?? id
-            let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
-            let payload: [String: JSONValue]
-            if case .object(let p)? = obj["payload"] { payload = p } else { payload = [:] }
-            due.append((
-                DueJob(id: id, name: name, kind: kind, payload: payload, row: row, dueEpoch: nextEpoch),
-                index
-            ))
+            if earliest == nil || nextEpoch < earliest!.epoch {
+                earliest = (row, obj, id, nextEpoch)
+            }
         }
-        due.sort {
-            $0.job.dueEpoch == $1.job.dueEpoch
-                ? $0.index < $1.index
-                : $0.job.dueEpoch < $1.job.dueEpoch
-        }
-        return due.prefix(max(0, maxJobs)).map(\.job)
+        guard let earliest else { return [] }
+        let name = SchedulerJobRuntime.string(earliest.fields["name"]) ?? earliest.id
+        let kind = (SchedulerJobRuntime.string(earliest.fields["kind"]) ?? "notify").lowercased()
+        let payload: [String: JSONValue]
+        if case .object(let p)? = earliest.fields["payload"] { payload = p } else { payload = [:] }
+        return [DueJob(id: earliest.id, name: name, kind: kind, payload: payload,
+                       row: earliest.row, dueEpoch: earliest.epoch)]
     }
 
     /// - Parameter reactivateCancelled: when true, a user-cancelled nightly
@@ -270,8 +98,8 @@ extension SchedulerDueJobRunner {
                 minute: NativeAgentDreamCycleSchedule.remMinute
             )
 
-        let repaired = try await persistence.withFileLock(jobsPath) { () async throws -> [String] in
-            var rows = try Self.readJobRowsChecked(at: jobsPath)
+        let root = root
+        let repaired = try await schedulerJobs.updateJobRows { rows in
             var repaired: [String] = []
 
             // Failed dream attempts settle this day's catch-up too. Only the
@@ -290,14 +118,7 @@ extension SchedulerDueJobRunner {
             let remJobName = "\(agentName) Weekly REM"
             let legacyAgentKey = agentName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 
-            let dreamNext = dreamCatchUp
-                ? now.timeIntervalSince1970
-                : try Self.nextEpoch(schedule: dreamSchedule, now: now, fallbackInterval: 86_400)
-            let remNext = remCatchUp
-                ? now.timeIntervalSince1970
-                : try Self.nextEpoch(schedule: remSchedule, now: now, fallbackInterval: 604_800)
-
-            if Self.upsertDefaultCycleJob(
+            if try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(
                 rows: &rows,
                 id: "nativeagent-nightly-dream",
                 legacyNames: ["nightly reflection", "assistant nightly dream", "\(legacyAgentKey) nightly dream"],
@@ -307,14 +128,14 @@ extension SchedulerDueJobRunner {
                 schedule: dreamSchedule,
                 objective: "Scheduled reflection",
                 extraPayload: [:],
-                nextRunEpoch: dreamNext,
+                nextRunEpoch: dreamCatchUp ? now.timeIntervalSince1970 : try Self.nextEpoch(schedule: dreamSchedule, now: now),
                 now: now,
                 reactivateCancelled: reactivateCancelled
             ) {
                 repaired.append(dreamCatchUp ? "\(dreamJobName) (catch-up due now)" : dreamJobName)
             }
 
-            if Self.upsertDefaultCycleJob(
+            if try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(
                 rows: &rows,
                 id: "nativeagent-weekly-rem",
                 legacyNames: ["weekly rem", "assistant weekly rem", "\(legacyAgentKey) weekly rem", "rem consolidation"],
@@ -324,15 +145,12 @@ extension SchedulerDueJobRunner {
                 schedule: remSchedule,
                 objective: "Scheduled REM consolidation",
                 extraPayload: [:],
-                nextRunEpoch: remNext,
+                nextRunEpoch: remCatchUp ? now.timeIntervalSince1970 : try Self.nextEpoch(schedule: remSchedule, now: now),
                 now: now
             ) {
                 repaired.append(remCatchUp ? "\(remJobName) (catch-up due now)" : remJobName)
             }
 
-            if !repaired.isEmpty {
-                try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
-            }
             return repaired
         }
         return repaired
@@ -340,9 +158,9 @@ extension SchedulerDueJobRunner {
 
     func backfillDreamReceiptIfNeeded(now: Date) async throws -> String? {
         let dateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(now)
+        guard !(try await notificationInboxContains(source: "dream_cycle", dateKey: dateKey)) else { return nil }
         let entries = Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey)
         guard !entries.isEmpty else { return nil }
-        guard !(try await notificationInboxContains(source: "dream_cycle", dateKey: dateKey)) else { return nil }
 
         let paths = entries.map { $0.path }
         let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
@@ -371,7 +189,7 @@ extension SchedulerDueJobRunner {
             source: "dream_cycle",
             itemId: itemId
         )
-        try await markDefaultCycleJobRun(
+        try await schedulerJobs.markDefaultCycleJobRun(
             id: "nativeagent-nightly-dream",
             detail: "dream entries found; inbox receipt backfilled",
             at: now

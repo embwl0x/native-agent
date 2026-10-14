@@ -68,13 +68,13 @@ filesystem API; it cannot call every action merely because the action exists.
 
 ### Authored tools, skills and MCP
 
-- `tool.propose` files Swift code and required input/expected-output cases as
+- `tool.propose` files JavaScript run(input) and optional intercepted fixtures as
   a proposal, with optional input schema and declared permissions.
 - `tool.approve` activates the proposal under the applicable authority.
   Active authored code appears as `authored.<id>` on Diagnostics.
-- Skills provide procedural guidance and optional admitted scripts, discovered
-  and read through `app`. `skill.save`, `skill.enable`, `skill.run`,
-  `skill.resume` and `skill.rollback` manage those procedures. They grant no
+- Skills are JavaScript routines discovered through `app`; ordinary reads return
+  metadata, with exact source/fixtures on request. `skill.save`, `skill.validate`,
+  `skill.enable`, `skill.run`, `skill.resume` and `skill.rollback` share the code lifecycle. They grant no
   new authority; see the [manifest spec](skill_manifest_spec.md).
 - Mounted MCP tools appear as `mcp.<server>.<tool>` from the server's live
   list, without adding model-facing tool schemas. Remote tools are not

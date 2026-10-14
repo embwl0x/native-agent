@@ -33,7 +33,7 @@ same files at once).
 
 | # | Package | Owns |
 |---|---|---|
-| P1 | Helper runtime | New executable target `NativeAgentSenseHost` (JavaScriptCore runtime speaking the plug protocol over stdin/stdout), bundled in the app, JIT entitlement for the helper in dev and public builds, the JS-side SDK (`sense.js`), the Seatbelt profile builder for a sense's declared reach. Swift-sense execution when `/usr/bin/swift` exists. |
+| P1 | Helper runtime | New executable target `NativeAgentSenseHost` (JavaScriptCore runtime speaking the plug protocol over stdin/stdout), bundled in the app, JIT entitlement for the helper in dev and public builds, the JS-side SDK (`sense.js`), the Seatbelt profile builder for a sense's declared reach. Historical authored Swift records stay readable; executable growth is JavaScript only. |
 | P2 | Runner + supervision | `SenseRunner` impl in the app: spawn the helper per sense (on-call and live), progress-based stall detection, memory caps, idle-stop after entry settlement, restart live senses from their state, the state notebook storage, the `native` (in-process Swift) path, provenance on every outcome. |
 | P3 | Registry + lifecycle + sharing | `SenseRegistry` impl: storage under `<dataRoot>/senses/` (registry.json, `<id>/v<N>/` folders), versions, rollback, uses/corrections counters, CapabilityLifecycle (30-day archive, restore), lookup by corner. Share export/import with fences (export never carries notebook/User's material; import lands sandboxed, verbs off until it has run here; export from User's Mac needs User). |
 | P4 | Door integration | The door consults the registry first: `mac.look`, `mac.read`, `files.read`, browser page reads serve the sense's `NativePage` when one exists; `raw:true` returns today's route; every sense-served reply carries the provenance line; `wrong:true` ("this view is wrong") on the same reads returns the view with a note pointing at `app sense.make`; sense verbs appear on the corner's page for `app {find}` / `app {read}` and invoking one runs `SenseRequest.act` inside their turn. Update `docs/TOOL_LOADING.md` for the two new arguments (User approved). |
@@ -119,8 +119,7 @@ coalesced messages. The runner renews its stall window only after validating a
 publish/notify, successfully servicing a first source read, or accepting a rising
 numeric mark. A first read of the app-supplied snapshot is reported with its
 address and checked against that snapshot; it keeps the local JS read path.
-Transport traffic alone never renews the window, including for Swift senses
-without a JSC watchdog. While the runner serves a source, notebook or act reply,
+Transport traffic alone never renews the window. While the runner serves a source, notebook or act reply,
 both watchdogs suspend stall accounting and exclude only that outstanding wait
 from elapsed execution time. Reply traffic does not reset the remaining window;
 repeated reads and state calls still cannot count as progress. Same-corner
@@ -144,7 +143,7 @@ Helper → app (API messages have `id` and `callID`; progress has only `id`):
   the source provider; it requires a `source_reply` acknowledgement.
 - `{"id":N,"callID":C,"type":"publish","page":{NativePage}}`. No reply.
   The helper inserts the record's corner, defaults things/folded/verbs to [],
-  and rejects text over 40,000 bytes. P2 validates Swift-sense pages too and
+  and rejects text over 40,000 bytes. P2 validates every sense page and
   holds a published read until `done`; a later failure discards that entry.
 - `{"id":N,"callID":C,"type":"notify","news":{SenseNews}}`. No reply.
   The JS helper inserts senseID/version/at; summary is at most 4,000 UTF-8 bytes.
@@ -191,18 +190,8 @@ delivery must retain the same private-store exclusions; supplied bytes never
 bypass them. Network resolution
 failure is `bad_reach`, never a broad network fallback. JSC has a watchdog per
 entry (SPI unavailable = `unsupported`); P2 owns outer accepted-progress stall
-detection and memory caps, including all Swift execution. App-served plug reply
+detection and memory caps, for authored JavaScript execution. App-served plug reply
 waits have no timer and are excluded from the entry's no-progress window.
-
-Swift senses are standalone Swift plug programs, not JS-shaped Swift functions.
-Launch the helper with `--scratch <folder>`; it stages only the supplied code
-in that folder and runs `/usr/bin/swift -module-cache-path <scratch>/module-cache`.
-The child receives the initial run (without source) and subsequent app messages
-on stdin; stdout is the same plug. It inherits the Seatbelt profile and a clean
-environment (PATH, HOME/TMPDIR pointing to scratch, compiler cache). Swift code
-must use app-supplied material and the plug for source/state/actions. P2 applies
-all output, attribution, reply and action gates regardless of language. Missing
-`/usr/bin/swift` fails with `unsupported`; compiler/process failure is `crashed`.
 
 ## Rules for every worker
 

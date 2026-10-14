@@ -753,58 +753,6 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
     }
 }
 
-/// Interprets the durable `context_receipts(kind: selection)` fields without
-/// turning missing, replay-supplied, or malformed values into a calm zero.
-/// This is deliberately a receipt reader, not a speed gate: callers may build
-/// envelope reports from `.measured` samples without asserting a wall-clock
-/// budget in ordinary functional tests.
-public struct ContextSelectionLatencyObservation: Equatable, Sendable {
-    public enum Status: String, Equatable, Sendable {
-        case measured
-        case missing
-        case invalid
-    }
-
-    public let status: Status
-    public let microseconds: Int?
-    public let provenance: ContextSelectionLatencyProvenance?
-    public let surface: ContextSurface?
-
-    public init(receipt: ContextStoreReceipt) {
-        guard receipt.kind == .selection else {
-            status = .invalid
-            microseconds = nil
-            provenance = nil
-            surface = nil
-            return
-        }
-        surface = receipt.details["surface"].flatMap(ContextSurface.init(rawValue:))
-        let rawProvenance = receipt.details["selection_latency_provenance"]
-        let provenance = rawProvenance.flatMap(ContextSelectionLatencyProvenance.init(rawValue:))
-        self.provenance = provenance
-        guard surface != nil else {
-            status = .invalid
-            microseconds = nil
-            return
-        }
-        guard let rawMicroseconds = receipt.details["selection_microseconds"],
-              rawMicroseconds != "absent",
-              let parsed = Int(rawMicroseconds),
-              parsed >= 0 else {
-            status = rawProvenance == nil || provenance == .unavailable ? .missing : .invalid
-            microseconds = nil
-            return
-        }
-        guard provenance == .monotonicClock else {
-            status = rawProvenance == nil || provenance == .unavailable ? .missing : .invalid
-            microseconds = nil
-            return
-        }
-        status = .measured
-        microseconds = parsed
-    }
-}
-
 public struct ContextPacket: Codable, Equatable, Sendable {
     public let generationID: Int64
     public let sourceFingerprint: String
@@ -828,26 +776,20 @@ public enum ContextSelectionError: Error, Equatable, Sendable {
     case mandatoryBudgetExceeded(required: Int, limit: Int)
 }
 
-/// Every ranking weight in one place. Defaults are EXACTLY the literals that
-/// lived inline in `score()`/the rerank loop through 2026-08-13, so
-/// `ContextScoreWeights()` is byte-identical to the pre-seam selector — pinned
-/// by `defaultScoreWeightsMatchTheHistoricalLiterals`. The seam exists for the
-/// selection-score-rebalance A/B (docs/build_plans/selection-score-rebalance.md):
-/// tuning happens by SHIPPING new defaults after the offline eval, never by
-/// per-call-site overrides scattered through production code.
+/// Shipped ranking weights have one owner.
 public struct ContextScoreWeights: Equatable, Sendable {
-    public let lexicalExact: Double
-    public let tokenOverlap: Double
-    public let semanticCosine: Double
-    public let sharedIdentifiers: Double
-    public let activation: Double
-    public let authority: Double
-    public let confidence: Double
-    public let recency: Double
-    public let usefulness: Double
-    public let decay: Double
-    public let redundancyPenalty: Double
-    public let characterCostPenaltyCap: Double
+    public let lexicalExact: Double = 2.4
+    public let tokenOverlap: Double = 1.7
+    public let semanticCosine: Double = 1.2
+    public let sharedIdentifiers: Double = 1.5
+    public let activation: Double = 1.2
+    public let authority: Double = 1.0
+    public let confidence: Double = 0.8
+    public let recency: Double = 0.5
+    public let usefulness: Double = 0.7
+    public let decay: Double = 0.5
+    public let redundancyPenalty: Double = 1.1
+    public let characterCostPenaltyCap: Double = 0.35
     /// Weight for the `messageCoverage` feature: how much of the CURRENT user
     /// message's token set the atom covers. Default 1.5 — shipped 2026-08-13
     /// from the offline A/B in docs/build_plans/selection-score-rebalance.md
@@ -857,62 +799,27 @@ public struct ContextScoreWeights: Equatable, Sendable {
     /// marginally better lexically but was rejected: measured WITHOUT the
     /// semantic feature, it risks drowning semantics on production turns.
     /// 0 disables the feature (score() still computes it for receipts).
-    public let messageCoverage: Double
+    public let messageCoverage: Double = 1.5
     /// Rank penalty applied while an atom's conflict group is unresolved.
-    public let conflictPenalty: Double
+    public let conflictPenalty: Double = 0.12
     /// Rerank bonus for the first atom from a not-yet-selected source.
-    public let diversityNewSourceBonus: Double
+    public let diversityNewSourceBonus: Double = 0.14
     /// Rerank bonus for the first atom of a not-yet-selected kind.
-    public let diversityNewKindBonus: Double
+    public let diversityNewKindBonus: Double = 0.10
 
-    public init(
-        lexicalExact: Double = 2.4,
-        tokenOverlap: Double = 1.7,
-        semanticCosine: Double = 1.2,
-        sharedIdentifiers: Double = 1.5,
-        activation: Double = 1.2,
-        authority: Double = 1.0,
-        confidence: Double = 0.8,
-        recency: Double = 0.5,
-        usefulness: Double = 0.7,
-        decay: Double = 0.5,
-        redundancyPenalty: Double = 1.1,
-        characterCostPenaltyCap: Double = 0.35,
-        messageCoverage: Double = 1.5,
-        conflictPenalty: Double = 0.12,
-        diversityNewSourceBonus: Double = 0.14,
-        diversityNewKindBonus: Double = 0.10
-    ) {
-        self.lexicalExact = lexicalExact
-        self.tokenOverlap = tokenOverlap
-        self.semanticCosine = semanticCosine
-        self.sharedIdentifiers = sharedIdentifiers
-        self.activation = activation
-        self.authority = authority
-        self.confidence = confidence
-        self.recency = recency
-        self.usefulness = usefulness
-        self.decay = decay
-        self.redundancyPenalty = redundancyPenalty
-        self.characterCostPenaltyCap = characterCostPenaltyCap
-        self.messageCoverage = messageCoverage
-        self.conflictPenalty = conflictPenalty
-        self.diversityNewSourceBonus = diversityNewSourceBonus
-        self.diversityNewKindBonus = diversityNewKindBonus
-    }
+    public init() {}
 }
 
 public struct ContextSelectionConfiguration: Equatable, Sendable {
-    public let maximumCandidates: Int
-    public let maximumDynamicAtoms: Int
-    public let maximumPointers: Int
-    public let maximumAtomsPerSource: Int
-    public let maximumAtomsPerKind: Int
+    public let maximumCandidates: Int = 256
+    public let maximumDynamicAtoms: Int = 12
+    public let maximumAtomsPerSource: Int = 2
+    public let maximumAtomsPerKind: Int = 4
     /// Kind-specific overrides of `maximumAtomsPerKind`. Memory atoms get a
     /// larger quota by default so high-scoring memories are not crowded out
     /// of the 12-atom dynamic budget by the uniform per-kind cap.
-    public let maximumAtomsPerKindOverrides: [ContextAtomKind: Int]
-    public let minimumRelevance: Double
+    public let maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8, .relationship: 4]
+    public let minimumRelevance: Double = 0.05
     /// Per embedding model (`model_id`): cosine below which a `.memory` or
     /// `.correction` atom is refused ADMISSION to the packet, however well it
     /// ranked on everything else. `0` turns off the whole 2026-09-02 precision
@@ -961,14 +868,14 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// 10.2 (4.9 on User's turns, 20% none), acknowledgements (0.19-0.22) and
     /// the unrelated design and greeting rules (0.07, 0.22) stay out, drive
     /// recalls 0.64-0.80 land (and 0.34 carried by message coverage).
-    public let memorySemanticFloors: [String: Double]
+    public let memorySemanticFloors: [String: Double] = ["bge-large-en-v1.5": 0.55, "all-MiniLM-L6-v2": 0.25]
     /// Effective `.memory` row cap on a message of at most
     /// `shortMessageTokenCount` content tokens — the same token set (and the
     /// same "4") the `messageCoverage` length damp already uses, so a message
     /// too short to evidence coverage is also too short to earn a full memory
     /// lane. Applied as `min(cap, shortMessageMemoryRowCap)`. `0` disables the
     /// cap on its own, and a zero semantic floor disables it too.
-    public let shortMessageMemoryRowCap: Int
+    public let shortMessageMemoryRowCap: Int = 6
     /// Phase 5 C3: `.personal` atoms leave the ordinary competition and get
     /// their own lane — the ONE with the highest lift (cosine minus the
     /// memory's own baseline, `ContextSelector.personalBaselines`) at or above
@@ -979,41 +886,13 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// one personal memory on 11% of turns, 15 distinct (the old lane put 1-3
     /// on 47%). Raw cosine at any floor kept answering every turn that
     /// mentioned Claude with the same memory.
-    public let personalRecallFloor: Double
-    public let weights: ContextScoreWeights
+    public let personalRecallFloor: Double = 0.20
+    public let weights: ContextScoreWeights = ContextScoreWeights()
 
     /// Content-token count at or below which a message counts as short.
     public static let shortMessageTokenCount = 4
 
-    public init(
-        maximumCandidates: Int = 256,
-        maximumDynamicAtoms: Int = 12,
-        // 2026-09-23: 0 — skill-heading pointers cost ~800 chars/turn and were
-        // expanded 3 times in 7 days. Truncation pointers are a separate lane.
-        maximumPointers: Int = 0,
-        maximumAtomsPerSource: Int = 2,
-        maximumAtomsPerKind: Int = 4,
-        maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8, .relationship: 4],
-        minimumRelevance: Double = 0.05,
-        memorySemanticFloors: [String: Double] = ["bge-large-en-v1.5": 0.55, "all-MiniLM-L6-v2": 0.25],
-        shortMessageMemoryRowCap: Int = 6,
-        personalRecallFloor: Double = 0.20,
-        weights: ContextScoreWeights = ContextScoreWeights()
-    ) {
-        self.personalRecallFloor = max(0, personalRecallFloor)
-        self.maximumCandidates = max(1, maximumCandidates)
-        self.maximumDynamicAtoms = max(0, maximumDynamicAtoms)
-        self.maximumPointers = max(0, maximumPointers)
-        self.maximumAtomsPerSource = max(1, maximumAtomsPerSource)
-        self.maximumAtomsPerKind = max(1, maximumAtomsPerKind)
-        self.maximumAtomsPerKindOverrides = maximumAtomsPerKindOverrides.mapValues { max(1, $0) }
-        self.minimumRelevance = max(0, minimumRelevance)
-        self.memorySemanticFloors = memorySemanticFloors.mapValues { max(0, $0) }
-        // 0 is OFF, not "no memories at all": a short message is a reason to
-        // carry fewer rows, never a reason to empty the lane.
-        self.shortMessageMemoryRowCap = max(0, shortMessageMemoryRowCap)
-        self.weights = weights
-    }
+    public init() {}
 
     /// The semantic floor for vectors from `modelID`; nil for a model with no
     /// entry, which no cosine clears.

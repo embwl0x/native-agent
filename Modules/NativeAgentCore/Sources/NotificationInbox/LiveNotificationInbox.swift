@@ -25,7 +25,7 @@ import PersistenceCore
 ///
 /// Nothing is destroyed: every evicted physical line is appended verbatim to
 /// the uncapped overflow shelf beside the inbox (`inbox_archive.jsonl`, read
-/// back with `archivedRows()`) BEFORE the trimmed feed is written, mirroring
+/// by delegation reconciliation) BEFORE the trimmed feed is written, mirroring
 /// the studio journal. A shelf that cannot be written aborts the whole write.
 public actor LiveNotificationInbox {
     /// Hard bound on physical lines in the live feed. Sized like the other hot
@@ -54,6 +54,18 @@ public actor LiveNotificationInbox {
             .appendingPathComponent("inbox.jsonl")
     }
 
+    /// Outstanding ways out stay live until the delivery owner settles them.
+    public static func hold(dataRoot: URL, title: String, body: String, ways: [String], approvalID: String? = nil,
+                            id: String = "held:" + UUID().uuidString.lowercased(), fields: [String: JSONValue] = [:]) async throws {
+        var row: [String: JSONValue] = ["id": .string(id), "source": .string("resident_wake"),
+            "created_at": .string(NotificationInboxClock.nowISO()), "severity": .string("info"), "status": .string("unread"),
+            "title": .string(String(title.prefix(160))), "summary": .string(String(body.prefix(500))),
+            "held_delivery": .array(ways.map(JSONValue.string)), "held_title": .string(title), "held_body": .string(body)]
+        row.merge(fields) { _, value in value }
+        if let approvalID { row["approval_id"] = .string(approvalID) }
+        try await live(dataRoot: dataRoot).appendUnique(.object(row), id: id)
+    }
+
     /// The live root's shared inbox keeps its parsed rows between calls; a
     /// fresh instance re-parses the whole feed. Any other root gets its own.
     public static func live(dataRoot: URL) -> LiveNotificationInbox {
@@ -75,9 +87,14 @@ public actor LiveNotificationInbox {
         let modified: TimeInterval
     }
 
-    private struct Line {
-        let raw: Data
-        let row: JSONValue?
+    public struct Line: Sendable {
+        public let raw: Data
+        public let row: JSONValue?
+
+        public init(raw: Data, row: JSONValue?) {
+            self.raw = raw
+            self.row = row
+        }
 
         var isActive: Bool {
             guard case .object(let object)? = row else { return false }
@@ -94,6 +111,12 @@ public actor LiveNotificationInbox {
         var isTerminal: Bool {
             guard case .object? = row else { return false }
             return !isActive
+        }
+
+        var hasHeldDelivery: Bool {
+            guard case .object(let object)? = row,
+                  case .array(let ways)? = object["held_delivery"] else { return false }
+            return !ways.isEmpty
         }
 
         /// When this row's retention clock started. For a terminal row that is
@@ -122,13 +145,11 @@ public actor LiveNotificationInbox {
 
     public let path: URL
     private let persistence = SwiftNativePersistenceCore()
-    private let clock: @Sendable () -> Date
     private var cachedStamp: Stamp?
     private var cachedRows: [JSONValue]?
 
-    public init(path: URL, clock: @escaping @Sendable () -> Date = { Date() }) {
+    public init(path: URL) {
         self.path = path
-        self.clock = clock
     }
 
     /// The overflow shelf this inbox prunes onto.
@@ -164,21 +185,11 @@ public actor LiveNotificationInbox {
         return parsed
     }
 
-    /// Rows retention moved off the live feed, oldest first. Uncached and
-    /// unbounded — this is history, read on demand, not part of the hot feed a
-    /// UI renders. A missing shelf is an empty history, not an error, and a
-    /// malformed shelf line is skipped rather than failing the whole read: the
-    /// feed's own fail-closed rule exists to stop an apparently-empty INBOX,
-    /// and the shelf can never be mistaken for one.
-    public func archivedRows() throws -> [JSONValue] {
-        try Self.readLines(Self.archivePath(forInbox: path)).compactMap(\.row)
-    }
-
     /// Append once by stable id. The scan and append happen under one flock, so
     /// retries from approval/execution staging cannot create duplicate cards.
     @discardableResult
     public func appendUnique(_ row: JSONValue, id: String) async throws -> Bool {
-        let now = clock()
+        let now = Date()
         let inserted = try await persistence.withFileLock(path) { () async throws -> Bool in
             var lines = try Self.readLines(path)
             if lines.contains(where: { Self.id(of: $0.row) == id }) { return false }
@@ -186,7 +197,7 @@ public actor LiveNotificationInbox {
             try Self.write(retaining: lines, to: path, now: now)
             return true
         }
-        invalidate()
+        if inserted { invalidate() }
         return inserted
     }
 
@@ -194,24 +205,23 @@ public actor LiveNotificationInbox {
     /// already live. The check and the append share this feed's single flock —
     /// the same guarantee the caller previously built by hand around a raw
     /// capped append — so two concurrent producers cannot both pass the check
-    /// and double-card. The check runs against this feed's file, so it must not
-    /// take that lock itself.
+    /// and double-card. The check receives this feed's freshly read rows.
     ///
     /// Returns the existing card's id when the append was suppressed, nil when
     /// the row was written.
     public func appendUnlessDuplicate(
         _ row: JSONValue,
-        duplicateID: @escaping @Sendable () -> String?
+        duplicateID: @escaping @Sendable ([JSONValue]) -> String?
     ) async throws -> String? {
-        let now = clock()
+        let now = Date()
         let existing = try await persistence.withFileLock(path) { () async throws -> String? in
-            if let existing = duplicateID() { return existing }
             var lines = try Self.readLines(path)
+            if let existing = duplicateID(lines.compactMap(\.row)) { return existing }
             lines.append(Line(raw: Data(try row.serialize(pretty: false).utf8), row: row))
             try Self.write(retaining: lines, to: path, now: now)
             return nil
         }
-        invalidate()
+        if existing == nil { invalidate() }
         return existing
     }
 
@@ -229,7 +239,7 @@ public actor LiveNotificationInbox {
         id: String,
         update: @escaping @Sendable (JSONValue?) throws -> (row: JSONValue, isNewOccurrence: Bool)
     ) async throws -> Bool {
-        let now = clock()
+        let now = Date()
         let isNewOccurrence = try await persistence.withFileLock(path) { () async throws -> Bool in
             var lines = try Self.readLines(path)
             let index = lines.firstIndex(where: { Self.id(of: $0.row) == id })
@@ -297,9 +307,9 @@ public actor LiveNotificationInbox {
             return InformationalRollupResult(inserted: inserted, cardID: id, occurrenceCount: 1)
         }
 
-        let now = clock()
+        let now = Date()
         let result = try await persistence.withFileLock(path) {
-            () async throws -> InformationalRollupResult in
+            () async throws -> (value: InformationalRollupResult, written: Bool) in
             var lines = try Self.readLines(path)
 
             if let occurrence,
@@ -308,11 +318,11 @@ public actor LiveNotificationInbox {
                          Self.string(object["informational_rollup_key"]) == key else { return false }
                    return Self.stringArray(object["absorbed_occurrence_ids"]).contains(occurrence)
                }) {
-                return InformationalRollupResult(
+                return (InformationalRollupResult(
                     inserted: false,
                     cardID: Self.id(of: duplicate.row) ?? id,
                     occurrenceCount: Self.recordedOccurrenceCount(duplicate.row)
-                )
+                ), false)
             }
 
             let existingIndex = lines.lastIndex { line in
@@ -327,11 +337,11 @@ public actor LiveNotificationInbox {
                   case .object(let existing)? = lines[existingIndex].row else {
                 if occurrence == nil,
                    let duplicate = lines.lastIndex(where: { Self.id(of: $0.row) == id }) {
-                    return InformationalRollupResult(
+                    return (InformationalRollupResult(
                         inserted: false,
                         cardID: id,
                         occurrenceCount: Self.recordedOccurrenceCount(lines[duplicate].row)
-                    )
+                    ), false)
                 }
                 let cardID = lines.contains(where: { Self.id(of: $0.row) == id })
                     ? "\(id)-\(UUID().uuidString)" : id
@@ -354,7 +364,7 @@ public actor LiveNotificationInbox {
                     row: insertedRow
                 ))
                 try Self.write(retaining: lines, to: path, now: now)
-                return InformationalRollupResult(inserted: true, cardID: cardID, occurrenceCount: 1)
+                return (InformationalRollupResult(inserted: true, cardID: cardID, occurrenceCount: 1), true)
             }
 
             let existingID = Self.string(existing["id"]) ?? id
@@ -364,9 +374,9 @@ public actor LiveNotificationInbox {
             // Is this write a NEW occurrence, or the same one arriving twice?
             if let occurrence {
                 guard !absorbed.contains(occurrence) else {
-                    return InformationalRollupResult(
+                    return (InformationalRollupResult(
                         inserted: false, cardID: existingID, occurrenceCount: priorCount
-                    )
+                    ), false)
                 }
                 absorbed.append(occurrence)
                 if absorbed.count > Self.maxAbsorbedOccurrenceIDs {
@@ -374,11 +384,11 @@ public actor LiveNotificationInbox {
                 }
             } else if let duplicate = lines.lastIndex(where: { Self.id(of: $0.row) == id }) {
                 // No occurrence identity: fall back to the card-id rule.
-                return InformationalRollupResult(
+                return (InformationalRollupResult(
                     inserted: false,
                     cardID: existingID,
                     occurrenceCount: Self.recordedOccurrenceCount(lines[duplicate].row)
-                )
+                ), false)
             }
 
             let nextCount = priorCount + 1
@@ -406,14 +416,14 @@ public actor LiveNotificationInbox {
                 row: replacementRow
             ))
             try Self.write(retaining: lines, to: path, now: now)
-            return InformationalRollupResult(
+            return (InformationalRollupResult(
                 inserted: false,
                 cardID: existingID,
                 occurrenceCount: nextCount
-            )
+            ), true)
         }
-        invalidate()
-        return result
+        if result.written { invalidate() }
+        return result.value
     }
 
     /// Set fields on the newest row `id` in one locked read-and-write; a null
@@ -421,7 +431,7 @@ public actor LiveNotificationInbox {
     /// row already has that key: the check is the claim. True when written.
     @discardableResult
     public func patch(id: String, unlessPresent: String? = nil, _ fields: [String: JSONValue]) async throws -> Bool {
-        let now = clock()
+        let now = Date()
         let changed = try await persistence.withFileLock(path) { () async throws -> Bool in
             var lines = try Self.readLines(path)
             guard let index = lines.lastIndex(where: { Self.id(of: $0.row) == id }),
@@ -433,7 +443,7 @@ public actor LiveNotificationInbox {
             try Self.write(retaining: lines, to: path, now: now)
             return true
         }
-        invalidate()
+        if changed { invalidate() }
         return changed
     }
 
@@ -442,14 +452,14 @@ public actor LiveNotificationInbox {
     public func updateStatus(
         id: String, status: String, readAt: String?, metadata: [String: JSONValue] = [:]
     ) async throws -> Bool {
-        let now = clock()
-        let changed = try await persistence.withFileLock(path) { () async throws -> Bool in
+        let now = Date()
+        let result = try await persistence.withFileLock(path) { () async throws -> (handled: Bool, written: Bool) in
             var lines = try Self.readLines(path)
             // The newest row is the card on screen. A producer that re-files a
             // settled card appends a fresh row under the same id, and settling
             // the oldest one instead left the visible card unread.
             guard let index = lines.lastIndex(where: { Self.id(of: $0.row) == id }),
-                  case .object(var object)? = lines[index].row else { return false }
+                  case .object(var object)? = lines[index].row else { return (false, false) }
             // A detail sheet may appear more than once while the same card is
             // already open.  Its automatic read action is therefore a
             // state-transition request, not a reason to churn `read_at` (and
@@ -471,7 +481,7 @@ public actor LiveNotificationInbox {
                 ? (existingStatus != status || !hasReadTimestamp ? Self.iso8601(now) : nil)
                 : readAt
             if existingStatus == status, stamp == nil || hasReadTimestamp, metadata.isEmpty {
-                return true
+                return (true, false)
             }
             object["status"] = .string(status)
             if let stamp { object["read_at"] = .string(stamp) }
@@ -479,10 +489,10 @@ public actor LiveNotificationInbox {
             let row = JSONValue.object(object)
             lines[index] = Line(raw: Data(try row.serialize(pretty: false).utf8), row: row)
             try Self.write(retaining: lines, to: path, now: now)
-            return true
+            return (true, true)
         }
-        invalidate()
-        return changed
+        if result.written { invalidate() }
+        return result.handled
     }
 
     /// Archives a producer-selected set of unread informational cards in one
@@ -496,7 +506,7 @@ public actor LiveNotificationInbox {
     ) async throws -> Int {
         let targets = Set(ids.filter { !$0.isEmpty })
         guard !targets.isEmpty else { return 0 }
-        let now = clock()
+        let now = Date()
         let changed = try await persistence.withFileLock(path) { () async throws -> Int in
             var lines = try Self.readLines(path)
             var changed = 0
@@ -541,7 +551,7 @@ public actor LiveNotificationInbox {
         }) {
             return 0
         }
-        let now = clock()
+        let now = Date()
         let changed = try await persistence.withFileLock(path) { () async throws -> Int in
             var lines = try Self.readLines(path)
             var changed = 0
@@ -578,7 +588,7 @@ public actor LiveNotificationInbox {
         readAt: String
     ) async throws -> Int {
         guard !source.isEmpty, !groupField.isEmpty else { return 0 }
-        let now = clock()
+        let now = Date()
         let changed = try await persistence.withFileLock(path) { () async throws -> Int in
             var lines = try Self.readLines(path)
             var latestByGroup: [String: Int] = [:]
@@ -629,7 +639,7 @@ public actor LiveNotificationInbox {
         let cutoff = now.addingTimeInterval(-terminalRetentionSeconds)
         for index in lines.indices {
             guard budget > 0 else { break }
-            guard lines[index].isTerminal,
+            guard !lines[index].hasHeldDelivery, lines[index].isTerminal,
                   let finished = lines[index].retentionStamp,
                   finished < cutoff else { continue }
             evicted.insert(index)
@@ -640,7 +650,8 @@ public actor LiveNotificationInbox {
         //    the budget first; the rest goes to newest terminal history and
         //    malformed physical lines, which are never silently "cleaned up" —
         //    they land on the shelf like anything else.
-        let survivors = lines.indices.filter { !evicted.contains($0) }
+        // Outstanding deliveries must stay live for their release owner.
+        let survivors = lines.indices.filter { !evicted.contains($0) && !lines[$0].hasHeldDelivery }
         if survivors.count > rowLimit {
             var kept = Set<Int>()
             for index in survivors.reversed() where lines[index].isActive {
@@ -746,13 +757,10 @@ public actor LiveNotificationInbox {
     }
 
     private static func parseISO8601(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) { return date }
-        return ISO8601DateFormatter().date(from: value)
+        NativeTimestampFormat.parseISO8601FractionalFirst(value)
     }
 
-    private static func readLines(_ path: URL) throws -> [Line] {
+    public static func readLines(_ path: URL) throws -> [Line] {
         guard FileManager.default.fileExists(atPath: path.path) else { return [] }
         let data = try Data(contentsOf: path)
         guard !data.isEmpty else { return [] }
@@ -762,7 +770,7 @@ public actor LiveNotificationInbox {
         return parts.map { Line(raw: $0, row: try? JSONValue.parse($0)) }
     }
 
-    private static func write(_ lines: [Line], to path: URL) throws {
+    public static func write(_ lines: [Line], to path: URL) throws {
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true
         )

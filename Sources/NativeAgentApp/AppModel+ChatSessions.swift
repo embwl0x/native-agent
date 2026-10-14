@@ -1,4 +1,6 @@
+import EngineRuntime
 import AppToolRuntime
+import Privacy
 import TurnTrace
 import Foundation
 import Observation
@@ -44,36 +46,6 @@ import Connectors
 import Browser
 import DeviceSync
 
-/// Whether the human has explicitly picked a chat session since this launch.
-///
-/// THE RULE: the main window defaults to the conversation anchor — the remote
-/// conversation User is currently in, on whichever surface — but it must NEVER
-/// take him off a session he chose himself. Same protection iOS already gives
-/// itself in `shouldReturnToMainSession`: a snapshot arriving mid-thought does
-/// not get to move the screen.
-///
-/// Process-scoped rather than persisted, and that is the point. "This launch"
-/// is the window in which his choice is still current; a choice from last week
-/// should not outrank the conversation he is having right now.
-@MainActor
-enum MacChatSelectionIntent {
-    private(set) static var userChoseThisLaunch = false
-
-    /// The anchor Simple last followed or was taken off by a choice. Simple
-    /// moves only when the anchor moves past this.
-    static var lastSeenAnchorSessionId: String?
-
-    /// Called wherever the human's own intent selects a session — picking one
-    /// in the sidebar, or creating a new one.
-    static func noteUserChoice() {
-        userChoseThisLaunch = true
-        lastSeenAnchorSessionId = ConversationAnchor.currentSessionId()
-    }
-
-    /// Test seam. Production never calls this; a launch has exactly one start.
-    static func resetForTesting() { userChoseThisLaunch = false }
-}
-
 extension Notification.Name {
     /// See `AppModel.flushLiveChatDrafts()`. Posted before a chat surface
     /// reads a stored draft; every mounted composer commits its live text.
@@ -84,30 +56,13 @@ extension Notification.Name {
 }
 
 @MainActor
-extension AppModel {
+extension AppModel: MacChatSessionSelectionPort {
     func loadChatState() async {
         // Idempotent; the earliest post-construction entry point AppModel owns.
         // Keeps the UserDefaults-backed settings block live so a bridge or
         // out-of-process write is picked up without a relaunch.
         installDefaultsBackedSettingsObserver()
         await reloadChatState()
-    }
-
-    @MainActor
-    private func waitForChatStateLoad() async {
-        await withCheckedContinuation { continuation in
-            chatStateLoadWaiters.append(continuation)
-        }
-    }
-
-    @MainActor
-    private func finishChatStateLoad() {
-        chatStateLoadInFlight = false
-        let waiters = chatStateLoadWaiters
-        chatStateLoadWaiters.removeAll()
-        for waiter in waiters {
-            waiter.resume()
-        }
     }
 
     // S.1: prune stale drafts/attachments for sessions that no longer exist,
@@ -193,12 +148,8 @@ extension AppModel {
         let toolStore = engine.tools
         let desk = engine.desk
         var failedEndpoints: [String] = []
-        // Sol P1, 2026-09-13: what this call ANNOUNCES must come from what this
-        // call actually did. Two branches below do no read at all, and the one
-        // that probes health must report the probe's own outcome rather than
-        // the cached row it fell back to.
+        // Branches that perform no read must not claim refreshed data.
         var performedRead = true
-        var healthProbeFailed = false
         /// Returns `value`, recording `endpoint` as failed when it is nil.
         /// Callers keep their `?? existingValue` fallback — the value on screen
         /// is unchanged, but now the UI knows it is carried over, not fetched.
@@ -234,7 +185,7 @@ extension AppModel {
             // those screens had been visited. Load it once here; the name is
             // the profile's, never a literal.
             if personality == nil {
-                if let next = fresh("personality profile", try? await Self.readPersonality(dataRoot: engine.dataRoot)), next != personality { personality = next }
+                if let next = fresh("personality profile", try? await SwiftNativePersonaEngine.readPersonality(dataRoot: engine.dataRoot)), next != personality { personality = next }
                 teachMemoryHygieneName()
             }
         case .legacyWorkshop:
@@ -286,9 +237,11 @@ extension AppModel {
             if let next = fresh("personality", personalityRow), next != personality { personality = next }
             teachMemoryHygieneName()
             if let next = fresh("trust policy", trustRow), next != engine.trust.policy { engine.trust.policy = next }
-        case .settingsHub, .settings, .connectors, .providers, .telegram, .inboxPolicy, .macIntegration:
-            async let nextConfig = try? Self.readConfig(dataRoot: engine.dataRoot)
-            async let nextTelegramStatus = try? engine.telegram.load(manager: backgroundLoopsManager.coreManager)
+        case .connectors:
+            workspaces = fresh("shared folders", try? await ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot)) ?? workspaces
+        case .settingsHub, .settings, .providers, .telegram, .inboxPolicy, .macIntegration:
+            async let nextConfig = try? RuntimeReadProjection.configuration(dataRoot: engine.dataRoot)
+            async let nextTelegramStatus = try? engine.telegram.load(manager: backgroundLoopsManager)
             async let nextConnectors = try? ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform())
             let (configRow, telegramRow, connectorRows) = await (
                 nextConfig,
@@ -297,18 +250,15 @@ extension AppModel {
             )
             if let config = fresh("config", configRow) {
                 engine.providers.codexAuth = config.codexAuth
-                _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
+                applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
             }
             engine.telegram.status = fresh("telegram status", telegramRow) ?? engine.telegram.status
             connectors = fresh("connectors", connectorRows) ?? connectors
-            if item == .connectors {
-                workspaces = fresh("shared folders", try? await ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot)) ?? workspaces
-            }
         case .approvals, .activity:
             async let nextApprovals = try? approvalStore.list()
             async let nextInbox = try? inbox.list()
             async let nextMemoryProposals = try? memory.proposals(status: "pending")
-            async let nextMisses = Self.readMisses(dataRoot: engine.dataRoot)
+            async let nextMisses = MemoryStatusProjection.recentMisses(dataRoot: engine.dataRoot)
             let (approvalRows, inboxRows, proposalRows) = await (
                 nextApprovals,
                 nextInbox,
@@ -323,7 +273,7 @@ extension AppModel {
             async let nextTools = try? toolStore.listAuthored()
             async let nextCapabilitySummary = try? engine.trust.loadCapabilities()
             async let nextApprovals = try? approvalStore.list()
-            async let nextWorkflows = try? makeWorkflowOrchestrationClient(root: engine.dataRoot).listWorkflowRecords()
+            async let nextWorkflows = try? SwiftNativeWorkflowOrchestrationClient(root: engine.dataRoot).listWorkflowRecords()
             async let nextMCPServers = try? engine.tools.mcp.listServers()
             // The compact MCP Builder is mounted in Capabilities too. Its
             // server controls render live session and consent evidence, so
@@ -340,15 +290,15 @@ extension AppModel {
             async let nextNativeActions = NativeActionRoutes.swiftNativeActionRecords()
             async let nextNativeActionReceipts: [NativeActionReceipt] = RuntimeReadProjection.tailJSONL(
                 path: NativeActionRoutes.nativeActionReceiptsPath(dataRoot: engine.dataRoot), limit: 50)
-            async let nextConnectorActionRegistry = try? ConnectorActionRegistry.read(dataRoot: engine.dataRoot)
+            async let nextConnectorActionRegistry = try? ConnectorActionRegistry.read(dataRoot: engine.dataRoot, platform: AppConnectorStatusPlatform())
             async let nextImprovementGauntletStatus = try? RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: engine.dataRoot)
             async let nextCatalog = try? engine.trust.catalog()
             async let nextCatalogSources = try? engine.trust.catalogSources()
             async let nextPackInstalls = try? engine.trust.packInstalls()
             async let nextCapabilityTrust = try? engine.trust.loadCapabilityNetwork()
-            async let nextSummary = try? NextGenStatusProjection(dataRoot: engine.dataRoot).getNextGenSummary()
-            async let nextPhases = try? NextGenStatusProjection(dataRoot: engine.dataRoot).getNextGenPhases()
-            async let nextReceipts = try? NextGenStatusProjection(dataRoot: engine.dataRoot).getNextGenReceipts()
+            async let nextGenSnapshot = decodeLogged("nextgen snapshot") {
+                try await NextGenStatusProjection(dataRoot: engine.dataRoot).snapshot()
+            }
             async let nextGraph = try? engine.memory.graphView()
             let (
                 skillRows,
@@ -370,9 +320,7 @@ extension AppModel {
                 sourceRows,
                 installRows,
                 trustRow,
-                summaryRow,
-                phaseRows,
-                receiptRows,
+                nextGenRow,
                 graphRow
             ) = await (
                 nextSkills,
@@ -394,9 +342,7 @@ extension AppModel {
                 nextCatalogSources,
                 nextPackInstalls,
                 nextCapabilityTrust,
-                nextSummary,
-                nextPhases,
-                nextReceipts,
+                nextGenSnapshot,
                 nextGraph
             )
             skills = fresh("skills", skillRows) ?? skills
@@ -431,7 +377,11 @@ extension AppModel {
             capabilityCatalogSources = fresh("catalog sources", sourceRows) ?? capabilityCatalogSources
             capabilityPackInstalls = fresh("pack installs", installRows) ?? capabilityPackInstalls
             engine.trust.capabilityNetwork = fresh("capability trust", trustRow) ?? engine.trust.capabilityNetwork
-            nextGenSummary = fresh("nextgen summary", summaryRow) ?? nextGenSummary
+            if let snapshot = fresh("nextgen snapshot", nextGenRow) {
+                nextGenSummary = snapshot.summary
+                nextGenPhases = snapshot.phases
+                nextGenReceipts = snapshot.receipts
+            }
             agentGraph = fresh("skill memory graph", graphRow?.agentGraph) ?? agentGraph
             graphEntities = fresh("skill memory graph entities", graphRow?.entities) ?? graphEntities
             graphStatus = fresh("skill memory graph status", graphRow?.status) ?? graphStatus
@@ -440,20 +390,10 @@ extension AppModel {
             } else {
                 graphLoadError = "The graph could not be loaded for Capabilities. Refresh Graph to retry."
             }
-            // `phaseRows` legitimately falls back to the summary's embedded
-            // phases, so only count it as failed when BOTH sources are absent.
-            nextGenPhases = phaseRows ?? fresh("nextgen phases", summaryRow?.phases) ?? nextGenPhases
-            nextGenReceipts = fresh("nextgen receipts", receiptRows) ?? nextGenReceipts
         case .autoImprovement:
             // The weekly pass reads its digest directly.
             async let nextJobs = try? desk.listJobs()
-            async let nextTrainingArtifacts = try? Self.readTrainingArtifacts(dataRoot: engine.dataRoot)
-            let (jobRows, artifactRows) = await (
-                nextJobs,
-                nextTrainingArtifacts
-            )
-            desk.jobs = fresh("jobs", jobRows) ?? desk.jobs
-            trainingArtifacts = fresh("training artifacts", artifactRows) ?? trainingArtifacts
+            desk.jobs = fresh("jobs", await nextJobs) ?? desk.jobs
         case .dreams:
             // The Dreams tab fetches its diary itself; refresh the trust policy
             // here so the REM toggle (trainingPolicy.rem_cycle_enabled) reflects
@@ -478,10 +418,10 @@ extension AppModel {
             // consumer is starved. See prerelease-upgrade-campaign.md B2.1 [W7#1].
             async let nextActivity = try? RuntimeReadProjection.getActivity(root: engine.dataRoot)
             async let nextRuns = RuntimeReadProjection.runs(dataRoot: engine.dataRoot)
-            async let nextWatchdog = engine.doctor.readWatchdog(manager: backgroundLoopsManager.coreManager)
+            async let nextWatchdog = engine.doctor.readWatchdog(manager: backgroundLoopsManager)
             // Health used to be fetched unconditionally for every page above;
             // Status is the page that actually reads it, so it reads it here.
-            let healthRow: RuntimeHealth? = engine.doctor.readHealth()
+            let healthRow = engine.doctor.readHealth()
             let (activityRows, runRows, watchdogRow) = await (
                 nextActivity,
                 nextRuns,
@@ -490,17 +430,12 @@ extension AppModel {
             activityEvents = fresh("activity", activityRows) ?? activityEvents
             runs = fresh("runs", runRows) ?? runs
             engine.doctor.watchdog = fresh("watchdog", watchdogRow) ?? engine.doctor.watchdog
-            healthProbeFailed = healthRow == nil
-            // The probe's outcome outlives this call: the Diagnostics
-            // projection reads `health` long after, and a cached row must not
-            // be read there as a reading that came back.
-            engine.doctor.healthProbeFailed = healthProbeFailed
-            engine.doctor.health = fresh("health", healthRow) ?? engine.doctor.health
+            engine.doctor.health = healthRow
         case .personality:
             async let nextPersonality = try? PersonaCompiler.compileProfile(dataRoot: engine.dataRoot).sharedProfile
             async let nextDocs = try? persona.listPersonaDocSpecs()
             async let nextCompiled = try? PersonaCompiler(engine: persona).compiledPacket(surface: "chat")
-            async let nextGrowth = try? Self.readPersonalityGrowth()
+            async let nextGrowth = try? RuntimeReadProjection.swiftPersonalityGrowth(runtime: NativeAgentEngine.liveCognition)
             let (personalityRow, docsResponse, compiledRow, growthRow) = await (
                 nextPersonality,
                 nextDocs,
@@ -537,7 +472,7 @@ extension AppModel {
             toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
         case .tools:
             async let nextTools = try? toolStore.listAuthored()
-            async let nextConnectorActions = try? ConnectorActionRegistry.read(dataRoot: engine.dataRoot)
+            async let nextConnectorActions = try? ConnectorActionRegistry.read(dataRoot: engine.dataRoot, platform: AppConnectorStatusPlatform())
             async let nextMCPServers = try? engine.tools.mcp.listServers()
             // Tools renders the current catalog *and* its Full Mac lifecycle
             // explanation. Refresh the Trust policy in the same pass so an
@@ -652,15 +587,8 @@ extension AppModel {
         // say "online"/"unavailable" — every other page says what its own read
         // did. Announcing cached health here claimed a probe that never ran.
         //
-        // Sol P1, 2026-09-13: the probe's OWN outcome is what it says. A failed
-        // health read left `health` on its cached row and the line still read
-        // "Native runtime online" — a claim about a reading that never came
-        // back. And a page whose branch read nothing now says nothing about
-        // freshness: "Desk up to date" was a receipt for no work at all.
         if item.normalized == .diagnostics {
-            statusText = healthProbeFailed
-                ? "Health check failed"
-                : (engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable")
+            statusText = engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable"
         } else if !performedRead {
             statusText = "\(item.normalized.rawValue) opened"
         } else if receipt.failedEndpoints.isEmpty {
@@ -747,7 +675,9 @@ extension AppModel {
     /// data root). Trust asks for it whenever it shows the map.
     func refreshPrivacyMap() async {
         let root = engine.dataRoot
-        privacyMap = await Task.detached(priority: .utility) { PrivacyMap(dataRoot: root) }.value
+        privacyMap = await Task.detached(priority: .utility) {
+            PrivacyMap(dataRoot: root, generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date()))
+        }.value
     }
 
     /// One user-facing sentence naming what could not be reached and how old
@@ -760,7 +690,7 @@ extension AppModel {
         guard let lastSuccess = status.lastSuccessAt else {
             // The provider reads failing with none connected is that cause;
             // anything else failed for its own reason, which is not named here.
-            return Set(status.failedEndpoints).isSubset(of: ["providers", "model catalog"]) && !hasAnyUsableProvider()
+            return Set(status.failedEndpoints).isSubset(of: ["providers", "model catalog"]) && !SwiftNativeProviderRouting(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).hasUsableCredentials()
                 ? "Nothing has loaded yet this session: no AI provider is connected. Connect one in Providers."
                 : "Nothing has loaded yet this session: the last read failed."
         }
@@ -944,13 +874,7 @@ extension AppModel {
 
     @MainActor
     func reloadChatState() async {
-        if chatStateLoadInFlight {
-            await waitForChatStateLoad()
-            return
-        }
-        chatStateLoadInFlight = true
-        await performLoadChatState()
-        finishChatStateLoad()
+        await engine.transcripts.sessionTransactions.load { await performLoadChatState() }
     }
 
     /// Lightweight live refresh for session-backed Mac read models.
@@ -965,7 +889,7 @@ extension AppModel {
     @MainActor
     func refreshChatSessionIndex() async {
         await refreshChatSessionIndex { [transcripts = engine.transcripts] in
-            try await transcripts.list()
+            try await transcripts.listForPresentation()
         }
     }
 
@@ -1019,7 +943,7 @@ extension AppModel {
         MacChatSelectionIntent.lastSeenAnchorSessionId = anchorId
         guard anchorId != activeChatSessionId else { return }
         if !engine.transcripts.sessions.contains(where: { $0.id == anchorId }) {
-            do { engine.transcripts.sessions = try await engine.transcripts.list() } catch { return }
+            do { engine.transcripts.sessions = try await engine.transcripts.listForPresentation() } catch { return }
         }
         guard let session = engine.transcripts.sessions.first(where: { $0.id == anchorId && $0.archived != true })
         else { return }
@@ -1037,7 +961,7 @@ extension AppModel {
             if let policy = try? await engine.trust.load() {
                 engine.trust.policy = policy
             }
-            let fetchedSessions = try await engine.transcripts.list()
+            let fetchedSessions = try await engine.transcripts.listForPresentation()
             chatSessionIndexRefreshFailed = false
             engine.transcripts.sessions = fetchedSessions
             // Simple owns its current thread. Advanced may default to the
@@ -1060,12 +984,9 @@ extension AppModel {
                    (activeChatSessionId != activeAtStart || chatSelectionGeneration != selectionGenerationAtStart) {
                     return
                 }
-                if let unified = chatSessionTransactions.existingMainSession(in: engine.transcripts.sessions) {
-                    activeChatSessionId = unified.id
-                } else {
-                    let session = try await chatSessionTransactions.create(store: engine.transcripts)
-                    activeChatSessionId = session.id
-                    engine.transcripts.sessions = [session]
+                let reconciled = try await engine.transcripts.sessionTransactions.reconcileStartupSession(store: engine.transcripts)
+                activeChatSessionId = reconciled.session.id
+                if reconciled.created {
                     NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: false)
                 }
                 UserDefaults.standard.set(activeChatSessionId, forKey: "activeChatSessionId")
@@ -1095,7 +1016,7 @@ extension AppModel {
                 markChatSidebarLoadSucceeded()
                 return
             }
-            applyLoadedChatMessages(messages, for: targetSessionId)
+            engine.transcripts.applyLoadedMessages(messages, for: targetSessionId)
             markChatSidebarLoadSucceeded()
         } catch {
             chatStateLoadFailed = true
@@ -1103,123 +1024,25 @@ extension AppModel {
         }
     }
 
-    /// Re-read the active transcript after a turn to replace optimistic rows
-    /// with persisted ones. Local turns already land their disk snapshot and
-    /// set `messagesAlreadyRefreshed`; remote turns keep the full refresh.
-    @MainActor
     func refreshChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool = false) async {
-        guard !sessionId.isEmpty, activeChatSessionId == sessionId else { return }
-        let lifecycleAtLoadStart = engine.turns.lifecycle(for: sessionId)
-        var messages: [ChatMessage]? = nil
-        if !messagesAlreadyRefreshed {
-            do {
-                messages = try await engine.transcripts.loadMessages(sessionId: sessionId, cached: true)
-            } catch {
-                // Don't swallow this. A failed post-turn refresh leaves optimistic
-                // bubble ids on screen; saying nothing is the same lie M12 is about.
-                setFailureStatus(error, action: "refresh your chats")
-                return
-            }
-        }
-        // The active session can change while the load is in flight.
-        guard activeChatSessionId == sessionId,
-              !engine.turns.streamingSessions.contains(sessionId),
-              engine.turns.lifecycle(for: sessionId) == lifecycleAtLoadStart else { return }
-        if let messages {
-            // A NEW turn may have started on this session while we were fetching
-            // (the user sent again immediately). That turn owns the slot and its
-            // optimistic bubbles are fresher than this disk snapshot — mirrors
-            // selectChatSession's streaming guard. The finished turn's rows are
-            // already in memory, so nothing is lost by skipping the swap.
-            guard !engine.turns.streamingSessions.contains(sessionId) else { return }
-            applyLoadedChatMessages(messages, for: sessionId)
-        }
-    }
-
-    /// Refresh a visible detached transcript after a turn completed on another
-    /// surface. This mirrors the active-chat refresh without changing the main
-    /// selection and never replaces a slot while a newer local stream owns it.
-    @MainActor
-    func refreshDetachedChatMessagesAfterTurn(
-        sessionId: String,
-        messagesAlreadyRefreshed: Bool = false
-    ) async {
-        guard !sessionId.isEmpty,
-              DetachedChatWindowController.shared.isDetached(sessionId),
-              !engine.turns.streamingSessions.contains(sessionId)
-        else { return }
-        let lifecycleAtLoadStart = engine.turns.lifecycle(for: sessionId)
-        var messages: [ChatMessage]?
-        if !messagesAlreadyRefreshed {
-            do {
-                messages = try await engine.transcripts.loadMessages(sessionId: sessionId, cached: true)
-            } catch {
-                detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
-                    previous: detachedChatRefreshStatus[sessionId],
-                    failedEndpoints: ["messages"],
-                    at: Date()
-                )
-                return
-            }
-        }
-        guard DetachedChatWindowController.shared.isDetached(sessionId),
-              engine.turns.lifecycle(for: sessionId) == lifecycleAtLoadStart,
-              !engine.turns.streamingSessions.contains(sessionId)
-        else { return }
-        if let messages {
-            applyLoadedChatMessages(messages, for: sessionId)
-        }
-        detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
-            previous: detachedChatRefreshStatus[sessionId],
-            failedEndpoints: [],
-            at: Date()
+        await engine.refreshChatMessagesAfterTurn(
+            sessionId: sessionId, messagesAlreadyRefreshed: messagesAlreadyRefreshed,
+            activeSession: { activeChatSessionId },
+            failure: { setFailureStatus($0, action: "refresh your chats") }
         )
     }
 
-    /// Apply a disk snapshot of `sessionId`'s messages over the in-memory list.
-    ///
-    /// Durability for synthetic error bubbles (audit #2 follow-up, fix Z):
-    /// failure/no-content notices are in-memory only (appendChatMessage never
-    /// persists), so a naive disk-replace would wipe them a beat after they
-    /// appear. If the current in-memory tail is a synthetic error bubble absent
-    /// from disk, carry it over so the notice survives the post-turn reload. It
-    /// drops naturally once a newer turn supersedes it (it's no longer the tail).
-    /// The `!isCompletedAssistant(disk.last)` clause prevents a stale error
-    /// bubble from floating BELOW a newer real reply: a remote/iOS turn on this
-    /// session posts .chatTurnCompleted without a local append, so only preserve
-    /// while disk's newest row is NOT a completed reply (a partial/user row
-    /// means the failure still stands; a real assistant reply supersedes the
-    /// notice). (gpt-5.5 review of fix Z, point b.)
-    ///
-    /// H4: skip the write entirely when the result is identical to what's
-    /// already in the slot. `engine.transcripts.messagesBySession` is observed by the message
-    /// list, the sidebar badges and the scroll coordinator; an equal-value
-    /// write still invalidates all of them.
-    @MainActor
-    func applyLoadedChatMessages(_ disk: [ChatMessage], for sessionId: String) {
-        var loaded = disk
-        if let local = engine.transcripts.messagesBySession[sessionId],
-           let tail = local.last,
-           tail.id.hasPrefix(Self.syntheticErrorIDPrefix),
-           !disk.contains(where: { $0.id == tail.id }) {
-            if tail.metadata?.syntheticUserRowPersisted == false {
-                // A pre-provider failure has a local-only user row as well as
-                // its notice. Reuse retry's exact predecessor-ID proof: an old
-                // completed reply is not a newer turn, while any canonical
-                // conversation advance must supersede this unsent pair.
-                if let snapshot = MacChatRetrySnapshot.capture(
-                    target: tail, messages: local, sessionId: sessionId, isSyntheticNotice: true
-                ), snapshot.matchesCanonical(disk),
-                   let user = local.first(where: { $0.id == snapshot.priorUserMessageId }) {
-                    loaded.append(user)
-                    loaded.append(tail)
-                }
-            } else if !isCompletedAssistant(disk.last) {
-                loaded.append(tail)
+    func refreshDetachedChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool = false) async {
+        await engine.refreshDetachedChatMessagesAfterTurn(
+            sessionId: sessionId, messagesAlreadyRefreshed: messagesAlreadyRefreshed,
+            isDetached: { DetachedChatWindowController.shared.isDetached(sessionId) },
+            finished: { failures in
+                detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
+                    previous: detachedChatRefreshStatus[sessionId],
+                    failedEndpoints: failures, at: Date()
+                )
             }
-        }
-        guard engine.transcripts.messagesBySession[sessionId] != loaded else { return }
-        engine.transcripts.messagesBySession[sessionId] = loaded
+        )
     }
 
     struct ChatSessionLoadSnapshot {
@@ -1244,8 +1067,10 @@ extension AppModel {
         persistSelection: Bool,
         load: (String) async throws -> ChatSessionLoadSnapshot
     ) async {
-        await chatSessionTransactions.select(
-            session.id, persistSelection: persistSelection, port: self, load: load
+        await engine.transcripts.sessionTransactions.select(
+            session.id, persistSelection: persistSelection, port: self,
+            store: engine.transcripts, runtime: engine.turns.runtime,
+            presentStatus: { statusText = $0 }, load: load
         )
     }
 
@@ -1261,7 +1086,7 @@ extension AppModel {
             let isStreamingThisSession = engine.turns.streamingSessions.contains(requestedId)
             let inMemoryEmpty = (engine.transcripts.messagesBySession[requestedId] ?? []).isEmpty
             if !isStreamingThisSession || inMemoryEmpty {
-                applyLoadedChatMessages(snapshot.messages, for: requestedId)
+                engine.transcripts.applyLoadedMessages(snapshot.messages, for: requestedId)
             }
         }
 
@@ -1273,33 +1098,34 @@ extension AppModel {
             UserDefaults.standard.set(requestedId, forKey: "activeChatSessionId")
         }
 
-        // PATCH-2026-05-13: parallel-sessions — if this session is still
-        // streaming, restore the optimistic user turn and live assistant row.
-        if engine.turns.streamingSessions.contains(requestedId) {
-            if let userTurnId = engine.turns.streamingUserTurnIds[requestedId],
-               !engine.transcripts.messages(for: requestedId).contains(where: { $0.id == userTurnId }) {
+        engine.transcripts.sessionTransactions.restoreLiveRows(
+            messages: { engine.transcripts.messages(for: requestedId) },
+            streaming: engine.turns.streamingSessions.contains(requestedId),
+            userTurnId: engine.turns.streamingUserTurnIds[requestedId],
+            bubbleId: engine.turns.streamingBubbleIds[requestedId],
+            makeUser: { userTurnId in
                 let userText = engine.turns.streamingUserTurnTexts[requestedId] ?? ""
                 var userBubble = ChatMessage(sessionId: requestedId, role: "user", content: userText)
                 userBubble.id = userTurnId
-                appendChatMessage(userBubble, to: requestedId)
-            }
-            if let bubbleId = engine.turns.streamingBubbleIds[requestedId],
-               !engine.transcripts.messages(for: requestedId).contains(where: { $0.id == bubbleId }) {
+                return userBubble
+            },
+            makeAssistant: { bubbleId in
                 let liveText = engine.turns.streamingTexts[requestedId] ?? ""
                 var liveBubble = ChatMessage(sessionId: requestedId, role: "assistant", content: liveText)
                 liveBubble.id = bubbleId
                 var liveMetadata = ChatMessageMetadata()
                 liveMetadata.turnTraceId = engine.turns.activeTurnIDsBySession[requestedId]
                 liveBubble.metadata = liveMetadata
-                appendChatMessage(liveBubble, to: requestedId)
-            }
-        }
+                return liveBubble
+            },
+            append: { appendChatMessage($0, to: requestedId) }
+        )
     }
 
     @MainActor
     func newChatSession() async {
         do {
-            let session = try await chatSessionTransactions.create(store: engine.transcripts)
+            let session = try await engine.transcripts.sessionTransactions.create(store: engine.transcripts)
             MacChatSelectionIntent.noteUserChoice()
             chatSelectionGeneration += 1
             // Seed before publishing the session: the next await lets its
@@ -1307,7 +1133,7 @@ extension AppModel {
             engine.transcripts.setMessages([], for: session.id)
             activeChatSessionId = session.id
             persistActiveChatSessionID(activeChatSessionId)
-            engine.transcripts.sessions = try await engine.transcripts.list()
+            engine.transcripts.sessions = try await engine.transcripts.listForPresentation()
             migrateEmptySessionChatState(to: activeChatSessionId)
             pruneChatDrafts()
             // 2026-07-21 audit fix: prune per-session message caches
@@ -1323,120 +1149,55 @@ extension AppModel {
 
     @MainActor
     func renameChatSession(id sessionId: String, title: String) async {
-        await chatSessionTransactions.rename(id: sessionId, title: title, store: engine.transcripts) { [self] status, publish in
+        await engine.transcripts.sessionTransactions.rename(id: sessionId, title: title, store: engine.transcripts) { [self] status, publish in
             statusText = status
             if publish { publishChatSnapshot() }
         }
     }
-
-    // PATCH-2026-05-13: settings-toggle-2 — AppModel wrappers for the
-    // embeddings-backend toggle. The Settings page's memory rows
-    // (SetupFeatureRows) consume these (can't reach `client` directly
-    // because it's private).
 }
 
-/// User, 2026-10-07: a turn from Telegram, the phone or a bridge into the open
-/// conversation showed his message, then nothing, then the whole reply. Every
-/// door fires the same trace milestones as a Mac turn, so this reads them into
-/// the same lifecycle the card, the thinking glow and Work read. Display only:
-/// no task, no Stop, no durable receipt, and a Mac turn in the session always
-/// wins. It keeps every session's open turn, seeded from the engine's run
-/// registry when it starts, so a turn already running when a chat is opened or
-/// returned to shows too.
-@MainActor
-final class OtherDoorTurns {
-    static let shared = OtherDoorTurns()
-    /// Each session's other-door turn that began and has not ended.
-    private var open: [String: MacChatTurnLifecycleState] = [:]
-    private var started = false
-    /// Her words reaching the surface: movement, and the card reads "replying".
-    private static let outputKinds: Set<String> = [
-        TurnLifecycleMilestone.providerFirstDelta.rawValue,
-        TurnLifecycleMilestone.surfaceOutputEnqueued.rawValue,
-        TurnLifecycleMilestone.surfaceFirstRender.rawValue,
-    ]
-
-    func start(_ appModel: AppModel) {
-        guard !started else { return }
-        started = true
-        Task { await run(appModel) }
+extension AppModel: QuietChatSessionCommandPort {
+    var chatSessionTransactions: MacChatSessionTransactions { engine.transcripts.sessionTransactions }
+    var chatCommandTranscripts: TranscriptsFacade { engine.transcripts }
+    var quietPinnedChatSessionIDs: [String] { ChatSessionRetention.load() }
+    func quietChatIsDetached(_ sessionId: String) -> Bool {
+        DetachedChatWindowController.shared.isDetached(sessionId)
     }
-
-    /// Puts the session's open turn on its card, unless a Mac turn holds it.
-    func show(_ sessionId: String, _ appModel: AppModel) {
-        guard let state = open[sessionId] else { return }
-        let turns = appModel.engine.turns
-        if let held = turns.lifecycle(for: sessionId), held.identity.turnId != state.identity.turnId,
-           !held.presentation.isTerminal { return }
-        turns.lifecycleBySession[sessionId] = state
+    func openQuietChatWindow(sessionId: String) {
+        DetachedChatWindowController.shared.open(sessionId: sessionId)
     }
-
-    private func run(_ appModel: AppModel) async {
-        let subscription = await TurnTraceBus.shared.subscribe(capacity: 256)
-        for turn in appModel.engine.turns.inFlightTurns() {
-            admit(MacChatTurnIdentity(sessionId: turn.sessionId, turnId: turn.turnId), at: turn.acceptedAt, appModel)
-        }
-        for sessionId in open.keys { show(sessionId, appModel) }
-        for await event in subscription.stream {
-            guard let sessionId = event.sessionId, let ended = reduce(event, appModel) else { continue }
-            if ended {
-                // A refresh that started while the card was up is dropped by
-                // its lifecycle guard; this one lands the reply.
-                await appModel.refreshChatMessagesAfterTurn(sessionId: sessionId)
-            } else {
-                show(sessionId, appModel)
+    func closeQuietChatWindow(sessionId: String) {
+        DetachedChatWindowController.shared.close(sessionId: sessionId)
+    }
+    func unpinQuietChatSession(_ sessionId: String) -> Bool? {
+        do {
+            switch try ChatSessionRetention.closePinnedTab(sessionID: sessionId) {
+            case .closed(let encoded):
+                ChatSessionRetention.request(encodedPinnedIDs: encoded) { _ in
+                    NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: false)
+                }
+                return true
+            case .refusedAlreadyUnpinned: return false
+            case .refusedInvalidSessionID: return nil
             }
-        }
+        } catch { return nil }
     }
 
-    /// Opens a turn another door started: false when it is already open or
-    /// the Mac holds it.
-    @discardableResult
-    private func admit(_ identity: MacChatTurnIdentity, at startedAt: Date, _ appModel: AppModel) -> Bool {
-        let sessionId = identity.sessionId
-        let turns = appModel.engine.turns
-        guard open[sessionId]?.identity != identity,
-              !turns.busySessions.contains(sessionId),
-              turns.activeTurnIDsBySession[sessionId] != identity.turnId,
-              turns.lifecycle(for: sessionId)?.identity.turnId != identity.turnId
-        else { return false }
-        open[sessionId] = MacChatTurnLifecycleState(identity: identity, startedAt: startedAt)
-        return true
+    func clearQuietChatMessages(sessionId: String) async -> (succeeded: Bool, agentMessage: String) {
+        let result = await clearActiveChatMessages(sessionId: sessionId)
+        return (result.succeeded, result.agentMessage)
     }
-
-    /// Folds one event in: nil when it is not an other-door turn's, else
-    /// whether that turn ended.
-    private func reduce(_ event: TurnTraceEvent, _ appModel: AppModel) -> Bool? {
-        guard let sessionId = event.sessionId else { return nil }
-        let turns = appModel.engine.turns
-        let identity = MacChatTurnIdentity(sessionId: sessionId, turnId: event.turnId)
-        if event.kind == TurnLifecycleMilestone.turnAccepted.rawValue {
-            return admit(identity, at: event.ts, appModel) ? false : nil
-        }
-        guard let state = open[sessionId], state.identity == identity else { return nil }
-        let kind: MacChatTurnLifecycleInput.Kind
-        switch event.kind {
-        case "tool.dispatch":
-            var action: String?
-            if case .object(let payload) = event.payload, payload["phase"] == .string("begin"),
-               case .string(let name)? = payload["shown"] ?? payload["name"] {
-                action = ToolActivityPresentation.progress(name)
-            }
-            kind = .working(action: action)
-        case let output where Self.outputKinds.contains(output):
-            kind = .streamProgress(accumulatedUTF16Length: state.presentation.streamedTextLength + 1)
-        case "turn.terminal", "turn.cancelled", "turn.failed":
-            open[sessionId] = nil
-            if turns.lifecycle(for: sessionId)?.identity == identity {
-                turns.lifecycleBySession.removeValue(forKey: sessionId)
-            }
-            return true
-        default:
-            return nil
-        }
-        open[sessionId] = MacChatTurnLifecycleReducer.reduce(
-            state, input: MacChatTurnLifecycleInput(identity: identity, kind: kind, occurredAt: event.ts)
-        )
-        return false
+    func archiveQuietChat(sessionId: String) async -> (succeeded: Bool, agentMessage: String) {
+        let result = await archiveActiveChat(sessionId: sessionId)
+        return (result.succeeded, result.agentMessage)
+    }
+    func compactQuietChat(sessionId: String, model: String?, providerID: String?, force: Bool) async throws -> ChatSessionCompactionOutcome {
+        try await compactSession(sessionId: sessionId, model: model, providerID: providerID, force: force)
+    }
+    func exportQuietChat(session: NativeAgentShared.ChatSession?, sessionId: String, messages: [ChatMessage]) async throws -> URL {
+        try await ChatExportService.export(session: session, sessionId: sessionId, messages: messages)
+    }
+    func isQuietSyntheticNotice(_ message: ChatMessage) -> Bool {
+        message.id.hasPrefix(Self.syntheticErrorIDPrefix)
     }
 }

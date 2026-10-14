@@ -25,7 +25,10 @@ extension SwiftNativeDeskStore {
         var archived: Set<String> = []
         var accounting = base?.state ?? DeskState(items: [], generatedTs: "")
         if let base {
-            for item in base.state.items {
+            for var item in base.state.items {
+                if item.origin == .system, item.findingKey == nil {
+                    item.findingKey = item.notes.lazy.compactMap(\.legacyFindingKey).first
+                }
                 byHandle[item.handle] = item
                 createOrder.append(item.handle)
             }
@@ -33,7 +36,7 @@ extension SwiftNativeDeskStore {
 
         for op in ops {
             switch op.body {
-            case let .createItem(alias, kind, project, title, parent, summary, assignee, laneOf, origin, pursuit):
+            case let .createItem(alias, kind, project, title, parent, summary, assignee, laneOf, origin, pursuit, findingKey):
                 if byHandle[op.handle] == nil { createOrder.append(op.handle) }
                 byHandle[op.handle] = DeskItem(
                     handle: op.handle, alias: alias, parent: parent, kind: kind,
@@ -41,7 +44,7 @@ extension SwiftNativeDeskStore {
                     assignee: assignee, laneOf: laneOf,
                     cadence: Cadence(), notify: NotifyPolicy(),
                     openedAt: op.ts, updatedAt: op.ts,
-                    origin: origin, pursuit: pursuit
+                    origin: origin, pursuit: pursuit, findingKey: findingKey
                 )
                 for reservation in pursuit?.reservations ?? [] {
                     accounting.chargeWorkSlot(handle: op.handle, day: reservation.day, id: reservation.reservationId)
@@ -69,8 +72,7 @@ extension SwiftNativeDeskStore {
                 if let assignee { item.assignee = assignee }
                 if let laneOf { item.laneOf = laneOf }
                 // A terminal status reached via set_status (not close_item) still
-                // needs closedAt, or archiveSweep + archive eligibility
-                // skip it forever (gpt-5.5 review HIGH). A non-terminal status
+                // needs closedAt for archive eligibility. A non-terminal status
                 // re-opens the row, so clear any stale closedAt.
                 if status.isTerminal {
                     if item.closedAt == nil { item.closedAt = op.ts }
@@ -79,7 +81,7 @@ extension SwiftNativeDeskStore {
                 }
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
-            case let .updateTitle(title, summary):
+            case let .updateTitle(title, summary, refs):
                 guard var item = byHandle[op.handle] else { continue }
                 if let title, !title.isEmpty { item.title = title }
                 // Empty summary is a NO-OP (mirrors title, and the encode that
@@ -87,6 +89,7 @@ extension SwiftNativeDeskStore {
                 // clear could never round-trip: the encode dropped the empty
                 // string, so the clear was silently lost (gpt-5.5 review HIGH).
                 if let summary, !summary.isEmpty { item.summary = summary }
+                if let refs { item.refs = refs }
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .addRef(ref):
@@ -101,9 +104,11 @@ extension SwiftNativeDeskStore {
                     item.updatedAt = op.ts
                 }
                 byHandle[op.handle] = item
-            case let .appendNote(text):
+            case let .appendNote(text, author):
                 guard var item = byHandle[op.handle] else { continue }
-                Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: text))
+                let note = DeskNote(ts: op.ts, text: text, author: author)
+                if item.origin == .system, item.findingKey == nil { item.findingKey = note.legacyFindingKey }
+                Self.appendNoteCapped(&item, note)
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .vetoPursuit(note):

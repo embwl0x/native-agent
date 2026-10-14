@@ -136,10 +136,6 @@ public enum PairingSecretManager {
         guard secret.count == 32 else { return false }
         let secretB64 = secret.base64EncodedString()
         let secretDigest = SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
-        guard await CloudKitHealth.shared.likelyHealthy() else {
-            return false
-        }
-
         // KVS reads include unsynchronized local writes. Only a checkpoint
         // recorded after synchronization proves this secret/version was sent.
         let result = await withCKTimeout("PairingSecretManager.publishMaterialToKVS") {

@@ -2,15 +2,16 @@ import Foundation
 import NativeAgentCore
 
 extension SwiftToolDispatcher {
-    /// Identical bounded pipe capture for both synchronous builder invokes.
+    /// Bounded pipe capture shared by builder and image subprocess adapters.
     /// Final drain must not wait for a descendant that inherited a write FD.
     final class InvokeOutputCapture: @unchecked Sendable {
         private let stdout = Pipe()
         private let stderr = Pipe()
         private let stdoutBuffer = BoundedBuffer(cap: 512 * 1024)
-        private let stderrBuffer = BoundedBuffer(cap: 128 * 1024)
+        private let stderrBuffer: BoundedBuffer
 
-        init(process: Process) {
+        init(process: Process, stderrCap: Int = 128 * 1024) {
+            stderrBuffer = BoundedBuffer(cap: stderrCap)
             process.standardOutput = stdout
             process.standardError = stderr
             for (pipe, buffer) in [(stdout, stdoutBuffer), (stderr, stderrBuffer)] {
@@ -30,12 +31,15 @@ extension SwiftToolDispatcher {
             stderr.fileHandleForReading.readabilityHandler = nil
         }
 
-        func finish() -> (stdout: String, stderr: String) {
+        func finish(strictUTF8: Bool = false) -> (stdout: String, stderr: String) {
             stopReading()
             SwiftToolDispatcher.drainPipeNonBlocking(stdout.fileHandleForReading, into: stdoutBuffer)
             SwiftToolDispatcher.drainPipeNonBlocking(stderr.fileHandleForReading, into: stderrBuffer)
-            var stdoutText = String(decoding: stdoutBuffer.data, as: UTF8.self)
-            var stderrText = String(decoding: stderrBuffer.data, as: UTF8.self)
+            let decode: (Data) -> String = strictUTF8
+                ? { String(data: $0, encoding: .utf8) ?? "" }
+                : { String(decoding: $0, as: UTF8.self) }
+            var stdoutText = decode(stdoutBuffer.data)
+            var stderrText = decode(stderrBuffer.data)
             if stdoutBuffer.truncated {
                 stdoutText += "\n[stdout truncated]"
             }
@@ -191,7 +195,9 @@ extension SwiftToolDispatcher {
     // queue, so the buffer must be safe to mutate from any thread.
     final class BoundedBuffer: @unchecked Sendable {
         private let lock = NSLock()
-        private var storage = Data()
+        private var head = Data()
+        private var tail = Data()
+        private var tailStart = 0
         private let cap: Int
         private var _truncated = false
         /// Each complete line as it arrives, called outside the lock.
@@ -227,21 +233,41 @@ extension SwiftToolDispatcher {
                     discardingLine = true
                 }
             }
-            storage.append(chunk)
-            if storage.count > cap {
-                let headEnd = storage.index(storage.startIndex, offsetBy: cap / 2)
-                let tailStart = storage.index(storage.endIndex, offsetBy: -(cap - cap / 2))
-                storage.removeSubrange(headEnd..<tailStart)
-                _truncated = true
+            let headCount = min(chunk.count, max(0, cap / 2 - head.count))
+            head.append(chunk.prefix(headCount))
+            let rest = chunk.dropFirst(headCount)
+            let tailBudget = cap - cap / 2
+            guard !rest.isEmpty else { return lines }
+            _truncated = _truncated || rest.count > tailBudget - tail.count
+            guard tailBudget > 0 else { return lines }
+            if rest.count >= tailBudget {
+                tail = Data(rest.suffix(tailBudget))
+                tailStart = 0
+            } else {
+                let fill = min(rest.count, tailBudget - tail.count)
+                tail.append(rest.prefix(fill))
+                let overflow = rest.dropFirst(fill)
+                if !overflow.isEmpty {
+                    tail.withUnsafeMutableBytes { destination in
+                        overflow.withUnsafeBytes { source in
+                            let first = min(overflow.count, tailBudget - tailStart)
+                            memcpy(destination.baseAddress!.advanced(by: tailStart), source.baseAddress!, first)
+                            if first < overflow.count {
+                                memcpy(destination.baseAddress!, source.baseAddress!.advanced(by: first), overflow.count - first)
+                            }
+                        }
+                    }
+                    tailStart = (tailStart + overflow.count) % tailBudget
+                }
             }
             return lines
         }
         var data: Data {
             lock.lock(); defer { lock.unlock() }
-            guard _truncated else { return storage }
-            var output = Data(storage.prefix(cap / 2))
-            output.append(Data("\n[output truncated; head and tail retained]\n".utf8))
-            output.append(storage.suffix(cap - cap / 2))
+            var output = head
+            if _truncated { output.append(Data("\n[output truncated; head and tail retained]\n".utf8)) }
+            output.append(tail.suffix(from: tailStart))
+            output.append(tail.prefix(tailStart))
             return output
         }
         var truncated: Bool {
@@ -290,74 +316,6 @@ extension SwiftToolDispatcher {
             let n = read(fd, &chunk, chunk.count)
             guard n > 0 else { break } // 0 = EOF, <0 = EAGAIN/error: stop
             buffer.append(Data(bytes: chunk, count: n))
-        }
-    }
-
-    final class PipeDrainLoop: @unchecked Sendable {
-        private let fd: Int32
-        private let buffer: BoundedBuffer
-        private let done = DispatchSemaphore(value: 0)
-        private let lock = NSLock()
-        private var stopped = false
-        private var started = false
-
-        init(fileDescriptor: Int32, buffer: BoundedBuffer) {
-            self.fd = fileDescriptor
-            self.buffer = buffer
-        }
-
-        func start() {
-            lock.lock()
-            guard !started else {
-                lock.unlock()
-                return
-            }
-            started = true
-            lock.unlock()
-
-            let flags = fcntl(fd, F_GETFL, 0)
-            if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-
-            let thread = Thread { [self] in
-                defer { done.signal() }
-                var chunk = [UInt8](repeating: 0, count: 65_536)
-                while true {
-                    var madeProgress = false
-                    while true {
-                        let n = read(fd, &chunk, chunk.count)
-                        if n > 0 {
-                            madeProgress = true
-                            buffer.append(Data(bytes: chunk, count: n))
-                            continue
-                        }
-                        if n == 0 { return }
-                        if errno == EINTR { continue }
-                        if errno == EAGAIN || errno == EWOULDBLOCK { break }
-                        return
-                    }
-
-                    if isStopped() { return }
-                    usleep(madeProgress ? 1_000 : 5_000)
-                }
-            }
-            thread.qualityOfService = .userInitiated
-            thread.start()
-        }
-
-        func stopAndWait() {
-            lock.lock()
-            stopped = true
-            let wasStarted = started
-            lock.unlock()
-            if wasStarted {
-                _ = done.wait(timeout: .now() + .seconds(5))
-            }
-        }
-
-        private func isStopped() -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return stopped
         }
     }
 

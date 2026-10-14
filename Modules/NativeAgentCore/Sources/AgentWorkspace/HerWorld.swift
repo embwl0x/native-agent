@@ -21,6 +21,7 @@ struct HerWorld: @unchecked Sendable {
     var handed: Set<String> = []
     var chats: [HerScreen.BridgeChat] = []
     var contacts: [HerScreen.Contact] = []
+    var identity = AgentContactIdentity(peers: [])
     var answered: [String: Date] = [:]
     var health: [String: AgentLocalHealth] = [:]
     var desk: DeskState?
@@ -37,6 +38,7 @@ struct HerWorld: @unchecked Sendable {
     /// Inbox cards asking the owner to choose (OwnerAttentionPolicy.inboxAsks);
     /// an approval's own card counts once, as the approval.
     var asks = 0
+    var newestAsk: String?
     var phonePlaces: [PhonePlaceEvent] = []
     /// Arrivals no other home line names (a failed wake, a recovery).
     var arrivals: [ResidentWake.Item] = []
@@ -91,7 +93,7 @@ final class HerMemo: @unchecked Sendable {
     }
 
     /// `value`, for a synchronous compute.
-    func cached<T>(_ key: String, stamp: [String], compute: () -> T) -> T {
+    func cached<T>(_ key: String, stamp: [String], compute: () throws -> T) rethrows -> T {
         let hit: T? = lock.withLock {
             let now = Date()
             prune(now)
@@ -99,7 +101,7 @@ final class HerMemo: @unchecked Sendable {
             return store[key].flatMap { $0.stamp == stamp ? $0.value as? T : nil }
         }
         if let hit { return hit }
-        let value = compute()
+        let value = try compute()
         lock.withLock { keep(key, stamp: stamp, value: value) }
         return value
     }
@@ -114,8 +116,8 @@ final class HerMemo: @unchecked Sendable {
         }
     }
 
-    func put(_ key: String, _ value: Any) {
-        lock.withLock { keep(key, stamp: [], value: value) }
+    func put(_ key: String, _ value: Any, stamp: [String] = []) {
+        lock.withLock { keep(key, stamp: stamp, value: value) }
     }
 
     /// One inline glance read per data root at a time.
@@ -188,7 +190,7 @@ extension HerScreen {
         func at(_ path: String) -> URL { dataRoot.appendingPathComponent(path) }
         let memo = HerMemo.shared
         var world = HerWorld()
-        world.health = AgentLocalHealth.read(dataRoot)
+        world.health = AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
         func part<T>(_ key: String, _ stamp: [String], _ compute: () async -> T?) async -> T? {
             if fresh { return await memo.value(root + key, stamp: stamp) { await compute() } ?? nil }
             let kept: (value: T?, current: Bool)? = memo.peek(root + key, stamp: stamp)
@@ -211,13 +213,12 @@ extension HerScreen {
             (AgentDiscoveryOffer.read(dataRoot) ?? [:]).filter(\.value.open).map { AgentDiscoveryOffer.line(id: $0.key, name: $0.value.name) }.sorted()
         }) { world.found = found }
 
-        typealias People = (records: [AgentConversationRecord], chats: [BridgeChat], contacts: [Contact], answered: [String: Date],
+        typealias People = (records: [AgentConversationRecord], chats: [BridgeChat], answered: [String: Date],
                             handed: Set<String>)
         if let people: People = await part("people", [stamp(at("agents/peers.json")), stamp(at("agents/conversations.json")),
                 stamp(at("chat/sessions.json"))] + stamps(at("agents/grok-requests")), {
-            let store = AgentWorkspaceConversationReader(dataRoot: dataRoot)
-            guard let all = try? (locked ? store.records() : store.recordsUnlocked()) else {
-                if locked { return ([], [], [], [:], []) }
+            guard let all = try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: locked) else {
+                if locked { return ([], [], [:], []) }
                 return nil
             }
             let records = all.filter { !$0.agent.hasPrefix("bot") }
@@ -227,11 +228,13 @@ extension HerScreen {
                 return entry.uppercased()
             })
             let chats = bridgeChats(dataRoot: dataRoot)
-            return (records, chats, contacts(dataRoot: dataRoot, records: records, chats: chats), grokAnswers(dataRoot: dataRoot), handed)
+            return (records, chats, grokAnswers(dataRoot: dataRoot), handed)
         }) {
-            world.records = people.records; world.chats = people.chats; world.contacts = people.contacts; world.answered = people.answered
+            world.records = people.records; world.chats = people.chats; world.answered = people.answered
             world.handed = people.handed
         }
+        world.identity = AgentContactIdentity(dataRoot: dataRoot)
+        world.contacts = contacts(dataRoot: dataRoot, identity: world.identity)
 
         // Parking is by whole days, so the day is part of the desk's stamp.
         let day = String(Int(now.timeIntervalSince1970 / 86_400))
@@ -279,15 +282,16 @@ extension HerScreen {
                     pending.count == 100)
         }) { world.reviews = reviews }
         let inboxPath = LiveNotificationInbox.livePath(dataRoot: dataRoot)
-        if let asks: Int = await part("asks", [stamp(inboxPath)], {
+        if let asks: (count: Int, newest: String?) = await part("asks", [stamp(inboxPath)], {
             let inbox = inboxPath == LiveNotificationInbox.livePath(dataRoot: PersistenceCore.defaultDataRoot()) ? LiveNotificationInbox.shared : LiveNotificationInbox(path: inboxPath)
             guard let rows = try? await inbox.rows() else { return nil }
-            return rows.compactMap(InboxItemRecord.init(row:)).filter { item in
+            let asks = rows.compactMap(InboxItemRecord.init(row:)).filter { item in
                 item.id != item.related_approval_id
                     && OwnerAttentionPolicy.inboxAsks(pending: item.isActivityPending, systemLane: item.isSystemLane,
                         severity: item.severity, linkedApproval: !(item.related_approval_id ?? "").isEmpty, actionIDs: item.actions.map(\.id))
-            }.count
-        }) { world.asks = asks }
+            }
+            return (asks.count, asks.max { $0.created_at < $1.created_at }?.title)
+        }) { world.asks = asks.count; world.newestAsk = asks.newest }
         if let crews: [[String: Any]] = await part("crews", [stamp(at("swarms/live.json")), stamp(at("swarms/runs.json"))], {
             try? SwiftNativeSwarmRunsReader(runsPath: at("swarms/runs.json")).readCrews(locked: locked)
         }) { world.crews = crews }
@@ -337,8 +341,7 @@ extension HerScreen {
                 let message: String? = if case .string(let id)? = record?.readInput?["message_id"] { id } else { nil }
                 let answered = message.flatMap { world.answered[$0] }
                 let bare = Contact(id: contact.id, name: contact.name, builtIn: contact.builtIn, kind: nil)
-                let health = world.health[record?.agent ?? contact.id] ?? world.health[contact.id]
-                let text = state(bare, record: record, chat: nil, answered: world.answered, now: now, health: health).text
+                let text = state(bare, record: record, chat: nil, answered: world.answered, now: now).text
                 var line = ""
                 // A live hand-off is her own send landing; its answer comes as a chat ("wrote").
                 // Already in her hands (her call's result, or the turn that
@@ -419,7 +422,7 @@ extension HerScreen {
                 at: event.timestamp.timeIntervalSince1970)
         }
         for item in world.arrivals {
-            marks["arrival:" + item.id] = Mark(fp: item.id, line: "", new: item.line, at: item.at.timeIntervalSince1970)
+            marks["arrival:" + item.id] = Mark(fp: item.id, line: "", new: item.renderedLine, at: item.at.timeIntervalSince1970)
         }
         marks["moments"] = Mark(fp: String(world.moments), line: "", at: now.timeIntervalSince1970)
         return marks
@@ -477,8 +480,17 @@ extension HerScreen {
 
     /// A room's look: the names that room shows (a person's room includes
     /// their bridge chats).
-    static func markRoomSeen(_ location: AgentWorkspaceLocation, dataRoot: URL, scope: String) async {
-        let now = Date(), world = await readWorld(dataRoot, now: now)
+    static func markRoomSeen(_ location: AgentWorkspaceLocation, dataRoot: URL, scope: String,
+                             observation: (world: HerWorld, at: Date)? = nil) async {
+        if observation == nil, case .record("agent_read", let input, _) = location,
+           case .string(let agent)? = input["agent"] {
+            guard agent.lowercased().hasPrefix("bot:"),
+                  UUID(uuidString: String(agent.dropFirst(4))) != nil else { return }
+        }
+        let now = observation?.at ?? Date()
+        let world: HerWorld
+        if let observation { world = observation.world }
+        else { world = await readWorld(dataRoot, now: now) }
         let marks = worldMarks(world, dataRoot: dataRoot, person: names(dataRoot).person, now: now)
         var names: Set<String> = []
         switch location {
@@ -511,13 +523,17 @@ extension HerScreen {
     // MARK: - The glance line
 
     /// Rides every turn in the dynamic segment: what changed since she last
-    /// looked, and what needs her. Nil when neither.
-    /// - Rendered once per turn (`turn` is the turn's pinned clock) and the
-    ///   same string reused by every iteration of that turn.
-    /// - Never blocks: kept values and stats only, under a 150 ms budget;
-    ///   stale parts refresh in the background for a later turn.
+    /// looked, what needs her, and her live built/recent abilities.
+    /// - Home changes stay pinned to the turn; ability names are read from
+    ///   their owners at assembly, outside that memo and its 150 ms budget.
     /// - Never advances what she has seen; never User's screen or activity data.
     package static func glance(dataRoot: URL, scope: String?, turn: Date?, includingMoments: Bool = true) async -> String? {
+        async let abilities = AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: turn ?? Date())
+        let home = await homeGlance(dataRoot: dataRoot, scope: scope, turn: turn, includingMoments: includingMoments)
+        return await [home, abilities].compactMap { $0 }.joined(separator: "\n")
+    }
+
+    private static func homeGlance(dataRoot: URL, scope: String?, turn: Date?, includingMoments: Bool) async -> String? {
         let key = (scope ?? "-") + "\u{0}" + (turn.map { String($0.timeIntervalSince1970) } ?? "-")
             + "\u{0}" + String(includingMoments)
         if turn != nil, let kept = HerMemo.shared.glance(key) { return kept }
@@ -580,7 +596,7 @@ extension HerScreen {
             waits += waiting.prefix(2).map { "desk." + $0.alias + " — " + clip($0.title, 28) }
                 + (waiting.count > 2 ? ["+\(waiting.count - 2) desk"] : [])
         }
-        if world.asks > 0 { waits.append("notes \(world.asks)") }
+        if world.asks > 0 { waits.append("inbox \(world.asks)" + (world.newestAsk.map { " — " + clip($0, 44) } ?? "")) }
         if includingMoments, world.moments > 0 { mine.append("moments \(world.moments)") }
         if world.reviews.count > 0 { mine.append("memories \(world.reviews.count)\(world.reviews.capped ? "+" : "")") }
         withNames(dataRoot) { book in
@@ -593,7 +609,7 @@ extension HerScreen {
                      "reviews": "memories to review", "crews": "crews", "live": "running helpers and moments"]
         let unread = world.unread.map { words[$0] ?? $0 }
         guard !changed.isEmpty || !waits.isEmpty || !mine.isEmpty || !unread.isEmpty else { return nil }
-        var parts: [String] = []
+        var parts = ["Home glance — snapshot as of \(now.formatted(.iso8601))\(world.stale ? "; retained values may be older" : ""). Desk, inbox, approvals, exchanges, helper/crew status, phone-place/wake records and reviews; no live calendar, reminders, mail, front app, full Doctor check or complete activity log."]
         if let seen, !changed.isEmpty {
             let shown = changed.prefix(3).map { clip($0, 44) }
             parts.append("Since you looked (\(age(now.timeIntervalSince1970 - seen.at))): " + shown.joined(separator: " · ")

@@ -93,6 +93,14 @@ public enum ProviderSurfaceGroups {
 
     /// Every label, keyed by surface — the page reads its row names from here so
     /// a name can never drift from the group that owns it.
+    public static func rows(visible: [String]) -> [ProviderSurfaceGroup] {
+        all.compactMap { group in
+            let members = group.members.filter { visible.contains($0.surface) }
+            guard !members.isEmpty else { return nil }
+            return ProviderSurfaceGroup(id: group.id, title: group.title, members: members)
+        }
+    }
+
     public static let labels: [String: String] = Dictionary(
         uniqueKeysWithValues: all.flatMap(\.members).map { ($0.surface, $0.label) }
     )
@@ -549,11 +557,6 @@ public let REASONING_EFFORT_OPTIONS: [String] = ["none", "low", "medium", "high"
 
 public let SERVICE_TIER_OPTIONS: [String] = ["default", "priority"]
 
-/// Top-level re-export of the canonical model id. Single source of truth
-/// is `nativeAgentPrimaryModel` in NativeAgentCore/Constants.swift; this
-/// alias is kept for existing callers that reference `PRIMARY_MODEL` by name.
-public let PRIMARY_MODEL: String = nativeAgentPrimaryModel
-
 /// Default reasoning control before model/account compatibility normalization.
 public let DEFAULT_REASONING_EFFORT: String = "high"
 
@@ -564,7 +567,6 @@ public protocol ProviderRoutingProtocol: Sendable {
     func getProvider(id: String) async throws -> Provider
     func configureProvider(id: String, config: JSONValue) async throws -> Provider
     func testProvider(id: String) async throws -> ProviderTestResult
-    func getModelPreferences() async throws -> ModelPreferences
     func saveModelConfig(_ body: JSONValue) async throws -> ModelPreferences
     /// Swift-native per-surface picker. Reads `providers/surfaces.json`
     /// and `providers/active.json`, then returns seeded preferences for
@@ -595,40 +597,6 @@ public protocol ProviderRoutingProtocol: Sendable {
 }
 
 extension ProviderRoutingProtocol {
-    /// Default empty so existing conformers keep compiling. The SwiftNative
-    /// impl overrides this to read providers/active.json.
-    public func activeProvidersForSurfaces() async -> [String: String] { [:] }
-
-    /// Compatibility implementation for test/dummy routers. The production
-    /// Swift-native owner overrides this with a single locked disk snapshot.
-    public func checkedRoutingSnapshot() async throws -> ProviderRoutingSnapshot {
-        let preferences = try await computeModelPreferences()
-        let active = await activeProvidersForSurfaces()
-        var pins: [String: String] = [:]
-        for surface in MODEL_SURFACES {
-            if let model = await pinnedModelStringForSurface(surface) {
-                pins[surface] = model
-            }
-        }
-        return ProviderRoutingSnapshot(
-            preferences: preferences,
-            activeProviders: active,
-            pinnedModels: pins
-        )
-    }
-
-    public func activeProvidersForSurfacesChecked() async throws -> [String: String] {
-        try await checkedRoutingSnapshot().activeProviders
-    }
-
-    public func pinnedModelStringForSurfaceChecked(_ surface: String) async throws -> String? {
-        ProviderRoutingSurfaceLookup.value(try await checkedRoutingSnapshot().pinnedModels, surface)
-    }
-
-    public func inferProviderForModel(_ modelId: String) -> String? {
-        SwiftNativeProviderRouting.inferredProviderID(forModel: modelId)
-    }
-
     /// Convenience: per-surface model lookup via the picker. Returns nil
     /// when the surface is unknown or the picker has no entry. Dream / REM
     /// / Workshop executions / telegram callers use this to pass an explicit model
@@ -639,20 +607,6 @@ extension ProviderRoutingProtocol {
         if let m = ProviderRoutingSurfaceLookup.value(prefs, surface)?.model, !m.isEmpty {
             return m
         }
-        return nil
-    }
-
-    /// Returns the pinned model only when the surface is EXPLICITLY pinned
-    /// in `providers/surfaces.json`. Unlike `modelStringForSurface(_:)` —
-    /// which can't distinguish a seed default from a user pin — this
-    /// returns nil whenever there is no on-disk pick for the surface, so
-    /// callers like dream / REM can fall back to the chat-surface model
-    /// and preserve Agent's current voice by default.
-    ///
-    /// Default implementation here returns nil; the SwiftNative actor
-    /// overrides with a real on-disk read. Test fakes get the default
-    /// "no pin" so they continue to fall back through their own paths.
-    public func pinnedModelStringForSurface(_ surface: String) async -> String? {
         return nil
     }
 
@@ -678,8 +632,7 @@ extension ProviderRoutingProtocol {
 ///
 /// Both vocabularies can appear on EITHER side here: a caller still passing
 /// `missions` (iOS a version behind, an old script), and a preferences map
-/// produced by a conformer that has not been renamed (test doubles, and the
-/// protocol defaults running over a fake `computeModelPreferences`). Trying the
+/// persisted before the rename. Trying the
 /// canonical key and then the legacy key is what keeps a mismatched pair from
 /// resolving to nil and silently falling back to the chat-surface model.
 public enum ProviderRoutingSurfaceLookup {

@@ -1,4 +1,6 @@
+import Cognition
 import AppToolRuntime
+import ToolRegistry
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -10,6 +12,7 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import ChatOrchestration
 import MemoryV2
+import Onboarding
 import PersistenceCore
 #if canImport(CoreSpotlight)
 import CoreSpotlight
@@ -350,7 +353,7 @@ struct ContentView: View {
                         root.appendingPathComponent("desk/desk_ops_base.json"),
                     ]
                 }
-                await ViewFileRefreshTask.run(paths: statusPaths) {
+                await EventDeadlinePhysiology.refreshOnChanges(paths: statusPaths) {
                     await appModel.refreshSidebarActivityBadge()
                 }
             }
@@ -409,7 +412,7 @@ struct ContentView: View {
             }
             guard navigationMountID == nil else { return }
             navigationMountID = NativeAgentAppCoordinator.shared.mountMainScene(currentPage: {
-                QuietPages.page(named: activeContentItem.rawValue)
+                QuietPages.all.first { $0.item == activeContentItem }
             }) { destination in
                 applyNavigationDestination(destination)
             }
@@ -437,7 +440,7 @@ struct ContentView: View {
             let sessionIndexPath = PersistenceCore.defaultDataRoot()
                 .appendingPathComponent("chat", isDirectory: true)
                 .appendingPathComponent("sessions.json")
-            await ViewFileRefreshTask.run(
+            await EventDeadlinePhysiology.refreshOnChanges(
                 paths: [sessionIndexPath],
                 debounceDelay: .milliseconds(150)
             ) {
@@ -448,17 +451,14 @@ struct ContentView: View {
             OnboardingWizard {
                 showFirstRunOnboarding = false
                 Task {
-                    await OnboardingWizardCompletionRoute.complete(
-                        selectChat: { selectionRaw = SidebarItem.chat.rawValue },
-                        refreshChat: {
-                            await appModel.reloadPersonality()
-                            return await appModel.refreshForSidebarItem(.chat)
-                        },
-                        // Fire the first-run welcome right when onboarding finishes
-                        // and chat is loaded — ChatView's .task is only a backup.
-                        sendGreeting: { await appModel.maybeSendFirstRunGreeting() },
-                        record: { appModel.recordOnboardingWizardCompletion($0) }
-                    )
+                    selectionRaw = SidebarItem.chat.rawValue
+                    await appModel.reloadPersonality()
+                    _ = await appModel.refreshForSidebarItem(.chat)
+                    // Fire after Chat loads; ChatView's task is a backup.
+                    let greeting = await appModel.maybeSendFirstRunGreeting()
+                    if let message = greeting.routeFailureMessage {
+                        appModel.statusText = "Onboarding finished, but \(message)."
+                    }
                 }
             }
             .interactiveDismissDisabled(true)
@@ -536,55 +536,22 @@ struct ContentView: View {
     private func checkFirstRunOnboardingIfNeeded() async {
         guard !didCheckFirstRunOnboarding else { return }
         didCheckFirstRunOnboarding = true
-        // WAVE 15 (2026-06-01): runtime must be plumbed — /v1/onboarding/start is retired,
-        // and startOnboarding() now throws DaemonError.swiftOnlyRoute when the gate sees no runtime.
-        // R22: AppModel's canonical `client` already carries the shared runtime.
-        // ONBOARDING-2026-05-26: extended retry budget for cold first launch.
-        // The previous budget (8 × 500ms = 4s) was below the bundled-Python
-        // first-cold-launch daemon ready time (5–10s + indexing), so the
-        // wizard never fired on a fresh DMG install — the user landed in the
-        // main UI with an uninitialized persona. 60 × 500ms = 30s is enough
-        // for first-cold-launch on slower Macs while still timing out fast
-        // enough that a stuck daemon doesn't block the UI forever.
         for attempt in 0..<60 {
-            if Task.isCancelled { return }
+            guard !Task.isCancelled else { return }
             do {
-                let start = try await appModel.startOnboarding()
-                // User, 2026-09-06: `profileRepairRequired` also opens the
-                // wizard. It arrives WITH `hasExisting` true (the persona docs
-                // and sentinel are real), so it has to be checked before the
-                // `hasExisting` early return below or the repair lane is
-                // unreachable and only Doctor ever names the condition.
-                if start.pendingRecovery
-                    || start.resetRequired
-                    || start.profileRepairRequired {
-                    selectionRaw = SidebarItem.chat.rawValue
-                    showTour = false
-                    showFirstRunOnboarding = true
-                    return
-                }
-                guard !start.hasExisting else { return }
-                selectionRaw = SidebarItem.chat.rawValue
-                showTour = false
-                showFirstRunOnboarding = true
-                return
+                guard try await appModel.startOnboarding().requiresPresentation else { return }
+                break
             } catch {
                 if attempt == 0 {
                     await appModel.loadHealthCard(includeApprovals: false)
                 }
-                if attempt == 59 {
-                    // A malformed or root-mismatched pending transaction is a
-                    // fail-closed onboarding state, not permission to hide the
-                    // wizard forever. The wizard exposes the exact error and an
-                    // explicit backup-preserving reset; it never auto-deletes.
-                    selectionRaw = SidebarItem.chat.rawValue
-                    showTour = false
-                    showFirstRunOnboarding = true
-                    return
-                }
+                if attempt == 59 { break }
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
+        selectionRaw = SidebarItem.chat.rawValue
+        showTour = false
+        showFirstRunOnboarding = true
     }
 
     // PATCH-2026-06-06: command-palette — sidebar badge counts for the
@@ -718,140 +685,6 @@ struct MetricTile: View {
 }
 
 
-enum NativeScreenCapture {
-    enum CaptureError: LocalizedError {
-        case permissionRequired
-        case noDisplay
-        case encodingFailed
-        case tooLarge
-        // ScreenVision v1 (2026-06-06): carries the underlying
-        // ScreenCaptureKit reason when SwiftNativeScreenVision throws
-        // .captureFailed(_). The reason goes to the log; the toast says it
-        // plainly.
-        case captureFailed(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .permissionRequired:
-                return "Screen Recording permission is required for NativeAgent. Enable it in System Settings, then restart NativeAgent if macOS asks."
-            case .noDisplay:
-                return "NativeAgent could not find a display to capture."
-            case .encodingFailed:
-                return "NativeAgent captured the screen but could not encode it as an image."
-            case .tooLarge:
-                return "NativeAgent captured the screen, but the image was too large to send."
-            case .captureFailed:
-                return "NativeAgent couldn't capture the screen. Try again in a moment."
-            }
-        }
-    }
-
-    static let maxCaptureDimension = 1600
-    static let maxCaptureBytes = 6 * 1024 * 1024
-
-    static func captureImageBase64() async throws -> (base64: String, mime: String, name: String, byteSize: Int) {
-        // v1 vision pipeline (2026-06-06): the capture itself is delegated to
-        // the Swift-native ScreenVision module. The size-cap / re-encode path
-        // below stays here because ScreenVision returns raw PNG bytes; the
-        // chat surface still wants a JPEG-with-quality-ladder fallback for
-        // anything that would exceed `maxCaptureBytes`.
-        //
-        // ScreenVision v1 captures the primary display only. There is no
-        // display-selection argument here because accepting one we cannot
-        // honor would silently send the wrong screen on a multi-display Mac.
-
-        let png: Data
-        do {
-            png = try await SwiftNativeScreenVision().captureScreen()
-        } catch let e as ScreenVisionError {
-            // Map the ScreenVision error surface back onto the existing
-            // CaptureError cases. The underlying ScreenCaptureKit reason is
-            // logged here rather than shown in the toast.
-            switch e {
-            case .permissionDenied:
-                throw CaptureError.permissionRequired
-            case .noDisplay:
-                throw CaptureError.noDisplay
-            case .captureFailed(let reason):
-                nativeLog("%@", "[screen-capture] failed: \(reason)")
-                throw CaptureError.captureFailed(reason)
-            }
-        }
-
-        // Decode the PNG back into a CGImage so the existing encodeForChat
-        // ladder (JPEG quality fallbacks, then PNG, then tooLarge) can run
-        // unchanged.
-        guard let provider = CGDataProvider(data: png as CFData),
-              let cg = CGImage(
-                pngDataProviderSource: provider,
-                decode: nil,
-                shouldInterpolate: false,
-                intent: .defaultIntent
-              ) else {
-            throw CaptureError.encodingFailed
-        }
-        let encoded = try encodeForChat(cg)
-        return (
-            encoded.data.base64EncodedString(),
-            encoded.mime,
-            encoded.name,
-            encoded.data.count
-        )
-    }
-
-    static func encodeForChat(_ source: CGImage) throws -> (data: Data, mime: String, name: String) {
-        let image = resizedForChat(source)
-        let bitmap = NSBitmapImageRep(cgImage: image)
-        return try fittingEncodedPayload(
-            maxBytes: maxCaptureBytes,
-            jpegData: { quality in
-                bitmap.representation(using: .jpeg, properties: [.compressionFactor: quality])
-            },
-            pngData: { bitmap.representation(using: .png, properties: [:]) }
-        )
-    }
-
-    static func fittingEncodedPayload(
-        maxBytes: Int,
-        jpegData: (Double) -> Data?,
-        pngData: () -> Data?
-    ) throws -> (data: Data, mime: String, name: String) {
-        for quality in [0.78, 0.65, 0.52, 0.40] {
-            if let jpeg = jpegData(quality), jpeg.count <= maxBytes {
-                return (jpeg, "image/jpeg", "screen.jpg")
-            }
-        }
-        if let png = pngData(), png.count <= maxBytes {
-            return (png, "image/png", "screen.png")
-        }
-        throw CaptureError.tooLarge
-    }
-
-    static func resizedForChat(_ source: CGImage) -> CGImage {
-        let width = source.width
-        let height = source.height
-        let largest = max(width, height)
-        guard largest > maxCaptureDimension else { return source }
-        let scale = CGFloat(maxCaptureDimension) / CGFloat(largest)
-        let targetWidth = max(1, Int(CGFloat(width) * scale))
-        let targetHeight = max(1, Int(CGFloat(height) * scale))
-        guard let context = CGContext(
-            data: nil,
-            width: targetWidth,
-            height: targetHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return source
-        }
-        context.interpolationQuality = .high
-        context.draw(source, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
-        return context.makeImage() ?? source
-    }
-
-}
 
 // PATCH-2026-05-06: multimodal-ui Sprint 3 — ChatView extended with voice, image, file, screen capture
 // B.2: recognised slash commands; anything else falls through to regular send
@@ -892,32 +725,6 @@ extension Notification.Name {
 }
 
 
-extension String {
-    var withoutStaleNextGenPhaseCopy: String {
-        var value = self
-        value = value.replacingOccurrences(
-            of: #"(?i)next-gen runtime phases?\s+52\s*[-–]\s*92"#,
-            with: "Next-Gen Runtime",
-            options: .regularExpression
-        )
-        value = value.replacingOccurrences(
-            of: #"(?i)phases?\s+52\s*[-–]\s*92"#,
-            with: "next-gen phases",
-            options: .regularExpression
-        )
-        value = value.replacingOccurrences(
-            of: #"phase-52[-–]92"#,
-            with: "nextgen-phase",
-            options: .regularExpression
-        )
-        value = value.replacingOccurrences(
-            of: #"phase-73[-–]92"#,
-            with: "nextgen-key-phase",
-            options: .regularExpression
-        )
-        return value
-    }
-}
 
 
 // Capabilities' two tabs (CapabilitiesRailPage). Hardening is not a third: it
@@ -929,4 +736,58 @@ enum CapabilityWorkspaceMode: String, CaseIterable, Identifiable {
     case installed = "What's installed"
 
     var id: String { rawValue }
+}
+
+/// Routes an iCloud inbox mutation to the smallest current Activity read. The
+/// route is selected when the notification arrives, before an async refresh can
+/// observe a later sidebar change.
+enum ICloudInboxDidProcessRoute: Equatable, Sendable {
+    case refreshActivity
+    case refreshActivityBadge
+
+    static func resolve(selectionRaw: String) -> Self {
+        guard let item = SidebarItem(rawValue: selectionRaw), item.normalized == .activity else {
+            return .refreshActivityBadge
+        }
+        return .refreshActivity
+    }
+}
+
+enum ICloudInboxDidProcessRefreshReceipt: Equatable, Sendable {
+    case activity(AppModel.PanelRefreshStatus)
+    case activityBadge(AppModel.PanelRefreshStatus)
+}
+
+extension ICloudInboxDidProcessRefreshReceipt {
+    @MainActor
+    static func execute(
+        route: ICloudInboxDidProcessRoute,
+        refreshActivity: @escaping @MainActor () async -> AppModel.PanelRefreshStatus,
+        refreshBadge: @escaping @MainActor () async -> AppModel.PanelRefreshStatus
+    ) async -> Self {
+        switch route {
+        case .refreshActivity:
+            return .activity(await refreshActivity())
+        case .refreshActivityBadge:
+            return .activityBadge(await refreshBadge())
+        }
+    }
+}
+
+@MainActor
+extension AppModel {
+    /// Handles the app-side consequence of an already-committed iCloud inbox
+    /// mutation. This is a read refresh, not a claim that the remote action
+    /// itself succeeded; the mutation owner posts only after its own durable
+    /// bookkeeping path has completed.
+    @discardableResult
+    func refreshAfterICloudInboxDidProcess(
+        route: ICloudInboxDidProcessRoute
+    ) async -> ICloudInboxDidProcessRefreshReceipt {
+        await ICloudInboxDidProcessRefreshReceipt.execute(
+            route: route,
+            refreshActivity: { await self.refreshForSidebarItem(.activity) },
+            refreshBadge: { await self.refreshSidebarActivityBadge() }
+        )
+    }
 }

@@ -60,8 +60,8 @@ nativeagent_verify_published_appcast() {
     return 2
   fi
 
-  verify_attempts="${NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS:-6}"
-  verify_delay="${NATIVEAGENT_APPCAST_VERIFY_DELAY:-5}"
+  verify_attempts="${NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS:-12}"
+  verify_delay="${NATIVEAGENT_APPCAST_VERIFY_DELAY:-15}"
   if [[ ! "$verify_attempts" =~ ^[0-9]+$ || "$verify_attempts" -lt 1 ]]; then
     NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REASON="NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS must be a positive integer, got '$verify_attempts'"
     return 2

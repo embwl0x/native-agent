@@ -3,12 +3,6 @@ import GRDB
 import PersistenceCore
 
 extension CognitiveSQLiteStore {
-    public func loadNodes() async throws -> [CognitiveNode] {
-        try await dbQueue.read { db in
-            try Self.fetchNodesWithDecayAnchors(db).nodes
-        }
-    }
-
     func loadRestoreBundle(
         artifactFamilies: [CognitiveArtifactFamilyLoad]
     ) async throws -> CognitiveSQLiteRestoreBundle {
@@ -18,8 +12,7 @@ extension CognitiveSQLiteStore {
                 artifacts[family.key] = try Self.fetchArtifacts(
                     db,
                     kindPrefix: family.kindPrefix,
-                    limit: family.limit,
-                    requireObjectPayload: true
+                    limit: family.limit
                 )
             }
             let restoredNodes = try Self.fetchNodesWithDecayAnchors(db)
@@ -31,75 +24,18 @@ extension CognitiveSQLiteStore {
         }
     }
 
-    public func loadArtifacts(kindPrefix: String? = nil, limit: Int = 100) async throws -> [JSONValue] {
+    public func loadReceiptRecords(limit: Int = 100) async throws -> [CognitiveReceiptRecord] {
         try await dbQueue.read { db in
-            try Self.fetchArtifacts(
+            let bounded = max(0, min(limit, 500))
+            let rows = try Row.fetchAll(
                 db,
-                kindPrefix: kindPrefix,
-                limit: limit,
-                requireObjectPayload: false
+                sql: """
+                SELECT id, kind, payload_json, created_at FROM cognitive_receipts
+                ORDER BY created_at DESC, id ASC
+                LIMIT ?
+                """,
+                arguments: [bounded]
             )
-        }
-    }
-
-    public func loadReceipts(kindPrefix: String? = nil, limit: Int = 100) async throws -> [JSONValue] {
-        try await dbQueue.read { db in
-            let bounded = max(0, min(limit, 500))
-            let rows: [Row]
-            if let kindPrefix {
-                rows = try Row.fetchAll(
-                    db,
-                    sql: """
-                    SELECT id, payload_json FROM cognitive_receipts
-                    WHERE kind LIKE ?
-                    ORDER BY created_at DESC, id ASC
-                    LIMIT ?
-                    """,
-                    arguments: ["\(kindPrefix)%", bounded]
-                )
-            } else {
-                rows = try Row.fetchAll(
-                    db,
-                    sql: """
-                    SELECT id, payload_json FROM cognitive_receipts
-                    ORDER BY created_at DESC, id ASC
-                    LIMIT ?
-                    """,
-                    arguments: [bounded]
-                )
-            }
-            return try rows.map { row in
-                try Self.receiptPayload(from: row)
-            }
-        }
-    }
-
-    public func loadReceiptRecords(kindPrefix: String? = nil, limit: Int = 100) async throws -> [CognitiveReceiptRecord] {
-        try await dbQueue.read { db in
-            let bounded = max(0, min(limit, 500))
-            let rows: [Row]
-            if let kindPrefix {
-                rows = try Row.fetchAll(
-                    db,
-                    sql: """
-                    SELECT id, kind, payload_json, created_at FROM cognitive_receipts
-                    WHERE kind LIKE ?
-                    ORDER BY created_at DESC, id ASC
-                    LIMIT ?
-                    """,
-                    arguments: ["\(kindPrefix)%", bounded]
-                )
-            } else {
-                rows = try Row.fetchAll(
-                    db,
-                    sql: """
-                    SELECT id, kind, payload_json, created_at FROM cognitive_receipts
-                    ORDER BY created_at DESC, id ASC
-                    LIMIT ?
-                    """,
-                    arguments: [bounded]
-                )
-            }
             return try rows.map { row in
                 let rowID: String = row["id"] ?? "<unknown>"
                 guard let id = UUID(uuidString: rowID),
@@ -119,19 +55,6 @@ extension CognitiveSQLiteStore {
                     createdAt: Date(timeIntervalSince1970: createdAt)
                 )
             }
-        }
-    }
-
-    public func schemaMarkers() async throws -> [String: String] {
-        try await dbQueue.read { db in
-            let rows = try Row.fetchAll(db, sql: "SELECT name, value FROM cognitive_schema_markers")
-            var out: [String: String] = [:]
-            for row in rows {
-                if let name: String = row["name"], let value: String = row["value"] {
-                    out[name] = value
-                }
-            }
-            return out
         }
     }
 
@@ -171,34 +94,20 @@ extension CognitiveSQLiteStore {
 
     private static func fetchArtifacts(
         _ db: Database,
-        kindPrefix: String?,
-        limit: Int,
-        requireObjectPayload: Bool
+        kindPrefix: String,
+        limit: Int
     ) throws -> [JSONValue] {
         let bounded = max(0, min(limit, 500))
-        let rows: [Row]
-        if let kindPrefix {
-            rows = try Row.fetchAll(
-                db,
-                sql: """
-                SELECT id, payload_json FROM cognitive_artifacts
-                WHERE kind LIKE ?
-                ORDER BY updated_at DESC, id ASC
-                LIMIT ?
-                """,
-                arguments: ["\(kindPrefix)%", bounded]
-            )
-        } else {
-            rows = try Row.fetchAll(
-                db,
-                sql: """
-                SELECT id, payload_json FROM cognitive_artifacts
-                ORDER BY updated_at DESC, id ASC
-                LIMIT ?
-                """,
-                arguments: [bounded]
-            )
-        }
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+            SELECT id, payload_json FROM cognitive_artifacts
+            WHERE kind LIKE ?
+            ORDER BY updated_at DESC, id ASC
+            LIMIT ?
+            """,
+            arguments: ["\(kindPrefix)%", bounded]
+        )
         return try rows.map { row in
             let id: String = row["id"] ?? "<unknown>"
             guard let raw: String = row["payload_json"] else {
@@ -218,10 +127,7 @@ extension CognitiveSQLiteStore {
                     detail: "payload_json is not valid JSON"
                 )
             }
-            if requireObjectPayload, case .object = payload {
-                return payload
-            }
-            if requireObjectPayload {
+            guard case .object = payload else {
                 throw CognitiveSQLiteReadError.malformedRow(
                     table: "cognitive_artifacts",
                     id: id,

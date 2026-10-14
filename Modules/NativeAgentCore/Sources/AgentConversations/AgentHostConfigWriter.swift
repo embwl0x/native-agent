@@ -46,15 +46,6 @@ public enum AgentHostConfigWriter {
     /// Bounded by the same order of magnitude as the peer store's own limit.
     public static let maximumConfigurationBytes = 4 * 1_048_576
 
-    /// Test-scoped seam for the one thing that cannot be provoked from outside:
-    /// another program saving this file between our read and our rename. Runs
-    /// exactly where that write would land. Always nil in production, and
-    /// task-local so nothing can race it. Mirrors `AgentPeerHTTP`.
-    @TaskLocal static var concurrentSaveHookForTests: (@Sendable () -> Void)?
-    @TaskLocal static var beforeRemovalHookForTests: (@Sendable () -> Void)?
-    @TaskLocal static var afterRemovalRenameHookForTests: (@Sendable () -> Void)?
-    @TaskLocal static var backupDateForTests: Date?
-
     /// What a write did, for an honest tool result. Never carries file content.
     public struct Outcome: Sendable, Equatable {
         public let path: String
@@ -140,10 +131,10 @@ public enum AgentHostConfigWriter {
             return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
         }
         return try edit(path: path, backupRecordURL: recordURL, initial: Data("{}".utf8), ownership: { data in
-            JSONOwnership(command: "antigravity-messaging", peerID: peerID, name: server,
-                original: try permissionEntry(data, "allow"),
-                originalMember: try JSONEntrySplice.entry(data, name: "allow", containerKey: "permissions",
-                    comments: true, trailingCommas: true, wholeMember: true))
+            let original = try JSONEntrySplice.entry(data, name: "allow", containerKey: "permissions",
+                comments: true, trailingCommas: true)
+            return JSONOwnership(command: "antigravity-messaging", peerID: peerID, name: server,
+                original: original?.value, originalMember: original?.member)
         }) { data in
             try checkMessagingConflicts(data, server: server, rules: rules)
             let existing = try permissionRules(data, "allow")
@@ -179,7 +170,7 @@ public enum AgentHostConfigWriter {
     }
 
     private static func permissionEntry(_ data: Data, _ key: String) throws -> String? {
-        try JSONEntrySplice.entry(data, name: key, containerKey: "permissions", comments: true, trailingCommas: true)
+        try JSONEntrySplice.entry(data, name: key, containerKey: "permissions", comments: true, trailingCommas: true)?.value
     }
 
     private static func checkMessagingConflicts(_ data: Data, server: String, rules: [String]) throws {
@@ -223,11 +214,10 @@ public enum AgentHostConfigWriter {
         return try edit(path: path, backupRecordURL: backupRecordURL, initial: Data("{}".utf8),
             ownership: { data in
                 guard let command, let peerID else { return nil }
+                let original = try JSONEntrySplice.entry(data, name: name, containerKey: containerKey,
+                    comments: comments, trailingCommas: trailingCommas)
                 return JSONOwnership(command: command, peerID: peerID, name: name,
-                    original: try JSONEntrySplice.entry(data, name: name, containerKey: containerKey,
-                        comments: comments, trailingCommas: trailingCommas),
-                    originalMember: try JSONEntrySplice.entry(data, name: name, containerKey: containerKey,
-                        comments: comments, trailingCommas: trailingCommas, wholeMember: true))
+                    original: original?.value, originalMember: original?.member)
             }) { data in
             try JSONEntrySplice.upsert(data, name: name, entryJSON: entryJSON, containerKey: containerKey, comments: comments, trailingCommas: trailingCommas)
         }
@@ -326,10 +316,8 @@ public enum AgentHostConfigWriter {
         if restoreAbsence {
             // Claim a private name BEFORE inspecting. Never unlink the host's
             // pathname: it may already name a newer save by the time we delete.
-            beforeRemovalHookForTests?()
             let claimed = path + ".nativeagent-removal-" + UUID().uuidString
             guard renamex_np(path, claimed, UInt32(RENAME_EXCL)) == 0 else { throw Failure.changedUnderneath }
-            afterRemovalRenameHookForTests?()
             let current: Data
             let currentIdentity: FileIdentity
             do { (current, currentIdentity) = try read(path: claimed) }
@@ -432,7 +420,7 @@ public enum AgentHostConfigWriter {
         formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
         // Create the newest undo before removing older ones, including writes
         // in the same second. Never overwrite a colliding file.
-        let stem = path + "." + InstallPaths.current.name("nativeagent-backup") + "-" + formatter.string(from: backupDateForTests ?? Date())
+        let stem = path + "." + InstallPaths.current.name("nativeagent-backup") + "-" + formatter.string(from: Date())
         for attempt in 0..<64 {
             let backup = attempt == 0 ? stem : "\(stem)-\(attempt)"
             if write(data, to: backup) {
@@ -502,7 +490,6 @@ public enum AgentHostConfigWriter {
     }
 
     private static func replaceAtomically(path: String, data: Data, unchangedSince identity: FileIdentity?, original: Data? = nil) throws {
-        concurrentSaveHookForTests?()
         var now = stat()
         let status = lstat(path, &now)
         guard identity == nil ? (status != 0 && errno == ENOENT)
@@ -657,15 +644,16 @@ enum JSONEntrySplice {
     }
 
     static func entry(_ data: Data, name: String, containerKey: String, comments: Bool,
-                      trailingCommas: Bool, wholeMember: Bool = false) throws -> String? {
+                      trailingCommas: Bool) throws -> (value: String, member: String)? {
         let bytes = try validatedBytes(data, comments: comments, trailingCommas: trailingCommas)
         let root = try members(bytes, from: objectStart(bytes))
         guard let container = try unique(root.members, named: containerKey, called: "section") else { return nil }
         let start = try valueOffset(bytes, member: container)
         guard bytes[start] == 123 else { throw AgentHostConfigWriter.Failure.unparsable("server section is not an object") }
         guard let member = try unique(members(bytes, from: start).members, named: name, called: "server") else { return nil }
-        let memberStart = wholeMember ? member.start : try valueOffset(bytes, member: member)
-        return String(decoding: Array(data)[memberStart..<member.end], as: UTF8.self)
+        let original = Array(data)
+        return (String(decoding: original[try valueOffset(bytes, member: member)..<member.end], as: UTF8.self),
+                String(decoding: original[member.start..<member.end], as: UTF8.self))
     }
 
     /// Find our command AND connection id throughout the document, including
@@ -713,7 +701,7 @@ enum JSONEntrySplice {
         }
         if let original = owner.original {
             if let current = try entry(output, name: owner.name, containerKey: containerKey,
-                                       comments: comments, trailingCommas: trailingCommas) {
+                                       comments: comments, trailingCommas: trailingCommas)?.value {
                 let lhs = try JSONSerialization.jsonObject(with: Data(validatedBytes(Data(current.utf8), comments: comments, trailingCommas: trailingCommas))) as? NSDictionary
                 let rhs = try JSONSerialization.jsonObject(with: Data(validatedBytes(Data(original.utf8), comments: comments, trailingCommas: trailingCommas))) as? NSDictionary
                 guard lhs == rhs else { throw AgentHostConfigWriter.Failure.unparsable("the original entry's name is occupied; resolve the collision before disconnecting") }

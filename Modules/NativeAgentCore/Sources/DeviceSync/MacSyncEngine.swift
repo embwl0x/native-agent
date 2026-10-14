@@ -89,7 +89,7 @@ public final class MacSyncEngine: ObservableObject {
     // fix-R9-9 Maintain insertion order so oldest are evicted first (not random).
     var processedMsgIds: Set<String> = []
     var processedMsgIdsOrdered: [String] = []
-    /// Sweep R4 item 1: the last `loadProcessedIds()` found the file present but
+    /// Sweep R4 item 1: the last `restoreState` found the file present but
     /// unreadable, so the in-memory window may be missing ids that really were
     /// processed. Distinct from "no file yet", which is ordinary genesis.
     var processedIdsUnreadable = false
@@ -271,53 +271,13 @@ public final class MacSyncEngine: ObservableObject {
     /// owner can prove durable-before-send and restart resend behavior without
     /// substituting a second action processor or a hand-built envelope.
     var cloudKitActionResponseSender: (@Sendable ([String: String], String) async throws -> Void)?
-    /// Test-only root seam for CloudKit action bookkeeping; production keeps
-    /// the canonical NativeAgent data root.
-    var cloudKitActionStateRootOverride: URL?
-    /// Test seam for the durable completion-marker recovery path.
-    var cloudKitActionProcessedIDPersistence: (() -> Bool)?
-    /// The production observer listens on `.default`; an isolated center keeps
-    /// transcript-coalescer evaluations from subscribing to the live app.
-    let chatTurnCompletedNotificationCenter: NotificationCenter
-    /// Production always takes the real snapshot writer. The injected path is
-    /// deliberately limited to the final coalesced chat projection boundary.
-    let chatTranscriptSnapshotWriter: (@MainActor @Sendable (Bool) async -> Void)?
-    /// Production sleeps for the requested coalescing duration. An injected
-    /// delay lets lifecycle evaluations hold the real debounce task at that
-    /// boundary without depending on wall-clock scheduler timing.
-    let chatSnapshotCoalescingDelay: @MainActor @Sendable (Duration) async throws -> Void
-    /// Isolated lifecycle evaluations persist only their digest state beneath
-    /// this injected root. Production always uses the canonical data root.
-    let stateDataRootOverride: URL?
-    /// The production closure reads the app-owned cognition actor. Snapshot
-    /// projection evals inject an immutable organism read so they can execute
-    /// the real Mac writer without touching the resident agent's body state.
-    let organismSnapshotProvider: @Sendable () async -> OrganismSnapshot
-
     enum KVSKey {
         static let snapshotUpdated = "snapshot_updated"
         static let inboxPending = "inbox_pending"
     }
 
-    init(
-        sync: DeviceSync,
-        stateDataRootOverride: URL?,
-        chatTurnCompletedNotificationCenter: NotificationCenter = .default,
-        chatTranscriptSnapshotWriter: (@MainActor @Sendable (Bool) async -> Void)? = nil,
-        chatSnapshotCoalescingDelay: @escaping @MainActor @Sendable (Duration) async throws -> Void = { duration in
-            try await Task.sleep(for: duration)
-        },
-        organismSnapshotProvider: (@Sendable () async -> OrganismSnapshot)? = nil
-    ) {
+    init(sync: DeviceSync) {
         self.sync = sync
-        self.stateDataRootOverride = stateDataRootOverride
-        self.chatTurnCompletedNotificationCenter = chatTurnCompletedNotificationCenter
-        self.chatTranscriptSnapshotWriter = chatTranscriptSnapshotWriter
-        self.chatSnapshotCoalescingDelay = chatSnapshotCoalescingDelay
-        let cognition = sync.cognition
-        self.organismSnapshotProvider = organismSnapshotProvider ?? {
-            await cognition.organismSnapshot()
-        }
     }
 
     enum Folder {

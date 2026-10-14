@@ -258,6 +258,10 @@ public enum MemoryMoments {
         return "\(content) — \"\(quote)\""
     }
 
+    static func author(surface: String, peer: Bool) -> String {
+        surface == "studio_wander" ? "app" : peer ? "peer" : "user"
+    }
+
     /// Metadata for one staged moment. `author` is "peer" when the user seat
     /// was another agent over the local bridge — still a moment, honestly
     /// attributed.
@@ -337,7 +341,7 @@ public enum MemoryMoments {
         let session = sourceSession ?? metadataString(metadata, "session_id")
         let storedAuthor = metadataString(metadata, "author")
         let author = session?.hasPrefix("agent-") == true || session?.hasPrefix("bot-") == true
-            ? "peer" : (["peer", "user"].contains(storedAuthor ?? "") ? storedAuthor! : "unknown")
+            ? "peer" : (["app", "peer", "user"].contains(storedAuthor ?? "") ? storedAuthor! : "unknown")
         var origin: [String: JSONValue] = ["author": .string(author)]
         if let session, !session.isEmpty { origin["session_id"] = .string(session) }
         if let source, !source.isEmpty { origin["source"] = .string(source) }

@@ -623,7 +623,6 @@ public enum TrustBackupPersistence {
                 try Self.writeRestoreIntent(intent, to: intentPath)
             }
             return try Self.rollbackInterruptedRestore(
-                intent: intent,
                 safety: safety,
                 intentPath: intentPath,
                 dataRoot: root,
@@ -661,7 +660,6 @@ public enum TrustBackupPersistence {
                 intent.state = .rollingBack
                 try Self.writeRestoreIntent(intent, to: intentPath)
                 return try Self.rollbackInterruptedRestore(
-                    intent: intent,
                     safety: safety,
                     intentPath: intentPath,
                     dataRoot: root,
@@ -689,13 +687,11 @@ public enum TrustBackupPersistence {
             requiresRestart: false,
             safetyBackupId: safety.id
         )
-        try Self.writeCodableJSON(result, to: Self.backupRestoreResultPath(dataRoot: root))
         try FileManager.default.removeItem(at: intentPath)
         return result
     }
 
     private static func rollbackInterruptedRestore(
-        intent: NativeBackupRestoreIntent,
         safety: NativeValidatedBackupSnapshot,
         intentPath: URL,
         dataRoot root: URL,
@@ -713,15 +709,6 @@ public enum TrustBackupPersistence {
                 in: root,
                 priorGenerations: priorGenerations
             )
-            let receipt: JSONValue = .object([
-                "kind": .string("backup_restore_rollback"),
-                "transactionId": .string(intent.transactionID),
-                "targetId": .string(intent.targetID),
-                "safetyBackupId": .string(safety.id),
-                "status": .string("rolled_back"),
-                "rolledBackAt": .string(Self.nativeArtifactTimestamp()),
-            ])
-            try Self.writeJSONValue(receipt, to: Self.backupRestoreResultPath(dataRoot: root))
             try FileManager.default.removeItem(at: intentPath)
         } catch {
             // Keep the rollingBack intent byte-for-byte available. The next
@@ -828,11 +815,6 @@ public enum TrustBackupPersistence {
     private static func backupRestoreIntentPath(dataRoot root: URL) -> URL {
         root.appendingPathComponent("backups", isDirectory: true)
             .appendingPathComponent("restore-intent.json")
-    }
-
-    private static func backupRestoreResultPath(dataRoot root: URL) -> URL {
-        root.appendingPathComponent("backups", isDirectory: true)
-            .appendingPathComponent("last-restore-result.json")
     }
 
     private static func readRestoreIntent(at path: URL) throws -> NativeBackupRestoreIntent {
@@ -1080,7 +1062,7 @@ public enum TrustBackupPersistence {
         try Self.validateBackupTrustPolicy(dataDir: dataDir)
         try Self.validateBackupCapabilityAuthority(dataDir: dataDir)
 
-        let record = try Self.readBackupRecords(root: root).first { $0.id == id }
+        let record = try (Self.readBackupRecords(root: root) + Self.readLegacyBackupRecords(root: root)).first { $0.id == id }
         let reasonCandidate = record?.reason.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let reason = reasonCandidate.isEmpty
             ? "legacy NativeAgent backup"
@@ -1606,7 +1588,7 @@ public enum TrustBackupPersistence {
         ])
     }
 
-    private static let backupRelativePaths = legacyBackupRelativePaths + ["senses", "make"]
+    private static let backupRelativePaths = legacyBackupRelativePaths + ["abilities", "senses", "make"]
 
     private static let legacyBackupRelativePaths: [String] = [
         "trust",
@@ -1682,8 +1664,8 @@ public enum TrustBackupPersistence {
             try fm.copyItem(at: source, to: destination)
             return
         }
-        if relative != "workshop" {
-            let lock = relative == "make" ? source : source.appendingPathComponent(relative == "senses" ? "registry.json" : "ops.jsonl")
+        if !["workshop", "senses"].contains(relative) {
+            let lock = relative == "make" ? source : source.appendingPathComponent("ops.jsonl")
             try await SwiftNativePersistenceCore().withFileLock(lock) {
                 try await Self.copyLocalSnapshotDirectory(from: source, to: destination, relative: relative)
             }
@@ -1890,7 +1872,6 @@ public enum TrustBackupPersistence {
         let backupRoot = root.appendingPathComponent("backups", isDirectory: true)
         let paths = [
             backupRoot.appendingPathComponent("index.json"),
-            backupRoot.appendingPathComponent("registry.json"),
         ]
         var byId: [String: BackupRecord] = [:]
         let fm = FileManager.default
@@ -1908,6 +1889,11 @@ public enum TrustBackupPersistence {
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
             return lhs.id < rhs.id
         }
+    }
+
+    public static func readLegacyBackupRecords(root: URL) throws -> [BackupRecord] {
+        try readBackupRecordsFile(root.appendingPathComponent("backups/registry.json"))
+            .sorted { $0.createdAt > $1.createdAt }
     }
 
     private static func readBackupRecordsFile(_ path: URL) throws -> [BackupRecord] {

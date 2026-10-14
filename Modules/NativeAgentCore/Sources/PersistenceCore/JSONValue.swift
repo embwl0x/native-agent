@@ -83,59 +83,54 @@ extension JSONValue {
     /// `NaN` / `Infinity` / `-Infinity` value tokens with `null`. Tokens
     /// inside double-quoted strings (respecting `\"` escapes) are untouched.
     static func stripNonFiniteTokens(_ data: Data) -> Data {
-        let bytes = [UInt8](data)
-        var out: [UInt8] = []
-        out.reserveCapacity(bytes.count)
-        let nullBytes: [UInt8] = [0x6E, 0x75, 0x6C, 0x6C] // "null"
-        var inString = false
-        var escape = false
-        var i = 0
-        while i < bytes.count {
-            let b = bytes[i]
-            if inString {
-                out.append(b)
-                if escape {
-                    escape = false
-                } else if b == 0x5C { // backslash
-                    escape = true
-                } else if b == 0x22 { // quote
-                    inString = false
+        data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            var out = Data()
+            let nullBytes: [UInt8] = [0x6E, 0x75, 0x6C, 0x6C] // "null"
+            var inString = false
+            var escape = false
+            var i = 0, start = 0
+            while i < bytes.count {
+                let b = bytes[i]
+                if inString {
+                    if escape {
+                        escape = false
+                    } else if b == 0x5C { // backslash
+                        escape = true
+                    } else if b == 0x22 { // quote
+                        inString = false
+                    }
+                    i += 1
+                    continue
                 }
-                i += 1
-                continue
-            }
-            if b == 0x22 { // entering string
-                inString = true
-                out.append(b)
-                i += 1
-                continue
-            }
-            // 'N' — try NaN
-            if b == 0x4E && matchesAscii(bytes, i, "NaN") {
+                if b == 0x22 { // entering string
+                    inString = true
+                    i += 1
+                    continue
+                }
+                let tokenLength: Int
+                if b == 0x4E && matchesAscii(bytes, i, "NaN") {
+                    tokenLength = 3
+                } else if b == 0x49 && matchesAscii(bytes, i, "Infinity") {
+                    tokenLength = 8
+                } else if b == 0x2D && i + 1 < bytes.count && bytes[i + 1] == 0x49
+                    && matchesAscii(bytes, i + 1, "Infinity") {
+                    tokenLength = 9
+                } else {
+                    i += 1
+                    continue
+                }
+                out.append(contentsOf: bytes[start..<i])
                 out.append(contentsOf: nullBytes)
-                i += 3
-                continue
+                i += tokenLength
+                start = i
             }
-            // 'I' — try Infinity
-            if b == 0x49 && matchesAscii(bytes, i, "Infinity") {
-                out.append(contentsOf: nullBytes)
-                i += 8
-                continue
-            }
-            // '-Infinity'
-            if b == 0x2D && i + 1 < bytes.count && bytes[i + 1] == 0x49
-                && matchesAscii(bytes, i + 1, "Infinity") {
-                out.append(contentsOf: nullBytes)
-                i += 9
-                continue
-            }
-            out.append(b)
-            i += 1
+            guard start > 0 else { return data }
+            out.append(contentsOf: bytes[start..<bytes.count])
+            return out
         }
-        return Data(out)
     }
 
-    private static func matchesAscii(_ bytes: [UInt8], _ i: Int, _ token: String) -> Bool {
+    private static func matchesAscii(_ bytes: UnsafeRawBufferPointer, _ i: Int, _ token: String) -> Bool {
         let t = Array(token.utf8)
         if i + t.count > bytes.count { return false }
         for j in 0..<t.count where bytes[i + j] != t[j] { return false }
@@ -155,7 +150,8 @@ extension JSONValue {
             case .float32Type, .float64Type, .cgFloatType, .doubleType, .floatType:
                 return .double(n.doubleValue)
             default:
-                return .int(n.int64Value)
+                if let value = n as? Int64 { return .int(value) }
+                return .double(n.doubleValue)
             }
         }
         if let s = any as? String { return .string(s) }
@@ -264,7 +260,7 @@ extension JSONValue {
             // Swift's default String.sorted() uses NFC + locale-aware comparison
             // which diverges from Python on non-ASCII keys.
             let keys = dict.keys.sorted { lhs, rhs in
-                Array(lhs.utf8).lexicographicallyPrecedes(Array(rhs.utf8))
+                lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
             }
             if pretty {
                 let inner = String(repeating: " ", count: (indentLevel + 1) * 2)

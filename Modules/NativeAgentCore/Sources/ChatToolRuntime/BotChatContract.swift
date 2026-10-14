@@ -3,30 +3,13 @@ import PersistenceCore
 import ProviderRouting
 import StandingBots
 
-// "Continue in Chat" (BotsShelfView.swift:113) opens a bot's OWN transcript in
-// ordinary Chat. Before this type, the next Mac send carried the transcript and
-// nothing else: the Chat model picker, the Chat reasoning effort and a hardcoded
-// `surface: "chat"` replaced the bot's saved provider choice and its
-// bot-specific approval rule (lane1 finding 4 — the prose-editor bot saves
-// codex/gpt-5.5/medium and none of it was consulted).
-//
-// A continued turn carries the bot's model, reasoning effort and current brief.
-// Its execution policy is independent of the door delivering the message.
-// Per-run claim and daily allowance stay with BotRunner: a person in its session is
-// an attended turn, not scheduled spend.
+/// Every door into a helper uses its current brief and the same checked choice.
 public struct BotChatContract: Sendable, Equatable {
     public let name: String
     public let instructions: String
     public let model: String?
     public let reasoningEffort: String?
-    /// The bot's saved provider tuple, exactly as StandingBotContinuity builds
-    /// it (SwiftToolDispatcher+StandingBotsContinuity.swift:12). Without this the
-    /// routing layer prefers the surface's configured model and the requested
-    /// one is ignored (ChatOrchestration+TurnEngine.swift:223).
-    ///
-    /// nil ONLY when the bot has no usable tuple — and then `modelChoiceProblem`
-    /// says why and the turn is refused. A bot never rides Chat's route
-    /// (2026-09-13 review): that was the silent fallback this closes.
+    /// Nil only when the choice is unavailable and the turn must be refused.
     public var choice: ProviderTurnChoice?
     /// What the bot still needs before it can run, or nil when it can.
     public var modelChoiceProblem: String? = nil
@@ -36,27 +19,24 @@ public struct BotChatContract: Sendable, Equatable {
             + (bot.outputFormat.map { "\nRequested output: " + $0 } ?? "")
     }
 
-    /// The contract with the FULL gate applied — the same one the runner uses:
-    /// the route is connected and still offers this model at this Think level,
-    /// not merely that three fields are nonempty (2026-09-13, third review). A
-    /// bot whose account was disconnected, or whose model left the catalog,
-    /// refuses its turn here exactly as a scheduled run would.
     public static func checked(
         _ sessionId: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> BotChatContract? {
-        // ONE read of the definition, and both the contract and its gate come
-        // from that one read (2026-09-13, fourth review). Reading twice meant a
-        // definition edited in between produced a contract for one version gated
-        // against another — and a second read that simply failed handed back the
-        // first, ungated.
         guard sessionId.hasPrefix("bot-"),
               UUID(uuidString: String(sessionId.dropFirst(4))) != nil else { return nil }
         guard let bot = definition(for: sessionId, dataRoot: dataRoot) else {
             return BotChatContract(name: "Bot", instructions: "", model: nil, reasoningEffort: nil, choice: nil,
-                                   modelChoiceProblem: "This bot's definition is unavailable or deleted. Restore it before continuing this conversation.")
+                                   modelChoiceProblem: "This helper's definition is unavailable or deleted. Choose an existing helper before continuing.")
         }
-        return await contract(for: bot, dataRoot: dataRoot)
+        do {
+            let choice = try await choice(for: bot, dataRoot: dataRoot)
+            return BotChatContract(name: bot.name, instructions: instructions(for: bot), model: choice.model,
+                                   reasoningEffort: choice.reasoningEffort, choice: choice)
+        } catch {
+            return BotChatContract(name: bot.name, instructions: instructions(for: bot), model: nil,
+                                   reasoningEffort: nil, choice: nil, modelChoiceProblem: String(describing: error))
+        }
     }
 
     /// The bot behind a session id, or nil for an ordinary session. Cheap:
@@ -73,24 +53,33 @@ public struct BotChatContract: Sendable, Equatable {
         return bot
     }
 
-    private static func contract(
+    public static func choice(
         for bot: BotDefinition,
         dataRoot: URL
-    ) async -> BotChatContract {
-        let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot)
-        let choice: ProviderTurnChoice? = problem == nil
-            ? ProviderTurnChoice(
+    ) async throws -> ProviderTurnChoice {
+        if let problem = bot.modelChoiceProblem { throw BotRunnerError.cannotRun(problem) }
+        let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
+        let choice: ProviderTurnChoice
+        if bot.modelPinned == true {
+            choice = ProviderTurnChoice(
                 provider: bot.provider ?? "", model: bot.model ?? "",
                 reasoningEffort: bot.reasoningEffort ?? "", fast: bot.fast ?? false
             )
-            : nil
-        return BotChatContract(name: bot.name, instructions: instructions(for: bot), model: bot.model,
-                               reasoningEffort: bot.reasoningEffort, choice: choice,
-                               modelChoiceProblem: problem)
+        } else {
+            // Helpers have always used Chat's selection when inheriting a route.
+            let snapshot = try await router.checkedRoutingSnapshot()
+            if let notice = snapshot.unusablePickNotice(for: "chat") { throw BotRunnerError.cannotRun(notice) }
+            guard let preference = snapshot.preferences["chat"],
+                  let provider = snapshot.activeProviders["chat"], !preference.model.isEmpty else {
+                throw BotRunnerError.cannotRun("Open Providers and choose an account and model for Chat.")
+            }
+            choice = ProviderTurnChoice(provider: provider, model: preference.model,
+                reasoningEffort: preference.reasoningEffort, fast: preference.serviceTier == "priority")
+        }
+        if let problem = await router.botChoiceRejection(provider: choice.provider, model: choice.model,
+                                                        reasoningEffort: choice.reasoningEffort) {
+            throw BotRunnerError.cannotRun(problem)
+        }
+        return choice
     }
-
-    // There is deliberately no ungated accessor. A shape-only `forSession`
-    // existed until 2026-09-13 and had no callers left once every turn path
-    // moved to `checked` — an entry point that skips the gate is the trap this
-    // review found twice, so it is gone rather than left for the next caller.
 }

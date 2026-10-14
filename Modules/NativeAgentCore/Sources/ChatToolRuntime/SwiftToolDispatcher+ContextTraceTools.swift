@@ -109,9 +109,9 @@ extension SwiftToolDispatcher {
         }
         let usage = jsonString(input["view"]) == "usage"
         let now = Date()
-        let requestedLimit = optionalInt(input, "limit") ?? 10
+        let requestedLimit = Self.jsonInt(input["limit"]) ?? 10
         let limit = max(1, min(requestedLimit, 50))
-        let offset = max(0, optionalInt(input, "offset") ?? 0)
+        let offset = max(0, Self.jsonInt(input["offset"]) ?? 0)
         let effectsOnly = input["effects_only"] == .bool(true)
         let receiptView = effectsOnly || jsonString(input["view"]) == "receipts"
         let since: Date?
@@ -131,7 +131,7 @@ extension SwiftToolDispatcher {
             }
             return try await TurnTraceRecentReader(dataRootOverride: dataRoot).usage(since: since, now: now, by: by)
         }
-        let completedTurns = optionalInt(input, "completed_turns").map { max(1, min($0, 50)) }
+        let completedTurns = Self.jsonInt(input["completed_turns"]).map { max(1, min($0, 50)) }
         let kindFilter = jsonString(input["kind"])
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .flatMap { $0.isEmpty ? nil : $0 }

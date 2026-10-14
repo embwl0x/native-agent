@@ -1,3 +1,4 @@
+import Onboarding
 import SwiftUI
 import AppKit
 import NativeAgentShared
@@ -86,61 +87,6 @@ struct PersonalityDocumentDraftState: Equatable {
         savingRevisions.removeValue(forKey: documentID)
         if succeeded && editRevisions[documentID, default: 0] == revision {
             unsavedDrafts.removeValue(forKey: documentID)
-        }
-    }
-}
-
-/// The starter card's durable operation. Keeping this separate from SwiftUI
-/// state means the same onboarding, document reload, and SOUL write sequence
-/// can be evaluated without treating an off-screen AppKit hierarchy as proof
-/// that the user action worked.
-@MainActor
-enum PersonalityStarterCreateAction {
-    enum Outcome: Equatable {
-        case created
-        case notesUnsaved(documentID: String, draft: String)
-        case failed(String)
-    }
-
-    static let notesUnsavedMessage =
-        "Setup notes were not saved. They are open as an unsaved SOUL.md draft below."
-
-    static func create(
-        appModel: AppModel,
-        agentName: String,
-        userName: String,
-        notes: String
-    ) async -> Outcome {
-        do {
-            let response = try await appModel.completeOnboarding(
-                agentName: agentName.trimmingCharacters(in: .whitespacesAndNewlines),
-                personaType: "ai",
-                userName: userName.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
-            guard response.ok else {
-                return .failed(response.detail ?? response.error ?? "Could not create the persona.")
-            }
-            guard await appModel.loadPersonalityDocs() else {
-                return .failed(
-                    "The persona was created, but its documents could not be reloaded to save your setup notes. Retry from the Personality page before editing anything else."
-                )
-            }
-
-            let trimmedNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedNotes.isEmpty,
-                  let soul = appModel.personalityDocs.first(where: { $0.id.uppercased() == "SOUL" })
-            else {
-                return .created
-            }
-
-            let draft = soul.content + "\n\n## From setup\n" + trimmedNotes + "\n"
-            PersonalityStarterPanelEvaluation.beforePersistingNotes?()
-            guard await appModel.savePersonalityDoc(id: soul.id, content: draft) else {
-                return .notesUnsaved(documentID: soul.id, draft: draft)
-            }
-            return .created
-        } catch {
-            return .failed(UserFacingError.message(error, action: "create the personality docs"))
         }
     }
 }
@@ -281,11 +227,16 @@ struct PersonalityView: View {
         starterBusy = true
         starterError = nil
         defer { starterBusy = false }
-        let outcome = await PersonalityStarterCreateAction.create(
-            appModel: appModel,
+        let outcome = await SwiftNativeOnboardingClient.createStarterPersona(
             agentName: starterAgentName,
             userName: starterUserName,
-            notes: starterNotes
+            notes: starterNotes,
+            complete: { name, user in
+                try await appModel.completeOnboarding(agentName: name, personaType: "ai", userName: user)
+            },
+            reload: { await appModel.loadPersonalityDocs() ? appModel.personalityDocs : nil },
+            save: { await appModel.savePersonalityDoc(id: $0, content: $1) },
+            failureMessage: { UserFacingError.message($0, action: "create the personality docs") }
         )
         switch outcome {
         case .created:
@@ -295,7 +246,7 @@ struct PersonalityView: View {
             // Keep the exact draft in the real editor rather than discarding it.
             documentDraftState.keepUnsavedDraft(draft, for: documentID)
             await loadProfile(forceRefresh: false)
-            documentSaveError = PersonalityStarterCreateAction.notesUnsavedMessage
+            documentSaveError = "Setup notes were not saved. They are open as an unsaved SOUL.md draft below."
         case .failed(let detail):
             starterError = detail
         }
@@ -630,14 +581,6 @@ private struct PersonalityNameSaveFeedback {
     }
 }
 
-/// Evaluation-only fault boundary for the starter panel's second, durable
-/// write. It is nil in ordinary app operation, so it cannot alter production
-/// behavior unless an executable evaluation explicitly installs it.
-@MainActor
-enum PersonalityStarterPanelEvaluation {
-    static var beforePersistingNotes: (() -> Void)?
-}
-
 // MARK: - Plain-English personality document help copy
 //
 // UI-6 (2026-08-01, public era): the tooltip named both the file and the
@@ -689,4 +632,44 @@ struct PersonalityDocumentPurposeDetail: View {
                 .foregroundStyle(NativeAgentShell.text.opacity(0.85))
         }
     }
+}
+
+extension PersonalityProfile {
+    static let defaultProfile = PersonalityProfile(
+        schemaVersion: 2,
+        personaEngineVersion: "2.0",
+        name: "NativeAgent",
+        personaKind: "AI",
+        essence: "A calm, sharp, practical native macOS agent that improves itself inside its own sandbox and helps the user get real work done.",
+        voice: "Direct, grounded, specific, with no corporate fluff.",
+        customDirective: "",
+        traits: PersonalityTraits(
+            warmth: 0.45,
+            directness: 0.82,
+            humor: 0.12,
+            proactivity: 0.78,
+            rigor: 0.86,
+            autonomy: 0.82,
+            creativity: 0.58,
+            brevity: 0.74
+        ),
+        examples: [
+            "Lead with the useful answer, then show only the context needed to act.",
+            "When tools are involved, be explicit about what was actually done."
+        ],
+        forbiddenPatterns: [
+            "Corporate filler.",
+            "Claiming tool or file actions that did not happen.",
+            "Over-explaining simple outcomes."
+        ],
+        instincts: nil,
+        boundaries: nil,
+        surfaceOverrides: [
+            "chat": "",
+            "telegram": "Keep Telegram replies shorter and preserve the same persona without long setup context.",
+            "dream": "Reflect like an internal agent maintenance pass: specific lessons, memory candidates, eval ideas, and improvement targets.",
+            "autonomy": "Operate as a careful self-improvement engineer inside the app-owned worktree."
+        ],
+        updatedAt: nil
+    )
 }

@@ -149,18 +149,17 @@ struct TaskLedgerCLI {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
         let pretty = parsed.flags.contains("pretty")
         if let taskId = parsed.options["task-id"], !taskId.isEmpty {
-            guard let state = try await ledger.listTasks().first(where: { $0.taskId == taskId }) else {
+            guard let snapshot = try await ledger.taskWithEvents(taskID: taskId) else {
                 printJSON(.object([
                     "status": .string("not_found"),
                     "task_id": .string(taskId),
                 ]), pretty: pretty)
                 return 0
             }
-            let events = try await ledger.readEventsUnlocked().filter { $0.taskId == taskId }
             printJSON(.object([
                 "status": .string("ok"),
-                "task": state.toJSON(),
-                "events": .array(events.map { $0.toJSON() }),
+                "task": snapshot.task.toJSON(),
+                "events": .array(snapshot.events.map { $0.toJSON() }),
             ]), pretty: pretty)
             return 0
         }

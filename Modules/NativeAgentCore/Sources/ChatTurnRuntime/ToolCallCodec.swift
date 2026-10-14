@@ -73,10 +73,11 @@ enum ToolCallCodec: Sendable, Equatable {
         if let marker = heldStarts.min(by: { $0.lowerBound < $1.lowerBound }) {
             let safe = String(pending[..<marker.lowerBound])
             pending = String(pending[marker.lowerBound...])
-            return safe
+            return ToolCallParser.stripProtocolDebris(safe)
         }
         if self == .textMarkers {
-            return TextMarkerCodec.releasableProse(holding: &pending, force: false)
+            return ToolCallParser.stripProtocolDebris(
+                TextMarkerCodec.releasableProse(holding: &pending, force: false))
         }
         // Hold only a tail that could still grow into a marker ("<to",
         // "**tool c"); plain prose goes out now. A fixed 16-character hold
@@ -86,19 +87,21 @@ enum ToolCallCodec: Sendable, Equatable {
         let split = pending.index(pending.endIndex, offsetBy: -held)
         let safe = String(pending[..<split])
         pending = String(pending[split...])
-        return safe
+        return ToolCallParser.stripProtocolDebris(safe)
     }
 
     private static let markerStarts = ToolCallParser.protocolMarkerStarts + ["```", "~~~", "NativeAgent tool result #"]
 
     /// Length of the longest suffix of `text` that is a proper start of a marker.
     static func markerPrefixTailLength(_ text: String) -> Int {
+        let placeholder = text.range(of: #"(?<!\w)_\w*\z"#, options: .regularExpression)
+            .map { text.distance(from: $0.lowerBound, to: text.endIndex) } ?? 0
         let longest = markerStarts.map(\.count).max() ?? 0
         for length in stride(from: min(longest, text.count), to: 0, by: -1) {
             let tail = text.suffix(length).lowercased()
-            if markerStarts.contains(where: { $0.lowercased().hasPrefix(tail) }) { return length }
+            if markerStarts.contains(where: { $0.lowercased().hasPrefix(tail) }) { return max(length, placeholder) }
         }
-        return 0
+        return placeholder
     }
 
     /// What of the held-back tail reaches the surface when the round calls

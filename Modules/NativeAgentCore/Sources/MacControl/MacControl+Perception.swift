@@ -42,8 +42,7 @@ extension SwiftNativeMacControl {
                 action: "read",
                 output: .object(output),
                 error: error,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
@@ -288,7 +287,7 @@ extension SwiftNativeMacControl {
                 : "raw view · passive observation · document accumulation requires desktop input; observation waits"
             return MacControlResult(ok: false, action: "read",
                 output: .object(["message": .string(message)]),
-                error: "passive_observation", durationMs: 0, viaSwift: true)
+                error: "passive_observation", durationMs: 0)
         }
         func result(ok: Bool, _ output: [String: JSONValue], error: String? = nil) -> MacControlResult {
             var output = output
@@ -316,8 +315,7 @@ extension SwiftNativeMacControl {
                 action: "read",
                 output: .object(output),
                 error: error,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         func refuse(_ code: String, _ words: String) -> MacControlResult {
@@ -585,8 +583,7 @@ extension SwiftNativeMacControl {
             action: "ax_status",
             output: .object(output),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -643,8 +640,7 @@ extension SwiftNativeMacControl {
                 "frontmost_app": accessibilitySource.frontmostApp()?.toJSON() ?? .null,
             ].merging(runningAppProjection()) { _, new in new }),
             error: Self.selfInspectionError,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -1147,8 +1143,7 @@ extension SwiftNativeMacControl {
                     "error": .string("no_frontmost_window"),
                 ]),
                 error: "no_frontmost_window",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         var output: [String: JSONValue] = Self.axTruncationJSON(read.snapshot, limits: limits)
@@ -1175,8 +1170,7 @@ extension SwiftNativeMacControl {
             action: "ax_tree",
             output: .object(output),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -1490,8 +1484,7 @@ extension SwiftNativeMacControl {
                     "message": .string("grade must be one of: glance, look, stare"),
                 ]),
                 error: "unknown_grade",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "look") }
@@ -1516,8 +1509,7 @@ extension SwiftNativeMacControl {
                         ),
                     ]),
                     error: "background_stare_unsupported",
-                    durationMs: Int(now().timeIntervalSince(started) * 1000),
-                    viaSwift: true
+                    durationMs: Int(now().timeIntervalSince(started) * 1000)
                 )
             }
             let resolution = MacBackgroundSight.resolve(
@@ -1540,8 +1532,7 @@ extension SwiftNativeMacControl {
                         "message": .string(words),
                     ]),
                     error: code,
-                    durationMs: Int(now().timeIntervalSince(started) * 1000),
-                    viaSwift: true
+                    durationMs: Int(now().timeIntervalSince(started) * 1000)
                 )
             }
             anchorPid = app.processIdentifier
@@ -1554,7 +1545,7 @@ extension SwiftNativeMacControl {
             guard MacObservationMode.current != .passive else {
                 return MacControlResult(ok: false, action: "look",
                     output: .object(["message": .string("raw view · passive observation · renderer accessibility flags were left unchanged")]),
-                    error: "passive_observation", durationMs: 0, viaSwift: true)
+                    error: "passive_observation", durationMs: 0)
             }
             var released = false
             var stillOn = false
@@ -1580,8 +1571,7 @@ extension SwiftNativeMacControl {
                     "enhanced_ax_still_on": .bool(stillOn),
                 ]),
                 error: nil,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
 
@@ -1596,8 +1586,7 @@ extension SwiftNativeMacControl {
                 action: "look",
                 output: .object(output),
                 error: tree.error,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
 
@@ -1611,8 +1600,7 @@ extension SwiftNativeMacControl {
                     "message": .string("scope must be one of: page, chrome, both"),
                 ]),
                 error: "unknown_scope",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         let limits = Self.axLimits(from: body)
@@ -1622,7 +1610,7 @@ extension SwiftNativeMacControl {
             if let refusal = continuation.refusal() {
                 return MacControlResult(ok: false, action: "look",
                     output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
-                    durationMs: 0, viaSwift: true)
+                    durationMs: 0)
             }
             anchorPid = continuation.app?.processIdentifier
             anchoredApp = continuation.app
@@ -1681,7 +1669,7 @@ extension SwiftNativeMacControl {
             if MacAXLimits.readDeadline.map({ Date() >= $0 }) == true {
                 output["message"] = .string("partial: budget reached; no readable accessibility content arrived within the read budget.")
                 return MacControlResult(ok: false, action: "look", output: .object(output), error: "time_budget",
-                    durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true)
+                    durationMs: Int(now().timeIntervalSince(started) * 1000))
             }
             if covered {
                 output["message"] = .string(MacScreenLock.reply)
@@ -1712,8 +1700,7 @@ extension SwiftNativeMacControl {
                 action: "look",
                 output: .object(output),
                 error: status,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
 
@@ -1732,21 +1719,21 @@ extension SwiftNativeMacControl {
         let fourVerbs = body["app_map"] == .bool(true) && grade == "look"
         // Authored senses receive the same complete source snapshot. The
         // native screen page is compiled from that read, not a second walk.
-        let material: [String: JSONValue]? = fourVerbs && (seam["chromium_family"] == .bool(true) || body["sense_material"] == .bool(true)) ? {
+        let needsMaterial = fourVerbs && (seam["chromium_family"] == .bool(true) || body["sense_material"] == .bool(true))
+        let accessibility: [String: JSONValue]? = needsMaterial || (fourVerbs && SenseAppReadCapture.current != nil && read.app?.bundleIdentifier != nil) ? {
             let snapshot = read.snapshot
             let valueChars = max(1, snapshot.nodes.reduce(0) { count, node in
                 max(count, max(node.attributes.title?.count ?? 0, node.attributes.value?.count ?? 0))
             })
             let nodes = MacScreenViewTextRedaction.redactedNodesJSON(snapshot.nodes, valueChars: valueChars)
             return [
-                "accessibility": .object([
-                    "nodes": .array(nodes), "count": .int(Int64(nodes.count)),
-                    "truncated": .bool(snapshot.truncated),
-                    "truncation_reasons": .array(snapshot.truncationReasons.map(JSONValue.string)),
-                    "skipped_at_least": .int(Int64(snapshot.skippedAtLeast)),
-                ]),
+                "nodes": .array(nodes), "count": .int(Int64(nodes.count)),
+                "truncated": .bool(snapshot.truncated),
+                "truncation_reasons": .array(snapshot.truncationReasons.map(JSONValue.string)),
+                "skipped_at_least": .int(Int64(snapshot.skippedAtLeast)),
             ]
         }() : nil
+        let material = needsMaterial ? accessibility.map { ["accessibility": JSONValue.object($0)] } : nil
         let windowKind = fourVerbs
             ? MacAppMaps.windowKind(role: read.windowIdentity?.role, subrole: read.windowIdentity?.subrole)
             : nil
@@ -1756,22 +1743,21 @@ extension SwiftNativeMacControl {
         // this frame_id" means the handles in THIS payload. A glance shows no
         // rows, so it mints every affordance and says how many are addressable.
         let capturedAt = now()
-        let frameId = UUID().uuidString
-        if fourVerbs, let capture = SenseAppReadCapture.current, let bundle = read.app?.bundleIdentifier {
-            let snapshot = read.snapshot
-            let valueChars = max(1, snapshot.nodes.reduce(0) { max($0, max($1.attributes.title?.count ?? 0, $1.attributes.value?.count ?? 0)) })
-            var tree: [String: JSONValue] = [
-                "nodes": .array(MacScreenViewTextRedaction.redactedNodesJSON(snapshot.nodes, valueChars: valueChars)),
-                "count": .int(Int64(snapshot.nodes.count)), "truncated": .bool(snapshot.truncated),
-                "truncation_reasons": .array(snapshot.truncationReasons.map(JSONValue.string)),
-                "skipped_at_least": .int(Int64(snapshot.skippedAtLeast)),
-                "seam": .object(seam), "frame_id": .string(frameId), "app_bundle_id": .string(bundle),
-                "affordances": .array(percept.affordances.map { $0.toJSON() })
-            ]
+        let frameId = MacSightCaptureBinding.current?.frameID ?? UUID().uuidString
+        OwnedProgramRunner.ReadContent.current?.record(.string(frameId), content: .string("<frame>"))
+        OwnedProgramRunner.ReadContent.current?.depend(on: .object([
+            "app": read.app?.toJSON() ?? .null, "window": read.windowIdentity?.toJSON() ?? .null,
+        ]))
+        if fourVerbs, let capture = SenseAppReadCapture.current, let bundle = read.app?.bundleIdentifier, var tree = accessibility {
+            tree["seam"] = .object(seam)
+            tree["frame_id"] = .string(frameId)
+            tree["app_bundle_id"] = .string(bundle)
+            tree["affordances"] = .array(percept.affordances.map { $0.toJSON() })
             tree["window_identity"] = read.windowIdentity?.toJSON()
             tree["renderer_wait_note"] = seam["renderer_wait_note"]
             capture.record(bundleID: bundle, tree: .object(tree))
         }
+        let nativePage: NativePage?
         let nativePageJSON: JSONValue?
         let nativePageBlocks: JSONValue?
         do {
@@ -1779,24 +1765,28 @@ extension SwiftNativeMacControl {
                 let compilation = try MacScreenPageCompiler.compile(snapshot: read.snapshot, percept: percept, frameID: frameId,
                     isFront: anchoredApp.map { accessibilitySource.frontmostApp()?.processIdentifier == $0.processIdentifier } ?? true,
                     settableAttributes: { node in node.element.map { accessibilitySource.settableAttributes(of: $0) } ?? [] })
+                nativePage = compilation.page
                 nativePageJSON = try JSONValue.parse(JSONEncoder().encode(compilation.page))
                 nativePageBlocks = compilation.blocks
-            } else { nativePageJSON = nil; nativePageBlocks = nil }
+            } else { nativePage = nil; nativePageJSON = nil; nativePageBlocks = nil }
         } catch {
             return MacControlResult(ok: false, action: "look",
                 output: .object(["message": .string("The native screen page could not be compiled: \(error.localizedDescription)")]),
-                error: "screen_page_unavailable", durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true)
+                error: "screen_page_unavailable", durationMs: Int(now().timeIntervalSince(started) * 1000))
         }
 
+        let captureStamp = JSONValue.string(ISO8601DateFormatter().string(from: capturedAt))
         /// Everything except the byte accounting, so the S5 loop below can
         /// serialize the COMPLETE object — envelope, `how_to_read` and all —
         /// rather than a percept plus a guessed reserve.
         func envelopeJSON(_ rendering: MacLookPercept.LookRendering?) -> [String: JSONValue] {
+            OwnedProgramRunner.ReadContent.current?.record(.object(["frame_id": .string(frameId), "captured_at": captureStamp]),
+                content: .object(["frame_id": .string(frameId)]))
             var output: [String: JSONValue] = [
                 "trusted": .bool(true),
                 "grade": .string(grade),
                 "frame_id": .string(frameId),
-                "captured_at": .string(ISO8601DateFormatter().string(from: capturedAt)),
+                "captured_at": captureStamp,
                 "frame_ttl_seconds": .int(Int64(MacLookFrameStore.ttlSeconds)),
                 "seam": .object(seam),
                 // fable51 item 32a — WHOSE window this is, and whether it is in
@@ -1968,7 +1958,7 @@ extension SwiftNativeMacControl {
             output: .object(output),
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            nativePage: nativePage
         )
     }
 
@@ -2017,8 +2007,7 @@ extension SwiftNativeMacControl {
                     "error": .string("no_frontmost_window"),
                 ]),
                 error: "no_frontmost_window",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         let matches = MacAccessibilityReader.find(
@@ -2056,8 +2045,7 @@ extension SwiftNativeMacControl {
             action: "ax_find",
             output: .object(output),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -2094,7 +2082,7 @@ extension SwiftNativeMacControl {
                 return MacControlResult(ok: false, action: "view", output: .object([
                     "error": .string(code),
                     "message": .string(MacBackgroundSight.words(for: resolution, requested: requested) ?? code),
-                ]), error: code, durationMs: 0, viaSwift: true)
+                ]), error: code, durationMs: 0)
             }
             anchorPid = app.processIdentifier
         }
@@ -2106,7 +2094,7 @@ extension SwiftNativeMacControl {
                     "view_note": .string("This screen request was cancelled; no new view was published."),
                 ]),
                 error: "view_capture_cancelled",
-                durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         guard !Task.isCancelled else { return cancelledResult() }
@@ -2144,6 +2132,7 @@ extension SwiftNativeMacControl {
         // 1. Where to look. The window rect comes from AX (the root node's own
         //    frame), so the capture is exactly the window — not a guessed crop.
         let axSnapshotStartedNs = DispatchTime.now().uptimeNanoseconds
+        let binding = MacSightCaptureBinding.current
         var windowRect: MacAXFrame?
         var app: MacAXAppInfo?
         var windowTitle: String?
@@ -2173,15 +2162,14 @@ extension SwiftNativeMacControl {
             return MacControlResult(ok: false, action: "view", output: .object([
                 "error": .string("named_window_unavailable"),
                 "message": .string("The named app has no readable window frame; no desktop image was substituted."),
-            ]), error: "named_window_unavailable", durationMs: 0, viaSwift: true)
+            ]), error: "named_window_unavailable", durationMs: 0)
         }
-        let binding = MacSightCaptureBinding.current
         func discardUnboundCapture() async -> MacControlResult {
             _ = await cancelCapture()
             return MacControlResult(ok: false, action: "view", output: .object([
                 "view": .null, "image": .null, "view_current": .bool(false),
                 "message": .string("The observed window or look generation changed; the pixel supplement was discarded."),
-            ]), error: "observation_changed", durationMs: 0, viaSwift: true)
+            ]), error: "observation_changed", durationMs: 0)
         }
         if let binding {
             guard let expected = await lookFrameStore.frame(frameId: binding.frameID),
@@ -2504,8 +2492,7 @@ extension SwiftNativeMacControl {
             action: "view",
             output: .object(output),
             error: ok ? nil : (viewCurrent ? "no_perception_available" : "view_capture_superseded"),
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -2532,7 +2519,6 @@ extension SwiftNativeMacControl {
                 output: .object(output),
                 error: error,
                 durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true,
                 httpStatus: status
             )
         }
@@ -2653,7 +2639,6 @@ extension SwiftNativeMacControl {
                 output: view.output,
                 error: view.error ?? "attention_view_unavailable",
                 durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true,
                 httpStatus: view.httpStatus
             )
         }
@@ -2685,7 +2670,6 @@ extension SwiftNativeMacControl {
             output: .object(output),
             error: view.error,
             durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true,
             httpStatus: view.httpStatus
         )
     }

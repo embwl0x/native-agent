@@ -108,54 +108,6 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
     }
 }
 
-/// Fifteen per-activity rows were fifteen decisions nobody made. The page offers
-/// three and only three: the surfaces a person talks to, the working lanes, and
-/// the memory/mind lanes. Storage stays per surface, but the group is the
-/// ROUTING answer (User, 2026-09-13): a member with no pick of its own resolves to
-/// its group's choice, so one row is one honest choice. Every routed surface is
-/// claimed by one of the three — `ProviderSurfaceGroups.membershipMismatch()`
-/// fails loudly at startup if a new one is ever added without deciding where it
-/// belongs.
-struct ProviderSettingsSurfaceGroup: Identifiable, Equatable, Sendable {
-    let id: String
-    let title: String
-    let surfaces: [String]
-
-    /// Membership is NOT declared here. User, 2026-09-13: the grouping is the
-    /// routing rule, so the router and this page read one table —
-    /// `ProviderSurfaceGroups` in ProviderRouting. A member with no pick of its
-    /// own resolves to its group's choice there, which is why a row can be one
-    /// honest choice.
-    init(id: String, title: String, surfaces: [String]) {
-        self.id = id
-        self.title = title
-        self.surfaces = surfaces
-    }
-
-    init(_ group: ProviderSurfaceGroup) {
-        self.init(id: group.id, title: group.title, surfaces: group.surfaces)
-    }
-
-    static let chat = ProviderSettingsSurfaceGroup(ProviderSurfaceGroups.chat)
-    static let work = ProviderSettingsSurfaceGroup(ProviderSurfaceGroups.work)
-    static let mind = ProviderSettingsSurfaceGroup(ProviderSurfaceGroups.mind)
-    static let known: [ProviderSettingsSurfaceGroup] =
-        ProviderSurfaceGroups.all.map(ProviderSettingsSurfaceGroup.init)
-
-    /// The rows to render: exactly the three groups, each narrowed to the
-    /// surfaces actually mounted. User, 2026-09-13: the page keeps three choices
-    /// and nothing else — there is no per-surface row for anything a group does
-    /// not claim, because `ProviderSurfaceGroups.membershipMismatch()` makes it
-    /// impossible for a routed surface to be unclaimed.
-    static func rows(visible: [String]) -> [ProviderSettingsSurfaceGroup] {
-        known.compactMap { group -> ProviderSettingsSurfaceGroup? in
-            let members = group.surfaces.filter(visible.contains)
-            guard !members.isEmpty else { return nil }
-            return ProviderSettingsSurfaceGroup(id: group.id, title: group.title, surfaces: members)
-        }
-    }
-}
-
 // MARK: - Main View
 
 struct ProviderSettingsView: View {
@@ -182,21 +134,14 @@ struct ProviderSettingsView: View {
         ProviderCard(content: content)
     }
 
-    private var surfaceGroups: [ProviderSettingsSurfaceGroup] {
-        ProviderSettingsSurfaceGroup.rows(visible: surfaces)
+    private var surfaceGroups: [ProviderSurfaceGroup] {
+        ProviderSurfaceGroups.rows(visible: surfaces)
     }
 
     /// What one surface currently routes to. Equality across a group's
     /// surfaces is what makes the group's row a single honest choice.
-    private struct SurfaceSelection: Hashable {
-        let provider: String
-        let model: String
-        let reasoningEffort: String
-        let fastMode: Bool
-    }
-
-    private func selection(of surface: String) -> SurfaceSelection {
-        SurfaceSelection(
+    private func selection(of surface: String) -> ProvidersFacade.SurfaceSelection {
+        ProvidersFacade.SurfaceSelection(
             provider: activeSurface[surface] ?? "codex",
             model: surfaceModel[surface] ?? "",
             reasoningEffort: surfaceReasoningEffort[surface] ?? "",
@@ -204,43 +149,14 @@ struct ProviderSettingsView: View {
         )
     }
 
-    /// The surface a group's row reads from: the most common choice among its
-    /// surfaces, ties going to the group's first surface — so the Chat group
-    /// keeps speaking for `chat`.
-    private func leadSurface(_ group: ProviderSettingsSurfaceGroup) -> String {
-        // Chat is the root the others inherit from, so its group always shows Chat's own choice.
-        if group.surfaces.contains("chat") { return "chat" }
-        guard var lead = group.surfaces.first else { return "chat" }
-        var counts: [SurfaceSelection: Int] = [:]
-        for surface in group.surfaces { counts[selection(of: surface), default: 0] += 1 }
-        var best = counts[selection(of: lead)] ?? 0
-        for surface in group.surfaces.dropFirst() {
-            let count = counts[selection(of: surface)] ?? 0
-            if count > best { best = count; lead = surface }
-        }
-        return lead
-    }
-
-    /// A group whose surfaces are all inheriting is not mixed even when their
-    /// unpinned seeds differ (dream and REM seed cheaper than chat by design).
-    /// Mixed means somebody's saved choice put the group's surfaces at odds.
-    private func groupIsMixed(_ group: ProviderSettingsSurfaceGroup) -> Bool {
-        guard groupHasOverride(group), let first = group.surfaces.first.map(selection(of:)) else {
-            return false
-        }
-        return group.surfaces.dropFirst().contains { selection(of: $0) != first }
-    }
-
-    /// Whether the group holds a saved choice that "Use Chat's choice" would clear.
-    /// `chat` is the root everything else inherits from and never clears.
-    private func groupHasOverride(_ group: ProviderSettingsSurfaceGroup) -> Bool {
-        group.surfaces.contains { $0 != "chat" && explicitSurfaces.contains($0) }
+    private var surfaceSelections: [String: ProvidersFacade.SurfaceSelection] {
+        Dictionary(uniqueKeysWithValues: surfaces.map { ($0, selection(of: $0)) })
     }
 
     private var exceptionSummary: String {
         let chatChoice = selection(of: "chat")
         let different = surfaceGroups.filter { group in
-            group.id != ProviderSettingsSurfaceGroup.chat.id
+            group.id != ProviderSurfaceGroups.chat.id
                 && group.surfaces.contains { selection(of: $0) != chatChoice }
         }
         guard !different.isEmpty else { return "All activities match Chat" }
@@ -254,10 +170,10 @@ struct ProviderSettingsView: View {
     /// survives only as an honest label for the impossible case where an
     /// unpinned group somehow disagrees with Chat, rather than showing a
     /// comforting "Same as Chat" over a route that is not Chat's.
-    private func selectionOrigin(_ group: ProviderSettingsSurfaceGroup) -> String {
+    private func selectionOrigin(_ group: ProviderSurfaceGroup) -> String {
         if overrideReadFailed { return "Saved choice source unavailable" }
         if group.surfaces.contains(where: { explicitSurfaces.contains($0) }) { return "Custom choice" }
-        if group.id == ProviderSettingsSurfaceGroup.chat.id { return "Chat's own route" }
+        if group.id == ProviderSurfaceGroups.chat.id { return "Chat's own route" }
         let chat = selection(of: "chat")
         return group.surfaces.allSatisfy { selection(of: $0) == chat } ? "Same as Chat" : "Built-in default"
     }
@@ -290,17 +206,17 @@ struct ProviderSettingsView: View {
     /// Why this group has no model, when a saved pick is the reason: the model
     /// is gone from the catalogs, or the route it sits on does not serve it.
     /// Nothing is substituted for it, so the row has to say so.
-    private func retiredPickNotice(_ group: ProviderSettingsSurfaceGroup) -> String? {
+    private func retiredPickNotice(_ group: ProviderSurfaceGroup) -> String? {
         for surface in group.surfaces {
             if let problem = unusablePicks[surface] { return problem }
         }
         return nil
     }
 
-    private func membershipCaption(_ group: ProviderSettingsSurfaceGroup, mixed: Bool) -> String {
+    private func membershipCaption(_ group: ProviderSurfaceGroup, mixed: Bool) -> String {
         let all = Self.listPhrase(surfaceNames(group.surfaces))
         guard mixed else { return all }
-        let lead = leadSurface(group)
+        let lead = ProvidersFacade.leadSurface(group, selections: surfaceSelections)
         let leadChoice = selection(of: lead)
         let differing = group.surfaces.filter { selection(of: $0) != leadChoice }
         let leadName = ProviderSettingsSurfaceLabel.presentation(for: lead).text
@@ -354,90 +270,10 @@ struct ProviderSettingsView: View {
     // a repair state instead of quietly leaving it unpinnable.
     private var surfaces: [String] { rowSet.visibleSurfaces }
 
-    private struct SurfaceModelChoice: Identifiable, Hashable {
-        let id: String
-        let name: String
-        let defaultReasoningEffort: String
-        let supportedReasoningEfforts: [String]
-        let supportsFast: Bool
-        let isUnavailable: Bool
-    }
-
-    private struct SurfaceBrainSelection {
-        let model: String
-        let reasoningEffort: String
-        let fastMode: Bool
-    }
-
-    private func modelsForProvider(_ providerId: String) -> [SurfaceModelChoice] {
-        // S12a: a fetched catalog that could not load is empty and says why
-        // (`models_note`); it never borrows the provider-neutral list below.
-        if let prov = providers.first(where: { $0.provider_id == providerId }),
-           !prov.models.isEmpty || Self.dynamicCatalogProviders.contains(providerId) {
-            return prov.models.map {
-                SurfaceModelChoice(
-                    id: $0.id,
-                    name: $0.name,
-                    defaultReasoningEffort: $0.default_reasoning_effort ?? "high",
-                    supportedReasoningEfforts: $0.supported_reasoning_efforts
-                        ?? Self.fallbackReasoningEfforts,
-                    supportsFast: $0.supports_fast == true,
-                    isUnavailable: false
-                )
-            }
-        }
-        return catalogModels.map {
-            SurfaceModelChoice(
-                id: $0.id,
-                name: $0.displayName,
-                defaultReasoningEffort: $0.defaultReasoningEffort ?? "high",
-                supportedReasoningEfforts: $0.supportedReasoningEfforts
-                    ?? Self.fallbackReasoningEfforts,
-                supportsFast: $0.supportsFast == true,
-                isUnavailable: false
-            )
-        }
-    }
-
-    /// Providers whose catalogue is fetched rather than compiled in. Their
-    /// `models` list can be empty or last-known when no live catalogue could
-    /// be loaded, so its silence about a model is not evidence of anything.
-    private static let dynamicCatalogProviders: Set<String> = ["openrouter", "moonshot"]
-
-    /// Whether a LIVE catalogue for this provider says the saved model is gone.
-    ///
-    /// 2026-09-06: the old test was "the choice list is non-empty", and
-    /// `modelsForProvider` substitutes the provider-neutral global catalogue
-    /// whenever a provider's own list is empty — so a dynamic provider with no
-    /// catalogue yet borrowed someone else's list and the saved model was
-    /// labelled Unavailable on it. Evidence now has to come from the provider
-    /// itself: OpenRouter's own live-backed cache (`.unknown` until one exists),
-    /// or a static provider's compiled-in list, which is the whole truth about
-    /// that provider. Moonshot has no live/fallback discriminator, so it never
-    /// convicts. Anything unproven shows the saved model plainly.
-    private func savedModelIsKnownAbsent(providerId: String, model: String) -> Bool {
-        if providerId == "openrouter" {
-            // User, 2026-09-06: this read the DEFAULT data root while the rest
-            // of the screen works off the model's scoped one, so under an
-            // override the verdict came from a catalog belonging to another
-            // root — including the "Unavailable" label on a saved model.
-            return OpenRouterModelCatalog.cachedAvailability(
-                of: model,
-                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            ) == .unavailable
-        }
-        guard !Self.dynamicCatalogProviders.contains(providerId) else { return false }
-        guard let provider = providers.first(where: { $0.provider_id == providerId }),
-              !provider.models.isEmpty else {
-            return false
-        }
-        return !provider.models.contains(where: { $0.id == model })
-    }
-
     /// Models offered for a surface, scoped to the provider selected for it.
-    private func modelsForSurface(_ surface: String) -> [SurfaceModelChoice] {
+    private func modelsForSurface(_ surface: String) -> [ProvidersFacade.SurfaceModelChoice] {
         let pid = activeSurface[surface] ?? "codex"
-        var choices = modelsForProvider(pid)
+        var choices = ProvidersFacade.modelsForProvider(pid, providers: providers, catalogModels: catalogModels)
         let current = surfaceModel[surface] ?? ""
         // 2026-09-06: this used to be an OpenRouter-only repair, so every other
         // provider whose catalogue did not list the SAVED model rendered the
@@ -446,8 +282,9 @@ struct ProviderSettingsView: View {
         // selection is always shown; it is only CALLED unavailable on the
         // evidence of a live catalogue for that provider.
         if !current.isEmpty, !choices.contains(where: { $0.id == current }) {
-            let unavailable = savedModelIsKnownAbsent(providerId: pid, model: current)
-            choices.insert(SurfaceModelChoice(
+            let unavailable = ProvidersFacade.savedModelIsKnownAbsent(providerId: pid, model: current, providers: providers,
+                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            choices.insert(ProvidersFacade.SurfaceModelChoice(
                 id: current,
                 name: unavailable ? "\(current) — Unavailable" : current,
                 defaultReasoningEffort: surfaceReasoningEffort[surface] ?? "high",
@@ -459,26 +296,7 @@ struct ProviderSettingsView: View {
         return choices
     }
 
-    private func reconciledBrainForProvider(surface: String, providerId: String) -> SurfaceBrainSelection? {
-        let choices = modelsForProvider(providerId)
-        guard let first = choices.first else { return nil }
-        let current = surfaceModel[surface] ?? ""
-        let choice = choices.first(where: { $0.id == current }) ?? first
-        let defaultEffort = choice.supportedReasoningEfforts.contains(choice.defaultReasoningEffort)
-            ? choice.defaultReasoningEffort
-            : (choice.supportedReasoningEfforts.first ?? "high")
-        let currentEffort = surfaceReasoningEffort[surface] ?? defaultEffort
-        let effort = choice.supportedReasoningEfforts.contains(currentEffort)
-            ? currentEffort
-            : defaultEffort
-        return SurfaceBrainSelection(
-            model: choice.id,
-            reasoningEffort: effort,
-            fastMode: choice.supportsFast && (surfaceFastMode[surface] ?? false)
-        )
-    }
-
-    private func selectedModelChoice(for surface: String) -> SurfaceModelChoice? {
+    private func selectedModelChoice(for surface: String) -> ProvidersFacade.SurfaceModelChoice? {
         let choices = modelsForSurface(surface)
         let model = surfaceModel[surface] ?? ""
         return choices.first(where: { $0.id == model }) ?? choices.first
@@ -496,12 +314,7 @@ struct ProviderSettingsView: View {
     /// Provider options for the picker. Ready providers are selectable, and
     /// currently pinned providers stay visible even if auth needs repair.
     private var pickerProviders: [ProviderInfo] {
-        let activeIds = Set(activeSurface.values)
-        return providers.filter {
-            $0.provider_id == "codex"
-            || $0.auth_status.state == "ready"
-            || activeIds.contains($0.provider_id)
-        }
+        ProvidersFacade.pickerProviders(providers, activeProviders: activeSurface)
     }
 
     var body: some View {
@@ -784,7 +597,7 @@ struct ProviderSettingsView: View {
                             }
                         } else {
                             AliveGroupCard {
-                                ForEach(surfaceGroups.filter { $0.id == ProviderSettingsSurfaceGroup.chat.id }) { group in
+                                ForEach(surfaceGroups.filter { $0.id == ProviderSurfaceGroups.chat.id }) { group in
                                     groupRow(group)
                                 }
                             }
@@ -798,7 +611,7 @@ struct ProviderSettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                         // Every other surface in ONE card, hairlines between.
                         AliveGroupCard {
-                            ForEach(surfaceGroups.filter { $0.id != ProviderSettingsSurfaceGroup.chat.id }) { group in
+                            ForEach(surfaceGroups.filter { $0.id != ProviderSurfaceGroups.chat.id }) { group in
                                 groupRow(group)
                             }
                         }
@@ -815,16 +628,16 @@ struct ProviderSettingsView: View {
     /// thinks, and whether it runs on the priority tier. Every control writes
     /// the same choice to each surface the group covers.
     @ViewBuilder
-    private func groupRow(_ group: ProviderSettingsSurfaceGroup) -> some View {
-        let lead = leadSurface(group)
-        let isChatGroup = group.id == ProviderSettingsSurfaceGroup.chat.id
-        let mixed = groupIsMixed(group)
+    private func groupRow(_ group: ProviderSurfaceGroup) -> some View {
+        let lead = ProvidersFacade.leadSurface(group, selections: surfaceSelections)
+        let isChatGroup = group.id == ProviderSurfaceGroups.chat.id
+        let mixed = ProvidersFacade.groupIsMixed(group, selections: surfaceSelections, explicitSurfaces: explicitSurfaces)
         let saving = savingGroups.contains(group.id)
         let surfModels = modelsForSurface(lead)
         let selectedChoice = selectedModelChoice(for: lead)
         let supportedEfforts = selectedChoice?.supportedReasoningEfforts
             ?? Self.fallbackReasoningEfforts
-        let clearable = groupHasOverride(group)
+        let clearable = ProvidersFacade.groupHasOverride(group, explicitSurfaces: explicitSurfaces)
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(group.title)
@@ -983,7 +796,7 @@ struct ProviderSettingsView: View {
 
     /// Restore inheritance from Chat for every surface in the group. `chat`
     /// itself is the root the others inherit from, so it is never cleared.
-    private func clearGroupOverride(_ group: ProviderSettingsSurfaceGroup) async {
+    private func clearGroupOverride(_ group: ProviderSurfaceGroup) async {
         guard !isLoading, !savingGroups.contains(group.id) else { return }
         savingGroups.insert(group.id)
         defer { savingGroups.remove(group.id) }
@@ -1027,9 +840,8 @@ struct ProviderSettingsView: View {
         let savingSurfaces = Set(
             surfaceGroups.filter { groupSaveTokens[$0.id] != nil }.flatMap(\.surfaces)
         )
-        switch await ProviderSettingsRefreshAction.perform(
-            appModel: appModel,
-            refreshCatalog: refreshCatalog
+        switch await appModel.engine.providers.refreshSettings(
+            refreshCatalog: refreshCatalog, cause: UserFacingError.cause
         ) {
         case let .loaded(snapshot):
             do {
@@ -1042,18 +854,7 @@ struct ProviderSettingsView: View {
                 // nothing. A surface is explicit when it holds a pin the resolver
                 // honoured, or when what it actually resolves to differs from
                 // Chat's resolved answer.
-                let chatPreference = routing.preferences["chat"]
-                let chatProvider = routing.activeProviders["chat"]
-                func resolvedDiffersFromChat(_ surface: String) -> Bool {
-                    let mine = routing.preferences[surface]
-                    let myProvider = routing.activeProviders[surface] ?? chatProvider
-                    return mine?.model != chatPreference?.model
-                        || mine?.reasoningEffort != chatPreference?.reasoningEffort
-                        || mine?.serviceTier != chatPreference?.serviceTier
-                        || myProvider != chatProvider
-                }
-                explicitSurfaces = Set(routing.pinnedModels.keys)
-                    .union(MODEL_SURFACES.filter { $0 != "chat" && resolvedDiffersFromChat($0) })
+                explicitSurfaces = ProvidersFacade.explicitSurfaces(in: routing)
                 unusablePicks = routing.unusablePicks
                 overrideReadFailed = false
             }
@@ -1089,10 +890,9 @@ struct ProviderSettingsView: View {
                     surfaceFastMode[surface] = preference.serviceTier == "priority"
                 } else if let choice = modelsForSurface(surface).first {
                     surfaceModel[surface] = choice.id
-                    surfaceReasoningEffort[surface] = choice.supportedReasoningEfforts
-                        .contains(choice.defaultReasoningEffort)
-                        ? choice.defaultReasoningEffort
-                        : (choice.supportedReasoningEfforts.first ?? "high")
+                    surfaceReasoningEffort[surface] = normalizedReasoningEffort(
+                        options: choice.supportedReasoningEfforts, preferred: choice.defaultReasoningEffort, selected: choice.defaultReasoningEffort
+                    )
                     surfaceFastMode[surface] = false
                 }
             }
@@ -1139,18 +939,22 @@ struct ProviderSettingsView: View {
     }
 
     private func requestSetGroupProvider(
-        group: ProviderSettingsSurfaceGroup,
+        group: ProviderSurfaceGroup,
         lead: String,
         providerId: String
     ) {
-        let brain = reconciledBrainForProvider(surface: lead, providerId: providerId)
+        let brain = ProvidersFacade.reconciledBrainForProvider(
+            providerId: providerId, model: surfaceModel[lead] ?? "",
+            reasoningEffort: surfaceReasoningEffort[lead], fastMode: surfaceFastMode[lead] ?? false,
+            providers: providers, catalogModels: catalogModels
+        )
         requestSetGroupSelection(
             group: group,
-            target: SurfaceSelection(
+            target: ProvidersFacade.SurfaceSelection(
                 provider: providerId,
                 model: brain?.model ?? "",
                 reasoningEffort: brain?.reasoningEffort ?? "high",
-                fastMode: brain?.fastMode ?? false
+                fastMode: brain?.fast ?? false
             ),
             // No model list for this account yet: pin the account only, the way
             // the single-surface row did, instead of failing the whole save.
@@ -1159,20 +963,17 @@ struct ProviderSettingsView: View {
     }
 
     private func requestSetGroupModel(
-        group: ProviderSettingsSurfaceGroup,
+        group: ProviderSurfaceGroup,
         lead: String,
         model: String
     ) {
-        guard !model.isEmpty, surfaceModel[lead] != model || groupIsMixed(group) else { return }
+        guard !model.isEmpty, surfaceModel[lead] != model || ProvidersFacade.groupIsMixed(group, selections: surfaceSelections, explicitSurfaces: explicitSurfaces) else { return }
         guard let choice = modelsForSurface(lead).first(where: { $0.id == model }) else { return }
-        let defaultEffort = choice.supportedReasoningEfforts.contains(choice.defaultReasoningEffort)
-            ? choice.defaultReasoningEffort
-            : (choice.supportedReasoningEfforts.first ?? "high")
-        let currentEffort = surfaceReasoningEffort[lead] ?? defaultEffort
-        let nextEffort = choice.supportedReasoningEfforts.contains(currentEffort)
-            ? currentEffort
-            : defaultEffort
-        requestSetGroupSelection(group: group, target: SurfaceSelection(
+        let nextEffort = normalizedReasoningEffort(
+            options: choice.supportedReasoningEfforts, preferred: choice.defaultReasoningEffort,
+            selected: surfaceReasoningEffort[lead] ?? choice.defaultReasoningEffort
+        )
+        requestSetGroupSelection(group: group, target: ProvidersFacade.SurfaceSelection(
             provider: activeSurface[lead] ?? "codex",
             model: model,
             reasoningEffort: nextEffort,
@@ -1181,15 +982,15 @@ struct ProviderSettingsView: View {
     }
 
     private func requestSetGroupReasoning(
-        group: ProviderSettingsSurfaceGroup,
+        group: ProviderSurfaceGroup,
         lead: String,
         effort: String
     ) {
-        guard surfaceReasoningEffort[lead] != effort || groupIsMixed(group) else { return }
+        guard surfaceReasoningEffort[lead] != effort || ProvidersFacade.groupIsMixed(group, selections: surfaceSelections, explicitSurfaces: explicitSurfaces) else { return }
         guard selectedModelChoice(for: lead)?.supportedReasoningEfforts.contains(effort) == true else {
             return
         }
-        requestSetGroupSelection(group: group, target: SurfaceSelection(
+        requestSetGroupSelection(group: group, target: ProvidersFacade.SurfaceSelection(
             provider: activeSurface[lead] ?? "codex",
             model: surfaceModel[lead] ?? "",
             reasoningEffort: effort,
@@ -1198,13 +999,13 @@ struct ProviderSettingsView: View {
     }
 
     private func requestSetGroupFastMode(
-        group: ProviderSettingsSurfaceGroup,
+        group: ProviderSurfaceGroup,
         lead: String,
         enabled: Bool
     ) {
-        guard surfaceFastMode[lead] != enabled || groupIsMixed(group) else { return }
+        guard surfaceFastMode[lead] != enabled || ProvidersFacade.groupIsMixed(group, selections: surfaceSelections, explicitSurfaces: explicitSurfaces) else { return }
         guard selectedModelChoice(for: lead)?.supportsFast == true else { return }
-        requestSetGroupSelection(group: group, target: SurfaceSelection(
+        requestSetGroupSelection(group: group, target: ProvidersFacade.SurfaceSelection(
             provider: activeSurface[lead] ?? "codex",
             model: surfaceModel[lead] ?? "",
             reasoningEffort: surfaceReasoningEffort[lead] ?? "high",
@@ -1215,8 +1016,8 @@ struct ProviderSettingsView: View {
     /// One choice, written to every surface the group covers. The optimistic
     /// local state moves first; ProviderRouting commits all members together.
     private func requestSetGroupSelection(
-        group: ProviderSettingsSurfaceGroup,
-        target: SurfaceSelection,
+        group: ProviderSurfaceGroup,
+        target: ProvidersFacade.SurfaceSelection,
         providerOnly: Bool = false
     ) {
         let previous = Dictionary(uniqueKeysWithValues: group.surfaces.map { ($0, selection(of: $0)) })
@@ -1245,10 +1046,10 @@ struct ProviderSettingsView: View {
     }
 
     private func saveGroupSelection(
-        group: ProviderSettingsSurfaceGroup,
-        target: SurfaceSelection,
+        group: ProviderSurfaceGroup,
+        target: ProvidersFacade.SurfaceSelection,
         providerOnly: Bool,
-        previous: [String: SurfaceSelection],
+        previous: [String: ProvidersFacade.SurfaceSelection],
         token: UUID
     ) async {
         guard groupSaveTokens[group.id] == token else { return }
@@ -1268,7 +1069,7 @@ struct ProviderSettingsView: View {
         // every member is written with the group's choice, so nothing is left
         // behind to diverge. Say so once when there was something to clear.
         let clearedLegacyPicks = group.surfaces.contains { surface in
-            surface != leadSurface(group)
+            surface != ProvidersFacade.leadSurface(group, selections: surfaceSelections)
                 && !(surfaceModel[surface] ?? "").isEmpty
                 && surfaceModel[surface] != target.model
         }
@@ -1321,7 +1122,7 @@ struct ProviderSettingsView: View {
         }
     }
 
-    private func finishGroupSave(_ group: ProviderSettingsSurfaceGroup) {
+    private func finishGroupSave(_ group: ProviderSurfaceGroup) {
         savingGroups.remove(group.id)
         groupSaveTokens.removeValue(forKey: group.id)
         groupSaveTasks.removeValue(forKey: group.id)
@@ -1334,4 +1135,113 @@ struct ProviderSettingsView: View {
         f.timeStyle = .medium
         return f.string(from: Date())
     }
+}
+
+/// Maps the Provider Settings operation receipt into one bounded, truthful
+/// status row. The raw operation string remains available to the owner, while
+/// this view contract prevents a failed or repair-required result from taking
+/// on the same neutral appearance as a successful save.
+enum ProviderSettingsStatusTextPresentation {
+    static let maximumVisibleCharacters = 220
+
+    enum Tone: Equatable {
+        case info
+        case progress
+        case success
+        case warning
+        case failure
+    }
+
+    struct State: Equatable {
+        let text: String
+        let tone: Tone
+        let systemImage: String
+        let isTruncated: Bool
+    }
+
+    static func state(for raw: String) -> State? {
+        let normalized = raw
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !normalized.isEmpty else { return nil }
+        let bounded = boundedText(normalized)
+        let lower = normalized.lowercased()
+
+        if lower.contains("failed") || lower.contains("error") || lower.contains("unavailable")
+            || lower.hasPrefix("couldn't") {
+            return State(text: bounded.text, tone: .failure,
+                         systemImage: "exclamationmark.triangle.fill", isTruncated: bounded.isTruncated)
+        }
+        if lower.contains("need repair") || lower.contains("not available") {
+            return State(text: bounded.text, tone: .warning,
+                         systemImage: "exclamationmark.triangle", isTruncated: bounded.isTruncated)
+        }
+        if lower.hasPrefix("saving ") {
+            return State(text: bounded.text, tone: .progress,
+                         systemImage: "hourglass", isTruncated: bounded.isTruncated)
+        }
+        if lower.hasSuffix(" saved") || lower == "credentials removed." {
+            return State(text: bounded.text, tone: .success,
+                         systemImage: "checkmark.circle", isTruncated: bounded.isTruncated)
+        }
+        return State(text: bounded.text, tone: .info,
+                     systemImage: "info.circle", isTruncated: bounded.isTruncated)
+    }
+
+    private static func boundedText(_ text: String) -> (text: String, isTruncated: Bool) {
+        guard text.count > maximumVisibleCharacters else { return (text, false) }
+        return (String(text.prefix(maximumVisibleCharacters)) + "…", true)
+    }
+}
+
+/// Truthful feedback for the Provider Settings shortcut to Telegram. A
+/// navigation request is not evidence that the Telegram UI is already open,
+/// so the copy names the actual coordinator receipt instead.
+enum ProviderTelegramSettingsButtonPresentation: Equatable {
+    case deliveredToMountedScene
+    case queuedForMainScene
+
+    static func presentation(for receipt: NativeAgentNavigationRequestReceipt) -> Self {
+        switch receipt {
+        case .deliveredToMountedScene:
+            .deliveredToMountedScene
+        case .queuedForMainScene:
+            .queuedForMainScene
+        }
+    }
+
+    var statusText: String {
+        switch self {
+        case .deliveredToMountedScene:
+            "Telegram settings request delivered to the main window."
+        case .queuedForMainScene:
+            "Telegram settings will open when the main window is ready."
+        }
+    }
+}
+
+/// The one line under a configured provider's name.
+///
+/// `auth_status.state == "ready"` means "eligible to dispatch", which is NOT
+/// the same claim as "connected". The oauth-direct readers deliberately return
+/// ready for an access token that has already expired as long as a refresh
+/// token is on file — the refresh itself is unproven until a chat uses it. That
+/// detail is already in the row's own model, so the line states it instead of
+/// replacing it with "Connected · account available".
+enum ProviderAccountStateLinePresentation {
+    static func line(state: String, detail: String, failedTest: String? = nil) -> String {
+        guard ProvidersFacade.accountIsReady(state) else { return "Not connected" }
+        if let failedTest { return failedTestLine(failedTest) }
+        // An expired access token with a refresh token on file is normal: it
+        // renews on the next chat. Saying "expired" here sent User to sign in
+        // three times (10-03); a real refresh failure arrives as failedTest.
+        return "Connected · account available"
+    }
+
+    /// A signed-in account whose last test failed (`LLMProviderStatusFeed.failedTest`):
+    /// ready to dispatch is not working. Reconnecting is User's, in Manage.
+    static func failedTestLine(_ failure: String) -> String {
+        failure == "key rejected" ? "Key rejected — reconnect" : "Connected · last test failed: \(failure)"
+    }
+
 }

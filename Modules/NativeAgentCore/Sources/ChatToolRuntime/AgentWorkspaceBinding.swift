@@ -1,11 +1,14 @@
 import AgentWorkspace
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import MacIntegration
 import ToolRegistry
 import TrustCenter
 import XConnector
 import SlackConnector
+import Skills
+import Senses
 
 package enum ChatWorkspaceBinding {
     package static let ports = AgentWorkspacePorts.Binding(conversations: Conversations(), tools: Tools())
@@ -27,6 +30,9 @@ package enum ChatWorkspaceBinding {
     }
 
     private struct Conversations: AgentWorkspaceConversationPort {
+        func liveHealth(dataRoot: URL) -> [String: AgentLocalHealth] {
+            AgentContactHealth.read(dataRoot: dataRoot)
+        }
         func refreshHealth(dataRoot: URL) {
             Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         }
@@ -61,6 +67,59 @@ package enum ChatWorkspaceBinding {
     }
 
     private struct Tools: AgentWorkspaceToolPort {
+        func builtAbilities(dataRoot: URL, now: Date) async -> String {
+            do {
+                async let tools = SwiftNativeToolRegistry(root: dataRoot).listTools(filter: .all)
+                async let senses = FileSenseRegistry(dataRoot: dataRoot).all()
+                let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot)
+                let callable = Set(SwiftToolDispatcher.authoredTools(dataRoot: dataRoot).map { $0.schema.name })
+                let since = now.addingTimeInterval(-7 * 86_400)
+                var names: [(name: String, changed: Date, builtIn: Bool)] = []
+                for tool in try await tools where callable.contains(tool.id) {
+                    names.append((tool.name + " (tool)", CapabilityLifecycle.date(tool.updatedAt ?? tool.createdAt) ?? .distantPast, false))
+                }
+                for skill in skills where skill.isRunnable {
+                    let row = skill.row
+                    let stamp = row["updatedAt"] ?? row["createdAt"]
+                    let changed = if case .string(let text)? = stamp { CapabilityLifecycle.date(text) ?? .distantPast } else { Date.distantPast }
+                    let builtIn = row["overrides"] == .string("built_in") || SkillScript.originKind(row["origin"]) == "pack"
+                    if !builtIn || changed >= since { names.append((skill.name + " (skill)", changed, builtIn)) }
+                }
+                for sense in try await senses where sense.status == .on {
+                    let changed = max(sense.createdAt, sense.enabledAt ?? .distantPast)
+                    if sense.origin == .grown || changed >= since {
+                        names.append((sense.corner.key + " (sense)", changed, sense.origin != .grown))
+                    }
+                }
+                names.sort {
+                    if $0.builtIn != $1.builtIn { return !$0.builtIn }
+                    if $0.changed != $1.changed { return $0.changed > $1.changed }
+                    return $0.name < $1.name
+                }
+                let prefix = "Your live abilities you built or changed in 7d: "
+                let suffix = "; you can reach Mac apps through your tools."
+                var shown: [String] = []
+                for name in names {
+                    let more = names.count - shown.count - 1
+                    let candidate = prefix + (shown + [name.name]).joined(separator: ", ")
+                        + (more > 0 ? ", +\(more) more" : "") + suffix
+                    if candidate.count > 200 { break }
+                    shown.append(name.name)
+                }
+                let more = names.count - shown.count
+                return prefix + (shown.isEmpty && more == 0 ? "none" : shown.joined(separator: ", "))
+                    + (more > 0 ? (shown.isEmpty ? "" : ", ") + "+\(more) more" : "") + suffix
+            } catch {
+                return "Your built abilities are unavailable: " + String(error.localizedDescription.prefix(150))
+            }
+        }
+
+        func usableAgentLanes(dataRoot: URL) -> Set<String> {
+            Set(["codex", "claude", "omp"].filter {
+                SwiftToolDispatcher.builtInAgentLaneUsable($0, dataRoot: dataRoot,
+                    configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot))
+            })
+        }
         func modelVisibleCatalogToolNames(_ names: Set<String>) -> Set<String> {
             SwiftToolDispatcher.modelVisibleCatalogToolNames(names)
         }
@@ -84,17 +143,17 @@ package enum ChatWorkspaceBinding {
                 ("notion", "Notion", ["notion_search", "notion_read_page"])
             ] where !SwiftToolDispatcher.cloudConnectorConnected(id, root: dataRoot) {
                 // Apple Mail already reads Gmail accounts added to Mail; only this API route is off (10-09).
-                let note = id == "gmail" ? "Gmail API connector not signed in (Settings > Connectors); Gmail accounts in Apple Mail are read by mail.* already."
-                    : "The owner must sign in to \(label) in Settings > Connectors."
+                let note = id == "gmail" ? "Gmail API connector not signed in; the owner can request a setup card in chat or open Connectors in Advanced view. Gmail accounts in Apple Mail are read by mail.* already."
+                    : "The owner can sign in to \(label) by requesting a setup card in chat or opening Connectors in Advanced view."
                 for name in names { tools[name] = note }
             }
             if (try? XConnectorActions.credentialStatus(dataRoot: dataRoot))?.configured != true {
                 for name in ["x_status", "x_me", "x_search", "x_timeline", "x_user_tweets"] {
-                    tools[name] = "The owner must sign in to X in Settings > Connectors."
+                    tools[name] = "The owner can sign in to X by requesting a setup card in chat or opening Connectors in Advanced view."
                 }
             }
             if !SlackConnectorActions.canSearch(dataRoot: dataRoot) {
-                tools["slack_search_messages"] = "Slack search needs a user token with search:read. The owner must sign in to Slack in Settings > Connectors."
+                tools["slack_search_messages"] = "Slack search needs a user token with search:read. The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
             }
             return tools
         }

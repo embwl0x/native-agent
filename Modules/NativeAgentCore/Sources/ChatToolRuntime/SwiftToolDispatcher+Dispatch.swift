@@ -141,6 +141,10 @@ public extension ToolDispatchClient {
         let schemas = try await listAvailableToolSchemas()
         let canonical = ToolNameAliases.canonical(tool) { name in schemas.contains { $0.name == name } }
         let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, input))
+        if canonical == "desk_close" {
+            try SwiftToolDispatcher.validateDeskClose(input)
+            return try await body(input)
+        }
         let schema = schemas.first { $0.name == canonical || $0.name.replacingOccurrences(of: ".", with: "_") == canonical }
         let normalized = schema.flatMap { try? JSONValue.parse($0.parametersJSON) }
             .map { ToolArguments.normalized(input, schema: $0, positiveOnly: ToolArguments.positiveOnly[canonical] ?? []) } ?? input
@@ -284,7 +288,7 @@ extension SwiftToolDispatcher {
             if case .object(let fields) = fetched {
                 let text: String = if case .string(let value)? = fields["text"] { value } else { "" }
                 if fields["untrusted_remote_data"] == .bool(true) || !text.isEmpty {
-                    PeerDataTaint.markConsumed(peer: "web content", line: text, attested: false)
+                    PeerDataTaint.markConsumed(peer: "web content", line: text)
                 }
             }
             let observedURL: String = if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"],
@@ -598,7 +602,7 @@ extension SwiftToolDispatcher {
         case "github_set_repo_visibility":
             return try await GitHubConnectorActions.setRepoVisibility(input: input, dataRoot: dataRoot)
         case "slack_status":
-            return try await SlackConnectorActions.status(input: input)
+            return try await SlackConnectorActions.status(input: input, dataRoot: dataRoot)
         case "slack_list_channels":
             return try await SlackConnectorActions.listChannels(input: input)
         case "slack_search_messages":
@@ -1147,7 +1151,7 @@ extension SwiftToolDispatcher {
                     surface: surface
                 )
             }
-            // R9: custom tools promoted into data/tools/registry.json route
+            // Admitted authored ability files route
             // through the sandboxed ToolExecution engine — the same lane
             // WorkflowOrchestration tool_run steps use. runTool enforces
             // active-status, code-fingerprint match, and the subprocess
@@ -1156,7 +1160,7 @@ extension SwiftToolDispatcher {
             // undispatchable (the custom-tool activation gap).
             // Reserved built-in names never reach here (the switch matches
             // them first), so this route only ever executes genuine customs.
-            if readRegistryNames().contains(tool) {
+            if let record = registryToolRecord(tool) {
                 // Review blocker fix: a registry tool executes self-authored
                 // code in a subprocess — shell-class. Same Full-Mac file_ops
                 // gate as shell/bash/builder tools. Capability-ADD with the
@@ -1168,7 +1172,7 @@ extension SwiftToolDispatcher {
                 // Review finding 3 fix: runTool only VERIFIES a fingerprint
                 // when one exists. The chat lane fails closed on unsigned
                 // tools rather than silently weakening the invariant.
-                guard let fingerprint = registryToolFingerprint(tool), !fingerprint.isEmpty else {
+                guard case .string(let fingerprint)? = record["codeFingerprint"], !fingerprint.isEmpty else {
                     return .object([
                         "status": .string("failed"),
                         "effects": .string("none"),
@@ -1294,6 +1298,10 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
 extension SwiftToolDispatcher: PureToolArgumentValidating {
     public func argumentRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
         let tool = CanonicalToolNameDispatcher.canonical(tool)
+        if tool == "desk_close" {
+            do { try Self.validateDeskClose(input) }
+            catch { return ChatToolOutcome.failure(error: error, tool: tool) }
+        }
         if let appTools, executorOwnedToolNames.contains(tool) {
             return await (appTools as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
         }

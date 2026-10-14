@@ -95,6 +95,7 @@ extension ChatStore {
     /// load) is covered without instrumenting each call site. Internal for tests.
 
     func noteMessageArrivals(previous: [ChatMessage], current: [ChatMessage]) {
+        guard !previous.elementsEqual(current, by: { $0.id == $1.id }) else { return }
         let previousIds = Set(previous.map(\.id))
         let currentIds = Set(current.map(\.id))
         let now = Date()
@@ -170,8 +171,6 @@ extension ChatStore {
         return matched
     }
 
-    // Internal (not private) so ChatStoreMergeTests can pin the stale-snapshot
-    // guard semantics directly.
     func mergedMacMessagesPreservingPending(
         _ macMessages: [ChatMessage]
     ) -> [ChatMessage] {
@@ -196,6 +195,13 @@ extension ChatStore {
         // snapshot. Positional matching also stops a repeated short reply ("ok")
         // from binding to the wrong snapshot row.
         var merged: [ChatMessage] = []
+        var mergedIDs = Set<UUID>()
+        var macIndices: [UUID: [Int]] = [:]
+        for index in macMessages.indices { macIndices[macMessages[index].id, default: []].append(index) }
+        func append(_ row: ChatMessage) {
+            merged.append(row)
+            mergedIDs.insert(row.id)
+        }
         var cursor = macMessages.startIndex
         // Snapshot rows flushed past without matching a local message. A later
         // local twin of one of these (order inversion) must CONSUME it rather
@@ -203,6 +209,7 @@ extension ChatStore {
         // recent local ("ok" twice) is still preserved, because the first
         // occurrence already consumed the only snapshot twin.
         var unconsumedFlushedIds = Set<UUID>()
+        var flushedIndices: [Int] = []
         for local in messages {
             if local.isStreaming { continue }                  // pending machinery owns these
             if pendingPlaceholderIds.contains(local.id) { continue }
@@ -213,36 +220,39 @@ extension ChatStore {
             func matches(_ row: ChatMessage) -> Bool {
                 paged ? row.id == local.id : snapshotMessageMatches(row, local: local)
             }
-            if let j = macMessages[cursor...].firstIndex(where: matches) {
+            let matchIndex = paged ? macIndices[local.id]?.first(where: { $0 >= cursor })
+                : macMessages[cursor...].firstIndex(where: matches)
+            if let j = matchIndex {
                 for flushed in macMessages[cursor..<j] {
-                    merged.append(flushed)
+                    flushedIndices.append(merged.endIndex)
+                    append(flushed)
                     unconsumedFlushedIds.insert(flushed.id)
                 }
-                merged.append(preservingLocalDetails(local, in: macMessages[j]))
+                append(preservingLocalDetails(local, in: macMessages[j]))
                 cursor = macMessages.index(after: j)
             } else if local.awaitingMacTranscript || retainedIDs.contains(local.id) || paged
                         || (localArrivalDates[local.id] ?? .distantPast) >= preserveFloor {
-                if let twinIndex = merged.firstIndex(where: {
-                    unconsumedFlushedIds.contains($0.id) && matches($0)
+                if let twinIndex = flushedIndices.first(where: {
+                    unconsumedFlushedIds.contains(merged[$0].id) && matches(merged[$0])
                 }) {
                     unconsumedFlushedIds.remove(merged[twinIndex].id) // local is that row's twin
                     merged[twinIndex] = preservingLocalDetails(local, in: merged[twinIndex])
-                } else if !merged.contains(where: { $0.id == local.id }) {
-                    merged.append(local)
+                } else if !mergedIDs.contains(local.id) {
+                    append(local)
                 }
             }
             // else: not in the snapshot and not recent — the snapshot is
             // authoritative (aged out of its window, or removed on the Mac).
         }
-        merged.append(contentsOf: macMessages[cursor...])
+        for row in macMessages[cursor...] { append(row) }
 
         for candidate in optimisticMessagesToPreserve(macMessages: macMessages) {
-            if merged.contains(where: { $0.id == candidate.id }) { continue }
+            if mergedIDs.contains(candidate.id) { continue }
             if candidate.role == .user,
                indexOfUserOccurrence(candidate, in: merged) != nil {
                 continue
             }
-            merged.append(candidate)
+            append(candidate)
         }
         return merged
     }
@@ -339,6 +349,12 @@ extension ChatStore {
             return (pendingId, placeholderId, reply, events)
         }
         guard !matches.isEmpty else { return false }
+        let wasSuppressed = suppressMessagePersistence
+        suppressMessagePersistence = true
+        defer {
+            suppressMessagePersistence = wasSuppressed
+            persistMessages()
+        }
         // Retire only matched exchanges before merging. Every other bubble
         // remains owned by its pending record, even if this snapshot has replies.
         for (pendingId, placeholderId, _, _) in matches {
@@ -356,7 +372,6 @@ extension ChatStore {
             onReply?(reply.text)
         }
         isPollingFallback = false
-        persistMessages()
         return true
     }
 }

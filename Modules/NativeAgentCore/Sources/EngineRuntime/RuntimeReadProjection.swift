@@ -49,31 +49,9 @@ public enum RuntimeReadProjection {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(sessionId).jsonl")
-        var totalChars = 0
-        var messageCount = 0
-        if let data = try? Data(contentsOf: messagesPath),
-           let text = String(data: data, encoding: .utf8) {
-            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.isEmpty { continue }
-                // gpt-5.5 review #5 (NIT): only count rows that actually
-                // decode. A partially-flushed row at the tail was previously
-                // inflating messageCount even though its tokens were skipped.
-                if let rowData = trimmed.data(using: .utf8),
-                   let obj = try? JSONSerialization.jsonObject(with: rowData) as? [String: Any] {
-                    messageCount += 1
-                    if let content = obj["content"] as? String {
-                        totalChars += content.count
-                    } else if let content = obj["content"] {
-                        // Tool-result rows store content as a JSON array;
-                        // re-serialize to charge for the bytes.
-                        if let blob = try? JSONSerialization.data(withJSONObject: content) {
-                            totalChars += blob.count
-                        }
-                    }
-                }
-            }
-        }
+        let statistics = await ChatTranscriptCache.shared.contextStatistics(at: messagesPath)
+        let totalChars = statistics.totalChars
+        let messageCount = statistics.messageCount
 
         let resolvedModel = (model?.isEmpty == false ? model! : "")
         // gpt-5.5 review #3 (NEEDS_FIX): chars/4 systematically
@@ -230,12 +208,10 @@ public enum RuntimeReadProjection {
         // status surface only; action execution remains guarded by its own
         // native engines.
         let policy = try await TrustFacade(dataRoot: dataRoot).load()
-        let processEnabled = true
         let trustEnabled = policy.enableAutonomy
-        let enabled = processEnabled && trustEnabled
+        let enabled = trustEnabled
         let mode = policy.autonomyDefault ?? "supervised"
         let disabledReason: String? = {
-            if !processEnabled { return "App autonomy process gate is disabled" }
             if !trustEnabled { return "Trust Center autonomy is disabled" }
             return nil
         }()
@@ -248,7 +224,7 @@ public enum RuntimeReadProjection {
             status: enabled ? "ok" : "off",
             mode: mode,
             enabled: enabled,
-            processEnabled: processEnabled,
+            processEnabled: true,
             trustEnabled: trustEnabled,
             disabledReason: disabledReason,
             guardrails: [
@@ -281,19 +257,6 @@ public enum RuntimeReadProjection {
             ],
             createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
         )
-    }
-
-    public static func decodeTailLines(_ data: Data, dropFirstPartial: Bool) -> [String] {
-        let text: String
-        if let utf8 = String(data: data, encoding: .utf8) {
-            text = utf8
-        } else {
-            text = String(decoding: data, as: UTF8.self)
-        }
-        var parts = text.components(separatedBy: "\n")
-        if parts.last == "" { parts.removeLast() }
-        if dropFirstPartial && !parts.isEmpty { parts.removeFirst() }
-        return parts
     }
 
     public static func getActivity(root: URL) async throws -> [ActivityEvent] {

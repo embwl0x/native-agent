@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import PersistenceCore
 
@@ -49,7 +50,7 @@ public actor AppRestartCoordinator {
     /// honestly.
     public static let shared = AppRestartCoordinator()
 
-    // MARK: Injectable seams (tests never spawn or terminate for real)
+    // MARK: App wiring
 
     /// App-bound port that spawns the detached relauncher argv. The app uses
     /// posix_spawn with POSIX_SPAWN_SETSID (own session — survives the
@@ -59,37 +60,20 @@ public actor AppRestartCoordinator {
     /// app layer (DispatchQueue.main.asyncAfter → NSApp.terminate) because
     /// this module must not import AppKit. nil = unconfigured → refuse.
     private var scheduleTerminate: (@Sendable (_ graceSeconds: TimeInterval) -> Void)?
-    private var now: @Sendable () -> Date
-    private let dataRoot: URL
-    private let persistence: any PersistenceCoreProtocol
-    private let currentPID: Int32
+    private let dataRoot = PersistenceCore.defaultDataRoot()
+    private let persistence = SwiftNativePersistenceCore()
+    private let currentPID = ProcessInfo.processInfo.processIdentifier
 
-    public init(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
-        currentPID: Int32 = ProcessInfo.processInfo.processIdentifier,
-        now: @escaping @Sendable () -> Date = { Date() },
-        spawnRelauncher: (@Sendable (_ argv: [String]) throws -> Void)? = nil,
-        scheduleTerminate: (@Sendable (_ graceSeconds: TimeInterval) -> Void)? = nil
-    ) {
-        self.dataRoot = dataRoot
-        self.persistence = persistence
-        self.currentPID = currentPID
-        self.now = now
-        self.spawnRelauncher = spawnRelauncher
-        self.scheduleTerminate = scheduleTerminate
-    }
+    private init() {}
 
     /// App-layer wiring point: inject the real terminate scheduler and
     /// relauncher spawn. Called once from applicationDidFinishLaunching.
     public func configure(
         scheduleTerminate: @escaping @Sendable (_ graceSeconds: TimeInterval) -> Void,
-        spawnRelauncher: @escaping @Sendable (_ argv: [String]) throws -> Void,
-        now: (@Sendable () -> Date)? = nil
+        spawnRelauncher: @escaping @Sendable (_ argv: [String]) throws -> Void
     ) {
         self.scheduleTerminate = scheduleTerminate
         self.spawnRelauncher = spawnRelauncher
-        if let now { self.now = now }
     }
 
     // MARK: Paths
@@ -174,7 +158,6 @@ public actor AppRestartCoordinator {
         let auditDir = self.auditDir
         let stampURL = self.stampURL
         let spawn = spawnRelauncher
-        let nowFn = self.now
         let pid = self.currentPID
         let cooldown = Self.cooldownSeconds
         let grace = Self.terminateGraceSeconds
@@ -190,7 +173,7 @@ public actor AppRestartCoordinator {
                 // process wrote while we waited, yielding negative elapsed —
                 // and the old `elapsed >= 0` guard turned that into a
                 // cooldown BYPASS instead of a refusal.
-                let requestedAt = nowFn()
+                let requestedAt = Date()
 
                 // 1. Cooldown guard — refuse honestly inside the window. A
                 //    stamp in the FUTURE (cross-process race remnant, clock
@@ -334,5 +317,60 @@ public actor AppRestartCoordinator {
               let fired = obj["firedAt"] as? String
         else { return nil }
         return ISO8601DateFormatter().date(from: fired)
+    }
+}
+
+extension AppRestartCoordinator {
+    /// The operator's menu/restore restart bounds the exit wait to 30 seconds, then opens anyway.
+    public nonisolated static func relaunchApp(
+        bundlePath: String = Bundle.main.bundlePath,
+        pid: Int32 = ProcessInfo.processInfo.processIdentifier,
+        terminate: () -> Void,
+        onSpawnFailure: (Error) -> Void
+    ) {
+        let script = "i=0; while /bin/kill -0 \"$1\" >/dev/null 2>&1 && [ \"$i\" -lt 150 ]; do /bin/sleep 0.2; i=$((i+1)); done; /usr/bin/open \"$2\""
+        do {
+            try spawnDetached(argv: ["/bin/sh", "-c", script, "relaunch", String(pid), bundlePath])
+        } catch {
+            onSpawnFailure(error)
+            return
+        }
+        terminate()
+    }
+
+    /// Production relauncher spawn: posix_spawn with POSIX_SPAWN_SETSID so
+    /// the helper becomes its own session leader — it must survive launchd
+    /// tearing down the app's process group when the login item exits —
+    /// with stdio redirected to /dev/null (nohup-equivalent, no SIGHUP /
+    /// no pipe to a dead parent).
+    public nonisolated static func spawnDetached(argv: [String]) throws {
+        precondition(!argv.isEmpty)
+
+        var fileActions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fileActions)
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        for fd: Int32 in 0...2 {
+            posix_spawn_file_actions_addopen(&fileActions, fd, "/dev/null", fd == 0 ? O_RDONLY : O_WRONLY, 0)
+        }
+
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        // POSIX_SPAWN_SETSID (Darwin) — child starts in a NEW session,
+        // detached from our session/process group and any controlling tty.
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+
+        let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+        defer { for p in cArgs where p != nil { free(p) } }
+
+        var childPID: pid_t = 0
+        let rc = posix_spawn(&childPID, argv[0], &fileActions, &attr, cArgs, environ)
+        guard rc == 0 else {
+            throw NSError(
+                domain: "AppRestartCoordinator",
+                code: Int(rc),
+                userInfo: [NSLocalizedDescriptionKey: "posix_spawn(\(argv[0])) failed: \(String(cString: strerror(rc)))"]
+            )
+        }
     }
 }

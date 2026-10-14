@@ -147,7 +147,7 @@ extension CognitiveSubstrate {
             // read already used, lifted above the floor because she formed it.
             let conviction = min(1.0, 0.5 + 0.1 * Double(view.evidenceNodeIds.count))
             let lean = view.status == .held
-                ? conviction * dynamics.heldStandingViewWeightFactor
+                ? conviction * PersonalityDynamicsConfiguration.heldStandingViewWeightFactor
                 : conviction
             out.append(AppraisalConcern(
                 name: "view:\(view.lineageId.isEmpty ? view.id.uuidString : view.lineageId)",
@@ -507,13 +507,6 @@ extension CognitiveSubstrate {
         let word = cleaned.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
         guard !word.isEmpty else { return nil }
         return String(word.prefix(peerSubjectCharacterCap))
-    }
-
-    /// DOCUMENTED READ for the felt layer: who moved her on this event, as a
-    /// payload-free subject word, or nil for User and for anything she authored.
-    /// The felt node's aboutness ("warm — claude") is composed from this.
-    public func relationalSubjectLabel(for event: CognitiveEvent) -> String? {
-        Self.relationalSource(for: event).subjectLabel
     }
 
     /// The conversational appraisal to use for `event`, weighted by WHO said it.

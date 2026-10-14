@@ -4,29 +4,52 @@ import ChatSessionWork
 import Desk
 import NativeAgentCore
 import PersistenceCore
+import Synchronization
+
+private let queueDoors: [String: Set<String>] = ["mac": ["app", "chat", "mac"], "phone": ["ios", "iphone", "mobile", "icloud"],
+                                               "ios": ["ios", "iphone", "mobile", "icloud"]]
+
+/// Nil candidates are unavailable; only a pending write refresh calls for a notice.
+public protocol MyQueueTurnProjectionProviding: Sendable {
+    func queueTurnCandidates() async -> (candidates: [DeskItem]?, refreshPendingAfterWrite: Bool)
+}
 
 /// Which MY QUEUE steps are ready now: the hook her wake asks (Wave 2 #7).
 public enum MyQueueReady {
-    /// The open steps whose condition is met, newest first. The wake side
-    /// asks with `ownTurn: true`. A `peerBorn` step was queued on a turn a peer
-    /// steered: run it under `PeerDataTaint(restoring: step.peers, elevated:
-    /// step.elevated)`, so the peer floor still cards User for it.
-    public static func ready(dataRoot: URL, now: Date = Date(), ownTurn: Bool) async -> [MyQueue.Entry] {
-        guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else { return [] }
-        let context = HerScreen.queueContext(dataRoot: dataRoot, now: now, ownTurn: ownTurn)
-        // A quiet step rides her next ordinary turn; it never wakes her.
-        return MyQueue.entries(state).filter { MyQueue.when($0) != .quiet && MyQueue.isReady($0, context) }
+    /// Carried work whose unattended condition is met. A peer-steered step
+    /// retains its recorded peers when the wake admits it.
+    package static func ready(items: [DeskItem], context: MyQueue.Context) -> [DeskItem] {
+        let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: context.now)
+        return items.filter { item in
+            guard !item.isPursuit, plan.byHandle[item.handle]?.isReady == true,
+                  item.project == MyQueue.project || item.assignee == "agent" else { return false }
+            guard let entry = MyQueue.entry(item) else { return true }
+            switch MyQueue.when(entry) {
+            case .nextTurn: return !entry.owedToPerson && context.ownTurn
+            case .userWrites: return false
+            default: return MyQueue.isReady(entry, context)
+            }
+        }
     }
 
-    /// Her wake takes a step it was woken for to work it (skills-as-code PR 4):
-    /// who holds it instead, or nil.
-    public static func hold(_ handle: String, session: String, dataRoot: URL) async -> String? {
-        (try? await SwiftNativeDeskStore(dataRoot: dataRoot).hold(handle, session: session)) ?? nil
+    /// Offered into the recorded conversation's next matching turn, including
+    /// one that answers without tools. Its caller restores every recorded peer.
+    package static func forTurn(items: [DeskItem], session: String, door: String, personTurn: Bool, at: Date) -> [MyQueue.Entry] {
+        let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: at)
+        return items.compactMap(MyQueue.entry).filter { entry in
+            guard entry.owedToPerson == personTurn, entry.step.session == session, plan.byHandle[entry.item.handle]?.isReady == true,
+                  let filed = DeskClock.parseISO(entry.step.filedAt ?? entry.item.openedAt), at > filed else { return false }
+            switch MyQueue.when(entry) {
+            case .nextTurn: return true
+            case .userWrites(let wanted): return personTurn && (wanted.map { (queueDoors[$0] ?? [$0]).contains(door) } ?? true)
+            default: return false
+            }
+        }
     }
 }
 
 extension HerScreen {
-    static func queueContext(dataRoot: URL, now: Date, ownTurn: Bool) -> MyQueue.Context {
+    package static func queueContext(dataRoot: URL, now: Date, ownTurn: Bool) -> MyQueue.Context {
         let completed = ((try? SwiftNativeApprovalInbox(root: dataRoot).resolvedUnlocked()) ?? []).filter { record in
             guard record.decision == "approved", case .object(let result)? = record.executedAction else { return false }
             if let resultClass = result["resultClass"] {
@@ -44,25 +67,31 @@ extension HerScreen {
             }
             return ChatToolOutcome.exactResultClass(.object(evidence)) == .succeeded
         }
+        // One observation per context; each entry still selects its own three
+        // newest conversations after applying its door and timestamp filters.
+        let observation = Mutex<(rows: [(id: String?, source: String, updatedAt: Date)]?, latest: [String: Date?])>((nil, [:]))
         return MyQueue.Context(now: now, ownTurn: ownTurn, completedCards: Set(completed.map(\.id))) { door, since in
-            userWrote(dataRoot: dataRoot, door: door, since: since)
-        }
-    }
-
-    /// Whether the person wrote after `since`, on a door (mac, telegram,
-    /// slack, phone) or any: the three newest conversations with him since.
-    static func userWrote(dataRoot: URL, door: String?, since: Date) -> Bool {
-        let doors: [String: Set<String>] = ["mac": ["app", "chat", "mac"], "phone": ["ios", "iphone", "mobile", "icloud"],
-                                            "ios": ["ios", "iphone", "mobile", "icloud"]]
-        let wanted = door.map { doors[$0] ?? [$0] }
-        return ((try? HumanConversationIndex.rows(dataRoot: dataRoot)) ?? []).filter { row in
-            (wanted?.contains(HumanConversationIndex.string(row["source"]) ?? "app") ?? true)
-                && (HumanConversationIndex.string(row["updatedAt"]).flatMap(date) ?? .distantPast) > since
-        }.prefix(3).contains { (row: [String: JSONValue]) -> Bool in
-            guard let id = HumanConversationIndex.string(row["id"]),
-                  NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return false }
-            return logTail(dataRoot.appendingPathComponent("chat/messages/\(id).jsonl"), bytes: 16_384, humanOnly: true)
-                .contains { !$0.mine && ($0.at ?? .distantPast) > since }
+            observation.withLock { observation in
+                if observation.rows == nil {
+                    observation.rows = ((try? HumanConversationIndex.rows(dataRoot: dataRoot)) ?? []).map { row in
+                        (HumanConversationIndex.string(row["id"]), HumanConversationIndex.string(row["source"]) ?? "app",
+                         HumanConversationIndex.string(row["updatedAt"]).flatMap(date) ?? .distantPast)
+                    }
+                }
+                let wanted = door.map { queueDoors[$0] ?? [$0] }
+                return observation.rows!.filter { row in
+                    (wanted?.contains(row.source) ?? true) && row.updatedAt > since
+                }.prefix(3).contains { row in
+                    guard let id = row.id,
+                          NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return false }
+                    if observation.latest[id] == nil {
+                        let latest = logTail(dataRoot.appendingPathComponent("chat/messages/\(id).jsonl"), bytes: 16_384, humanOnly: true)
+                            .filter { !$0.mine }.map { $0.at ?? .distantPast }.max()
+                        observation.latest.updateValue(latest, forKey: id)
+                    }
+                    return (observation.latest[id] ?? nil).map { $0 > since } ?? false
+                }
+            }
         }
     }
 
@@ -78,7 +107,10 @@ extension HerScreen {
             entry.item.notes.compactMap { DeskClock.parseISO($0.ts) }.max().map { "note " + age(now.timeIntervalSince($0)) }
         }
         let context = queueContext(dataRoot: dataRoot, now: now, ownTurn: false)
-        let ready = entries.filter { MyQueue.isReady($0, context) }
+        var ready: [MyQueue.Entry] = [], waiting: [MyQueue.Entry] = []
+        for entry in entries {
+            if MyQueue.isReady(entry, context) { ready.append(entry) } else { waiting.append(entry) }
+        }
         var rows = ready.prefix(4).map { entry in
             pad(entry.name, 10) + (entry.peerBorn ? clip(entry.item.title, 44) + " · open it to read"
                                                    : "\"" + clip(entry.step.words, 52) + "\"")
@@ -88,14 +120,14 @@ extension HerScreen {
         }
         if ready.count > 4 { rows.append("+\(ready.count - 4) more ready · app desk.read {query:\"\(MyQueue.project)\"}") }
         var waits: [(String, Int)] = [], notes: [String] = []
-        for entry in entries where !MyQueue.isReady(entry, context) {
+        for entry in waiting {
             if let note = noted(entry) { notes.append(entry.name + " " + note) }
             let word = switch MyQueue.when(entry) {
             case .afterCard: "on a card"
             case .userWrites: "for \(person) to write"
-            case .ownTurn: "for my own turn"
+            case .ownTurn, .quiet: "for my own turn"
             case .at: "for their time"
-            case .nextTurn, .quiet: "for next turn"
+            case .nextTurn: "for next turn"
             }
             if let index = waits.firstIndex(where: { $0.0 == word }) { waits[index].1 += 1 } else { waits.append((word, 1)) }
         }

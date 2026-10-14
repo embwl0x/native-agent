@@ -76,10 +76,6 @@ public enum ProactiveSpeechOutcome: Sendable, Equatable {
     /// Proactive quota not yet expired; nothing was written.
     case rateLimited(secondsRemaining: Int)
 
-    public var didPost: Bool {
-        if case .posted = self { return true }
-        return false
-    }
 }
 
 public enum ProactiveSpeechError: Error, LocalizedError {

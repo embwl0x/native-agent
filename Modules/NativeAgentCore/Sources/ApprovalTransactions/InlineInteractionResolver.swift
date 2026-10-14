@@ -8,6 +8,7 @@ import TurnTrace
 import ProviderRouting
 import TrustCenter
 import ToolRegistry
+import MacControl
 
 /// The one place an inline card settles and the one place a suspended request
 /// resumes.
@@ -667,7 +668,7 @@ public enum InlineInteractionResolver {
                 return .success(.init(selection: "chrome", summary: "Chrome connected"))
             }
             if interaction.target == "iphone" {
-                guard platform.pairedPhoneCount() > 0 else {
+                guard await platform.pairedPhoneCount() > 0 else {
                     return .failure("No iPhone is paired yet: open NativeAgent on the iPhone, then choose Pair here when the codes match.")
                 }
                 return .success(.init(selection: "iphone", summary: "iPhone paired"))
@@ -712,6 +713,17 @@ public enum InlineInteractionResolver {
             let granted = (try? await store.currentChecked()) ?? [:]
             var missing: [String] = []
             for capability in interaction.allTargets {
+                if capability == "applescript" {
+                    return .failure("Automation consent is per app. Request permission with target applescript:<bundle_id>.")
+                }
+                if let bundleID = SystemAppleScriptAdapter.automationTarget(capability) {
+                    let permission = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID)
+                    if case .object(let fields) = permission, fields["state"] == .string("allowed") {
+                        continue
+                    } else {
+                        return .failure((try? permission.serialize(pretty: false)) ?? "Automation consent unavailable.")
+                    }
+                }
                 if InlineInteractionRegistry.isMacControlCategory(capability) {
                     if !InlineInteractionRegistry.macControlCategoryAllowed(
                         capability, dataRoot: dataRoot
@@ -879,8 +891,8 @@ public enum InlineInteractionResolver {
             ?? PeerDataTaint(restoring: sources, elevated: elevated)
         // A turn already carrying this card must keep its provenance too.
         // Historical steering cannot be cleared by a later trust change.
-        for source in sources { taint.mark(peer: source, attested: false) }
-        for source in elevated { taint.markElevated(peer: source, attested: false) }
+        for source in sources { taint.mark(peer: source) }
+        for source in elevated { taint.markElevated(peer: source) }
         await PeerDataTaint.$current.withValue(taint) {
             await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot)
         }

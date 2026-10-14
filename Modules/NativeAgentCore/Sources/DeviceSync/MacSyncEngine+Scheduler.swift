@@ -79,15 +79,18 @@ extension MacSyncEngine {
         }
     }
 
-    func startSchedulerSnapshotObservation() {
+    func startSchedulerSnapshotObservation() async {
         schedulerSnapshotWatcher?.cancel()
-        schedulerSnapshotWatcher = FileChangeWatcher(paths: [
+        let generation = snapshotLifecycleGeneration
+        let watcher = await FileChangeWatcher.armed(paths: [
             PersistenceCore.defaultDataRoot().appendingPathComponent("scheduler/jobs.json")
         ]) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, self.isActive else { return }
+                guard let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
                 await self.writeSnapshots()
             }
         }
+        guard isActive, generation == snapshotLifecycleGeneration else { watcher.cancel(); return }
+        schedulerSnapshotWatcher = watcher
     }
 }

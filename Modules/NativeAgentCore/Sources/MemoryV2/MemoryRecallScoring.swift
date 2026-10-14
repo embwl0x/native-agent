@@ -135,18 +135,6 @@ public enum MemoryRecallScoring {
     /// BM25 over the already-loaded candidate set. Recall already performs a
     /// full candidate sweep for cosine, so this avoids a schema migration while
     /// restoring the daemon-era lexical signal.
-    public static func normalizedBM25Scores(
-        query: String?,
-        documents: [String],
-        k1: Double = 1.2,
-        b: Double = 0.75
-    ) -> [Double] {
-        guard query != nil else { return Array(repeating: 0, count: documents.count) }
-        return normalizedBM25Scores(
-            query: query, lexicalDocuments: documents.map(LexicalDocument.init), k1: k1, b: b
-        )
-    }
-
     static func normalizedBM25Scores(
         query: String?,
         lexicalDocuments documents: [LexicalDocument],

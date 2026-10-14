@@ -1,4 +1,5 @@
 import Foundation
+import KnowledgeGraph
 
 /// The agent asks her memory in the first person ("what does User call me")
 /// while many rows name her in the third ("User uses different names for
@@ -53,27 +54,11 @@ public enum MemoryRecallQueryExpansion {
         let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
         return cacheLock.withLock {
             if let cached = cache[url.path], cached.modified == modified { return cached.names }
-            var names = Names()
-            if let data = try? Data(contentsOf: url),
-               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                names.agent = usable(object["name"] as? String, rejecting: ["assistant", "the assistant", "agent", "the agent"])
-                names.user = usable(object["userName"] as? String, rejecting: ["user", "the user"])
-            }
+            let profile = SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: url)
+            let names = Names(agent: profile.agent, user: profile.user)
             cache[url.path] = (modified, names)
             return names
         }
-    }
-
-    private static func usable(_ raw: String?, rejecting: Set<String>) -> String? {
-        guard let raw else { return nil }
-        let trimmed = raw
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count <= 80,
-              !rejecting.contains(trimmed.lowercased()),
-              trimmed.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
-        else { return nil }
-        return trimmed
     }
 
     private static let cacheLock = NSLock()

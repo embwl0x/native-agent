@@ -11,21 +11,11 @@ struct LivingStatusPanel: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     private var cognition: CognitionViewFacade { appModel.engine.cognitionView }
-    private var snapshot: LivingStatusSnapshot? {
-        get { cognition.livingSnapshot }
-        nonmutating set { cognition.livingSnapshot = newValue }
-    }
-    private var refreshCoalescer: LivingStatusRefreshCoalescer {
-        get { cognition.livingRefreshCoalescer }
-        nonmutating set { cognition.livingRefreshCoalescer = newValue }
-    }
-    private var refreshStatus: AppModel.PanelRefreshStatus? {
-        get { cognition.livingRefreshStatus }
-        nonmutating set { cognition.livingRefreshStatus = newValue }
-    }
+    private var snapshot: LivingStatusSnapshot? { cognition.livingSnapshot }
+    private var refreshStatus: AppModel.PanelRefreshStatus? { cognition.livingRefreshStatus }
     @State private var fileWatchAvailability: LivingStatusFileWatch.Availability?
 
-    private var isRefreshing: Bool { refreshCoalescer.isRefreshing }
+    private var isRefreshing: Bool { cognition.livingRefreshCoalescer.isRefreshing }
 
     private var dataRoot: URL {
         appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -176,30 +166,75 @@ struct LivingStatusPanel: View {
 
     @MainActor
     private func refresh() async {
-        guard refreshCoalescer.requestRefresh() else { return }
-        while true {
-            await refreshOnce()
-            guard !Task.isCancelled else {
-                refreshCoalescer.cancel()
-                return
-            }
-            guard refreshCoalescer.completePass() else { return }
-            if !refreshCoalescer.trailingPassConsumed {
-                do {
-                    try await Task.sleep(for: .milliseconds(500))
-                } catch {
-                    refreshCoalescer.cancel()
-                    return
-                }
-            }
+        await cognition.refreshLivingStatus(
+            desk: appModel.engine.desk,
+            approvals: appModel.engine.approvals,
+            agentDisplayName: { appModel.agentDisplayName },
+            dreamErrorDidChange: { appModel.dreamError = $0 }
+        )
+    }
+}
+
+extension LivingStatusFileWatch {
+    @MainActor
+    static func observe(
+        dataRoot: URL,
+        debounceDelay: Duration = .milliseconds(250),
+        availabilityDidChange: @escaping @MainActor (Availability) -> Void = { _ in },
+        refresh: @escaping @MainActor @Sendable () async -> Void
+    ) async {
+        let availability = availability(dataRoot: dataRoot)
+        availabilityDidChange(availability)
+        guard case .watching = availability else {
+            // Preserve the one canonical read even when live observation cannot
+            // be armed; the card will report both the read result and the lost
+            // live-update capability instead of quietly retaining stale data.
+            await refresh()
+            return
+        }
+        await EventDeadlinePhysiology.refreshOnChanges(
+            paths: watchedPaths(dataRoot: dataRoot),
+            debounceDelay: debounceDelay,
+            refresh: refresh
+        )
+    }
+}
+
+extension LivingStatusFileWatch.Availability {
+    var unavailableMessage: String? {
+        guard case let .unavailable(detail) = self else { return nil }
+        return "Live status updates are unavailable: \(detail)"
+    }
+}
+
+/// A completed refresh is not silent: an unavailable read and retained last
+/// known snapshot each have distinct, user-visible feedback.
+enum LivingStatusRefreshPresentation: Equatable {
+    case loading
+    case current
+    case retainedFailure
+    case unavailable
+    case empty
+
+    static func resolve(
+        hasSnapshot: Bool,
+        status: AppModel.PanelRefreshStatus?
+    ) -> Self {
+        if status?.isStale == true { return hasSnapshot ? .retainedFailure : .unavailable }
+        guard status != nil else { return .loading }
+        return hasSnapshot ? .current : .empty
+    }
+
+    var adverseMessage: String? {
+        switch self {
+        case .retainedFailure:
+            return "Refresh couldn't complete — showing the last known state."
+        case .unavailable:
+            return "Refresh couldn't complete — current state is unavailable; no calm or needs-nothing state was inferred."
+        case .empty:
+            return "Refresh completed, but no current state was available."
+        case .loading, .current:
+            return nil
         }
     }
-
-    @MainActor
-    private func refreshOnce() async {
-        let outcome = await LivingStatusRefreshOperation.run(appModel: appModel)
-        snapshot = outcome.applying(to: snapshot)
-        refreshStatus = outcome.status(previous: refreshStatus)
-    }
-
 }

@@ -31,6 +31,7 @@
             read: address => material(invoke("source_read", {address: address == null ? null : address})),
             watch: () => invoke("source_watch")
         }),
+        apps: Object.freeze({read: args => invoke("app_read", {args})}),
         publish: page => invoke("publish", {page}),
         notify: news => invoke("notify", {news}),
         // Report completed work, never a heartbeat. Omit n for one completed

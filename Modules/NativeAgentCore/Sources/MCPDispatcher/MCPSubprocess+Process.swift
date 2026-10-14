@@ -425,8 +425,6 @@ public actor MCPSubprocess {
     public let serverId: String
     public let command: String
     public let argv: [String]
-    public let env: [String: String]?
-    public let cwd: URL?
     public let executionIdentity: String?
     /// Request timeout used by `request(...)`. Daemon uses 10s for initialize,
     /// 20s for the actual method — we use 20s as the single default for both.
@@ -443,7 +441,7 @@ public actor MCPSubprocess {
     /// past this means the child stopped reading — we treat it as wedged,
     /// terminate it, and route through the unexpected-termination path so
     /// the pool evicts + arms backoff.
-    public private(set) var writeTimeout: TimeInterval = 10
+    private let writeTimeout: TimeInterval = 10
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
     /// F-B4: bounded tail of the child's stderr, continuously drained so the
@@ -455,12 +453,9 @@ public actor MCPSubprocess {
     /// Event-driven task that drains completed stdout frames only after the
     /// readability handler signals new bytes or EOF.
     private var drainTask: Task<Void, Never>?
-    /// Test-visible evidence that an idle subprocess does not repeatedly call
-    /// `MCPFrameReader.drain()`. Incremented once per coalesced stdout signal.
-    private var stdoutDrainPassCount: UInt64 = 0
     private var nextRpcId: Int64 = 0
     /// Outstanding request waiters keyed by JSON-RPC id.
-    private var waiters: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
+    private var waiters: [Int64: (continuation: CheckedContinuation<JSONValue, Error>, timeout: Task<Void, Never>)] = [:]
     /// Request ids whose waiter was cancelled while their OWN request frame may
     /// still be queued on stdin. A wedge-timeout may drop such a frame only
     /// before any bytes were emitted; a partial frame terminates the transport.
@@ -471,12 +466,6 @@ public actor MCPSubprocess {
     /// cancellation contract while fatal writes stop native FIFO admission
     /// atomically at timeout.
     private var requestWritePolicies: [Int64: _MCPStdinWritePolicy] = [:]
-    /// Deterministic test gate for the cancellation-before-write-start race.
-    /// Production leaves this false; it inserts no await or scheduling work.
-    private var pauseRequestWritesForTesting = false
-    private var pausedRequestWriteWaiters: [CheckedContinuation<Void, Never>] = []
-    private var pausedRequestWriteObservers: [CheckedContinuation<Void, Never>] = []
-    private var notificationHandler: (@Sendable (String, JSONValue) -> Void)?
     /// Optional handler the pool installs so it can record a backoff when
     /// the child dies UNEXPECTEDLY (i.e. not via `stop()`). The handler is
     /// invoked with the exit status (or 0 if not exposed by Process) and a
@@ -505,15 +494,11 @@ public actor MCPSubprocess {
         serverId: String,
         command: String,
         argv: [String],
-        env: [String: String]? = nil,
-        cwd: URL? = nil,
         executionIdentity: String? = nil
     ) {
         self.serverId = serverId
         self.command = command
         self.argv = argv
-        self.env = env
-        self.cwd = cwd
         self.executionIdentity = executionIdentity
     }
 
@@ -522,8 +507,6 @@ public actor MCPSubprocess {
     public static func fromServerCommand(
         serverId: String,
         command: String,
-        env: [String: String]? = nil,
-        cwd: URL? = nil,
         executionIdentity: String? = nil
     ) throws -> MCPSubprocess {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -535,8 +518,6 @@ public actor MCPSubprocess {
             serverId: serverId,
             command: first,
             argv: argv,
-            env: env,
-            cwd: cwd,
             executionIdentity: executionIdentity
         )
     }
@@ -569,10 +550,7 @@ public actor MCPSubprocess {
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             proc.arguments = argv
         }
-        if let cwd = cwd { proc.currentDirectoryURL = cwd }
-        proc.environment = AgentHostCommandLines.scrubbedEnvironment().merging(env ?? [:]) {
-            _, configured in configured
-        }
+        proc.environment = AgentHostCommandLines.scrubbedEnvironment()
         let stdin = Pipe()
         let stdout = Pipe()
         let stderr = Pipe()
@@ -672,7 +650,6 @@ public actor MCPSubprocess {
         stderrPipe = stderr
         stderrTail = tail
         reader = frameReader
-        stdoutDrainPassCount = 0
         startedAt = Date()
         lastUsedAt = startedAt
         didRequestStop = false
@@ -731,11 +708,6 @@ public actor MCPSubprocess {
         initialized = true
     }
 
-    /// Test/diagnostic seam: last-8KB snapshot of the child's stderr.
-    public func stderrTailSnapshot() -> String {
-        stderrTail?.snapshot() ?? ""
-    }
-
     private static func decorate(_ message: String, withStderr tail: _MCPStderrTail) -> String {
         let fragment = tail.reasonFragment()
         return fragment.isEmpty ? message : "\(message) — stderr: \(fragment)"
@@ -759,13 +731,6 @@ public actor MCPSubprocess {
         // so the contract (cancel takes priority) holds either way.
         try Task.checkCancellation()
         return result
-    }
-
-    /// Register a handler for server-initiated notifications. The handler is
-    /// called from inside the actor; pass a `@Sendable` closure that captures
-    /// nothing actor-isolated.
-    public func notifications(handler: @escaping @Sendable (String, JSONValue) -> Void) {
-        self.notificationHandler = handler
     }
 
     /// Install a handler that fires when the child process terminates
@@ -825,7 +790,6 @@ public actor MCPSubprocess {
         stdinHandle = nil
         requestWritePolicies.removeAll()
         cancelledRequestWrites.removeAll()
-        resumePausedRequestWritesForTesting()
         stdoutPipe = nil
         stderrPipe = nil
         reader = nil
@@ -902,7 +866,6 @@ public actor MCPSubprocess {
         stdinHandle = nil
         requestWritePolicies.removeAll()
         cancelledRequestWrites.removeAll()
-        resumePausedRequestWritesForTesting()
         stdoutPipe = nil
         stderrPipe = nil
         reader = nil
@@ -962,7 +925,6 @@ public actor MCPSubprocess {
     /// stream state so the event consumer exits. Framing, waiter correlation,
     /// malformed-output eviction, and EOF failure all remain actor-serialized.
     private func consumeStdoutEvent(from frameReader: MCPFrameReader) async -> Bool {
-        stdoutDrainPassCount &+= 1
         let (frames, closed, malformed) = frameReader.drain()
         if let notice = malformed {
             // A malformed frame means the server is broken or logging to
@@ -1015,8 +977,17 @@ public actor MCPSubprocess {
                 // received executor time yet.
                 let writePolicy = _MCPStdinWritePolicy(stopWriterOnTimeout: true)
                 requestWritePolicies[rpcId] = writePolicy
-                waiters[rpcId] = cont
                 let waiterMethod = method
+                let timeoutTask = Task { [weak self] in
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    await self?.timeOutWaiter(id: rpcId, method: waiterMethod, seconds: timeout)
+                }
+                waiters[rpcId] = (cont, timeoutTask)
                 Task { [weak self] in
                     do {
                         try await self?.writeFramed(
@@ -1029,10 +1000,6 @@ public actor MCPSubprocess {
                         await self?.failWaiter(id: rpcId, error: error)
                     }
                     await self?.clearCancelledWrite(rpcId)
-                }
-                Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                    await self?.timeOutWaiter(id: rpcId, method: waiterMethod, seconds: timeout)
                 }
             }
         } onCancel: {
@@ -1052,7 +1019,7 @@ public actor MCPSubprocess {
     /// server-side request to cancel. The notification is fire-and-forget — a
     /// wedged/closed stdin just makes `writeFramed` throw, which we swallow.
     private func cancelWaiter(id: Int64) async {
-        guard let cont = waiters.removeValue(forKey: id) else { return }
+        guard let cont = removeWaiter(id) else { return }
         // Mark BEFORE resuming: if this request's own frame is the one wedging
         // stdin, its write-timeout must not terminate the subprocess.
         if let policy = requestWritePolicies[id] {
@@ -1126,9 +1093,6 @@ public actor MCPSubprocess {
         rpcId: Int64? = nil,
         policyOverride: _MCPStdinWritePolicy? = nil
     ) async throws {
-        if rpcId != nil {
-            await waitForRequestWritePermissionForTesting()
-        }
         guard let writer = stdinWriter else { throw MCPSubprocessError.streamClosed }
         // Cancellation may win after waiter/policy installation but before
         // this task begins. Do not emit the abandoned request after its cancel
@@ -1203,7 +1167,6 @@ public actor MCPSubprocess {
                 return
             }
             // Notification — no id, has `method`.
-            notificationHandler?(method, obj["params"] ?? .null)
             return
         }
         // Response — has an `id`, no `method`.
@@ -1216,7 +1179,7 @@ public actor MCPSubprocess {
                 await _terminateForMalformedFrame(notice: notice)
                 return
             }
-            guard let cont = waiters.removeValue(forKey: rpcId) else { return }
+            guard let cont = removeWaiter(rpcId) else { return }
             if case .object(let err) = obj["error"] ?? .null {
                 var code = -1
                 if let c = err["code"], let n = jsonValueAsInt64(c), let exact = Int(exactly: n) {
@@ -1263,75 +1226,29 @@ public actor MCPSubprocess {
     }
 
     private func timeOutWaiter(id: Int64, method: String, seconds: Double) {
-        guard let cont = waiters.removeValue(forKey: id) else { return }
+        guard let cont = removeWaiter(id) else { return }
         cont.resume(throwing: MCPSubprocessError.timeout(method: method, seconds: seconds))
     }
 
     /// Fail one in-flight waiter (write-path errors). No-op when the waiter
     /// was already resolved by a response/timeout.
     private func failWaiter(id: Int64, error: Error) {
-        guard let cont = waiters.removeValue(forKey: id) else { return }
+        guard let cont = removeWaiter(id) else { return }
         cont.resume(throwing: error)
     }
 
-    /// Test seam — tighten the stdin-write deadline without waiting 10s.
-    public func _setWriteTimeout(_ seconds: TimeInterval) {
-        writeTimeout = seconds
-    }
-
-    func _pauseRequestWritesForTesting() {
-        pauseRequestWritesForTesting = true
-    }
-
-    func _waitUntilRequestWritePausedForTesting() async {
-        guard pauseRequestWritesForTesting,
-              pausedRequestWriteWaiters.isEmpty
-        else { return }
-        await withCheckedContinuation { continuation in
-            pausedRequestWriteObservers.append(continuation)
-        }
-    }
-
-    func _resumeRequestWritesForTesting() {
-        resumePausedRequestWritesForTesting()
-    }
-
-    /// Test seam for proving the stdout consumer stays suspended while idle.
-    func _stdoutDrainPassCountForTesting() -> UInt64 {
-        stdoutDrainPassCount
+    private func removeWaiter(_ id: Int64) -> CheckedContinuation<JSONValue, Error>? {
+        guard let waiter = waiters.removeValue(forKey: id) else { return nil }
+        waiter.timeout.cancel()
+        return waiter.continuation
     }
 
     private func failAllWaiters(error: Error) {
         let snapshot = waiters
         waiters.removeAll()
-        for (_, cont) in snapshot {
-            cont.resume(throwing: error)
-        }
-    }
-
-    private func waitForRequestWritePermissionForTesting() async {
-        guard pauseRequestWritesForTesting else { return }
-        await withCheckedContinuation { continuation in
-            pausedRequestWriteWaiters.append(continuation)
-            let observers = pausedRequestWriteObservers
-            pausedRequestWriteObservers.removeAll()
-            for observer in observers {
-                observer.resume()
-            }
-        }
-    }
-
-    private func resumePausedRequestWritesForTesting() {
-        pauseRequestWritesForTesting = false
-        let writeWaiters = pausedRequestWriteWaiters
-        pausedRequestWriteWaiters.removeAll()
-        for waiter in writeWaiters {
-            waiter.resume()
-        }
-        let observers = pausedRequestWriteObservers
-        pausedRequestWriteObservers.removeAll()
-        for observer in observers {
-            observer.resume()
+        for (_, waiter) in snapshot {
+            waiter.timeout.cancel()
+            waiter.continuation.resume(throwing: error)
         }
     }
 

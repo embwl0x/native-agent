@@ -235,32 +235,6 @@ public struct TelegramSessionStore: Sendable {
         )
     }
 
-    func savedReply(sessionId: String, runId: String) async throws -> TelegramAssistantDeliveryState? {
-        let rows = try await SwiftNativePersistenceCore().readJSONL(messagesPath(sessionId: sessionId))
-        for row in rows.reversed() {
-            guard case .object(let object) = row,
-                  object["role"] == .string("assistant"), object["runId"] == .string(runId),
-                  case .string(let content)? = object["content"], !content.isEmpty else { continue }
-            if case .object(let metadata)? = object["metadata"],
-               metadata["mechanicalKind"] != nil || metadata["partial"] == .bool(true) { continue }
-            let reply = TelegramRichMessageRenderer.sanitize(TelegramRichMessageRenderer.stripBoldMarkers(content))
-            guard !reply.isEmpty else { return nil }
-            var paths: [String] = []
-            if case .object(let metadata)? = object["metadata"],
-               case .array(let attachments)? = metadata["attachments"] {
-                let root = dataRoot.appendingPathComponent("generated_images").standardizedFileURL.path + "/"
-                paths = attachments.compactMap { attachment in
-                    guard case .object(let row) = attachment, row["type"] == .string("image"),
-                          case .string(let path)? = row["path"],
-                          URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(root) else { return nil }
-                    return path
-                }
-            }
-            return TelegramAssistantDeliveryState(reply: reply, imagePaths: paths)
-        }
-        return nil
-    }
-
     private func canAccessAllSessions(destination: TelegramDestination, fromUserId: Int?) -> Bool {
         fromUserId == destination.chatId && isOwnerDestination(destination)
     }

@@ -135,12 +135,6 @@ public enum ExecutionEventVocabulary {
         return canonicalKind(lhs) == canonicalKind(rhs)
     }
 
-    /// `hasPrefix` that tolerates either vocabulary on either side. Used by the
-    /// inbox `source` readers (`mission_complete:<id>` vs
-    /// `execution_complete:<id>`).
-    public static func hasKindPrefix(_ value: String, _ prefix: String) -> Bool {
-        canonicalKind(value).hasPrefix(canonicalKind(prefix))
-    }
 }
 
 /// The ApprovalInbox `action` (and payload `kind`) for a Workshop step that is
@@ -337,8 +331,4 @@ public enum ExecutionEnvVocabulary {
         )
     }
 
-    /// Test seam: forget which deprecations were already logged.
-    public static func _resetDeprecationNoticesForTesting() {
-        noticed.withLock { $0.removeAll() }
-    }
 }

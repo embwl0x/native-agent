@@ -65,6 +65,40 @@ public enum EventDeadlinePhysiology {
         }
         return pair.stream
     }
+
+    /// View-lifetime refresh over canonical invalidations. The source is armed
+    /// before the initial read so writes racing that read remain buffered.
+    @MainActor
+    public static func refreshOnChanges(
+        paths: [URL],
+        stores: Set<StoreChange.Store> = [],
+        notifications: [Notification.Name] = [],
+        debounceDelay: Duration = .milliseconds(250),
+        refresh: @escaping @MainActor @Sendable () async -> Void
+    ) async {
+        let events = EventDeadlinePhysiology.storeAndFileEvents(
+            paths: paths,
+            stores: stores,
+            notifications: notifications
+        )
+        let debouncer = StoreReloadDebouncer(delay: debounceDelay) {
+            await refresh()
+        }
+        // Arm the source before the initial read. Any write racing that read
+        // remains buffered by the source stream and is replayed below.
+        await refresh()
+        guard !Task.isCancelled else {
+            await debouncer.cancel()
+            return
+        }
+        await debouncer.setVisible(true)
+
+        for await _ in events {
+            guard !Task.isCancelled else { break }
+            await debouncer.signal()
+        }
+        await debouncer.cancel()
+    }
 }
 
 /// NotificationCenter's observer tokens are opaque and not `Sendable`, and the

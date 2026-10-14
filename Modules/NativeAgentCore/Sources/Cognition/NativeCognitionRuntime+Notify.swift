@@ -38,10 +38,8 @@ extension NativeCognitionRuntime: InnerStateProviding {
         // not a launch, and a tool call that silently boots the mind would make
         // "did she wake up?" depend on whether anyone asked.
         //
-        // Same contract the frozen-mind read already keeps
-        // (`NativeFrozenMindReadError.runtimeNotBootstrapped`): refuse before
-        // the owner has started, and merely WAIT on a start the owner has
-        // already begun.
+        // Refuse before the owner has started, and merely WAIT on a start the
+        // owner has already begun.
         guard let bootstrapTask else {
             return .unavailable(at: now(), windowHours: windowHours, detail: detail)
         }

@@ -26,34 +26,10 @@ import TrustCenter
 // MARK: - Lazy tool filtering
 
 extension TurnContext {
-    /// Copy of this context with only `toolSchemas` replaced. The ONE
-    /// manual-copy site for the 15 let-only fields — every lazy-filter rebuild
-    /// routes through here so a newly added TurnContext field can't be silently
-    /// dropped by a hand-inlined 15-field copy (the field-drop trap C3 closes).
     func withToolSchemas(_ newSchemas: [LLMToolSchema]) -> TurnContext {
-        TurnContext(
-            surface: surface,
-            personaID: personaID,
-            personaDocs: personaDocs,
-            personaFingerprint: personaFingerprint,
-            recalled: recalled,
-            modelId: modelId,
-            reasoningEffort: reasoningEffort,
-            providerId: providerId,
-            serviceTier: serviceTier,
-            toolsAvailable: toolsAvailable,
-            systemPrompt: systemPrompt,
-            userMessage: userMessage,
-            toolSchemas: newSchemas,
-            systemSegments: systemSegments,
-            imageBlocks: imageBlocks,
-            fluidContextTurn: fluidContextTurn,
-            naturalExpressionCue: naturalExpressionCue,
-            historyMessages: historyMessages,
-            turnVolatileBlock: turnVolatileBlock,
-            historyWindowReceipt: historyWindowReceipt,
-            preparationMs: preparationMs
-        )
+        var copy = self
+        copy.toolSchemas = newSchemas
+        return copy
     }
 }
 
@@ -184,6 +160,7 @@ extension SwiftNativeTurnEngine {
                                   "ios_icloud", "agent-bridge", "claude-bridge", "codex-bridge"]
         guard let root = remPinsDataRoot else { return }
         let store = SwiftNativeDeskStore(dataRoot: root)
+        let origin = ChatPersistenceContext.originPrincipal
         let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                           peerID: ChatToolSessionContext.envelope?.verifiedUserId)
         // A skill run still stopped as the turn ends waits for her own turn,
@@ -206,7 +183,8 @@ extension SwiftNativeTurnEngine {
         for words in stopped.values.sorted() {
             do {
                 _ = try await MyQueue.add(DeskStep(words: words, when: "own_turn", peers: steer.sources, elevated: steer.elevated,
-                                                   session: ChatToolSessionContext.verifiedSessionId), store: store)
+                                                   session: ChatToolSessionContext.verifiedSessionId, origin: origin,
+                                                   replyRoute: TurnEnvelope.current(surface: surface).persistedMetadata()), store: store)
             } catch {
                 nativeLog("[my-queue] a stopped skill run was not queued: \(error)")
             }
@@ -227,7 +205,8 @@ extension SwiftNativeTurnEngine {
             do {
                 _ = try await MyQueue.add(DeskStep(words: promise.sentence, when: when, card: after, source: promise.sentence,
                                                    peers: steer.sources, elevated: steer.elevated,
-                                                   session: ChatToolSessionContext.verifiedSessionId), store: store)
+                                                   session: ChatToolSessionContext.verifiedSessionId, origin: origin,
+                                                   replyRoute: TurnEnvelope.current(surface: surface).persistedMetadata()), store: store)
             } catch {
                 nativeLog("[my-queue] a promise was not queued: \(error)")
             }
@@ -384,8 +363,8 @@ extension SwiftNativeTurnEngine {
         if StandingBotContinuity.isHelperTurn, iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
             ChatTurnExecution.current?.waitForApproval()
         }
-        // Setup and permission cards leave this item skipped while the turn
-        // finishes its other work. Only a question needed by the turn parks it.
+        // Automation waits for the owner's system grant; other setup lets
+        // the turn finish its remaining work.
         if let waiting = iterationRecords.lazy
             .compactMap({ InlineInteractionNeed.interaction(in: $0.result) })
             .first(where: InlineInteractionNeed.blocksTurn) {

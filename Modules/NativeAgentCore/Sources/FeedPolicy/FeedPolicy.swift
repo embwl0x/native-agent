@@ -71,8 +71,6 @@ public enum JSONLLineCaps {
     public static let backgroundLoopFailures = 5000
     /// `<dataRoot>/memory/retention_receipts.jsonl` — hard-bound evictions.
     public static let memoryRetentionReceipts = 5000
-    /// `<dataRoot>/training/journal/audit_ledger.jsonl`.
-    public static let trainingAudit = 5000
     /// `~/.config/claude-bridge/claude-inbox.jsonl` — Agent → Claude
     /// durable inbox rows (audit 2026-07-21: raw uncapped append; same
     /// budget as the other bridge feeds).

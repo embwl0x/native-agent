@@ -1,3 +1,4 @@
+import EngineRuntime
 import SwiftUI
 
 /// The settled receipt for a line the agent wrote into its own persona.
@@ -12,10 +13,8 @@ import SwiftUI
 /// `ChatShellToolSummary.personaReceipt` for which calls qualify; anything that
 /// does not returns nil there and keeps its ordinary row.
 struct PersonaWriteReceiptRow: View {
-    var message: ChatMessage
-    /// The exact section title the first conversation's exemption was armed
-    /// with, read once per transcript by the caller rather than per row.
-    var exemptTitle: String?
+    let outcome: String
+    let meta: String
 
     /// Nil for every tool call that is not THE first conversation's own write.
     ///
@@ -30,7 +29,8 @@ struct PersonaWriteReceiptRow: View {
         for message: ChatMessage,
         exemptTitle: String?
     ) -> (outcome: String, meta: String)? {
-        guard let exemptTitle, !exemptTitle.isEmpty else { return nil }
+        guard let exemptTitle, !exemptTitle.isEmpty,
+              message.metadata?.toolName == "persona_append_section" || message.metadata?.toolName == "app" else { return nil }
         let status = ChatShellToolSummary.status(
             kind: message.metadata?.kind,
             ok: message.metadata?.ok,
@@ -48,13 +48,7 @@ struct PersonaWriteReceiptRow: View {
     }
 
     var body: some View {
-        if let receipt = Self.receipt(for: message, exemptTitle: exemptTitle) {
-            InlineCardReceipt(
-                mark: .done,
-                outcome: receipt.outcome,
-                meta: receipt.meta
-            )
+        InlineCardReceipt(mark: .done, outcome: outcome, meta: meta)
             .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-        }
     }
 }

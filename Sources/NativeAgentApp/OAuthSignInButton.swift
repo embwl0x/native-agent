@@ -14,7 +14,7 @@ import PersistenceCore
 /// Drop into Settings, onboarding, or anywhere else.
 /// Examples:
 ///   OAuthSignInButton(provider: .chatgpt)
-///   OAuthSignInButton(provider: .claude)
+///   OAuthSignInButton(provider: .anthropic)
 struct OAuthSignInButton: View {
     let provider: OAuthProvider
     var onSuccess: (() -> Void)? = nil
@@ -182,39 +182,29 @@ struct OAuthSignInButton: View {
         authStatusText = nil
         print("[oauth-signin] starting native flow for \(provider.id)")
 
-        let result = await NativeOAuthFlow.startOAuthFlow(
-            platform: NativeOAuthPlatform.self,
-            providerId: provider.id,
-            dataRoot: oauthDataRoot
+        let result = await appModel.engine.providers.connectOAuthProvider(
+            platform: NativeOAuthPlatform.self, providerID: provider.id,
+            present: { result in
+                NSApp.activate(ignoringOtherApps: true)
+                if result.ok {
+                    status = .complete
+                    authStatusText = NativeOAuthFlow.signInStatusDetail(
+                        providerId: provider.id, dataRoot: oauthDataRoot
+                    ) ?? "Signed in"
+                } else {
+                    status = .idle
+                    lastError = result.error ?? "OAuth failed (no details)"
+                }
+            },
+            refreshProviders: { _ = await appModel.loadProvidersForChat() },
+            failure: { error, action in appModel.setFailureStatus(error, action: action) },
+            clearOverride: { try await appModel.clearSurfaceOverride(surface: $0) }
         )
-        if Task.isCancelled {
+        guard let result else {
             status = .idle
             return
         }
-        // ChatGPT and Grok finish in the browser; bring the result back to the person.
-        NSApp.activate(ignoringOtherApps: true)
-        if result.ok {
-            status = .complete
-            // F.evalfix2/R2: render the same countdown the next refreshStatus
-            // cycle would compute, off the just-written auth.json — not a
-            // placeholder. If signInStatusDetail can't read expiry (long-lived
-            // setup_token), fall through to "Signed in".
-            authStatusText = NativeOAuthFlow.signInStatusDetail(
-                providerId: provider.id,
-                dataRoot: oauthDataRoot
-            )
-                ?? "Signed in"
-            await appModel.loadProvidersForChat()
-            // Fill any blank/stale surfaces with the provider just connected, so
-            // the user isn't left hand-switching surfaces off the codex default.
-            // Only touches unconfigured/unavailable surfaces — never clobbers a
-            // surface already on another connected provider.
-            await appModel.adoptProviderForBlankSurfaces(provider.id)
-            onSuccess?()
-        } else {
-            status = .idle
-            lastError = result.error ?? "OAuth failed (no details)"
-        }
+        if result.ok { onSuccess?() }
     }
 
     @MainActor
@@ -238,11 +228,11 @@ struct OAuthSignInButton: View {
     @MainActor
     private func refreshStatus() async {
         guard flowTask == nil else { return }
-        let projection = OAuthSignInPresentation.status(
+        let projection = NativeOAuthFlow.signInStatus(
             providerID: provider.id,
             dataRoot: oauthDataRoot
         )
-        status = projection.state
+        status = projection.isSignedIn ? .complete : .idle
         authStatusText = projection.detail
         lastError = projection.error
         cliSessionOffer = provider.id == "openai_oauth_direct"
@@ -255,14 +245,15 @@ struct OAuthSignInButton: View {
     /// the badge labels it as an adopted CLI session.
     @MainActor
     private func acceptCLISessionOffer() async {
-        guard NativeOAuthFlow.recordCodexCLISessionDecision(
-            allow: true, source: "providers_offer", dataRoot: oauthDataRoot) else {
+        guard await appModel.engine.providers.acceptCodexCLISession(
+            refreshStatus: { await refreshStatus() },
+            refreshProviders: { _ = await appModel.loadProvidersForChat() },
+            failure: { error, action in appModel.setFailureStatus(error, action: action) },
+            clearOverride: { try await appModel.clearSurfaceOverride(surface: $0) }
+        ) else {
             lastError = "Could not save the choice — check disk permissions."
             return
         }
-        await refreshStatus()
-        await appModel.loadProvidersForChat()
-        await appModel.adoptProviderForBlankSurfaces(provider.id)
         onSuccess?()
     }
 
@@ -308,8 +299,6 @@ struct OAuthProvider {
         iconSystemName: "sparkles"
     )
 
-    /// Back-compat alias — earlier code referred to this provider as `.claude`.
-    static let claude = anthropic
 }
 
 // MARK: - Presentation context (AppKit hook)
@@ -359,5 +348,40 @@ final class OAuthSignInPresenter: NSObject, ASWebAuthenticationPresentationConte
         )
         fallbackAnchorWindow = fallback
         return fallback
+    }
+}
+
+/// The persisted-credential outcome shown by every OAuth sign-in control.
+/// It is intentionally derived from the same root-aware read as the runtime,
+/// rather than from a mounted SwiftUI control or an optimistic write result.
+enum OAuthSignInPresentation {
+    enum State: Equatable {
+        case idle
+        case running
+        case complete
+    }
+
+    struct ButtonControl: Equatable {
+        let title: String
+        let isDisabled: Bool
+        var showsCancel: Bool = false
+        var guidance: String? = nil
+    }
+
+    static func buttonControl(providerDisplayShort: String, state: State) -> ButtonControl {
+        switch state {
+        case .running:
+            return ButtonControl(
+                title: "Signing in…", isDisabled: true,
+                showsCancel: true, guidance: "Finish signing in in your browser"
+            )
+        case .complete:
+            return ButtonControl(
+                title: "Re-authenticate \(providerDisplayShort)",
+                isDisabled: false
+            )
+        case .idle:
+            return ButtonControl(title: "Sign in with \(providerDisplayShort)", isDisabled: false)
+        }
     }
 }

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 enum SlackInboundDeliveryPhase: String, Codable, Sendable {
@@ -10,8 +11,10 @@ enum SlackInboundDeliveryPhase: String, Codable, Sendable {
     case delivered
     case interrupted
     case outcomeUnknown = "outcome_unknown"
+    case sentUnconfirmed = "sent_unconfirmed"
+    case failedBeforeAnswer = "failed_before_answer"
 
-    var isTerminal: Bool { self == .delivered || self == .interrupted }
+    var isTerminal: Bool { self == .delivered || self == .interrupted || self == .sentUnconfirmed || self == .failedBeforeAnswer }
 }
 
 struct SlackPreparedUpload: Codable, Equatable, Sendable {
@@ -103,12 +106,26 @@ struct SlackDurableInboundPayload: Codable, Equatable, Sendable {
 }
 
 struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
+    struct Rejection: Codable, Equatable, Sendable {
+        let reason: String
+        let preparedFingerprint: String
+        let at: Date
+    }
+
     let inbound: SlackDurableInboundPayload
     var phase: SlackInboundDeliveryPhase
     var prepared: SlackPreparedReply?
     var dispatchStartedAt: Date?
     var updatedAt: Date
     var outcomeDetail: String?
+    var assistantRunId: String? = nil
+    var assistantSessionId: String? = nil
+    var assistantOriginRunId: String? = nil
+    var settledAssistantRuns: [String: String]? = nil
+    var failedBeforeAnswer: Bool? = nil
+    var lastRejection: Rejection? = nil
+    var confirmedText: Bool? = nil
+    var confirmedUploadCount: Int? = nil
 }
 
 enum SlackInboundClaimOutcome: Sendable, Equatable {
@@ -160,15 +177,7 @@ public actor SlackInboundDeliveryJournal {
 
         init() {}
 
-        /// HAND-WRITTEN because a synthesized `init(from:)` ignores the default
-        /// values above: a 0.4.11 journal, which has no `botEventClaims` key,
-        /// threw `keyNotFound` — and `loadFile` treats any decode throw as
-        /// damage, so a perfectly healthy journal was renamed aside and every
-        /// accepted-but-undelivered reply vanished from recovery on upgrade.
-        /// ONLY the 0.4.12 addition is optional. `version` and `records` were
-        /// required in 0.4.11 and stay required: a `{}` or `{"version":1}` file
-        /// is damage, not an empty journal, and must still fail decode so
-        /// `loadFile` quarantines it instead of silently starting over.
+        /// Only `botEventClaims`, added in 0.4.12, may be absent in older journals.
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             version = try c.decode(Int.self, forKey: .version)
@@ -179,15 +188,15 @@ public actor SlackInboundDeliveryJournal {
     }
 
     private let path: URL
-    private let terminalCap: Int
-    private let pendingCap: Int
+    private let dataRoot: URL
+    private let terminalCap = 500
+    private let pendingCap = 100
     private let encoder: JSONEncoder
     private var activeHandlers: Set<String> = []
 
-    init(dataRoot: URL, terminalCap: Int = 500, pendingCap: Int = 100) {
+    init(dataRoot: URL) {
         path = Self.path(dataRoot: dataRoot)
-        self.terminalCap = max(1, terminalCap)
-        self.pendingCap = max(1, pendingCap)
+        self.dataRoot = dataRoot
         encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
@@ -204,7 +213,6 @@ public actor SlackInboundDeliveryJournal {
     public nonisolated static func recoverySummary(dataRoot: URL) throws -> RecoverySummary? {
         let path = path(dataRoot: dataRoot)
         let existed = FileManager.default.fileExists(atPath: path.path)
-        // loadFile may quarantine, so count the evidence files afterwards.
         let file = existed ? try loadFile(path: path) : File()
         let quarantined = quarantinedEvidencePaths(dataRoot: dataRoot).count
         guard existed || quarantined > 0 else { return nil }
@@ -214,6 +222,14 @@ public actor SlackInboundDeliveryJournal {
             pendingLimit: max(1, file.pendingLimit ?? 100),
             quarantinedCount: quarantined
         )
+    }
+
+    public nonisolated static func failedReplyClaims(dataRoot: URL) throws -> [(path: URL, at: String)] {
+        let path = path(dataRoot: dataRoot)
+        let formatter = ISO8601DateFormatter()
+        return try loadFile(path: path).records.filter { $0.phase == .failedBeforeAnswer }.map {
+            (path: path, at: formatter.string(from: $0.updatedAt))
+        }
     }
 
     /// Damaged journals this actor renamed aside, newest last. Never deleted:
@@ -257,6 +273,28 @@ public actor SlackInboundDeliveryJournal {
         activeHandlers.insert(eventId).inserted
     }
 
+    func reserveReply(_ inbound: SlackInboundMessage, reply: SlackPreparedReply, runId: String,
+                      sessionId: String, priorVerdict: String?) throws -> SlackInboundDeliveryRecord {
+        try CredentialFileLock.withLock(path) {
+            var file = try load()
+            if let record = file.records.first(where: { $0.inbound.eventId == inbound.eventId }) {
+                guard record.assistantRunId == runId, record.assistantSessionId == sessionId,
+                      record.prepared == reply, record.inbound.channelId == inbound.channelId,
+                      record.inbound.threadTs == inbound.threadTs else { throw SlackInboundJournalError.malformed }
+                return record
+            }
+            guard file.records.filter({ !$0.phase.isTerminal }).count < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
+            let record = SlackInboundDeliveryRecord(inbound: SlackDurableInboundPayload(inbound),
+                phase: priorVerdict == "completed" ? .delivered : priorVerdict == nil ? .prepared : .sentUnconfirmed,
+                prepared: reply, dispatchStartedAt: nil, updatedAt: Date(),
+                outcomeDetail: priorVerdict == "sent_unconfirmed" ? "legacy_completion_dispatch_unconfirmed" : nil,
+                assistantRunId: runId, assistantSessionId: sessionId)
+            file.records.append(record)
+            try save(file)
+            return record
+        }
+    }
+
     /// Durable once-only claim for waking bots on this message (0.4.12). The
     /// handler set above is in-memory, so recovery or a retry of an unresolved
     /// row would re-enter handling after a restart; this claim is persisted
@@ -289,21 +327,26 @@ public actor SlackInboundDeliveryJournal {
         activeHandlers.remove(eventId)
     }
 
-    func prepare(eventId: String, reply: SlackPreparedReply, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
+    func prepare(eventId: String, reply: SlackPreparedReply, failedBeforeAnswer: Bool = false,
+                 now: Date = Date()) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) { record in
             record.phase = .prepared
             record.prepared = reply
             record.dispatchStartedAt = nil
             record.updatedAt = now
             record.outcomeDetail = nil
+            record.failedBeforeAnswer = failedBeforeAnswer
         }
     }
 
-    func beginGeneration(eventId: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
+    func beginGeneration(eventId: String, runId: String, sessionId: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) { record in
             record.phase = .generating
             record.updatedAt = now
             record.outcomeDetail = nil
+            record.assistantRunId = runId
+            record.assistantSessionId = sessionId
+            record.assistantOriginRunId = runId
         }
     }
 
@@ -316,20 +359,35 @@ public actor SlackInboundDeliveryJournal {
         }
     }
 
-    func retryPrepared(eventId: String, detail: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
+    func retryPrepared(eventId: String, detail: String, rejectionReason: String? = nil, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) { record in
+            if record.phase == .prepared, record.outcomeDetail == detail,
+               rejectionReason == nil || record.lastRejection?.preparedFingerprint == record.prepared?.fingerprint { return }
             record.phase = .prepared
             record.dispatchStartedAt = nil
             record.updatedAt = now
             record.outcomeDetail = detail
+            if let rejectionReason, let prepared = record.prepared {
+                record.lastRejection = .init(reason: rejectionReason, preparedFingerprint: prepared.fingerprint, at: now)
+            }
         }
     }
 
     func markDelivered(eventId: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) { record in
-            record.phase = .delivered
+            record.phase = record.failedBeforeAnswer == true ? .failedBeforeAnswer : .delivered
             record.updatedAt = now
             record.outcomeDetail = nil
+        }
+    }
+
+    func confirmReplyPart(eventId: String, isText: Bool) throws -> SlackInboundDeliveryRecord {
+        try mutate(eventId: eventId) {
+            if isText { $0.confirmedText = true }
+            else { $0.confirmedUploadCount = ($0.confirmedUploadCount ?? 0) + 1 }
+            $0.phase = .prepared
+            $0.dispatchStartedAt = nil
+            $0.updatedAt = Date()
         }
     }
 
@@ -341,11 +399,10 @@ public actor SlackInboundDeliveryJournal {
         }
     }
 
-    func markInterrupted(eventId: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
-        try mutate(eventId: eventId) { record in
-            record.phase = .interrupted
-            record.updatedAt = now
-            record.outcomeDetail = "Reply generation was interrupted; prior chat/tool effects require recovery before rerunning the turn"
+    func settleUnconfirmed(eventId: String, failedBeforeAnswer: Bool = false) throws -> SlackInboundDeliveryRecord {
+        try mutate(eventId: eventId) {
+            $0.phase = failedBeforeAnswer || $0.failedBeforeAnswer == true ? .failedBeforeAnswer : .sentUnconfirmed
+            $0.updatedAt = Date()
         }
     }
 
@@ -359,6 +416,55 @@ public actor SlackInboundDeliveryJournal {
         try load().records.first { $0.inbound.eventId == eventId }
     }
 
+    func answerRecord(runId: String, originRunId: String) throws -> SlackInboundDeliveryRecord? {
+        try load().records.first { $0.assistantRunId == runId || $0.assistantRunId == originRunId || $0.assistantOriginRunId == originRunId || $0.settledAssistantRuns?[runId] != nil }
+    }
+
+    func savedUnconfirmedReply(for inbound: SlackInboundMessage) throws -> SlackInboundDeliveryRecord? {
+        try load().records.filter {
+            $0.phase == .sentUnconfirmed && $0.inbound.teamId == inbound.teamId
+                && $0.inbound.channelId == inbound.channelId && $0.inbound.userId == inbound.userId
+                && ($0.inbound.threadTs == inbound.threadTs
+                    || inbound.threadTs != nil && $0.inbound.inbound.replyThreadTs == inbound.threadTs)
+        }.max { $0.updatedAt < $1.updatedAt }
+    }
+
+    func retryRejectedReply(for inbound: SlackInboundMessage) throws -> SlackInboundDeliveryRecord? {
+        try CredentialFileLock.withLock(path) {
+            var file = try load()
+            guard let command = file.records.firstIndex(where: { $0.inbound.eventId == inbound.eventId && $0.phase == .claimed }),
+                  let rejected = file.records.indices.filter({ index in
+                      let record = file.records[index]
+                      return record.phase == .prepared && record.lastRejection != nil
+                          && record.lastRejection?.preparedFingerprint == record.prepared?.fingerprint
+                          && record.inbound.teamId == inbound.teamId && record.inbound.channelId == inbound.channelId
+                          && record.inbound.userId == inbound.userId
+                          && (record.inbound.threadTs == inbound.threadTs
+                              || inbound.threadTs != nil && record.inbound.inbound.replyThreadTs == inbound.threadTs)
+                  }).max(by: { file.records[$0].updatedAt < file.records[$1].updatedAt }) else { return nil }
+            file.records[rejected].lastRejection = nil
+            file.records[rejected].outcomeDetail = nil
+            file.records[rejected].updatedAt = Date()
+            // Consume the command with the reset so recovery cannot repeatedly clear a new rejection.
+            file.records[command].prepared = file.records[rejected].prepared
+            file.records[command].phase = .delivered
+            file.records[command].updatedAt = Date()
+            let record = file.records[rejected]
+            try save(file)
+            return record
+        }
+    }
+
+    func prepareSuccessor(eventId: String, response: SlackPreparedReply, runId: String, sessionId: String) throws {
+        _ = try mutate(eventId: eventId) {
+            if let priorRun = $0.assistantRunId { $0.settledAssistantRuns = ($0.settledAssistantRuns ?? [:]).merging([priorRun: $0.phase.rawValue], uniquingKeysWith: { first, _ in first }) }
+            $0.assistantOriginRunId = $0.assistantOriginRunId ?? $0.assistantRunId
+            $0.assistantRunId = runId; $0.assistantSessionId = sessionId
+            $0.prepared = response; $0.phase = .prepared; $0.failedBeforeAnswer = false; $0.dispatchStartedAt = nil; $0.updatedAt = Date()
+            $0.confirmedText = nil; $0.confirmedUploadCount = nil
+        }
+    }
+
     private func mutate(
         eventId: String,
         update: (inout SlackInboundDeliveryRecord) -> Void
@@ -368,9 +474,10 @@ public actor SlackInboundDeliveryJournal {
             guard let index = file.records.firstIndex(where: { $0.inbound.eventId == eventId }) else {
                 throw SlackInboundJournalError.missingClaim(eventId)
             }
+            let previous = file.records[index]
             update(&file.records[index])
             let result = file.records[index]
-            try save(file)
+            if result != previous { try save(file) }
             return result
         }
     }
@@ -381,8 +488,6 @@ public actor SlackInboundDeliveryJournal {
 
     nonisolated private static func loadFile(path: URL) throws -> File {
         guard FileManager.default.fileExists(atPath: path.path) else { return File() }
-        // A read failure (permissions, I/O) says nothing about the CONTENT and
-        // must never quarantine a healthy journal; it stays a hard error.
         let data = try Data(contentsOf: path)
         do {
             let decoder = JSONDecoder()
@@ -393,35 +498,12 @@ public actor SlackInboundDeliveryJournal {
                   file.records.allSatisfy({
                       !$0.inbound.eventId.isEmpty
                         && ($0.phase == .claimed || $0.phase == .generating || $0.phase == .interrupted
-                            || $0.phase == .outcomeUnknown || $0.prepared != nil)
+                            || $0.phase == .outcomeUnknown || $0.phase == .failedBeforeAnswer || $0.prepared != nil)
                   }) else { throw SlackInboundJournalError.malformed }
             return file
         } catch {
             // Unreadable replay evidence cannot authorize a fresh admission.
             throw SlackInboundJournalError.malformed
-        }
-    }
-
-    @discardableResult
-    nonisolated private static func quarantine(path: URL) -> Bool {
-        let directory = path.deletingLastPathComponent()
-        let stamp = Int(Date().timeIntervalSince1970)
-        var destination = directory
-            .appendingPathComponent(path.lastPathComponent + "\(quarantineSuffixPrefix)\(stamp)")
-        var attempt = 1
-        while FileManager.default.fileExists(atPath: destination.path), attempt < 100 {
-            destination = directory
-                .appendingPathComponent(path.lastPathComponent + "\(quarantineSuffixPrefix)\(stamp)-\(attempt)")
-            attempt += 1
-        }
-        guard !FileManager.default.fileExists(atPath: destination.path) else { return false }
-        do {
-            try FileManager.default.moveItem(at: path, to: destination)
-            return true
-        } catch {
-            // A concurrent owner may already have moved it aside; that is a
-            // healed journal, not a failure. Anything else keeps the refusal.
-            return !FileManager.default.fileExists(atPath: path.path)
         }
     }
 
@@ -431,9 +513,17 @@ public actor SlackInboundDeliveryJournal {
             .filter { $0.phase.isTerminal }
             .sorted { $0.updatedAt > $1.updatedAt }
         let unresolved = file.records.filter { !$0.phase.isTerminal }
-        file.records = unresolved + terminal.prefix(terminalCap)
+        let referenced = try? CodexCompletionLifecycleProjection.unsettledAnswerRuns(
+            configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
+        let protected = terminal.filter { record in
+            guard let referenced else { return true }
+            return !Set(record.settledAssistantRuns?.keys.map { $0 } ?? [])
+                .union([record.assistantRunId, record.assistantOriginRunId].compactMap { $0 }).isDisjoint(with: referenced)
+        }
+        file.records = unresolved + protected + terminal.filter { !protected.contains($0) }.prefix(terminalCap)
         file.pendingLimit = pendingCap
-        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let directory = path.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         // Creation-time 0600, not chmod after publication: the existing slack
         // directory may be 0755 and these rows contain private message bodies.
         guard NativePrivateFile.write(try encoder.encode(file), to: path) else {

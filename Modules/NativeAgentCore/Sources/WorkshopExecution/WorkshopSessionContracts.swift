@@ -11,25 +11,16 @@ public enum WorkshopSessionStatus: String, Sendable, Equatable {
 public struct WorkshopSessionRequest: Sendable, Equatable {
     public let handle: String
     public let reservationId: String
-    /// "workshop:<handle>:<reservationId>" — the sole authorization token.
-    public let triggerSource: String
-    public let title: String
     /// The bounded work prompt (item title/why/doneLooksLike) — no persona bytes.
     public let promptSeed: String
 
     // Internal on purpose: only the Core-owned pump can mint a workshop run.
     // Chat tools and other modules can observe reservation ids, but cannot
     // construct an executable request from that data.
-    init(handle: String, reservationId: String, title: String, promptSeed: String) {
+    init(handle: String, reservationId: String, promptSeed: String) {
         self.handle = handle
         self.reservationId = reservationId
-        self.triggerSource = WorkshopSessionRequest.makeTriggerSource(handle: handle, reservationId: reservationId)
-        self.title = title
         self.promptSeed = promptSeed
-    }
-
-    public static func makeTriggerSource(handle: String, reservationId: String) -> String {
-        "workshop:\(handle):\(reservationId)"
     }
 }
 
@@ -59,8 +50,4 @@ public struct WorkshopSessionReceipt: Sendable, Equatable {
         self.generatedAt = generatedAt
         self.disposition = disposition
     }
-}
-
-public protocol WorkshopSessionRunning: Sendable {
-    func run(_ request: WorkshopSessionRequest) async -> WorkshopSessionReceipt
 }

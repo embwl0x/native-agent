@@ -3,6 +3,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import MacIntegration
+import MacControl
 
 extension SwiftToolDispatcher {
     /// Agent raising a need HERSELF, before hitting a wall.
@@ -107,6 +108,7 @@ extension SwiftToolDispatcher {
             }
         }()
 
+        var automation: [JSONValue] = []
         let interaction: InlineInteraction?
         switch kind {
         case .connector:
@@ -118,6 +120,9 @@ extension SwiftToolDispatcher {
                 declineConsequence: declineConsequence
             )
         case .permission:
+            if target == "applescript" {
+                return failed("missing_target", "Automation consent is per app. Request permission with target applescript:<bundle_id>.")
+            }
             let access = text("mode", "access").flatMap { InlineInteraction.AccessMode(rawValue: $0) }
             // A chain she can predict is ONE ask. Extra capabilities are
             // canonical ids from the Mac list; anything the registry does not
@@ -129,17 +134,34 @@ extension SwiftToolDispatcher {
                     return nil
                 }
             }
-            do {
-                let permissions = try await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()
-                for capability in capabilities {
-                    for mode in [MacIntegrationPermissionMode.read, .write]
-                    where access == nil || access?.rawValue == mode.rawValue || access == .readWrite {
-                        if let refusal = permissions.refusal(integration: capability, mode: mode) {
-                            return failed("operator_permission_off", refusal)
+            if capabilities.contains(where: MacIntegrationID.all.contains) {
+                do {
+                    let permissions = try await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()
+                    for capability in capabilities where MacIntegrationID.all.contains(capability) {
+                        for mode in [MacIntegrationPermissionMode.read, .write]
+                        where access == nil || access?.rawValue == mode.rawValue || access == .readWrite {
+                            if let refusal = permissions.refusal(integration: capability, mode: mode) {
+                                return failed("operator_permission_off", refusal)
+                            }
                         }
                     }
+                } catch { return failed("permission_settings_unavailable", "Mac permission settings could not be read; the saved switch must be available before requesting access.") }
+            }
+            for capability in capabilities {
+                guard let bundleID = SystemAppleScriptAdapter.automationTarget(capability) else { continue }
+                let permission = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID)
+                guard case .object(let fields) = permission, fields["app_path"] != nil else {
+                    return failed("app_not_installed", "No installed app resolves \(bundleID); install that app before requesting Automation consent.")
                 }
-            } catch { return failed("permission_settings_unavailable", "Mac permission settings could not be read; the saved switch must be available before requesting access.") }
+                automation.append(permission)
+                if fields["state"] == .string("allowed") {
+                    capabilities.removeAll { $0 == capability }
+                }
+            }
+            if capabilities.isEmpty, !automation.isEmpty {
+                return .object(["status": .string("ok"), "already_done": .bool(true), "effects": .string("none"),
+                    "summary": .string("Automation is already allowed; no card is needed."), "automation": .array(automation)])
+            }
             // She may say which axis she needs; she cannot widen one. An
             // unknown value reads as "both", which is what the card would have
             // said before this field existed.
@@ -211,6 +233,11 @@ extension SwiftToolDispatcher {
                 descriptor.unavailableReason ?? "No control for \(interaction.target)."
             )
         }
-        return InlineInteractionNeed.envelope(interaction)
+        let result = InlineInteractionNeed.envelope(interaction)
+        if kind == .permission, case .object(var fields) = result {
+            if !automation.isEmpty { fields["automation"] = .array(automation) }
+            return .object(fields)
+        }
+        return result
     }
 }

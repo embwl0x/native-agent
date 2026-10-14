@@ -1,3 +1,5 @@
+import ChatOrchestration
+import EngineRuntime
 import SwiftUI
 import NativeAgentShared
 import TrustCenter
@@ -150,7 +152,9 @@ struct ShellConversationRow: View {
                         .layoutPriority(1)
                     Spacer(minLength: 0)
                 }
-                Text(ChatShellConversationRow.subtitle(for: session))
+                Text(ChatShellConversationRow.subtitle(for: session, relativeTimestamp: {
+                    UserDisplayFormatters.relativeISOTimestamp($0, unitsStyle: .abbreviated, fallback: "")
+                }))
                     .font(preview.isEmpty ? ShellType.labelMedium : ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
@@ -288,49 +292,30 @@ struct ShellToolRow: View {
     var messages: [ChatMessage]
     @State private var expanded = false
 
-    /// Only a recorded FALSE is a failure; most rows record no outcome at all
-    /// (2026-09-06, same rule the detail lines use). 2026-09-14: a row that
-    /// raised an inline card is a QUESTION, so it is classified separately and
-    /// never counted here — pending or answered.
-    private var statuses: [ChatShellToolSummary.Status] {
-        messages.map {
-            ChatShellToolSummary.status(
-                kind: $0.metadata?.kind,
-                ok: $0.metadata?.ok,
-                resultSummary: $0.metadata?.resultSummary,
-                resultStatus: $0.metadata?.resultStatus,
-                interactionState: $0.metadata?.interactionState
-            )
-        }
+    @State private var statuses: [ChatShellToolSummary.Status] = []
+    @State private var details: [String] = []
+    private struct Revision: Equatable, Sendable {
+        let messages: [ChatMessage]
+        let expanded: Bool
     }
+    @State private var preparedRevision: Revision?
 
-    private var failedCount: Int { statuses.filter { $0 == .failed }.count }
-    private var needsYouCount: Int { statuses.filter { $0 == .needsYou }.count }
-
-    private var details: [String] {
-        zip(messages, statuses).map { message, status in
-            ChatShellToolSummary.detailLine(
-                toolName: message.metadata?.toolName,
-                inputJSON: message.metadata?.inputJSON,
-                // 2026-09-06: the outcome used to be dropped here, so a
-                // write_file that failed still read "Wrote a file".
-                status: status
-            )
-        }
-    }
 
     var body: some View {
-        let all = details
-        let shown = Array(zip(messages, all).prefix(ChatShellToolSummary.detailLimit))
+        let current = preparedRevision == Revision(messages: messages, expanded: expanded)
+        let details = current ? self.details : []
+        let statuses = current ? self.statuses : []
+        let shown = Array(zip(messages.prefix(ChatShellToolSummary.detailLimit), details))
         let headline = ChatShellToolSummary.headline(
-            count: messages.count, failed: failedCount, needsYou: needsYouCount)
+            count: messages.count, failed: statuses.filter { $0 == .failed }.count,
+            needsYou: statuses.filter { $0 == .needsYou }.count)
         ChatActivityRow(title: headline, isExpanded: $expanded) {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(shown, id: \.0.id) { pair in
                     ToolPillView(message: pair.0, headline: pair.1)
                 }
                 if let overflow = ChatShellToolSummary.overflowLine(
-                    total: all.count, shown: shown.count
+                    total: messages.count, shown: shown.count
                 ) {
                     Text(overflow)
                         .foregroundStyle(NativeAgentShell.tertiary)
@@ -340,6 +325,27 @@ struct ShellToolRow: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(headline)
+        .task(id: Revision(messages: messages, expanded: expanded)) {
+            let revision = Revision(messages: messages, expanded: expanded)
+            let prepared = await Task.detached(priority: .userInitiated) {
+                let statuses = revision.messages.map { message in
+                    ChatShellToolSummary.status(
+                        kind: message.metadata?.kind, ok: message.metadata?.ok,
+                        resultSummary: message.metadata?.resultSummary, resultStatus: message.metadata?.resultStatus,
+                        interactionState: message.metadata?.interactionState)
+                }
+                let details = revision.expanded
+                    ? zip(revision.messages, statuses).prefix(ChatShellToolSummary.detailLimit).map { message, status in
+                        ChatShellToolSummary.detailLine(toolName: message.metadata?.toolName,
+                                                       inputJSON: message.metadata?.inputJSON, status: status)
+                    } : []
+                return (statuses, details)
+            }.value
+            guard !Task.isCancelled else { return }
+            self.statuses = prepared.0
+            self.details = prepared.1
+            preparedRevision = revision
+        }
     }
 }
 

@@ -8,13 +8,11 @@ import ChatTurnContracts
 struct NativeSwarmChatClientFactory: SwarmChatClientFactory {
     func makeClient(tools: any ToolDispatchClient, dataRoot: URL,
                     approvalFiler: (any ApprovalFiler)?,
-                    providerLifecycleObserver: (any LLMCallLifecycleObserving)?,
-                    codexAdapterFactory: (@Sendable ([String: String]?) -> any LLMAdapter)?) -> any SwarmChatClient {
+                    providerLifecycleObserver: (any LLMCallLifecycleObserving)?) -> any SwarmChatClient {
         NativeSwarmChatClient(client: makeChatOrchestrationClient(
             tools: tools, dataRoot: dataRoot, providersRoot: dataRoot,
             approvalFiler: approvalFiler,
-            providerLifecycleObserver: providerLifecycleObserver,
-            codexAdapterFactory: codexAdapterFactory
+            providerLifecycleObserver: providerLifecycleObserver
         ))
     }
 }

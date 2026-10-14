@@ -56,7 +56,7 @@ public enum KnowledgeGraphJSONLoadError: Error, Sendable {
 // MARK: - KnowledgeGraphStore (read-only)
 
 /// Pure, read-only in-memory view over a loaded knowledge_graph.json document.
-/// Construct via `load(path:)` or `init(document:)`. All query methods are
+/// Construct via `loadChecked(path:)` or `normalize`. All query methods are
 /// deterministic functions of the loaded data — no disk writes, no locks.
 public struct KnowledgeGraphStore: Sendable {
     /// Normalized entities keyed by id (insertion order preserved via `entityOrder`).
@@ -66,57 +66,19 @@ public struct KnowledgeGraphStore: Sendable {
     public let entityOrder: [String]
     /// Normalized, orphan-pruned edge list.
     public let edges: [JSONValue]
-    /// WAVE 32 W04: the deterministic-freshness commit counter stamped into the
-    /// file by the daemon's `_flush_locked` (top-level `"_commit_seq"`). 0 when the
-    /// file predates the field or is missing/unparseable. The SwiftNative reader's
-    /// flush-read-confirm sandwich (`verifiedFreshStore`) requires this to EQUAL the
-    /// seq the `/v1/knowledge_graph/flush` route reports across both confirming
-    /// flushes (`seq1 == seq2 == commitSeq`). Files written by an older daemon (no
-    /// field) yield 0; a LIVE W32 daemon always reports seq >= 1 (it force-stamps off
-    /// 0), so a 0 here can never equal the reported seq and the reader safely defers
-    /// to the authoritative HTTP path — never serving an unverifiable snapshot.
-    public let commitSeq: Int
-
     public init(
         entities: [String: JSONValue],
         entityOrder: [String],
-        edges: [JSONValue],
-        commitSeq: Int = 0
+        edges: [JSONValue]
     ) {
         self.entities = entities
         self.entityOrder = entityOrder
         self.edges = edges
-        self.commitSeq = commitSeq
     }
 
-    /// Load + normalize from the on-disk JSON file. Mirrors `_load()` in
-    /// the retired daemon (L108-206). Returns an EMPTY store (not nil)
-    /// when the file is missing or unreadable — matching Python, which boots a
-    /// fresh `{"entities": {}, "edges": [], "version": 1}` skeleton.
-    ///
-    /// The daemon writes the file via `json.dumps(self._data, indent=2)` with
-    /// NO sort_keys, so the file's textual entity-key
-    /// order == Python dict INSERTION order. `all_entities` paginates in that
-    /// order and `search_entities` ties break on it (stable sort). Swift's
-    /// JSONSerialization does NOT preserve object key order, so we recover the
-    /// top-level `"entities"` key order directly from the raw bytes and feed it
-    /// to `normalize` (gpt-5.5 review finding #2).
-    public static func load(path: URL) -> KnowledgeGraphStore {
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let raw) = parsed else {
-            return KnowledgeGraphStore(entities: [:], entityOrder: [], edges: [])
-        }
-        let keyOrder = extractEntitiesKeyOrder(from: data)
-        return normalize(raw, entityKeyOrder: keyOrder)
-    }
-
-    /// U5 W-C (2026-06-11): like `load(path:)` but with the empty-vs-error
-    /// distinction the honest read path needs. A MISSING file is a legitimate
-    /// empty graph (Python boots the skeleton, fresh installs have no file);
-    /// a file that EXISTS but cannot be read or parsed is an ERROR — it must
-    /// never render as an empty-but-healthy graph. `load(path:)` keeps its
-    /// silent-empty contract for the import path and historical callers.
+    /// A missing file is a legitimate empty graph; an existing unreadable or
+    /// malformed file is an error. Recover textual entity-key order before
+    /// normalization because JSONSerialization discards insertion order.
     public static func loadChecked(path: URL) throws -> KnowledgeGraphStore {
         guard FileManager.default.fileExists(atPath: path.path) else {
             return KnowledgeGraphStore(entities: [:], entityOrder: [], edges: [])
@@ -138,27 +100,11 @@ public struct KnowledgeGraphStore: Sendable {
         return normalize(raw, entityKeyOrder: extractEntitiesKeyOrder(from: data))
     }
 
-    /// WAVE 32 W04: extract the daemon's persisted `"_commit_seq"` from a parsed
-    /// graph object. Mirrors the daemon's restore logic (`max(0, int(... or 0))`):
-    /// an int -> itself (floored, clamped ≥0), a numeric string -> parsed, anything
-    /// else / missing -> 0. The reader uses this to verify the on-disk file is at
-    /// least as new as the flush the daemon just confirmed.
-    static func commitSeq(from raw: [String: JSONValue]) -> Int {
-        switch raw["_commit_seq"] {
-        case .some(.int(let i)): return max(0, Int(i))
-        case .some(.double(let d)): return max(0, Int(exactly: d.rounded(.towardZero)) ?? 0)
-        case .some(.string(let s)): return max(0, Int(s) ?? 0)
-        default: return 0
-        }
-    }
-
-    /// Apply the same skeleton-merge + entity/edge normalization Python does on
-    /// load. Kept separate from `load` so tests can pin behavior on an in-memory
-    /// document without touching disk.
+    /// Apply the legacy skeleton-merge + entity/edge normalization.
     ///
     /// `entityKeyOrder`, when supplied, pins the iteration/pagination order to
     /// the file's textual key order (== Python insertion order). When nil
-    /// (in-memory tests with no source bytes), keys are visited in a stable
+    /// (in-memory documents with no source bytes), keys are visited in a stable
     /// lexicographic order so behavior is still deterministic.
     public static func normalize(
         _ raw: [String: JSONValue],
@@ -264,8 +210,7 @@ public struct KnowledgeGraphStore: Sendable {
         return KnowledgeGraphStore(
             entities: entities,
             entityOrder: order,
-            edges: normalizedEdges,
-            commitSeq: commitSeq(from: raw)
+            edges: normalizedEdges
         )
     }
 
@@ -416,7 +361,7 @@ public struct KnowledgeGraphStore: Sendable {
     /// This mirrors the Python METHOD exactly: it does NOT clamp `page` — it
     /// echoes whatever it is given. The daemon ROUTE is what clamps the param
     /// with `max(0, int(...))`, so a negative page never
-    /// reaches the method over HTTP. `SwiftNativeKnowledgeGraphReader.allEntities`
+    /// reaches the method over HTTP. `SwiftNativeKnowledgeGraphReader.allEntitiesChecked`
     /// reproduces that route-level clamp before calling this method (gpt-5.5
     /// wave-30 review finding — negative-page echo parity). Slicing uses a
     /// non-negative start so a (route-clamped, always ≥0) page never under-runs;

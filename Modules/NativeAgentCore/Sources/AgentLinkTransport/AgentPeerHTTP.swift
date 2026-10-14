@@ -5,13 +5,11 @@ import PersistenceCore
 public enum AgentPeerHTTP {
     public typealias LiveUpdateHandler = @Sendable (AgentA2AStream.LiveUpdate) async -> Void
     public static let maximumResponseBytes = 2 * 1_024 * 1_024
-    /// Test-scoped transport injection; production callers cannot configure it.
-    @TaskLocal static var fixtureConfiguration: (@Sendable () -> URLSessionConfiguration)?
     public struct Response: Sendable, Equatable {
         public let statusCode: Int
         /// Nil for an empty or non-JSON response; raw bodies are never errors.
         public let json: JSONValue?
-        public var events: [JSONValue] = []
+        public var receipt: Result<AgentA2AStream.Receipt, AgentA2AWire.WireError>?
         public var interrupted = false
     }
     public enum TransportError: Error, LocalizedError, Equatable {
@@ -34,25 +32,23 @@ public enum AgentPeerHTTP {
             return try await AgentA2AGRPC.send(request, bearerToken: bearerToken, timeout: timeout,
                 liveUpdate: liveUpdate)
         }
-        let configuration = fixtureConfiguration?() ?? .ephemeral
         return try await exchange(url: request.url, method: request.httpMethod, headers: request.headers,
                                   body: request.body, bearerToken: bearerToken, timeout: timeout,
-                                  configuration: configuration, liveUpdate: liveUpdate,
+                                  liveUpdate: liveUpdate,
                                   streamInterface: request.streamInterface, requestID: request.requestID,
                                   expectedTaskID: request.expectedTaskID)
     }
 
     public static func get(_ url: URL, bearerToken: String? = nil, headers: [String: String] = [:],
                            timeout: TimeInterval = 30, liveUpdate: LiveUpdateHandler?) async throws -> Response {
-        let configuration = fixtureConfiguration?() ?? .ephemeral
         return try await exchange(url: url, method: "GET", headers: headers, body: nil,
-                                  bearerToken: bearerToken, timeout: timeout, configuration: configuration, liveUpdate: liveUpdate)
+                                  bearerToken: bearerToken, timeout: timeout, liveUpdate: liveUpdate)
     }
 
     /// Automatic discovery has no credentials, DNS lookup, redirects or system proxy.
     package static func getLoopbackCard(_ url: URL) async throws -> Response {
         try validateLoopbackCandidate(url)
-        let configuration = fixtureConfiguration?() ?? .ephemeral
+        let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = ["HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0]
         return try await exchange(url: url, method: "GET", headers: [:], body: nil,
                                   bearerToken: nil, timeout: 0.6, configuration: configuration, liveUpdate: nil)
@@ -149,8 +145,8 @@ public enum AgentPeerHTTP {
         private var status: Int?
         private let streaming: Bool
         private var eventStream = false
-        /// The live stream retains the latest display snapshot; the result
-        /// below is still built from the whole capture, exactly as before.
+        /// Display and final evidence share the accumulator; only complete
+        /// frames advance the capture offset.
         private let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
         private var liveOffset = 0
         private var accumulator: AgentA2AStream.Accumulator?
@@ -255,10 +251,19 @@ public enum AgentPeerHTTP {
             if streaming, eventStream, let status {
                 // Only blank-line-delimited events are evidence. A truncated tail
                 // and even a clean EOF do not establish task completion.
+                let events: [JSONValue]
+                do { events = try AgentA2AStream.events(in: Data(data.dropFirst(liveOffset))) }
+                catch { finish(.failure(TransportError.unavailable)); return }
                 do {
-                    let events = try AgentA2AStream.events(in: data)
-                    finish(.success(Response(statusCode: status, json: nil, events: events, interrupted: error != nil)))
-                } catch { finish(.failure(TransportError.unavailable)) }
+                    if (200..<300).contains(status) {
+                        for event in events { _ = try accumulator?.receive(event) }
+                    }
+                    finish(.success(Response(statusCode: status, json: nil,
+                        receipt: accumulator.map { .success($0.receipt) }, interrupted: error != nil)))
+                } catch let failure as AgentA2AWire.WireError {
+                    finish(.success(Response(statusCode: status, json: nil,
+                        receipt: .failure(failure), interrupted: error != nil)))
+                } catch { finish(.failure(error)) }
                 return
             }
             guard error == nil, let status else { finish(.failure(TransportError.unavailable)); return }

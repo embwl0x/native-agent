@@ -1,4 +1,5 @@
 import FeedPolicy
+import CryptoKit
 import Privacy
 import Foundation
 import os
@@ -6,146 +7,8 @@ import NativeAgentCore
 import PersistenceCore
 import WorkshopExecution
 
-// Canonical job storage for the Mac UI, phone actions and agent tools. Native
-// pause/resume and in-place editing supersede the historical parity audits below.
-//
-// MARK: - Subsystem #17 WAVE 33 W18 (2026-06-01): scheduler-job create write port
-//                       WAVE 35 W14 (2026-06-02): cancel write port (+ update audit)
-//                       WAVE 36 W18 (2026-06-02): fire_now audit (§6.138 — nothing to port)
-//                       WAVE 38 W15 (2026-06-02): list READ port (+ pause/resume audit, §6.180)
-//
-// Ports the WRITE side of `/v1/scheduler/jobs` (POST → create_job) into the
-// SwiftNative TriggerScheduler. The daemon path is:
-//
-//   POST /v1/scheduler/jobs  → Daemon.create_job(body)
-//                              → normalize_scheduler_job_payload   (L43524)
-//                              → flock'd append to scheduler/jobs.json
-//                              → record_activity("scheduler", ...) (L5260 → activity/events.jsonl)
-//
-// WAVE 35 W14 — cancel + update audit (cluster `/v1/scheduler/jobs/<id>/{cancel,update}`):
-//   The cluster name describes HTTP routes that DO NOT EXIST. Re-verified this
-//   wave against the retired daemon + a full-repo grep:
-//     * There is NO `/v1/scheduler/jobs/<id>/cancel` HTTP route. `cancel_job`
-// is reachable ONLY through the connector-action
-//       dispatch `scheduler.cancel_job` (L21348). It IS a real, portable daemon
-//       method, so this wave ports it natively as `cancelJob(jobId:)` for parity
-//       with the create write — the SwiftNative write surface now owns the same
-//       jobs.json mutations the daemon's connector path performs.
-//     * There is NO `/v1/scheduler/jobs/<id>/update` route AND no `update_job`
-//       method, connector action, reschedule/edit/modify/toggle, or any other
-//       update surface anywhere in the daemon (grep-confirmed). The only
-//       mutations of an existing job are `cancel_job` (above) and the internal
-//       `scheduler_loop` advancing nextRunAt/lastRunAt each tick. Per AUDIT-FIRST
-//       there is NOTHING to port for "update" — inventing an updateJob would
-//       create a Swift behavior with no daemon parity reference. KEPT_NO_NATIVE_IMPL.
-// The audit (script/audit_v1_routes.py) lists `/v1/scheduler/jobs` GET as
-// LEGACY and POST at L52993.
-//
-// WAVE 36 W18 — fire_now audit (cluster `/v1/scheduler/triggers/<name>/fire_now`):
-//   Same AUDIT-FIRST result as the W14 cancel/update audit — re-verified this
-//   wave against the retired daemon + a full-repo grep:
-//     * There is NO `/v1/scheduler/triggers/<name>/fire_now` HTTP route. The
-//       cluster name describes a route that does not exist.
-//     * The job-level "fire now" semantic IS `Daemon.run_job` (the retired daemon
-//       L44116) — run a scheduled job's action on demand. But `run_job` is
-//       reachable ONLY from the in-process `scheduler_loop` (the SOLE
-//       `self.run_job(` call site, L44054): NO HTTP route, NO connector action,
-//       no `scheduler.run_job` / `scheduler.fire_*` / `scheduler.trigger_*`
-//       dispatch id (the scheduler dispatch surface is exactly the four ids
-//       create/schedule, list, cancel — L21337-L21355). It is a daemon-internal
-//       BACKGROUND-LOOP method. Disposition: KEPT_DAEMON_INTERNAL — porting it
-//       would create a Swift write surface with no daemon parity reference
-//       (the same anti-pattern W14 avoided for "update"). RETIREMENT PATH:
-//       migrates with the scheduler_loop in the broader BackgroundLoops cutover
-//       (subsystem #15), post-daemon-HTTP-deprecation.
-//     * The ACTUAL fire_now surfaces are the TRIGGER fire_now routes, already
-//       ported/retired in prior waves and NOT a scheduler-jobs concern:
-//         - `/v1/inbox/triggers/<name>/fire_now`  — Swift-native for stub=true
-//           canonical kinds (wave 12); stub=false returns an explicit
-//           unsupported envelope unless a test injects a compatibility fallback.
-//         - `/v1/missions/triggers/<name>/fire_now` — Swift-native (wave 21);
-//           daemon route retired wave 28; Swift-native is the only path.
-//   Pinned by SchedulerFireNowAuditTests so a future wave does not re-open this
-//   by inventing a Swift `runJob`/`fireJob`.
-//
-// WAVE 39 W17 — `/v1/scheduler/jobs/<id>/run` audit (cluster
-// `/v1/scheduler/jobs/<id>/run port`, §6.201):
-//   The "run = trigger-on-demand" framing is the JOB-LEVEL restatement of the
-//   wave-36 W18 finding above. Re-verified against the retired daemon in THIS
-//   checkout: there is NO `/v1/scheduler/jobs/<id>/run` HTTP route (never has
-//   been — `GET`/`POST /v1/scheduler/jobs` are the ENTIRE scheduler-jobs HTTP
-//   surface), NO `scheduler.run_*` / `fire_*` / `trigger_*` connector action,
-//   and `Daemon.run_job` is still defined once and called from exactly one site
-//   (the in-process `scheduler_loop`). On-demand "run this job now" therefore
-//   has no HTTP/connector parity reference to port against. Disposition:
-//   KEPT_DAEMON_INTERNAL (unchanged from W18). Porting `run_job` standalone
-//   would invent a Swift write surface with no daemon parity (the W14 "update"
-//   anti-pattern). RETIREMENT PATH unchanged: migrates with `scheduler_loop` in
-//   the BackgroundLoops cutover (subsystem #15), post-daemon-HTTP-deprecation.
-//   Now pinned BY THE `/run` LITERAL in SchedulerFireNowAuditTests
-//   (`runJob_hasNoOnDemandSurface`) so the run-cluster name itself can't be
-//   re-opened.
-//
-// WAVE 38 W15 — list READ port + pause/resume audit (cluster
-// `/v1/scheduler/jobs list+pause+resume`):
-//   * list IS real and portable. `Daemon.list_jobs`
-//     backs BOTH the GET `/v1/scheduler/jobs` route (L52221, audit=LEGACY,
-//     live Mac-UI callers via NativeClient.getJobs) AND the `scheduler.list_jobs`
-//     connector action (L21402). It reads the SAME scheduler/jobs.json the
-//     native createJob/cancelJob already mutate, under the SAME
-//     `self.jobs_lock, self._jobs_file_lock()` guard, then decorates each row's
-//     `nextRunAt`: parse the stored float-string epoch → ISO-8601 UTC, set
-//     `nextRunAtEpoch` (float), `nextRunAt`=ISO, `nextRunAtISO`=ISO. This wave
-//     ports it natively as `listJobs()`, completing read/write parity on the
-//     native scheduler-jobs surface. The decoration ISO is produced by
-//     `epochToDecorationISO` — a FAITHFUL `datetime.fromtimestamp(e, UTC)
-//     .isoformat()` mirror (integral epochs omit fractional seconds; fractional
-//     epochs render microsecond precision) — DISTINCT from `isoTimestamp`
-//     (always millisecond), because the daemon's decoration matches Python
-//     isoformat, not now_iso().
-//   * pause / resume DO NOT EXIST. Re-verified this wave against
-//     the retired daemon + a full-repo grep:
-//       - There is NO `/v1/scheduler/jobs/<id>/pause` or `/resume` HTTP route.
-//       - There is NO `pause_job` / `resume_job` / `enable_job` / `disable_job`
-//         / `toggle_job` method, and NO `scheduler.pause` / `scheduler.resume`
-//         / `scheduler.enable` / `scheduler.disable` / `scheduler.toggle`
-//         connector action. The ENTIRE scheduler dispatch surface is exactly
-//         the four ids create/schedule, list, cancel (L21176-L21179). The only
-//         `resume` in the daemon is `resume_workflow_run` (L7343) — a
-//         WORKFLOWS concern, not scheduler-jobs.
-//       - The closest semantic is `enabled=False` (set by cancel_job) — there
-//         is no inverse "re-enable" surface; a cancelled job stays disabled.
-//     Per AUDIT-FIRST there is NOTHING to port for pause/resume — inventing a
-//     pauseJob/resumeJob would create a Swift write surface with no daemon
-//     parity reference (the exact anti-pattern W14 avoided for "update").
-//     Disposition: KEPT_NO_NATIVE_IMPL. Pinned by SchedulerJobListTests +
-//     SchedulerFireNowAuditTests so a future wave does not re-open this.
-//
-// SCOPE / BOUNDARY:
-//   - FULLY native for all eight job kinds: notify, connector_action, dream,
-//     improve, harness_benchmark, proactive_scan, rem, and workshop. Schedule computation is ported
-//     byte-for-byte across all seven schedule types (once / every / hourly /
-//     daily / weekly / monthly / cron) including the cron field parser.
-//   - `connector_action` validates `payload.actionId` against the Swift
-//     ConnectorActionsRegistry and persists `payload.input` as the action input.
-//   - The scheduler job store is Swift-native. Swift periodic loops and trigger
-//     evaluation are app-owned; arbitrary due-job execution uses the same
-//     connector/action runners that own those effects.
-//
-// The production Swift callers are the app's job writers
-// (`makeSchedulerJobWriter`: the recurring improvement and her scheduler
-// tools). The connector-action create path is reachable
-// ONLY through the daemon's own dispatcher (scheduler.create_job), never the
-// Swift HTTP seam, so delegating that one branch costs the native path nothing
-// the Swift surface actually exercises.
-//
-// PARITY DIVERGENCES (documented, accepted — same class as Connectors W20):
-//   - createdAt / activity createdAt: millisecond precision vs Python's
-//     microsecond now_iso(). Informational, sortable, never byte-compared.
-//   - notify title/name default uses `displayNameFallback` ("NativeAgent" =
-//     APP) rather than the live personality profile name from
-//     agent_display_name(). The production caller always supplies an explicit
-//     name + title, so this only differs for a name-less notify job.
+// Canonical scheduled-job storage and occurrence transactions shared by UI,
+// agent tools, and execution. Effects run only after a durable claim.
 
 // MARK: - Errors (scheduler-job specific)
 
@@ -197,22 +60,6 @@ public protocol SchedulerJobWriter: Sendable {
     /// epoch → ISO-8601 UTC; adds `nextRunAtEpoch` + `nextRunAtISO`). Returns the
     /// decorated array verbatim (`[JSONValue]`).
     func listJobs() async throws -> [JSONValue]
-
-    /// Idempotently install a user-selected blueprint as one canonical job.
-    /// An active row with the same blueprint id/version is retained exactly;
-    /// a cancelled or older row is replaced in place. No passive/background
-    /// path calls this mutation.
-    func installBlueprintJob(body: JSONValue) async throws -> JSONValue
-}
-
-public extension SchedulerJobWriter {
-    func installBlueprintJob(body: JSONValue) async throws -> JSONValue {
-        throw TriggerSchedulerError.schedulerInvalid("blueprint installation is unavailable")
-    }
-
-    func setJobEnabled(jobId: String, enabled: Bool) async throws -> JSONValue {
-        throw TriggerSchedulerError.schedulerInvalid("scheduler job pause/resume is unavailable")
-    }
 }
 
 // MARK: - SwiftNative create-job impl
@@ -336,91 +183,6 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
         }
 
         return job
-    }
-
-    public func installBlueprintJob(body: JSONValue) async throws -> JSONValue {
-        guard case .object(let requested) = body,
-              case .string(let requestedID)? = requested["id"],
-              !requestedID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              case .object(let requestedPayload)? = requested["payload"],
-              case .string(let blueprintID)? = requestedPayload["blueprintId"],
-              case .int(let blueprintVersion)? = requestedPayload["blueprintVersion"],
-              blueprintVersion > 0 else {
-            throw TriggerSchedulerError.schedulerInvalid(
-                "blueprint jobs require id, payload.blueprintId, and payload.blueprintVersion"
-            )
-        }
-        let normalized = try SchedulerJobNormalizer.normalize(
-            body: requested,
-            now: now,
-            uuid: uuid,
-            displayNameFallback: Self.displayNameFallback,
-            connectorActionIDs: connectorActionIDs
-        )
-        let result: (status: String, job: JSONValue) = try await runSerialized {
-            [persistence, jobsPath] () async throws -> (String, JSONValue) in
-            try await persistence.withFileLock(jobsPath) {
-                var jobs = try Self.readJobsChecked(at: jobsPath)
-
-                let index = jobs.firstIndex { row in
-                    guard case .object(let object) = row,
-                          case .string(let id)? = object["id"] else { return false }
-                    return id == requestedID
-                }
-                if let index,
-                   case .object(let existing) = jobs[index],
-                   case .bool(true)? = existing["enabled"],
-                   case .object(let existingPayload)? = existing["payload"],
-                   case .string(let existingBlueprintID)? = existingPayload["blueprintId"],
-                   existingBlueprintID == blueprintID,
-                   case .int(let existingBlueprintVersion)? = existingPayload["blueprintVersion"],
-                   existingBlueprintVersion == blueprintVersion {
-                    return ("already_present", jobs[index])
-                }
-
-                let status: String
-                if let index {
-                    jobs[index] = normalized
-                    status = "repaired"
-                } else {
-                    jobs.append(normalized)
-                    status = "installed"
-                }
-                do {
-                    try await persistence.writeDataAtomicDurable(Self.jobsDataForWrite(jobs), to: jobsPath)
-                } catch {
-                    throw TriggerSchedulerError.persistenceFailure(String(describing: error))
-                }
-                return (status, normalized)
-            }
-        }
-        if result.status != "already_present" {
-            let event: JSONValue = .object([
-                "id": .string(uuid()),
-                "kind": .string("scheduler"),
-                "title": .string(SchedulerSecretRedactor.redactText("Automation blueprint \(result.status)")),
-                "detail": .string(SchedulerSecretRedactor.redactText(blueprintID)),
-                "status": .string("ok"),
-                "executionId": .null,
-                "payload": SchedulerSecretRedactor.redactValue(.object([
-                    "jobId": .string(requestedID),
-                    "blueprintId": .string(blueprintID),
-                    "blueprintVersion": .int(blueprintVersion),
-                    "installStatus": .string(result.status),
-                ])),
-                "createdAt": .string(SwiftNativeTriggerScheduler.isoTimestamp(now())),
-            ])
-            let eventPath = activityPath
-            let eventPersistence = persistence
-            await Self.appendJobActivity(
-                event, to: eventPath, using: eventPersistence,
-                logLabel: "SchedulerJobs.blueprint.activity"
-            )
-        }
-        return .object([
-            "status": .string(result.status),
-            "job": result.job,
-        ])
     }
 
     /// Faithful port of Daemon.cancel_job:
@@ -706,10 +468,15 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 if changes["kind"] != nil { existing["kind"] = normalized["kind"] }
                 if changes["payload"] != nil || rescheduled { existing["payload"] = normalized["payload"] }
                 if rescheduled {
-                    for key in ["schedule", "intervalSeconds", "oneShot", "nextRunAt", "nextRunAtEpoch"] {
+                    for key in ["schedule", "intervalSeconds", "oneShot", "nextRunAt", "nextRunAtEpoch", "nextWallClockOccurrence"] {
                         existing[key] = normalized[key]
                     }
                     existing.removeValue(forKey: "nextRunAtISO")
+                    existing.removeValue(forKey: "completedAt")
+                    existing["scheduleGeneration"] = .string(uuid())
+                    for key in ["retryCount", "retryDayKey", "retryPendingUntilEpoch", "retryParkedDateKey"] {
+                        existing.removeValue(forKey: key)
+                    }
                 }
                 jobs[index] = .object(existing)
                 do {
@@ -767,17 +534,16 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
     /// the same per-actor ordering as the writes. The decoration is a pure
     /// transform of what was read; only an absent source yields an empty list.
     public func listJobs() async throws -> [JSONValue] {
-        return try await runSerialized { [persistence, jobsPath] () async throws -> [JSONValue] in
-            let work: @Sendable () async throws -> [JSONValue] = {
-                let jobs = try Self.readJobsChecked(at: jobsPath)
-                return jobs.map { SchedulerJobNormalizer.decorateNextRunAt($0) }
+        try await listJobsIfPresent() ?? []
+    }
+
+    /// The same decorated snapshot, retaining absence for read-only surfaces.
+    public func listJobsIfPresent() async throws -> [JSONValue]? {
+        try await runSerialized { [persistence, jobsPath] in
+            try await persistence.withFileLock(jobsPath) {
+                guard FileManager.default.fileExists(atPath: jobsPath.path) else { return nil as [JSONValue]? }
+                return try Self.readJobsChecked(at: jobsPath).map { SchedulerJobNormalizer.decorateNextRunAt($0) }
             }
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            return try await persistence.withFileLock(jobsPath, work)
         }
     }
 
@@ -802,7 +568,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
     /// schedule; malformed or wrongly typed existing bytes must not be
     /// reinterpreted as a dormant empty schedule and then overwritten by the
     /// next create/cancel mutation.
-    private nonisolated static func readJobsChecked(at path: URL) throws -> [JSONValue] {
+    public nonisolated static func readJobsChecked(at path: URL) throws -> [JSONValue] {
         let manager = FileManager.default
         guard manager.fileExists(atPath: path.path) else { return [] }
         do {
@@ -824,6 +590,510 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
             throw TriggerSchedulerError.persistenceFailure("scheduler jobs file is unreadable or malformed: \(error.localizedDescription)")
         }
     }
+}
+
+extension SwiftNativeTriggerScheduler {
+    public struct DueJob: Sendable {
+        public let id: String
+        public let name: String
+        public let kind: String
+        public let payload: [String: JSONValue]
+        public let row: JSONValue
+        public let dueEpoch: Double
+        /// Stable identity for exactly one scheduled occurrence. This key is
+        /// persisted before any effect and survives process restart.
+        public let occurrenceKey: String
+
+        public init(
+            id: String,
+            name: String,
+            kind: String,
+            payload: [String: JSONValue],
+            row: JSONValue,
+            dueEpoch: Double,
+            occurrenceKey: String? = nil
+        ) {
+            self.id = id
+            self.name = name
+            self.kind = kind
+            self.payload = payload
+            self.row = row
+            self.dueEpoch = dueEpoch
+            let civil: String? = if case .object(let object) = row, object["retryPendingUntilEpoch"] == nil {
+                SchedulerJobRuntime.wallClockOccurrence(for: object, epoch: dueEpoch)
+            } else { nil }
+            self.occurrenceKey = occurrenceKey ?? Self.makeOccurrenceKey(jobId: id, dueEpoch: dueEpoch, civil: civil)
+        }
+
+        static func makeOccurrenceKey(jobId: String, dueEpoch: Double, civil: String? = nil) -> String {
+            let millis = Int64((dueEpoch * 1_000).rounded())
+            let canonical = "\(jobId.utf8.count):\(jobId):\(civil ?? String(millis))"
+            let digest = SHA256.hash(data: Data(canonical.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+            // 74 bytes: safely inside downstream 128-byte idempotency limits,
+            // even when a repaired legacy job carries an unusually long id.
+            return "scheduler.\(digest)"
+        }
+    }
+
+    public struct OccurrenceRecovery: Sendable {
+        public let jobId: String
+        public let jobName: String
+        public let kind: String
+        public let occurrenceKey: String
+        public let detail: String
+    }
+
+    public struct ClaimedDueJobs: Sendable {
+        public let jobs: [DueJob]
+        public let recoveredUnknown: [OccurrenceRecovery]
+    }
+
+    public func jobRows() async throws -> [JSONValue] {
+        try await persistence.withFileLock(jobsPath) { try Self.readJobsChecked(at: jobsPath) }
+    }
+
+    public func updateJobRows<Result: Sendable>(
+        _ update: @Sendable (inout [JSONValue]) throws -> Result
+    ) async throws -> Result {
+        try await persistence.withFileLock(jobsPath) {
+            let original = try Self.readJobsChecked(at: jobsPath)
+            var rows = original
+            let result = try update(&rows)
+            if rows != original {
+                try await persistence.writeDataAtomicDurable(Self.jobsDataForWrite(rows), to: jobsPath)
+            }
+            return result
+        }
+    }
+
+    /// Atomically selects and claims scheduled occurrences before any effect
+    /// executes. A claim surviving process restart is an ambiguous outcome,
+    /// not permission to repeat a notification, connector action, Desk task,
+    /// or other non-idempotent effect.
+    /// The execution owner selects due work from the locked snapshot. Claim
+    /// only its first row so a crash cannot strand untouched preclaimed work.
+    public func claimDueJobs(
+        now: Date,
+        select: @Sendable ([JSONValue]) -> [DueJob]
+    ) async throws -> ClaimedDueJobs {
+        try await persistence.withFileLock(jobsPath) { () async throws -> ClaimedDueJobs in
+            var rows = try Self.readJobsChecked(at: jobsPath)
+            var changed = false
+            for index in rows.indices {
+                guard case .object(var object) = rows[index] else { continue }
+                var rowChanged = Self.rearmFutureOneShot(&object, now: now)
+                if object["nextWallClockOccurrence"] == nil,
+                   let occurrence = SchedulerJobRuntime.nextWallClockOccurrence(for: object) {
+                    object["nextWallClockOccurrence"] = .string(occurrence)
+                    rowChanged = true
+                }
+                guard rowChanged else { continue }
+                rows[index] = .object(object)
+                changed = true
+            }
+            let selected = select(rows).prefix(1)
+            var claimed: [DueJob] = []
+            var recovered: [OccurrenceRecovery] = []
+            for job in selected {
+                guard let index = rows.firstIndex(where: { row in
+                    guard case .object(let object) = row else { return false }
+                    return SchedulerJobRuntime.string(object["id"]) == job.id
+                }), case .object(var object) = rows[index] else { continue }
+
+                if let activeValue = object["activeOccurrence"] {
+                    let decodedPriorKey: String?
+                    if case .object(let active) = activeValue {
+                        decodedPriorKey = SchedulerJobRuntime.string(active["key"])
+                    } else {
+                        decodedPriorKey = nil
+                    }
+                    let priorKey = decodedPriorKey ?? job.occurrenceKey
+                    let detail: String
+                    if decodedPriorKey == nil {
+                        detail = "A prior scheduler occurrence claim was malformed. Its external effect "
+                            + "may have happened, so NativeAgent preserved the claim and did not repeat it."
+                    } else {
+                        detail = "A prior scheduler pass ended after claiming occurrence \(priorKey). "
+                            + "Its external effect may have happened, so NativeAgent did not repeat it."
+                    }
+                    // DETECTION ONLY (2026-09-06). The row is left exactly as
+                    // found — claim intact, next run unmoved — until the caller
+                    // has the reconciliation notice durably on record and calls
+                    // `settleUnknownOccurrence`. Clearing it here gave the
+                    // notice a ONE-ATTEMPT window: the claim and the old
+                    // schedule were already gone, so a failed notice write left
+                    // nothing for a later pass to find and reconcile. Either
+                    // way this job is not claimed on this pass, so nothing can
+                    // be replayed by waiting.
+                    recovered.append(OccurrenceRecovery(
+                        jobId: job.id,
+                        jobName: job.name,
+                        kind: job.kind,
+                        occurrenceKey: priorKey,
+                        detail: detail
+                    ))
+                    continue
+                }
+
+                var claim: [String: JSONValue] = [
+                    "key": .string(job.occurrenceKey),
+                    "dueEpoch": .int(Int64(job.dueEpoch.rounded())),
+                    "claimedAt": .string(Self.isoTimestamp(now)),
+                    "state": .string("claimed"),
+                ]
+                claim["scheduleGeneration"] = object["scheduleGeneration"]
+                object["activeOccurrence"] = .object(claim)
+                Self.stampNextRun(&object, epoch: job.dueEpoch)
+                rows[index] = .object(object)
+                claimed.append(job)
+            }
+            // Detecting a stale claim does not itself change canonical state.
+            if changed || !claimed.isEmpty {
+                try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
+            }
+            return ClaimedDueJobs(jobs: claimed, recoveredUnknown: recovered)
+        }
+    }
+
+    private static func rearmFutureOneShot(_ object: inout [String: JSONValue], now: Date) -> Bool {
+        guard SchedulerJobRuntime.bool(object["oneShot"], default: false),
+              SchedulerJobRuntime.bool(object["enabled"], default: true),
+              SchedulerJobRuntime.string(object["cancelledAt"]) == nil,
+              case .object(let claim)? = object["activeOccurrence"],
+              Set(claim.keys).isSubset(of: ["key", "dueEpoch", "claimedAt", "state"]),
+              SchedulerJobRuntime.string(claim["key"])?.isEmpty == false,
+              SchedulerJobRuntime.string(claim["state"]) == "claimed",
+              let claimedAt = SchedulerJobRuntime.string(claim["claimedAt"]).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst),
+              let claimedDue = SchedulerJobRuntime.epoch(from: claim["dueEpoch"]),
+              claimedDue.isFinite,
+              // A rewind cannot make a due-time claim evidence of non-execution.
+              // Round up to avoid mistaking the stored dueEpoch's rounding for it.
+              claimedDue > claimedAt.timeIntervalSince1970.rounded(.up),
+              let due = SchedulerJobRuntime.epoch(from: object["nextRunAt"])
+                ?? SchedulerJobRuntime.epoch(from: object["nextRunAtEpoch"]),
+              due > now.timeIntervalSince1970 else { return false }
+        object.removeValue(forKey: "activeOccurrence")
+        clearRetryState(&object)
+        return true
+    }
+
+    /// Release a recovered stale claim and advance the job — ONLY once its
+    /// reconciliation notice is on record. Re-reads the row under the lock and
+    /// does nothing if the claim is already gone, so a retry after a partial
+    /// pass is harmless.
+    public func settleUnknownOccurrence(_ recovery: OccurrenceRecovery, now: Date) async throws {
+        try await persistence.withFileLock(jobsPath) { () async throws -> Void in
+            var rows = try Self.readJobsChecked(at: jobsPath)
+            guard let index = rows.firstIndex(where: { row in
+                guard case .object(let object) = row else { return false }
+                return SchedulerJobRuntime.string(object["id"]) == recovery.jobId
+            }), case .object(var object) = rows[index],
+                let activeValue = object["activeOccurrence"] else { return }
+            if Self.rearmFutureOneShot(&object, now: now) {
+                rows[index] = .object(object)
+                try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
+                return
+            }
+            var decodedPriorKey: String?
+            var replacedSchedule = false
+            if case .object(let active) = activeValue {
+                decodedPriorKey = SchedulerJobRuntime.string(active["key"])
+                if case .string(let key)? = active["key"], !key.isEmpty,
+                   case .string(let generation)? = object["scheduleGeneration"], !generation.isEmpty {
+                    switch active["scheduleGeneration"] {
+                    case .string(let claimed)? where !claimed.isEmpty: replacedSchedule = claimed != generation
+                    default: break
+                    }
+                }
+            }
+            if decodedPriorKey == nil { object["lastInvalidOccurrenceClaim"] = activeValue }
+            object["lastRunAt"] = .string(Self.isoTimestamp(now))
+            object["lastRunStatus"] = .string("unknown")
+            object["lastRunDetail"] = .string(recovery.detail)
+            object["lastRunError"] = .string(recovery.detail)
+            object["lastUnknownOccurrenceKey"] = .string(recovery.occurrenceKey)
+            object.removeValue(forKey: "activeOccurrence")
+            if replacedSchedule {
+                // The unknown result belongs to the old schedule, not its replacement.
+            } else if SchedulerJobRuntime.bool(object["oneShot"], default: false) {
+                object["enabled"] = .bool(false)
+                object["disabledReason"] = .string("unknown outcome after restart; review before retry")
+            } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(
+                for: .object(object), now: { now }
+            ) {
+                Self.stampNextRun(&object, epoch: next)
+            } else {
+                object["enabled"] = .bool(false)
+                object["disabledReason"] = .string("unknown outcome and next run could not be computed")
+            }
+            // Unknown means "do not automatically replay." Any prior retry
+            // floor/counter would contradict that settlement and could re-arm
+            // the same occurrence through catch-up logic.
+            Self.clearRetryState(&object)
+            rows[index] = .object(object)
+            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
+        }
+    }
+
+    public func settleOccurrence(
+        jobId: String, occurrenceKey: String, status: String, detail: String,
+        output: JSONValue, at runDate: Date, runDateKey: String
+    ) async throws -> Int? {
+        try await persistence.withFileLock(jobsPath) { () async throws -> Int? in
+            var rows = try Self.readJobsChecked(at: jobsPath)
+            var parkedAttempts: Int?
+            var found = false
+            for idx in rows.indices {
+                guard case .object(var obj) = rows[idx],
+                      (SchedulerJobRuntime.string(obj["id"]) ?? "") == jobId else {
+                    continue
+                }
+                guard case .object(let active)? = obj["activeOccurrence"],
+                      SchedulerJobRuntime.string(active["key"]) == occurrenceKey else {
+                    throw NSError(domain: "NativeAgentScheduler", code: -409, userInfo: [
+                        NSLocalizedDescriptionKey: "occurrence claim changed before settlement: \(occurrenceKey)"
+                    ])
+                }
+                found = true
+                obj["lastRunAt"] = .string(Self.isoTimestamp(runDate))
+                obj["lastRunStatus"] = .string(status)
+                obj["lastRunDetail"] = .string(String(detail.prefix(1000)))
+                if status == "error" {
+                    obj["lastRunError"] = .string(String(detail.prefix(1000)))
+                } else {
+                    obj.removeValue(forKey: "lastRunError")
+                }
+
+                let oneShot = SchedulerJobRuntime.bool(obj["oneShot"], default: false)
+                if obj["scheduleGeneration"] != active["scheduleGeneration"] {
+                    // Keep the run's evidence without consuming the newly saved schedule.
+                } else if oneShot {
+                    obj["enabled"] = .bool(false)
+                    obj["completedAt"] = .string(Self.isoTimestamp(runDate))
+                    Self.clearRetryState(&obj)
+                } else if let retryFloor = Self.retryEpoch(from: output, runDate: runDate) {
+                    // FIX 2 (A4.4): per-job retry count + exponential backoff +
+                    // a daily attempt cap. The retry stamp IS the backoff
+                    // carrier and composes with FIX 1 (catch-up honors
+                    // retryPendingUntilEpoch as a floor).
+                    let todayKey = runDateKey
+                    let sameDay = SchedulerJobRuntime.string(obj["retryDayKey"]) == todayKey
+                    let priorCount = sameDay ? SchedulerJobRuntime.int(obj["retryCount"], default: 0) : 0
+                    let attempt = priorCount + 1
+                    obj["retryDayKey"] = .string(todayKey)
+                    obj["retryCount"] = .int(Int64(attempt))
+                    if attempt > Self.maxRetryAttemptsPerDay {
+                        // Cap reached: PARK. Stop retrying today, reschedule to
+                        // the next natural run, drop the pending-retry floor,
+                        // and mark the day parked so catch-up stays disarmed.
+                        // A receipt is emitted below (never a silent give-up).
+                        obj["retryParkedDateKey"] = .string(todayKey)
+                        obj.removeValue(forKey: "retryPendingUntilEpoch")
+                        if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
+                            Self.stampNextRun(&obj, epoch: next)
+                        }
+                        parkedAttempts = attempt - 1
+                    } else {
+                        let backoff = runDate
+                            .addingTimeInterval(Double(Self.retryBackoffSeconds(attempt: attempt)))
+                            .timeIntervalSince1970
+                        let retry = max(retryFloor, backoff)
+                        Self.stampNextRun(&obj, epoch: retry)
+                        obj["retryPendingUntilEpoch"] = .int(Int64(retry))
+                    }
+                } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
+                    Self.stampNextRun(&obj, epoch: next)
+                    Self.clearRetryState(&obj)
+                } else {
+                    obj["enabled"] = .bool(false)
+                    obj["disabledReason"] = .string("could not compute next scheduled run")
+                    Self.clearRetryState(&obj)
+                }
+                obj["lastOccurrenceKey"] = .string(occurrenceKey)
+                obj.removeValue(forKey: "activeOccurrence")
+                rows[idx] = .object(obj)
+                break
+            }
+            guard found else {
+                throw NSError(domain: "NativeAgentScheduler", code: -404, userInfo: [
+                    NSLocalizedDescriptionKey: "claimed scheduler job disappeared before settlement: \(jobId)"
+                ])
+            }
+            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
+            return parkedAttempts
+        }
+
+    }
+
+    /// Record retirement durably before removing rows under the jobs lock.
+    @discardableResult
+    public func pruneJobs(
+        select: @Sendable ([JSONValue]) -> (rows: [JSONValue], retired: [JSONValue])
+    ) async throws -> Int {
+        try await persistence.withFileLock(jobsPath) { () async throws -> Int in
+            let rows = try Self.readJobsChecked(at: jobsPath)
+            let result = select(rows)
+            guard !result.retired.isEmpty else { return 0 }
+            try await SwiftNativePersistenceCore().appendJSONLDurable(result.retired, to: jobsPath.deletingLastPathComponent()
+                .appendingPathComponent("retired.jsonl"))
+            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(result.rows), to: jobsPath)
+            return result.retired.count
+        }
+    }
+
+    public func markDefaultCycleJobRun(id: String, detail: String, at runDate: Date) async throws {
+        try await persistence.withFileLock(jobsPath) {
+            var rows = try Self.readJobsChecked(at: jobsPath)
+            for idx in rows.indices {
+                guard case .object(var obj) = rows[idx],
+                      (SchedulerJobRuntime.string(obj["id"]) ?? "") == id else {
+                    continue
+                }
+                obj["lastRunAt"] = .string(Self.isoTimestamp(runDate))
+                obj["lastRunStatus"] = .string("completed")
+                obj["lastRunDetail"] = .string(detail)
+                obj.removeValue(forKey: "lastRunError")
+                // FIX 2 (A4.4): a successful/backfilled completion clears the
+                // retry backoff so it self-heals once the outage clears.
+                Self.clearRetryState(&obj)
+                if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
+                    Self.stampNextRun(&obj, epoch: next)
+                }
+                rows[idx] = .object(obj)
+                break
+            }
+            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
+        }
+    }
+
+    public nonisolated static func upsertDefaultCycleJob(
+        rows: inout [JSONValue],
+        id: String,
+        legacyNames: Set<String>,
+        name: String,
+        kind: String,
+        intervalSeconds: Int,
+        schedule: [String: JSONValue],
+        objective: String,
+        extraPayload: [String: JSONValue],
+        nextRunEpoch: @autoclosure () throws -> Double,
+        now: Date,
+        reactivateCancelled: Bool = false
+    ) throws -> Bool {
+        let matchIndex = rows.firstIndex { row in
+            guard case .object(let obj) = row else { return false }
+            let rowID = SchedulerJobRuntime.string(obj["id"]) ?? ""
+            if rowID == id { return true }
+            let rowKind = (SchedulerJobRuntime.string(obj["kind"]) ?? "").lowercased()
+            let rowName = (SchedulerJobRuntime.string(obj["name"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return rowKind == kind && legacyNames.contains(rowName)
+        }
+
+        var existing: [String: JSONValue] = [:]
+        if let matchIndex, case .object(let obj) = rows[matchIndex] {
+            existing = obj
+        }
+
+        // Passive bootstrap honors cancellation; only explicit reactivation clears it.
+        let isCancelledTombstone = existing["cancelledAt"] != nil
+            && existing["enabled"] == .bool(false)
+        // Pauses survive bootstrap; only setJobEnabled resumes them.
+        let isPaused = existing["pausedAt"] != nil
+            && existing["enabled"] == .bool(false)
+        if isPaused || (isCancelledTombstone && !reactivateCancelled) {
+            return false
+        }
+
+        var next = existing
+        if isCancelledTombstone, reactivateCancelled {
+            next.removeValue(forKey: "cancelledAt")
+            next["enabled"] = .bool(true)
+        }
+        // Bootstrap fills missing fields; the canonical writer owns saved edits.
+        next["id"] = existing["id"] ?? .string(id)
+        next["name"] = existing["name"] ?? .string(name)
+        next["kind"] = existing["kind"] ?? .string(kind)
+        next["intervalSeconds"] = existing["intervalSeconds"] ?? .int(Int64(intervalSeconds))
+        next["enabled"] = next["enabled"] ?? .bool(true)
+        next["oneShot"] = existing["oneShot"] ?? .bool(false)
+        next["schedule"] = existing["schedule"] ?? .object(schedule)
+        var payload = extraPayload
+        payload["objective"] = .string(objective)
+        next["payload"] = existing["payload"] ?? .object(payload)
+        next["createdBy"] = existing["createdBy"] ?? .string("nativeagent_bootstrap")
+        next["createdAt"] = existing["createdAt"] ?? .string(isoTimestamp(now))
+        if existing["nextRunAt"] == nil && existing["nextRunAtEpoch"] == nil {
+            let nextRunEpoch = try nextRunEpoch()
+            stampNextRun(&next, epoch: nextRunEpoch)
+            if existing["schedule"] == nil, nextRunEpoch <= now.timeIntervalSince1970 {
+                var firstSchedule = schedule
+                firstSchedule["firstRunAt"] = .string(isoTimestamp(Date(timeIntervalSince1970: nextRunEpoch)))
+                next["schedule"] = .object(firstSchedule)
+                next.removeValue(forKey: "nextWallClockOccurrence")
+            }
+        }
+        if existing["lastRunAt"] == nil { next["lastRunAt"] = .null }
+
+        let nextValue = JSONValue.object(next)
+        if let matchIndex {
+            if rows[matchIndex] == nextValue { return false }
+            rows[matchIndex] = nextValue
+        } else {
+            rows.append(nextValue)
+        }
+        return true
+    }
+
+    static func retryEpoch(from output: JSONValue, runDate: Date) -> Double? {
+        guard case .object(let obj) = output else { return nil }
+        if let explicit = SchedulerJobRuntime.epoch(from: obj["retryAtEpoch"] ?? obj["retry_at_epoch"]) {
+            return max(explicit, runDate.addingTimeInterval(60).timeIntervalSince1970)
+        }
+        let after = SchedulerJobRuntime.int(
+            obj["retryAfterSeconds"] ?? obj["retry_after_seconds"],
+            default: 0
+        )
+        guard after > 0 else { return nil }
+        return runDate.addingTimeInterval(Double(max(60, after))).timeIntervalSince1970
+    }
+
+    // MARK: - FIX 2 (A4.4): retry count + exponential backoff + daily cap.
+
+    /// Consecutive retryable failures a job may accrue in a single day before
+    /// it is PARKED (stops retrying, reschedules to its next natural run, and
+    /// leaves a receipt) instead of retrying forever at the 60s due-floor.
+    static let maxRetryAttemptsPerDay = 6
+
+    /// Exponential backoff carried by the retry stamp: 15m → 30m → 60m (cap).
+    /// The stamp itself is the backoff carrier — FIX 1's floor keeps the
+    /// catch-up path from collapsing it.
+    static func retryBackoffSeconds(attempt: Int) -> Int {
+        switch attempt {
+        case ..<2: return 15 * 60
+        case 2: return 30 * 60
+        default: return 60 * 60
+        }
+    }
+
+    /// Stamp the canonical next-run trio on a job row.
+    static func stampNextRun(_ obj: inout [String: JSONValue], epoch: Double) {
+        obj["nextRunAt"] = .string(SchedulerJobRuntime.floatString(epoch))
+        obj["nextRunAtEpoch"] = .int(Int64(epoch))
+        obj["nextRunAtISO"] = .string(SchedulerJobRuntime.decorationISO(epoch: epoch))
+        obj["nextWallClockOccurrence"] = SchedulerJobRuntime.wallClockOccurrence(for: obj, epoch: epoch).map(JSONValue.string)
+    }
+
+    /// Clear all retry/park bookkeeping — called on any successful or normally
+    /// rescheduled run so the backoff self-heals once the outage clears.
+    static func clearRetryState(_ obj: inout [String: JSONValue]) {
+        obj.removeValue(forKey: "retryCount")
+        obj.removeValue(forKey: "retryDayKey")
+        obj.removeValue(forKey: "retryPendingUntilEpoch")
+        obj.removeValue(forKey: "retryParkedDateKey")
+    }
+
 }
 
 // MARK: - SchedulerJobNormalizer
@@ -906,11 +1176,10 @@ enum SchedulerJobNormalizer {
             throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
         }
 
-        let typeLower = (string(schedule["type"]) ?? string(schedule["kind"]) ?? "every")
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let typeLower = scheduleType(schedule)
         if ["hourly", "daily", "weekly", "monthly", "cron"].contains(typeLower),
-           string(schedule["timezone"] ?? schedule["tz"])?.isEmpty != false {
-            schedule["timezone"] = .string(TimeZone.current.identifier)
+           string(schedule["timezone"] ?? schedule["tz"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            schedule["timezone"] = .string("local")
         }
         if typeLower == "every" {
             interval = try everyInterval(schedule, default: interval)
@@ -933,6 +1202,7 @@ enum SchedulerJobNormalizer {
         let nextRun: Double
         if let fr = firstRun, truthy(fr) {
             nextRun = try epochFromValue(fr, now: now)
+            schedule["firstRunAt"] = fr
         } else {
             nextRun = scheduledRun
         }
@@ -1108,6 +1378,7 @@ enum SchedulerJobNormalizer {
         if typeLower != "every", !oneShot {
             job.removeValue(forKey: "intervalSeconds")
         }
+        job["nextWallClockOccurrence"] = SchedulerJobRuntime.wallClockOccurrence(for: job, epoch: nextRun).map(JSONValue.string)
         return .object(job)
     }
 
@@ -1233,12 +1504,16 @@ enum SchedulerJobNormalizer {
         ))
     }
 
+    static func scheduleType(_ schedule: [String: JSONValue]) -> String {
+        (string(schedule["type"]) ?? string(schedule["kind"]) ?? "every")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
     /// _scheduler_next_from_schedule (L43176). `tz` handling: the daemon resolves
     /// IANA tz or local; we use local tz (matching the daemon's local-default)
     /// and honor an explicit IANA timezone string via TimeZone(identifier:).
     static func nextFromSchedule(_ schedule: [String: JSONValue], afterEpoch: Double?, now: @Sendable () -> Date) throws -> Double {
-        let typ = (string(schedule["type"]) ?? string(schedule["kind"]) ?? "every")
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let typ = scheduleType(schedule)
         let tz = resolveTimezone(schedule["timezone"] ?? schedule["tz"])
         let nowEpoch = afterEpoch ?? now().timeIntervalSince1970
 
@@ -1641,19 +1916,28 @@ enum SchedulerJobNormalizer {
     /// metadata pass through untouched.
     static func decorateNextRunAt(_ row: JSONValue) -> JSONValue {
         guard case .object(var d) = row else { return row }
-        if case .object(let schedule)? = d["schedule"],
-           let zone = string(schedule["timezone"] ?? schedule["tz"]), !zone.isEmpty {
-            d["mac_timezone"] = .string(TimeZone.current.identifier)
-            if zone != TimeZone.current.identifier {
-                d["timezone_warning"] = .string("Schedule time zone \(zone) differs from this Mac's current zone \(TimeZone.current.identifier). Saved timing was not changed.")
+        if case .object(let schedule)? = d["schedule"] {
+            let zone = string(schedule["timezone"] ?? schedule["tz"]) ?? "local"
+            d["mac_timezone"] = .string(TimeZone.autoupdatingCurrent.identifier)
+            if let due = SchedulerJobRuntime.scheduledEpoch(for: d) {
+                d["nextRunAt"] = .string(pyFloatString(due))
+                if ["", "local", "system"].contains(zone.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
+                    d["timezone_detail"] = .string("Follows the Mac: \(TimeZone.autoupdatingCurrent.identifier).")
+                } else if zone != TimeZone.autoupdatingCurrent.identifier {
+                    d["timezone_warning"] = .string("Schedule time zone \(zone) differs from this Mac's current zone \(TimeZone.autoupdatingCurrent.identifier). Saved timing was not changed.")
+                }
+            } else if SchedulerJobRuntime.wallClockSchedule(d) != nil {
+                d["timezone_warning"] = .string("Wall-clock occurrence is ambiguous. Review and save this schedule before it can run.")
+                d["nextRunAt"] = .null
+                d["nextRunAtEpoch"] = .null
+                d["nextRunAtISO"] = .null
             }
         }
         // Older one-off and calendar rows retained the default hourly interval.
         let calendarTypes: Set<String> = ["once", "hourly", "daily", "weekly", "monthly", "cron"]
         let scheduleType: String? = {
             guard case .object(let schedule)? = d["schedule"] else { return nil }
-            return (string(schedule["type"]) ?? string(schedule["kind"]))?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return SchedulerJobNormalizer.scheduleType(schedule)
         }()
         if d["oneShot"] == .bool(true) || scheduleType == "once" {
             d["intervalSeconds"] = .null
@@ -1802,7 +2086,7 @@ enum SchedulerJobNormalizer {
                 return tz
             }
         }
-        return TimeZone.current
+        return .autoupdatingCurrent
     }
 
     static func floorToMinute(_ date: Date, cal: Calendar) -> Date {

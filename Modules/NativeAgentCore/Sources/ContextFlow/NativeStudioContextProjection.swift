@@ -81,49 +81,15 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     let invalidationSourceURL: URL?
     private let canonURL: URL
 
-    private let loadEntries: @Sendable () async throws -> [StudioJournalEntry]
-    /// The SECOND source kind (desk 903 phase 4): decided canon rows, reduced to
-    /// current membership. Same pointer shape, same caps, same privacy — a canon
-    /// pointer says a work holds and how to pull the argument, never the
-    /// argument itself.
-    private let loadCanon: @Sendable () async throws -> [StudioCanonMember]
-    private let loadShelfSlots: @Sendable () throws -> [StudioWorkingShelf.Slot]
-    private let diagnostics: @Sendable (String) -> Void
+    private let store: SwiftNativeStudioStore
+    private let shelf: StudioWorkingShelf
 
-    init(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        maximumPointers: Int = NativeStudioContextProjection.maximumPointers,
-        maximumEntriesPerWork: Int = NativeStudioContextProjection.maximumEntriesPerWork,
-        loadEntries: (@Sendable () async throws -> [StudioJournalEntry])? = nil,
-        loadCanon: (@Sendable () async throws -> [StudioCanonMember])? = nil,
-        loadShelfSlots: (@Sendable () throws -> [StudioWorkingShelf.Slot])? = nil,
-        diagnostics: @escaping @Sendable (String) -> Void = { nativeLog("%@", $0) }
-    ) {
-        let store = SwiftNativeStudioStore(dataRoot: dataRoot)
+    init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
+        self.store = SwiftNativeStudioStore(dataRoot: dataRoot)
+        self.shelf = StudioWorkingShelf(dataRoot: dataRoot)
         self.invalidationSourceURL = store.journalPath.standardizedFileURL
         self.canonURL = dataRoot.appendingPathComponent("studio/canon/canon.jsonl").standardizedFileURL
-        self.diagnostics = diagnostics
-        if let loadShelfSlots {
-            self.loadShelfSlots = loadShelfSlots
-        } else if loadEntries == nil {
-            self.loadShelfSlots = { try StudioWorkingShelf(dataRoot: dataRoot).selections() }
-        } else {
-            self.loadShelfSlots = { [] }
-        }
-        self.totalCap = max(0, maximumPointers)
-        self.perWorkCap = max(1, maximumEntriesPerWork)
-        // 2026-09-06: hot PLUS shelf. Reading only the hot file made the
-        // context projection forget every entry the cap had archived — the
-        // encounters simply stopped being pointed at.
-        self.loadEntries = loadEntries ?? { try await store.journalEntriesIncludingArchive() }
-        self.loadCanon = loadCanon ?? {
-            StudioCanonLaw.membership(from: try await store.readCanon())
-                .values.sorted { $0.workTitle < $1.workTitle }
-        }
     }
-
-    private let totalCap: Int
-    private let perWorkCap: Int
 
     func isInvalidated(by change: DerivedSourceChange) -> Bool {
         guard change.semantic, invalidationNamespaces.contains(change.namespace) else { return false }
@@ -137,22 +103,23 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     ) async throws -> ContextCompiledProjectionResult {
         let shelfPointer: Prepared?
         var shelfUnavailable = false
-        do { shelfPointer = Self.prepareShelfPointer(try loadShelfSlots()) }
+        do { shelfPointer = Self.prepareShelfPointer(try shelf.selections()) }
         catch is CancellationError { throw CancellationError() }
         catch {
-            diagnostics("[context-studio] shelf read failed; keeping last good source: \(String(describing: error))")
+            nativeLog("%@", "[context-studio] shelf read failed; keeping last good source: \(String(describing: error))")
             shelfPointer = nil
             shelfUnavailable = true
         }
         let shelfID = ContextStableID.source(owner: Self.owner, locator: "studio/working_shelf")
+        async let canonRead = store.readCanon()
         let entries: [StudioJournalEntry]
         do {
-            entries = try await loadEntries()
+            entries = try await store.journalEntriesIncludingArchive()
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             // Retain journal pointers, while the independently read shelf still updates.
-            diagnostics("[context-studio] journal read failed: \(String(describing: error))")
+            nativeLog("%@", "[context-studio] journal read failed: \(String(describing: error))")
             let changed = shelfPointer.flatMap { pointer in
                 previousSources[pointer.sourceID]?.sourceHash == pointer.sourceHash ? nil : pointer.compiledSource
             }
@@ -161,7 +128,7 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
             return ContextCompiledProjectionResult(changedSources: changed.map { [$0] } ?? [], removedSourceIDs: removed)
         }
 
-        var prepared = Self.prepare(entries, totalCap: totalCap, perWorkCap: perWorkCap)
+        var prepared = Self.prepare(entries)
         if let pointer = shelfPointer {
             prepared.append(pointer)
         }
@@ -169,10 +136,13 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
         // the prior canon while still publishing healthy journal updates.
         let canon: [StudioCanonMember]
         var canonUnavailable = false
-        do { canon = try await loadCanon() }
+        do {
+            canon = StudioCanonLaw.membership(from: try await canonRead)
+                .values.sorted { $0.workTitle < $1.workTitle }
+        }
         catch is CancellationError { throw CancellationError() }
         catch {
-            diagnostics("[context-studio] canon read failed; keeping last good source: \(String(describing: error))")
+            nativeLog("%@", "[context-studio] canon read failed; keeping last good source: \(String(describing: error))")
             canon = []
             canonUnavailable = true
         }
@@ -240,11 +210,8 @@ extension NativeStudioContextProjection {
     /// the selector's existing `maximumAtomsPerSource` bound keep a work she has
     /// returned to five times from owning the whole studio budget of a packet.
     static func prepare(
-        _ entries: [StudioJournalEntry],
-        totalCap: Int = maximumPointers,
-        perWorkCap: Int = maximumEntriesPerWork
+        _ entries: [StudioJournalEntry]
     ) -> [Prepared] {
-        guard totalCap > 0 else { return [] }
         let usable = entries.filter { entry in
             let body = self.body(entry)
             return !body.isEmpty
@@ -253,7 +220,7 @@ extension NativeStudioContextProjection {
                 && !ContextSecretContentPolicy.containsSecretLikeContent(body)
         }
         let grouped = Dictionary(grouping: usable, by: { workKey($0.work) })
-        var remaining = totalCap
+        var remaining = maximumPointers
         var result: [Prepared] = []
         for key in grouped.keys.sorted() {
             guard remaining > 0, let all = grouped[key], !all.isEmpty else { continue }
@@ -264,7 +231,7 @@ extension NativeStudioContextProjection {
                     if lhs.recordedAt != rhs.recordedAt { return lhs.recordedAt > rhs.recordedAt }
                     return lhs.id > rhs.id
                 }
-                .prefix(min(perWorkCap, remaining))
+                .prefix(min(maximumEntriesPerWork, remaining))
             )
             guard !ordered.isEmpty else { continue }
             remaining -= ordered.count

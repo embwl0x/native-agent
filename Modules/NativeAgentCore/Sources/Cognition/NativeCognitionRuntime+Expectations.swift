@@ -6,7 +6,6 @@ import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Desk
-import TriggerScheduler
 
 // Item 5 (2026-09-02) — TOWARD. The app-side half of the forward register.
 //
@@ -108,14 +107,6 @@ extension NativeCognitionRuntime {
     /// How long a delegated peer job runs before she is WAITING on it rather
     /// than merely expecting it.
     static let horizonPeerReplyWindow: TimeInterval = 30 * 60
-    /// Scheduler kinds that may become something she looks toward. EMPTY since
-    /// Phase 5 D (Agent, binding): a schedule is not anticipation. The nightly
-    /// dream, REM and upkeep are internal processes; they leaned her "toward"
-    /// with positive valence for no reason she had. Anticipation attaches to
-    /// something she has a reason to look forward to — a day User set (a
-    /// stated plan), a reply she is waiting on — never to a cron row.
-    static let horizonSchedulerKinds: Set<String> = []
-
     /// Her valence GUESS per source — the sign that decides whether a horizon
     /// lifts curiosity/warmth or raises vigilance, and how much. These are
     /// judgments, not measurements, and they are small on purpose: the ceiling
@@ -303,7 +294,7 @@ extension NativeCognitionRuntime {
     /// reader that throws returns zero rows, which downstream is
     /// indistinguishable from "every one of those things landed" — and that is
     /// the relief door. An unreadable Desk must not congratulate her.
-    struct HorizonSourceReading {
+    struct HorizonSourceReading: Sendable {
         let kind: OrganismHorizonSourceKind
         let rows: [(token: String, dueAt: Date)]
         let complete: Bool
@@ -316,11 +307,14 @@ extension NativeCognitionRuntime {
     private func composeHorizonSources(
         at now: Date
     ) async -> (tokens: [String], completeKinds: [String]) {
+        async let statedPlans = statedPlanSources(at: now)
+        async let stagedApprovals = stagedApprovalSources(at: now)
+        async let openQuestions = openQuestionSources(at: now)
         let readings: [HorizonSourceReading] = [
-            await statedPlanSources(at: now),
-            statedScheduleSources(at: now),
-            await stagedApprovalSources(at: now),
-            await openQuestionSources(at: now),
+            await statedPlans,
+            statedScheduleSources(),
+            await stagedApprovals,
+            await openQuestions,
             peerReplySources(at: now),
         ]
         var rows = readings.flatMap { reading in
@@ -435,9 +429,9 @@ extension NativeCognitionRuntime {
 
     /// Desk items User parked until a date. `deferUntil` is the one field in
     /// the system that means "this is for later, and later is a specific day".
-    /// The label is the item's stable HANDLE — never its title.
+    /// The label names the work, as the Desk does.
     private func deskDeferralSources(at now: Date) async -> (rows: [(token: String, dueAt: Date)], complete: Bool) {
-        guard let state = try? await pursuitStateLoader() else {
+        guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else {
             return ([], false)
         }
         // A DeskState coming back is NOT evidence the Desk was read. The store
@@ -459,7 +453,7 @@ extension NativeCognitionRuntime {
                   !raw.isEmpty,
                   let until = Self.parseDeferStamp(raw),
                   until > now else { continue }
-            guard let token = token(.statedPlan, label: item.handle, natural: until, at: now) else {
+            guard let token = token(.statedPlan, label: item.title, natural: until, at: now) else {
                 continue
             }
             out.append(token)
@@ -498,37 +492,16 @@ extension NativeCognitionRuntime {
         return DeskClock.parseISO(raw)
     }
 
-    /// (b) Scheduler rows she has a relationship with. Read straight off the
-    /// canonical jobs file through the runner's own checked reader, so a
-    /// malformed schedule is an error (no rows) rather than an invented empty
-    /// one. The label is the job id — `nativeagent-nightly-dream` — never its
-    /// payload or objective.
-    private func statedScheduleSources(at now: Date) -> HorizonSourceReading {
+    /// Schedules do not mint anticipation. Availability still settles legacy
+    /// scheduled horizons only when the canonical jobs file can be read.
+    private func statedScheduleSources() -> HorizonSourceReading {
         let path = dataRoot
             .appendingPathComponent("scheduler", isDirectory: true)
             .appendingPathComponent("jobs.json")
-        guard let rows = try? host.schedulerJobRows(at: path) else {
+        guard (try? host.schedulerJobRows(at: path)) != nil else {
             return .unavailable(.scheduledJob)
         }
-        var out: [(token: String, dueAt: Date)] = []
-        for row in rows {
-            guard case .object(let object) = row,
-                  SchedulerJobRuntime.bool(object["enabled"], default: true),
-                  let kind = SchedulerJobRuntime.string(object["kind"])?.lowercased(),
-                  Self.horizonSchedulerKinds.contains(kind),
-                  let id = SchedulerJobRuntime.string(object["id"]), !id.isEmpty,
-                  let epoch = SchedulerJobRuntime.epoch(from: object["nextRunAt"])
-                    ?? SchedulerJobRuntime.epoch(from: object["nextRunAtEpoch"]),
-                  epoch.isFinite else { continue }
-            guard let token = token(
-                .scheduledJob,
-                label: id,
-                natural: Date(timeIntervalSince1970: epoch),
-                at: now
-            ) else { continue }
-            out.append(token)
-        }
-        return HorizonSourceReading(kind: .scheduledJob, rows: out, complete: true)
+        return HorizonSourceReading(kind: .scheduledJob, rows: [], complete: true)
     }
 
     /// (c) Approvals she staged and he has not walked through. The label is the

@@ -57,17 +57,10 @@ import PersistenceCore
 // MARK: - The four verbs
 
 public struct MacFourVerbs: Sendable {
-    let host: any MacFourVerbsHost
-    let clock: any MacFourVerbsClock
+    let host: any MacControlClient
+    let clock = SystemMacFourVerbsClock()
     let supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)?
-    let options: MacScreenRender.Options
     let namedLocationRoots: [URL]
-    /// fable51 item 31 — the two subscriptions `wait` ends on. They are seams
-    /// here rather than inside the client because `wait` is the only caller and
-    /// because the WAITING is paced by `clock`, which is a seam of this type:
-    /// a host that blocked on real time would take the fake clock out of the
-    /// loop and make a 60-second budget cost 60 real seconds in a test.
-    ///
     /// AUTHORITY, explicitly: subscribing is not perception. Nothing is
     /// installed until the first `sight()` has SUCCEEDED, and that sight goes
     /// through `host.dispatch("look")`, which runs the full gate pre-flight
@@ -80,18 +73,14 @@ public struct MacFourVerbs: Sendable {
     public var sightRecorder: MacSightRecorder?
 
     public init(
-        host: any MacFourVerbsHost,
-        clock: any MacFourVerbsClock = SystemMacFourVerbsClock(),
+        host: any MacControlClient,
         supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)? = nil,
-        options: MacScreenRender.Options = .default,
         namedLocationRoots: [URL]? = nil,
         effectObserverSource: any MacAXEffectObserverSource = defaultMacAXEffectObserverSource(),
         appActivationSource: any MacAppActivationObserverSource = defaultMacAppActivationObserverSource()
     ) {
         self.host = host
-        self.clock = clock
         self.supplementalSource = supplementalSource
-        self.options = options
         self.namedLocationRoots = namedLocationRoots ?? Self.commonHomeLocationRoots()
         self.effectObserverSource = effectObserverSource
         self.appActivationSource = appActivationSource

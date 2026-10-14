@@ -20,4 +20,11 @@ public enum HerScreenPreview {
             await AgentWorkspaceScreenPreview.render(room, dataRoot: dataRoot, scope: scope)
         }
     }
+    /// The pane for one tab, exactly as shown; app_page_read page=agent reads this.
+    @MainActor
+    public static func paneText(_ room: String, root: URL, scope: String) async -> String {
+        let said = await HerScreenPreview.glance(dataRoot: root, scope: scope)
+        let text = await HerScreenPreview.render(room, dataRoot: root, scope: scope)
+        return (said ?? "(no glance this turn)") + "\n\n" + text
+    }
 }

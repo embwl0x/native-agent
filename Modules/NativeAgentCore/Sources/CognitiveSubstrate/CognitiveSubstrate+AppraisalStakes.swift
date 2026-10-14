@@ -97,17 +97,6 @@ extension CognitiveSubstrate {
         ) != nil
     }
 
-    /// Prediction path kinds whose resolution is MACHINERY, not stake — the body
-    /// noticing its own infrastructure work out. Kept as documentation of the
-    /// measured population (see `AppraisalStakesTests.measuredFeltPopulation`);
-    /// admission is decided by `stakeBearingResolutionPathKinds` alone, so an
-    /// unknown kind is treated the same as these.
-    static let mechanicalResolutionPathKinds: Set<String> = [
-        OrganismPredictionKind.toolCompletion.rawValue,
-        OrganismPredictionKind.providerCompletion.rawValue,
-        OrganismPredictionKind.phoneDelivery.rawValue,
-    ]
-
     /// Was a concern she holds actually at stake in this felt resolution?
     ///
     /// Pure and synchronous (it runs inside the await-free ingest segment). Two

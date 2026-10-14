@@ -66,9 +66,6 @@ public enum TriggerSchedulerBackgroundWork {
 
     public static func makeMorningBriefSynthesizer(
         runTurn: @escaping @Sendable (String) async throws -> String,
-        deadlineSleep: @escaping @Sendable (TimeInterval) async throws -> Void = { interval in
-            try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-        },
         failureMarker: @escaping @Sendable (String) -> Void = { marker in
             nativeLog("%@", marker)
         }
@@ -80,10 +77,14 @@ public enum TriggerSchedulerBackgroundWork {
                 requiredTools: morningBriefTools
             )
             do {
-                return try await withBoundedMorningBriefTurn(deadlineSleep: deadlineSleep) {
-                    let response = try await runTurn(prompt)
-                    let output = response.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return output.isEmpty ? nil : output
+                do {
+                    return try await TurnDeadline.withThrowingDeadline(seconds: morningBriefSynthesisTimeout) {
+                        let response = try await runTurn(prompt)
+                        let output = response.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return output.isEmpty ? nil : output
+                    }
+                } catch is TurnDeadline.DeadlineExceeded {
+                    throw CancellationError()
                 }
             } catch {
                 // FAIL-OPEN, NOT SILENT: nil restores the deterministic brief,
@@ -96,45 +97,6 @@ public enum TriggerSchedulerBackgroundWork {
                 return nil
             }
         }
-    }
-
-    /// Races the turn against a deadline. The loser is cancelled, so a wedged
-    /// provider call cannot outlive the brief that asked for it.
-    ///
-    /// 2026-09-06: this was a `withThrowingTaskGroup`, and leaving a group
-    /// WAITS for its children. Cancellation is a request — a provider call that
-    /// does not observe it kept the group scope open long past the 120 s
-    /// ceiling, and the loop manager holds its execution gate until the tick
-    /// body returns, so the "bounded" brief could pin the whole lane. Same
-    /// resume-once shape as `IntraTurnContextCompaction.withDeadline`: whoever
-    /// finishes first resolves the caller NOW, and the loser is cancelled and
-    /// then ignored.
-    private static func withBoundedMorningBriefTurn(
-        deadlineSleep: @escaping @Sendable (TimeInterval) async throws -> Void,
-        _ body: @escaping @Sendable () async throws -> String?
-    ) async throws -> String? {
-        let once = MorningBriefTurnRace()
-        let child = Task {
-            do { once.resume(.init(value: .success(try await body()))) }
-            catch { once.resume(.init(value: .failure(error))) }
-        }
-        let sleeper = Task {
-            try? await deadlineSleep(morningBriefSynthesisTimeout)
-            guard !Task.isCancelled else { return }
-            once.resume(.init(value: .failure(CancellationError())))
-        }
-        let outcome = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                once.install(continuation)
-            }
-        } onCancel: {
-            child.cancel()
-            sleeper.cancel()
-            once.resume(.init(value: .failure(CancellationError())))
-        }
-        child.cancel()
-        sleeper.cancel()
-        return try outcome.value.get()
     }
 
     /// The evidence layer IS the prompt. The turn is asked for a read on top of
@@ -174,46 +136,6 @@ public enum TriggerSchedulerBackgroundWork {
         mention this instruction.
         """)
         return lines.joined(separator: "\n")
-    }
-}
-
-/// Carries a thrown synthesis error across the race without laundering it into
-/// the timeout's `CancellationError` — the degraded-brief marker names the real
-/// reason. `@unchecked` because `any Error` is not `Sendable`; the value is
-/// written once and read once.
-private struct MorningBriefTurnOutcome: @unchecked Sendable {
-    let value: Result<String?, Error>
-}
-
-/// Resume-once gate for `withBoundedMorningBriefTurn`. A resume that lands
-/// before the continuation is installed is remembered and applied on install,
-/// so a cancellation that wins the race still resolves the wait.
-private final class MorningBriefTurnRace: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<MorningBriefTurnOutcome, Never>?
-    private var pending: MorningBriefTurnOutcome?
-    private var resolved = false
-
-    func install(_ continuation: CheckedContinuation<MorningBriefTurnOutcome, Never>) {
-        lock.lock()
-        if let pending, resolved {
-            lock.unlock()
-            continuation.resume(returning: pending)
-            return
-        }
-        self.continuation = continuation
-        lock.unlock()
-    }
-
-    func resume(_ outcome: MorningBriefTurnOutcome) {
-        lock.lock()
-        guard !resolved else { lock.unlock(); return }
-        resolved = true
-        pending = outcome
-        let waiting = continuation
-        continuation = nil
-        lock.unlock()
-        waiting?.resume(returning: outcome)
     }
 }
 
@@ -296,10 +218,6 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     }
 
     public func shutdown() async { await shutdownJobs() }
-
-    public func tick() async {
-        _ = await tickOutcome()
-    }
 
     public func tickOutcome() async -> LoopTickOutcome {
         let dueJobs = await runDueJobs()

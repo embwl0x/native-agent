@@ -510,20 +510,6 @@ extension AnthropicOAuthDirectAdapter {
             body["stream"] = true
         }
         Self.applyTextLaneStops(to: &body, system: system)
-        // Turn Inspector W2 — GATED summarized-thinking lane. The `thinking`
-        // param is part of the request BODY, so adding it CHANGES the bytes on
-        // the wire (and the U1 cache prefix). It is therefore strictly gated on
-        // the per-surface opt-in task-local `InspectorThinkingLane.summarized-
-        // Thinking`, which is FALSE unless the Mac chat surface explicitly binds
-        // it TRUE (read here at call time, same as the other body task-locals).
-        // UNBOUND (the default everywhere) → the key is NOT added → the body is
-        // BYTE-IDENTICAL to pre-W2. Display "summarized" yields SUMMARIZED
-        // thinking blocks (Opus 4.7/4.8 omit raw CoT); the SSE parser renders
-        // thinking_delta onto the bus and redacted_thinking as "[redacted]" —
-        // blocks and signatures are NEVER mutated.
-        if InspectorThinkingLane.summarizedThinking {
-            body["thinking"] = ["type": "adaptive", "display": "summarized"]
-        }
         FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel)
         return body
     }

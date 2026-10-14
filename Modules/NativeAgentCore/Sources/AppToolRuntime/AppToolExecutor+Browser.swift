@@ -201,8 +201,9 @@ extension AppToolExecutor {
                 }
             }
             let read = id == "browser.chrome_snapshot" && !dryRun ? try await ChromePageText.readDocument(result) : result
-            if !dryRun, id == "browser.chrome_snapshot", ChromePageText.render(read) != nil {
-                PeerDataTaint.markConsumed(peer: "web content", attested: false)
+            if !dryRun, id == "browser.chrome_snapshot", case .object(let page) = read,
+               case .string? = page["snapshotId"], case .array? = page["nodes"] {
+                PeerDataTaint.markConsumed(peer: "web content")
             }
             return read
         }
@@ -252,12 +253,13 @@ extension AppToolExecutor {
         let result = try await BrowserActionRoutes.$retainRead.withValue(visibleRead.map { retained in
             { @Sendable capture in retained.remember(capture) }
         }) { try await run(actionId, input) }
-        Self.mirrorChromePage(result, closedBy: actionId, input: input)
+        let projection = ChromePageText.project(result)
+        Self.mirrorChromePage(result, projection: projection, closedBy: actionId, input: input)
         guard case .object(var obj) = result else {
             return result
         }
-        if direct, actionId == "browser.chrome_snapshot", let page = ChromePageText.render(result) {
-            return try await browserSenseRead(snapshot: result, raw: .string(page), input: input)
+        if direct, actionId == "browser.chrome_snapshot", let page = projection.text {
+            return try await browserSenseRead(snapshot: result, raw: .string(page), input: input, projection: projection)
         }
         if direct, Self.chromePageActions.contains(actionId), case .object(let receipt)? = obj["receipt"],
            case .int(let tab)? = receipt["tabId"] {
@@ -321,7 +323,7 @@ extension AppToolExecutor {
                 actionID: actionId, visibleCapture: visibleRead?.capture)
         }
         if !dryRun, actionId == "browser.chrome_snapshot" {
-            return try await browserSenseRead(snapshot: result, raw: .object(obj), input: input)
+            return try await browserSenseRead(snapshot: result, raw: .object(obj), input: input, projection: projection)
         }
         return .object(obj)
     }
@@ -374,8 +376,9 @@ extension AppToolExecutor {
                 try? await Task.sleep(nanoseconds: 750_000_000)
                 snapshot = try await readPage()
             }
-            Self.mirrorChromePage(snapshot)
-            guard let page = ChromePageText.render(snapshot) else {
+            let projection = ChromePageText.project(snapshot)
+            Self.mirrorChromePage(snapshot, projection: projection)
+            guard let page = projection.text else {
                 return "The fresh page could not be read. Call browser.chrome_snapshot."
             }
             return page
@@ -387,7 +390,8 @@ extension AppToolExecutor {
 
     private func browserSenseRead(snapshot: JSONValue, raw: JSONValue, input: [String: JSONValue],
                                   actionID: String = "browser.chrome_snapshot",
-                                  visibleCapture: BrowserVisibleCapture? = nil) async throws -> JSONValue {
+                                  visibleCapture: BrowserVisibleCapture? = nil,
+                                  projection: ChromePageText.Projection? = nil) async throws -> JSONValue {
         guard case .object(let fields) = snapshot else {
             return SenseDoor.signedRaw(raw, line: "raw view · \(actionID) · snapshot unavailable")
         }
@@ -398,11 +402,12 @@ extension AppToolExecutor {
         else {
             // The supplied text already uses ChromePageText and may be a scroll
             // delta with its stalled-feed warning. Keep that exact presentation.
-            let rendered = if case .string(let text) = raw { text } else { ChromePageText.render(snapshot) }
+            let projection = projection ?? ChromePageText.project(snapshot)
+            let rendered = if case .string(let text) = raw { text } else { projection.text }
             guard let rendered else {
                 return SenseDoor.signedRaw(raw, line: "raw view · builtin-chrome · snapshot unavailable")
             }
-            let receipt = try ChromePageText.envelope(snapshot, rendered: rendered)
+            let receipt = try ChromePageText.envelope(snapshot, rendered: rendered, projection: projection)
             if case .object(let original) = raw, original["nodes"] != nil, case .object(let fields) = receipt {
                 servedRaw = .object(original.merging(fields) { _, new in new })
             } else { servedRaw = receipt }
@@ -445,7 +450,7 @@ extension AppToolExecutor {
                 throw SenseFailure(code: "source_unavailable", message: "The visible browser read did not retain its captured material.")
             }
             if case .string(let text)? = document["text"], !text.isEmpty {
-                PeerDataTaint.markConsumed(peer: "web content", attested: false)
+                PeerDataTaint.markConsumed(peer: "web content")
             }
             retained = .object(document)
         } else { retained = snapshot }

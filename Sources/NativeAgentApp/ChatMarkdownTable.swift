@@ -1,3 +1,4 @@
+import EngineRuntime
 import SwiftUI
 
 // Third pass (the conversation itself), item 2. A Markdown table used to land
@@ -14,8 +15,8 @@ import SwiftUI
 // its header AND separator row exist (which is also the rule below, so a
 // re-render mid-stream would not flicker a one-column table into view).
 
-struct ChatMarkdownTable: Equatable {
-    enum Align: Equatable { case leading, center, trailing }
+struct ChatMarkdownTable: Equatable, Sendable {
+    enum Align: Equatable, Sendable { case leading, center, trailing }
 
     var header: [String]
     var aligns: [Align]
@@ -32,7 +33,7 @@ struct ChatMarkdownTable: Equatable {
     }
 }
 
-enum ChatProseSegment: Equatable {
+enum ChatProseSegment: Equatable, Sendable {
     case text(String)
     case table(ChatMarkdownTable)
 }
@@ -147,13 +148,14 @@ enum ChatMarkdownTableParser {
 /// transcript's own scroll view.
 struct ChatMarkdownTableView: View {
     let table: ChatMarkdownTable
+    let cells: [[AttributedString]]
 
     var body: some View {
-        let columns = Array(0..<table.columnCount)
+        let columns = Array(0..<(cells.first?.count ?? 0))
         Grid(alignment: .topLeading, horizontalSpacing: NativeAgentSpacing.sm, verticalSpacing: 0) {
             GridRow {
                 ForEach(columns, id: \.self) { column in
-                    cellText(table.cell(table.header, column), column: column)
+                    cellText(cells[0][column], column: column)
                         .font(NativeAgentFont.tag)
                         .foregroundStyle(.secondary)
                         .textCase(.uppercase)
@@ -164,7 +166,7 @@ struct ChatMarkdownTableView: View {
             ForEach(table.rows.indices, id: \.self) { row in
                 GridRow {
                     ForEach(columns, id: \.self) { column in
-                        cellText(table.cell(table.rows[row], column), column: column)
+                        cellText(cells[row + 1][column], column: column)
                             .padding(.vertical, NativeAgentSpacing.xs)
                     }
                 }
@@ -181,19 +183,13 @@ struct ChatMarkdownTableView: View {
     }
 
     @ViewBuilder
-    private func cellText(_ text: String, column: Int) -> some View {
+    private func cellText(_ text: AttributedString, column: Int) -> some View {
         let aligned: Alignment = switch table.align(column) {
         case .leading: .leading
         case .center: .center
         case .trailing: .trailing
         }
-        Group {
-            if let attributed = ChatMarkdownCache.attributed(text) {
-                Text(attributed)
-            } else {
-                Text(text)
-            }
-        }
+        Text(text)
         .multilineTextAlignment(table.align(column) == .trailing ? .trailing : .leading)
         .frame(maxWidth: .infinity, alignment: aligned)
         .gridColumnAlignment(table.align(column) == .trailing ? .trailing : .leading)

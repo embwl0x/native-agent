@@ -120,7 +120,7 @@ public enum DeskRefKind: Sendable, Equatable {
     case approval(id: String, status: String?)
     case trace(id: String, kind: String?)
     case note(text: String)
-    /// A MY QUEUE step (`MyQueue`): when it is ready and where it came from.
+    /// Carried work: when it is ready and where it came from.
     case step(DeskStep)
 
     /// Wire token written as the ref's `kind` field.
@@ -184,8 +184,9 @@ public enum DeskRefKind: Sendable, Equatable {
             return .trace(id: id, kind: str("traceKind") ?? kind)
         case let .note(text):
             return .note(text: str("text") ?? text)
-        case .step:
-            return self
+        case .step(var step):
+            if step.replyRoute == nil { step.replyRoute = fields["replyRoute"] }
+            return .step(step)
         }
     }
 }
@@ -284,10 +285,8 @@ public struct DeskRef: Sendable, Equatable {
     }
 }
 
-/// What makes a Desk item a step in her queue (Wave 2 #7): her words when it
-/// was queued, when it becomes ready, the card it follows and the call she
-/// means to make there, the sentence it was inferred from (nil when she queued
-/// it herself), and the peers who steered the turn it was born on.
+/// Carried work's words, readiness, planned call and originating turn. An
+/// inferred step keeps its source sentence; every step keeps its peer steering.
 public struct DeskStep: Sendable, Equatable {
     public var words: String
     /// `next_turn`, `own_turn`, `when_user_messages[ <door>]`, `after_card`, `at <ISO time>`.
@@ -297,33 +296,59 @@ public struct DeskStep: Sendable, Equatable {
     public var source: String?
     public var peers: [String]
     public var elevated: [String]
-    /// The conversation that queued it: a wake that works it carries that conversation's context.
+    /// The originating conversation: a wake that works it carries that conversation's context.
     public var session: String?
+    /// `person`, `agent:<name>` or `self`; nil on older steps.
+    public var origin: String?
     /// When the current readiness condition was filed.
     public var filedAt: String?
+    /// The originating turn's durable envelope, never a later message's door.
+    public var replyRoute: JSONValue?
 
     public init(words: String, when: String, card: String? = nil, action: String? = nil, source: String? = nil,
-                peers: [String] = [], elevated: [String] = [], session: String? = nil, filedAt: String? = nil) {
+                peers: [String] = [], elevated: [String] = [], session: String? = nil, origin: String? = nil, filedAt: String? = nil,
+                replyRoute: JSONValue? = nil) {
         self.words = words; self.when = when; self.card = card; self.action = action; self.source = source
         self.peers = peers; self.elevated = elevated; self.session = session
+        self.origin = origin
         self.filedAt = filedAt
+        self.replyRoute = replyRoute
     }
 
     init?(fields obj: [String: JSONValue]) {
         guard let words = jsonString(obj, "words"), let when = jsonString(obj, "when") else { return nil }
         self.init(words: words, when: when, card: jsonString(obj, "card"), action: jsonString(obj, "action"),
                   source: jsonString(obj, "source"), peers: jsonStringArray(obj, "peers"),
-                  elevated: jsonStringArray(obj, "elevated"), session: jsonString(obj, "session"), filedAt: jsonString(obj, "filedAt"))
+                  elevated: jsonStringArray(obj, "elevated"), session: jsonString(obj, "session"),
+                  origin: jsonString(obj, "origin"), filedAt: jsonString(obj, "filedAt"), replyRoute: obj["replyRoute"])
     }
 
     var fields: [String: JSONValue] {
         var obj: [String: JSONValue] = ["words": .string(words), "when": .string(when)]
-        for (key, value) in [("card", card), ("action", action), ("source", source), ("session", session), ("filedAt", filedAt)] {
+        for (key, value) in [("card", card), ("action", action), ("source", source), ("session", session), ("origin", origin), ("filedAt", filedAt)] {
             if let value, !value.isEmpty { obj[key] = .string(value) }
         }
         if !peers.isEmpty { obj["peers"] = .array(peers.map(JSONValue.string)) }
         if !elevated.isEmpty { obj["elevated"] = .array(elevated.map(JSONValue.string)) }
+        if let replyRoute { obj["replyRoute"] = replyRoute }
         return obj
+    }
+
+    mutating func preserveOrigin(of previous: DeskStep) {
+        peers = previous.peers + peers.filter { !previous.peers.contains($0) }
+        elevated = previous.elevated + elevated.filter { !previous.elevated.contains($0) }
+        session = previous.session
+        origin = previous.origin
+        filedAt = previous.filedAt
+        replyRoute = previous.replyRoute
+    }
+
+    public var owedToPerson: Bool {
+        if let origin { return origin == "person" }
+        // Older steps recorded only their conversation, or an inferred promise.
+        return source?.hasPrefix("Repeated work: ") != true
+            && session != "resident-wake" && session?.hasPrefix("agent-") != true
+            && session?.hasPrefix("bot-") != true && (session != nil || source != nil)
     }
 }
 
@@ -423,21 +448,34 @@ public struct NotifyPolicy: Sendable, Equatable {
 public struct DeskNote: Sendable, Equatable {
     public var ts: String
     public var text: String
+    public var author: String?
 
-    public init(ts: String, text: String) {
+    var legacyFindingKey: String? {
+        let line = text.prefix { $0 != "\n" }
+        return line.hasPrefix("harness-key ") ? String(line.dropFirst("harness-key ".count)) : nil
+    }
+
+    public init(ts: String, text: String, author: String? = nil) {
         self.ts = ts
-        self.text = text
+        // Items filed before 10-12 carry the harness key as "harness-key:<key>",
+        // which the display redactor reads as a credential pair. Every note
+        // built from the ops or the state file carries the label-plus-space
+        // form the queue writes now; the stored op is untouched.
+        self.text = text.hasPrefix("harness-key:") ? "harness-key " + text.dropFirst("harness-key:".count) : text
+        self.author = author
     }
 
     public func toJSON() -> JSONValue {
-        .object(["ts": .string(ts), "text": .string(text)])
+        var fields: [String: JSONValue] = ["ts": .string(ts), "text": .string(text)]
+        if let author { fields["author"] = .string(author) }
+        return .object(fields)
     }
 
     public static func fromJSON(_ value: JSONValue) -> DeskNote? {
         guard case .object(let obj) = value,
               let ts = jsonString(obj, "ts"),
               let text = jsonString(obj, "text") else { return nil }
-        return DeskNote(ts: ts, text: text)
+        return DeskNote(ts: ts, text: text, author: jsonString(obj, "author"))
     }
 }
 
@@ -910,6 +948,7 @@ public struct DeskProgress: Sendable, Equatable {
 
 public struct DeskItem: Sendable, Equatable {
     public var continuation: DeskContinuation?
+    public var findingKey: String?
     public var handle: String           // stable
     public var alias: String            // view number "2" / "2.1" — stable, never renumbered
     public var parent: String?
@@ -924,6 +963,11 @@ public struct DeskItem: Sendable, Equatable {
     public var laneOf: String?
     public var progress: DeskProgress?
     public var refs: [DeskRef]
+    public var step: DeskStep? {
+        refs.reversed().lazy.compactMap { ref -> DeskStep? in
+            if case .step(let step) = ref.kind { return step }; return nil
+        }.first
+    }
     public var cadence: Cadence
     public var notify: NotifyPolicy
     public var notes: [DeskNote]
@@ -986,10 +1030,12 @@ public struct DeskItem: Sendable, Equatable {
         blockedOn: [String] = [],
         deferUntil: String? = nil,
         workAttempts: [DeskWorkAttempt] = [],
-        continuation: DeskContinuation? = nil
+        continuation: DeskContinuation? = nil,
+        findingKey: String? = nil
     ) {
         self.handle = handle
         self.continuation = continuation
+        self.findingKey = findingKey
         self.alias = alias
         self.parent = parent
         self.kind = kind
@@ -1057,6 +1103,7 @@ public struct DeskItem: Sendable, Equatable {
         if let pursuit { obj["pursuit"] = pursuit.toJSON() }
         if !workAttempts.isEmpty { obj["workAttempts"] = .array(workAttempts.map { $0.toJSON() }) }
         if let continuation { obj["continuation"] = continuation.toJSON() }
+        if let findingKey { obj["findingKey"] = .string(findingKey) }
         return .object(obj)
     }
 
@@ -1161,7 +1208,8 @@ public struct DeskItem: Sendable, Equatable {
             blockedOn: blockedOn,
             deferUntil: jsonString(obj, "deferUntil"),
             workAttempts: workAttempts,
-            continuation: continuation
+            continuation: continuation,
+            findingKey: jsonString(obj, "findingKey")
         )
     }
 }
@@ -1213,7 +1261,8 @@ public enum OwnerAttentionPolicy {
     public static func inboxAsks(pending: Bool, systemLane: Bool, severity: String, linkedApproval: Bool,
                                  actionIDs: [String]) -> Bool {
         guard pending, !systemLane, severity.lowercased() != "info" else { return false }
-        return linkedApproval || actionIDs.contains { !["view", "read", "archive", "dismiss"].contains($0.lowercased()) }
+        return severity.lowercased() == "actionable" || linkedApproval
+            || actionIDs.contains { !["view", "read", "archive", "dismiss"].contains($0.lowercased()) }
     }
 }
 
@@ -1254,12 +1303,13 @@ public struct ArchiveRecord: Sendable, Equatable {
     public var decisions: [String]
     public var artifacts: [String]
     public var supersededBy: String?
+    public var findingKey: String?
 
     public init(
         handle: String, title: String, project: String,
         finalStatus: ArchiveFinalStatus, openedAt: String, closedAt: String,
         summary: String, refs: [DeskRef] = [], decisions: [String] = [],
-        artifacts: [String] = [], supersededBy: String? = nil
+        artifacts: [String] = [], supersededBy: String? = nil, findingKey: String? = nil
     ) {
         self.handle = handle
         self.title = title
@@ -1272,6 +1322,7 @@ public struct ArchiveRecord: Sendable, Equatable {
         self.decisions = decisions
         self.artifacts = artifacts
         self.supersededBy = supersededBy
+        self.findingKey = findingKey
     }
 
     public func toJSON() -> JSONValue {
@@ -1288,6 +1339,7 @@ public struct ArchiveRecord: Sendable, Equatable {
         if !decisions.isEmpty { obj["decisions"] = .array(decisions.map { .string($0) }) }
         if !artifacts.isEmpty { obj["artifacts"] = .array(artifacts.map { .string($0) }) }
         if let supersededBy, !supersededBy.isEmpty { obj["supersededBy"] = .string(supersededBy) }
+        if let findingKey { obj["findingKey"] = .string(findingKey) }
         return .object(obj)
     }
 
@@ -1308,7 +1360,7 @@ public struct ArchiveRecord: Sendable, Equatable {
             openedAt: openedAt, closedAt: closedAt, summary: summary, refs: refs,
             decisions: jsonStringArray(obj, "decisions"),
             artifacts: jsonStringArray(obj, "artifacts"),
-            supersededBy: jsonString(obj, "supersededBy")
+            supersededBy: jsonString(obj, "supersededBy"), findingKey: jsonString(obj, "findingKey")
         )
     }
 }
@@ -1368,6 +1420,11 @@ public struct DeskState: Sendable, Equatable {
     }
 
     public var topLevel: [DeskItem] { items.filter { $0.parent == nil } }
+    public var boardCountSummary: String {
+        let board = items.filter { $0.project != MyQueue.project }
+        let top = board.filter { $0.parent == nil }
+        return "\(top.filter { !$0.status.isTerminal }.count) of \(top.count) top-level items open; \(board.filter { !$0.status.isTerminal }.count) open including parts; MY QUEUE and archives excluded"
+    }
     public func children(of handle: String) -> [DeskItem] { items.filter { $0.parent == handle } }
 
     public func toJSON() -> JSONValue {

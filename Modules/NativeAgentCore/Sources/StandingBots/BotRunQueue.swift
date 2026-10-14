@@ -31,7 +31,7 @@ public struct BotEventProvenance: Codable, Equatable, Sendable {
 }
 
 public enum BotRunAdmissionError: String, Error {
-    case paused, overBudget = "over_budget", alreadyRunning = "already_running"
+    case paused, alreadyRunning = "already_running"
 }
 
 /// Durable local requests, consumed before work so an interrupted run is never
@@ -296,10 +296,6 @@ public struct BotRunQueue: Sendable {
                 }
             }
         }
-    }
-
-    func configuredBudget(bot id: UUID) throws -> BotBudget {
-        try disk.locked { try disk.definition(id).definition.budget }
     }
 
     private func admit(bot id: UUID, runID: UUID?, manual: Bool = false) throws -> ClaimedRun {

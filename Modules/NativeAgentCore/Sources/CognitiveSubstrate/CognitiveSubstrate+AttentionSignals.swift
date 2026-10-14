@@ -25,7 +25,7 @@ extension CognitiveSubstrate {
         guard !honorCancellation || !Task.isCancelled else { return nil }
         // Gate exactly the way the capsule path does: disabled cognition adds
         // nothing; workspace off yields no items below.
-        guard configuration.enabled, configuration.workspaceEnabled else { return nil }
+        guard configuration.enabled else { return nil }
 
         // PURE hot-set read (gpt-5.5 HIGH, 2026-07-10): `workspaceSnapshot()`
         // routes through the field's MUTATING snapshot (decay writes, anchor
@@ -37,8 +37,9 @@ extension CognitiveSubstrate {
         // association-edge reasons (mutating read; attention doesn't need
         // reasons) and the per-session user-turn/system caps (machine subjects
         // never become terms anyway, so the caps don't change this output).
-        let mood = derivedMood(at: date)
-        let currentAffect = projectedAffect(at: date)
+        let dyn = dynamics
+        let currentAffect = projectedAffect(at: date, dynamics: dyn)
+        let mood = derivedMood(at: date, dynamics: dyn, affect: currentAffect)
         let hotItems = field.peekDecayedNodes(at: date)
             .map { node in
                 (node: node, turnKind: field.cachedTurnKind(for: node))

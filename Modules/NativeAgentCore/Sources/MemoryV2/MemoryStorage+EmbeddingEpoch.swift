@@ -13,23 +13,6 @@ extension MemoryStorage {
         try await dbPool.read { db in try Self.embeddingCorpus(in: db) }
     }
 
-    /// Transactionally consistent evaluation copy. The returned store has its
-    /// own root and can be freely probed; canonical live rows and access
-    /// counters cannot be mutated by the lab.
-    public func frozenCopy(at dataRoot: URL) throws -> MemoryStorage {
-        let destinationDirectory = dataRoot.appendingPathComponent("memory", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: destinationDirectory,
-            withIntermediateDirectories: true
-        )
-        let destination = destinationDirectory.appendingPathComponent("memory.sqlite")
-        guard !FileManager.default.fileExists(atPath: destination.path) else {
-            throw MemoryStorageError.databaseUnavailable("frozen-copy destination already exists")
-        }
-        try MemoryConsolidationGate.onlineBackup(from: dbPool, to: destination)
-        return try MemoryStorage(dataRoot: dataRoot, memoryLimit: memoryLimit)
-    }
-
     public func embeddingEpochState() async throws -> MemoryEmbeddingEpochState {
         try await dbPool.read { db in try Self.embeddingEpochState(in: db) }
     }

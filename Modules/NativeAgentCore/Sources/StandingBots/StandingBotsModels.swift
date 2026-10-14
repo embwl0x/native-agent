@@ -74,6 +74,8 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public var sources: [BotSource]
     public var provider: String? = nil
     public var model: String? = nil
+    /// Missing on legacy definitions; nil follows Providers.
+    public var modelPinned: Bool? = false
     public var reasoningEffort: String? = nil
     public var fast: Bool? = nil
     public var dailyTokenCeiling: Int? = nil
@@ -108,7 +110,7 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
 extension BotDefinition {
     private enum CodingKeys: String, CodingKey {
         case id, name, brief, briefVersion, cadence, sources, outputFormat, budget, paused, createdAt, updatedAt
-        case provider, model, reasoningEffort, fast, dailyTokenCeiling, notificationCondition, deleted
+        case provider, model, modelPinned, reasoningEffort, fast, dailyTokenCeiling, notificationCondition, deleted
         case eventTrigger
     }
     public init(from decoder: Decoder) throws {
@@ -128,6 +130,7 @@ extension BotDefinition {
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
         provider = try c.decodeIfPresent(String.self, forKey: .provider)
         model = try c.decodeIfPresent(String.self, forKey: .model)
+        modelPinned = try c.decodeIfPresent(Bool.self, forKey: .modelPinned)
         reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
         fast = try c.decodeIfPresent(Bool.self, forKey: .fast)
         dailyTokenCeiling = try c.decodeIfPresent(Int.self, forKey: .dailyTokenCeiling)

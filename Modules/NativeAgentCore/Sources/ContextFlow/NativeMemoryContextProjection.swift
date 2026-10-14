@@ -4,175 +4,16 @@ import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 
-struct NativeMemoryProjectionRecord: Sendable, Equatable {
-    let id: String
-    let text: String
-    let layer: String?
-    let memoryKind: String?
-    let createdAt: String
-    let updatedAt: String?
-    let sourceRunId: String?
-    var status: String?
-    let pinned: Bool?
-    let confidence: Double?
-    let importance: Double?
-    let tags: [String]?
-    let sourceQuality: Double?
-    let decay: JSONValue?
-    let correction: JSONValue?
-    let provenance: JSONValue?
-    let extras: JSONValue?
-    let personaId: String?
-    let lifecycle: String?
-    let validFrom: String?
-    let validTo: String?
-    let observedAt: String?
-    let evidence: JSONValue?
-
-    init(
-        id: String,
-        text: String,
-        layer: String?,
-        memoryKind: String?,
-        createdAt: String,
-        updatedAt: String?,
-        sourceRunId: String?,
-        status: String?,
-        pinned: Bool?,
-        confidence: Double?,
-        importance: Double?,
-        tags: [String]?,
-        sourceQuality: Double?,
-        decay: JSONValue?,
-        correction: JSONValue?,
-        provenance: JSONValue?,
-        extras: JSONValue?,
-        personaId: String? = nil,
-        lifecycle: String? = nil,
-        validFrom: String? = nil,
-        validTo: String? = nil,
-        observedAt: String? = nil,
-        evidence: JSONValue? = nil
-    ) {
-        self.id = id
-        self.text = text
-        self.layer = layer
-        self.memoryKind = memoryKind
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-        self.sourceRunId = sourceRunId
-        self.status = status
-        self.pinned = pinned
-        self.confidence = confidence
-        self.importance = importance
-        self.tags = tags
-        self.sourceQuality = sourceQuality
-        self.decay = decay
-        self.correction = correction
-        self.provenance = provenance
-        self.extras = extras
-        self.personaId = personaId
-        self.lifecycle = lifecycle
-        self.validFrom = validFrom
-        self.validTo = validTo
-        self.observedAt = observedAt
-        self.evidence = evidence
-    }
-}
-
-protocol NativeMemoryContextProjectionMemory: Sendable {
-    func listContextProjectionRecords() async throws -> [NativeMemoryProjectionRecord]
-    func contextProjectionEmbeddingModelFingerprint() async throws -> String
-    func embedForDerivedContext(_ texts: [String]) async throws -> [[Float]]
-    func contextProjectionEmbeddingEpoch() async throws -> MemoryEmbeddingEpoch
-    func embedForDerivedContextWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch
-}
-
-extension NativeMemoryContextProjectionMemory {
-    func contextProjectionEmbeddingEpoch() async throws -> MemoryEmbeddingEpoch {
-        MemoryEmbeddingEpoch(rawValue: try await contextProjectionEmbeddingModelFingerprint())
-    }
-
-    func embedForDerivedContextWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
-        MemoryEmbeddingBatch(
-            epoch: try await contextProjectionEmbeddingEpoch(),
-            vectors: try await embedForDerivedContext(texts)
-        )
-    }
-}
-
-extension SwiftNativeMemoryV2: NativeMemoryContextProjectionMemory {
-    func listContextProjectionRecords() async throws -> [NativeMemoryProjectionRecord] {
-        try await listMemory(kind: nil).map { record in
-            NativeMemoryProjectionRecord(
-                id: record.id,
-                text: record.text,
-                layer: record.layer,
-                memoryKind: record.memoryKind,
-                createdAt: record.createdAt,
-                updatedAt: record.updatedAt,
-                sourceRunId: record.sourceRunId,
-                status: record.status,
-                pinned: record.pinned,
-                confidence: record.confidence,
-                importance: record.importance,
-                tags: record.tags,
-                sourceQuality: record.sourceQuality,
-                decay: record.decay,
-                correction: record.correction,
-                provenance: record.provenance,
-                extras: record.extras,
-                personaId: record.personaId,
-                lifecycle: record.lifecycle,
-                validFrom: record.validFrom,
-                validTo: record.validTo,
-                observedAt: record.observedAt,
-                evidence: record.evidence
-            )
-        }
-    }
-
-    func contextProjectionEmbeddingEpoch() async throws -> MemoryEmbeddingEpoch {
-        guard let epoch = embeddingEpoch() else {
-            throw MemoryV2Error.storageUnavailable
-        }
-        return epoch
-    }
-
-    func contextProjectionEmbeddingModelFingerprint() async throws -> String {
-        try await contextProjectionEmbeddingEpoch().rawValue
-    }
-}
-
-struct NativeMemoryContextProjectionLimits: Sendable, Equatable {
-    static let standard = NativeMemoryContextProjectionLimits()
-
-    let maximumRecords: Int
-    let maximumTextUTF8Bytes: Int
-    let maximumEmbeddingBatchSize: Int
-    let maximumTagsPerRecord: Int
-    let maximumTagUTF8Bytes: Int
-    let maximumProvenanceUTF8Bytes: Int
-
-    init(
-        maximumRecords: Int = 2_000,
-        maximumTextUTF8Bytes: Int = 16 * 1_024,
-        maximumEmbeddingBatchSize: Int = 32,
-        maximumTagsPerRecord: Int = 32,
-        maximumTagUTF8Bytes: Int = 128,
-        maximumProvenanceUTF8Bytes: Int = 2 * 1_024
-    ) {
-        self.maximumRecords = maximumRecords
-        self.maximumTextUTF8Bytes = maximumTextUTF8Bytes
-        self.maximumEmbeddingBatchSize = maximumEmbeddingBatchSize
-        self.maximumTagsPerRecord = maximumTagsPerRecord
-        self.maximumTagUTF8Bytes = maximumTagUTF8Bytes
-        self.maximumProvenanceUTF8Bytes = maximumProvenanceUTF8Bytes
-    }
+private enum NativeMemoryContextProjectionLimits {
+    static let maximumRecords = 2_000
+    static let maximumTextUTF8Bytes = 16 * 1_024
+    static let maximumEmbeddingBatchSize = 32
+    static let maximumTagsPerRecord = 32
+    static let maximumTagUTF8Bytes = 128
+    static let maximumProvenanceUTF8Bytes = 2 * 1_024
 }
 
 enum NativeMemoryContextProjectionError: Error, Equatable, Sendable {
-    case invalidLimits
     case invalidModelFingerprint
     case embeddingCountMismatch(expected: Int, actual: Int)
     case invalidEmbedding(batchIndex: Int)
@@ -235,18 +76,15 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
 
     // v3: creation time is separate from update freshness for memory age tags.
     private static let schemaVersion = "memory-context-projection-v4"
-    private let memory: any NativeMemoryContextProjectionMemory
-    let limits: NativeMemoryContextProjectionLimits
+    private let memory: SwiftNativeMemoryV2
     private let provenanceIndex: MemoryAtomRecordIndex?
 
     init(
-        memory: any NativeMemoryContextProjectionMemory = SwiftNativeMemoryV2.shared,
-        limits: NativeMemoryContextProjectionLimits = .standard,
+        memory: SwiftNativeMemoryV2 = SwiftNativeMemoryV2.shared,
         provenanceIndex: MemoryAtomRecordIndex? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         self.memory = memory
-        self.limits = limits
         self.provenanceIndex = provenanceIndex
         self.dataRoot = dataRoot
         self.invalidationSourceURL = dataRoot.appendingPathComponent("memory/memory.sqlite")
@@ -256,13 +94,11 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
-        try validateLimits()
-
-        let listed = try await memory.listContextProjectionRecords()
+        let listed = try await memory.listMemory(kind: nil)
         let active = listed.filter(Self.isActive)
-        let prepared = Self.prepareUnique(active, limits: limits, dataRoot: dataRoot)
+        let prepared = Self.prepareUnique(active, dataRoot: dataRoot)
             .sorted { $0.recordID < $1.recordID }
-        let selected = Array(prepared.prefix(limits.maximumRecords))
+        let selected = Array(prepared.prefix(NativeMemoryContextProjectionLimits.maximumRecords))
         let selectedIDs = Set(selected.map(\.sourceID))
         let previousOwnedIDs = Set(previousSources.values.lazy
             .filter { $0.descriptor.owner == Self.owner }
@@ -282,8 +118,10 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
             )
         }
 
-        let modelFingerprint = try await memory.contextProjectionEmbeddingEpoch().rawValue
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let epoch = await memory.embeddingEpoch() else {
+            throw MemoryV2Error.storageUnavailable
+        }
+        let modelFingerprint = epoch.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !modelFingerprint.isEmpty else {
             throw NativeMemoryContextProjectionError.invalidModelFingerprint
         }
@@ -305,7 +143,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
         vectors.reserveCapacity(changed.count)
         var offset = 0
         while offset < changed.count {
-            let end = min(offset + limits.maximumEmbeddingBatchSize, changed.count)
+            let end = min(offset + NativeMemoryContextProjectionLimits.maximumEmbeddingBatchSize, changed.count)
             let texts = changed[offset..<end].map(\.embeddingText)
             let batch = try await memory.embedForDerivedContextWithEpoch(texts)
             guard batch.epoch.rawValue == modelFingerprint else {
@@ -356,17 +194,6 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
                 .map(\.draft.id)),
             retaining: generationIDs
         )
-    }
-
-    private func validateLimits() throws {
-        guard limits.maximumRecords > 0,
-              limits.maximumTextUTF8Bytes > 0,
-              limits.maximumEmbeddingBatchSize > 0,
-              limits.maximumTagsPerRecord > 0,
-              limits.maximumTagUTF8Bytes > 0,
-              limits.maximumProvenanceUTF8Bytes > 0 else {
-            throw NativeMemoryContextProjectionError.invalidLimits
-        }
     }
 }
 
@@ -425,8 +252,7 @@ private extension NativeMemoryContextProjection {
     }
 
     static func prepareUnique(
-        _ records: [NativeMemoryProjectionRecord],
-        limits: NativeMemoryContextProjectionLimits,
+        _ records: [MemoryRecord],
         dataRoot: URL
     ) -> [PreparedRecord] {
         let grouped = Dictionary(grouping: records, by: { normalizedID($0.id) })
@@ -436,13 +262,12 @@ private extension NativeMemoryContextProjection {
                   group.count == 1 else {
                 return nil
             }
-            return prepare(group[0], limits: limits, dataRoot: dataRoot)
+            return prepare(group[0], dataRoot: dataRoot)
         }
     }
 
     static func prepare(
-        _ record: NativeMemoryProjectionRecord,
-        limits: NativeMemoryContextProjectionLimits,
+        _ record: MemoryRecord,
         dataRoot: URL
     ) -> PreparedRecord? {
         let recordID = normalizedID(record.id)
@@ -454,7 +279,7 @@ private extension NativeMemoryContextProjection {
 
         let embeddingText = normalizedText(record.text)
         guard !embeddingText.isEmpty,
-              embeddingText.utf8.count <= limits.maximumTextUTF8Bytes,
+              embeddingText.utf8.count <= NativeMemoryContextProjectionLimits.maximumTextUTF8Bytes,
               !NativeContextProjectionText.containsDisallowedControl(embeddingText),
               !ContextSecretContentPolicy.containsSecretLikeContent(embeddingText) else {
             return nil
@@ -471,12 +296,12 @@ private extension NativeMemoryContextProjection {
             return nil
         }
         let createdAt = parseDate(record.createdAt)
-        let tags = normalizedTags(record.tags, limits: limits)
-        guard let provenance = provenanceText(record, limit: limits.maximumProvenanceUTF8Bytes) else {
+        let tags = normalizedTags(record.tags)
+        guard let provenance = provenanceText(record, limit: NativeMemoryContextProjectionLimits.maximumProvenanceUTF8Bytes) else {
             return nil
         }
         let body = presentationBody(
-            embeddingText, record: record, maximumUTF8Bytes: limits.maximumTextUTF8Bytes
+            embeddingText, record: record, maximumUTF8Bytes: NativeMemoryContextProjectionLimits.maximumTextUTF8Bytes
         )
 
         let correction = isCorrection(record, tags: tags)
@@ -625,7 +450,7 @@ private extension NativeMemoryContextProjection {
     /// Memory kinds the personal lane carries (Phase 5 C3).
     static let personalKinds: Set<String> = ["moment", "relationship", "lesson_origin"]
 
-    static func isActive(_ record: NativeMemoryProjectionRecord) -> Bool {
+    static func isActive(_ record: MemoryRecord) -> Bool {
         let status = record.status?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -643,25 +468,22 @@ private extension NativeMemoryContextProjection {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func normalizedTags(
-        _ values: [String]?,
-        limits: NativeMemoryContextProjectionLimits
-    ) -> [String] {
+    static func normalizedTags(_ values: [String]?) -> [String] {
         let valid = (values ?? []).compactMap { raw -> String? in
             let value = raw.precomposedStringWithCanonicalMapping
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
             guard !value.isEmpty,
-                  value.utf8.count <= limits.maximumTagUTF8Bytes,
+                  value.utf8.count <= NativeMemoryContextProjectionLimits.maximumTagUTF8Bytes,
                   !NativeContextProjectionText.containsDisallowedControl(value) else {
                 return nil
             }
             return value
         }
-        return Array(Set(valid).sorted().prefix(limits.maximumTagsPerRecord))
+        return Array(Set(valid).sorted().prefix(NativeMemoryContextProjectionLimits.maximumTagsPerRecord))
     }
 
-    static func isCorrection(_ record: NativeMemoryProjectionRecord, tags: [String]) -> Bool {
+    static func isCorrection(_ record: MemoryRecord, tags: [String]) -> Bool {
         if record.memoryKind?.lowercased() == "correction" || tags.contains("correction") {
             return true
         }
@@ -680,7 +502,7 @@ private extension NativeMemoryContextProjection {
         }
     }
 
-    static func provenanceText(_ record: NativeMemoryProjectionRecord, limit: Int) -> String? {
+    static func provenanceText(_ record: MemoryRecord, limit: Int) -> String? {
         var components: [String] = []
         if let source = record.sourceRunId?.trimmingCharacters(in: .whitespacesAndNewlines),
            !source.isEmpty {
@@ -728,7 +550,7 @@ private extension NativeMemoryContextProjection {
     /// Prefix them so the existing bounded context_expand prefix also retains
     /// them. Reserve their bytes inside the existing body cap, never above it.
     static func presentationBody(
-        _ text: String, record: NativeMemoryProjectionRecord, maximumUTF8Bytes: Int
+        _ text: String, record: MemoryRecord, maximumUTF8Bytes: Int
     ) -> String {
         let warning = MemorySenseProvenance.warning(in: record.extras)
         let fields = [

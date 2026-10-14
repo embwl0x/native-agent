@@ -1,5 +1,12 @@
 import Foundation
 
+public struct AutoDoctorConfig: Codable, Hashable {
+    public var enabled: Bool?
+    public var runOnStartup: Bool?
+    public var intervalSeconds: Int?
+    public init() {}
+}
+
 extension DoctorStatusProjection {
     public static func readAutoDoctorConfig(dataRoot: URL) -> AutoDoctorConfig {
         let path = dataRoot
@@ -16,8 +23,6 @@ extension DoctorStatusProjection {
         config.enabled = boolValue(object["enabled"])
         config.runOnStartup = boolValue(object["run_on_startup"])
         config.intervalSeconds = intValue(object["interval_seconds"])
-        config.usesModelCalls = boolValue(object["uses_model_calls"])
-        config.checkLLM = boolValue(object["check_llm"])
         return config
     }
 

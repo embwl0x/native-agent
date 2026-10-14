@@ -96,24 +96,15 @@ public actor MCPHTTPTransport {
     private var initTask: Task<Void, Error>?
     private var closed = false
 
-    public init(
-        serverId: String,
-        endpoint: URL,
-        timeout: TimeInterval = MCPHTTPTransport.defaultTimeout,
-        session: URLSession? = nil
-    ) {
+    public init(serverId: String, endpoint: URL) {
         self.serverId = serverId
         self.endpoint = endpoint
-        self.requestTimeout = timeout
-        if let s = session {
-            self.session = s
-        } else {
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = timeout
-            config.timeoutIntervalForResource = timeout
-            config.waitsForConnectivity = false
-            self.session = URLSession(configuration: config)
-        }
+        self.requestTimeout = Self.defaultTimeout
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = Self.defaultTimeout
+        config.timeoutIntervalForResource = Self.defaultTimeout
+        config.waitsForConnectivity = false
+        self.session = URLSession(configuration: config)
     }
 
     private func nextId() -> Int64 {
@@ -193,14 +184,12 @@ public actor MCPHTTPTransport {
     /// [] would make a broken HTTP MCP server indistinguishable from an
     /// empty one — the no-silent-fallback contract applies to shapes too.
     public func listTools() async throws -> [JSONValue] {
-        try await initializeIfNeeded()
         return try await Self.collectCatalogPages(key: "tools", serverId: serverId) { params in
             try await self.sendRequest(method: "tools/list", params: params, expectsResponse: true) ?? .null
         }
     }
 
     public func listResources() async throws -> [JSONValue] {
-        try await initializeIfNeeded()
         return try await Self.collectCatalogPages(key: "resources", serverId: serverId) { params in
             try await self.sendRequest(method: "resources/list", params: params, expectsResponse: true) ?? .null
         }
@@ -256,7 +245,6 @@ public actor MCPHTTPTransport {
     /// `tools/call` — returns the raw JSON-RPC `result` object exactly as the
     /// server emits it (typically an MCP tool-result `{content:[...], isError}`).
     public func callTool(name: String, arguments: JSONValue) async throws -> JSONValue {
-        try await initializeIfNeeded()
         let params: JSONValue = .object([
             "name": .string(name),
             "arguments": arguments,
@@ -285,7 +273,7 @@ public actor MCPHTTPTransport {
         let endpoint = endpoint
         let serverId = serverId
         do {
-            try await Self.withTimeout(timeout, serverId: serverId, method: "session termination") {
+            try await Self.withTimeout(timeout, method: "session termination") {
                 var request = URLRequest(url: endpoint)
                 request.httpMethod = "DELETE"
                 request.timeoutInterval = timeout
@@ -333,7 +321,7 @@ public actor MCPHTTPTransport {
         let currentSessionId = method == "initialize" ? nil : sessionId
         let outcome: (result: JSONValue?, sessionId: String?)
         do {
-            outcome = try await Self.withTimeout(to, serverId: sid, method: method) {
+            outcome = try await Self.withTimeout(to, method: method) {
                 try await Self.httpRPC(
                     session: sess,
                     endpoint: ep,
@@ -546,29 +534,18 @@ public actor MCPHTTPTransport {
     /// (the SSE never-reply case).
     private nonisolated static func withTimeout<T: Sendable>(
         _ seconds: TimeInterval,
-        serverId: String,
         method: String,
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+        do {
+            return try await TurnDeadline.withThrowingDeadline(seconds: max(0, seconds), operation)
+        } catch {
+            let nsError = error as NSError
+            if error is TurnDeadline.DeadlineExceeded ||
+                (nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorTimedOut) {
                 throw MCPSubprocessError.timeout(method: method, seconds: seconds)
             }
-            do {
-                let result = try await group.next()!
-                group.cancelAll()
-                return result
-            } catch {
-                group.cancelAll()
-                let nsError = error as NSError
-                if nsError.domain == NSURLErrorDomain,
-                   nsError.code == NSURLErrorTimedOut {
-                    throw MCPSubprocessError.timeout(method: method, seconds: seconds)
-                }
-                throw error
-            }
+            throw error
         }
     }
 }

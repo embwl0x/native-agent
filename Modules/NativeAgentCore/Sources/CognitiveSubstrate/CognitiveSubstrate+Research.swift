@@ -10,16 +10,19 @@ extension CognitiveSubstrate {
         ablations[trimmed] = enabled
     }
 
-    public func facultyMeasurementSnapshot() async -> [CognitiveFacultyMeasurement] {
-        let now = dependencies.now()
-        let nodeCount = field.snapshot(at: now, configuration: configuration).count
-        let workspaceCount = (await workspaceSnapshot()).items.count
-        let activeThoughtSeeds = projectedThoughtSeeds(at: now)
-        let welfare = welfareBoundsSnapshot(at: now)
+    public func facultyMeasurementSnapshot(from read: CognitiveFrozenRead) -> [CognitiveFacultyMeasurement] {
+        let now = read.fixedAt
+        // Faculty evidence counts retained nodes even while the visible mind is off.
+        let nodeCount = read.configuration.enabled
+            ? read.snapshot.nodes.count
+            : field.snapshot(at: now, configuration: read.configuration).count
+        let workspaceCount = read.workspace.items.count
+        let activeThoughtSeeds = read.thoughtSeeds
+        let welfare = welfareBoundsSnapshot(at: now, affect: read.affect)
         return [
             CognitiveFacultyMeasurement(faculty: "event-continuity", score: nodeCount > 0 ? 1 : 0, evidence: "nodes=\(nodeCount)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "workspace-focus", score: workspaceCount > 0 ? 1 : 0, evidence: "workspace=\(workspaceCount)", generatedAt: now),
-            CognitiveFacultyMeasurement(faculty: "capsule-grounding", score: configuration.capsuleInjectionEnabled ? 1 : 0, evidence: "capsuleEnabled=\(configuration.capsuleInjectionEnabled)", generatedAt: now),
+            CognitiveFacultyMeasurement(faculty: "capsule-grounding", score: read.configuration.capsuleInjectionEnabled ? 1 : 0, evidence: "capsuleEnabled=\(read.configuration.capsuleInjectionEnabled)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "affect-bounds", score: welfare.withinBounds ? 1 : 0, evidence: "maxAffect=\(String(format: "%.2f", welfare.maxAffectValue))", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "thought-seeds", score: activeThoughtSeeds.isEmpty ? 0 : 1, evidence: "seeds=\(activeThoughtSeeds.count)", generatedAt: now),
             CognitiveFacultyMeasurement(faculty: "replay-lineage", score: developmentalTimeline.isEmpty ? 0 : 1, evidence: "timeline=\(developmentalTimeline.count)", generatedAt: now),
@@ -34,7 +37,7 @@ extension CognitiveSubstrate {
         seed: String = "default"
     ) async -> CognitiveExperimentResult? {
         await waitForMaintenanceTransition()
-        guard configuration.enabled, configuration.observatoryEnabled else { return nil }
+        guard configuration.enabled else { return nil }
         let now = dependencies.now()
         let metrics = await experimentMetrics(kind: kind)
         guard let score = experimentScore(kind: kind, metrics: metrics) else { return nil }
@@ -71,8 +74,8 @@ extension CognitiveSubstrate {
         welfareBoundsSnapshot(at: dependencies.now())
     }
 
-    private func welfareBoundsSnapshot(at now: Date) -> CognitiveWelfareBounds {
-        let currentAffect = projectedAffect(at: now)
+    private func welfareBoundsSnapshot(at now: Date, affect: CognitiveAffectState? = nil) -> CognitiveWelfareBounds {
+        let currentAffect = affect ?? projectedAffect(at: now)
         let maxAffect = max(
             currentAffect.arousal,
             currentAffect.uncertainty,
@@ -98,8 +101,9 @@ extension CognitiveSubstrate {
 
     public func exportResearchTrace(maxItems: Int = 20) async -> JSONValue {
         let limit = max(1, min(maxItems, 50))
-        let summary = await observatorySnapshot()
-        let measurements = await facultyMeasurementSnapshot()
+        let read = await frozenRead(at: dependencies.now())
+        let summary = observatorySnapshot(from: read)
+        let measurements = facultyMeasurementSnapshot(from: read)
         let experiments = await researchExperimentSnapshot()
         let timeline = await developmentalTimelineSnapshot(limit: limit)
         let welfare = welfareBoundsSnapshot()
@@ -123,10 +127,10 @@ extension CognitiveSubstrate {
         ])
     }
 
-    public func observatorySnapshot() async -> CognitiveObservatorySnapshot {
-        let now = dependencies.now()
-        let currentAffect = projectedAffect(at: now)
-        guard configuration.enabled, configuration.observatoryEnabled else {
+    public func observatorySnapshot(from read: CognitiveFrozenRead) -> CognitiveObservatorySnapshot {
+        let now = read.fixedAt
+        let currentAffect = read.affect
+        guard read.configuration.enabled else {
             return CognitiveObservatorySnapshot(
                 generatedAt: now,
                 nodeCount: 0,
@@ -138,9 +142,9 @@ extension CognitiveSubstrate {
                 ablations: ablations
             )
         }
-        let nodeCount = field.snapshot(at: now, configuration: configuration).count
-        let workspaceCount = (await workspaceSnapshot()).items.count
-        let activeThoughtSeeds = projectedThoughtSeeds(at: now)
+        let nodeCount = read.snapshot.nodes.count
+        let workspaceCount = read.workspace.items.count
+        let activeThoughtSeeds = read.thoughtSeeds
         return CognitiveObservatorySnapshot(
             generatedAt: now,
             nodeCount: nodeCount,
@@ -175,12 +179,12 @@ extension CognitiveSubstrate {
     private func experimentScore(kind: CognitiveExperimentKind, metrics: [String: Double]) -> Double? {
         switch kind {
         case .continuity:
-            return clamp((metrics["nodes"] ?? 0) > 0 ? 1 : 0.5)
+            return ((metrics["nodes"] ?? 0) > 0 ? 1 : 0.5).clamped01()
         case .providerSwap, .selfModelAccuracy:
             // Neither provider agreement nor self-model accuracy is measured.
             return nil
         case .ablation:
-            return clamp((metrics["ablationCount"] ?? 0) > 0 ? 1 : 0.5)
+            return ((metrics["ablationCount"] ?? 0) > 0 ? 1 : 0.5).clamped01()
         }
     }
 

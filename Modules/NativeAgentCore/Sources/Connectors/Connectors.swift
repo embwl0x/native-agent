@@ -9,48 +9,16 @@ import PersistenceCore
 // searches their local files and records redacted search activity under the
 // configured data root.
 
-// MARK: - Client protocol
-
-public protocol ConnectorsClient: Sendable {
-    /// The saved workspace rows (default []).
-    /// Returns the array as-stored (passthrough, no field reshaping).
-    func listWorkspaces() async throws -> [JSONValue]
-
-    /// Returns {"query": <normalized>, "results": [...]} for a local search,
-    /// or nil when the query is empty.
-    func searchWorkspaces(query: String) async throws -> JSONValue?
-}
-
-// MARK: - SwiftNative impl
-
-public final class SwiftNativeConnectorsClient: ConnectorsClient {
+public final class SwiftNativeConnectorsClient: Sendable {
     private let root: URL
     private let persistence: SwiftNativePersistenceCore
-    /// Caps mirror the daemon (search_workspaces L27982/L27985).
-    private let maxResults: Int
-    private let maxScanned: Int
-    private let maxContentBytes: Int
-    /// Test seams for the activity-event append (mirror Research's `now` /
-    /// `receiptIDFactory`). Default to wall clock + uuid4, matching the daemon.
-    private let now: @Sendable () -> Date
-    private let activityIDFactory: @Sendable () -> String
+    private let maxResults = 50
+    private let maxScanned = 2000
+    private let maxContentBytes = 512_000
 
-    public init(
-        root: URL,
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
-        maxResults: Int = 50,
-        maxScanned: Int = 2000,
-        maxContentBytes: Int = 512_000,
-        now: @escaping @Sendable () -> Date = { Date() },
-        activityIDFactory: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() }
-    ) {
+    public init(root: URL) {
         self.root = root
-        self.persistence = persistence
-        self.maxResults = maxResults
-        self.maxScanned = maxScanned
-        self.maxContentBytes = maxContentBytes
-        self.now = now
-        self.activityIDFactory = activityIDFactory
+        self.persistence = SwiftNativePersistenceCore()
     }
 
     private var workspacesPath: URL {
@@ -141,7 +109,7 @@ public final class SwiftNativeConnectorsClient: ConnectorsClient {
     /// - status = "ok"
     private func recordSearchActivity(query: String, resultCount: Int) async throws {
         let event: JSONValue = .object([
-            "id": .string(activityIDFactory()),
+            "id": .string(UUID().uuidString.lowercased()),
             "kind": .string("connector"),
             "title": .string(SecretRedactor.redactText("Workspace search")),
             "detail": .string(SecretRedactor.redactText(query)),
@@ -150,7 +118,7 @@ public final class SwiftNativeConnectorsClient: ConnectorsClient {
             "payload": SecretRedactor.redactValue(.object([
                 "resultCount": .int(Int64(resultCount)),
             ])),
-            "createdAt": .string(Self.isoTimestamp(now())),
+            "createdAt": .string(Self.isoTimestamp(Date())),
         ])
         // The shared owner takes the one-sided Swift flock and amortizes the
         // newest-5000 trim behind the activity feed's byte trigger. Do not
@@ -294,13 +262,3 @@ public final class SwiftNativeConnectorsClient: ConnectorsClient {
 // Keep the historical module-local spelling while the canonical eight-pattern
 // contract lives in NativeAgentCore.
 typealias SecretRedactor = NativeAgentSecretRedactor
-
-// MARK: - Factory
-
-/// Returns the SwiftNative client. `root` is the data root (the dir that
-/// contains `connectors/`); injectable for tests.
-public func makeConnectorsClient(
-    root: URL
-) -> any ConnectorsClient {
-    return SwiftNativeConnectorsClient(root: root)
-}

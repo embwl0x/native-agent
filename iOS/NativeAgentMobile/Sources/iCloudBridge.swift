@@ -308,12 +308,12 @@ final class iCloudBridge: ObservableObject {
     private var seenKVSProgressMessageIDsOrdered: [String] = []
     private var isCheckingMacOutbox = false
     private var macOutboxScanQueued = false
-    private var setupTask: Task<Void, Never>?
+    var setupTask: Task<Void, Never>?
     /// The injected and production CloudKit paths both install their incoming
     /// forwarder asynchronously. Explicit refresh/push drains wait for that
     /// one-time registration so an early message cannot be mistaken for an
     /// empty inbox merely because setup lost the scheduling race.
-    private var deviceIncomingSetupTask: Task<Void, Never>?
+    var deviceIncomingSetupTask: Task<Void, Never>?
     private var setupGeneration = 0
     private let processedMacReplyIDsKey = "NativeAgentMobile.iCloud.processedMacReplyIDs.v1"
     private let maxProcessedMacReplyIDs = 500
@@ -426,12 +426,9 @@ final class iCloudBridge: ObservableObject {
     /// main actor.  Split out from setup() so the Task.detached closure
     /// doesn't capture `self` directly (Swift-6 strict concurrency clean).
     @MainActor
-    private func applyContainerResult(_ containerURL: URL?, generation: Int) {
+    private func applyContainerResult(_ containerURL: URL?, generation: Int) async {
         guard generation == setupGeneration, isSetUp else { return }
-        // The detached lookup has settled. Clear its handle before publishing
-        // either outcome so a later retry never treats a completed setup task
-        // as active work.
-        setupTask = nil
+        defer { if generation == setupGeneration { setupTask = nil } }
         guard let containerURL else {
             available = false
             syncStatus = "iCloud unavailable — sign into iCloud in Settings → Apple Account"
@@ -439,13 +436,15 @@ final class iCloudBridge: ObservableObject {
             return
         }
         let docsURL = containerURL.appendingPathComponent("Documents")
+        do {
+            try await Task.detached(priority: .utility) { try Self.createDriveDirectories(docsURL: docsURL) }.value
+        } catch { available = false; syncStatus = error.localizedDescription; isSetUp = false; return }
+        guard generation == setupGeneration, isSetUp else { return }
         driveURL = docsURL
-        createDriveDirectories(docsURL: docsURL)
+        await iCloudSyncEngine.shared.setup(docsURL: docsURL)
+        guard generation == setupGeneration, isSetUp else { return }
         available = true
         syncStatus = "iCloud ready"
-
-        // PATCH-2026-05-07: ios-parity wire snapshot engine to the same container
-        iCloudSyncEngine.shared.setup(docsURL: docsURL)
 
         NotificationCenter.default.addObserver(
             self,
@@ -487,7 +486,6 @@ final class iCloudBridge: ObservableObject {
         available = true
         syncStatus = "CloudKit connecting…"
         NSLog("[iCloudBridge] device transport: CloudKit ACTIVE (role=ios)")
-        iCloudSyncEngine.shared.enableCloudKitSnapshotCache()
 
         // Silent CloudKit subscription pushes do not require alert permission,
         // but they do require APNS device registration. Register as soon as the
@@ -504,6 +502,8 @@ final class iCloudBridge: ObservableObject {
         }
 
         deviceIncomingSetupTask = Task {
+            await iCloudSyncEngine.shared.enableCloudKitSnapshotCache()
+            guard setupGeneration == generation else { return }
             await transport.observeIncoming { [weak self = self] msg in
                 guard await self?.setupGeneration == generation else { return false }
                 return await self?.handleIncomingFromTransport(msg) ?? false
@@ -532,15 +532,15 @@ final class iCloudBridge: ObservableObject {
             // happened to publish a different one.
             await transport.observeStatus(
                 key: NAProviderCatalogStatusCodec.statusKey,
-                onApply: { [weak self] value, writtenAt in
-                    await MainActor.run {
-                        guard self?.setupGeneration == generation else { return false }
-                        let applied = iCloudSyncEngine.shared.applyProviderCatalogStatus(value)
-                        if applied, let writtenAt {
-                            self?.recordMacConfirmation(at: writtenAt)
-                        }
-                        return applied
+                onApply: { @MainActor [weak self = self] value, writtenAt in
+                    guard self?.setupGeneration == generation else { return false }
+                    let applied = await iCloudSyncEngine.shared.applyProviderCatalogStatus(value) {
+                        self?.setupGeneration == generation
                     }
+                    if applied, let writtenAt {
+                        self?.recordMacConfirmation(at: writtenAt)
+                    }
+                    return applied
                 }
             )
         }
@@ -622,11 +622,11 @@ final class iCloudBridge: ObservableObject {
         return pairingStore.applyCloudKitPairingSecret(secret)
     }
 
-    private func createDriveDirectories(docsURL: URL) {
+    nonisolated private static func createDriveDirectories(docsURL: URL) throws {
         let fm = FileManager.default
         for folder in [DriveFolder.outboxMac, DriveFolder.outboxIos, DriveFolder.processed] {
             let url = docsURL.appendingPathComponent(folder)
-            try? fm.createDirectory(at: url, withIntermediateDirectories: true)
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
         }
     }
 
@@ -646,7 +646,7 @@ final class iCloudBridge: ObservableObject {
         metadata: [String: String]? = nil,
         attachments: [MultimodalAttachment] = [],
         preparedMessage: BridgeMessage? = nil,
-        onPrepared: ((BridgeMessage) throws -> Void)? = nil
+        onPrepared: ((BridgeMessage) async throws -> Void)? = nil
     ) async throws -> BridgeMessage {
         let unsigned = BridgeMessage.make(
             id: id,
@@ -665,14 +665,15 @@ final class iCloudBridge: ObservableObject {
         }
         activeSendCount += 1
         defer { activeSendCount -= 1 }
-        let msg: BridgeMessage
+        let generation = setupGeneration
+        let msg = try await Task.detached(priority: .userInitiated) {
         if let preparedMessage {
             if preparedMessage.verifySignature(secret: secret) {
-                msg = preparedMessage
+                return preparedMessage
             } else {
                 var retainedMetadata = preparedMessage.metadata ?? [:]
                 retainedMetadata[NAChatMessageCodec.recordIDMetadataKey] = UUID().uuidString
-                msg = try BridgeMessage.make(
+                return try BridgeMessage.make(
                     id: preparedMessage.id,
                     sender: preparedMessage.sender,
                     text: preparedMessage.text,
@@ -683,9 +684,16 @@ final class iCloudBridge: ObservableObject {
                 ).signed(with: secret)
             }
         } else {
-            msg = try unsigned.signed(with: secret)
+            return try unsigned.signed(with: secret)
         }
-        try onPrepared?(msg)
+        }.value
+        guard generation == setupGeneration, secret == pairingStore?.iCloudPairingSecret else {
+            throw BridgeError.missingPairingSecret
+        }
+        try await onPrepared?(msg)
+        guard generation == setupGeneration, secret == pairingStore?.iCloudPairingSecret else {
+            throw BridgeError.missingPairingSecret
+        }
 
         // CK-3b: CloudKit transport path. The signed BridgeMessage rides verbatim
         // in the record's payloadJSON (lossless — signature preserved), so the Mac
@@ -711,9 +719,14 @@ final class iCloudBridge: ObservableObject {
         guard let docsURL = driveURL else {
             throw BridgeError.containerUnavailable
         }
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(msg)
+        let data = try await Task.detached(priority: .userInitiated) {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            return try encoder.encode(msg)
+        }.value
+        guard generation == setupGeneration, secret == pairingStore?.iCloudPairingSecret else {
+            throw BridgeError.missingPairingSecret
+        }
 
         let outboxURL = docsURL
             .appendingPathComponent(DriveFolder.outboxIos)
@@ -1095,9 +1108,9 @@ final class iCloudBridge: ObservableObject {
         refreshSecret: () async -> Data?
     ) async -> Bool {
         guard message.sender == "mac" else { return false }
-        if message.verifySignature(secret: secret) { return true }
+        if await Task.detached(priority: .userInitiated, operation: { message.verifySignature(secret: secret) }).value { return true }
         guard let refreshed = await refreshSecret() else { return false }
-        return message.verifySignature(secret: refreshed)
+        return await Task.detached(priority: .userInitiated) { message.verifySignature(secret: refreshed) }.value
     }
 
     /// CK-3c: drain the CloudKit transport (incoming + pairing + status) if it is

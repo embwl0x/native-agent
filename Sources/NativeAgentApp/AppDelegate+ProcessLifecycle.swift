@@ -1,7 +1,9 @@
+import NativeAgentCore
 import Foundation
 import AppKit
 import ServiceManagement
 import DeviceSync
+import PersistenceCore
 
 private final class SingleInstanceActivationBox: @unchecked Sendable {
     private let lock = NSLock()
@@ -19,29 +21,6 @@ private final class SingleInstanceActivationBox: @unchecked Sendable {
         return storedValue
     }
 }
-
-enum LoginItemInstallLocation {
-    /// A login item must name an app in an actual Applications directory.
-    /// Prefix matching alone admits lookalikes such as `/Applications-old`,
-    /// which leaves macOS relaunching a build artifact that disappears on the
-    /// next cleanup.
-    static func allows(bundlePath: String, homeDirectory: String = NSHomeDirectory()) -> Bool {
-        let path = URL(fileURLWithPath: bundlePath).standardizedFileURL.path
-        let userApplications = URL(fileURLWithPath: homeDirectory, isDirectory: true)
-            .appendingPathComponent("Applications", isDirectory: true)
-            .standardizedFileURL.path
-        return isDescendant(path, of: "/Applications")
-            || isDescendant(path, of: userApplications)
-    }
-
-    private static func isDescendant(_ path: String, of directory: String) -> Bool {
-        let normalizedDirectory = directory.hasSuffix("/")
-            ? String(directory.dropLast())
-            : directory
-        return path.hasPrefix(normalizedDirectory + "/")
-    }
-}
-
 
 extension AppDelegate {
     @MainActor
@@ -67,11 +46,11 @@ extension AppDelegate {
         }
         _ = semaphore.wait(timeout: .now() + 2.5)
         guard activationBox.value != nil else {
-            nativeLog("[launch] existing pid wedged — cannot evict (kernel UE state); user must reboot")
+            ModuleLog.app("[launch] existing pid wedged — cannot evict (kernel UE state); user must reboot")
             Self.presentSingleInstanceWedgedAlert(pid: existingPID)
             return false
         }
-        nativeLog("[launch] another NativeAgent instance is already running (pid=\(existing.processIdentifier)); activating it and exiting duplicate")
+        ModuleLog.app("[launch] another NativeAgent instance is already running (pid=\(existing.processIdentifier)); activating it and exiting duplicate")
         return false
     }
 
@@ -87,7 +66,7 @@ extension AppDelegate {
 
     @MainActor
     static func presentPublicReleaseDataRootError(_ detail: String) {
-        nativeLog("[paths] refusing to start NativeAgent after public-release data preparation failure: \(detail)")
+        ModuleLog.app("[paths] refusing to start NativeAgent after public-release data preparation failure: \(detail)")
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "NativeAgent could not prepare a clean data directory."
@@ -99,7 +78,7 @@ extension AppDelegate {
 
     @MainActor
     static func presentBackupRestoreError(_ detail: String) {
-        nativeLog("[backup-restore] refusing to start after staged restore failure: \(detail)")
+        ModuleLog.app("[backup-restore] refusing to start after staged restore failure: \(detail)")
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "NativeAgent could not safely finish the backup restore."
@@ -114,7 +93,7 @@ extension AppDelegate {
     /// agent. Returns true to continue.
     @MainActor
     static func confirmLaunchWithMissingRoots(_ missing: [String]) -> Bool {
-        nativeLog("[paths] launch roots missing: %@", missing.joined(separator: " | "))
+        ModuleLog.app("[paths] launch roots missing: %@", missing.joined(separator: " | "))
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.alertStyle = .critical
@@ -144,7 +123,7 @@ extension AppDelegate {
     static func registerLoginItemIfNeeded() async {
         guard #available(macOS 13.0, *) else { return }
         let bundlePath = Bundle.main.bundlePath
-        guard LoginItemInstallLocation.allows(bundlePath: bundlePath) else {
+        guard InstallPaths.allowsLoginItem(bundlePath: bundlePath) else {
             print("[app] skipped login auto-start registration for non-installed bundle: \(bundlePath)")
             return
         }

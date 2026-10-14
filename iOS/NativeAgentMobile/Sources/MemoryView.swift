@@ -8,7 +8,7 @@ import NativeAgentShared
 
 struct MemoryView: View {
     @StateObject private var store = MemoryStore()
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var showsConnection = false
@@ -140,7 +140,9 @@ struct MemoryView: View {
     private var memorySyncStatus: some View {
         // Reuse the freshness cadence and rules; connection and snapshot age
         // are independent facts, presented together with one recovery.
-        TimelineView(.periodic(from: .now, by: 15)) { context in
+        TimelineView(MacSnapshotFreshnessSchedule(
+            lastSyncedAt: sync.transportDeliveryAt(screenGroup: Self.snapshotGroup(for: segment)),
+            fixed: sampleSyncState != nil, showsFreshAge: true)) { context in
             let sample = sampleSyncState
             let state = MacSnapshotPageFreshness.state(
                 // This segment's own delivery clock, not the cache-read clock.
@@ -485,20 +487,6 @@ enum MemorySearchPresentation {
         raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    static func matches(_ memory: MemoryRecord, query: String) -> Bool {
-        let needle = normalizedQuery(query)
-        guard !needle.isEmpty else { return true }
-        if memory.text.lowercased().contains(needle) { return true }
-        if memory.layer.lowercased().contains(needle) { return true }
-        return memory.tags?.contains { $0.lowercased().contains(needle) } ?? false
-    }
-
-    static func filter(_ memories: [MemoryRecord], query: String) -> [MemoryRecord] {
-        let needle = normalizedQuery(query)
-        guard !needle.isEmpty else { return memories }
-        return memories.filter { matches($0, query: needle) }
-    }
-
     /// Why the list is empty. A filtered-to-nothing list must never borrow the
     /// "waiting for iCloud" copy — that would blame the sync for the query.
     enum EmptyState: Equatable {
@@ -519,6 +507,8 @@ struct MemoryListView: View {
     var searchQuery: String = ""
     var header: AnyView = AnyView(EmptyView())
     @State private var pendingDeleteMemory: MemoryRecord?
+    @State private var searchIndex = MobileSearchIndex<MemoryRecord>()
+    @State private var searchResults: [MemoryRecord] = []
 
     private var isSample: Bool { MemorySamples.isOn }
 
@@ -527,7 +517,7 @@ struct MemoryListView: View {
     }
 
     private var visibleMemories: [MemoryRecord] {
-        MemorySearchPresentation.filter(sourceMemories, query: searchQuery)
+        MemorySearchPresentation.normalizedQuery(searchQuery).isEmpty ? sourceMemories : searchResults
     }
 
     private var isDeleteConfirmationPresented: Binding<Bool> {
@@ -540,7 +530,8 @@ struct MemoryListView: View {
     }
 
     var body: some View {
-        ScrollViewReader { proxy in
+        let visibleMemories = visibleMemories
+        return ScrollViewReader { proxy in
         List {
             header.aliveListRow(top: 0, bottom: 10)
             if let emptyState = MemorySearchPresentation.emptyState(
@@ -607,6 +598,14 @@ struct MemoryListView: View {
                 proxy.scrollTo(last.id, anchor: .bottom)
             }
             #endif
+        }
+        .task(id: MobileSearchInput(rows: sourceMemories, query: searchQuery)) {
+            let input = MobileSearchInput(rows: sourceMemories, query: MemorySearchPresentation.normalizedQuery(searchQuery))
+            let result = await searchIndex.search(input, maximum: input.rows.count,
+                fields: { [$0.text.lowercased(), $0.layer.lowercased()] + ($0.tags ?? []).map { $0.lowercased() } },
+                matches: { $0.contains($1) })
+            guard !Task.isCancelled else { return }
+            searchResults = result
         }
         .confirmationDialog(
             "Delete memory?",
@@ -768,3 +767,32 @@ struct MemoryProposalRow: View {
 // (`MemoryStackPanelCard`) was removed along with `MemoryStackStatus` and the
 // `memory_stack.json` read — no writer for that snapshot exists on disk, so
 // the card was always showing placeholder defaults.
+
+struct MobileSearchInput<Row: Equatable & Sendable>: Equatable, Sendable {
+    let rows: [Row]
+    let query: String
+}
+
+actor MobileSearchIndex<Row: Equatable & Sendable> {
+    private var source: [Row] = []
+    private var searchable: [[String]] = []
+
+    func search(_ input: MobileSearchInput<Row>, maximum: Int,
+                fields: @Sendable (Row) -> [String],
+                matches: @Sendable (String, String) -> Bool) -> [Row] {
+        if source != input.rows {
+            source = input.rows
+            searchable = source.map(fields)
+        }
+        guard !input.query.isEmpty else { return Array(source.prefix(maximum)) }
+        var result: [Row] = []
+        for (row, text) in zip(source, searchable) {
+            if Task.isCancelled { return [] }
+            if text.contains(where: { matches($0, input.query) }) {
+                result.append(row)
+                if result.count == maximum { break }
+            }
+        }
+        return result
+    }
+}

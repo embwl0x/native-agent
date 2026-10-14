@@ -82,9 +82,9 @@ struct MacPairingView: View {
                                     text: phone.status == .paired ? "Paired" : "Waiting",
                                     tone: phone.status == .paired ? NativeAgentShell.calm : NativeAgentShell.needsYou)
                                 if phone.status == .pending {
-                                    Button("Pair") { sync.setStatus(.paired, id: phone.id) }
+                                    Button("Pair") { Task { await sync.setStatus(.paired, id: phone.id) } }
                                 }
-                                Button("Remove", role: .destructive) { sync.setStatus(.removed, id: phone.id) }
+                                Button("Remove", role: .destructive) { Task { await sync.setStatus(.removed, id: phone.id) } }
                             }
                         }
                     }

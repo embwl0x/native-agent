@@ -1,4 +1,5 @@
 import SwiftUI
+import EngineRuntime
 import AppKit
 import CoreGraphics
 import ScreenCaptureKit
@@ -10,6 +11,7 @@ import NativeAgentShared
 import MemoryV2
 import PersistenceCore
 import ProviderRouting
+import TelegramBot
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -166,57 +168,6 @@ final class ScrollWheelNSView: NSView {
     }
 }
 
-func modelOptions(from catalog: ModelCatalogResponse?, current: String, limit: Int = 80) -> [ModelCatalogItem] {
-    let fallbackModels = (
-        FirstPartyModelCatalog.publicOpenAIModels
-        + FirstPartyModelCatalog.anthropicModels
-        + FirstPartyModelCatalog.xAIModels
-    ).enumerated().map { index, model in
-        ModelCatalogItem(
-            id: model.id,
-            displayName: model.name,
-            description: nil,
-            defaultReasoningEffort: model.defaultReasoningEffort,
-            supportedReasoningEfforts: model.supportedReasoningEfforts,
-            supportsFast: model.supportsFast,
-            priority: index
-        )
-    }
-    let sourceModels = catalog?.models ?? CodexSelectableModelCatalog.modelCatalogItems() + fallbackModels
-    var seen: Set<String> = []
-    var models: [ModelCatalogItem] = []
-
-    if let currentModel = sourceModels.first(where: { $0.id == current }), seen.insert(currentModel.id).inserted {
-        models.append(currentModel)
-    } else if !current.isEmpty, seen.insert(current).inserted {
-        models.append(ModelCatalogItem(id: current, displayName: current, description: "Custom model", defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"], supportsFast: nil, priority: 999))
-    }
-
-    for model in sourceModels {
-        guard seen.insert(model.id).inserted else { continue }
-        models.append(model)
-        if models.count >= limit { break }
-    }
-    return models
-}
-
-func reasoningOptions(from catalog: ModelCatalogResponse?, model: String) -> [ReasoningEffortOption] {
-    let fallback = catalog?.reasoningEfforts ?? defaultReasoningEffortOptions
-    guard let record = catalog?.models.first(where: { $0.id == model }),
-          let supported = record.supportedReasoningEfforts,
-          !supported.isEmpty else {
-        return fallback
-    }
-    return fallback.filter { supported.contains($0.id) }
-}
-
-struct TelegramNumericIDParseResult: Equatable {
-    let canonicalIDs: [String]
-    let invalidTokens: [String]
-
-    var isConfigured: Bool { !canonicalIDs.isEmpty }
-}
-
 struct TelegramAllowlistPresentation: Equatable {
     let chatIDs: Set<String>
     let userIDs: Set<String>
@@ -264,44 +215,9 @@ func telegramReasoningEffortMismatch(
     model: String,
     selected: String
 ) -> String? {
-    let normalized = normalizedReasoningEffort(from: catalog, model: model, selected: selected)
+    let normalized = ProvidersFacade.normalizedReasoningEffort(from: catalog, model: model, selected: selected)
     guard normalized != selected else { return nil }
     return "Saved think level '\(selected)' is unsupported for \(model). Save to use \(normalized)."
-}
-
-func parseTelegramNumericIDs(_ value: String) -> TelegramNumericIDParseResult {
-    let tokens = value
-        .split { $0 == "," || $0 == " " || $0 == "\n" || $0 == "\t" }
-        .map(String.init)
-        .filter { !$0.isEmpty }
-    var valid: [String] = []
-    var invalid: [String] = []
-    for token in tokens {
-        if let id = Int64(token) {
-            valid.append(String(id))
-        } else {
-            invalid.append(token)
-        }
-    }
-    return TelegramNumericIDParseResult(
-        canonicalIDs: Array(Set(valid)).sorted(),
-        invalidTokens: invalid
-    )
-}
-
-func normalizedReasoningEffort(
-    from catalog: ModelCatalogResponse?,
-    model: String,
-    selected: String
-) -> String {
-    let options = reasoningOptions(from: catalog, model: model)
-    if options.contains(where: { $0.id == selected }) { return selected }
-    if let record = catalog?.models.first(where: { $0.id == model }),
-       let preferred = record.defaultReasoningEffort,
-       options.contains(where: { $0.id == preferred }) {
-        return preferred
-    }
-    return options.first?.id ?? "high"
 }
 
 // PATCH-2026-05-07: proactive-inbox-1 InboxStripContainer — loads and renders unread inbox items

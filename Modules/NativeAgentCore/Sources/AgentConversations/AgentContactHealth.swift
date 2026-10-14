@@ -17,6 +17,51 @@ public actor AgentContactHealth {
     /// A2A contacts whose card this launch's health has dry-run because their recipe had not read it.
     private var cardsRead: Set<String> = []
 
+    /// Presence is read at presentation, independently of saved reply-path evidence.
+    public nonisolated static func read(dataRoot: URL) -> [String: AgentLocalHealth] {
+        var health = AgentLocalHealth.read(dataRoot).mapValues {
+            var evidence = $0
+            evidence.retainReplyEvidence()
+            return evidence
+        }
+        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        let bridge = claudePresence(dataRoot: dataRoot)
+        for key in Set(["claude"] + peers.filter { identity.canonical("peer:" + $0.id) == "claude" }.map { "peer:" + $0.id }) {
+            if health[key] == nil { health[key] = AgentLocalHealth(status: "unchecked", detail: "", checkedAt: .distantPast, authenticated: false) }
+            health[key]?.present(bridge)
+        }
+        for peer in peers where ChatGPTDotIPCTransport.owns(peer) {
+            let key = "peer:" + peer.id
+            if health[key] == nil { health[key] = AgentLocalHealth(status: "unchecked", detail: "", checkedAt: .distantPast, authenticated: false) }
+            health[key]?.present(dotPresence())
+        }
+        return health
+    }
+
+    private nonisolated static func claudePresence(dataRoot: URL) -> AgentLocalHealth {
+        let path = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+            .appendingPathComponent("claude-bridge/claude-live")
+        let at = (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
+        let recent = at.map { Date().timeIntervalSince($0) < 600 } == true
+        return bridgePresence(recent)
+    }
+
+    private nonisolated static func bridgePresence(_ recent: Bool) -> AgentLocalHealth {
+        AgentLocalHealth(status: recent ? "recent_activity" : "waiting",
+            detail: recent ? "Claude's bridge was active within the last 10 minutes." : "No recent activity from Claude's bridge.",
+            checkedAt: Date(), authenticated: false)
+    }
+
+    private nonisolated static func dotPresence() -> AgentLocalHealth {
+        let fields: [String: JSONValue] = if case .object(let fields) = ChatGPTDotIPCTransport.readiness { fields } else { [:] }
+        let available = fields["status"] == .string("available")
+        let missingWindow = ["dot_not_selected", "dot_not_open"].contains(text(fields["reason"]) ?? "")
+        return AgentLocalHealth(status: available ? "ready" : fields["status"] == .string("not_checked") ? "unchecked" : "waiting",
+            detail: available ? "Ready" : missingWindow ? "No ChatGPT window has Dot's conversation open." : text(fields["detail"]) ?? "Dot's conversation has not been checked.",
+            checkedAt: Date(), authenticated: false)
+    }
+
     public func installGrokVerifier(dataRoot: URL, verify: @escaping @Sendable (String) async throws -> Void) async {
         grokVerifiers[dataRoot.standardizedFileURL.path] = verify
         await refresh(dataRoot: dataRoot)
@@ -28,12 +73,10 @@ public actor AgentContactHealth {
     /// chain it always takes (`AgentRecipeStore.dryRun`). Its program is
     /// re-resolved and its handshake run with no prompt (ACP), its window's
     /// controls found without typing or coming forward (desktop chat), its
-    /// connect probe sent (command line). What that learns is written to its
-    /// recipe; a pass is proof, and closes the bridge items it exercised.
+    /// executable and args checked without launching (command line). Findings
+    /// are written to its recipe; a pass closes the bridge items it exercised.
     package static func repair(_ agent: String, dataRoot: URL, perform: AgentConversationSession.Dispatch) async throws -> JSONValue {
-        let found = try await AgentRecipeStore.$dryRun.withValue(true) {
-            try await perform("agent_message", ["agent": .string(agent), "text": .string(AgentHostDirectory.probeToken)])
-        }
+        let found = try await perform("agent_message", ["agent": .string(agent), "text": .string(AgentHostDirectory.probeToken), "dry_run": .bool(true)])
         if passed(found), case .object(let fields) = found, let peer = text(fields["agent"]) {
             // A pass closes only what it exercised: an ACP handshake's protocol
             // mismatches, an A2A card's mismatches, a window's checked controls.
@@ -148,24 +191,10 @@ public actor AgentContactHealth {
         guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list(),
               let records = try? AgentConversationStore(dataRoot: dataRoot).recordsUnlocked() else { return }
         var previous = AgentLocalHealth.read(dataRoot)
-        // Claude lives in her own session (Claude Code, Claude Desktop), not a
-        // program this app runs: she is live when she spoke over the bridge
-        // (agent_message, agent_reply) or marked a message read in her inbox in
-        // the last 30 minutes, or her session touched `claude-live` beside that
-        // inbox in the last 10 (it does every few minutes while it watches).
         let identity = AgentContactIdentity(dataRoot: dataRoot)
         let claude = peers.filter { identity.canonical("peer:" + $0.id) == "claude" }
         let iso = ISO8601DateFormatter()
-        let spoke = claude.compactMap { $0.provenInboundAt.flatMap(iso.date) }
-            + ContactReplyReads.read(dataRoot).filter { read in
-                claude.contains { read.session.hasPrefix(ContactThread.prefix(owner: $0.id)) }
-            }.map(\.at)
-        let inbox = AgentConversationDelivery.inbox(agent: "claude", bridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot))
-        let beat = inbox.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.deletingLastPathComponent()
-            .appendingPathComponent("claude-live").path)[.modificationDate] as? Date }
-        let live = (spoke + (inbox.map(Self.reads) ?? [])).contains { Date().timeIntervalSince($0) < 1800 }
-            || beat.map { Date().timeIntervalSince($0) < 600 } == true
-        let bridge = Probe.bridge(live: live)
+        let bridge = Probe.bridge(live: Self.claudePresence(dataRoot: dataRoot).status == "recent_activity")
         var probes: [(String, Probe)] = peers.map { ("peer:" + $0.id, claude.contains($0) ? bridge : probe($0)) }
         if !claude.isEmpty || records.contains(where: { $0.agent == "claude" }) { probes.append(("claude", bridge)) }
         for (lane, binary) in [("codex", "codex"), ("omp", "omp")] {
@@ -273,16 +302,14 @@ public actor AgentContactHealth {
                 changed = true
                 continue
             }
-            // Dot's check is free (his listener's live state, which asks for a
-            // refresh on every change): asked every time, the cached word kept
-            // only while it still matches.
-            let dot = probe == .dot ? await inspect(probe) : nil
-            if let old = previous[agent], !old.sticky, old.lastGoodAt == good, Date().timeIntervalSince(old.checkedAt) < 300, old.failureOperation == operation,
-               dot.map({ $0.status == old.status && $0.detail == old.detail }) ?? true { continue }
+            // Dot's word is overlaid live at every read (`present`); the stored
+            // row drops it, so comparing the two never matched and every
+            // refresh rewrote this watched file (a CPU loop, 10-12).
+            if let old = previous[agent], !old.sticky, old.lastGoodAt == good, Date().timeIntervalSince(old.checkedAt) < 300,
+               old.failureOperation == operation { continue }
             if Task.isCancelled { return }
             var observed: AgentLocalHealth
             if let kept = observations[probe] { observed = kept }
-            else if let dot { observed = dot; observations[probe] = dot }
             else { observed = await inspect(probe); observations[probe] = observed }
             observed.failureOperation = operation
             observed.lastGoodAt = good
@@ -297,6 +324,11 @@ public actor AgentContactHealth {
             if let old = previous[agent] { arrive(agent, from: old, to: observed, peers: peers, dataRoot: dataRoot) }
             previous[agent] = observed
             changed = true
+        }
+        for (agent, _) in probes {
+            let before = previous[agent]
+            previous[agent]?.retainReplyEvidence()
+            changed = changed || before != previous[agent]
         }
         guard changed else { return }
         let active = Set(probes.map(\.0))
@@ -343,6 +375,7 @@ public actor AgentContactHealth {
         var health = AgentLocalHealth.read(dataRoot)
         guard health[agent]?.repairFor == operation, health[agent]?.brokenSince != nil || health[agent]?.status == "no_reply_by_deadline" else { return }
         health[agent]?.repairDetail = detail
+        for key in health.keys { health[key]?.retainReplyEvidence() }
         do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(health), to: AgentLocalHealth.url(dataRoot)) }
         catch { nativeLog("AgentContactHealth: could not save verification: %@", error.localizedDescription) }
     }
@@ -369,8 +402,11 @@ public actor AgentContactHealth {
                 id: key + ":" + new.status + ":" + stamp, line: name + ": " + new.detail, key: key, thread: key, hold: 60)])
         } else if problems.contains(old.status), ["ready", "installed"].contains(new.status),
                   !ResidentWake.shared.withdraw(dataRoot: dataRoot, key: key) {
+            var evidence = new
+            evidence.retainReplyEvidence()
             ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(
-                id: key + ":ready:" + stamp, line: name + " is back: " + new.detail, key: key, thread: key, home: true, hold: 60)])
+                id: key + ":recovery:" + stamp, line: name, key: key, thread: key, home: true, hold: 60,
+                at: new.checkedAt, recoveredFrom: old.status, recovery: evidence)])
         }
     }
 
@@ -381,19 +417,6 @@ public actor AgentContactHealth {
         case remote
         case bridge(live: Bool)
         case dot
-    }
-
-    /// When her inbox's newest messages were marked read (`readAt`), from its last 64 KB.
-    private static func reads(_ inbox: URL) -> [Date] {
-        guard let handle = try? FileHandle(forReadingFrom: inbox) else { return [] }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        try? handle.seek(toOffset: size > 65_536 ? size - 65_536 : 0)
-        let text = String(decoding: (try? handle.readToEnd()) ?? Data(), as: UTF8.self)
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return text.components(separatedBy: "\"readAt\":\"").dropFirst()
-            .compactMap { $0.split(separator: "\"", maxSplits: 1).first.flatMap { iso.date(from: String($0)) } }
     }
 
     private func probe(_ peer: AgentPeerContact) -> Probe {
@@ -417,14 +440,9 @@ public actor AgentContactHealth {
         switch probe {
         case .remote: return result("unchecked", "No local health probe")
         case .bridge(let live):
-            return live ? result("live", "Live") : result("waiting", "Messages wait for Claude's next session")
+            return Self.bridgePresence(live)
         case .dot:
-            // Offline, not unavailable: the ChatGPT app closing is not news to wake her for.
-            if ChatGPTDotIPCTransport.available { return result("ready", "Ready") }
-            if case .object(let fields) = ChatGPTDotIPCTransport.readiness, fields["status"] == .string("not_checked") {
-                return result("unchecked", ChatGPTDotIPCTransport.detail)
-            }
-            return result("offline", ChatGPTDotIPCTransport.detail)
+            return Self.dotPresence()
         case .unavailable(let detail): return result("unavailable", detail)
         case .app(let bundles):
             // A stuck Launch Services lookup is retained, never multiplied by

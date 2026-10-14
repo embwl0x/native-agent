@@ -32,14 +32,14 @@ extension SwiftNativeResearchClient {
         payload: JSONValue
     ) async throws {
         let event: JSONValue = .object([
-            "id": .string(receiptIDFactory()),
+            "id": .string(UUID().uuidString.lowercased()),
             "kind": .string(kind),
             "title": .string(NativeAgentSecretRedactor.redactText(title)),
             "detail": .string(NativeAgentSecretRedactor.redactText(detail)),
             "status": .string(status),
             "executionId": .null,
             "payload": NativeAgentSecretRedactor.redactValue(payload),
-            "createdAt": .string(Self.isoTimestamp(now())),
+            "createdAt": .string(Self.isoTimestamp(Date())),
         ])
         // The shared owner takes the one-sided Swift flock and amortizes the
         // newest-5000 trim behind the activity feed's byte trigger.
@@ -67,12 +67,12 @@ extension SwiftNativeResearchClient {
             statusField = s
         }
         let event: JSONValue = .object([
-            "id": .string(receiptIDFactory()),
+            "id": .string(UUID().uuidString.lowercased()),
             "kind": .string(kind),
             "title": .string(NativeAgentSecretRedactor.redactText(title)),
             "status": .string(statusField),
             "payload": redactedPayload,
-            "createdAt": .string(Self.isoTimestamp(now())),
+            "createdAt": .string(Self.isoTimestamp(Date())),
         ])
         try await appendEnvelope(event, to: tracesPath)
     }

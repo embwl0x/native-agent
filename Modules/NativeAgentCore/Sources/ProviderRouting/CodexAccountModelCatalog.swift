@@ -46,6 +46,49 @@ public enum CodexAccountModelCatalog {
 
     private struct Cache: Decodable {
         var models: [Record]
+        var accountID: String?
+
+        enum CodingKeys: String, CodingKey {
+            case models
+            case accountID = "nativeagent_account_id"
+        }
+
+        init(from decoder: Decoder) throws {
+            let fields = try decoder.container(keyedBy: CodingKeys.self)
+            // Matching accepts any JSON object; malformed model rows still
+            // leave the shipped projection, as an unsuccessful load did.
+            models = (try? fields.decode([Record].self, forKey: .models)) ?? []
+            accountID = try? fields.decode(String.self, forKey: .accountID)
+        }
+    }
+
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var decodedByPath: [String: (stamp: [FileAttributeKey: Any], cache: Cache?)] = [:]
+
+    /// Account matching and both route projections share this decode. File
+    /// replacement invalidates it; auth identity is checked on every selection.
+    private static func readCache(at url: URL) -> Cache? {
+        let url = url.resolvingSymlinksInPath()
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            decodedByPath.removeValue(forKey: url.path)
+            return nil
+        }
+        if let entry = decodedByPath[url.path], NSDictionary(dictionary: entry.stamp).isEqual(to: attributes) {
+            return entry.cache
+        }
+        let cache = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Cache.self, from: $0) }
+        guard let after = try? FileManager.default.attributesOfItem(atPath: url.path),
+              NSDictionary(dictionary: attributes).isEqual(to: after) else {
+            decodedByPath.removeValue(forKey: url.path)
+            return nil
+        }
+        if decodedByPath[url.path] == nil, decodedByPath.count >= 64 {
+            decodedByPath.remove(at: decodedByPath.startIndex)
+        }
+        decodedByPath[url.path] = (attributes, cache)
+        return cache
     }
 
     private struct Record: Decodable {
@@ -84,8 +127,11 @@ public enum CodexAccountModelCatalog {
         cacheURL: URL? = nil,
         useDefaultCacheWhenNil: Bool = true
     ) -> [Model] {
-        let candidates = cacheURL.map { [$0] }
-            ?? (useDefaultCacheWhenNil ? [cacheCandidate()] : [])
+        let url = cacheURL ?? (useDefaultCacheWhenNil ? cacheCandidate() : nil)
+        return models(providerID: providerID, cache: url.flatMap { readCache(at: $0) })
+    }
+
+    private static func models(providerID: String, cache: Cache?) -> [Model] {
         var byID: [String: Model] = [:]
         for (index, descriptor) in FirstPartyModelCatalog.chatGPTAccountFallbackModels.enumerated() {
             byID[descriptor.id] = Model(
@@ -101,9 +147,7 @@ public enum CodexAccountModelCatalog {
         }
         let directOAuth = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "openai_oauth_direct"
-        for url in candidates {
-            guard let data = try? Data(contentsOf: url),
-                  let cache = try? JSONDecoder().decode(Cache.self, from: data) else { continue }
+        if let cache {
             for record in cache.models {
                 let id = record.slug.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 guard record.visibility == nil || record.visibility == "list",
@@ -133,9 +177,7 @@ public enum CodexAccountModelCatalog {
     /// 2026-09-22: `load` always carries every fallback row, so only the signed
     /// cache itself says this account can run a model. No cache = cannot.
     public static func signedCacheLists(_ modelID: String, providerID: String, cacheURL: URL?) -> Bool {
-        guard let cacheURL,
-              let data = try? Data(contentsOf: cacheURL),
-              let cache = try? JSONDecoder().decode(Cache.self, from: data) else { return false }
+        guard let cacheURL, let cache = readCache(at: cacheURL) else { return false }
         let directOAuth = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "openai_oauth_direct"
         return cache.models.contains {
@@ -164,6 +206,23 @@ public enum CodexAccountModelCatalog {
         dataRoot: URL,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL? {
+        chatGPTOAuthCache(dataRoot: dataRoot, environment: environment)?.url
+    }
+
+    static func chatGPTOAuthCatalogs(
+        dataRoot: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: [Model]] {
+        let cache = chatGPTOAuthCache(dataRoot: dataRoot, environment: environment)?.cache
+        return Dictionary(uniqueKeysWithValues: ["codex", "openai_oauth_direct"].map {
+            ($0, models(providerID: $0, cache: cache))
+        })
+    }
+
+    private static func chatGPTOAuthCache(
+        dataRoot: URL,
+        environment: [String: String]
+    ) -> (url: URL, cache: Cache)? {
         let usesCanonicalBody = dataRoot.standardizedFileURL
             == PersistenceCore.defaultDataRoot().standardizedFileURL
         let authURL = usesCanonicalBody
@@ -172,9 +231,10 @@ public enum CodexAccountModelCatalog {
         if !usesCanonicalBody {
             let sibling = authURL.deletingLastPathComponent()
                 .appendingPathComponent("models_cache.json")
-            return cacheMatchesAccount(cacheURL: sibling, authURL: authURL) ? sibling : nil
+            guard let cache = readCache(at: sibling), cacheMatchesAccount(cache, authURL: authURL) else { return nil }
+            return (sibling, cache)
         }
-        return matchingCacheCandidate(
+        return matchingCache(
             oauthAuthURL: authURL,
             fallbackCacheURL: cacheCandidate(environment: environment)
         )
@@ -184,12 +244,29 @@ public enum CodexAccountModelCatalog {
         oauthAuthURL: URL,
         fallbackCacheURL: URL
     ) -> URL? {
+        matchingCache(oauthAuthURL: oauthAuthURL, fallbackCacheURL: fallbackCacheURL)?.url
+    }
+
+    static func matchingModels(
+        providerID: String,
+        oauthAuthURL: URL,
+        fallbackCacheURL: URL
+    ) -> [Model] {
+        models(providerID: providerID, cache: matchingCache(
+            oauthAuthURL: oauthAuthURL, fallbackCacheURL: fallbackCacheURL
+        )?.cache)
+    }
+
+    private static func matchingCache(
+        oauthAuthURL: URL,
+        fallbackCacheURL: URL
+    ) -> (url: URL, cache: Cache)? {
         let sibling = oauthAuthURL.deletingLastPathComponent()
             .appendingPathComponent("models_cache.json")
-        if cacheMatchesAccount(cacheURL: sibling, authURL: oauthAuthURL) {
-            return sibling
+        if let cache = readCache(at: sibling), cacheMatchesAccount(cache, authURL: oauthAuthURL) {
+            return (sibling, cache)
         }
-        guard cacheMatchesAccount(cacheURL: fallbackCacheURL, authURL: oauthAuthURL),
+        guard let cache = readCache(at: fallbackCacheURL), cacheMatchesAccount(cache, authURL: oauthAuthURL),
               let oauthAccount = persistedAccountID(at: oauthAuthURL),
               let cacheAccount = persistedAccountID(
                 at: fallbackCacheURL.deletingLastPathComponent()
@@ -198,14 +275,12 @@ public enum CodexAccountModelCatalog {
               oauthAccount == cacheAccount else {
             return nil
         }
-        return fallbackCacheURL
+        return (fallbackCacheURL, cache)
     }
 
-    private static func cacheMatchesAccount(cacheURL: URL, authURL: URL) -> Bool {
-        guard let bytes = try? Data(contentsOf: cacheURL),
-              let cache = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { return false }
+    private static func cacheMatchesAccount(_ cache: Cache, authURL: URL) -> Bool {
         // Older CLI caches carry no account marker; keep their existing read policy.
-        guard let account = cache["nativeagent_account_id"] as? String else { return true }
+        guard let account = cache.accountID else { return true }
         return account == persistedAccountID(at: authURL)
     }
 
@@ -220,15 +295,7 @@ public enum CodexAccountModelCatalog {
             if !trimmed.isEmpty { return trimmed }
         }
         guard let accessToken = tokens["access_token"] as? String else { return nil }
-        let parts = accessToken.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count >= 2 else { return nil }
-        var payload = String(parts[1])
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        let remainder = payload.count % 4
-        if remainder != 0 { payload += String(repeating: "=", count: 4 - remainder) }
-        guard let payloadData = Data(base64Encoded: payload),
-              let claims = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+        guard let claims = jwtPayload(accessToken, omittingEmptySubsequences: false),
               let auth = claims["https://api.openai.com/auth"] as? [String: Any],
               let accountID = auth["chatgpt_account_id"] as? String else {
             return nil

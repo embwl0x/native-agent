@@ -74,42 +74,21 @@ public enum SessionHistoryPromptRenderer {
         }
     }
 
-    public struct RenderResult: Sendable {
-        public let historyBlock: String?
-    }
-
     /// `windowTokens` is the model's context window for THIS turn (nil when the
     /// model is unknown or the caller has none). It selects the budget regime;
     /// see `ContextBudgetPolicy`.
-    public static func renderDetailed(
-        messages: [ChatMessage],
-        middleCandidates: [ChatMessage] = [],
-        userMessage: String = "",
-        surface: String,
-        historyLimit: Int,
-        windowTokens: Int? = nil
-    ) -> RenderResult {
-        renderDetailed(
-            renderables: messages.compactMap(renderable),
-            middleCandidates: middleCandidates.compactMap(renderable),
-            userMessage: userMessage, surface: surface,
-            historyLimit: historyLimit, windowTokens: windowTokens
-        )
-    }
-
     package static func renderDetailed(
         renderables: [Renderable],
         middleCandidates: [Renderable],
         userMessage: String,
-        surface: String,
         historyLimit: Int,
         windowTokens: Int?,
         consumeToolReceipt: ((String) -> Void)? = nil
-    ) -> RenderResult {
+    ) -> String? {
         let cappedLimit = max(0, historyLimit)
-        guard cappedLimit > 0 else { return RenderResult(historyBlock: nil) }
+        guard cappedLimit > 0 else { return nil }
 
-        guard !renderables.isEmpty else { return RenderResult(historyBlock: nil) }
+        guard !renderables.isEmpty else { return nil }
 
         var sections: [String] = [
             "Earlier messages are history, not live readings; recheck anything current before relying on it."
@@ -119,27 +98,13 @@ public enum SessionHistoryPromptRenderer {
             promptRenderables: renderables,
             candidates: middleCandidates,
             historyLimit: cappedLimit,
-            surface: surface,
             windowTokens: windowTokens,
             consumeToolReceipt: consumeToolReceipt
         )
         if let middle = middleSnippet {
             sections.append(middle)
         }
-        guard !sections.isEmpty else {
-            return RenderResult(historyBlock: nil)
-        }
-        return RenderResult(
-            historyBlock: sections.joined(separator: "\n\n")
-        )
-    }
-
-    package static func recallQuery(
-        userMessage: String,
-        messages: [ChatMessage],
-        cap maxCount: Int = recallQueryCharCap
-    ) -> String {
-        recallQuery(userMessage: userMessage, renderables: messages.compactMap(renderable), cap: maxCount)
+        return sections.joined(separator: "\n\n")
     }
 
     package static func recallQuery(
@@ -201,39 +166,11 @@ public enum SessionHistoryPromptRenderer {
         return String(userMessage.prefix(400)) + "\nRecent conversation:\n" + recent
     }
 
-    static func middleSnippetText(
-        userMessage: String,
-        promptMessages: [ChatMessage],
-        candidates: [ChatMessage],
-        historyLimit: Int,
-        surface: String,
-        windowTokens: Int? = nil
-    ) -> String? {
-        middleSnippetText(
-            userMessage: userMessage,
-            promptRenderables: promptMessages.compactMap(renderable),
-            candidates: candidates.compactMap(renderable),
-            historyLimit: max(0, historyLimit),
-            surface: surface,
-            windowTokens: windowTokens,
-            consumeToolReceipt: nil
-        )
-    }
-
-    /// Sweep R4 W3: the surface table now lives in `ContextBudgetPolicy` and is
-    /// a function of the model's context window. `windowTokens == nil` — every
-    /// legacy caller, and any turn whose model could not be resolved — returns
-    /// the pre-policy literals byte-identically.
-    static func budget(for surface: String, windowTokens: Int?) -> Budget {
-        ContextBudgetPolicy.resolve(windowTokens: windowTokens, surface: surface)
-    }
-
     private static func middleSnippetText(
         userMessage: String,
         promptRenderables: [Renderable],
         candidates: [Renderable],
         historyLimit: Int,
-        surface: String,
         windowTokens: Int?,
         consumeToolReceipt: ((String) -> Void)?
     ) -> String? {
@@ -242,7 +179,7 @@ public enum SessionHistoryPromptRenderer {
             promptRenderables: promptRenderables,
             candidates: candidates,
             historyLimit: historyLimit,
-            budget: budget(for: surface, windowTokens: windowTokens),
+            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens),
             consumeToolReceipt: consumeToolReceipt
         )
     }
@@ -655,7 +592,24 @@ public enum SessionHistoryPromptRenderer {
     }
 
     package static func restoringReceiptBoundaries(_ fields: [String: JSONValue]) -> [String: JSONValue] {
+        // Undo receipts live only in the current workspace. Historical results
+        // cannot establish that they survived restart, eviction or a later write.
+        // Strip old saved cues too, including results retained inside scripts.
+        func withoutUndoCue(_ value: JSONValue) -> JSONValue {
+            switch value {
+            case .object(let object):
+                return .object(object.filter {
+                    $0.key != "undo" || $0.value != .object(["action": .string("undo")])
+                }.mapValues(withoutUndoCue))
+            case .array(let array): return .array(array.map(withoutUndoCue))
+            default: return value
+            }
+        }
         var fields = fields
+        fields.removeValue(forKey: "undo")
+        for key in ["ops", "returned"] {
+            if let value = fields[key] { fields[key] = withoutUndoCue(value) }
+        }
         if let next = fields["next"], next != .null, !historicalContinuationIsExact(next) {
             fields.removeValue(forKey: "next")
             var omitted: [JSONValue] = if case .array(let list)? = fields["fields_omitted"] { list } else { [] }

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CryptoKit
 import Darwin
 import NativeAgentCore
@@ -119,10 +120,11 @@ public struct SenseNews: Codable, Sendable, Hashable {
 
 // MARK: - Senses
 
-public enum SenseStatus: String, Codable, Sendable { case draft, on, archived, unavailable }
+public enum SenseStatus: String, Codable, Sendable { case draft, on, off, unavailable }
 
 /// The language a sense is written in. `native` = a built-in Swift sense
 /// (our existing corners, wrapped unchanged on day one).
+// swift is retained only to decode historical authored records.
 public enum SenseLanguage: String, Codable, Sendable { case javascript, swift, native }
 
 /// On call: runs when she reads or acts, then stops. Live: keeps running to
@@ -140,11 +142,15 @@ public struct SenseReach: Codable, Sendable, Hashable {
     public var readPaths: [String]
     /// Hosts it may reach over the network (empty = none).
     public var hosts: [String]
+    /// Bundle identifiers; senses may only read these apps.
+    public var apps: [String]?
 
-    public init(readPaths: [String] = [], hosts: [String] = []) { self.readPaths = readPaths; self.hosts = hosts }
+    public init(readPaths: [String] = [], hosts: [String] = [], apps: [String]? = nil) {
+        self.readPaths = readPaths; self.hosts = hosts; self.apps = apps
+    }
 }
 
-/// One sense: identity, version and lifecycle. Stored by the registry.
+/// One sense: identity, version and lifecycle, projected from its ability file.
 public struct SenseRecord: Codable, Sendable, Hashable {
     public var id: String
     public var corner: SenseCorner
@@ -155,8 +161,11 @@ public struct SenseRecord: Codable, Sendable, Hashable {
     public var mode: SenseMode
     public var origin: SenseOrigin
     public var reach: SenseReach
-    /// Entry file, relative to the sense's version folder (nil for `native`).
+    /// Source entry name, retained for bundled modules and portable exports (nil for `native`).
     public var entry: String?
+    /// Validated program identity; absent for bundled and migrated source-only abilities.
+    public var candidateDigest: String?
+    public var disabledBy: String?
     /// The verbs it offers on its things, for door discovery.
     public var verbs: [String]
     public var createdAt: Date
@@ -207,7 +216,10 @@ public struct SenseProvenance: Codable, Sendable, Hashable {
         let age = Int(max(0, now.timeIntervalSince(grownAt)))
         let ago: String = age < 3600 ? "\(max(1, age / 60))m" : age < 86_400 ? "\(age / 3600)h" : "\(age / 86_400)d"
         let source = origin == .builtIn ? "built in" : "grown \(ago) ago"
-        return "via sense \(senseID) v\(version) · \(source) · used \(uses)× · corrected \(corrections)×"
+        let line = "via sense \(senseID) v\(version) · \(source) · used \(uses)× · corrected \(corrections)×"
+        OwnedProgramRunner.ReadContent.current?.record(.string(line),
+            content: .string("via sense \(senseID) v\(version) · \(origin?.rawValue ?? "")"))
+        return line
     }
 }
 
@@ -256,8 +268,8 @@ public enum SenseOutcome: Sendable {
 public enum SenseMaterial: Sendable {
     /// An app's accessibility tree, as JSON.
     case accessibility(JSONValue)
-    /// A file: its path (read-only) and size.
-    case file(path: String, bytes: Int)
+    /// A file: its path (read-only), size and bytes already admitted by a read.
+    case file(path: String, bytes: Int, data: Data? = nil)
     /// A web page snapshot, as JSON (the Chrome read model).
     case pageSnapshot(JSONValue)
     /// Plain text (a document extract, a stream chunk).
@@ -276,7 +288,7 @@ public protocol SenseSourceProvider: Sendable {
 /// Receipt for the exact whole-file bytes delivered by the helper runner.
 /// Package bytes count member content; version hashes names and content.
 public protocol SenseFileReadReporting: SenseSourceProvider {
-    func didReadFile(path: String, bytes: Int, version: String) async
+    func didReadFile(path: String, bytes: Int, version: String, data: Data) async
 }
 
 /// Optional event-backed observation. Every delivered material passes the
@@ -309,7 +321,7 @@ public struct SenseEntryProgress: Sendable {
     }
 }
 
-/// Runs a sense (the helper process for javascript/swift, in-process for native).
+/// Runs JavaScript senses in the shared helper; fixed native adapters stay in-process.
 public protocol SenseRunner: Sendable {
     func run(_ record: SenseRecord, request: SenseRequest, source: SenseSourceProvider) async -> SenseOutcome
 }
@@ -321,6 +333,10 @@ public struct SenseInteractiveView: Codable, Sendable, Hashable {
     public var version: Int
     public var title: String
     public var html: String
+
+    public func isCurrent(in records: [SenseRecord]) -> Bool {
+        records.contains { $0.id == senseID && $0.version == version && $0.status == .on }
+    }
 
     public init(senseID: String, version: Int, title: String, html: String) {
         self.senseID = senseID; self.version = version; self.title = title; self.html = html
@@ -349,12 +365,10 @@ public protocol SenseRegistryManaging: SenseRegistry {
     func upsert(_ record: SenseRecord, codeFiles: [String: Data]) async throws -> SenseRecord
     func versions(id: String) async throws -> [SenseRecord]
     func recordUse(senseID: String, version: Int) async throws
-    func rollback(id: String) async throws -> SenseRecord
-    func setStatus(id: String, version: Int, status: SenseStatus) async throws -> SenseRecord
+    func rollback(id: String, version: Int, preview: Bool) async throws -> SenseRecord
+    func drop(id: String, version: Int, preview: Bool, ownerAuthorized: Bool) async throws -> SenseRecord
+    func setStatus(id: String, version: Int, status: SenseStatus, preview: Bool, ownerAuthorized: Bool) async throws -> SenseRecord
     func markUnavailable(id: String, version: Int, reason: String) async throws
-    /// Publication and User's off-switch are serialized by the registry owner.
-    func publishIfNotArchived(_ record: SenseRecord, codeFiles: [String: Data]) async throws -> SenseRecord?
-    func archiveUnused(now: Date) async throws -> [SenseRecord]
     func exportBundle(id: String, to destination: URL, userApproved: Bool) async throws -> SenseExportResult
     func importBundle(from bundle: URL) async throws -> SenseRecord
 }
@@ -477,6 +491,35 @@ public final class SensesHub: @unchecked Sendable {
     public var registry: SenseRegistry? { lock.lock(); defer { lock.unlock() }; return _registry }
     public var runner: SenseRunner? { lock.lock(); defer { lock.unlock() }; return _runner }
     public var source: SenseSourceProvider? { lock.lock(); defer { lock.unlock() }; return _source }
+
+    @MainActor
+    public func presentationRecords() async throws -> ([SenseRecord], [SenseCorner: String]) {
+        let records: [SenseRecord]
+        if let registry = registry as? any SenseRegistryManaging { records = try await registry.allChecked() }
+        else { records = try await registry?.all() ?? [] }
+        return await Task.detached(priority: .utility) {
+            (records.sorted { $0.corner.key < $1.corner.key },
+             Dictionary(uniqueKeysWithValues: Set(records.map(\.corner)).map { ($0, $0.surfaceName) }))
+        }.value
+    }
+
+    @MainActor
+    public func receiveViewEvent(_ event: JSONValue, presentation: SenseInteractiveView) async -> String? {
+        guard let registry, let source, let receiver = runner as? any SenseViewEventReceiver else {
+            return "This sense cannot receive view events yet."
+        }
+        do {
+            guard let record = try await registry.all().first(where: {
+                $0.id == presentation.senseID && $0.version == presentation.version && $0.status == .on
+            }), !Task.isCancelled else {
+                return "This sense is off or its view has changed."
+            }
+            try await receiver.receiveViewEvent(event, for: record, source: source)
+            return nil
+        } catch {
+            return "This sense could not handle the event: \(error.localizedDescription)"
+        }
+    }
 
     /// Watch entries, their source callbacks and restarts are observations,
     /// independently of which turn originally started the live sense.
@@ -760,4 +803,19 @@ public actor SenseNewsBoard {
 /// "SenseFailure error 1".
 extension SenseFailure: LocalizedError {
     public var errorDescription: String? { message.isEmpty ? code : message }
+}
+
+extension SenseCorner {
+    public var surfaceName: String {
+        switch self {
+        case .app(let id):
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+                return url.deletingPathExtension().lastPathComponent
+            }
+            return id
+        case .fileKind(let kind): return ".\(kind) files"
+        case .site(let host): return host
+        case .stream(let id), .need(let id): return id
+        }
+    }
 }

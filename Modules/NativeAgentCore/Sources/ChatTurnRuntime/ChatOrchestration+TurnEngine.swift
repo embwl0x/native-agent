@@ -19,7 +19,7 @@ import StandingBots
 //
 // This module wires together the Swift pieces needed to assemble a turn:
 //   - PersonaCompiler.compile() / ContextFlow   — persona prompt
-//   - MemoryRecalling.recall()                  — memory recall boundary
+//   - SwiftNativeMemoryV2RecallingAdapter       — memory recall boundary
 //   - ProviderRouting.checkedRoutingSnapshot()  — one per-turn route admission
 //   - TrustCenter.autonomyForTool()             — autonomy resolution
 //   - ToolDispatchClient                        — the tool dispatch boundary
@@ -27,16 +27,13 @@ import StandingBots
 // MARK: - SwiftNativeTurnEngine
 
 public actor SwiftNativeTurnEngine {
-    private let persona: any PersonaEngineProtocol
-    private let memory: (any MemoryRecalling)?
+    private let persona: SwiftNativePersonaEngine
+    private let memory: SwiftNativeMemoryV2RecallingAdapter?
     private let router: any ProviderRoutingProtocol
     private let trust: SwiftNativeTrustCenter
     private let tools: any ToolDispatchClient
     let clock: @Sendable () -> Date
-    // 2026-09-06: injected wait for retry-ladder fixtures (4af32f79,
-    // b593d8f2). Default timing, Retry-After and cancellation stay unchanged.
-    let providerRecoverySleep: @Sendable (TimeInterval) async throws -> Void
-    private let memoryPromoter: (any MemoryPromoting)?
+    private let memoryPromoter: SharedAdaptiveMemoryPromoter?
     /// Per-session churn guard for the moments nudge line. Session-local,
     /// in-memory, and forgettable: a restart re-renders one line.
     var momentNudgeState: [String: (lastCount: Int, turnsSinceRender: Int)] = [:]
@@ -60,44 +57,29 @@ public actor SwiftNativeTurnEngine {
     /// module. nil → memory-keyed activation is dropped (terms/intent still
     /// flow); empty is the byte-identical default.
     private let memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)?
-    /// One constructor seam disables both additions for an immediate rollback
-    /// without changing persona docs or any durable runtime state.
-    let naturalExpressionGuidanceEnabled: Bool
-    /// Injected only for deterministic turn-boundary proof. Production reads
-    /// the canonical preference file through `TurnQuietHoursWindow.read`.
-    private let quietHoursReader: @Sendable (URL) -> TurnQuietHoursWindow?
-
     /// Upper bound on the attention-signal read. A slow substrate must never
     /// stall the turn: on expiry we proceed with no signals and flag the trace.
     private static let attentionSignalsTimeoutNanos: UInt64 = 250_000_000
 
     public init(
-        persona: any PersonaEngineProtocol,
-        memory: (any MemoryRecalling)?,
+        persona: SwiftNativePersonaEngine,
+        memory: SwiftNativeMemoryV2RecallingAdapter?,
         router: any ProviderRoutingProtocol,
         trust: SwiftNativeTrustCenter,
         tools: any ToolDispatchClient,
-        providerRecoverySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
         clock: @escaping @Sendable () -> Date = { Date() },
         remPinsDataRoot: URL? = nil,
-        memoryPromoter: (any MemoryPromoting)? = SharedAdaptiveMemoryPromoter(),
+        memoryPromoter: SharedAdaptiveMemoryPromoter? = SharedAdaptiveMemoryPromoter(),
         turnTraceBus: TurnTraceBus = .shared,
         contextFlow: (any ContextTurnPreparing)? = nil,
         cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
-        memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
-        naturalExpressionGuidanceEnabled: Bool = true,
-        quietHoursReader: @escaping @Sendable (URL) -> TurnQuietHoursWindow? = {
-            TurnQuietHoursWindow.read(dataRoot: $0)
-        }
+        memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil
     ) {
         self.persona = persona
         self.memory = memory
         self.router = router
         self.trust = trust
         self.tools = tools
-        self.providerRecoverySleep = providerRecoverySleep ?? {
-            try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000))
-        }
         self.clock = clock
         self.memoryPromoter = memoryPromoter
         self.turnTraceBus = turnTraceBus
@@ -105,25 +87,10 @@ public actor SwiftNativeTurnEngine {
         self.contextFlow = contextFlow
         self.cognitiveContextProvider = cognitiveContextProvider
         self.memoryAtomTranslator = memoryAtomTranslator
-        self.naturalExpressionGuidanceEnabled = naturalExpressionGuidanceEnabled
-        self.quietHoursReader = quietHoursReader
     }
 
     func readTurnQuietHours() -> TurnQuietHoursWindow? {
-        remPinsDataRoot.flatMap(quietHoursReader)
-    }
-
-    public func captureTurnQuietHoursSnapshot() -> TurnQuietHoursSnapshot {
-        TurnQuietHoursSnapshot(window: readTurnQuietHours())
-    }
-
-    func checkedActiveProviderID(for surface: String) async throws -> String? {
-        if let choice = ProviderTurnChoice.current { return choice.provider }
-        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let routingSurface = canonicalRoutingSurface(normalized)
-        return ProviderRoutingSurfaceLookup.value(
-            try await router.checkedRoutingSnapshot().activeProviders, routingSurface
-        )
+        remPinsDataRoot.flatMap { TurnQuietHoursWindow.read(dataRoot: $0) }
     }
 
     func checkedRouteAdmission(
@@ -251,17 +218,9 @@ public actor SwiftNativeTurnEngine {
         // passes the same value every iteration so the dynamic segment's
         // time line can't churn the cache mid-turn. nil = clock() per build.
         clockNowOverride: Date? = nil,
-        // Text-compatible multi-iteration turns capture this once outside the
-        // stream loop. nil means this call itself owns a fresh turn capture.
-        quietHoursSnapshot: TurnQuietHoursSnapshot? = nil,
         offeredToolNames: Set<String>? = nil
     ) async throws -> TurnContext {
-        let quietHoursWindow: TurnQuietHoursWindow?
-        if let quietHoursSnapshot {
-            quietHoursWindow = quietHoursSnapshot.window
-        } else {
-            quietHoursWindow = readTurnQuietHours()
-        }
+        let quietHoursWindow = readTurnQuietHours()
         return try await buildTurnContext(
             surface: surface,
             userMessage: userMessage,
@@ -372,8 +331,7 @@ public actor SwiftNativeTurnEngine {
         let packetBudget = ContextBudgetPolicy.resolve(
             model: LLMCallContext.admittedModel,
             providerID: LLMCallContext.providerId,
-            dataRoot: remPinsDataRoot,
-            surface: surface
+            dataRoot: remPinsDataRoot
         )
         trace.setFlag("budget.packetDerived", packetBudget.isDerived)
         // Settings ▸ "Remember across conversations". One fresh read per turn,
@@ -554,16 +512,13 @@ public actor SwiftNativeTurnEngine {
         let compiledPersonaPrompt: String
         let personaStartNs = DispatchTime.now().uptimeNanoseconds
         do {
-            guard let swiftPersona = persona as? SwiftNativePersonaEngine else {
-                throw PersonaEngineError.underlying("The persona engine has no compiler.")
-            }
             if let preparedContextTurn {
                 resolvedPersonaID = preparedContextTurn.mirror.personaID.rawValue
                 var documents = Dictionary(preparedContextTurn.mirror.documents.map {
                     (String($0.id.rawValue.dropLast(3)), $0.text)
                 }, uniquingKeysWith: { first, _ in first })
                 // The saved name is read at admission, independent of cached documents.
-                documents["IDENTITY"] = try PersonaCompiler.identityPrompt(dataRoot: await swiftPersona.dataRootURL)
+                documents["IDENTITY"] = try PersonaCompiler.identityPrompt(dataRoot: await persona.dataRootURL)
                 if !preparedContextTurn.kernel.surfaceGuidance.isEmpty {
                     documents["surfaceGuidance"] = preparedContextTurn.kernel.surfaceGuidance
                 }
@@ -635,9 +590,7 @@ public actor SwiftNativeTurnEngine {
                     )
                 }
             } else {
-                // SwiftNativePersonaEngine is the only persona engine; there is
-                // no uncompiled persona prompt to drop back to.
-                let compiler = PersonaCompiler(engine: swiftPersona)
+                let compiler = PersonaCompiler(engine: persona)
                 // The saved name is required, as above: an unreadable profile
                 // fails the turn with the compiler's repair text.
                 let packet = try await compiler.compile(
@@ -688,8 +641,7 @@ public actor SwiftNativeTurnEngine {
         let turnBudget = ContextBudgetPolicy.resolve(
             model: modelId,
             providerID: LLMCallContext.providerId,
-            dataRoot: remPinsDataRoot,
-            surface: surface
+            dataRoot: remPinsDataRoot
         )
         trace.setCount("budget.windowTokens", turnBudget.windowTokens ?? 0)
         trace.setFlag("budget.derived", turnBudget.isDerived)
@@ -703,7 +655,7 @@ public actor SwiftNativeTurnEngine {
         var contextFlowMemoryAtomCount: Int?
         if let preparedContextTurn {
             for item in preparedContextTurn.packet.selectedItems {
-                for source in item.untrustedSources ?? [] { PeerDataTaint.markConsumed(peer: source, attested: false) }
+                for source in item.untrustedSources ?? [] { PeerDataTaint.markConsumed(peer: source) }
             }
             contextFlowMemoryAtomCount = preparedContextTurn.packet.selectedItems.reduce(into: 0) {
                 if $1.pointer.kind == .memory || $1.pointer.kind == .correction { $0 += 1 }
@@ -733,7 +685,7 @@ public actor SwiftNativeTurnEngine {
                 recalled = try await memory.recall(
                     effectiveRecallQuery,
                     k: turnBudget.recallRowLimit,
-                    persona: memoryRecallPersonaFilter(resolvedPersonaID),
+                    persona: nil,
                     surface: surface
                 )
                 trace.setMemoryRecallOutcome(.succeeded(hitCount: recalled.count))
@@ -805,12 +757,6 @@ public actor SwiftNativeTurnEngine {
             try Task.checkCancellation()
             throw TurnEngineError.toolCatalogLoadFailed(underlying: error)
         }
-        let snapshot = TurnContextSnapshot(
-            providerPreferences: prefs,
-            toolNames: toolNames,
-            toolSchemas: toolSchemas
-        )
-
         // 6. Assembled system prompt: compiled persona packet (canonical
         //    order, surface guidance baked in) + recall + REM pins rendered
         //    INLINE under a dedicated header (fix 6 — pins pre-emptive).
@@ -825,7 +771,6 @@ public actor SwiftNativeTurnEngine {
             recalled: recalled,
             remPins: remPins,
             budget: turnBudget,
-            includeNaturalExpressionGuidance: naturalExpressionGuidanceEnabled,
             requiredDocuments: Self.stablePrefixRequiredDocuments(preparedContextTurn),
             userMemoryCore: userMemoryCore,
             surfaceGuidance: preparedContextTurn?.kernel.surfaceGuidance ?? ""
@@ -858,10 +803,10 @@ public actor SwiftNativeTurnEngine {
             reasoningEffort: effort,
             providerId: admittedProvider,
             serviceTier: admittedServiceTier,
-            toolsAvailable: snapshot.toolNames,
+            toolsAvailable: toolNames,
             systemPrompt: resolvedSegments.combined,
             userMessage: userMessage,
-            toolSchemas: snapshot.toolSchemas,
+            toolSchemas: toolSchemas,
             systemSegments: resolvedSegments,
             imageBlocks: imageBlocks,
             fluidContextTurn: preparedContextTurn
@@ -909,10 +854,10 @@ public actor SwiftNativeTurnEngine {
         if let contextFlowMemoryAtomCount {
             trace.setMemoryRecallOutcome(.contextFlow(hitCount: contextFlowMemoryAtomCount))
         }
-        trace.setCount("snapshot.providerPrefs", snapshot.providerPreferences.count)
-        trace.setCount("snapshot.toolNames", snapshot.toolNames.count)
-        trace.setCount("snapshot.toolSchemas", snapshot.toolSchemas.count)
-        trace.setCount("snapshot.toolSchemaParameterBytes", snapshot.toolSchemaParameterBytes)
+        trace.setCount("snapshot.providerPrefs", prefs.count)
+        trace.setCount("snapshot.toolNames", toolNames.count)
+        trace.setCount("snapshot.toolSchemas", toolSchemas.count)
+        trace.setCount("snapshot.toolSchemaParameterBytes", toolSchemas.reduce(0) { $0 + $1.parametersJSON.count })
         trace.setCount("persona.docCount", personaMap.count)
         trace.setCount("persona.docChars", personaMap.values.reduce(0) { $0 + $1.count })
         trace.setCount("remPins.count", remPins.count)
@@ -1202,7 +1147,7 @@ public actor SwiftNativeTurnEngine {
         clock: ContextRenderClock = .unstamped
     ) -> String {
         for source in item.untrustedSources ?? [] {
-            PeerDataTaint.markConsumed(peer: source, attested: false)
+            PeerDataTaint.markConsumed(peer: source)
         }
         let kind = item.pointer.kind.rawValue
         let text = item.text
@@ -1624,24 +1569,12 @@ public actor SwiftNativeTurnEngine {
             return
         }
         let toolEvidence = TurnToolEvidenceProjection.project(toolDispatches)
-        let promotionTelemetry: MemoryPromotionTelemetry?
-        if let reportingPromoter = memoryPromoter as? any MemoryPromotionTelemetryReporting {
-            promotionTelemetry = await reportingPromoter.observeTurnWithTelemetry(
-                userMessage: userMessage,
-                assistantMessage: assistantMessage,
-                toolEvidence: toolEvidence,
-                sessionId: sessionId ?? "swift-turn-engine",
-                surface: surface
-            )
-        } else {
-            await memoryPromoter.observeTurn(
-                userMessage: userMessage,
-                assistantMessage: assistantMessage,
-                toolEvidence: toolEvidence,
-                sessionId: sessionId ?? "swift-turn-engine"
-            )
-            promotionTelemetry = nil
-        }
+        let promotionTelemetry = await memoryPromoter.observeTurnWithTelemetry(
+            userMessage: userMessage,
+            assistantMessage: assistantMessage,
+            sessionId: sessionId ?? "swift-turn-engine",
+            surface: surface
+        )
         ContextStageTrace.emitStage(
             name: .memoryPromotion,
             elapsedMs: Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
@@ -1649,28 +1582,28 @@ public actor SwiftNativeTurnEngine {
             counts: [
                 "userMessageChars": Int64(userMessage.count),
                 "assistantMessageChars": Int64(assistantMessage.count),
-                "stagedProposalCount": promotionTelemetry?.stagedProposalCount ?? 0,
-                "extractedCandidateCount": promotionTelemetry?.candidateCount ?? 0,
-                "semanticCandidateCount": promotionTelemetry?.semanticCandidateCount ?? 0,
+                "stagedProposalCount": promotionTelemetry.stagedProposalCount,
+                "extractedCandidateCount": promotionTelemetry.candidateCount,
+                "semanticCandidateCount": promotionTelemetry.semanticCandidateCount,
                 "toolEvidenceLineCount": Int64(toolEvidence.count),
                 "toolDispatchCount": Int64(toolDispatches.count),
-                "savedCorrectionCount": Int64(promotionTelemetry?.savedCorrectionCount ?? 0),
-                "pendingCorrectionCount": Int64(promotionTelemetry?.pendingCorrectionCount ?? 0),
-                "failedCorrectionCount": Int64(promotionTelemetry?.failedCorrectionCount ?? 0),
+                "savedCorrectionCount": Int64(promotionTelemetry.savedCorrectionCount),
+                "pendingCorrectionCount": Int64(promotionTelemetry.pendingCorrectionCount),
+                "failedCorrectionCount": Int64(promotionTelemetry.failedCorrectionCount),
             ],
             flags: [
                 "configured": true,
-                "outcomeReported": promotionTelemetry != nil,
+                "outcomeReported": true,
             ],
             labels: [
-                "semanticExtraction": promotionTelemetry?.semanticStatus.rawValue ?? "unreported",
-                "interpretationFailure": promotionTelemetry?.interpretationFailure?.rawValue ?? "none",
-                "momentOutcome": promotionTelemetry?.momentOutcome ?? "unreported",
-                "noveltySkip": promotionTelemetry?.noveltySkipReason ?? "ran",
-                "failureReason": promotionTelemetry?.failure?.reason.rawValue ?? "none",
-                "recoveryAction": promotionTelemetry?.failure?.recovery ?? "none",
-                "memoryModel": promotionTelemetry?.failure?.model ?? "unreported",
-                "memorySurface": promotionTelemetry?.failure?.surface ?? "unreported",
+                "semanticExtraction": promotionTelemetry.semanticStatus.rawValue,
+                "interpretationFailure": promotionTelemetry.interpretationFailure?.rawValue ?? "none",
+                "momentOutcome": promotionTelemetry.momentOutcome,
+                "noveltySkip": promotionTelemetry.noveltySkipReason ?? "ran",
+                "failureReason": promotionTelemetry.failure?.reason.rawValue ?? "none",
+                "recoveryAction": promotionTelemetry.failure?.recovery ?? "none",
+                "memoryModel": promotionTelemetry.failure?.model ?? "unreported",
+                "memorySurface": promotionTelemetry.failure?.surface ?? "unreported",
             ]
         )
     }
@@ -1729,7 +1662,7 @@ public actor SwiftNativeTurnEngine {
             elsewhereRead = (dataRoot, sessionID, surface, peer)
         }
         // Her screen's glance (Phase 2): what changed since she last looked
-        // and what needs her, one line, only when either. Dynamic segment,
+        // and what needs her, plus live built/recent abilities. Dynamic segment,
         // never the cached prefix; helpers' own sessions do not get hers.
         let glanceRead = remPinsDataRoot.flatMap { root in sessionID.flatMap { $0.hasPrefix("bot-") ? nil : (root, $0) } }
         // Both reads start now, side by side, and each lands in its place below.
@@ -1870,10 +1803,8 @@ public actor SwiftNativeTurnEngine {
     static let momentNudgeSessionCap = 64
 
     func momentReviewNudge(sessionID: String?) async -> String? {
-        guard let reporter = memoryPromoter as? any MomentReviewQueueReporting else {
-            return nil
-        }
-        let count = await reporter.pendingMomentCount()
+        guard let memoryPromoter else { return nil }
+        let count = await memoryPromoter.pendingMomentCount()
         let key = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionKey = (key?.isEmpty == false) ? key! : "swift-turn-engine"
         var state = momentNudgeState[sessionKey] ?? (lastCount: -1, turnsSinceRender: Self.momentNudgeRefreshTurns)
@@ -1906,13 +1837,13 @@ public actor SwiftNativeTurnEngine {
         let providerName = (provider?.isEmpty == false)
             ? provider!
             : (router.inferProviderForModel(model) ?? "unknown")
-        // Names only, from canonical connected state, without a lock or probe.
-        var connectedAgents: [String] = []
+        // Saved contacts with reachability and trust shown independently.
+        var savedContacts: [String] = []
         var rosterIssue: String?
         if let dataRoot = remPinsDataRoot {
-            do { connectedAgents = try AgentPeerStore(dataRoot: dataRoot).connectedNames() }
+            do { savedContacts = try AgentPeerStore(dataRoot: dataRoot).contactSummaries() }
             catch {
-                rosterIssue = "Connected agents could not be read. Open app {page:\"agents\"} to inspect the connection storage error before relying on a connection."
+                rosterIssue = "Saved contacts could not be read. Open app {page:\"agents\"} to inspect the contact storage error before relying on a contact."
             }
         }
         // The app's Simple | Advanced switch (SimpleViewMode.swift). Only the
@@ -1924,7 +1855,7 @@ public actor SwiftNativeTurnEngine {
             surface: surfaceName,
             provider: providerName,
             model: model,
-            connectedAgents: connectedAgents,
+            savedContacts: savedContacts,
             viewMode: viewMode
         )
         return rosterIssue.map { runtime + "\n" + $0 } ?? runtime
@@ -1979,7 +1910,7 @@ public actor SwiftNativeTurnEngine {
     ) -> [(hit: MemoryRecallHit, line: String)] {
         guard !recalled.isEmpty else { return [] }
         let resolved = budget ?? ContextBudgetPolicy.resolve(
-            windowTokens: nil, surface: "chat"
+            windowTokens: nil
         )
         var used = 0
         var rows: [(hit: MemoryRecallHit, line: String)] = []
@@ -2200,7 +2131,6 @@ public actor SwiftNativeTurnEngine {
         recalled: [MemoryRecallHit],
         remPins: [REMPin],
         budget: ContextBudgetPolicy.Resolved? = nil,
-        includeNaturalExpressionGuidance: Bool = true,
         requiredDocuments: [RequiredDocument] = [],
         userMemoryCore: [String]? = nil,
         surfaceGuidance: String = ""
@@ -2220,15 +2150,13 @@ public actor SwiftNativeTurnEngine {
         if !body.isEmpty {
             stableLines.append(body)
         }
-        if includeNaturalExpressionGuidance {
-            // Phase 5A: the first-run invitation rules are for an agent that
-            // does not know its person yet. Once a pinned USER core exists
-            // they are generic onboarding, not hers.
-            let established = !(userMemoryCore ?? []).isEmpty
-            stableLines.append(established
-                ? NaturalExpressionGuidance.baseline
-                : NaturalExpressionGuidance.baseline + "\n" + NaturalExpressionGuidance.onboarding)
-        }
+        // Phase 5A: the first-run invitation rules are for an agent that
+        // does not know its person yet. Once a pinned USER core exists
+        // they are generic onboarding, not hers.
+        let established = !(userMemoryCore ?? []).isEmpty
+        stableLines.append(established
+            ? NaturalExpressionGuidance.baseline
+            : NaturalExpressionGuidance.baseline + "\n" + NaturalExpressionGuidance.onboarding)
         // Fix 6: pins rendered FIRST, under a dedicated authority header.
         // Phase 5A: a pin already in the prompt verbatim (REM appends every
         // approved lesson to GROWTH, so all of them are) is not injected twice.
@@ -2288,29 +2216,10 @@ public actor SwiftNativeTurnEngine {
                 : existing + "\n\n" + trimmed
         }
 
-        return TurnContext(
-            surface: context.surface,
-            personaID: context.personaID,
-            personaDocs: context.personaDocs,
-            personaFingerprint: context.personaFingerprint,
-            recalled: context.recalled,
-            modelId: context.modelId,
-            reasoningEffort: context.reasoningEffort,
-            providerId: context.providerId,
-            serviceTier: context.serviceTier,
-            toolsAvailable: context.toolsAvailable,
-            systemPrompt: systemPrompt,
-            userMessage: context.userMessage,
-            toolSchemas: context.toolSchemas,
-            systemSegments: segments,
-            imageBlocks: context.imageBlocks,
-            fluidContextTurn: context.fluidContextTurn,
-            naturalExpressionCue: context.naturalExpressionCue,
-            historyMessages: context.historyMessages,
-            turnVolatileBlock: context.turnVolatileBlock,
-            historyWindowReceipt: context.historyWindowReceipt,
-            preparationMs: context.preparationMs
-        )
+        var copy = context
+        copy.systemPrompt = systemPrompt
+        copy.systemSegments = segments
+        return copy
     }
 
     /// ONE line, human wall-clock, in the DYNAMIC segment (it changes every
@@ -2344,7 +2253,7 @@ public actor SwiftNativeTurnEngine {
         surface: String,
         provider: String,
         model: String,
-        connectedAgents: [String] = [],
+        savedContacts: [String] = [],
         viewMode: String? = nil
     ) -> String {
         var line = "Current runtime: surface=\(surface); provider=\(provider); model=\(model). If asked what model or provider you are using, answer from Current runtime; do not guess."
@@ -2355,9 +2264,8 @@ public actor SwiftNativeTurnEngine {
             line += " For setup a person must do, raise app card.request (request_interaction where that is your tool) rather than sending them to a page."
         default: break
         }
-        guard !connectedAgents.isEmpty else { return line }
-        let more = connectedAgents.count > 12 ? " (+\(connectedAgents.count - 12) more)" : ""
-        return line + "\nConnected agents: " + connectedAgents.prefix(12).joined(separator: ", ") + more + "."
+        guard !savedContacts.isEmpty else { return line }
+        return line + "\nSaved contacts: " + savedContacts.joined(separator: ", ") + "."
     }
 
     /// "Tuesday, August 11, 2026 at 9:29 AM CDT" — weekday and AM/PM spelled

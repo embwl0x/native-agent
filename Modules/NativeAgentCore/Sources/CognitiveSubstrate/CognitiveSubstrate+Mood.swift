@@ -123,8 +123,6 @@ extension CognitiveSubstrate {
 
     /// Mood only colors her phrasing when it is genuinely STRONG…
     static let moodPhrasingValenceThreshold: Double = 0.3
-    /// …and backed by at least this many recent felt nodes (a single node isn't a mood).
-    static let moodPhrasingMinBasis: Int = 2
 
     /// Felt-day dream summary (see `feltDaySummary`): how many of the day's
     /// strongest-felt nodes to name, the char ceiling on the whole summary, and
@@ -159,17 +157,22 @@ extension CognitiveSubstrate {
     /// When affect is disabled the whole construct is off: mood derives from affect, so
     /// there is no mood without it — returns neutral, keeping the affect-off path
     /// byte-identical to pre-Wave-C behavior.
-    func derivedMood(at now: Date) -> CognitiveMoodReading {
-        guard configuration.enabled, configuration.affectEnabled else {
+    func derivedMood(
+        at now: Date,
+        dynamics capturedDynamics: PersonalityDynamicsConfiguration? = nil,
+        affect capturedAffect: CognitiveAffectState? = nil
+    ) -> CognitiveMoodReading {
+        guard configuration.enabled else {
             return CognitiveMoodReading(valence: 0, basis: 0)
         }
 
-        let currentAffect = projectedAffect(at: now)
-        let affectProxy = Self.clampSigned(
+        let dyn = capturedDynamics ?? dynamics
+        let currentAffect = capturedAffect ?? projectedAffect(at: now, dynamics: dyn)
+        let affectProxy = (
             currentAffect.socialWarmth
                 - 0.5 * currentAffect.uncertainty
                 - 0.3 * currentAffect.taskPressure
-        )
+        ).clampedSigned()
 
         let nodes = field.peekNodes()
         var weightedSum = 0.0
@@ -183,7 +186,7 @@ extension CognitiveSubstrate {
             ) != nil else { continue }
             let age = now.timeIntervalSince(node.lastActivatedAt)
             guard age >= 0, age <= Self.moodActivationWindow else { continue }
-            let weight = pow(0.5, age / dynamics.moodRecencyHalfLife)
+            let weight = pow(0.5, age / dyn.moodRecencyHalfLife)
             weightedSum += weight * node.emotionalValence
             weightTotal += weight
             basis += 1
@@ -192,23 +195,26 @@ extension CognitiveSubstrate {
         // The slow undertone: what her reflections have CONCLUDED lately, decayed to
         // now. Zero when no reflection has moved it → both paths byte-identical to
         // the pre-disposition behavior.
-        let undertone = Self.dispositionMoodWeight * decayedDispositionValence(at: now)
+        let undertone = Self.dispositionMoodWeight * decayedDispositionValence(at: now, dynamics: dyn)
 
         guard basis > 0, weightTotal > 0 else {
-            return CognitiveMoodReading(valence: Self.clampSigned(affectProxy + undertone), basis: 0)
+            return CognitiveMoodReading(valence: (affectProxy + undertone).clampedSigned(), basis: 0)
         }
         let tagIntegral = weightedSum / weightTotal
         let blended = Self.moodTagBlendWeight * tagIntegral + Self.moodAffectBlendWeight * affectProxy
-        return CognitiveMoodReading(valence: Self.clampSigned(blended + undertone), basis: basis)
+        return CognitiveMoodReading(valence: (blended + undertone).clampedSigned(), basis: basis)
     }
 
     // MARK: - Disposition mechanics
 
     /// The disposition's valence decayed to `now` — pure, no mutation.
-    func decayedDispositionValence(at now: Date) -> Double {
+    func decayedDispositionValence(
+        at now: Date,
+        dynamics capturedDynamics: PersonalityDynamicsConfiguration? = nil
+    ) -> Double {
         let elapsed = max(0, now.timeIntervalSince(disposition.updatedAt))
         guard elapsed > 0 else { return disposition.valence }
-        return disposition.valence * pow(0.5, elapsed / dynamics.dispositionHalfLife)
+        return disposition.valence * pow(0.5, elapsed / (capturedDynamics ?? dynamics).dispositionHalfLife)
     }
 
     /// The SIGNED felt tone of a considered outcome — the ONE lexicon shared by every
@@ -351,7 +357,7 @@ extension CognitiveSubstrate {
         // dream. A view User settled is his, and is never recorded.
         undoable: Bool = false
     ) async -> Bool {
-        guard configuration.enabled, configuration.affectEnabled, tone != 0 else { return true }
+        guard configuration.enabled, tone != 0 else { return true }
         let previousDisposition = disposition
         let previousDreamNight = dreamDispositionNight
         let previousTransitions = dispositionTransitions
@@ -592,7 +598,7 @@ extension CognitiveSubstrate {
     /// `integrateDreamDisposition`. Nothing to mint counts as durable.
     @discardableResult
     func mintDreamResidue(tone: Double, at now: Date, dreamId: String? = nil) async -> Bool {
-        guard configuration.enabled, configuration.affectEnabled, tone != 0 else {
+        guard configuration.enabled, tone != 0 else {
             // A dream that felt like nothing leaves nothing. Silence is honest.
             return true
         }
@@ -812,7 +818,7 @@ extension CognitiveSubstrate {
     /// stays in `journal.jsonl`, the record of it. Naming an entry the same way
     /// on both surfaces is also what lets the chain be walked by hand.
     public func feltDaySummary(at now: Date) async -> String? {
-        guard configuration.enabled, configuration.affectEnabled else { return nil }
+        guard configuration.enabled else { return nil }
 
         // The last-24h felt nodes — the same population derivedMood integrates over.
         // peekNodes is the non-mutating read (routing a read through snapshot would
@@ -931,9 +937,6 @@ extension CognitiveSubstrate {
         let moments = feltCount == 1 ? "1 felt moment" : "\(feltCount) felt moments"
         return "\(band) — from \(moments)."
     }
-
-    /// Clamp to the signed −1…1 range (the substrate's shared `clamp` is [0,1]).
-    static func clampSigned(_ value: Double) -> Double { (value).clampedSigned() }
 }
 
 extension CognitiveSubstrate {
@@ -980,10 +983,6 @@ extension CognitiveSubstrate {
             )
         }
     }
-
-    /// Diagnostic read of the night's residue — used by the purity test to
-    /// prove that reading the lean did NOT clear a stale residue.
-    func dreamResidueSnapshotForTesting() -> CognitiveDreamResidue? { dreamResidue }
 
     func dreamResidueArtifactPayload(at now: Date) -> JSONValue {
         var object: [String: JSONValue] = [

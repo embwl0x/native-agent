@@ -47,7 +47,7 @@ public struct KnowledgeGraphNeighborhood: Sendable {
     public var neighbors: [String: KnowledgeGraphEntity]
 }
 
-public extension KnowledgeGraphReader {
+public extension SwiftNativeKnowledgeGraphReader {
     func entityPageChecked(page: Int) async throws -> KnowledgeGraphEntityPage {
         guard case .object(let envelope) = try await allEntitiesChecked(page: page),
               case .array(let rawEntities)? = envelope["entities"] else {

@@ -54,14 +54,6 @@ public enum TelegramMediaDownloadError: Error, Equatable {
     case malformedResponse
 }
 
-public protocol TelegramMediaDownloading: Sendable {
-    func download(
-        token: String,
-        attachment: TelegramMediaAttachment,
-        maxBytes: Int
-    ) async throws -> TelegramMediaAttachment
-}
-
 // MARK: - TelegramMediaDownloader
 
 /// Two-stage media downloader:
@@ -108,7 +100,7 @@ public actor TelegramMediaDownloader {
         maxBytes: Int
     ) async throws -> TelegramMediaAttachment {
         // --- Stage 1: getFile ---
-        let encodedToken = _tgPctEncode(token)
+        let encodedToken = _tgEncodeBotToken(token)
         var comps1 = URLComponents()
         comps1.scheme = "https"
         comps1.host = "api.telegram.org"
@@ -188,14 +180,4 @@ public actor TelegramMediaDownloader {
             captureFilename: filename.isEmpty ? nil : filename
         )
     }
-
-    // MARK: - private helpers
-
-    private func _tgPctEncode(_ token: String) -> String {
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "-._~")
-        return token.addingPercentEncoding(withAllowedCharacters: allowed) ?? token
-    }
 }
-
-extension TelegramMediaDownloader: TelegramMediaDownloading {}

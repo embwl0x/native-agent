@@ -18,10 +18,6 @@ private let repoMarkerFiles: [String] = [
 ///   - a bundle carrying a REPO_PATH stamp (every dev install): `<stamp>/data`,
 ///     whether or not it exists; launch names what is missing.
 ///   - anything else, the public release among them: Application Support.
-///
-/// The internal resolver also receives bundle identity as a value, so its
-/// public-app branch is executable without mutating process-global
-/// `Bundle.main` state.
 private let processDataRoot = ResolvedDataRootCache()
 
 /// The process default is stable. Explicit resolver arguments below deliberately
@@ -50,37 +46,13 @@ public func defaultDataRoot(
 ) -> URL {
     resolveDefaultDataRoot(
         fileManager: fileManager,
-        environment: environment,
-        bundleContext: .main
+        environment: environment
     )
 }
 
-/// The bundle identity consulted by the canonical data-root resolver. Keeping
-/// this as a value rather than reaching for `Bundle.main` inside a branch makes
-/// the installed-public-app boundary executable without changing the runtime
-/// path: production always supplies `.main` above.
-internal struct DefaultDataRootBundleContext: Sendable {
-    let bundleURL: URL
-    let resourcesURL: URL?
-
-    static var main: Self {
-        Self(bundleURL: Bundle.main.bundleURL, resourcesURL: Bundle.main.resourceURL)
-    }
-
-    init(bundleURL: URL, resourcesURL: URL?) {
-        self.bundleURL = bundleURL
-        self.resourcesURL = resourcesURL
-    }
-}
-
-/// Internal resolver seam for the process-global public entry point above.
-/// `fallbackRoot` exists only so the executable contract can prove where a
-/// first write lands without touching a developer's real Application Support.
 internal func resolveDefaultDataRoot(
     fileManager: FileManager = .default,
-    environment: [String: String] = ProcessInfo.processInfo.environment,
-    bundleContext: DefaultDataRootBundleContext = .main,
-    fallbackRoot: URL? = nil
+    environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> URL {
     // 1. Env var wins. Empty string is treated as unset (matches Python:
     //    `if env: return Path(env)` — Python treats "" as falsy). The env
@@ -107,16 +79,13 @@ internal func resolveDefaultDataRoot(
     }
 
     // 2. Dev bundle: the checkout its REPO_PATH stamp names.
-    if let repo = _repoPathStampTarget(
-        fileManager: fileManager,
-        bundleContext: bundleContext
-    ) {
+    if let repo = _repoPathStampTarget(fileManager: fileManager) {
         return repo.appendingPathComponent("data", isDirectory: true)
     }
 
     // 3. Everything else, the public release among them (bare — no /data
     //    suffix, no dir creation).
-    return fallbackRoot ?? libraryAppSupportFallback(fileManager: fileManager)
+    return libraryAppSupportFallback(fileManager: fileManager)
 }
 
 /// The Swift-native persona root, decided by the data root alone: a
@@ -219,15 +188,14 @@ func appSupportFolderName(for bundleIdentifier: String?) -> String {
 /// unreadable), or nil when the bundle carries none (public release, test
 /// runner, command-line tool).
 private func _repoPathStampFile(
-    fileManager: FileManager,
-    bundleContext: DefaultDataRootBundleContext = .main
+    fileManager: FileManager
 ) -> (file: URL, text: String)? {
     var bases: [URL] = []
-    if let res = bundleContext.resourcesURL { bases.append(res) }
-    bases.append(bundleContext.bundleURL
+    if let res = Bundle.main.resourceURL { bases.append(res) }
+    bases.append(Bundle.main.bundleURL
         .appendingPathComponent("Contents", isDirectory: true)
         .appendingPathComponent("Resources", isDirectory: true))
-    bases.append(bundleContext.bundleURL)
+    bases.append(Bundle.main.bundleURL)
     for base in bases {
         let stamp = base.appendingPathComponent("REPO_PATH")
         guard fileManager.fileExists(atPath: stamp.path) else { continue }
@@ -241,10 +209,9 @@ private func _repoPathStampFile(
 /// whether or not it is a valid checkout — launch says so when it is not. An
 /// empty stamp names `/`.
 private func _repoPathStampTarget(
-    fileManager: FileManager,
-    bundleContext: DefaultDataRootBundleContext = .main
+    fileManager: FileManager
 ) -> URL? {
-    guard let stamp = _repoPathStampFile(fileManager: fileManager, bundleContext: bundleContext) else {
+    guard let stamp = _repoPathStampFile(fileManager: fileManager) else {
         return nil
     }
     return URL(fileURLWithPath: stamp.text.isEmpty ? "/" : stamp.text).resolvingSymlinksInPath()

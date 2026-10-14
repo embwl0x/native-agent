@@ -50,11 +50,6 @@ public enum NADeviceRole: String, Sendable, Codable, CaseIterable {
     case mac
     case ios
 
-    /// The direction of a message this role SENDS.
-    public var outboundDirection: NAChatDirection {
-        self == .mac ? .mac2ios : .ios2mac
-    }
-
     /// The direction of a message this role RECEIVES.
     public var inboundDirection: NAChatDirection {
         self == .mac ? .ios2mac : .mac2ios
@@ -347,15 +342,6 @@ public enum DeviceSyncError: Error, LocalizedError, Sendable {
         case .underlying(let m): return "device sync error: \(m)"
         }
     }
-
-    /// True iff this is the `.notConfigured` case — the crash-guard signal that
-    /// the CloudKit entitlement is absent and no `CKContainer` was touched.
-    /// (Enum has associated values so it isn't auto-Equatable; this is the
-    /// precise-match helper the crash-guard tests assert on.)
-    public var isNotConfigured: Bool {
-        if case .notConfigured = self { return true }
-        return false
-    }
 }
 
 // MARK: - The seam
@@ -380,6 +366,8 @@ public protocol DeviceSyncTransport: Sendable {
     /// Push one chat message to the other device. Mirrors
     /// `iCloudBridge.sendChatMessage`.
     func send(_ message: BridgeMessage) async throws
+    /// Commit the route's dispatch journal only after local preparation succeeds.
+    func send(_ message: BridgeMessage, beforeDispatch: @Sendable () async throws -> Void) async throws
 
     /// Register the single forwarder for messages arriving FROM the other
     /// device. Mirrors `iCloudBridge.observeIncomingMessages`. Idempotent —
@@ -409,22 +397,17 @@ public protocol DeviceSyncTransport: Sendable {
     /// works. The unacknowledged form above claims the record's modification
     /// date BEFORE the handler runs, so a snapshot the phone failed to store
     /// was never redelivered.
-    ///
-    /// Defaulted onto the unacknowledged form so a transport that cannot tell
-    /// keeps today's behaviour.
     func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async
     func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async
 
     /// iCloud account availability: "available" | "noAccount" | "restricted" |
-    /// "temporarilyUnavailable" | "unknown". Defaulted for transports (KVS)
-    /// that don't model an account.
+    /// "temporarilyUnavailable" | "unknown".
     func accountStatus() async -> String
 
     /// Pull any pending inbound messages NOW and dispatch to the `observeIncoming`
     /// handler; distinguishes success, failure and skipped work. The wakeup for a pull-based
     /// transport (CloudKit) — called after a late handler registration and on an
-    /// APNs silent push (CK-3c). Push-driven transports (a future KVS impl) can
-    /// no-op via the default. Idempotent per message id.
+    /// APNs silent push (CK-3c). Idempotent per message id.
     @discardableResult
     func drainIncoming() async -> DeviceSyncDrainResult
 
@@ -434,8 +417,7 @@ public protocol DeviceSyncTransport: Sendable {
 
     /// 2026-09-06: read the peer's published pairing secret WITHOUT applying it
     /// — the material a manually pasted recovery key is verified against on a
-    /// build whose only pairing channel is this transport. Transports with no
-    /// readable pairing record return nil via the default.
+    /// build whose only pairing channel is this transport.
     func peekPairingSecret() async -> Data?
 
     /// Rewrite the Mac's presence record (`NAMacPresence`). Never pushed.
@@ -452,54 +434,9 @@ public protocol DeviceSyncTransport: Sendable {
     /// return how many went. Nothing else ever deletes a chat/notification
     /// record, so without this the store grows for the life of the account.
     /// Only the always-on Mac owner calls (and performs) this; the phone never
-    /// deletes. Transports with no server-side store no-op via the default.
+    /// deletes.
     @discardableResult
     func sweepExpiredRecords() async -> Int
-}
-
-public extension DeviceSyncTransport {
-    func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async {
-        await observeStatus(key: key, onApply: { value in
-            await onApply(value, nil)
-        })
-    }
-
-    var presentsVisualNotifications: Bool { false }
-    func ensurePushSubscriptions() async -> Bool { presentsVisualNotifications }
-
-    func accountStatus() async -> String { "available" }
-
-    /// 2026-09-06: the adapter of last resort, and it says so. A transport that
-    /// implements only the unacknowledged form has ALREADY claimed the peer's
-    /// record before the handler runs, so a `false` here cannot be honoured by
-    /// redelivery — the one thing this default can still do is refuse to hide
-    /// it. `_ = await onApply(value)` dropped the answer on the floor, so a
-    /// snapshot the peer failed to store looked exactly like one it stored.
-    /// Every transport whose records are claimed on delivery implements this
-    /// method itself (CloudKit does); inheriting this default is a conformer
-    /// saying it has no redelivery to offer.
-    func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async {
-        await observeStatus(key: key) { value in
-            guard await onApply(value) else {
-                nativeLog(
-                    "[device-sync] status %@ was NOT applied and this transport cannot redeliver it — the value is lost",
-                    key
-                )
-                return
-            }
-        }
-    }
-
-    // Default no-ops: a push-driven transport that delivers via observe* alone
-    // (e.g. a future KVS/ubiquity impl) needs no explicit pull. The CloudKit
-    // transport and the mock override these with real pulls.
-    @discardableResult func drainIncoming() async -> DeviceSyncDrainResult { .skipped(0) }
-    @discardableResult func drainPairing() async -> Bool { false }
-    func peekPairingSecret() async -> Data? { nil }
-    @discardableResult func drainStatus() async -> Int { 0 }
-    func setPresence(pairingSecret: Data) async throws {}
-    func peerPresence(pairingSecret: Data) async -> Date? { nil }
-    @discardableResult func sweepExpiredRecords() async -> Int { 0 }
 }
 
 // MARK: - Build/runtime flag + resolver (deliverable 4)
@@ -539,22 +476,5 @@ public enum DeviceSyncTransportResolver {
         case "kvs", "", nil: return .kvs
         default: return .kvs
         }
-    }
-
-    /// Whether the device bridge has a usable transport after startup.
-    ///
-    /// CloudKit and iCloud Drive are separate iCloud services. Public
-    /// Developer ID/App Store builds may be provisioned for CloudKit without a
-    /// mounted ubiquity Documents container, while personal builds continue to
-    /// use KVS/Drive. A bridge is therefore usable when either its checked
-    /// CloudKit transport exists or the legacy ubiquity container exists.
-    ///
-    /// This value owns no transport and grants no entitlement authority; the
-    /// CloudKit crash guard remains `makeCloudKitTransport`.
-    public static func bridgeCanStart(
-        cloudKitTransportActive: Bool,
-        ubiquityContainerAvailable: Bool
-    ) -> Bool {
-        cloudKitTransportActive || ubiquityContainerAvailable
     }
 }

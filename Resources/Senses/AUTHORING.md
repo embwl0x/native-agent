@@ -7,6 +7,13 @@ their small format entry points; lib/ holds the shared readers. assemble.sh
 concatenates these authoring sources into the runnable builtin/ entries.
 
 Define read(request). Read real material with sense.source.read(address?).
+For app scripting reads, declare bundle ids with sense.make's apps list.
+Use sense.apps.read({bundle_id, dictionary:true}) for the scripting dictionary,
+or {bundle_id,event_class,event_id,parameters} for a read-only Apple Event.
+Only standard core getd/cnte/doex events classify as reads. Parameters use
+four-character keys and plain JSON, lists, {type}, {enum}, {record}, or
+{object:{want,form,seld,from}} descriptors. Reads never prompt for Automation;
+permission cards use target applescript:<bundle_id> and require the owner's tap.
 File material has kind, path, bytes and data (Uint8Array). Accessibility
 material has kind and tree. Publish exactly one page with sense.publish:
 address, title, text, things, folded and optional more. Each thing has name,

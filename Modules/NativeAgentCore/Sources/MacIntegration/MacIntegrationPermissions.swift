@@ -1,4 +1,12 @@
 import Foundation
+import NativeAgentShared
+import Speech
+import AVFoundation
+import ApplicationServices
+import CoreGraphics
+import EventKit
+import Contacts
+import OSLog
 import PersistenceCore
 
 // MARK: - Mac Integration permissions
@@ -101,6 +109,51 @@ public enum MacIntegrationPermissionStoreError: Error, Sendable, Equatable, Loca
         }
     }
 }
+
+public enum MacIntegrationFrameworkPermission: String, CaseIterable {
+    case calendar
+    case reminders
+    case contacts
+    // Speech Recognition and Microphone share the framework-row grant path,
+    // so failure copy must name them as specifically as Calendar et al.
+    case speechRecognition = "speech_recognition"
+    case microphone
+
+    public var label: String {
+        switch self {
+        case .speechRecognition: return "Speech Recognition"
+        case .microphone: return "Microphone"
+        default: return rawValue.capitalized
+        }
+    }
+
+    public var purpose: String {
+        switch self {
+        case .speechRecognition: return "Turn voice messages and dictation into text."
+        case .microphone: return "Record your voice when you use the microphone."
+        case .calendar: return "Read and manage events in Mac Calendar."
+        case .reminders: return "Read and manage your reminders."
+        case .contacts: return "Find people in your address book."
+        }
+    }
+
+    /// Single source of truth for the pane anchors: the shared capability
+    /// vocabulary, not a second hand-maintained copy.
+    public var capability: SystemPermissionCapability {
+        switch self {
+        case .calendar: return .calendars
+        case .reminders: return .reminders
+        case .contacts: return .contacts
+        case .speechRecognition: return .speechRecognition
+        case .microphone: return .microphone
+        }
+    }
+
+    public var settingsAnchor: String {
+        capability.settingsAnchor ?? "Privacy_AllFiles"
+    }
+}
+
 
 // MARK: - Stable identifiers
 
@@ -220,6 +273,18 @@ public enum MacIntegrationID {
 public actor MacIntegrationPermissionStore {
     public static let shared = MacIntegrationPermissionStore()
 
+    public struct Snapshot: Sendable {
+        public let permissions: [String: MacIntegrationPermission]
+        public let readiness: MacIntegrationPermissionReadiness
+
+        public func allows(_ integrationId: String, mode: MacIntegrationPermissionMode, fullMacAdmitted: Bool = false) -> Bool {
+            guard let permission = permissions[integrationId],
+                  (mode == .read ? MacIntegrationID.supportsRead(integrationId) : MacIntegrationID.supportsWrite(integrationId)),
+                  !(mode == .read ? readiness.operatorReadOff : readiness.operatorWriteOff).contains(integrationId) else { return false }
+            return fullMacAdmitted || (mode == .read ? permission.read : permission.write)
+        }
+    }
+
     private let persistence: SwiftNativePersistenceCore
     private let dataRoot: URL
 
@@ -248,33 +313,33 @@ public actor MacIntegrationPermissionStore {
     /// One checked read for environment presentation; no migration write,
     /// permission request, OS probe, or authority change is performed here.
     public func readinessChecked() async throws -> MacIntegrationPermissionReadiness {
-        let raw = try Self.loadRawStoreChecked(at: storePath)
-        let overrides = Self.operatorOverrides(in: raw)
-        return MacIntegrationPermissionReadiness(
-            operatorReadOff: Set(overrides.compactMap { $0.value["read"] == false ? $0.key : nil }),
-            operatorWriteOff: Set(overrides.compactMap { $0.value["write"] == false ? $0.key : nil }))
+        try await snapshotChecked().readiness
     }
 
     /// Returns the current effective permission map: stored values merged on
     /// top of defaults for any unset key. Every entry in
     /// `MacIntegrationID.all` is present in the returned dict.
     public func currentChecked() async throws -> [String: MacIntegrationPermission] {
-        let stored = try loadStoredChecked()
+        try await snapshotChecked().permissions
+    }
+
+    public func snapshotChecked() async throws -> Snapshot {
+        let raw = try Self.loadRawStoreChecked(at: storePath)
+        let overrides = Self.operatorOverrides(in: raw)
         var out: [String: MacIntegrationPermission] = [:]
         out.reserveCapacity(MacIntegrationID.all.count)
         for id in MacIntegrationID.all {
-            let def = MacIntegrationID.defaultPermission(for: id)
-            if let s = stored[id] {
-                // Clamp stored values to axis support so a corrupted file
-                // that put a `true` on an unsupported axis can't grant access.
-                let r = MacIntegrationID.supportsRead(id) ? s.read : false
-                let w = MacIntegrationID.supportsWrite(id) ? s.write : false
-                out[id] = MacIntegrationPermission(read: r, write: w)
-            } else {
-                out[id] = def
+            var permission = MacIntegrationID.defaultPermission(for: id)
+            if case .object(let entry)? = raw[id] {
+                permission = MacIntegrationPermission(read: entry["read"] == .bool(true), write: entry["write"] == .bool(true))
             }
+            permission.read = MacIntegrationID.supportsRead(id) && permission.read && overrides[id]?["read"] != false
+            permission.write = MacIntegrationID.supportsWrite(id) && permission.write && overrides[id]?["write"] != false
+            out[id] = permission
         }
-        return out
+        return Snapshot(permissions: out, readiness: MacIntegrationPermissionReadiness(
+            operatorReadOff: Set(overrides.compactMap { $0.value["read"] == false ? $0.key : nil }),
+            operatorWriteOff: Set(overrides.compactMap { $0.value["write"] == false ? $0.key : nil })))
     }
 
     /// Compatibility projection for nonthrowing status callers. Existing
@@ -295,33 +360,10 @@ public actor MacIntegrationPermissionStore {
     /// Unsupported axes (e.g. `read` on `notify_mac`) ALWAYS return
     /// false — there is no concept to grant.
     public func allows(_ integrationId: String, mode: MacIntegrationPermissionMode, fullMacAdmitted: Bool = false) async -> Bool {
-        // Unknown integration → deny. (Stops a typo'd id from accidentally
-        // matching the "default to ON" branch.)
-        guard MacIntegrationID.all.contains(integrationId) else { return false }
-        switch mode {
-        case .read:
-            if !MacIntegrationID.supportsRead(integrationId) { return false }
-        case .write:
-            if !MacIntegrationID.supportsWrite(integrationId) { return false }
-        }
-        let stored: [String: MacIntegrationPermission]
         do {
-            let raw = try Self.loadRawStoreChecked(at: storePath)
-            if Self.operatorOverrides(in: raw)[integrationId]?[mode.rawValue] == false {
-                return false
-            }
-            stored = Self.permissions(in: raw)
+            return try await snapshotChecked().allows(integrationId, mode: mode, fullMacAdmitted: fullMacAdmitted)
         } catch {
             return false
-        }
-        // Admission is evaluated by TrustCenter for the actual tool origin.
-        // Full Mac covers untouched defaults, never an operator revocation,
-        // unreadable authority or an unsupported operation.
-        if fullMacAdmitted { return true }
-        let perm = stored[integrationId] ?? MacIntegrationID.defaultPermission(for: integrationId)
-        switch mode {
-        case .read:  return perm.read
-        case .write: return perm.write
         }
     }
 
@@ -663,37 +705,6 @@ public actor MacIntegrationPermissionStore {
         return dict
     }
 
-    private func loadStoredChecked() throws -> [String: MacIntegrationPermission] {
-        Self.permissions(in: try Self.loadRawStoreChecked(at: storePath))
-    }
-
-    private nonisolated static func permissions(in dict: [String: JSONValue]) -> [String: MacIntegrationPermission] {
-        let overrides = operatorOverrides(in: dict)
-        var out: [String: MacIntegrationPermission] = [:]
-        out.reserveCapacity(dict.count)
-        for (id, val) in dict {
-            guard MacIntegrationID.all.contains(id), case .object(let entry) = val else {
-                continue
-            }
-            var r = false
-            var w = false
-            if case .bool(let b) = entry["read"] ?? .null { r = b }
-            if case .bool(let b) = entry["write"] ?? .null { w = b }
-            if overrides[id]?["read"] == false { r = false }
-            if overrides[id]?["write"] == false { w = false }
-            out[id] = MacIntegrationPermission(read: r, write: w)
-        }
-        // A revocation remains authoritative even if an older client omitted
-        // the ordinary axis entry while preserving this metadata.
-        for (id, axes) in overrides where out[id] == nil {
-            var permission = MacIntegrationID.defaultPermission(for: id)
-            if axes["read"] == false { permission.read = false }
-            if axes["write"] == false { permission.write = false }
-            out[id] = permission
-        }
-        return out
-    }
-
     /// Called only after strict document/receipt validation. Legacy stores did
     /// not record additive-vs-replacement intent. Supported reads default ON,
     /// so a saved read-OFF is a revocation even without a receipt. Default
@@ -748,5 +759,358 @@ public actor MacIntegrationPermissionStore {
                 ($0, MacIntegrationPermission(read: false, write: false))
             }
         )
+    }
+}
+
+/// A macOS privacy (TCC) capability the app depends on.
+public enum SystemPermissionCapability: String, CaseIterable, Sendable {
+    case speechRecognition
+    case microphone
+    case accessibility
+    case fullDiskAccess
+    case screenRecording
+    case automation
+    case calendars
+    case reminders
+    case contacts
+    case notifications
+
+    public var displayName: String {
+        switch self {
+        case .speechRecognition: return "Speech Recognition"
+        case .microphone: return "Microphone"
+        case .accessibility: return "Accessibility"
+        case .fullDiskAccess: return "Full Disk Access"
+        case .screenRecording: return "Screen Recording"
+        case .automation: return "Automation"
+        case .calendars: return "Calendar"
+        case .reminders: return "Reminders"
+        case .contacts: return "Contacts"
+        case .notifications: return "Notifications"
+        }
+    }
+
+    /// Anchor for the `com.apple.settings.PrivacySecurity.extension` pane.
+    /// The Calendar / Reminders / Contacts values are the same literals
+    /// `MacIntegrationView.FrameworkPermission.settingsAnchor` already uses —
+    /// one vocabulary, not two. `notifications` is nil because it does not live
+    /// under Privacy & Security at all (it has its own Settings extension), and
+    /// returning a bogus Privacy anchor for it would deep-link to the wrong pane.
+    public var settingsAnchor: String? {
+        switch self {
+        case .speechRecognition: return "Privacy_SpeechRecognition"
+        case .microphone: return "Privacy_Microphone"
+        case .accessibility: return "Privacy_Accessibility"
+        case .fullDiskAccess: return "Privacy_AllFiles"
+        case .screenRecording: return "Privacy_ScreenCapture"
+        case .automation: return "Privacy_Automation"
+        case .calendars: return "Privacy_Calendars"
+        case .reminders: return "Privacy_Reminders"
+        case .contacts: return "Privacy_Contacts"
+        case .notifications: return nil
+        }
+    }
+
+    /// True when a background/headless code path depends on this capability and
+    /// there is NO guarantee an interactive acquisition ever runs. These are the
+    /// grants that can silently stay unacquired forever — exactly the shape of
+    /// the Telegram voice-note bug — so a non-granted state here is worth
+    /// surfacing on a health panel. The rest (microphone, screen recording,
+    /// calendars, reminders, contacts) are only reached from a user-initiated
+    /// in-app action that fires their own prompt at the moment of use.
+    public var isHeadlessLoadBearing: Bool {
+        switch self {
+        case .speechRecognition, .accessibility, .automation, .notifications:
+            return true
+        case .microphone, .screenRecording, .fullDiskAccess, .calendars, .reminders, .contacts:
+            return false
+        }
+    }
+}
+
+public enum SystemPermissionStatus: String, Sendable {
+    case granted
+    case denied
+    case restricted
+    case notDetermined
+    case unknown
+}
+
+public struct SystemPermissionSnapshot: Sendable, Equatable {
+    public let capability: SystemPermissionCapability
+    public let status: SystemPermissionStatus
+    public let detail: String
+
+    public init(capability: SystemPermissionCapability, status: SystemPermissionStatus, detail: String = "") {
+        self.capability = capability
+        self.status = status
+        self.detail = detail
+    }
+}
+
+public enum SystemPermissionPreflight {
+    private static let logger = Logger(subsystem: "com.nativeagent.app", category: "permission-preflight")
+
+    public typealias SpeechAuthorizationRequest = @Sendable (
+        @escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void
+    ) -> Void
+
+    public static let settingsPanePrefix = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?"
+
+    /// Full System Settings deep link for a capability, or nil when it has no
+    /// Privacy & Security anchor.
+    public static func settingsURL(for capability: SystemPermissionCapability) -> URL? {
+        guard let anchor = capability.settingsAnchor else { return nil }
+        return URL(string: settingsPanePrefix + anchor)
+    }
+
+    // MARK: - Non-prompting reads
+
+    /// Reads the current TCC state. **MUST NEVER PROMPT.** Every call below is
+    /// the query-only variant of its framework's API; the requesting variants
+    /// (`SFSpeechRecognizer.requestAuthorization`,
+    /// `CGRequestScreenCaptureAccess`, `AXIsProcessTrustedWithOptions` with
+    /// `kAXTrustedCheckOptionPrompt: true`,
+    /// `AEDeterminePermissionToAutomateTarget(askUserIfNeeded: true)`) are
+    /// deliberately absent. A prompt fired from a background context is not just
+    /// invisible — macOS resolves it to a hard `.denied` the user can never undo
+    /// from inside the app, which is the exact bug this file exists to fix.
+    public static func status(_ capability: SystemPermissionCapability) -> SystemPermissionStatus {
+        switch capability {
+        case .speechRecognition:
+            // Class-level READ. Not requestAuthorization.
+            switch SFSpeechRecognizer.authorizationStatus() {
+            case .authorized: return .granted
+            case .denied: return .denied
+            case .restricted: return .restricted
+            case .notDetermined: return .notDetermined
+            @unknown default: return .unknown
+            }
+        case .microphone:
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized: return .granted
+            case .denied: return .denied
+            case .restricted: return .restricted
+            case .notDetermined: return .notDetermined
+            @unknown default: return .unknown
+            }
+        case .accessibility:
+            // AXIsProcessTrusted() is the no-prompt form; the prompting form is
+            // AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt.
+            // AX exposes no notDetermined/restricted distinction — it is a
+            // boolean trust bit — so a non-trusted process reads as .denied.
+            return AXIsProcessTrusted() ? .granted : .denied
+        case .fullDiskAccess:
+            // macOS has no safe, universal non-prompting FDA read. Do not
+            // infer authority from a probe of one arbitrary path.
+            return .unknown
+        case .screenRecording:
+            // CGPreflightScreenCaptureAccess is the preflight (no prompt);
+            // CGRequestScreenCaptureAccess is the prompting sibling.
+            return CGPreflightScreenCaptureAccess() ? .granted : .denied
+        case .calendars:
+            return mapEKStatus(EKEventStore.authorizationStatus(for: .event))
+        case .reminders:
+            return mapEKStatus(EKEventStore.authorizationStatus(for: .reminder))
+        case .contacts:
+            switch CNContactStore.authorizationStatus(for: .contacts) {
+            case .authorized: return .granted
+            case .denied: return .denied
+            case .restricted: return .restricted
+            case .notDetermined: return .notDetermined
+            @unknown default: return .unknown
+            }
+        case .automation, .notifications:
+            // No CHEAP non-prompting read exists here.
+            // Automation: AEDeterminePermissionToAutomateTarget is per-target,
+            // requires the target app to be running, and the only variant that
+            // resolves a not-yet-determined grant is askUserIfNeeded:true —
+            // which prompts. MacIntegrationView owns that per-app probe.
+            // Notifications: UNUserNotificationCenter's settings read is async
+            // and requires a bundled, registered app.
+            // Reporting .unknown is honest; `healthWarnings` deliberately does
+            // not warn on .unknown so an unreadable state never becomes a
+            // permanent false alarm.
+            return .unknown
+        }
+    }
+
+    private static func mapEKStatus(_ status: EKAuthorizationStatus) -> SystemPermissionStatus {
+        switch status {
+        case .authorized: return .granted
+        case .denied: return .denied
+        case .restricted: return .restricted
+        case .notDetermined: return .notDetermined
+        case .fullAccess: return .granted
+        case .writeOnly:
+            // NOT .granted. Write-only means the app may add events but cannot
+            // READ them, and every calendar/reminder capability this app
+            // surfaces (briefings, watch jobs, mac_calendar_list_upcoming) is a
+            // read. Reporting .granted here would show a green row while those
+            // reads keep failing — the same "looks fine, silently broken" shape
+            // this whole file exists to kill. MacPIMConnectorActions already
+            // treats write-only as not read-ready; match it.
+            return .denied
+        @unknown default: return .unknown
+        }
+    }
+
+    // MARK: - Pure judgement seam (the tested surface)
+
+    /// The subset of `snapshots` worth telling the human about: a capability a
+    /// headless path depends on that is NOT granted.
+    ///
+    /// `.unknown` is excluded on purpose — it means "we could not read this
+    /// without prompting," not "it is missing." Warning on unreadable state
+    /// would put a permanent, unresolvable card in front of the user (the
+    /// dead-end-alert bug class), which is worse than staying quiet.
+    public static func healthWarnings(from snapshots: [SystemPermissionSnapshot]) -> [SystemPermissionSnapshot] {
+        snapshots.filter { snapshot in
+            snapshot.capability.isHeadlessLoadBearing
+                && snapshot.status != .granted
+                && snapshot.status != .unknown
+        }
+    }
+
+    /// User-facing copy for one warning. Names the capability AND the System
+    /// Settings pane, because the whole point of the card is that the user can
+    /// get from the message to the switch.
+    public static func warningSummary(for snapshot: SystemPermissionSnapshot) -> String {
+        let name = snapshot.capability.displayName
+        let pane = "System Settings → Privacy & Security → \(name)"
+        switch snapshot.status {
+        case .notDetermined:
+            return "\(name) has never been approved for NativeAgent. "
+                + "Background features that need it will fail silently until it is granted in \(pane)."
+        case .denied:
+            return "\(name) is denied for NativeAgent. macOS will not re-prompt once denied — "
+                + "turn it back on in \(pane)."
+        case .restricted:
+            return "\(name) is restricted on this Mac (device management or parental controls). "
+                + "Check \(pane)."
+        case .granted, .unknown:
+            // Not reachable via healthWarnings; kept total so the function has
+            // no crashing branch if a caller passes an arbitrary snapshot.
+            return "\(name) status: \(snapshot.status.rawValue). See \(pane)."
+        }
+    }
+
+    // MARK: - Foreground acquisition
+
+    /// Bridges Speech's callback without inheriting the caller's actor.
+    ///
+    /// `SFSpeechRecognizer.requestAuthorization` is invoked from the main actor
+    /// so macOS can present its consent sheet, but TCC delivers the completion
+    /// on an arbitrary dispatch queue. Defining the continuation bridge as
+    /// `nonisolated` is essential: otherwise Swift 6 actor inference makes the
+    /// callback main-actor isolated and traps when TCC calls it off-main.
+    public nonisolated static func awaitSpeechAuthorization(
+        using request: SpeechAuthorizationRequest = { completion in
+            SFSpeechRecognizer.requestAuthorization(completion)
+        }
+    ) async -> SFSpeechRecognizerAuthorizationStatus {
+        await withCheckedContinuation { continuation in
+            request { status in
+                continuation.resume(returning: status)
+            }
+        }
+    }
+
+    /// Fires the macOS Speech Recognition consent prompt — but ONLY from the
+    /// main actor, and ONLY when the grant is still `.notDetermined`.
+    ///
+    /// Why main-actor/foreground is not a style preference:
+    /// `SFSpeechRecognizer.requestAuthorization` from a headless context (a
+    /// background poll loop, a detached utility task with no active app) cannot
+    /// render its prompt. macOS does not queue it for later — it resolves the
+    /// request `.denied` immediately, WITHOUT writing a real user decision into
+    /// the TCC database. The user is then stuck: the app looks denied, the
+    /// system never asked, and no in-app button can re-ask, because TCC will not
+    /// re-prompt a resolved grant. That is precisely how the Telegram voice-note
+    /// path bricked itself (`data/telegram/errors.jsonl`,
+    /// context=voice_transcription, speechPermissionDenied("denied")).
+    ///
+    /// Reading first is the other half of the guard: calling request on an
+    /// already-denied grant is a silent no-op, so callers must route those to
+    /// System Settings instead of showing a button that appears to do nothing.
+    @MainActor
+    public static func requestSpeechRecognitionIfNotDetermined() async -> SystemPermissionStatus {
+        let current = status(.speechRecognition)
+        guard current == .notDetermined else {
+            logger.info(
+                "speech-recognition preflight: already resolved (\(current.rawValue, privacy: .public)); no prompt fired"
+            )
+            return current
+        }
+        let resolved = await awaitSpeechAuthorization()
+        let mapped: SystemPermissionStatus
+        switch resolved {
+        case .authorized: mapped = .granted
+        case .denied: mapped = .denied
+        case .restricted: mapped = .restricted
+        case .notDetermined: mapped = .notDetermined
+        @unknown default: mapped = .unknown
+        }
+        logger.info(
+            "speech-recognition preflight: prompt resolved \(mapped.rawValue, privacy: .public)"
+        )
+        return mapped
+    }
+}
+
+// MARK: - Setup cards
+
+extension SystemPermissionPreflight {
+    /// The macOS privacy switch a card's grant also needs, where a cheap
+    /// non-prompting read exists. The app-side grant alone does not reach it,
+    /// so a card must not settle while macOS still says no.
+    public static func cardGate(_ id: String, mode: InlineInteraction.AccessMode?) -> SystemPermissionCapability? {
+        switch id {
+        case "calendar": return .calendars
+        case "reminders": return .reminders
+        case "contacts": return .contacts
+        case "accessibility": return .accessibility
+        case "screen_capture": return .screenRecording
+        default: return nil
+        }
+    }
+
+    /// The first macOS switch still off for these ids, as the one sentence of
+    /// what to click; nil when macOS has nothing against it.
+    public static func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) -> String? {
+        for id in ids {
+            guard let gate = cardGate(id, mode: mode) else { continue }
+            let current = cardStatus(gate, mode: mode)
+            if current == .granted { continue }
+            if current == .notDetermined {
+                return "macOS hasn\u{2019}t allowed \(gate.displayName) yet: tap the card and choose Allow when macOS asks."
+            }
+            return "macOS is still blocking \(gate.displayName): in System Settings \u{2192} "
+                + "Privacy & Security \u{2192} \(cardPaneName(gate)), turn NativeAgent on"
+                + (gate == .screenRecording ? " (macOS may ask to reopen NativeAgent)." : ".")
+        }
+        return nil
+    }
+
+    /// Only a real grant counts. A Calendar WRITE card is satisfied by
+    /// macOS's write-only access as well as full access.
+    public static func cardStatus(
+        _ gate: SystemPermissionCapability, mode: InlineInteraction.AccessMode?
+    ) -> SystemPermissionStatus {
+        guard gate == .calendars, mode == .write else { return status(gate) }
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .writeOnly, .fullAccess, .authorized: return .granted
+        case .notDetermined: return .notDetermined
+        case .restricted: return .restricted
+        default: return .denied
+        }
+    }
+
+    private static func cardPaneName(_ capability: SystemPermissionCapability) -> String {
+        switch capability {
+        case .calendars: return "Calendars"
+        case .screenRecording: return "Screen & System Audio Recording"
+        default: return capability.displayName
+        }
     }
 }

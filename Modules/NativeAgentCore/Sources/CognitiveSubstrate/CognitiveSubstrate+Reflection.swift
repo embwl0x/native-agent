@@ -302,15 +302,6 @@ extension CognitiveSubstrate {
         return picked
     }
 
-    /// The unchanged entry point: an explicit request, refusal collapsed to nil.
-    public func planReflection(reason: String) async -> CognitiveReflectionRequest? {
-        guard case .admitted(let request) = await planReflectionChecked(
-            reason: reason,
-            demand: .requested
-        ) else { return nil }
-        return request
-    }
-
     @discardableResult
     public func releaseReflectionReservation(request: CognitiveReflectionRequest) async -> Bool {
         await waitForMaintenanceTransition()
@@ -333,10 +324,6 @@ extension CognitiveSubstrate {
         // terminal path. A nil token is not a compatibility bypass, and a late
         // expired request cannot integrate or release a newer reservation.
         guard ownedBudgetSlot else { return nil }
-        // A caller without a substrate-issued request cannot inject a receipt
-        // while reflection is disabled. A real in-flight call, however, must
-        // still be accounted if Settings changed before its result returned.
-        guard integrationEnabled || ownedBudgetSlot else { return nil }
         let sourcePeers = request.sourcePeerIds
         // An LLM reflection that hits its output cap (or the 600-char bound below)
         // ends mid-sentence ("…easy to let evaporate. Not") and that fragment
@@ -399,7 +386,7 @@ extension CognitiveSubstrate {
         // Install terminal budget accounting before releasing the reservation.
         // Proposal/affect/disposition integration above is reentrant; clearing
         // this earlier let another planner claim the same final daily slot.
-        if ownedBudgetSlot { reflectionReservation = nil }
+        reflectionReservation = nil
         if !cancelled, boundedResult.localizedCaseInsensitiveContains("reflection failed") == false {
             // PROVENANCE: the rumination lane admits a seed only if at least one
             // of its source nodes is still in the field AND is lived traffic
@@ -424,27 +411,6 @@ extension CognitiveSubstrate {
             )
         }
         return receipt
-    }
-
-    /// Test-only integration seam for exercising standing-view parsing without
-    /// manufacturing a production budget bypass. This is internal and visible
-    /// to the target's `@testable` tests only.
-    func recordUnreservedReflectionResultForTesting(
-        request: CognitiveReflectionRequest,
-        resultSummary: String,
-        provider: String,
-        cancelled: Bool = false
-    ) async -> CognitiveReflectionReceipt? {
-        let reservation = ReflectionReservation(id: dependencies.makeUUID(), since: dependencies.now())
-        reflectionReservation = reservation
-        var reservedRequest = request
-        reservedRequest.reservationId = reservation.id
-        return await recordReflectionResult(
-            request: reservedRequest,
-            resultSummary: resultSummary,
-            provider: provider,
-            cancelled: cancelled
-        )
     }
 
     /// Scheduled-runtime durability confirmation for a reflection that already
@@ -768,7 +734,7 @@ extension CognitiveSubstrate {
         cancelled: Bool
     ) -> Double {
         guard !cancelled, proposalCount > 0 else { return 0 }
-        return clamp(Double(proposalCount) / max(1, costUnits * 4))
+        return (Double(proposalCount) / max(1, costUnits * 4)).clamped01()
     }
 
     func restoreReflectionReceipts(from payloads: [JSONValue]) {

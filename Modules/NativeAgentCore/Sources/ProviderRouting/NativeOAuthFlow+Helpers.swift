@@ -3,6 +3,95 @@ import Security
 import CryptoKit
 import Darwin
 import PersistenceCore
+import NativeAgentShared
+import TurnTrace
+
+extension NativeOAuthFlow {
+    public struct InlineSetupOutcome: Sendable {
+        public var error: String?
+        public var note: String?
+
+        public init(error: String? = nil, note: String? = nil) {
+            self.error = error
+            self.note = note
+        }
+    }
+
+    /// A failure as one fixed reason class. The raw text goes to the local log
+    /// only, through the chat secret redactor with every typed value removed
+    /// too; it never reaches the card, the transcript or the agent.
+    public nonisolated static func inlineSetupFailureReason(
+        _ raw: String, service: String, secret: String = "token", typed: [String] = [],
+        otherwise: String? = nil
+    ) -> String {
+        var logged = TurnTraceRedactor.redactText(raw)
+        for value in typed where value.count >= 6 {
+            logged = logged.replacingOccurrences(of: value, with: "[redacted]")
+        }
+        nativeLog("%@", "[inline-setup] \(service) failed: \(logged)")
+        let text = raw.lowercased()
+        func has(_ words: String...) -> Bool { words.contains { text.contains($0) } }
+        // Local allowlist checks, not service text: the person can fix these.
+        if has("at least one allowed", "allowed chat id", "allowed user id", "allowlist") {
+            return "\(service) needs a valid allowed chat, channel or user ID."
+        }
+        if has("could not connect", "couldn't connect", "cannot connect", "network connection",
+               "timed out", "offline", "not connected to the internet", "hostname", "could not be found",
+               "unreachable") {
+            return "Couldn't reach \(service)."
+        }
+        // Before the scope check: the format hints name "OAuth & Permissions".
+        if has("401", "reject", "unauthorized", "such as", "botfather", "isn't a setup token",
+               "enter a valid", "not a valid", "invalid_auth", "invalid token", "invalid api key",
+               "incorrect api key", "didn't accept", "not_authed", "bad credentials") {
+            return "\(service) rejected the \(secret)."
+        }
+        if has("scope", "permission", "forbidden", "403", "not accessible") {
+            return "\(service) is missing a permission or scope this needs."
+        }
+        return otherwise ?? "\(service): other error (details in the app log)."
+    }
+
+    /// A pasted provider key, checked with the provider BEFORE it is saved —
+    /// Providers' own probe (`testProvider` with the draft key), so a key the
+    /// provider rejects is never written and never reads as connected. A
+    /// provider Providers has no probe for (e.g. Codex, xAI) is saved and
+    /// says so rather than claiming a check that did not happen.
+    @MainActor
+    public static func saveInlineProviderKey(
+        _ key: String, providerName name: String,
+        testProvider: @MainActor () async throws -> NativeAgentShared.ProviderTestResult,
+        configureProvider: @MainActor () async throws -> Void
+    ) async -> InlineSetupOutcome {
+        let probe: NativeAgentShared.ProviderTestResult
+        do {
+            probe = try await testProvider()
+        } catch {
+            return InlineSetupOutcome(error: inlineSetupFailureReason(
+                error.localizedDescription, service: name, secret: "key", typed: [key],
+                otherwise: "Couldn't reach \(name)."
+            ))
+        }
+        if probe.tested, probe.status != "ok" {
+            return InlineSetupOutcome(error: inlineSetupFailureReason(
+                probe.error ?? "", service: name, secret: "key", typed: [key],
+                otherwise: "\(name) rejected the key."
+            ))
+        }
+        do {
+            // Providers' own configure call — the same one its sheet makes.
+            // `defaultModel: nil` so saving a key never silently repoints the
+            // provider at a different model.
+            try await configureProvider()
+        } catch {
+            return InlineSetupOutcome(error: inlineSetupFailureReason(
+                error.localizedDescription, service: name, secret: "key", typed: [key]
+            ))
+        }
+        return InlineSetupOutcome(note: probe.tested ? "key checked with \(name)"
+                       : "key saved; \(name) has no check to run")
+    }
+}
 
 // MARK: - PKCE + helpers
 

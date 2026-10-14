@@ -31,9 +31,6 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
     public let heartbeatEligible: Bool = false
 
     private let root: URL
-    private let now: @Sendable () -> Date
-    /// The build whose behavior this row is allowed to grade.
-    private let identity: NativeAgentBuildIdentity
     private let cache: DoctorScanCache
 
     /// Hard ceiling on day FILES opened; the window's floor is this build's
@@ -64,18 +61,14 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
 
     public init(
         root: URL = defaultDataRoot(),
-        now: @escaping @Sendable () -> Date = { Date() },
-        identity: NativeAgentBuildIdentity = .current,
         cacheTTL: TimeInterval = 60
     ) {
         self.root = root
-        self.now = now
-        self.identity = identity
         self.cache = DoctorScanCache(ttl: cacheTTL)
     }
 
     public func run() async -> CheckResult {
-        let moment = now()
+        let moment = Date()
         if let memo = await cache.fresh(now: moment) { return memo }
         let result = measure()
         await cache.store(result, at: moment)
@@ -97,8 +90,8 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         var wordingTurns = 0
         var seenTurns = Set<String>()
 
-        let moment = now()
-        let window = DoctorWindowFloor.resolve(root: root, now: moment, identity: identity)
+        let moment = Date()
+        let window = DoctorWindowFloor.resolve(root: root, now: moment)
         let summary = TurnTraceWindowReader.scan(
             root: root,
             now: moment,

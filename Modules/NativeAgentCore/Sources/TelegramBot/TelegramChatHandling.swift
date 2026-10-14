@@ -2,7 +2,6 @@ import Foundation
 import PersistenceCore
 import ChatSessionWork
 
-public typealias TelegramChatHandler = @Sendable (_ chatId: Int, _ text: String) async throws -> String
 public typealias TelegramCompactionHandler = @Sendable (_ sessionId: String) async throws -> ChatSessionCompactionOutcome
 
 public enum TelegramChatProgressEvent: Sendable, Equatable {
@@ -58,13 +57,6 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
         self.runId = runId
     }
 }
-
-public typealias TelegramProgressChatHandler = @Sendable (
-    _ chatId: Int,
-    _ text: String,
-    _ progress: @escaping TelegramChatProgressSink,
-    _ context: TelegramChatAttemptContext
-) async throws -> String
 
 /// Progress chat handler variant that also carries inbound image attachments
 /// (telegram-vision-in). When non-empty, `attachments` hold already-downloaded

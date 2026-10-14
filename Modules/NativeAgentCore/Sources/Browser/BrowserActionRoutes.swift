@@ -36,29 +36,27 @@ public struct BrowserActionRoutes: Sendable {
     ) async throws -> BrowserRun {
         // Browser Core owns every canonical operation transition and derived
         // receipt. The app owns only the visible WKWebView effect adapter.
-        let bodyValue: JSONValue = .object([
-            "url": .string(url),
-            "dryRun": .bool(dryRun),
-            "readOnly": .bool(true),
-            "captureSource": .bool(false),
-            "captureScreenshot": .bool(false),
-        ])
-        let writer = makeBrowserWriter(
-            dataRoot: dataRoot
-        )
-        // `try`: nil means declined before any side effect; a THROW means a
-        // native write already began, so the error propagates.
-        if let envelope = try await writer.runBrowserAction(body: bodyValue) {
-            let run = try BrowserRun(row: envelope)
-            if !dryRun {
-                await observeBrowserMotorAction(runID: run.id, dataRoot: dataRoot)
+        if dryRun {
+            let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let components = URLComponents(string: trimmed),
+                  let scheme = components.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  let host = components.host, !host.isEmpty else {
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
+                    NSLocalizedDescriptionKey: "Browser dry-run body was not handled by the Swift browser writer."
+                ])
             }
-            return run
-        }
-        guard !dryRun else {
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
-                NSLocalizedDescriptionKey: "Browser dry-run body was not handled by the Swift browser writer."
-            ])
+            let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
+            let result = try await browser.executeBrowserOperation(.start(.init(
+                id: UUID().uuidString, url: trimmed, domain: host.lowercased(),
+                initialState: .dryRun
+            )))
+            guard let run = result.run else {
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
+                    NSLocalizedDescriptionKey: "Browser dry-run body was not handled by the Swift browser writer."
+                ])
+            }
+            return try BrowserRun(row: run)
         }
         let runID = UUID().uuidString.lowercased()
         let run = try await executeVisibleBrowserRun(
@@ -73,34 +71,25 @@ public struct BrowserActionRoutes: Sendable {
     }
 
     public func cancelBrowserRun(id: String?, dataRoot: URL) async throws -> BrowserRun {
-        // Subsystem #27 wave 34 W17: cancel_browser_run is a pure flock'd
-        // runs.json read-find-mutate-write + one receipt append — fully ported.
-        // SwiftNativeBrowserClient handles it in-process; any IO failure fails
-        // closed instead of replaying the cancel.
-        var swiftBody: [String: JSONValue] = ["dryRun": .bool(true)]
-        if let id, !id.isEmpty {
-            swiftBody["id"] = .string(id)
-        }
-        let writer = makeBrowserWriter(
-            dataRoot: dataRoot
-        )
+        let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         do {
-            if let envelope = try await writer.cancelBrowserRun(body: .object(swiftBody)) {
-                if jsonString(envelope, "status") == "canceled",
-                   let runID = jsonString(envelope, "id") {
-                    await effects.cancelNavigation(runID: runID)
-                }
-                return try BrowserRun(row: envelope)
+            let result = try await browser.executeBrowserOperation(.cancel(id: id))
+            guard let envelope = result.run else {
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
+                    NSLocalizedDescriptionKey: "Browser cancel body was not handled by the Swift browser writer."
+                ])
             }
+            if SwiftNativeBrowserClient.objectString(envelope, "status") == "canceled",
+               let runID = SwiftNativeBrowserClient.objectString(envelope, "id") {
+                await effects.cancelNavigation(runID: runID)
+            }
+            return try BrowserRun(row: envelope)
         } catch let error as BrowserCancellationProjectionError {
-            if let runID = jsonString(error.run, "id") {
+            if let runID = SwiftNativeBrowserClient.objectString(error.run, "id") {
                 await effects.cancelNavigation(runID: runID)
             }
             throw error
         }
-        throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
-            NSLocalizedDescriptionKey: "Browser cancel body was not handled by the Swift browser writer."
-        ])
     }
 
     public func executeVisibleBrowserRun(
@@ -124,7 +113,6 @@ public struct BrowserActionRoutes: Sendable {
             url: parsed.url.absoluteString,
             domain: parsed.domain,
             initialState: .running,
-            visible: true,
             approvalId: approvalId,
             captureSource: captureSource,
             captureScreenshot: captureScreenshot,
@@ -278,7 +266,7 @@ public struct BrowserActionRoutes: Sendable {
                 captureScreenshot: captureScreenshot,
                 dataRoot: dataRoot
             )
-            let status = jsonString(run, "status") ?? "succeeded"
+            let status = SwiftNativeBrowserClient.objectString(run, "status") ?? "succeeded"
             try await effects.annotateApprovalExecution(id: approval.id, executedAction: run,
                                                         detail: "Browser navigation \(status)", dataRoot: dataRoot)
         } catch {
@@ -309,7 +297,6 @@ public struct BrowserActionRoutes: Sendable {
             url: parsed.url.absoluteString,
             domain: parsed.domain,
             initialState: .waitingApproval,
-            visible: true,
             approvalId: approval.id
         )
         let digest = SwiftNativeBrowserClient.browserRequestDigest(for: start)
@@ -330,7 +317,7 @@ public struct BrowserActionRoutes: Sendable {
                 NSLocalizedDescriptionKey: "Browser rejection returned no canonical run"
             ])
         }
-        let committedStatus = jsonString(committed, "status") ?? status
+        let committedStatus = SwiftNativeBrowserClient.objectString(committed, "status") ?? status
         try await effects.annotateApprovalExecution(
             id: approval.id,
             executedAction: committed,
@@ -507,11 +494,6 @@ public struct BrowserActionRoutes: Sendable {
             "visionNote": .string(shown.note),
             "captureRetention": BrowserCaptureCache.shared.policy.receipt,
         ]
-    }
-
-    private func jsonString(_ value: JSONValue, _ key: String) -> String? {
-        guard case .object(let object) = value, case .string(let string)? = object[key] else { return nil }
-        return string
     }
 
     private func connectorInputBool(_ raw: JSONValue?, default defaultValue: Bool) -> Bool {

@@ -7,7 +7,7 @@ import PersistenceCore
 /// or — for create — the newly assigned handle). Tolerant decode: an unknown
 /// `op` token yields nil and is skipped by the rebuild.
 public enum DeskOpBody: Sendable, Equatable {
-    case createItem(alias: String, kind: DeskKind, project: String, title: String, parent: String?, summary: String?, assignee: String?, laneOf: String?, origin: DeskOrigin, pursuit: Pursuit?)
+    case createItem(alias: String, kind: DeskKind, project: String, title: String, parent: String?, summary: String?, assignee: String?, laneOf: String?, origin: DeskOrigin, pursuit: Pursuit?, findingKey: String? = nil)
     /// Agent self-pursuit creation under a DEDICATED op token (H2, 2026-07-11
     /// review). A pre-Workshop binary sharing the ops flock decodes an unknown
     /// token to nil and SKIPS it — so an old writer can never see a pursuit as
@@ -22,10 +22,10 @@ public enum DeskOpBody: Sendable, Equatable {
         assignee: String?,
         laneOf: String?
     )
-    case updateTitle(title: String?, summary: String?)
+    case updateTitle(title: String?, summary: String?, refs: [DeskRef]? = nil)
     case addRef(ref: DeskRef)
     case updateRef(refId: String, cachedFields: [String: JSONValue])
-    case appendNote(text: String)
+    case appendNote(text: String, author: String? = "system")
     /// One atomic user veto: the pursuit becomes canceled and carries the
     /// durable rationale in the same replayable event.
     case vetoPursuit(note: String)
@@ -101,7 +101,7 @@ public struct DeskOp: Sendable, Equatable {
         ]
         func put(_ k: String, _ v: String?) { if let v, !v.isEmpty { obj[k] = .string(v) } }
         switch body {
-        case let .createItem(alias, kind, project, title, parent, summary, assignee, laneOf, origin, pursuit):
+        case let .createItem(alias, kind, project, title, parent, summary, assignee, laneOf, origin, pursuit, findingKey):
             obj["alias"] = .string(alias)
             obj["kind"] = .string(kind.rawValue)
             obj["project"] = .string(project)
@@ -110,6 +110,7 @@ public struct DeskOp: Sendable, Equatable {
             put("summary", summary)
             put("assignee", assignee)
             put("laneOf", laneOf)
+            put("findingKey", findingKey)
             // M10: origin OMITTED when .owner so a pre-origin create op re-serializes
             // BYTE-IDENTICAL; pursuit emitted only for an origin=agent create.
             if origin != .owner { obj["origin"] = .string(origin.rawValue) }
@@ -128,16 +129,18 @@ public struct DeskOp: Sendable, Equatable {
             if let progress { obj["progress"] = progress.toJSON() }
             put("assignee", assignee)
             put("laneOf", laneOf)
-        case let .updateTitle(title, summary):
+        case let .updateTitle(title, summary, refs):
             put("title", title)
             put("summary", summary)
+            if let refs { obj["refs"] = .array(refs.map { $0.toJSON() }) }
         case let .addRef(ref):
             obj["ref"] = ref.toJSON()
         case let .updateRef(refId, cachedFields):
             obj["refId"] = .string(refId)
             obj["cachedFields"] = .object(cachedFields)
-        case let .appendNote(text):
+        case let .appendNote(text, author):
             obj["text"] = .string(text)
+            put("author", author)
         case let .vetoPursuit(note):
             obj["note"] = .string(note)
         case let .setCadence(cadence):
@@ -215,7 +218,7 @@ public struct DeskOp: Sendable, Equatable {
                                parent: jsonString(obj, "parent"), summary: jsonString(obj, "summary"),
                                assignee: jsonString(obj, "assignee"), laneOf: jsonString(obj, "laneOf"),
                                origin: jsonString(obj, "origin").flatMap(DeskOrigin.decodePersisted) ?? .owner,
-                               pursuit: obj["pursuit"].map { Pursuit.fromJSON($0) })
+                               pursuit: obj["pursuit"].map { Pursuit.fromJSON($0) }, findingKey: jsonString(obj, "findingKey"))
         case "open_pursuit":
             guard let alias = jsonString(obj, "alias"),
                   let project = jsonString(obj, "project"),
@@ -240,7 +243,14 @@ public struct DeskOp: Sendable, Equatable {
                 laneOf: jsonString(obj, "laneOf")
             )
         case "update_title":
-            body = .updateTitle(title: jsonString(obj, "title"), summary: jsonString(obj, "summary"))
+            var refs: [DeskRef]?
+            if let value = obj["refs"] {
+                guard case .array(let rows) = value else { return nil }
+                let decoded = rows.compactMap(DeskRef.fromJSON)
+                guard decoded.count == rows.count else { return nil }
+                refs = decoded
+            }
+            body = .updateTitle(title: jsonString(obj, "title"), summary: jsonString(obj, "summary"), refs: refs)
         case "add_ref":
             guard let refVal = obj["ref"], let ref = DeskRef.fromJSON(refVal) else { return nil }
             body = .addRef(ref: ref)
@@ -251,7 +261,7 @@ public struct DeskOp: Sendable, Equatable {
             body = .updateRef(refId: refId, cachedFields: fields)
         case "append_note":
             guard let text = jsonString(obj, "text") else { return nil }
-            body = .appendNote(text: text)
+            body = .appendNote(text: text, author: jsonString(obj, "author"))
         case "veto_pursuit":
             guard let note = jsonString(obj, "note"), !note.isEmpty else { return nil }
             body = .vetoPursuit(note: note)

@@ -8,7 +8,8 @@ import PersistenceCore
 // Subsystem #3 — READ-ONLY MCP query surface + consent ledger storage IO.
 //
 // This file owns persisted MCP server/cache/consent records. Live stdio
-// subprocess lifecycle and tool calls are implemented in MCPSubprocessClient.
+// subprocess lifecycle and tool calls are implemented in MCPSubprocess+Process
+// and MCPSubprocess+LiveCache.
 //
 // Storage layout:
 //   <root>/mcp/servers.json            — list of server records
@@ -580,37 +581,6 @@ public enum MCPDispatcherError: Error, Equatable {
     case unavailable(underlying: String)
 }
 
-// MARK: - Protocol
-
-/// Subsystem #3 — MCP query + consent storage IO.
-///
-/// Tool execution and live subprocess operations are implemented on
-/// `SwiftNativeMCPDispatcher` in `MCPSubprocessClient.swift`; this protocol
-/// covers the persisted server, cached tool, and consent surfaces.
-public protocol MCPDispatcherProtocol: Sendable {
-    /// List configured MCP servers from `<root>/mcp/servers.json`.
-    /// Sort: by name ascending (matches `list_mcp_servers`).
-    func listServers() async throws -> [MCPServer]
-
-    /// List the cached tools advertised by a server. SwiftNative reads
-    /// `<root>/mcp/cache/tools.json` and pulls the entry for `serverId`.
-    func listTools(forServer serverId: String) async throws -> [MCPTool]
-
-    /// List consent records, sorted updatedAt DESC (falling back to
-    /// grantedAt). SwiftNative reads `<root>/mcp/consent/ledger.json`.
-    func listConsents() async throws -> [MCPConsent]
-
-    /// Grant or upsert a consent. SwiftNative writes the ledger directly and
-    /// returns the resulting record exactly as persisted.
-    @discardableResult
-    func grantConsent(_ grant: MCPConsentGrant) async throws -> MCPConsent
-
-    /// Revoke an existing consent by (serverId, toolName). SwiftNative
-    /// flips status to "revoked" + stamps revokedAt/updatedAt.
-    /// Throws `.consentNotFound` when absent.
-    func revokeConsent(serverId: String, toolName: String) async throws
-}
-
 // MARK: - SwiftNative implementation
 
 /// File-backed implementation. Reads/writes
@@ -623,15 +593,9 @@ public protocol MCPDispatcherProtocol: Sendable {
 ///
 /// Actor-isolated to serialize concurrent grant/revoke R-M-W against the
 /// same on-disk ledger. Mirrors ApprovalInbox's reentrancy gate.
-public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
+public actor SwiftNativeMCPDispatcher {
     let root: URL
     let persistence: any PersistenceCoreProtocol
-    private let clock: @Sendable () -> Date
-    private let traceFailureLogger: @Sendable (String) -> Void
-    /// Same-module accessor for the injected clock (`clock` is `private`, so
-    /// file-scoped). `MCPSubprocess+LiveCache` stamps `createdAt` on the tools
-    /// cache through this so tests can pin the timestamp.
-    var clockNow: Date { clock() }
     /// Serializes mutating ledger ops (grant/revoke) — see ApprovalInbox
     /// for the pattern's rationale.
     private var mutationTail: Task<Void, Never>? = nil
@@ -647,38 +611,14 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     private var _inflightListServers: Task<[MCPServer], Error>?
     /// 60-second TTL by default — same as MCPLiveCache so a server-list
     /// add/remove naturally falls out of cache on the next minute boundary.
-    /// Tunable so tests can pin behavior; production stays at 60.
-    public var listServersTTL: TimeInterval = 60
+    private let listServersTTL: TimeInterval = 60
 
     public init(
         root: URL,
-        persistence: (any PersistenceCoreProtocol)? = nil,
-        clock: @escaping @Sendable () -> Date = { Date() },
-        traceFailureLogger: @escaping @Sendable (String) -> Void = SwiftNativeMCPDispatcher.defaultTraceFailureLogger
+        persistence: (any PersistenceCoreProtocol)? = nil
     ) {
         self.root = root
         self.persistence = persistence ?? SwiftNativePersistenceCore()
-        self.clock = clock
-        self.traceFailureLogger = traceFailureLogger
-    }
-
-    public nonisolated static func defaultTraceFailureLogger(_ message: String) {
-        nativeLog("%@", message)
-    }
-
-    /// Test seam — invalidate the listServers cache so a fixture change
-    /// is picked up on the next call without waiting out the TTL.
-    public func _invalidateListServersCache() {
-        _serversCacheRow = nil
-        _inflightListServers = nil
-    }
-
-    /// Test seam — set TTL from outside (mostly to set it to 0 so the
-    /// cache is bypassed entirely in cases where a test wants the legacy
-    /// per-call read behavior).
-    public func _setListServersTTL(_ seconds: TimeInterval) {
-        listServersTTL = seconds
-        _serversCacheRow = nil
     }
 
     // MARK: Paths
@@ -721,26 +661,13 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
 
     // MARK: Read paths
 
-    /// Authoritative saved membership for session retention, without defaults or
-    /// cache fallback. Any unreadable or malformed record makes the read fail.
-    public func configuredServerAvailability() throws -> (configured: Set<String>, usable: Set<String>) {
-        struct Record: Decodable { let id: String; let status: String? }
-        let records = try JSONDecoder().decode([Record].self, from: Data(contentsOf: serversPath))
-        guard records.allSatisfy({ !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        return (Set(records.map(\.id)), Set(records.filter {
-            $0.status != "needs_setup" && $0.status != "error"
-        }.map(\.id)))
-    }
-
     public func listServers() async throws -> [MCPServer] {
         // Bug 6 fix (2026-05-31): consult the in-actor TTL cache before
         // hitting disk. Within `listServersTTL` (default 60s) all callers
         // share the same merged list; saves the 2× servers.json reads
         // that swiftMCPServerIsStdio + ensurePool used to do per request.
         if let row = _serversCacheRow,
-           clock().timeIntervalSince(row.storedAt) <= listServersTTL {
+           Date().timeIntervalSince(row.storedAt) <= listServersTTL {
             return row.value
         }
         if let inflight = _inflightListServers {
@@ -753,7 +680,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
         _inflightListServers = task
         do {
             let result = try await task.value
-            _serversCacheRow = _ServersCacheRow(storedAt: clock(), value: result)
+            _serversCacheRow = _ServersCacheRow(storedAt: Date(), value: result)
             _inflightListServers = nil
             return result
         } catch {
@@ -780,7 +707,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
         // Mirrors the retired daemon. createdAt/updatedAt use
         // now_iso() (= isoTimestamp here); since the daemon overwrites these
         // fields per call anyway, the freshly-stamped value is byte-compat.
-        let stamp = Self.isoTimestamp(clock())
+        let stamp = Self.isoTimestamp(Date())
         let internalDefault: [String: JSONValue] = [
             "id": .string("nativeagent-internal"),
             "name": .string("NativeAgent Internal MCP"),
@@ -903,11 +830,12 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
         return out.sorted { $0.name < $1.name }
     }
 
-    public func listConsents() async throws -> [MCPConsent] {
+    public func listConsents(forServer serverId: String? = nil) async throws -> [MCPConsent] {
         var records = try Self.readConsentLedgerChecked(at: consentLedgerPath)
+        if let serverId { records.removeAll { $0.serverId != serverId } }
         let servers = try await _readServersUncached()
         var identities: [String: String] = [:]
-        for server in servers {
+        for server in servers where serverId == nil || server.id == serverId {
             identities[server.id] = try? server.executionIdentity()
         }
         consentServerIdentities = identities
@@ -920,6 +848,61 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             let rkey = rhs.updatedAt.isEmpty ? rhs.grantedAt : rhs.updatedAt
             return lkey > rkey
         }
+    }
+
+    public enum ToolAdmission: Sendable {
+        case allowed(risk: String)
+        case revoked
+        case unpinned
+        case requiresApproval(risk: String)
+        case pinRequired
+        case unpinnedGrant
+    }
+
+    /// Own consent mechanics here; each surface keeps its refusal and cards.
+    public func toolAdmission(
+        server: MCPServer, toolName: String, surface: String, presentsApproval: Bool,
+        fullMacYoloAdmitted: @Sendable (String, String) async -> Bool
+    ) async throws -> ToolAdmission {
+        let consents = try await listConsents(forServer: server.id)
+        let unpinnedGrant = consents.first {
+            $0.toolName == toolName && $0.unpinned
+                && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "granted"
+        }
+        let revoked = consents.contains {
+            $0.toolName == toolName
+                && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "revoked"
+        }
+        // Chat refuses revocation immediately. UI preserves legacy-grant
+        // refusal ordering before returning its blocked card.
+        if !presentsApproval, revoked { return .revoked }
+        let risk = MCPToolBridge.effectiveRiskClass(
+            serverId: server.id, toolName: toolName,
+            serverRiskClass: server.riskClass, dataRoot: root
+        )
+        if consents.contains(where: {
+            $0.toolName == toolName && MCPToolBridge.consent($0, matchesCurrentEffectiveRisk: risk)
+        }) { return .allowed(risk: risk) }
+        let yoloAdmitted = await fullMacYoloAdmitted("mcp__\(server.id)__\(toolName)", surface)
+        let requiresApproval = MCPToolBridge.riskRequiresApproval(risk)
+        if unpinnedGrant != nil, !yoloAdmitted, requiresApproval { return .unpinned }
+        if revoked { return .revoked }
+        if requiresApproval, !yoloAdmitted { return .requiresApproval(risk: risk) }
+        if yoloAdmitted, try server.pinnedExecutionIdentity() == nil { return .pinRequired }
+        if !requiresApproval || (yoloAdmitted && unpinnedGrant != nil) {
+            let grant = try await grantConsent(MCPConsentGrant(
+                serverId: server.id,
+                toolName: toolName,
+                scope: unpinnedGrant?.scope ?? "server_tool",
+                risk: risk,
+                permissions: unpinnedGrant?.permissions ?? [],
+                argumentSummary: unpinnedGrant != nil && yoloAdmitted
+                    ? "Renewed legacy MCP consent under admitted Full Mac authority using the current resolved implementation."
+                    : (presentsApproval ? "Auto-granted low-risk local Swift MCP call." : "Auto-granted low-risk Swift chat MCP call.")
+            ))
+            if grant.unpinned { return .unpinnedGrant }
+        }
+        return .allowed(risk: risk)
     }
 
     // MARK: Mutating paths
@@ -951,7 +934,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
                 ledgerPath: consentLedgerPath,
                 serverIdentity: serverIdentity,
                 unpinned: binding.unpinned,
-                now: clock()
+                now: Date()
             )
         }
         // Trace parity with the daemon's record_trace,
@@ -968,7 +951,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
                 "status": .string("granted"),
                 "permissions": .array(record.permissions.map(JSONValue.string)),
             ],
-            now: clock()
+            now: Date()
         )
         return record
     }
@@ -1037,7 +1020,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
                 toolName: toolName,
                 persistence: persistence,
                 ledgerPath: consentLedgerPath,
-                now: clock()
+                now: Date()
             )
         }
         // Trace parity with the daemon's record_trace,
@@ -1052,7 +1035,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
                 "consentId": .string(key),
                 "status": .string("revoked"),
             ],
-            now: clock()
+            now: Date()
         )
     }
 
@@ -1090,7 +1073,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
                 logLabel: "MCPDispatcher.trace"
             )
         } catch {
-            traceFailureLogger(
+            nativeLog("%@",
                 "MCPDispatcher: best-effort consent trace append failed (\(kind) \(title)): \(error)"
             )
         }
@@ -1242,7 +1225,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
 /// Returns SwiftNative. The SwiftNative path resolves its data root via
 /// `SwiftNativeMCPDispatcher.defaultDataRoot()` — callers wanting an
 /// in-process or override path should construct it directly.
-public func makeMCPDispatcher() -> any MCPDispatcherProtocol {
+public func makeMCPDispatcher() -> SwiftNativeMCPDispatcher {
     let root = SwiftNativeMCPDispatcher.defaultDataRoot()
     return SwiftNativeMCPDispatcher(root: root)
 }

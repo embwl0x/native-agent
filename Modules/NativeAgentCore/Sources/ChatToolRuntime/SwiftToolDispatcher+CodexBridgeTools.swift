@@ -135,6 +135,7 @@ extension SwiftToolDispatcher {
         if let value = resolved.sourceKey { object["sourceKey"] = .string(value) }
         if let value = resolved.replyTo { object["replyTo"] = .string(value) }
         if let value = resolved.correlationId { object["correlationId"] = .string(value) }
+        if let value = resolved.requesterUserId { object["requesterUserId"] = .string(value) }
         return .object(object)
     }
 
@@ -284,11 +285,9 @@ extension SwiftToolDispatcher {
             ? "github-command-repository-network-v1"
             : nil
 
-        if codexMessageWakeupOverride == nil, codexMessageWakeupHelperOverride == nil {
-            let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: agentBridgeConfigRoot)
-            guard returnPath.isReady else {
-                return Self.returnBridgeUnavailableEnvelope(returnPath)
-            }
+        let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: agentBridgeConfigRoot)
+        guard returnPath.isReady else {
+            return Self.returnBridgeUnavailableEnvelope(returnPath)
         }
         let dir = Self.bridgeConfigDirectory(
             named: "codex-nativeagent-bridge",
@@ -643,13 +642,8 @@ extension SwiftToolDispatcher {
         priority: String,
         topic: String?
     ) async -> JSONValue {
-        let allowed: Bool
-        if let codexMessageNotificationPermissionOverride {
-            allowed = codexMessageNotificationPermissionOverride
-        } else {
-            let admitted = await fullMacYoloAdmitted(tool: "mac_notify", surface: surface)
-            allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write, fullMacAdmitted: admitted)
-        }
+        let admitted = await fullMacYoloAdmitted(tool: "mac_notify", surface: surface)
+        let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write, fullMacAdmitted: admitted)
         guard allowed else {
             return .object([
                 "status": .string("skipped"),
@@ -741,39 +735,11 @@ extension SwiftToolDispatcher {
         pairReviewer: Bool,
         completionMode: String
     ) async -> JSONValue {
-        if let codexMessageWakeupOverride {
-            var payload: [String: JSONValue] = [
-                "messageId": .string(messageId),
-                "text": .string(text),
-                "priority": .string(priority),
-                "queuedAt": .string(queuedAt),
-                "inboxPath": .string(inboxPath),
-                "source": .string("codex_message"),
-            ]
-            if let topic { payload["topic"] = .string(topic) }
-            if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
-            payload["origin"] = origin
-            payload["brain"] = brain.jsonValue
-            if let model = brain.model { payload["model"] = .string(model) }
-            if let effort = brain.reasoningEffort { payload["reasoningEffort"] = .string(effort) }
-            if let tier = brain.serviceTier { payload["serviceTier"] = .string(tier) }
-            if let fast = brain.fast { payload["fast"] = .bool(fast) }
-            if let threadId { payload["threadId"] = .string(threadId) }
-            if let workingDirectory { payload["workingDirectory"] = .string(workingDirectory) }
-            if let executionProfile { payload["executionProfile"] = .string(executionProfile) }
-            if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
-            if pairReviewer { payload["pairReviewer"] = .bool(true) }
-            if completionMode == "receipt_only" { payload["completionMode"] = .string(completionMode) }
-            Self.stampDelegationProducer(on: &payload)
-            return await codexMessageWakeupOverride(payload)
-        }
-
         // L1#14 replay guard. The codex store UNLINKS a delivered reply-job, so
         // a terminal record still present in reply-jobs/ is one whose work
         // finished and whose handoff is pending recovery — re-firing would
         // duplicate the run. `undelivered/` is deliberately not scanned, so an
-        // undeliverable job stays re-askable. After the override for the same
-        // hermeticity reason as postClaudeThreadWakeup.
+        // undeliverable job stays re-askable.
         if !WakeupReplayGuard.isDisabled(),
            let match = WakeupReplayGuard.terminalDuplicate(
                store: .codex,
@@ -797,7 +763,6 @@ extension SwiftToolDispatcher {
         }
 
         guard let helper = AgentBridgeRuntime.codexHelperURL(
-            override: codexMessageWakeupHelperOverride,
             dataRoot: dataRoot
         ) else {
             return .object([
@@ -805,7 +770,6 @@ extension SwiftToolDispatcher {
                 "reason": .string("helper_not_found"),
                 "expected": .string(AgentBridgeRuntime.expectedHelperPath(
                     named: "codex_thread_wakeup.js",
-                    override: codexMessageWakeupHelperOverride,
                     dataRoot: dataRoot
                 ).path),
                 "fix": .string("Rebuild or reinstall NativeAgent so codex_thread_wakeup.js is at the expected path."),
@@ -900,7 +864,12 @@ extension SwiftToolDispatcher {
             if case .string(let h)? = input["commit_hash"], !h.isEmpty { return h }
             return nil
         }()
-        let cwdRaw = builderInvokeWorkingDirectory(input: input, dataRoot: dataRoot)
+        let cwdRaw: String
+        do { cwdRaw = try builderInvokeWorkingDirectory(input: input, dataRoot: dataRoot) }
+        catch {
+            return .object(["status": .string("failed"), "effects": .string("none"),
+                "reason": .string("invalid_working_directory"), "detail": .string(error.localizedDescription)])
+        }
         let timeoutSeconds: Int = {
             if case .int(let i)? = input["timeout_seconds"] { return max(30, min(3600, Int(i))) }
             return 600

@@ -42,7 +42,7 @@ import DeviceSync
 
 /// What KIND of fact a notification carries. This, not the sending subsystem,
 /// decides whether User is interrupted.
-public enum AttentionImportance: String, Sendable, CaseIterable {
+public enum AttentionImportance: String, Sendable, CaseIterable, Codable {
     /// Agent is blocked on User, or is deliberately reaching for him (an
     /// approval, a needs-you edge, an explicitly invoked notify tool).
     case ownerWaiting = "owner_waiting"
@@ -76,7 +76,7 @@ public enum AttentionImportance: String, Sendable, CaseIterable {
 }
 
 /// Where User last was. Mirrors the `surface` value every turn trace stamps.
-public enum AttentionSurface: String, Sendable, CaseIterable {
+public enum AttentionSurface: String, Sendable, CaseIterable, Codable {
     case chat
     case ios
     case telegram
@@ -88,7 +88,7 @@ public enum AttentionSurface: String, Sendable, CaseIterable {
 }
 
 /// The router's only outputs.
-public enum AttentionDelivery: String, Sendable, Equatable {
+public enum AttentionDelivery: String, Sendable, Equatable, Codable {
     case phone
     case telegram
     /// Back to the exact conversation the fact came from — the Telegram topic
@@ -106,7 +106,7 @@ public enum AttentionDelivery: String, Sendable, Equatable {
 /// allowlist says who may talk to Agent and says nothing whatsoever about where
 /// she should knock, and treating the two as the same thing is how an agent
 /// starts messaging people who never asked to hear from it.
-public struct AttentionOrigin: Sendable, Equatable {
+public struct AttentionOrigin: Sendable, Equatable, Codable {
     public let surface: AttentionSurface
     /// The conversation on that surface, when there is one. Carried into the
     /// push payload so a tap lands on the thought's own conversation instead of
@@ -177,8 +177,7 @@ public struct AttentionOutcome: Sendable {
     /// True when the routing said knock, the transport was TRIED and failed,
     /// and no other way out was open. A failed transport is not suppression:
     /// nothing reached him and nothing was deduped, so a caller must be able to
-    /// tell this apart from "already delivered". The failure is also written to
-    /// `data/notify/attention-router-failures.jsonl`, and the ledger is left
+    /// tell this apart from "already delivered". The ledger is left
     /// untouched so the next pass can still deliver the fact.
     public let deliveryFailed: Bool
     /// Her resident wake's knock in quiet hours: kept in the inbox, sent when they end.
@@ -411,27 +410,13 @@ public actor AttentionRouter {
         honorsQuietHours(importance) && inQuietHours(at: date, dataRoot: dataRoot)
     }
 
-    // MARK: - Held for quiet hours (her resident wake)
+    // MARK: - Held for quiet hours
 
     /// Her resident wake runs in the person's quiet hours too (Agent 10-02);
     /// anything it would put in front of him waits until they end. True for
     /// a knock from that turn (or naming its session) while the window is open.
     public static func holdsResidentWake(session: String?, dataRoot: URL, at date: Date = Date()) -> Bool {
-        (session ?? ChatToolSessionContext.verifiedSessionId) == ResidentWake.session && inQuietHours(at: date, dataRoot: dataRoot)
-    }
-
-    /// Kept in the inbox, not yet delivered: `held_delivery` names the ways
-    /// out it is owed ("phone", "mac"); `releaseHeld` sends them. An
-    /// approval's push names it, so release skips one already decided.
-    public static func hold(dataRoot: URL, title: String, body: String, ways: [String], approvalID: String? = nil) async {
-        let id = "held:" + UUID().uuidString.lowercased()
-        var row: [String: JSONValue] = ["id": .string(id), "source": .string("resident_wake"),
-            "created_at": .string(NotificationInboxClock.nowISO()), "severity": .string("info"), "status": .string("unread"),
-            "title": .string(String(title.prefix(160))), "summary": .string(String(body.prefix(500))),
-            "held_delivery": .array(ways.map(JSONValue.string))]
-        if let approvalID { row["approval_id"] = .string(approvalID) }
-        do { try await LiveNotificationInbox.live(dataRoot: dataRoot).appendUnique(.object(row), id: id) }
-        catch { nativeLog("attention_router: could not hold a quiet-hours knock: %@", error.localizedDescription) }
+        TurnQuietHoursWindow.holdsResidentWake(session: session ?? ChatToolSessionContext.verifiedSessionId, dataRoot: dataRoot, at: date)
     }
 
     public static func hasHeld(dataRoot: URL) async -> Bool {
@@ -442,14 +427,17 @@ public actor AttentionRouter {
     /// Once quiet hours end, clear only destinations whose transport accepted
     /// the knock. Failed sends and unavailable approval reads remain held.
     public static func releaseHeld(dataRoot: URL, router: AttentionRouter,
-                                   banner: @Sendable (String, String) async -> Bool) async -> Int {
+                                   banner: @Sendable (String, String, [String: String], String?) async -> Bool) async -> Int {
         guard !inQuietHours(at: Date(), dataRoot: dataRoot) else { return 0 }
         let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
         var released = 0
         for case .object(let row) in (try? await inbox.rows()) ?? [] {
             guard case .array(let ways)? = row["held_delivery"], case .string(let id)? = row["id"] else { continue }
-            let title = if case .string(let text)? = row["title"] { text } else { "" }
-            let body = if case .string(let text)? = row["summary"] { text } else { "" }
+            let title = if case .string(let text)? = row["held_title"] ?? row["title"] { text } else { "" }
+            let body = if case .string(let text)? = row["held_body"] ?? row["summary"] { text } else { "" }
+            let userInfo: [String: String]
+            do { userInfo = try row["held_user_info"].map { try JSONDecoder().decode([String: String].self, from: $0.serializedData(pretty: false)) } ?? [:] }
+            catch { nativeLog("attention_router: held metadata unavailable: %@", error.localizedDescription); continue }
             // A card settled or an approval decided meanwhile is no longer news.
             let approval: String? = if case .string(let value)? = row["approval_id"] { value } else { nil }
             var live = row["status"] != .string("archived") && row["status"] != .string("dismissed")
@@ -464,19 +452,44 @@ public actor AttentionRouter {
             var remaining = live ? ways : []
             if live, ways.contains(.string("phone")) {
                 do {
-                    let eventID = approval.map { "approval:\($0)" } ?? id
-                    let outcome = try await router.route(eventId: eventID, importance: .ownerWaiting, title: title, body: body,
-                        reason: eventID,
-                        userInfo: approval.map { ["screen": "approvals", "source": "approval", "approvalId": $0] }
-                            ?? ["screen": "inbox", "itemId": id])
+                    func retainedString(_ key: String) throws -> String? {
+                        guard let value = row[key] else { return nil }
+                        guard case .string(let text) = value else { throw CocoaError(.fileReadCorruptFile) }
+                        return text
+                    }
+                    let eventID = try retainedString("held_event_id") ?? approval.map { "approval:\($0)" } ?? id
+                    let reason = try retainedString("held_reason") ?? eventID
+                    let importanceName = try retainedString("held_importance") ?? AttentionImportance.ownerWaiting.rawValue
+                    let pinnedName = try retainedString("held_pinned_to")
+                    let pinned = pinnedName.flatMap(AttentionDelivery.init(rawValue:))
+                    guard let importance = AttentionImportance(rawValue: importanceName), pinnedName == nil || pinned != nil else {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    let origin = try row["held_origin"].map { try JSONDecoder().decode(AttentionOrigin.self, from: $0.serializedData(pretty: false)) }
+                    let outcome = try await router.route(eventId: eventID, importance: importance, title: title, body: body,
+                        reason: reason, userInfo: row["held_user_info"] != nil ? userInfo :
+                            approval.map { ["screen": "approvals", "source": "approval", "approvalId": $0] } ?? ["screen": "inbox", "itemId": id],
+                        origin: origin, pinnedTo: pinned)
                     if outcome.deliveryProjection.reachedAChannel || outcome.deliveryProjection == .previouslyHandled {
                         remaining.removeAll { $0 == .string("phone") }
                     }
                 } catch { nativeLog("attention_router: held push failed: %@", error.localizedDescription) }
             }
             if live, ways.contains(.string("mac")) {
-                if await banner(title, body) { remaining.removeAll { $0 == .string("mac") } }
-                else { nativeLog("attention_router: held banner failed") }
+                let sound: String? = if case .string(let value)? = row["held_sound_name"] { value } else { nil }
+                do {
+                    if try await inbox.patch(id: id, unlessPresent: "held_mac_dispatch", ["held_mac_dispatch": .string("sent_unconfirmed")]) {
+                        if await banner(title, body, userInfo, sound) {
+                            remaining.removeAll { $0 == .string("mac") }
+                            _ = try await inbox.patch(id: id, ["held_mac_dispatch": .string("completed")])
+                        } else {
+                            _ = try await inbox.patch(id: id, ["held_mac_dispatch": .null])
+                            nativeLog("attention_router: held banner failed")
+                        }
+                    } else if row["held_mac_dispatch"] == .string("completed") {
+                        remaining.removeAll { $0 == .string("mac") }
+                    }
+                } catch { nativeLog("attention_router: held banner dispatch remains unconfirmed: %@", error.localizedDescription) }
             }
             guard remaining != ways else { continue }
             do {
@@ -604,6 +617,7 @@ public actor AttentionRouter {
         userInfo: [String: String] = [:],
         origin: AttentionOrigin? = nil,
         pinnedTo: AttentionDelivery? = nil,
+        postMacBanner: (@Sendable () async -> Void)? = nil,
         at date: Date = Date()
     ) async throws -> AttentionOutcome {
         // Only the caller's own origin names a conversation. The newest turn
@@ -618,26 +632,27 @@ public actor AttentionRouter {
             pinnedTo ?? Self.policy(importance: importance, origin: origin),
             origin: origin
         )
-        guard delivery != .none else { return .routineSuccess }
+        guard delivery != .none || postMacBanner != nil else { return .routineSuccess }
         // Her resident wake runs in his quiet hours; what it would put in
         // front of him, pinned or not, waits in the inbox for them to end.
-        if Self.holdsResidentWake(session: nil, dataRoot: dataRoot, at: date) {
-            await Self.hold(dataRoot: dataRoot, title: title, body: body, ways: ["phone"])
+        let quietHours = TurnQuietHoursWindow.read(dataRoot: dataRoot)
+        let quietNow = quietHours?.contains(hour: Calendar.current.component(.hour, from: date)) == true
+        let residentHeld = ChatToolSessionContext.verifiedSessionId == ResidentWake.session && quietNow
+        if residentHeld || (pinnedTo == nil && Self.honorsQuietHours(importance) && quietNow) {
+            var fields: [String: JSONValue] = ["held_event_id": .string(eventId), "held_importance": .string(importance.rawValue),
+                "held_reason": .string(reason ?? body), "held_user_info": .object(userInfo.mapValues(JSONValue.string))]
+            if let origin { fields["held_origin"] = try JSONValue.parse(JSONEncoder().encode(origin)) }
+            if let pinnedTo { fields["held_pinned_to"] = .string(pinnedTo.rawValue) }
+            let identity = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo, fallback: eventId)
+            let id = pinnedTo == nil ? "held:" + Self.stableDigest(identity + ":" + (reason ?? body)) : "held:" + UUID().uuidString.lowercased()
+            let ways = (delivery == .none ? [] : ["phone"]) + (postMacBanner == nil ? [] : ["mac"])
+            try await LiveNotificationInbox.hold(dataRoot: dataRoot, title: title, body: body, ways: ways, approvalID: userInfo["approvalId"], id: id, fields: fields)
             var held = AttentionOutcome.quietHours
-            held.heldForResidentWake = true
+            held.heldForResidentWake = residentHeld
             return held
         }
-        // A knock Agent CHOSE to make, and a request she is waiting on, are
-        // hers to hold until morning; a knock she was forced into by something
-        // going wrong is not. A PINNED call is exempt because it is not an
-        // attention event to triage — it is an explicit device command whose
-        // caller is owed a real receipt.
-        // The ledger is deliberately not written here: the fact is still true
-        // when the window closes, and it should still be able to reach him.
-        if pinnedTo == nil, Self.honorsQuietHours(importance),
-           Self.inQuietHours(at: date, dataRoot: dataRoot) {
-            return .quietHours
-        }
+        await postMacBanner?()
+        guard delivery != .none else { return .routineSuccess }
 
         // The device-event id already exists and is what the APNS collapse id
         // and the iCloud notification id are built from. Reuse it so the ledger
@@ -690,10 +705,8 @@ public actor AttentionRouter {
                     nativeLog("attention_router: conversation send failed, falling back to phone: %@",
                           error.localizedDescription)
                     guard NotificationChannelPreference.push() else {
-                        await self.recordDeliveryFailure(
-                            eventId: ledgerKey, importance: importance,
-                            title: title, body: body, error: error
-                        )
+                        nativeLog("attention_router: delivery failed with no channel left, event=%@: %@",
+                                  ledgerKey, error.localizedDescription)
                         return AttentionOutcome(
                             delivery: .none, receipt: nil, suppressed: false, deliveryFailed: true)
                     }
@@ -718,10 +731,8 @@ public actor AttentionRouter {
                         // fact reached nobody. Returning `suppressed` here told
                         // callers it was handled and left no trace at all; a
                         // failed transport is never suppression.
-                        await self.recordDeliveryFailure(
-                            eventId: ledgerKey, importance: importance,
-                            title: title, body: body, error: error
-                        )
+                        nativeLog("attention_router: delivery failed with no channel left, event=%@: %@",
+                                  ledgerKey, error.localizedDescription)
                         return AttentionOutcome(
                             delivery: .none, receipt: nil, suppressed: false, deliveryFailed: true)
                     }
@@ -853,7 +864,7 @@ public actor AttentionRouter {
     /// delivery OVERWROTE it — the dedupe state was reset without a trace and
     /// every previously-delivered event could knock again, with the evidence of
     /// what was already sent destroyed. Now the damaged bytes are renamed
-    /// aside, never deleted, a repair receipt records the loss, and the fresh
+    /// aside, never deleted, a log records the loss, and the fresh
     /// ledger starts from a known-empty state.
     private func load() async -> State {
         if let cached { return cached }
@@ -863,49 +874,9 @@ public actor AttentionRouter {
             cached = state
             return state
         } catch {
-            await quarantineDamagedLedger(byteCount: data.count, error: error)
+            quarantineDamagedLedger()
             return .empty
         }
-    }
-
-    /// The durable record of a knock that reached nobody, beside the router's
-    /// own state and written the same way its quarantine receipt is. Best
-    /// effort by design: a failed receipt write must not turn a reported
-    /// failure into a thrown one, and the ledger is deliberately not advanced,
-    /// so the next pass retries the delivery itself.
-    private func recordDeliveryFailure(
-        eventId: String,
-        importance: AttentionImportance,
-        title: String,
-        body: String,
-        error: Error
-    ) async {
-        nativeLog("attention_router: delivery failed with no channel left, event=%@: %@",
-              eventId, error.localizedDescription)
-        let row: [String: JSONValue] = [
-            "event": .string("attention_router_delivery_failed"),
-            "failedAt": .string(ISO8601DateFormatter().string(from: Date())),
-            "eventId": .string(eventId),
-            "importance": .string(importance.rawValue),
-            "attempted": .string(AttentionDelivery.telegram.rawValue),
-            "fallback": .string("phone channel switched off"),
-            "title": .string(title),
-            "body": .string(body),
-            "error": .string(error.localizedDescription),
-        ]
-        try? FileManager.default.createDirectory(
-            at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        try? await appendJSONLCapped(
-            .object(row),
-            to: stateURL.deletingLastPathComponent()
-                .appendingPathComponent("attention-router-failures.jsonl"),
-            using: SwiftNativePersistenceCore(),
-            maxLines: 1000,
-            logLabel: "attention_router_failures",
-            maxBytes: 1024 * 1024,
-            durable: true
-        )
     }
 
     /// Rename aside, NEVER delete — the same contract the builder-inbox
@@ -913,10 +884,8 @@ public actor AttentionRouter {
     /// and the chat delivery receipts store use: a file that turns out to be
     /// recoverable is still on disk, and a human can read
     /// `attention_router.json.quarantined-<ts>` to see exactly which events had
-    /// already been delivered. The receipt lands in a sibling
-    /// `attention-router-quarantine.jsonl` so the reset is recorded rather than
-    /// silent.
-    private func quarantineDamagedLedger(byteCount: Int, error: Error) async {
+    /// already been delivered.
+    private func quarantineDamagedLedger() {
         let fileManager = FileManager.default
         let stamp = String(Int(Date().timeIntervalSince1970))
         var aside = stateURL.appendingPathExtension("quarantined-\(stamp)")
@@ -937,23 +906,6 @@ public actor AttentionRouter {
         }
         nativeLog("attention_router: damaged ledger self-healed; bytes preserved at %@",
               aside.lastPathComponent)
-        let receipt: [String: JSONValue] = [
-            "event": .string("attention_router_ledger_quarantined"),
-            "quarantinedAt": .string(ISO8601DateFormatter().string(from: Date())),
-            "ledgerPath": .string(stateURL.path),
-            "quarantinedPath": .string(aside.path),
-            "reason": .string(
-                "attention router dedupe ledger is malformed; original bytes preserved"),
-            "byteCount": .int(Int64(byteCount)),
-            "decodeError": .string(String(describing: error)),
-        ]
-        // Best effort: the bytes are already safe, and a receipt write failure
-        // must not turn a recovered router back into a dead one.
-        try? await SwiftNativePersistenceCore().appendJSONLDurable(
-            .object(receipt),
-            to: stateURL.deletingLastPathComponent()
-                .appendingPathComponent("attention-router-quarantine.jsonl")
-        )
     }
 
     /// Encode under BOTH budgets: `ledgerLimit` has already bounded the entry

@@ -326,6 +326,7 @@ function postWakeCompletion(transport, requestOptions, token, body, sessionId, c
         replyStatus,
         replyPersisted: parsed && parsed.replyPersisted === true,
         nativeAgentSessionId: parsed && parsed.sessionId ? parsed.sessionId : null,
+        nativeAgentRunId: parsed && parsed.runId ? parsed.runId : null,
         nativeAgentReplyPreview: parsed && typeof parsed.reply === "string" ? unicodePrefix(parsed.reply, 1000) : null,
         completionDelivery: parsed && parsed.completionDelivery ? parsed.completionDelivery : null,
         rawPreview: unicodePrefix(raw, 1000),

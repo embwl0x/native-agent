@@ -57,94 +57,7 @@ public enum TurnEngineError: Error, LocalizedError {
     }
 }
 
-// MARK: - MemoryRecalling
-
-public protocol MemoryRecalling: Sendable {
-    func recall(_ query: String, k: Int) async throws -> [MemoryRecallHit]
-    func recall(
-        _ query: String,
-        k: Int,
-        persona: String?,
-        surface: String?
-    ) async throws -> [MemoryRecallHit]
-    /// Bump use_count/last_used_at for memory records served into a turn by
-    /// Fluid Context (task #42). On active ContextFlow turns the legacy recall
-    /// lane — whose recordRecallHits call is the only other access-bump path —
-    /// is skipped entirely, so packet-served memories otherwise read as
-    /// "unused" to hygiene/eviction, starving exactly the hot rows. Must be a
-    /// protocol REQUIREMENT (not extension-only) so existential dispatch
-    /// reaches the production adapter (same trap as `matchesTombstone`).
-    /// Non-throwing: implementations log failures; a dropped bump self-heals
-    /// on any later serve.
-    func recordServedContextHits(ids: [String]) async
-}
-
-public extension MemoryRecalling {
-    /// Backward-compatible default for legacy/test recallers that do not own
-    /// disclosure metadata. Production MemoryV2 adapters override this method
-    /// so failover recall uses the same persona/surface policy as Fluid Context
-    /// projection and the explicit `recall_memory` tool.
-    func recall(
-        _ query: String,
-        k: Int,
-        persona: String?,
-        surface: String?
-    ) async throws -> [MemoryRecallHit] {
-        try await recall(query, k: k)
-    }
-
-    /// Default no-op: legacy recallers and test fixtures track no access
-    /// signals. The production V2 adapter overrides this with a real bump.
-    func recordServedContextHits(ids: [String]) async {}
-}
-
-// MARK: - MemoryPromoting
-//
-// After-turn hook for adaptive memory promotion. The real implementation
-// (AdaptiveMemoryPromoter — sister worker m5) inspects the user/assistant
-// pair and may stage a promotion proposal. Until m5 lands, the protocol is
-// here so the chat path can call into a no-op default and the seam is
-// already wired. Optional on SwiftNativeChatOrchestrationClient — nil ⇒
-// skip the call entirely.
-public protocol MemoryPromoting: Sendable {
-    func observeTurn(userMessage: String, assistantMessage: String, sessionId: String) async
-
-    /// Sweep item 35: the same turn, plus a BOUNDED projection of what she
-    /// actually DID — the succeeded, fact-shaped tool dispatches, already
-    /// head+tail projected and secret-redacted by
-    /// `TurnToolEvidenceProjection`. The default implementation drops the
-    /// evidence and calls the prose-only overload, so every existing
-    /// conformer (narrow injectors, test fixtures) compiles and behaves
-    /// EXACTLY as before.
-    func observeTurn(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String
-    ) async
-}
-
-extension MemoryPromoting {
-    public func observeTurn(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String
-    ) async {
-        await observeTurn(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            sessionId: sessionId
-        )
-    }
-}
-
 /// Bounded, payload-free result of the memory-promotion side channel.
-///
-/// `MemoryPromoting` stays intentionally source-compatible for narrow or
-/// legacy injectors. Production promoters that can name their outcome adopt
-/// this refinement so the turn receipt can distinguish "configured but no
-/// candidate crossed the gate" from an unobservable promotion attempt.
 public struct MemoryPromotionTelemetry: Sendable, Equatable {
     public let stagedProposalCount: Int64
     /// The moment pass's one-word outcome (see AdaptiveMemoryObservation).
@@ -169,132 +82,22 @@ public struct MemoryPromotionTelemetry: Sendable, Equatable {
     }
 }
 
-/// Optional outcome reporting for the post-turn memory-promotion seam.
-///
-/// The telemetry contains only a count. Candidate text, proposal IDs, and
-/// session content remain in the canonical memory store and never enter a
-/// turn trace receipt.
-public protocol MemoryPromotionTelemetryReporting: MemoryPromoting {
-    func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        sessionId: String
-    ) async -> MemoryPromotionTelemetry
-
-    /// Tool-evidence variant; default drops the evidence (see `MemoryPromoting`).
-    func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String
-    ) async -> MemoryPromotionTelemetry
-
-    /// Surface-carrying variant (moments lane, 2026-09-02). A staged moment
-    /// records WHERE it happened — chat, Telegram, a bridge — because "the
-    /// night we shipped it over Telegram" is part of the moment. Default drops
-    /// the surface exactly as the evidence default drops evidence, so every
-    /// existing conformer compiles and behaves identically.
-    func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String,
-        surface: String
-    ) async -> MemoryPromotionTelemetry
-}
-
-extension MemoryPromotionTelemetryReporting {
-    public func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String
-    ) async -> MemoryPromotionTelemetry {
-        await observeTurnWithTelemetry(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            sessionId: sessionId
-        )
-    }
-
-    public func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String,
-        surface: String
-    ) async -> MemoryPromotionTelemetry {
-        await observeTurnWithTelemetry(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            toolEvidence: toolEvidence,
-            sessionId: sessionId
-        )
-    }
-}
-
-/// How many moments are waiting on her review. Deliberately a COUNT and
-/// nothing else: the per-turn nudge line names a number and a tool, and the
-/// moments themselves stay in the store until she pulls them. Optional
-/// refinement so a narrow or test promoter never has to answer.
-public protocol MomentReviewQueueReporting: Sendable {
-    func pendingMomentCount() async -> Int
-}
-
-public struct SharedAdaptiveMemoryPromoter: MemoryPromotionTelemetryReporting, MomentReviewQueueReporting {
+public struct SharedAdaptiveMemoryPromoter: Sendable {
     public init() {}
 
     public func pendingMomentCount() async -> Int {
         await AdaptiveMemoryPromoter.shared.pendingMomentCount()
     }
 
-    public func observeTurn(userMessage: String, assistantMessage: String, sessionId: String) async {
-        _ = await observeTurnWithTelemetry(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            sessionId: sessionId
-        )
-    }
-
     public func observeTurnWithTelemetry(
         userMessage: String,
         assistantMessage: String,
-        sessionId: String
-    ) async -> MemoryPromotionTelemetry {
-        await observeTurnWithTelemetry(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            toolEvidence: [],
-            sessionId: sessionId
-        )
-    }
-
-    public func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
-        sessionId: String
-    ) async -> MemoryPromotionTelemetry {
-        await observeTurnWithTelemetry(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            toolEvidence: toolEvidence,
-            sessionId: sessionId,
-            surface: "chat"
-        )
-    }
-
-    public func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String],
         sessionId: String,
         surface: String
     ) async -> MemoryPromotionTelemetry {
         let observation = await AdaptiveMemoryPromoter.shared.observeTurnWithReport(
             userMessage: userMessage,
             assistantMessage: assistantMessage,
-            toolEvidence: toolEvidence,
             sessionId: sessionId,
             surface: surface,
             standingAgentName: StandingBotContinuity.currentBot?.name,
@@ -305,7 +108,6 @@ public struct SharedAdaptiveMemoryPromoter: MemoryPromotionTelemetryReporting, M
             semanticStatus: observation.extraction.semanticStatus,
             semanticCandidateCount: observation.extraction.semanticCandidateCount,
             candidateCount: observation.extraction.candidates.count
-                + observation.toolEvidenceCandidateCount
         )
         telemetry.momentOutcome = observation.momentOutcome
         telemetry.savedCorrectionCount = observation.savedCorrectionCount
@@ -459,28 +261,6 @@ enum TurnToolEvidenceProjection {
 
 public typealias ToolDispatchClient = ChatTurnContracts.ToolDispatchClient
 
-struct TurnContextSnapshot: Sendable {
-    let providerPreferences: [String: SurfacePreference]
-    let toolNames: [String]
-    let toolSchemas: [LLMToolSchema]
-
-    var toolSchemaParameterBytes: Int {
-        toolSchemas.reduce(0) { $0 + $1.parametersJSON.count }
-    }
-}
-
-/// Turn-owned quiet-hours preference bytes. The wrapper is intentionally
-/// non-optional even when no window is configured, so a multi-iteration turn
-/// can distinguish "captured absence" from "not captured yet" and avoid a
-/// second preference-file read.
-public struct TurnQuietHoursSnapshot: Sendable, Equatable {
-    let window: TurnQuietHoursWindow?
-
-    public init(window: TurnQuietHoursWindow?) {
-        self.window = window
-    }
-}
-
 /// One immutable provider-routing generation admitted before a chat facade
 /// chooses its execution branch. This is execution context only; the
 /// ProviderRouting store remains the sole authority and adapters still use a
@@ -506,8 +286,8 @@ public struct TurnContext: Sendable {
     /// Source revision captured before USER's per-turn memory-core projection.
     public let personaFingerprint: String
     public let recalled: [MemoryRecallHit]
-    public let modelId: String
-    public let reasoningEffort: String
+    public internal(set) var modelId: String
+    public internal(set) var reasoningEffort: String
     /// Immutable route admitted from one checked provider-routing snapshot.
     /// Adapters still reread canonical routing for corruption/revocation, but
     /// a valid mid-turn preference change cannot splice generations.
@@ -518,8 +298,8 @@ public struct TurnContext: Sendable {
     /// name. Threaded into `LLMClient.complete(...tools:)` so the model can
     /// emit tool calls. Empty when the dispatcher only knows names — the
     /// pre-W1 wire path (no tools embedded in the request body).
-    public let toolSchemas: [LLMToolSchema]
-    public let systemPrompt: String?
+    public internal(set) var toolSchemas: [LLMToolSchema]
+    public internal(set) var systemPrompt: String?
     public let userMessage: String
     /// U1 step 2b/3b (2026-06-10) — ADDITIVE stable/dynamic split of
     /// `systemPrompt` for provider prompt caching. When present:
@@ -533,7 +313,7 @@ public struct TurnContext: Sendable {
     /// (persona + pins + the current lazy tool contract) instead of the end
     /// of the churning combined string.
     /// nil → legacy behavior everywhere.
-    public let systemSegments: SystemPromptSegments?
+    public internal(set) var systemSegments: SystemPromptSegments?
     /// Per-turn DYNAMIC image content blocks for the CURRENT user message.
     /// CACHE INVARIANT: image blocks live ONLY on the in-flight user message —
     /// they MUST NEVER enter `systemPrompt`/`systemSegments` (would churn the
@@ -546,22 +326,22 @@ public struct TurnContext: Sendable {
     public let fluidContextTurn: ContextPreparedTurn?
     /// Request-scoped candidate derived from existing history. It is not model
     /// visible until the shared turn-plan seam confirms an ordinary chat turn.
-    public let naturalExpressionCue: String?
+    public internal(set) var naturalExpressionCue: String?
     /// v2Prefix (2026-09-01): prior turns replayed as REAL messages, oldest →
     /// newest, so a provider cache can match them byte-for-byte across turns.
     /// Empty on non-history callers. Produced by
     /// `SessionHistoryMessageProjection` from bounded transcript rows.
-    public let historyMessages: [LLMMessage]
+    public internal(set) var historyMessages: [LLMMessage]
     /// v2Prefix: the per-turn volatile mass (packet, recall, digest, derived
     /// history blocks, clock/runtime, plan hint, capsule) AFTER it has been
     /// lifted out of `systemSegments.dynamic` — see `splittingVolatileBlock()`.
     /// nil until that split runs.
-    public let turnVolatileBlock: String?
+    public internal(set) var turnVolatileBlock: String?
     /// What the replayed-prefix window cursor did for this turn. Set by
     /// `buildTurnContextWithHistory` — the one place that runs the cursor — so
     /// every downstream receipt reports the same decision instead of re-reading
     /// it from disk or guessing zero. nil on non-history callers.
-    public let historyWindowReceipt: HistoryWindowReceipt?
+    public internal(set) var historyWindowReceipt: HistoryWindowReceipt?
     /// Frozen duration from the context preparation summary, absent if unmeasured.
     public var preparationMs: Int64?
     /// The memory record identities behind THIS turn — legacy recall hits
@@ -666,29 +446,11 @@ public struct TurnContext: Sendable {
             stableSuffix: segments.stableSuffix,
             dynamic: ""
         )
-        return TurnContext(
-            surface: surface,
-            personaID: personaID,
-            personaDocs: personaDocs,
-            personaFingerprint: personaFingerprint,
-            recalled: recalled,
-            modelId: modelId,
-            reasoningEffort: reasoningEffort,
-            providerId: providerId,
-            serviceTier: serviceTier,
-            toolsAvailable: toolsAvailable,
-            systemPrompt: lifted.combined,
-            userMessage: userMessage,
-            toolSchemas: toolSchemas,
-            systemSegments: lifted,
-            imageBlocks: imageBlocks,
-            fluidContextTurn: fluidContextTurn,
-            naturalExpressionCue: naturalExpressionCue,
-            historyMessages: historyMessages,
-            turnVolatileBlock: volatileBlock,
-            historyWindowReceipt: historyWindowReceipt,
-            preparationMs: preparationMs
-        )
+        var copy = self
+        copy.systemPrompt = lifted.combined
+        copy.systemSegments = lifted
+        copy.turnVolatileBlock = volatileBlock
+        return copy
     }
 }
 

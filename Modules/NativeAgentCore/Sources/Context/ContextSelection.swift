@@ -4,11 +4,9 @@ import NativeAgentCore
 // MARK: - Deterministic hybrid selector
 
 public struct ContextSelector: Sendable {
-    public let configuration: ContextSelectionConfiguration
+    public let configuration = ContextSelectionConfiguration()
 
-    public init(configuration: ContextSelectionConfiguration = .init()) {
-        self.configuration = configuration
-    }
+    public init() {}
 
     public func select(
         _ need: NeedSignal,
@@ -375,15 +373,10 @@ public struct ContextSelector: Sendable {
             selectionOrdinals[personalItem.pointer.atomID] = selectedItems.count
         }
 
-        let onDemandPointers = boundedCandidates
-            .filter { $0.draft.injectionPolicy == .onDemand }
-            .sorted { rankedBefore($0, $1, scores: scores) }
-            .prefix(configuration.maximumPointers)
-            .map { ContextAtomPointer(atom: $0, generationID: generation.generation.id) }
         // Summaries and renderer-truncated bodies retain a route to the full
         // atom. This adds at most one pointer per bounded selected item.
-        var pointers = onDemandPointers
-        var published = Set(pointers.map(\.atomID))
+        var pointers: [ContextAtomPointer] = []
+        var published: Set<ContextAtomID> = []
         for item in selectedItems where item.representation == .deterministicSummary
             || (need.packetAtomExpandThresholdChars > 0
                 && item.text.count > need.packetAtomExpandThresholdChars) {

@@ -73,89 +73,6 @@ public struct ContextPrewarmHintMetadata: Equatable, Sendable {
     }
 }
 
-public struct ContextSessionPrewarmHint: Equatable, Sendable {
-    public let metadata: ContextPrewarmHintMetadata
-
-    public init(
-        sessionID: String,
-        eventID: String,
-        revision: Int64,
-        priority: Int = 0,
-        candidates: [ContextPrewarmCandidate]
-    ) {
-        self.metadata = ContextPrewarmHintMetadata(
-            scope: ContextPrewarmScope(kind: .session, id: sessionID),
-            eventID: eventID,
-            revision: revision,
-            priority: priority,
-            candidates: candidates
-        )
-    }
-}
-
-public struct ContextWorkshopPrewarmHint: Equatable, Sendable {
-    public let metadata: ContextPrewarmHintMetadata
-
-    public init(
-        executionID: String,
-        eventID: String,
-        revision: Int64,
-        priority: Int = 0,
-        candidates: [ContextPrewarmCandidate]
-    ) {
-        self.metadata = ContextPrewarmHintMetadata(
-            scope: ContextPrewarmScope(kind: .workshopExecution, id: executionID),
-            eventID: eventID,
-            revision: revision,
-            priority: priority,
-            candidates: candidates
-        )
-    }
-}
-
-public struct ContextCognitivePrewarmHint: Equatable, Sendable {
-    public let activationID: String
-    public let metadata: ContextPrewarmHintMetadata
-
-    public init(
-        workspaceID: String,
-        activationID: String,
-        eventID: String,
-        revision: Int64,
-        priority: Int = 0,
-        candidates: [ContextPrewarmCandidate]
-    ) {
-        self.activationID = activationID
-        self.metadata = ContextPrewarmHintMetadata(
-            scope: ContextPrewarmScope(kind: .cognitive, id: workspaceID),
-            eventID: eventID,
-            revision: revision,
-            priority: priority,
-            candidates: candidates
-        )
-    }
-}
-
-public struct ContextOrganismPrewarmHint: Equatable, Sendable {
-    public let metadata: ContextPrewarmHintMetadata
-
-    public init(
-        predictionID: String,
-        eventID: String,
-        revision: Int64,
-        priority: Int = 0,
-        candidates: [ContextPrewarmCandidate]
-    ) {
-        self.metadata = ContextPrewarmHintMetadata(
-            scope: ContextPrewarmScope(kind: .organism, id: predictionID),
-            eventID: eventID,
-            revision: revision,
-            priority: priority,
-            candidates: candidates
-        )
-    }
-}
-
 public struct ContextPrewarmCancellation: Equatable, Sendable {
     public let scope: ContextPrewarmScope
     public let eventID: String
@@ -169,109 +86,18 @@ public struct ContextPrewarmCancellation: Equatable, Sendable {
 }
 
 public enum ContextPrewarmEvent: Equatable, Sendable {
-    case session(ContextSessionPrewarmHint)
-    case workshopExecution(ContextWorkshopPrewarmHint)
-    case cognitive(ContextCognitivePrewarmHint)
-    case organism(ContextOrganismPrewarmHint)
+    case hint(ContextPrewarmHintMetadata)
     case cancel(ContextPrewarmCancellation)
-
-    fileprivate var metadata: ContextPrewarmHintMetadata? {
-        switch self {
-        case .session(let hint): hint.metadata
-        case .workshopExecution(let hint): hint.metadata
-        case .cognitive(let hint): hint.metadata
-        case .organism(let hint): hint.metadata
-        case .cancel: nil
-        }
-    }
 }
 
-public enum ContextPrewarmLimitsError: Error, Equatable, Sendable {
-    case invalidQueueLimit
-    case invalidTrackedScopeLimit
-    case invalidAtomLimit
-    case invalidByteLimit
-    case invalidTimeLimit
-    case invalidReceiptLimit
-}
-
-public struct ContextPrewarmLimits: Equatable, Sendable {
-    public static let hardMaximumQueuedHints = 256
-    public static let hardMaximumTrackedScopes = 1_024
-    public static let hardMaximumAtomsPerHint = 64
-    public static let hardMaximumAtomsPerPlan = 128
-    public static let hardMaximumBytesPerHint = 8 * 1_048_576
-    public static let hardMaximumBytesPerPlan = 16 * 1_048_576
-    public static let hardMaximumPlanningNanoseconds: UInt64 = 50_000_000
-    public static let hardMaximumUsefulnessReceipts = 1_024
-
-    public let maximumQueuedHints: Int
-    public let maximumTrackedScopes: Int
-    public let maximumAtomsPerHint: Int
-    public let maximumAtomsPerPlan: Int
-    public let maximumBytesPerHint: Int
-    public let maximumBytesPerPlan: Int
-    public let maximumPlanningNanoseconds: UInt64
-    public let maximumUsefulnessReceipts: Int
-
-    public init(
-        maximumQueuedHints: Int = 32,
-        maximumTrackedScopes: Int = 128,
-        maximumAtomsPerHint: Int = 16,
-        maximumAtomsPerPlan: Int = 32,
-        maximumBytesPerHint: Int = 2 * 1_048_576,
-        maximumBytesPerPlan: Int = 4 * 1_048_576,
-        maximumPlanningNanoseconds: UInt64 = 5_000_000,
-        maximumUsefulnessReceipts: Int = 128
-    ) throws {
-        guard (1...Self.hardMaximumQueuedHints).contains(maximumQueuedHints) else {
-            throw ContextPrewarmLimitsError.invalidQueueLimit
-        }
-        guard (maximumQueuedHints...Self.hardMaximumTrackedScopes).contains(maximumTrackedScopes) else {
-            throw ContextPrewarmLimitsError.invalidTrackedScopeLimit
-        }
-        guard (1...Self.hardMaximumAtomsPerHint).contains(maximumAtomsPerHint),
-              (1...Self.hardMaximumAtomsPerPlan).contains(maximumAtomsPerPlan)
-        else {
-            throw ContextPrewarmLimitsError.invalidAtomLimit
-        }
-        guard (1...Self.hardMaximumBytesPerHint).contains(maximumBytesPerHint),
-              (1...Self.hardMaximumBytesPerPlan).contains(maximumBytesPerPlan)
-        else {
-            throw ContextPrewarmLimitsError.invalidByteLimit
-        }
-        guard (1...Self.hardMaximumPlanningNanoseconds).contains(maximumPlanningNanoseconds) else {
-            throw ContextPrewarmLimitsError.invalidTimeLimit
-        }
-        guard (1...Self.hardMaximumUsefulnessReceipts).contains(maximumUsefulnessReceipts) else {
-            throw ContextPrewarmLimitsError.invalidReceiptLimit
-        }
-
-        self.maximumQueuedHints = maximumQueuedHints
-        self.maximumTrackedScopes = maximumTrackedScopes
-        self.maximumAtomsPerHint = maximumAtomsPerHint
-        self.maximumAtomsPerPlan = maximumAtomsPerPlan
-        self.maximumBytesPerHint = maximumBytesPerHint
-        self.maximumBytesPerPlan = maximumBytesPerPlan
-        self.maximumPlanningNanoseconds = maximumPlanningNanoseconds
-        self.maximumUsefulnessReceipts = maximumUsefulnessReceipts
-    }
-
-    /// The defaults above, each already inside its hard bound. Validation
-    /// cannot fail for them, so this needs no `try` — and nothing has to
-    /// `try!` its way to a default set of limits.
-    public static let standard = ContextPrewarmLimits(validatedDefaults: ())
-
-    private init(validatedDefaults: ()) {
-        maximumQueuedHints = 32
-        maximumTrackedScopes = 128
-        maximumAtomsPerHint = 16
-        maximumAtomsPerPlan = 32
-        maximumBytesPerHint = 2 * 1_048_576
-        maximumBytesPerPlan = 4 * 1_048_576
-        maximumPlanningNanoseconds = 5_000_000
-        maximumUsefulnessReceipts = 128
-    }
+private enum ContextPrewarmLimits {
+    static let hardMaximumAtomsPerHint = 64
+    static let maximumQueuedHints = 32
+    static let maximumTrackedScopes = 128
+    static let maximumAtomsPerHint = 16
+    static let maximumBytesPerHint = 2 * 1_048_576
+    static let maximumPlanningNanoseconds: UInt64 = 5_000_000
+    static let maximumUsefulnessReceipts = 128
 }
 
 public struct ContextPrewarmClock: Sendable {
@@ -307,24 +133,6 @@ public enum ContextPrewarmSubmissionOutcome: Equatable, Sendable {
     case rejected(ContextPrewarmRejection)
 }
 
-public struct ContextPrewarmSubmissionReceipt: Equatable, Sendable {
-    public let eventID: String
-    public let scope: ContextPrewarmScope
-    public let outcome: ContextPrewarmSubmissionOutcome
-    public let supersededEventIDs: [String]
-    public let evictedEventIDs: [String]
-    public let acceptedAtomCount: Int
-    public let acceptedByteCount: Int
-    public let droppedAtomCount: Int
-    public let queueCount: Int
-}
-
-public struct ContextPrewarmPressureReceipt: Equatable, Sendable {
-    public let pressure: ContextArenaPressure
-    public let cancelledEventIDs: [String]
-    public let queueCount: Int
-}
-
 public struct ContextPrewarmPlanItem: Equatable, Sendable {
     public let candidate: ContextPrewarmCandidate
     public let cause: ContextPrewarmScope
@@ -338,9 +146,6 @@ public struct ContextPrewarmPlan: Equatable, Sendable {
     public let id: String
     public let items: [ContextPrewarmPlanItem]
     public let estimatedByteCount: Int
-
-    public var canAlterSelection: Bool { false }
-    public var canGrantAuthority: Bool { false }
 }
 
 public enum ContextPrewarmPlanningOutcome: Equatable, Sendable {
@@ -359,25 +164,11 @@ public struct ContextPrewarmPlanningReceipt: Equatable, Sendable {
     public let remainingQueueCount: Int
 }
 
-public struct ContextPrewarmValidationReceipt: Equatable, Sendable {
-    public let planID: String
-    public let validItems: [ContextPrewarmPlanItem]
-    public let invalidatedItems: [ContextPrewarmPlanItem]
-    public let pressure: ContextArenaPressure
-}
-
 public struct ContextPrewarmUsefulnessReceipt: Equatable, Sendable {
-    public let id: String
-    public let ordinal: UInt64
-    public let planID: String
-    public let requestedAtomIDs: [ContextAtomID]
-    public let warmedAtomIDs: [ContextAtomID]
-    public let independentlySelectedAtomIDs: [ContextAtomID]
-    public let usefulAtomIDs: [ContextAtomID]
-    public let unusedWarmedAtomIDs: [ContextAtomID]
+    public let requestedAtomCount: Int
+    public let warmedAtomCount: Int
+    public let usefulAtomCount: Int
     public let usefulness: Double
-    public let selectionWasObservedOnly: Bool
-    public let authorityGranted: Bool
 }
 
 /// Event-driven only: submit, processNext, and receipt recording perform all
@@ -398,7 +189,6 @@ public actor ContextPrewarmPlanner {
     private struct QueuedHint: Equatable, Sendable {
         let metadata: ContextPrewarmHintMetadata
         let droppedAtomCount: Int
-        let byteCount: Int
     }
 
     private struct LatestState: Sendable {
@@ -408,62 +198,29 @@ public actor ContextPrewarmPlanner {
         let ordinal: UInt64
     }
 
-    public let limits: ContextPrewarmLimits
     private let clock: ContextPrewarmClock
     private var pressure: ContextArenaPressure = .normal
     private var queue: [ContextPrewarmScope: QueuedHint] = [:]
     private var latest: [ContextPrewarmScope: LatestState] = [:]
-    private var usefulnessReceipts: [ContextPrewarmUsefulnessReceipt] = []
+    private var retainedUsefulnessReceiptCount = 0
     private var stateOrdinal: UInt64 = 0
-    private var usefulnessOrdinal: UInt64 = 0
-
-    public init(
-        limits: ContextPrewarmLimits,
-        clock: ContextPrewarmClock = .continuous
-    ) {
-        self.limits = limits
-        self.clock = clock
-    }
 
     public init(clock: ContextPrewarmClock = .continuous) {
-        self.limits = .standard
         self.clock = clock
     }
 
     @discardableResult
-    public func submit(_ event: ContextPrewarmEvent) -> ContextPrewarmSubmissionReceipt {
+    public func submit(_ event: ContextPrewarmEvent) -> ContextPrewarmSubmissionOutcome {
         switch event {
         case .cancel(let cancellation):
             return cancel(cancellation)
-        default:
-            guard let metadata = event.metadata else {
-                // Only `.cancel` carries no metadata and it is handled above.
-                // A future metadata-less case gets a rejected receipt on the
-                // submit path, never a trap.
-                return ContextPrewarmSubmissionReceipt(
-                    eventID: "",
-                    scope: ContextPrewarmScope(kind: .session, id: ""),
-                    outcome: .rejected(.emptyEventID),
-                    supersededEventIDs: [],
-                    evictedEventIDs: [],
-                    acceptedAtomCount: 0,
-                    acceptedByteCount: 0,
-                    droppedAtomCount: 0,
-                    queueCount: queue.count
-                )
-            }
+        case .hint(let metadata):
             return submit(metadata)
         }
     }
 
-    @discardableResult
-    public func setResourcePressure(
-        _ newPressure: ContextArenaPressure
-    ) -> ContextPrewarmPressureReceipt {
+    public func setResourcePressure(_ newPressure: ContextArenaPressure) {
         pressure = newPressure
-        let cancelled = newPressure == .normal
-            ? []
-            : latest.values.filter { !$0.cancelled }.map(\.eventID).sorted()
         if newPressure != .normal {
             queue.removeAll(keepingCapacity: true)
             for (scope, state) in Array(latest) where !state.cancelled {
@@ -475,11 +232,6 @@ public actor ContextPrewarmPlanner {
                 )
             }
         }
-        return ContextPrewarmPressureReceipt(
-            pressure: newPressure,
-            cancelledEventIDs: cancelled,
-            queueCount: queue.count
-        )
     }
 
     public func processNext() -> ContextPrewarmPlanningReceipt {
@@ -514,19 +266,11 @@ public actor ContextPrewarmPlanner {
 
         for candidate in hint.metadata.candidates {
             let elapsed = Self.elapsed(since: started, now: clock.nowNanoseconds())
-            if elapsed >= limits.maximumPlanningNanoseconds {
+            if elapsed >= ContextPrewarmLimits.maximumPlanningNanoseconds {
                 hitTimeBound = true
                 break
             }
             considered += 1
-            guard items.count < limits.maximumAtomsPerPlan else {
-                dropped += 1
-                continue
-            }
-            guard candidate.estimatedByteCount <= limits.maximumBytesPerPlan - byteCount else {
-                dropped += 1
-                continue
-            }
             items.append(ContextPrewarmPlanItem(
                 candidate: candidate,
                 cause: hint.metadata.scope,
@@ -576,7 +320,7 @@ public actor ContextPrewarmPlanner {
 
     /// Revalidate immediately before loading. A newer event, cancellation, or
     /// pressure transition invalidates the affected advisory items.
-    public func validate(_ plan: ContextPrewarmPlan) -> ContextPrewarmValidationReceipt {
+    public func validate(_ plan: ContextPrewarmPlan) -> [ContextPrewarmPlanItem] {
         let valid: [ContextPrewarmPlanItem]
         if pressure == .normal {
             valid = plan.items.filter { item in
@@ -588,18 +332,11 @@ public actor ContextPrewarmPlanner {
         } else {
             valid = []
         }
-        let validSet = Set(valid.map(Self.itemIdentity))
-        let invalidated = plan.items.filter { !validSet.contains(Self.itemIdentity($0)) }
-        return ContextPrewarmValidationReceipt(
-            planID: plan.id,
-            validItems: valid,
-            invalidatedItems: invalidated,
-            pressure: pressure
-        )
+        return valid
     }
 
     public func validPlanIDs(_ plans: [ContextPrewarmPlan]) -> Set<String> {
-        Set(plans.filter { !validate($0).validItems.isEmpty }.map(\.id))
+        Set(plans.filter { !validate($0).isEmpty }.map(\.id))
     }
 
     @discardableResult
@@ -611,36 +348,19 @@ public actor ContextPrewarmPlanner {
         let requested = Set(plan.items.map(\.candidate.atomID))
         let warmed = requested.intersection(warmedAtomIDs)
         let useful = warmed.intersection(independentlySelectedAtomIDs)
-        let unused = warmed.subtracting(useful)
-        usefulnessOrdinal &+= 1
-        let receiptID = ContextStableID.digest(parts: [
-            plan.id,
-            String(usefulnessOrdinal),
-        ] + warmed.sorted().map(\.rawValue) + useful.sorted().map(\.rawValue))
-        let receipt = ContextPrewarmUsefulnessReceipt(
-            id: receiptID,
-            ordinal: usefulnessOrdinal,
-            planID: plan.id,
-            requestedAtomIDs: requested.sorted(),
-            warmedAtomIDs: warmed.sorted(),
-            independentlySelectedAtomIDs: independentlySelectedAtomIDs.sorted(),
-            usefulAtomIDs: useful.sorted(),
-            unusedWarmedAtomIDs: unused.sorted(),
-            usefulness: warmed.isEmpty ? 0 : Double(useful.count) / Double(warmed.count),
-            selectionWasObservedOnly: true,
-            authorityGranted: false
+        retainedUsefulnessReceiptCount = min(
+            ContextPrewarmLimits.maximumUsefulnessReceipts, retainedUsefulnessReceiptCount + 1
         )
-        usefulnessReceipts.append(receipt)
-        if usefulnessReceipts.count > limits.maximumUsefulnessReceipts {
-            usefulnessReceipts.removeFirst(
-                usefulnessReceipts.count - limits.maximumUsefulnessReceipts
-            )
-        }
-        return receipt
+        return ContextPrewarmUsefulnessReceipt(
+            requestedAtomCount: requested.count,
+            warmedAtomCount: warmed.count,
+            usefulAtomCount: useful.count,
+            usefulness: warmed.isEmpty ? 0 : Double(useful.count) / Double(warmed.count)
+        )
     }
 
-    public func recentUsefulnessReceipts() -> [ContextPrewarmUsefulnessReceipt] {
-        usefulnessReceipts
+    public func usefulnessReceiptCount() -> Int {
+        retainedUsefulnessReceiptCount
     }
 
     public func pendingHintCount() -> Int {
@@ -649,55 +369,35 @@ public actor ContextPrewarmPlanner {
 
     private func submit(
         _ metadata: ContextPrewarmHintMetadata
-    ) -> ContextPrewarmSubmissionReceipt {
+    ) -> ContextPrewarmSubmissionOutcome {
         if pressure != .normal {
-            return receipt(
-                metadata: metadata,
-                outcome: .suppressed(pressure),
-                queueCount: queue.count
-            )
+            return .suppressed(pressure)
         }
         if metadata.scope.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return receipt(metadata: metadata, outcome: .rejected(.emptyScope))
+            return .rejected(.emptyScope)
         }
         if metadata.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return receipt(metadata: metadata, outcome: .rejected(.emptyEventID))
+            return .rejected(.emptyEventID)
         }
         if metadata.revision < 0 {
-            return receipt(metadata: metadata, outcome: .rejected(.negativeRevision))
+            return .rejected(.negativeRevision)
         }
         if metadata.candidates.count > ContextPrewarmLimits.hardMaximumAtomsPerHint * 4 {
-            return receipt(
-                metadata: metadata,
-                outcome: .rejected(.invalidCandidateCount(metadata.candidates.count))
-            )
+            return .rejected(.invalidCandidateCount(metadata.candidates.count))
         }
 
         let normalized = normalize(metadata)
         guard !normalized.metadata.candidates.isEmpty else {
-            return receipt(
-                metadata: metadata,
-                outcome: .rejected(.noUsableCandidates),
-                droppedAtomCount: metadata.candidates.count
-            )
+            return .rejected(.noUsableCandidates)
         }
 
         if let state = latest[metadata.scope] {
             if metadata.revision < state.revision {
-                return receipt(
-                    metadata: normalized.metadata,
-                    outcome: .stale(latestRevision: state.revision),
-                    acceptedAtomCount: normalized.metadata.candidates.count,
-                    acceptedByteCount: normalized.byteCount,
-                    droppedAtomCount: normalized.droppedAtomCount
-                )
+                return .stale(latestRevision: state.revision)
             }
             if metadata.revision == state.revision {
                 guard !state.cancelled else {
-                    return receipt(
-                        metadata: normalized.metadata,
-                        outcome: .stale(latestRevision: state.revision)
-                    )
+                    return .stale(latestRevision: state.revision)
                 }
                 if let existing = queue[metadata.scope] {
                     let merged = merge(existing, normalized)
@@ -709,30 +409,13 @@ public actor ContextPrewarmPlanner {
                         cancelled: false,
                         ordinal: nextOrdinal()
                     )
-                    let evicted = enforceQueueBound()
-                    return receipt(
-                        metadata: merged.metadata,
-                        outcome: .deduplicated(intoEventID: mergedEventID),
-                        evictedEventIDs: evicted,
-                        acceptedAtomCount: merged.metadata.candidates.count,
-                        acceptedByteCount: merged.byteCount,
-                        droppedAtomCount: merged.droppedAtomCount,
-                        queueCount: queue.count
-                    )
+                    enforceQueueBound()
+                    return .deduplicated(intoEventID: mergedEventID)
                 }
-                return receipt(
-                    metadata: normalized.metadata,
-                    outcome: .deduplicated(intoEventID: state.eventID),
-                    acceptedAtomCount: normalized.metadata.candidates.count,
-                    acceptedByteCount: normalized.byteCount,
-                    droppedAtomCount: normalized.droppedAtomCount
-                )
+                return .deduplicated(intoEventID: state.eventID)
             }
         }
 
-        let superseded = queue.removeValue(forKey: metadata.scope).map {
-            [$0.metadata.eventID]
-        } ?? []
         queue[metadata.scope] = normalized
         latest[metadata.scope] = LatestState(
             revision: metadata.revision,
@@ -740,45 +423,27 @@ public actor ContextPrewarmPlanner {
             cancelled: false,
             ordinal: nextOrdinal()
         )
-        let evicted = enforceQueueBound()
+        enforceQueueBound()
         pruneLatestState()
-        return receipt(
-            metadata: normalized.metadata,
-            outcome: .accepted,
-            supersededEventIDs: superseded,
-            evictedEventIDs: evicted,
-            acceptedAtomCount: normalized.metadata.candidates.count,
-            acceptedByteCount: normalized.byteCount,
-            droppedAtomCount: normalized.droppedAtomCount,
-            queueCount: queue.count
-        )
+        return .accepted
     }
 
     private func cancel(
         _ cancellation: ContextPrewarmCancellation
-    ) -> ContextPrewarmSubmissionReceipt {
-        let metadata = ContextPrewarmHintMetadata(
-            scope: cancellation.scope,
-            eventID: cancellation.eventID,
-            revision: cancellation.revision,
-            candidates: []
-        )
+    ) -> ContextPrewarmSubmissionOutcome {
         if cancellation.scope.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return receipt(metadata: metadata, outcome: .rejected(.emptyScope))
+            return .rejected(.emptyScope)
         }
         if cancellation.eventID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return receipt(metadata: metadata, outcome: .rejected(.emptyEventID))
+            return .rejected(.emptyEventID)
         }
         if cancellation.revision < 0 {
-            return receipt(metadata: metadata, outcome: .rejected(.negativeRevision))
+            return .rejected(.negativeRevision)
         }
         if let state = latest[cancellation.scope], cancellation.revision < state.revision {
-            return receipt(
-                metadata: metadata,
-                outcome: .stale(latestRevision: state.revision)
-            )
+            return .stale(latestRevision: state.revision)
         }
-        let removed = queue.removeValue(forKey: cancellation.scope)
+        queue.removeValue(forKey: cancellation.scope)
         latest[cancellation.scope] = LatestState(
             revision: cancellation.revision,
             eventID: cancellation.eventID,
@@ -786,17 +451,11 @@ public actor ContextPrewarmPlanner {
             ordinal: nextOrdinal()
         )
         pruneLatestState()
-        return receipt(
-            metadata: metadata,
-            outcome: .cancelled,
-            supersededEventIDs: removed.map { [$0.metadata.eventID] } ?? [],
-            queueCount: queue.count
-        )
+        return .cancelled
     }
 
     private func normalize(_ metadata: ContextPrewarmHintMetadata) -> QueuedHint {
         var candidates: [CandidateKey: ContextPrewarmCandidate] = [:]
-        var invalidCount = 0
         for candidate in metadata.candidates {
             guard candidate.generationID >= 0,
                   !candidate.atomID.rawValue.isEmpty,
@@ -806,7 +465,6 @@ public actor ContextPrewarmPlanner {
                   candidate.likelihood >= 0,
                   candidate.likelihood <= 1
             else {
-                invalidCount += 1
                 continue
             }
             let key = CandidateKey(
@@ -827,8 +485,8 @@ public actor ContextPrewarmPlanner {
         var accepted: [ContextPrewarmCandidate] = []
         var bytes = 0
         for candidate in ranked {
-            guard accepted.count < limits.maximumAtomsPerHint,
-                  candidate.estimatedByteCount <= limits.maximumBytesPerHint - bytes
+            guard accepted.count < ContextPrewarmLimits.maximumAtomsPerHint,
+                  candidate.estimatedByteCount <= ContextPrewarmLimits.maximumBytesPerHint - bytes
             else {
                 continue
             }
@@ -843,8 +501,7 @@ public actor ContextPrewarmPlanner {
                 priority: metadata.priority,
                 candidates: accepted
             ),
-            droppedAtomCount: invalidCount + metadata.candidates.count - invalidCount - accepted.count,
-            byteCount: bytes
+            droppedAtomCount: metadata.candidates.count - accepted.count
         )
     }
 
@@ -860,27 +517,21 @@ public actor ContextPrewarmPlanner {
             metadata: merged.metadata,
             droppedAtomCount: merged.droppedAtomCount
                 + lhs.droppedAtomCount
-                + rhs.droppedAtomCount,
-            byteCount: merged.byteCount
+                + rhs.droppedAtomCount
         )
     }
 
-    private func enforceQueueBound() -> [String] {
+    private func enforceQueueBound() {
         let ranked = queue.values.sorted(by: Self.hintRanksBefore)
-        let retained = ranked.prefix(limits.maximumQueuedHints)
+        let retained = ranked.prefix(ContextPrewarmLimits.maximumQueuedHints)
         let retainedScopes = Set(retained.map(\.metadata.scope))
-        let evicted = ranked
-            .filter { !retainedScopes.contains($0.metadata.scope) }
-            .map(\.metadata.eventID)
-            .sorted()
         for scope in queue.keys where !retainedScopes.contains(scope) {
             queue[scope] = nil
         }
-        return evicted
     }
 
     private func pruneLatestState() {
-        guard latest.count > limits.maximumTrackedScopes else { return }
+        guard latest.count > ContextPrewarmLimits.maximumTrackedScopes else { return }
         let queuedScopes = Set(queue.keys)
         let removable = latest
             .filter { !queuedScopes.contains($0.key) }
@@ -890,7 +541,7 @@ public actor ContextPrewarmPlanner {
                 }
                 return lhs.key < rhs.key
             }
-        for entry in removable.prefix(latest.count - limits.maximumTrackedScopes) {
+        for entry in removable.prefix(latest.count - ContextPrewarmLimits.maximumTrackedScopes) {
             latest[entry.key] = nil
         }
     }
@@ -898,29 +549,6 @@ public actor ContextPrewarmPlanner {
     private func nextOrdinal() -> UInt64 {
         stateOrdinal &+= 1
         return stateOrdinal
-    }
-
-    private func receipt(
-        metadata: ContextPrewarmHintMetadata,
-        outcome: ContextPrewarmSubmissionOutcome,
-        supersededEventIDs: [String] = [],
-        evictedEventIDs: [String] = [],
-        acceptedAtomCount: Int = 0,
-        acceptedByteCount: Int = 0,
-        droppedAtomCount: Int = 0,
-        queueCount: Int? = nil
-    ) -> ContextPrewarmSubmissionReceipt {
-        ContextPrewarmSubmissionReceipt(
-            eventID: metadata.eventID,
-            scope: metadata.scope,
-            outcome: outcome,
-            supersededEventIDs: supersededEventIDs.sorted(),
-            evictedEventIDs: evictedEventIDs.sorted(),
-            acceptedAtomCount: acceptedAtomCount,
-            acceptedByteCount: acceptedByteCount,
-            droppedAtomCount: droppedAtomCount,
-            queueCount: queueCount ?? queue.count
-        )
     }
 
     private static func candidateRanksBefore(
@@ -960,17 +588,5 @@ public actor ContextPrewarmPlanner {
     private static func elapsed(since start: UInt64, now: UInt64) -> UInt64 {
         guard now >= start else { return UInt64.max }
         return now - start
-    }
-
-    private static func itemIdentity(_ item: ContextPrewarmPlanItem) -> String {
-        [
-            item.cause.kind.rawValue,
-            item.cause.id,
-            item.causeEventID,
-            String(item.causeRevision),
-            item.candidate.atomID.rawValue,
-            String(item.candidate.generationID),
-            item.candidate.sourceFingerprint,
-        ].joined(separator: "\u{1F}")
     }
 }

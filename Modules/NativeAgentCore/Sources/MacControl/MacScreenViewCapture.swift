@@ -110,24 +110,19 @@ private final class MacScreenCaptureRequest<Value>: @unchecked Sendable {
 }
 
 private func macScreenCaptureWait<Value>(
-    _ name: String,
     issue: (MacScreenCaptureRequest<Value>) -> Void
 ) async throws -> Value {
     try Task.checkCancellation()
     let request = MacScreenCaptureRequest<Value>()
-    do {
-        let value: MacScreenCaptureValue<Value> = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                if request.install(continuation) { issue(request) }
-            }
-        } onCancel: {
-            request.invalidate()
+    let value: MacScreenCaptureValue<Value> = try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+            if request.install(continuation) { issue(request) }
         }
-        try Task.checkCancellation()
-        return value.value
-    } catch {
-        throw error
+    } onCancel: {
+        request.invalidate()
     }
+    try Task.checkCancellation()
+    return value.value
 }
 
 /// Live capture.
@@ -154,7 +149,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         guard isScreenRecordingTrusted() else { return .failure(.screenRecordingNotTrusted) }
         do {
             try Task.checkCancellation()
-            let content: SCShareableContent = try await macScreenCaptureWait("screen capture (window descriptions)") { request in
+            let content: SCShareableContent = try await macScreenCaptureWait { request in
                 SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
                     request.receive(content, error)
                 }
@@ -181,7 +176,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
             configuration.showsCursor = false
             configuration.captureResolution = .best
             configuration.pixelFormat = kCVPixelFormatType_32BGRA
-            let image: CGImage = try await macScreenCaptureWait("screen capture (window image)") { request in
+            let image: CGImage = try await macScreenCaptureWait { request in
                 SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, error in
                     request.receive(image, error)
                 }
@@ -200,7 +195,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         guard isScreenRecordingTrusted() else { return .failure(.screenRecordingNotTrusted) }
         let content: SCShareableContent
         do {
-            content = try await macScreenCaptureWait("screen capture (display descriptions)") { request in
+            content = try await macScreenCaptureWait { request in
                 SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
                     request.receive(content, error)
                 }
@@ -261,7 +256,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
 
         let image: CGImage
         do {
-            image = try await macScreenCaptureWait("screen capture (display image)") { request in
+            image = try await macScreenCaptureWait { request in
                 SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, error in
                     request.receive(image, error)
                 }

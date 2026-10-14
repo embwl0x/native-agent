@@ -42,8 +42,11 @@ public enum ProviderStateValidation {
     }
 
     public static func credential(_ object: [String: Any]) throws {
-        let data = try JSONSerialization.data(withJSONObject: object)
-        guard case .object(let fields) = try JSONDecoder().decode(JSONValue.self, from: data) else {
+        // Preserve Foundation's error for invalid input without encoding valid objects.
+        if !JSONSerialization.isValidJSONObject(object) {
+            _ = try JSONSerialization.data(withJSONObject: object)
+        }
+        guard case .object(let fields) = JSONValue(fromFoundation: object) else {
             throw invalid("provider credential must be an object")
         }
         try credentialFields(fields)

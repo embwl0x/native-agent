@@ -347,24 +347,19 @@ public struct CognitiveStandingViewCapsuleCandidate: Sendable, Equatable {
     /// active view rather than competing with them on relevance score, so the
     /// tier has to survive the freeze into the frozen read.
     public let isHeld: Bool
-    /// Phase 5 D: an opinion or an interest. It surfaces only on a turn it is
-    /// relevant to — never on the relevance-off path.
-    public let onlyWhenRelevant: Bool
 
     public init(
         id: UUID,
         line: String,
         concernKeywords: [String],
         updatedAt: Date,
-        isHeld: Bool = false,
-        onlyWhenRelevant: Bool = false
+        isHeld: Bool = false
     ) {
         self.id = id
         self.line = line
         self.concernKeywords = concernKeywords
         self.updatedAt = updatedAt
         self.isHeld = isHeld
-        self.onlyWhenRelevant = onlyWhenRelevant
     }
 }
 
@@ -379,8 +374,6 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     public let affect: CognitiveAffectState
     public let mood: CognitiveMoodReading
     public let thoughtSeeds: [CognitiveThoughtSeed]
-    public let standingViewInnerLine: String?
-    public let soundEchoLine: String?
     public let feltProxies: CognitiveFeltProxyReads
     public let standingViewCapsuleCandidates: [CognitiveStandingViewCapsuleCandidate]
     public let soundLandingScores: [UUID: Double]
@@ -400,8 +393,6 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         affect: CognitiveAffectState = CognitiveAffectState(),
         mood: CognitiveMoodReading = CognitiveMoodReading(valence: 0, basis: 0),
         thoughtSeeds: [CognitiveThoughtSeed] = [],
-        standingViewInnerLine: String? = nil,
-        soundEchoLine: String? = nil,
         feltProxies: CognitiveFeltProxyReads = .absent,
         standingViewCapsuleCandidates: [CognitiveStandingViewCapsuleCandidate] = [],
         soundLandingScores: [UUID: Double] = [:],
@@ -420,8 +411,6 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         self.affect = affect
         self.mood = mood
         self.thoughtSeeds = thoughtSeeds
-        self.standingViewInnerLine = standingViewInnerLine
-        self.soundEchoLine = soundEchoLine
         self.feltProxies = feltProxies
         self.standingViewCapsuleCandidates = standingViewCapsuleCandidates
         self.soundLandingScores = soundLandingScores

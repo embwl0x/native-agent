@@ -18,10 +18,31 @@ extension SwiftNativeResearchClient {
         candidates.append(contentsOf: dockerCandidates)
 
         var seen: Set<String> = []
-        for cand in candidates {
+        candidates = candidates.filter { seen.insert(trimTrailingSlash($0.baseURL)).inserted }
+        let seed = await withTaskGroup(of: (Int, Bool).self, returning: SearXNGCandidate?.self) { group in
+            for (index, candidate) in candidates.prefix(4).enumerated() {
+                group.addTask { (index, await self.checkSearXNG(base: candidate.baseURL)) }
+            }
+            var results = [Bool?](repeating: nil, count: 4)
+            var preferred = 0
+            for await (index, reachable) in group {
+                results[index] = reachable
+                while preferred < results.count, let result = results[preferred] {
+                    if result {
+                        group.cancelAll()
+                        return candidates[preferred]
+                    }
+                    preferred += 1
+                }
+            }
+            return nil
+        }
+        if let seed {
+            try await persistSearXNGBaseURL(seed.baseURL)
+            return SearXNGAutodetectResult(found: true, baseURL: seed.baseURL, source: seed.source, error: nil)
+        }
+        for cand in candidates.dropFirst(4) {
             let base = trimTrailingSlash(cand.baseURL)
-            if seen.contains(base) { continue }
-            seen.insert(base)
             if await checkSearXNG(base: base) {
                 try await persistSearXNGBaseURL(base)
                 return SearXNGAutodetectResult(found: true, baseURL: base, source: cand.source, error: nil)
@@ -125,8 +146,11 @@ extension SwiftNativeResearchClient {
 
     /// Save a person-entered SearXNG base URL, normalized, under the same
     /// config lock autodetect writes through.
-    public func saveSearXNGBaseURL(_ value: String) async throws {
-        try await persistSearXNGBaseURL(Self.normalizedSearXNGBaseURL(value))
+    @discardableResult
+    public func saveSearXNGBaseURL(_ value: String) async throws -> String {
+        let normalized = try Self.normalizedSearXNGBaseURL(value)
+        try await persistSearXNGBaseURL(normalized)
+        return normalized
     }
 
     /// Read `data/research/config.json`, overwrite `searxng_base_url`, write

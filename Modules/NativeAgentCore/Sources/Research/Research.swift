@@ -20,7 +20,36 @@ public struct SearXNGCandidate: Sendable, Equatable {
     }
 }
 
+/// The result of one SearXNG discovery attempt. Research owns presentation of
+/// this result so an incidental discovery cannot replace the app-wide status
+/// message used by other mounted surfaces.
+public enum SearXNGAutodetectOutcome: Equatable, Sendable {
+    case found(String)
+    case notFound(String)
+    case failed(String)
+}
+
 public struct SearXNGAutodetectResult: Sendable, Equatable {
+    public var outcome: SearXNGAutodetectOutcome {
+        guard found else {
+            let detail = error?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let detail, !detail.isEmpty {
+                return .notFound(detail)
+            }
+            return .notFound("No reachable local instance was found.")
+        }
+        guard let baseURL = baseURL,
+              !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failed("SearXNG detection returned no usable URL.")
+        }
+        do {
+            let normalized = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(baseURL)
+            return .found(normalized)
+        } catch {
+            return .failed("SearXNG detection returned an invalid URL: \(error.localizedDescription)")
+        }
+    }
+
     public let found: Bool
     public let baseURL: String?
     public let source: String?     // "common-port" | "docker" | nil when none
@@ -294,65 +323,6 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
     }
 }
 
-// MARK: - Protocol
-
-public protocol ResearchClientProtocol: Sendable {
-    /// Scan candidate base URLs (common ports + `docker ps`), probe each
-    /// via `/search?q=nativeagent&format=json`, persist the first
-    /// responsive one to `data/research/config.json` under
-    /// `searxng_base_url`, return the structured result.
-    func autodetectSearXNG() async throws -> SearXNGAutodetectResult
-
-    /// Run a SearXNG query against the configured base URL, parse the top
-    /// 10 results, write a receipt JSON to `data/research/<uuid>.json`,
-    /// return `{results: [...]}`.
-    func search(query: String, categories: String?, timeRange: String?) async throws -> ResearchSearchResponse
-
-    /// GET an http/https URL with a 1MB response-body bound, extract supported
-    /// text, and preserve it with explicit coverage in the source receipt.
-    /// Model response paging belongs to the existing tool-output pager.
-    func fetchURL(_ url: String) async throws -> ResearchFetchRecord
-
-    /// Read `data/research/lab/runs.json`, return the runs sorted by
-    /// `createdAt` descending. Mirrors `Daemon.research_lab_runs`
-    ///. Returns the raw stored JSON rows.
-    func researchLabRuns() async throws -> [JSONValue]
-
-    /// Run a research-lab pass: search the objective, build a brief, persist
-    /// the run (newest-first, capped at 100) to `data/research/lab/runs.json`,
-    /// return it using the stable research-lab record shape.
-    ///
-    /// The SwiftNative impl emits activity/events.jsonl and traces/events.jsonl
-    /// entries alongside the run so the Mac activity feed and trace ledger stay
-    /// complete for research-lab runs.
-    func runResearchLab(objective: String, maxResults: Int) async throws -> ResearchLabRun
-}
-
-public extension ResearchClientProtocol {
-    func search(query: String) async throws -> ResearchSearchResponse {
-        try await search(query: query, categories: nil, timeRange: nil)
-    }
-
-    func search(query: String, categories: String?) async throws -> ResearchSearchResponse {
-        try await search(query: query, categories: categories, timeRange: nil)
-    }
-}
-
-// MARK: - Network + Docker dependency boundaries (test seams)
-
-/// Thin URLSession seam — implemented by URLSession.shared in production
-/// and by the test stub `_ResearchHTTPStub` in ResearchTests. Keeps
-/// SwiftNativeResearchClient mockable without dragging in URLProtocol
-/// subclasses at the call sites.
-public protocol ResearchHTTPClient: Sendable {
-    /// GET the URL, return (status, body, contentType). `contentType` is the
-    /// raw `Content-Type` response header (nil if absent) — used by
-    /// `fetchURL` to decide HTML->text stripping. Should NOT throw on non-2xx
-    /// — callers do their own status branching.
-    func get(url: URL, timeout: TimeInterval) async throws -> (Int, Data, String?)
-    func getBounded(url: URL, timeout: TimeInterval, maxBytes: Int) async throws -> ResearchHTTPResponse
-}
-
 public struct ResearchHTTPResponse: Sendable {
     public let status: Int
     public let body: Data
@@ -367,31 +337,9 @@ public struct ResearchHTTPResponse: Sendable {
     }
 }
 
-extension ResearchHTTPClient {
-    /// Compatibility seam for injected clients. Only the production transport
-    /// can enforce a network read bound or identify the final redirect URL.
-    public func getBounded(url: URL, timeout: TimeInterval, maxBytes: Int) async throws -> ResearchHTTPResponse {
-        let (status, body, contentType) = try await get(url: url, timeout: timeout)
-        try Task.checkCancellation()
-        let limit = max(0, maxBytes)
-        return ResearchHTTPResponse(status: status, body: Data(body.prefix(limit)), contentType: contentType,
-            finalURL: nil, observedBytes: body.count, truncated: body.count > limit)
-    }
-}
-
-/// `docker ps` shell-out seam — production runs the real binary if
-/// present; tests inject a fake to return canned JSON-per-line.
-public protocol DockerPSExecutor: Sendable {
-    /// Returns the `docker ps --format '{{json .}}'` stdout, or nil if
-    /// docker isn't on PATH or the call failed within the 8s timeout
-    /// (matches `Daemon.docker_searxng_candidates` at the retired daemon
-    /// L42811).
-    func runJSONLines() async -> String?
-}
-
 // MARK: - SwiftNative impl
 
-public actor SwiftNativeResearchClient: ResearchClientProtocol {
+public actor SwiftNativeResearchClient {
     let configPath: URL
     let receiptsDir: URL
     let labRunsPath: URL
@@ -400,87 +348,16 @@ public actor SwiftNativeResearchClient: ResearchClientProtocol {
     // emitting here keeps those surfaces complete.
     let activityPath: URL
     let tracesPath: URL
-    let persistence: any PersistenceCoreProtocol
-    let http: any ResearchHTTPClient
-    let docker: any DockerPSExecutor
-    let userAgent: String
-    let now: @Sendable () -> Date
-    let receiptIDFactory: @Sendable () -> String
+    let persistence = SwiftNativePersistenceCore()
+    let http = URLSessionResearchHTTPClient()
+    let docker = SystemDockerPSExecutor()
 
-    /// Production initializer.
-    ///
-    /// `configPathOverride` + `receiptsDirOverride` + `nowOverride` +
-    /// `receiptIDFactoryOverride` are test seams. `persistence`, `http`,
-    /// `docker` are protocol-typed so tests can pin behavior without
-    /// touching disk or the network.
-    public init(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
-        http: any ResearchHTTPClient = URLSessionResearchHTTPClient(),
-        docker: any DockerPSExecutor = SystemDockerPSExecutor(),
-        configPathOverride: URL? = nil,
-        receiptsDirOverride: URL? = nil,
-        labRunsPathOverride: URL? = nil,
-        activityPathOverride: URL? = nil,
-        tracesPathOverride: URL? = nil,
-        userAgent: String = "NativeAgent/0.1",
-        now: @escaping @Sendable () -> Date = { Date() },
-        receiptIDFactory: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() }
-    ) {
-        self.persistence = persistence
-        self.http = http
-        self.docker = docker
-        self.userAgent = userAgent
-        self.now = now
-        self.receiptIDFactory = receiptIDFactory
+    public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         let root = dataRoot.standardizedFileURL
-        if let override = configPathOverride {
-            self.configPath = override
-        } else {
-            self.configPath = root
-                .appendingPathComponent("research", isDirectory: true)
-                .appendingPathComponent("config.json")
-        }
-        if let override = receiptsDirOverride {
-            self.receiptsDir = override
-        } else {
-            self.receiptsDir = root.appendingPathComponent("research", isDirectory: true)
-        }
-        if let override = labRunsPathOverride {
-            self.labRunsPath = override
-        } else {
-            // Mirrors Python: root / "research" / "lab" / "runs.json"
-            //.
-            self.labRunsPath = root
-                .appendingPathComponent("research", isDirectory: true)
-                .appendingPathComponent("lab", isDirectory: true)
-                .appendingPathComponent("runs.json")
-        }
-        if let override = activityPathOverride {
-            self.activityPath = override
-        } else {
-            // Matches data-root layout: root / "activity" / "events.jsonl"
-            //.
-            self.activityPath = root
-                .appendingPathComponent("activity", isDirectory: true)
-                .appendingPathComponent("events.jsonl")
-        }
-        if let override = tracesPathOverride {
-            self.tracesPath = override
-        } else {
-            // Matches data-root layout: root / "traces" / "events.jsonl"
-            //. Same file DispatchLedger appends to.
-            self.tracesPath = root
-                .appendingPathComponent("traces", isDirectory: true)
-                .appendingPathComponent("events.jsonl")
-        }
+        self.receiptsDir = root.appendingPathComponent("research", isDirectory: true)
+        self.configPath = receiptsDir.appendingPathComponent("config.json")
+        self.labRunsPath = receiptsDir.appendingPathComponent("lab/runs.json")
+        self.activityPath = root.appendingPathComponent("activity/events.jsonl")
+        self.tracesPath = root.appendingPathComponent("traces/events.jsonl")
     }
-}
-
-// MARK: - Factory
-
-public func makeResearchClient(
-    dataRoot: URL = PersistenceCore.defaultDataRoot()
-) -> any ResearchClientProtocol {
-    return SwiftNativeResearchClient(dataRoot: dataRoot)
 }

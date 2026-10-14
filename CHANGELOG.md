@@ -6,6 +6,19 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.6.4 — abilities, one file each (2026-10-14)
+
+### Abilities
+- Tools, skills and senses are one lifecycle on one JS engine (propose, validate, keep, rollback, drop); each ability is one file in data/abilities/ (<id>.js|md, one .prev, one .next, state.json); drop deletes the file; agent-side archive/trash/quarantine states gone; forward-only verified migration.
+- host.apps.call drives scriptable apps by bundle id (per-event timeout, dialogs observed); an abilities line rides every turn; census lists every ability; owner-off and trusted-peer rules unchanged.
+
+### Smaller models
+- Haiku plain-ask drive fixes: malformed-call repair, announced-no-call continuation, junk-tag and debris cleanup, stall retry on evidence; digest failures recorded, never fail the turn.
+
+### Smoother, leaner
+- Mac and iPhone UI work moved off the main thread, narrower redraws; iPhone status snapshots save at user-initiated priority (were deferred in background).
+- ~25k lines of dead code, duplicates and waste out; engine logic back in NativeAgentCore; the architecture check reads its rules from ARCHITECTURE_BLUEPRINT.md and fails non-UI app files.
+
 ## 0.6.3 — a turn never fails (2026-10-11)
 
 ### One way out

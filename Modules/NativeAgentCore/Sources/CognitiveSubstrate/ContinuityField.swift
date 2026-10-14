@@ -93,9 +93,9 @@ struct ContinuityField: Sendable {
 
         let isNewNode = nodesByKey[key] == nil
         if var node = nodesByKey[key] {
-            node.activation = clamp(node.activation + input * 0.45)
-            node.salience = clamp(max(node.salience, node.activation * 0.7 + event.importance * 0.3))
-            node.confidence = clamp(max(node.confidence, confidence))
+            node.activation = (node.activation + input * 0.45).clamped01()
+            node.salience = (max(node.salience, node.activation * 0.7 + event.importance * 0.3)).clamped01()
+            node.confidence = (max(node.confidence, confidence)).clamped01()
             node.sourceClass = strongerSource(lhs: node.sourceClass, rhs: event.sourceClass)
             node.lastActivatedAt = now
             node.summary = boundedSummary.isEmpty ? node.summary : boundedSummary
@@ -110,7 +110,7 @@ struct ContinuityField: Sendable {
                 kind: event.kind.nodeKind,
                 subjectReference: event.subject,
                 activation: input,
-                salience: clamp(input * 0.7 + event.importance * 0.3),
+                salience: (input * 0.7 + event.importance * 0.3).clamped01(),
                 confidence: confidence,
                 sourceClass: event.sourceClass,
                 createdAt: now,
@@ -360,8 +360,8 @@ struct ContinuityField: Sendable {
             let elapsed = max(0, now.timeIntervalSince(anchor))
             if elapsed > 0, copy.decayHalfLife > 0 {
                 let factor = pow(0.5, elapsed / copy.decayHalfLife)
-                copy.activation = clamp(copy.activation * factor)
-                copy.salience = clamp(copy.salience * factor)
+                copy.activation = (copy.activation * factor).clamped01()
+                copy.salience = (copy.salience * factor).clamped01()
             }
             return copy
         }
@@ -498,8 +498,8 @@ struct ContinuityField: Sendable {
             let elapsed = max(0, now.timeIntervalSince(anchor))
             guard elapsed > 0, node.decayHalfLife > 0 else { continue }
             let factor = pow(0.5, elapsed / node.decayHalfLife)
-            node.activation = clamp(node.activation * factor)
-            node.salience = clamp(node.salience * factor)
+            node.activation = (node.activation * factor).clamped01()
+            node.salience = (node.salience * factor).clamped01()
             nodesByKey[key] = node
             decayAnchorsByKey[key] = now
         }
@@ -580,8 +580,8 @@ struct ContinuityField: Sendable {
             let whisper = configuration.affectEnabled
                 ? Self.affectiveSpreadMaxWhisper * Self.affectiveCongruence(source, node)
                 : 0
-            node.activation = clamp(node.activation + input * stored * 0.18 * (1 + whisper))
-            node.salience = clamp(node.salience + input * stored * 0.10)
+            node.activation = (node.activation + input * stored * 0.18 * (1 + whisper)).clamped01()
+            node.salience = (node.salience + input * stored * 0.10).clamped01()
             nodesByKey[otherKey] = node
             boosted.append((otherKey, stored))
         }
@@ -621,7 +621,7 @@ struct ContinuityField: Sendable {
             let denominator = max(1, min(sourceTokens.count, targetTokens.count))
             weight += min(0.5, Double(overlap.count) / Double(denominator) * 0.5)
         }
-        return clamp(weight)
+        return (weight).clamped01()
     }
 
     private func associationReasons(from: CognitiveNode, to: CognitiveNode) -> [String] {
@@ -675,7 +675,7 @@ struct ContinuityField: Sendable {
     }
 
     private func eventActivationInput(_ importance: Double) -> Double {
-        clamp(0.2 + (importance).clamped01() * 0.8)
+        (0.2 + (importance).clamped01() * 0.8).clamped01()
     }
 
     private func confidenceSeed(for source: CognitiveSourceClass) -> Double {
@@ -710,10 +710,6 @@ struct ContinuityField: Sendable {
         return out
     }
 
-    private func clamp(_ value: Double) -> Double {
-        value.clamped01()
-    }
-
     private static func snapshotSort(_ lhs: CognitiveNode, _ rhs: CognitiveNode) -> Bool {
         if lhs.activation != rhs.activation { return lhs.activation > rhs.activation }
         if lhs.salience != rhs.salience { return lhs.salience > rhs.salience }
@@ -739,7 +735,6 @@ struct ContinuityField: Sendable {
                         maximumArrayItems: 8,
                         maximumDepth: JSONValueBounding.uncappedDepth
                     ),
-                    redactSecrets: true,
                     keyPath: key.lowercased()
                 )
         }

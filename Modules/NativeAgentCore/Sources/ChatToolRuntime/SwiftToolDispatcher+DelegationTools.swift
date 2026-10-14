@@ -37,7 +37,7 @@ extension SwiftToolDispatcher {
             messageID = value.isEmpty ? nil : value
         default: return Self.invalidDelegationMessageLookup()
         }
-        let projector = DelegationStatusProjector(configRoot: agentBridgeConfigRoot)
+        let projector = DelegationStatusProjector(configRoot: agentBridgeConfigRoot, dataRoot: dataRoot)
         let limit = Self.delegationStatusLimit(input)
         let offset = Self.delegationStatusOffset(input)
         let agentFilter = Self.delegationStatusAgentFilter(input)

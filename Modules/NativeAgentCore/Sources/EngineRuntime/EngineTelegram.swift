@@ -4,6 +4,7 @@ import PersistenceCore
 import ProviderRouting
 import BackgroundLoops
 import TelegramBot
+import AppToolRuntime
 
 /// Mounted Telegram management state. The core owns configuration and transport
 /// status; the facade adds bounded diagnostic feeds and the app's routing pick.
@@ -15,12 +16,15 @@ public final class TelegramFacade {
 
     public nonisolated init(dataRoot: URL) { self.dataRoot = dataRoot }
 
+    public nonisolated func toolStatusEnvelope() async throws -> JSONValue {
+        let status = try await load()
+        return AppToolExecutor.telegramStatusEnvelope(status: status, now: Date())
+    }
+
     public nonisolated func configuration() async -> TelegramConfigurationSummary? {
         guard let config = try? TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot) else { return nil }
         let routing = try? await SwiftNativeProviderRouting(dataRoot: dataRoot).computeModelPreferences()["telegram"]
-        let brain = resolveTelegramBrain(routing: routing, legacyModel: config.model,
-                                         legacyReasoningEffort: config.reasoningEffort)
-        return TelegramConfigurationSummary(config: config, model: brain.model, reasoningEffort: brain.reasoningEffort)
+        return TelegramConfigurationSummary(config: config, model: routing?.model, reasoningEffort: routing?.reasoningEffort)
     }
 
     public nonisolated func load(manager: BackgroundLoopsManager = .shared, credentialUnavailable: Bool = false,
@@ -61,11 +65,6 @@ public final class TelegramFacade {
             telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
                 .computeModelPreferences()["telegram"]
         }
-        let resolvedTelegramBrain = resolveTelegramBrain(
-            routing: telegramBrain,
-            legacyModel: cfg?.model,
-            legacyReasoningEffort: cfg?.reasoningEffort
-        )
         let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
         let stateURL = telegramDir.appendingPathComponent("state.json")
         var lastSeenUpdateId: Int?
@@ -126,8 +125,8 @@ public final class TelegramFacade {
                     : lastError ?? (cfg == nil ? "No bot token saved — paste one to enable." : nil)
             ),
             configuration: TelegramConfigurationSummary(
-                config: cfg, model: resolvedTelegramBrain.model,
-                reasoningEffort: resolvedTelegramBrain.reasoningEffort
+                config: cfg, model: telegramBrain?.model,
+                reasoningEffort: telegramBrain?.reasoningEffort
             ),
             pollBackoffFailures: pollBackoffFailures,
             lastPollAt: lastPollAt,

@@ -19,11 +19,9 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public let commandSignatureVerified: Bool?
     public let declaredRemote: Bool?
     public let helperDefinition: JSONValue?
-    public var iteration = 0
     public var keptProse = ""
     public var workingCommentaryCharacters = 0
     public var workingNotes = ""
-    public var dispatchCount = 0
     public var runningStep: Int?
     public var deliveryPending = false
 
@@ -135,12 +133,6 @@ public struct AbandonedTurnReconciler: Sendable {
             self.resumable = resumable
             self.failure = failure
         }
-
-        public static func == (lhs: Outcome, rhs: Outcome) -> Bool {
-            lhs.acceptedScanned == rhs.acceptedScanned && lhs.reconciled == rhs.reconciled
-                && lhs.tooRecentToJudge == rhs.tooRecentToJudge && lhs.failure == rhs.failure
-                && lhs.resumable == rhs.resumable
-        }
     }
 
     private struct Accepted {
@@ -155,73 +147,86 @@ public struct AbandonedTurnReconciler: Sendable {
         let today = now()
         var accepted: [String: Accepted] = [:]
         var terminated: Set<String> = []
+        var terminalIndex: [URL: (terminated: Set<String>, replyReady: Set<String>)] = [:]
 
         let scan = scanRange(today: today)
         // Catch-up terminals are written today, outside a historical window.
         // Read them before selecting candidates so prior passes do not spend
         // the attempt budget again. Today's accepted turns stay outside that window.
         let terminalOnlyDays = scan.newestOffset > 0 ? [0] : []
+        func readDay(_ path: URL, includeAccepted: Bool) throws {
+            guard terminalIndex[path] == nil else { return }
+            var terminalTurns = Set<String>()
+            var replyReadyTurns = Set<String>()
+            if FileManager.default.fileExists(atPath: path.path) {
+                let text = try String(contentsOf: path, encoding: .utf8)
+                for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                    guard Self.lifecycleKinds.contains(where: { line.utf8.firstRange(of: $0.utf8) != nil }),
+                          let data = String(line).data(using: .utf8),
+                          let value = try? JSONValue.parse(data),
+                          case .object(let row) = value,
+                          case .string(let kind)? = row["kind"],
+                          case .string(let turnId)? = row["turnId"] else { continue }
+                    switch kind {
+                    case "turn.accepted":
+                        guard includeAccepted, !turnId.isEmpty, turnId != "unknown", accepted[turnId] == nil,
+                              case .string(let stamp)? = row["ts"],
+                              let ts = Self.iso8601(stamp) else { continue }
+                        accepted[turnId] = Accepted(ts: ts,
+                            sessionId: Self.string(row["sessionId"]), surface: Self.string(row["surface"]))
+                    case "turn.terminal", "turn.cancelled", "turn.failed":
+                        terminalTurns.insert(turnId)
+                        if case .object(let payload)? = row["payload"],
+                           payload["status"] == .string("completed") || payload["status"] == .string("waiting") {
+                            replyReadyTurns.insert(turnId)
+                        }
+                    default:
+                        continue
+                    }
+                }
+            }
+            terminalIndex[path] = (terminalTurns, replyReadyTurns)
+        }
         for dayOffset in terminalOnlyDays + Array(scan.newestOffset...scan.oldestOffset) {
             guard let day = Self.dayCalendar.date(byAdding: .day, value: -dayOffset, to: today)
             else { continue }
             let path = lane.path(for: day)
-            // A MISSING day file is an empty day. An UNREADABLE one is not:
-            // a torn or transiently locked file could hide a real terminal or
-            // an accepted turn, so the sweep stops here and writes nothing —
-            // the cursor does not move, and the next sweep tries again
-            // (GPT-5.6 round review r3, 2026-09-11).
-            guard FileManager.default.fileExists(atPath: path.path) else { continue }
-            guard let handle = try? String(contentsOf: path, encoding: .utf8) else {
+            do {
+                try readDay(path, includeAccepted: dayOffset >= scan.newestOffset)
+                terminated.formUnion(terminalIndex[path]!.terminated)
+            } catch {
                 return Outcome(acceptedScanned: 0, reconciled: [], tooRecentToJudge: 0,
                                failure: "\(path.lastPathComponent) is unreadable")
-            }
-            for line in handle.split(separator: "\n", omittingEmptySubsequences: true) {
-                // Most rows are a turn's steps. Only a row naming a lifecycle
-                // kind can matter, so only those are parsed.
-                guard Self.lifecycleKinds.contains(where: { line.utf8.firstRange(of: $0.utf8) != nil }),
-                      let data = String(line).data(using: .utf8),
-                      let value = try? JSONValue.parse(data),
-                      case .object(let row) = value,
-                      case .string(let kind)? = row["kind"],
-                      case .string(let turnId)? = row["turnId"],
-                      !turnId.isEmpty, turnId != "unknown" else { continue }
-                switch kind {
-                case "turn.accepted":
-                    guard dayOffset >= scan.newestOffset else { continue }
-                    guard accepted[turnId] == nil else { continue }
-                    guard case .string(let stamp)? = row["ts"],
-                          let ts = Self.iso8601(stamp) else { continue }
-                    accepted[turnId] = Accepted(
-                        ts: ts,
-                        sessionId: Self.string(row["sessionId"]),
-                        surface: Self.string(row["surface"])
-                    )
-                case "turn.terminal", "turn.cancelled", "turn.failed":
-                    terminated.insert(turnId)
-                default:
-                    continue
-                }
             }
         }
 
         var tooRecent = 0
         var written: [String] = []
         var writeAttempts = 0
-        var persistenceFailure: String?
+        var persistenceFailures: [String] = []
         var deferred = false
         var resumable: [TurnCheckpoint] = []
         var checkpoints: [String: TurnCheckpoint] = [:]
+        var unreadableSessions: Set<String> = []
         do {
             let root = dataRoot.appendingPathComponent("chat/session_state")
             if FileManager.default.fileExists(atPath: root.path) {
-                for session in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
-                    for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: session.lastPathComponent) {
-                        let turnId = checkpoint.turnId
-                        checkpoints[turnId] = checkpoint
-                        if accepted[turnId] == nil {
-                            accepted[turnId] = Accepted(ts: checkpoint.acceptedAt,
-                                sessionId: checkpoint.sessionId, surface: checkpoint.surface)
+                for session in try FileManager.default.contentsOfDirectory(at: root,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
+                    do {
+                        let values = try session.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                        guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+                        for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: session.lastPathComponent) {
+                            let turnId = checkpoint.turnId
+                            checkpoints[turnId] = checkpoint
+                            if accepted[turnId] == nil {
+                                accepted[turnId] = Accepted(ts: checkpoint.acceptedAt,
+                                    sessionId: checkpoint.sessionId, surface: checkpoint.surface)
+                            }
                         }
+                    } catch {
+                        unreadableSessions.insert(session.lastPathComponent)
+                        persistenceFailures.append("Turn checkpoint is unreadable; repair chat/session_state/\(session.lastPathComponent) before resuming: \(error)")
                     }
                 }
             }
@@ -231,7 +236,8 @@ public struct AbandonedTurnReconciler: Sendable {
         }
         let candidates = accepted
             .filter { (!terminated.contains($0.key) || checkpoints[$0.key] != nil)
-                && !inFlightTurnIds.contains($0.key) }
+                && !inFlightTurnIds.contains($0.key)
+                && !unreadableSessions.contains($0.value.sessionId ?? "") }
             .sorted {
                 if (checkpoints[$0.key] != nil) != (checkpoints[$1.key] != nil) { return checkpoints[$0.key] != nil }
                 return $0.value.ts < $1.value.ts
@@ -249,11 +255,8 @@ public struct AbandonedTurnReconciler: Sendable {
                     let days = Set([row.ts, checkpoint.updatedAt, today].flatMap { day in
                         [day] + [-1, 1].compactMap { Self.dayCalendar.date(byAdding: .day, value: $0, to: day) }
                     }.map { lane.path(for: $0) })
-                    let traces = try days.compactMap { path -> String? in
-                        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-                        return try String(contentsOf: path, encoding: .utf8)
-                    }
-                    let hasTerminal = traces.contains { Self.containsTerminal(forTurn: turnId, in: $0) }
+                    for path in days { try readDay(path, includeAccepted: false) }
+                    let hasTerminal = days.contains { terminalIndex[$0]!.terminated.contains(turnId) }
                     if hasTerminal, checkpoint.deliveryPending, !checkpoint.hasRedeliveryOwner {
                         // A finished turn whose route cannot redeliver: the retirement row
                         // lands durably (deduped) before the file goes, so a kill between the
@@ -269,10 +272,10 @@ public struct AbandonedTurnReconciler: Sendable {
                         continue
                     }
                     let replyReady = checkpoint.deliveryPending
-                        && traces.contains { Self.containsTerminal(forTurn: turnId, in: $0, status: "completed") }
+                        && days.contains { terminalIndex[$0]!.replyReady.contains(turnId) }
                     if !hasTerminal || replyReady { resumable.append(checkpoint) }
                     else { try checkpoint.remove(dataRoot: dataRoot) }
-                } catch { persistenceFailure = "Cannot check checkpoint terminal: \(error)" }
+                } catch { persistenceFailures.append("Cannot check checkpoint terminal: \(error)") }
                 continue
             }
             guard writeAttempts < Self.maximumWritesPerPass else {
@@ -363,7 +366,7 @@ public struct AbandonedTurnReconciler: Sendable {
                     }
                 }
             } catch {
-                persistenceFailure = "guarded append failed: \(error)"
+                persistenceFailures.append("guarded append failed: \(error)")
                 FileHandle.standardError.write(
                     Data("TurnTracePersistLane: guarded append failed (turn \(turnId)): \(error)\n".utf8)
                 )
@@ -378,7 +381,7 @@ public struct AbandonedTurnReconciler: Sendable {
         // review, 2026-09-11).
         // A failed read/append or deferred candidate leaves the window pending.
         // Already confirmed terminals make the next pass idempotent.
-        if persistenceFailure == nil, !deferred, let newestScannedDay = Self.dayCalendar.date(
+        if persistenceFailures.isEmpty, !deferred, let newestScannedDay = Self.dayCalendar.date(
             byAdding: .day, value: -scan.newestOffset, to: today
         ) {
             writeCursor(day: newestScannedDay)
@@ -388,7 +391,7 @@ public struct AbandonedTurnReconciler: Sendable {
             reconciled: written,
             tooRecentToJudge: tooRecent,
             resumable: resumable,
-            failure: persistenceFailure
+            failure: persistenceFailures.isEmpty ? nil : persistenceFailures.joined(separator: "\n")
         )
     }
 

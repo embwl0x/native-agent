@@ -121,7 +121,7 @@ public actor MCPLiveCache {
     /// A force refresh reserves its generation before awaiting cancellation;
     /// older callers may return a result but cannot overwrite the current slot.
     private var keyGenerations: [String: UUID] = [:]
-    public var ttl: TimeInterval = 60
+    private let ttl: TimeInterval = 60
 
     public init() {}
 
@@ -233,17 +233,6 @@ public actor MCPLiveCache {
         }
     }
 
-    /// Test seam — clear all rows.
-    public func _clear() {
-        rows.removeAll()
-        inflight.removeAll()
-        keyGenerations.removeAll()
-    }
-
-    /// Test seam — set the TTL from outside the actor.
-    public func _setTTL(_ seconds: TimeInterval) {
-        ttl = seconds
-    }
 }
 
 extension SwiftNativeMCPDispatcher {
@@ -269,71 +258,75 @@ extension SwiftNativeMCPDispatcher {
         cached: Bool = true,
         pool: MCPSubprocessPool? = nil
     ) async throws -> [JSONValue] {
+        try await listCatalogLive(kind: "tools", serverId: serverId, cached: cached, pool: pool)
+    }
+
+    /// Live `resources/list` with the same transport and caching contract.
+    public func listResourcesLive(
+        forServer serverId: String,
+        cached: Bool = true,
+        pool: MCPSubprocessPool? = nil
+    ) async throws -> [JSONValue] {
+        try await listCatalogLive(kind: "resources", serverId: serverId, cached: cached, pool: pool)
+    }
+
+    private func listCatalogLive(
+        kind: String, serverId: String, cached: Bool, pool: MCPSubprocessPool?
+    ) async throws -> [JSONValue] {
         let servers = try await listServers()
         guard let server = servers.first(where: { $0.id == serverId }) else {
             throw MCPDispatcherError.serverNotFound(serverId)
         }
         guard server.transport == "stdio" || (server.transport == "http" && server.id != "searxng-local") else {
-            return try await cachedToolJSON(forServer: serverId)
+            return try await kind == "tools"
+                ? cachedToolJSON(forServer: serverId)
+                : cachedResourcesJSON(forServer: serverId)
         }
         let expectedIdentity = try server.executionIdentity()
-        let cacheKey = liveCacheKey(kind: "tools", server: server, executionIdentity: expectedIdentity, pool: pool)
+        let cacheKey = liveCacheKey(kind: kind, server: server, executionIdentity: expectedIdentity, pool: pool)
         let publicationKey = Self.cacheIdentity([toolsCachePath.standardizedFileURL.path, serverId])
-        let generation = await MCPToolsCachePublications.shared.reserve()
-        let fetch: @Sendable () async throws -> [JSONValue]
+        let generation = kind == "tools" ? await MCPToolsCachePublications.shared.reserve() : nil
+        let request: @Sendable () async throws -> [JSONValue]
         if server.transport == "stdio" {
             let activePool: MCPSubprocessPool
             if let p = pool { activePool = p }
             else { activePool = await Self.ensurePool(for: servers, root: root) }
-            fetch = {
+            request = {
                 let proc = try await activePool.get(serverId: serverId)
                 guard proc.executionIdentity == expectedIdentity,
                       try server.executionIdentity() == expectedIdentity else {
                     throw MCPDispatcherError.malformedResponse("MCP implementation changed before catalog discovery")
                 }
-                return try await MCPHTTPTransport.collectCatalogPages(key: "tools", serverId: serverId) { params in
-                    try await proc.request(method: "tools/list", params: params)
+                return try await MCPHTTPTransport.collectCatalogPages(key: kind, serverId: serverId) { params in
+                    try await proc.request(method: "\(kind)/list", params: params)
                 }
             }
         } else {
             let transport = try await genericHTTPTransport(for: server)
-            fetch = { try await transport.listTools() }
-        }
-        // F-B3 (2026-08-02): `mcp/cache/tools.json` is the ONLY producer of
-        // `mcp__<server>__<tool>` descriptors for the model (MCPToolBridge),
-        // and after the daemon was retired NOTHING wrote it — a working MCP
-        // server contributed zero tools with no error and no log. The
-        // handshake result is now stamped back to disk exactly where the
-        // daemon used to stamp it (see this file's header contract). `didFetch`
-        // makes the write happen on a REAL round-trip only, not on a memory
-        // cache hit.
-        let didFetch = _MCPLiveFetchFlag()
-        let tools: [JSONValue]
-        if !cached {
-            // Bug 7 fix (2026-05-31): route force-fresh through the cache
-            // actor's `forceFill` so it cancels/awaits any in-flight
-            // `getOrFill` for the same key before writing. Previously
-            // bypassing the cache entirely allowed a slow in-flight fill
-            // to clobber the newer force-fresh result on completion.
-            tools = try await MCPLiveCache.shared.forceFill(cacheKey) {
-                didFetch.mark()
-                await MCPToolsCachePublications.shared.begin(key: publicationKey, generation: generation)
-                return try await fetch()
-            }
-        } else {
-            tools = try await MCPLiveCache.shared.getOrFill(cacheKey) {
-                didFetch.mark()
-                await MCPToolsCachePublications.shared.begin(key: publicationKey, generation: generation)
-                return try await fetch()
+            request = {
+                try await kind == "tools" ? transport.listTools() : transport.listResources()
             }
         }
-        if didFetch.value {
+        // Only a tools round-trip may publish the model's on-disk catalog;
+        // memory hits and superseded fetches must not replace it.
+        let didFetch = generation == nil ? nil : _MCPLiveFetchFlag()
+        let fetch: @Sendable () async throws -> [JSONValue] = {
+            didFetch?.mark()
+            if let generation {
+                await MCPToolsCachePublications.shared.begin(key: publicationKey, generation: generation)
+            }
+            return try await request()
+        }
+        let items = try await cached
+            ? MCPLiveCache.shared.getOrFill(cacheKey, fill: fetch)
+            : MCPLiveCache.shared.forceFill(cacheKey, fill: fetch)
+        if let generation, didFetch?.value == true {
             try await persistToolsCache(
-                serverId: serverId, tools: tools,
+                serverId: serverId, tools: items,
                 publicationKey: publicationKey, generation: generation
             )
         }
-        return tools
+        return items
     }
 
     /// Force a live `tools/list` handshake and stamp `mcp/cache/tools.json`.
@@ -352,36 +345,6 @@ extension SwiftNativeMCPDispatcher {
         try await listToolsLive(forServer: serverId, cached: false, pool: pool).count
     }
 
-    /// Warm `mcp/cache/tools.json` for every bridgeable server. Per-server
-    /// failures are collected, NOT swallowed: the result maps serverId →
-    /// tool count on success or the error text on failure, and every failure
-    /// is also logged loudly to stderr. Never throws for one bad server —
-    /// one broken MCP server must not blind the model to the other five.
-    @discardableResult
-    public func refreshAllToolsCaches(
-        pool: MCPSubprocessPool? = nil
-    ) async -> [String: String] {
-        let servers = (try? await listServers()) ?? []
-        var report: [String: String] = [:]
-        for server in servers where server.status != "needs_setup" && server.status != "error" {
-            do {
-                let count = try await refreshToolsCache(forServer: server.id, pool: pool)
-                report[server.id] = "\(count)"
-                if count == 0 {
-                    FileHandle.standardError.write(Data(
-                        "MCPDispatcher: server '\(server.id)' completed tools/list but advertised ZERO tools — it will contribute no mcp__\(server.id)__* descriptors to the model.\n".utf8
-                    ))
-                }
-            } catch {
-                report[server.id] = "error: \(error)"
-                FileHandle.standardError.write(Data(
-                    "MCPDispatcher: tools-cache refresh FAILED for server '\(server.id)': \(error) — its tools stay invisible to the model.\n".utf8
-                ))
-            }
-        }
-        return report
-    }
-
     /// Merge one server's live descriptors into `mcp/cache/tools.json`.
     /// The path lock spans the whole read-modify-write across instances; the
     /// refresh ordinal prevents an older same-server result replacing a newer one.
@@ -390,7 +353,7 @@ extension SwiftNativeMCPDispatcher {
     ) async throws {
         let path = toolsCachePath
         let persistence = persistence
-        let stamp = Self.isoTimestamp(clockNow)
+        let stamp = Self.isoTimestamp(Date())
         do {
             try await persistence.withFileLock(path) {
                 let existing = try await persistence.readJSON(path, ifMissing: .object([:]))
@@ -427,47 +390,6 @@ final class _MCPLiveFetchFlag: @unchecked Sendable {
 }
 
 extension SwiftNativeMCPDispatcher {
-
-    /// Live `resources/list` against stdio or generic HTTP. Same caching contract
-    /// as `listToolsLive`.
-    public func listResourcesLive(
-        forServer serverId: String,
-        cached: Bool = true,
-        pool: MCPSubprocessPool? = nil
-    ) async throws -> [JSONValue] {
-        let servers = try await listServers()
-        guard let server = servers.first(where: { $0.id == serverId }) else {
-            throw MCPDispatcherError.serverNotFound(serverId)
-        }
-        guard server.transport == "stdio" || (server.transport == "http" && server.id != "searxng-local") else {
-            return try await cachedResourcesJSON(forServer: serverId)
-        }
-        let expectedIdentity = try server.executionIdentity()
-        let cacheKey = liveCacheKey(kind: "resources", server: server, executionIdentity: expectedIdentity, pool: pool)
-        let fetch: @Sendable () async throws -> [JSONValue]
-        if server.transport == "stdio" {
-            let activePool: MCPSubprocessPool
-            if let p = pool { activePool = p }
-            else { activePool = await Self.ensurePool(for: servers, root: root) }
-            fetch = {
-                let proc = try await activePool.get(serverId: serverId)
-                guard proc.executionIdentity == expectedIdentity,
-                      try server.executionIdentity() == expectedIdentity else {
-                    throw MCPDispatcherError.malformedResponse("MCP implementation changed before catalog discovery")
-                }
-                return try await MCPHTTPTransport.collectCatalogPages(key: "resources", serverId: serverId) { params in
-                    try await proc.request(method: "resources/list", params: params)
-                }
-            }
-        } else {
-            let transport = try await genericHTTPTransport(for: server)
-            fetch = { try await transport.listResources() }
-        }
-        if !cached {
-            return try await MCPLiveCache.shared.forceFill(cacheKey, fill: fetch)
-        }
-        return try await MCPLiveCache.shared.getOrFill(cacheKey, fill: fetch)
-    }
 
     /// Live `tools/call` against an stdio server. Sends a JSON-RPC
     /// `tools/call` and returns the raw `result` object exactly as the child
@@ -603,7 +525,7 @@ extension SwiftNativeMCPDispatcher {
     ) async throws -> JSONValue {
         switch toolName {
         case "capabilities.summary":
-            let summary = try await makeCapabilityFoundryClient(root: root).capabilityFoundrySummary()
+            let summary = try await SwiftNativeCapabilityFoundryClient(root: root).capabilityFoundrySummary()
             return Self.okMCPResult(Self.compactCapabilitySummaryJSON(summary))
         case "graph.search":
             let query = Self.stringArgument(arguments, key: "query")
@@ -671,7 +593,7 @@ extension SwiftNativeMCPDispatcher {
         guard server.id == "searxng-local" else {
             throw MCPSubprocessError.unsupportedTransport(server.transport)
         }
-        let client = makeResearchClient(dataRoot: root)
+        let client = SwiftNativeResearchClient(dataRoot: root)
         switch toolName {
         case "search":
             let query = Self.stringArgument(arguments, key: "query")
@@ -790,11 +712,4 @@ extension SwiftNativeMCPDispatcher {
         return pool
     }
 
-    static func extractArray(_ result: JSONValue, key: String) -> [JSONValue] {
-        if case .object(let obj) = result, case .array(let arr) = obj[key] ?? .null {
-            return arr
-        }
-        if case .array(let arr) = result { return arr }
-        return []
-    }
 }

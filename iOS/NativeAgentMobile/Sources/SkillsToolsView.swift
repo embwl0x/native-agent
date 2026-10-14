@@ -27,16 +27,6 @@ enum ToolCatalogPresentation {
         return .content
     }
 
-    static func visibleTools(_ tools: [ToolRecord], query: String) -> [ToolRecord] {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return tools }
-        return tools.filter {
-            $0.name.localizedCaseInsensitiveContains(needle)
-                || ($0.description?.localizedCaseInsensitiveContains(needle) ?? false)
-                || ($0.kind?.localizedCaseInsensitiveContains(needle) ?? false)
-        }
-    }
-
     static func status(for tool: ToolRecord) -> Status {
         guard let raw = tool.status?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return .unknown
@@ -160,15 +150,18 @@ private struct MobileToolCatalogView: View {
     let accessory: AnyView
     @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = MobileToolCatalogStore()
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var searchText = ""
+    @State private var searchIndex = MobileSearchIndex<ToolRecord>()
+    @State private var searchResults: [ToolRecord] = []
 
     private var visibleTools: [ToolRecord] {
-        ToolCatalogPresentation.visibleTools(store.tools, query: searchText)
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? store.tools : searchResults
     }
 
     var body: some View {
-        AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
+        let visibleTools = visibleTools
+        return AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
                  freshnessGroup: "tools_snapshot", accessory: accessory) {
             switch ToolCatalogPresentation.contentState(
                 isLoading: store.isLoading,
@@ -209,6 +202,14 @@ private struct MobileToolCatalogView: View {
                     .padding(.top, 6)
                     .padding(.bottom, 8)
             }
+        }
+        .task(id: MobileSearchInput(rows: store.tools, query: searchText)) {
+            let input = MobileSearchInput(rows: store.tools, query: searchText.trimmingCharacters(in: .whitespacesAndNewlines))
+            let result = await searchIndex.search(input, maximum: input.rows.count,
+                fields: { [$0.name, $0.description ?? "", $0.kind ?? ""] },
+                matches: { $0.localizedCaseInsensitiveContains($1) })
+            guard !Task.isCancelled else { return }
+            searchResults = result
         }
         .refreshable {
             await store.refresh(pairingStore: pairingStore)

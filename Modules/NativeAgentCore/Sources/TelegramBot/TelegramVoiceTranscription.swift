@@ -22,11 +22,6 @@ public struct TelegramVoiceTranscription: Sendable, Codable, Equatable {
     }
 }
 
-public protocol TelegramVoiceTranscribing: Sendable {
-    var hasSpeechPermission: Bool { get }
-    func transcribe(_ attachment: TelegramMediaAttachment) async throws -> TelegramVoiceTranscription
-}
-
 public enum TelegramVoiceTranscriptionBackends {
     public static let appleSpeech = "apple_speech"
     public static let appleSpeechModel = "apple-speech"
@@ -196,42 +191,14 @@ struct TelegramPreparedVoiceAudio: Sendable {
 enum TelegramVoiceAudioPreparer {
     static let speechReadableExtensions: Set<String> = ["aif", "aiff", "caf", "m4a", "mp3", "mp4", "wav"]
 
-    /// The production transcode path. The optional seams keep its failure
-    /// contract testable without consulting a host's AVFoundation/ffmpeg
-    /// installation; production always supplies the real converters.
     static func prepareSpeechURL(
-        _ attachment: TelegramMediaAttachment,
-        temporaryDirectory: URL? = nil,
-        avFoundationTranscoder: (@Sendable (URL, URL) async throws -> Void)? = nil,
-        ffmpegLocator: (@Sendable () -> URL?)? = nil,
-        ffmpegTranscoder: (@Sendable (URL, URL, URL) async throws -> Void)? = nil
-    ) async throws -> TelegramPreparedVoiceAudio {
-        try await prepareURL(
-            attachment,
-            readableExtensions: speechReadableExtensions,
-            missingConverterMessage: "Telegram OGG/Opus audio is not readable by AVFoundation on this Mac, and no ffmpeg binary was found",
-            temporaryDirectory: temporaryDirectory,
-            avFoundationTranscoder: avFoundationTranscoder,
-            ffmpegLocator: ffmpegLocator,
-            ffmpegTranscoder: ffmpegTranscoder
-        )
-    }
-
-    private static func prepareURL(
-        _ attachment: TelegramMediaAttachment,
-        readableExtensions: Set<String>,
-        missingConverterMessage: String,
-        temporaryDirectory: URL? = nil,
-        avFoundationTranscoder: (@Sendable (URL, URL) async throws -> Void)? = nil,
-        ffmpegLocator: (@Sendable () -> URL?)? = nil,
-        ffmpegTranscoder: (@Sendable (URL, URL, URL) async throws -> Void)? = nil
+        _ attachment: TelegramMediaAttachment
     ) async throws -> TelegramPreparedVoiceAudio {
         guard let bytes = attachment.bytes, !bytes.isEmpty else {
             throw TelegramVoiceTranscriptionError.missingAudioBytes
         }
-        let tempRoot = temporaryDirectory
-            ?? FileManager.default.temporaryDirectory
-                .appendingPathComponent(InstallPaths.current.name("nativeagent-telegram-voice"), isDirectory: true)
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(InstallPaths.current.name("nativeagent-telegram-voice"), isDirectory: true)
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         let id = UUID().uuidString
         let inputExt = fileExtension(for: attachment.captureFilename) ?? fileExtension(forMIMEType: attachment.mimeType) ?? "oga"
@@ -240,30 +207,23 @@ enum TelegramVoiceAudioPreparer {
         do {
             try bytes.write(to: input, options: .atomic)
 
-            if readableExtensions.contains(inputExt) {
+            if speechReadableExtensions.contains(inputExt) {
                 return TelegramPreparedVoiceAudio(url: input, cleanupURLs: [input])
             }
 
-            let avTranscode = avFoundationTranscoder ?? { input, output in
-                try await transcodeWithAVFoundation(input: input, output: output)
-            }
             do {
-                try await avTranscode(input, output)
+                try await transcodeWithAVFoundation(input: input, output: output)
                 return TelegramPreparedVoiceAudio(url: output, cleanupURLs: [input, output])
             } catch {
                 try? FileManager.default.removeItem(at: output)
             }
 
-            let locateFFmpeg = ffmpegLocator ?? { ffmpegURL() }
-            guard let ffmpeg = locateFFmpeg() else {
+            guard let ffmpeg = ffmpegURL() else {
                 throw TelegramVoiceTranscriptionError.conversionFailed(
-                    missingConverterMessage
+                    "Telegram OGG/Opus audio is not readable by AVFoundation on this Mac, and no ffmpeg binary was found"
                 )
             }
-            let ffmpegTranscode = ffmpegTranscoder ?? { ffmpeg, input, output in
-                try await transcodeWithFFmpeg(ffmpeg: ffmpeg, input: input, output: output)
-            }
-            try await ffmpegTranscode(ffmpeg, input, output)
+            try await transcodeWithFFmpeg(ffmpeg: ffmpeg, input: input, output: output)
             return TelegramPreparedVoiceAudio(url: output, cleanupURLs: [input, output])
         } catch {
             // A failed preparation never reaches the caller's deferred
@@ -435,15 +395,11 @@ enum TelegramVoiceAudioPreparer {
 /// Speech framework. Telegram OGG/Opus files are converted to M4A before
 /// recognition because SFSpeechRecognizer consumes file URLs in system audio
 /// formats, not raw Telegram voice-note containers.
-public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
-    public var hasSpeechPermission: Bool { speechAuthorizationStatus() == .authorized }
+public final class SwiftAppleSpeechTranscriber: Sendable {
+    public var hasSpeechPermission: Bool { SFSpeechRecognizer.authorizationStatus() == .authorized }
     private let localeIdentifier: String
     private let preferOnDevice: Bool
     private let timeoutNanoseconds: UInt64
-    /// Read-only authorization seam. Production uses the system status reader;
-    /// the injectable form lets the headless denial boundary be exercised
-    /// without changing a machine's TCC state.
-    private let speechAuthorizationStatus: @Sendable () -> SFSpeechRecognizerAuthorizationStatus
     /// Words the recognizer should expect, read per note (the agent's name).
     private let contextualStrings: @Sendable () -> [String]
 
@@ -451,15 +407,11 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
         localeIdentifier: String = Locale.current.identifier,
         preferOnDevice: Bool = false,
         timeoutSeconds: TimeInterval = 45,
-        speechAuthorizationStatus: @escaping @Sendable () -> SFSpeechRecognizerAuthorizationStatus = {
-            SFSpeechRecognizer.authorizationStatus()
-        },
         contextualStrings: @escaping @Sendable () -> [String] = { [] }
     ) {
         self.localeIdentifier = localeIdentifier
         self.preferOnDevice = preferOnDevice
         self.timeoutNanoseconds = UInt64(max(1, timeoutSeconds) * 1_000_000_000)
-        self.speechAuthorizationStatus = speechAuthorizationStatus
         self.contextualStrings = contextualStrings
     }
 
@@ -574,7 +526,7 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
     }
 
     private func validateSpeechAuthorization() throws {
-        let status = speechAuthorizationStatus()
+        let status = SFSpeechRecognizer.authorizationStatus()
         guard status == .authorized else {
             throw TelegramVoiceTranscriptionError.speechPermissionDenied(Self.authorizationLabel(status))
         }

@@ -1,22 +1,8 @@
 import Foundation
 
-// MARK: - Clock seam
+// MARK: - Clock
 
-/// The watcher's only source of "now".
-///
-/// Injectable because the alternative is untestable: the real capture path
-/// cannot be exercised on a locked machine (no window server, no AX), so the
-/// span state machine has to be drivable from a scripted timeline instead. A
-/// `ManualActivityClock` plus `ActivitySpanEngine` reproduces the live spans
-/// exactly, because the live watcher runs the SAME engine — not a copy of it.
-public protocol ActivityClock: Sendable {
-    /// Seconds since the epoch. May jump backwards (NTP, manual set).
-    func wallNow() -> Double
-    /// Monotonic seconds. Never jumps backwards; does NOT advance across sleep.
-    func monotonicNow() -> Double
-}
-
-public struct SystemActivityClock: ActivityClock {
+public struct SystemActivityClock: Sendable {
     public init() {}
 
     public func wallNow() -> Double { Date().timeIntervalSince1970 }
@@ -29,52 +15,9 @@ public struct SystemActivityClock: ActivityClock {
     }
 }
 
-/// Test/simulation clock. Wall and monotonic advance independently so a
-/// backwards wall step, or a sleep (wall advances, monotonic does not), can be
-/// scripted exactly.
-public final class ManualActivityClock: ActivityClock, @unchecked Sendable {
-    private let lock = NSLock()
-    private var wall: Double
-    private var monotonic: Double
-
-    public init(wall: Double, monotonic: Double = 0) {
-        self.wall = wall
-        self.monotonic = monotonic
-    }
-
-    public func wallNow() -> Double {
-        lock.lock(); defer { lock.unlock() }
-        return wall
-    }
-
-    public func monotonicNow() -> Double {
-        lock.lock(); defer { lock.unlock() }
-        return monotonic
-    }
-
-    /// Both clocks advance together — ordinary time passing.
-    public func advance(_ seconds: Double) {
-        lock.lock(); defer { lock.unlock() }
-        wall += seconds
-        monotonic += seconds
-    }
-
-    /// Wall advances, monotonic does not: the machine was asleep.
-    public func sleep(_ seconds: Double) {
-        lock.lock(); defer { lock.unlock() }
-        wall += seconds
-    }
-}
-
 // MARK: - Input vocabulary
 
 /// Everything that can move the span state machine.
-///
-/// This is the *whole* input surface. The live watcher translates NSWorkspace
-/// notifications, AX observer callbacks and its 60 s tick into exactly these
-/// cases and does no span reasoning of its own; a scripted timeline builds the
-/// same cases directly. That is what makes the simulation load-bearing rather
-/// than decorative.
 public enum ActivityInputEvent: Sendable, Equatable {
     /// Frontmost app changed (or was seeded at start / after unlock).
     case activate(bundleId: String, appName: String, at: Double)
@@ -92,20 +35,8 @@ public enum ActivityInputEvent: Sendable, Equatable {
     case wake(at: Double)
     /// The observed app quit, or the watcher is shutting down cleanly.
     case terminate(at: Double)
-    /// The PROCESS died without a chance to close anything. Emits no close —
-    /// the open row stays open and startup reconciliation owns it.
-    case crash(at: Double)
     /// The 60 s liveness tick with nothing else to report.
     case heartbeat(at: Double)
-
-    public var timestamp: Double {
-        switch self {
-        case .activate(_, _, let at), .focusEvent(let at), .titleChange(_, let at),
-             .idle(let at), .lock(let at), .unlock(let at), .sleep(let at),
-             .wake(let at), .terminate(let at), .crash(let at), .heartbeat(let at):
-            return at
-        }
-    }
 }
 
 /// What the engine wants written. Deliberately mirrors `ActivitySpanStore`'s
@@ -125,13 +56,12 @@ public enum ActivityStoreCommand: Sendable, Equatable {
 
 // MARK: - The state machine
 
-/// THE span state machine. One copy, used by both the live watcher and the
-/// simulator.
+/// The span state machine driven by the live watcher.
 ///
 /// Invariants it exists to hold (build plan W1/W2/W3):
 ///
 ///  * every `open` has exactly one `close`, and `close_reason` says which path
-///    closed it — except a `crash`, which by definition emits none and is
+///    closed it — except a process crash, which emits none and is
 ///    settled by `reconcileAbandoned` at next start;
 ///  * lock and sleep CLOSE the open span at the boundary and write NOTHING
 ///    until unlock/wake — while locked, AX returns plausible garbage (the P0
@@ -172,28 +102,20 @@ public struct ActivitySpanEngine: Sendable {
     public private(set) var isGated: Bool
     /// Highest timestamp already emitted. The monotonic floor for everything.
     public private(set) var lastEmittedAt: Double
-    /// Set by `.crash`; the next processed event emits `.reconcileAbandoned`.
-    public private(set) var needsReconcile: Bool
 
     private var lockedByLock = false
     private var lockedBySleep = false
     private let tzOffsetMin: Int
-    private let makeID: @Sendable () -> String
 
     public init(
         policy: ActivityPolicy,
-        tzOffsetMin: Int = ActivitySpan.currentTZOffsetMinutes(),
-        startedGated: Bool = false,
-        makeID: @escaping @Sendable () -> String = { UUID().uuidString }
+        tzOffsetMin: Int = ActivitySpan.currentTZOffsetMinutes()
     ) {
         self.policy = policy
         self.tzOffsetMin = tzOffsetMin
         self.openSpan = nil
-        self.isGated = startedGated
-        self.lockedByLock = startedGated
+        self.isGated = false
         self.lastEmittedAt = 0
-        self.needsReconcile = false
-        self.makeID = makeID
     }
 
     /// Swap the policy mid-flight (the user edited exclusions). If the app whose
@@ -236,28 +158,13 @@ public struct ActivitySpanEngine: Sendable {
     }
 
     /// Startup: settle anything a prior process left open.
-    public mutating func startupReconcile() -> [ActivityStoreCommand] {
-        needsReconcile = false
-        return [.reconcileAbandoned]
+    public func startupReconcile() -> [ActivityStoreCommand] {
+        [.reconcileAbandoned]
     }
 
     // MARK: Event processing
 
     public mutating func process(_ event: ActivityInputEvent) -> [ActivityStoreCommand] {
-        var commands: [ActivityStoreCommand] = []
-        if needsReconcile {
-            needsReconcile = false
-            commands.append(.reconcileAbandoned)
-        }
-        commands.append(contentsOf: handle(event))
-        return commands
-    }
-
-    public mutating func process(_ events: [ActivityInputEvent]) -> [ActivityStoreCommand] {
-        events.flatMap { process($0) }
-    }
-
-    private mutating func handle(_ event: ActivityInputEvent) -> [ActivityStoreCommand] {
         switch event {
         case .activate(let bundleId, let appName, let at):
             return handleActivate(bundleId: bundleId, appName: appName, at: at)
@@ -298,14 +205,6 @@ public struct ActivitySpanEngine: Sendable {
 
         case .terminate(let at):
             return [closeCurrent(reason: .quit, at: at)].compactMap { $0 }
-
-        case .crash(let at):
-            // NO close command. The row stays open with its last_seen_at, and
-            // startup reconciliation closes it there and marks it `abandoned`.
-            bump(at)
-            openSpan = nil
-            needsReconcile = true
-            return []
 
         case .heartbeat(let at):
             guard !isGated, let span = openSpan else { return [] }
@@ -418,7 +317,7 @@ public struct ActivitySpanEngine: Sendable {
         // let a new span start before the close that just happened.
         let start = clamp(at)
         let span = ActivitySpan(
-            id: makeID(),
+            id: UUID().uuidString,
             startedAt: start,
             endedAt: nil,
             lastSeenAt: start,

@@ -545,11 +545,12 @@ extension NativeCognitionRuntime {
         // What a builder he trusts shipped in his projects, that he likely has
         // not seen: Codex works on its own; Claude works with him, so only
         // what she logged during his quiet hours. Features only; the newest.
-        let root = dataRoot
+        let quietWindow = TurnQuietHoursWindow.read(dataRoot: dataRoot)
+        let calendar = Calendar.current
         let builders: [(name: String, lane: String, shipped: [(Date, String)], why: String)] = [
             ("Claude", "claude",
              Self.claudeShipped(Self.defaultClaudeWorklog(), kinds: ["feature"])
-                .filter { host.inQuietHours(at: $0.0, dataRoot: root) },
+                .filter { quietWindow?.contains(hour: calendar.component(.hour, from: $0.0)) == true },
              "Claude shipped it during \(person)'s quiet hours, so he likely hasn't seen it; you could make it short and human"),
             ("Codex", "codex", Self.codexShipped(Self.defaultCodexRecord()),
              "Codex works on its own, so \(person) may not have seen it; you could make it short and human"),

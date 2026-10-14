@@ -1,9 +1,9 @@
 import Foundation
 
 public enum SwiftCodexDeviceLoginManager {
-    public static func augmentedPath(_ existing: String?) -> String {
+    static var executableSearchDirectories: [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let additions = [
+        return [
             "\(home)/.local/bin",
             "\(home)/bin",
             "\(home)/.cargo/bin",
@@ -14,8 +14,11 @@ public enum SwiftCodexDeviceLoginManager {
             "/usr/sbin",
             "/sbin",
         ]
+    }
+
+    public static func augmentedPath(_ existing: String?) -> String {
         var parts = (existing ?? "").split(separator: ":").map(String.init)
-        for addition in additions where !parts.contains(addition) {
+        for addition in executableSearchDirectories where !parts.contains(addition) {
             parts.append(addition)
         }
         return parts.joined(separator: ":")
@@ -39,12 +42,5 @@ public enum SwiftCodexDeviceLoginManager {
         throw NSError(domain: "NativeAgentSwiftOnly", code: -2, userInfo: [
             NSLocalizedDescriptionKey: "Could not find an executable codex CLI. Install codex or set NATIVE_AGENT_CODEX_BIN."
         ])
-    }
-
-    /// Finder-launched apps need an augmented PATH to find Homebrew/cargo installs.
-    public static func codexIsResolvable() -> Bool {
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = augmentedPath(environment["PATH"])
-        return (try? resolveCodexExecutable(environment: environment)) != nil
     }
 }

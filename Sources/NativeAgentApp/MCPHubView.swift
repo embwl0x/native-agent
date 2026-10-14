@@ -1,4 +1,6 @@
 import SwiftUI
+import NativeAgentShared
+import AppToolRuntime
 import PersistenceCore
 import MCPDispatcher
 
@@ -62,7 +64,7 @@ struct MCPHubConsentSection: View {
 
     @ViewBuilder
     private var consentRows: some View {
-        AliveGroupCard {
+        AliveGroupCard(lazy: true) {
             ForEach(appModel.mcpConsent) { consent in
                 MCPHubConsentRow(consent: consent)
             }
@@ -128,50 +130,12 @@ private struct MCPHubConsentRow: View {
 // List, no Section chrome, no material of its own — the frame owns the room.
 struct MCPHubView: View {
     @Environment(AppModel.self) private var appModel
-
-    // Per-tool form state. Keyed by (tool.name, schemaFingerprint) so a
-    // schema change for a same-named tool invalidates the dict in lockstep
-    // with the form's SwiftUI identity below. gpt-5.5 v2 review caught the
-    // bug where the form reset its @State on schema change but the Run
-    // button still read perToolValues[tool.name] holding old/wrong-typed args.
-    @State private var perToolValues: [String: [String: JSONValue]] = [:]
-    @State private var expandedTool: Set<String> = []
-    @State private var inputValidationErrors: [String: String] = [:]
-    @State private var perToolParseErrors: [String: [String: String]] = [:]
-    @State private var perToolDrafts: [String: MCPInputSchemaForm.Draft] = [:]
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private func valuesKey(for tool: MCPTool) -> String {
-        "\(tool.name)|\(schemaFingerprint(tool.inputSchema))"
-    }
-
-    private func binding(for tool: MCPTool) -> Binding<[String: JSONValue]> {
-        let key = valuesKey(for: tool)
-        return Binding(
-            get: { perToolValues[key] ?? [:] },
-            set: {
-                perToolValues[key] = $0
-                inputValidationErrors.removeValue(forKey: key)
-            }
-        )
-    }
-
-    /// Stable in-process fingerprint of a JSON Schema, used as part of the
-    /// form's SwiftUI identity so a schema change forces a fresh @State scope.
-    /// Falls back to "nil" / "0" if the schema isn't serializable (shouldn't
-    /// happen for well-formed JSONValue but we don't want to crash on it).
-    private func schemaFingerprint(_ schema: JSONValue?) -> String {
-        guard let schema = schema else { return "nil" }
-        guard let data = try? schema.serializedData(pretty: false) else { return "unhashable" }
-        // String.hashValue is per-process-seeded; that's fine — view identity
-        // only matters within a process, and equal schemas in one process
-        // always produce equal hashes.
-        return "\(data.count)-\(String(data: data, encoding: .utf8)?.hashValue ?? 0)"
-    }
+    @State private var drafts: [String: MCPHubToolDraft] = [:]
+    @State private var draftServer: String?
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 24) {
                 serversSection
                 toolsSection
                 resourcesSection
@@ -188,21 +152,17 @@ struct MCPHubView: View {
             }
             .accessibilityLabel("Refresh MCP connections")
         }
-        // gpt-5.5 review: dropped the child .task here — ContentView's parent
-        // task at line ~125 already fires refreshForSidebarItem(selection) on
-        // appear and on selection change. The child .task was a redundant
-        // refresh that widened the stale-result race window.
-        .onChange(of: appModel.selectedMCPServerId) { _, _ in
-            // gpt-5.5 review: per-tool form state is keyed only by tool.name;
-            // switching servers can preserve stale expanded/values entries and
-            // even submit one server's args against a same-named tool on the
-            // other server. Clear both on server change. (state-lifecycle:
-            // every add path needs a remove path.)
-            perToolValues.removeAll()
-            expandedTool.removeAll()
-            inputValidationErrors.removeAll()
-            perToolParseErrors.removeAll()
-            perToolDrafts.removeAll()
+        .onChange(of: appModel.mcpTools, initial: true) { _, _ in refreshDrafts() }
+        .onChange(of: appModel.selectedMCPServerId) { _, _ in refreshDrafts() }
+    }
+
+    private func refreshDrafts() {
+        if draftServer != appModel.selectedMCPServerId {
+            drafts = [:]
+            draftServer = appModel.selectedMCPServerId
+        }
+        for tool in appModel.mcpTools where drafts[tool.name]?.schema != tool.inputSchema || drafts[tool.name] == nil {
+            drafts[tool.name] = MCPHubToolDraft(schema: tool.inputSchema)
         }
     }
 
@@ -235,7 +195,7 @@ struct MCPHubView: View {
     }
 
     private var serverRows: some View {
-        AliveGroupCard {
+        AliveGroupCard(lazy: true) {
             ForEach(appModel.mcpServers) { server in
                 serverRow(server)
             }
@@ -351,97 +311,17 @@ struct MCPHubView: View {
                 .accessibilityIdentifier(notice.isFailure ? "mcp.tools.unavailable" : "mcp.tools.empty-or-loading")
             }
             if notice.showsTools, !appModel.mcpTools.isEmpty {
-                AliveGroupCard {
+                AliveGroupCard(lazy: true) {
                     ForEach(appModel.mcpTools) { tool in
-                        toolRow(tool)
-                    }
-                }
-            }
-        }
-    }
-
-    private func toolRow(_ tool: MCPTool) -> some View {
-        let isExpanded = expandedTool.contains(tool.name)
-        return MCPCard {
-            HStack(alignment: .top, spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(tool.name)
-                        .font(ShellType.labelSemibold.monospaced())
-                        .foregroundStyle(NativeAgentShell.text)
-                    if let description = tool.description, !description.isEmpty {
-                        Text(description)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                Spacer(minLength: 8)
-                Button(isExpanded ? "Hide" : "Edit") {
-                    withAnimation(
-                        NativeAgentMotion.respecting(
-                            NativeAgentMotion.spring,
-                            reduceMotion: reduceMotion
-                        )
-                    ) {
-                        if isExpanded { expandedTool.remove(tool.name) } else { expandedTool.insert(tool.name) }
-                    }
-                }
-                .buttonStyle(.bordered)
-            }
-            if isExpanded {
-                let consentRisk = appModel.selectedMCPServer.map {
-                    appModel.mcpConsentRisk(server: $0, toolName: tool.name)
-                }
-                // Values, drafts and parse errors share the schema key so
-                // hiding the form preserves them together.
-                let key = valuesKey(for: tool)
-                MCPInputSchemaForm(schema: tool.inputSchema, values: binding(for: tool), jsonErrors: Binding(
-                    get: { perToolParseErrors[key] ?? [:] },
-                    set: { perToolParseErrors[key] = $0 }
-                ), draft: Binding(
-                    get: { perToolDrafts[key] ?? .init() },
-                    set: { perToolDrafts[key] = $0 }
-                ))
-                    .id(key)
-                if let consentRisk {
-                    Text("Consent risk: \(consentRisk)")
-                        .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                }
-                HStack {
-                    Button("Grant consent") {
-                        guard let server = appModel.selectedMCPServer else { return }
-                        Task { await appModel.grantMCPConsent(server: server, toolName: tool.name, risk: consentRisk) }
-                    }
-                    Button("Run") {
-                        guard (perToolParseErrors[key] ?? [:]).isEmpty else { return }
-                        guard let server = appModel.selectedMCPServer else { return }
-                        let input = perToolValues[key] ?? [:]
-                        if let validation = MCPInputSchemaForm.validationMessage(
-                            schema: tool.inputSchema,
-                            values: input
-                        ) {
-                            inputValidationErrors[key] = validation
-                            return
+                        if let draft = drafts[tool.name] {
+                            MCPHubToolRow(tool: tool, form: draft)
+                                .id(ObjectIdentifier(draft))
                         }
-                        inputValidationErrors.removeValue(forKey: key)
-                        Task { await appModel.callMCPToolWithInput(server: server, tool: tool, input: input) }
                     }
-                    .disabled(!(perToolParseErrors[key] ?? [:]).isEmpty)
-                    Spacer(minLength: 0)
                 }
-                .buttonStyle(.bordered)
-                if let validation = inputValidationErrors[key] {
-                    Text(validation)
-                        .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.trouble)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                        .accessibilityIdentifier("mcp.tool.input.invalid.\(tool.name)")
-                }
+                .id(appModel.selectedMCPServerId)
             }
         }
-        .contentShape(Rectangle())
     }
 
     // MARK: - Resources
@@ -465,7 +345,7 @@ struct MCPHubView: View {
                     resourceCount: appModel.mcpResources.count
                 )!.text)
             case .current:
-                AliveGroupCard {
+                AliveGroupCard(lazy: true) {
                 ForEach(appModel.mcpResources) { resource in
                     MCPCard {
                         Text(resource.name ?? resource.uri)
@@ -633,6 +513,104 @@ private enum MCPHubWords {
     }
 }
 
+@Observable
+private final class MCPHubToolDraft {
+    let schema: JSONValue?
+    var isExpanded = false
+    var values: [String: JSONValue] = [:]
+    var parseErrors: [String: String] = [:]
+    var draft = MCPInputSchemaForm.Draft()
+    var validationError: String?
+
+    init(schema: JSONValue?) { self.schema = schema }
+}
+
+private struct MCPHubToolRow: View {
+    @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let tool: MCPTool
+    @Bindable var form: MCPHubToolDraft
+
+    var body: some View {
+        MCPCard {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(tool.name)
+                        .font(ShellType.labelSemibold.monospaced())
+                        .foregroundStyle(NativeAgentShell.text)
+                    if let description = tool.description, !description.isEmpty {
+                        Text(description)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 8)
+                Button(form.isExpanded ? "Hide" : "Edit") {
+                    withAnimation(
+                        NativeAgentMotion.respecting(
+                            NativeAgentMotion.spring,
+                            reduceMotion: reduceMotion
+                        )
+                    ) {
+                        form.isExpanded.toggle()
+                    }
+                }
+                .buttonStyle(.bordered)
+            }
+            if form.isExpanded {
+                let consentRisk = appModel.selectedMCPServer.map {
+                    appModel.mcpConsentRisk(server: $0, toolName: tool.name)
+                }
+                MCPInputSchemaForm(schema: tool.inputSchema, values: Binding(
+                    get: { form.values },
+                    set: {
+                        form.values = $0
+                        form.validationError = nil
+                    }
+                ), jsonErrors: $form.parseErrors, draft: $form.draft)
+                if let consentRisk {
+                    Text("Consent risk: \(consentRisk)")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                }
+                HStack {
+                    Button("Grant consent") {
+                        guard let server = appModel.selectedMCPServer else { return }
+                        Task { await appModel.grantMCPConsent(server: server, toolName: tool.name, risk: consentRisk) }
+                    }
+                    Button("Run") {
+                        guard form.parseErrors.isEmpty else { return }
+                        guard let server = appModel.selectedMCPServer else { return }
+                        let input = form.values
+                        if let validation = MCPUIActions.validationMessage(
+                            schema: tool.inputSchema,
+                            values: input
+                        ) {
+                            form.validationError = validation
+                            return
+                        }
+                        form.validationError = nil
+                        Task { await appModel.callMCPToolWithInput(server: server, tool: tool, input: input) }
+                    }
+                    .disabled(!form.parseErrors.isEmpty)
+                    Spacer(minLength: 0)
+                }
+                .buttonStyle(.bordered)
+                if let validation = form.validationError {
+                    Text(validation)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("mcp.tool.input.invalid.\(tool.name)")
+                }
+            }
+        }
+        .contentShape(Rectangle())
+    }
+}
+
 /// One row of a list. Alive glass (2026-09-23): rows carry no chrome; the
 /// list's `AliveGroupCard` is the card. A selected row takes the next fill
 /// rung, reaching out into the card's row inset.
@@ -676,4 +654,361 @@ private struct MCPNote: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 2)
     }
+}
+
+/// Server metadata can lag the inventory already displayed below its row.
+/// Only the selected server's successful read proves a current visible count.
+enum MCPHubServerCountPresentation: Equatable {
+    case loaded(Int)
+    case reported(Int)
+    case unknown
+
+    static func resolve(
+        isSelected: Bool,
+        isCurrent: Bool,
+        visibleCount: Int,
+        reportedCount: Int?
+    ) -> Self {
+        if isSelected, isCurrent { return .loaded(visibleCount) }
+        guard let reportedCount, reportedCount >= 0 else { return .unknown }
+        return .reported(reportedCount)
+    }
+
+    func label(noun: String) -> String {
+        switch self {
+        case let .loaded(count):
+            return "\(count) \(noun)\(count == 1 ? "" : "s")"
+        case let .reported(count):
+            return "\(count) \(noun)\(count == 1 ? "" : "s") reported"
+        case .unknown:
+            return "\(noun.capitalized) count unknown"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .loaded:
+            return "Count from this server's successfully loaded inventory."
+        case .reported:
+            return "Last reported by the server; its current inventory has not been verified here."
+        case .unknown:
+            return "This server has not reported a usable count, and its current inventory has not been loaded."
+        }
+    }
+}
+enum MCPHubResourceReadState: Equatable {
+    case notLoaded
+    case loading
+    case current
+    case unavailable(String)
+}
+
+/// Tool discovery is an independent server-scoped read. It cannot borrow the
+/// resource state: one side of an MCP server can be healthy while the other
+/// refuses or times out.
+enum MCPHubToolReadState: Equatable {
+    case notLoaded
+    case loading
+    case current
+    case unavailable(String)
+}
+
+enum MCPHubCollectionPresentation {
+    enum State: Equatable {
+        case loading
+        case empty
+        case available
+        case stale
+        case unavailable
+    }
+
+    /// A panel refresh receipt is the only evidence that an empty array is a
+    /// completed empty read. A failed endpoint retains earlier rows as stale,
+    /// or remains unavailable when there are no prior rows to show.
+    static func resolve(
+        recordCount: Int,
+        endpoint: String,
+        refresh: AppModel.PanelRefreshStatus?
+    ) -> State {
+        let failed = refresh?.failedEndpoints.contains { candidate in
+            candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(endpoint) == .orderedSame
+        } ?? false
+        if failed { return recordCount > 0 ? .stale : .unavailable }
+        if recordCount > 0 { return .available }
+        return refresh == nil ? .loading : .empty
+    }
+}
+
+enum MCPHubInventoryPresentation {
+    static func notice(
+        state: MCPHubToolReadState,
+        selectedServerName: String?,
+        toolCount: Int
+    ) -> (text: String, isFailure: Bool, showsTools: Bool) {
+        switch state {
+        case .notLoaded:
+            return selectedServerName == nil
+                ? ("Select an MCP server to inspect its tools.", false, false)
+                : ("Tools have not loaded yet.", false, false)
+        case .loading:
+            return ("Loading tools…", false, false)
+        case .unavailable(let detail):
+            return ("Tools unavailable: \(detail)", true, toolCount > 0)
+        case .current where toolCount == 0:
+            return ("This server exposes no tools.", false, false)
+        case .current:
+            return ("", false, true)
+        }
+    }
+}
+
+enum MCPHubResourcesPresentation {
+    static func notice(
+        state: MCPHubResourceReadState,
+        resourceCount: Int
+    ) -> (text: String, isFailure: Bool)? {
+        switch state {
+        case .notLoaded, .loading:
+            return ("Resources have not loaded yet.", false)
+        case .unavailable(let detail):
+            return ("Resources unavailable: \(detail)", true)
+        case .current where resourceCount == 0:
+            return ("No resources exposed by this server.", false)
+        case .current:
+            return nil
+        }
+    }
+}
+
+extension AppModel {
+    @MainActor
+    func refreshMCPHubRecentCall() {
+        do {
+            mcpRecentCallState = try MCPResultEvidence.readRecentCall(root: engine.dataRoot)
+        } catch {
+            mcpRecentCallState = .unavailable(UserFacingError.cause(error, action: "read the Activity receipt"))
+        }
+    }
+}
+
+@MainActor
+extension AppModel {
+    @MainActor
+    func loadMCPDetails(_ server: MCPServer) async {
+        // gpt-5.5 review: race-safe load. User can tap server A then tap
+        // server B before A's fetch returns; without this check, A's late
+        // result would overwrite B's. Tag the request with the target id
+        // and only adopt the result if the user is still on it.
+        selectedMCPServerId = server.id
+        // Clear stale inventories immediately so the UI doesn't show the
+        // previous server's tools under the new server's name during fetch.
+        mcpTools = []
+        mcpToolReadState = .loading
+        mcpResources = []
+        mcpResourceReadState = .loading
+        let pendingId = server.id
+        do {
+            let toolsResult = try await MCPUIActions.listTools(serverId: pendingId, dispatcher: engine.tools.mcp)
+            let resourcesResult = try await MCPUIActions.listResources(serverId: pendingId, dispatcher: engine.tools.mcp)
+            // Late-arrival guard: discard if user has moved on.
+            guard selectedMCPServerId == pendingId else { return }
+            mcpTools = toolsResult
+            mcpToolReadState = .current
+            mcpResources = resourcesResult
+            mcpResourceReadState = .current
+            statusText = "Loaded MCP details for \(server.name)"
+        } catch {
+            guard selectedMCPServerId == pendingId else { return }
+            mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
+            mcpResources = []
+            mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
+            setFailureStatus(error, action: "load MCP details")
+        }
+    }
+
+    @MainActor
+    func warmMCPServer(_ server: MCPServer) async {
+        // gpt-5.5 review-2 race-safety: same late-arrival guard as
+        // loadMCPDetails. Warm A then tap B before A's awaits return would
+        // otherwise overwrite B's inventories with A's. Capture pendingId
+        // up-front and only adopt fetched arrays when the user is still on
+        // this server.
+        let pendingId = server.id
+        do {
+            selectedMCPServerId = pendingId
+            _ = try await MCPUIActions.warmMCPServer(serverId: pendingId, dispatcher: engine.tools.mcp)
+            let fetchedSessions = (try? await engine.tools.listMCPSessions())
+            if selectedMCPServerId == pendingId {
+                mcpToolReadState = .loading
+            }
+            let fetchedTools: [MCPTool]?
+            do {
+                fetchedTools = try await MCPUIActions.listTools(serverId: pendingId, dispatcher: engine.tools.mcp)
+            } catch {
+                fetchedTools = nil
+                if selectedMCPServerId == pendingId {
+                    mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
+                }
+            }
+            if selectedMCPServerId == pendingId {
+                mcpResourceReadState = .loading
+            }
+            let fetchedResources: [MCPResource]?
+            do {
+                fetchedResources = try await MCPUIActions.listResources(serverId: pendingId, dispatcher: engine.tools.mcp)
+            } catch {
+                fetchedResources = nil
+                if selectedMCPServerId == pendingId {
+                    mcpResources = []
+                    mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
+                }
+            }
+            // Sessions are server-list-wide, safe to apply unconditionally.
+            if let s = fetchedSessions { engine.tools.mcpSessions = s }
+            // Tools / resources are server-scoped — guard on still-selected.
+            if selectedMCPServerId == pendingId {
+                if let t = fetchedTools { mcpTools = t }
+                if fetchedTools != nil { mcpToolReadState = .current }
+                if let r = fetchedResources {
+                    mcpResources = r
+                    mcpResourceReadState = .current
+                }
+            }
+            if selectedMCPServerId == pendingId {
+                disabledFeature = nil
+                if case .current = mcpResourceReadState {
+                    statusText = "MCP warmed and details refreshed: \(server.name)"
+                } else {
+                    statusText = "MCP warmed, but details could not refresh: \(server.name)"
+                }
+            }
+        } catch let err as NSError where AppModel.isNotImplemented(err) {
+            guard selectedMCPServerId == pendingId else { return }
+            disabledFeature = AppModel.disabledBadge(for: "MCP warm", error: err)
+            statusText = disabledFeature ?? "MCP warm disabled"
+        } catch {
+            guard selectedMCPServerId == pendingId else { return }
+            setFailureStatus("Warming the MCP server failed. " + UserFacingError.cause(error, action: "warm the MCP server"), cause: error)
+        }
+    }
+
+    @MainActor
+    func restartMCPServer(_ server: MCPServer) async {
+        let pendingId = server.id
+        do {
+            selectedMCPServerId = pendingId
+            _ = try await MCPUIActions.restartMCPServer(serverId: pendingId, dispatcher: engine.tools.mcp)
+            engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
+            // Restart replaces the live child. Refresh the selected inventory
+            // through the same owner before declaring completion; otherwise
+            // the Hub can show tools/resources from the pre-restart session.
+            guard selectedMCPServerId == pendingId else { return }
+            await loadMCPDetails(server)
+            guard selectedMCPServerId == pendingId else { return }
+            if case .current = mcpResourceReadState {
+                statusText = "MCP restarted and details refreshed: \(server.name)"
+            } else {
+                statusText = "MCP restarted, but details could not refresh: \(server.name)"
+            }
+        } catch {
+            guard selectedMCPServerId == pendingId else { return }
+            setFailureStatus("Restarting the MCP server failed. " + UserFacingError.cause(error, action: "restart the MCP server"), cause: error)
+        }
+    }
+
+    @MainActor
+    func refreshMCPCache(_ server: MCPServer) async {
+        let pendingId = server.id
+        selectedMCPServerId = pendingId
+        mcpTools = []
+        mcpToolReadState = .loading
+        mcpResources = []
+        mcpResourceReadState = .loading
+        do {
+            _ = try await MCPUIActions.refreshMCPCache(serverId: pendingId, dispatcher: engine.tools.mcp)
+            engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
+            guard selectedMCPServerId == pendingId else { return }
+            await loadMCPDetails(server)
+            guard selectedMCPServerId == pendingId else { return }
+            disabledFeature = nil
+            if case .current = mcpToolReadState, case .current = mcpResourceReadState {
+                statusText = "MCP cache and details refreshed: \(server.name)"
+            } else {
+                statusText = "MCP cache refreshed, but details could not refresh: \(server.name)"
+            }
+        } catch let err as NSError where AppModel.isNotImplemented(err) {
+            guard selectedMCPServerId == pendingId else { return }
+            mcpToolReadState = .unavailable(UserFacingError.cause(err, action: "read the MCP tools"))
+            mcpResourceReadState = .unavailable(UserFacingError.cause(err, action: "read the MCP resources"))
+            disabledFeature = AppModel.disabledBadge(for: "MCP cache refresh", error: err)
+            statusText = disabledFeature ?? "MCP cache refresh disabled"
+        } catch {
+            guard selectedMCPServerId == pendingId else { return }
+            mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
+            mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
+            setFailureStatus("Refreshing the MCP cache failed. " + UserFacingError.cause(error, action: "refresh the MCP cache"), cause: error)
+        }
+    }
+
+    @MainActor
+    func mcpConsentRisk(server: MCPServer, toolName: String) -> String {
+        MCPUIActions.consentRisk(server: server, toolName: toolName, dataRoot: engine.dataRoot)
+    }
+
+    @MainActor
+    func grantMCPConsent(server: MCPServer, toolName: String, risk: String? = nil) async {
+        do {
+            let granted = try await MCPUIActions.grantConsent(
+                serverId: server.id, toolName: toolName,
+                risk: risk ?? mcpConsentRisk(server: server, toolName: toolName),
+                dispatcher: engine.tools.mcp, dataRoot: engine.dataRoot
+            )
+            mcpConsent = (try? await engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)) ?? mcpConsent
+            statusText = "MCP consent granted (\(granted.risk ?? "unknown"))"
+        } catch {
+            setFailureStatus(error, action: "grant that MCP consent")
+        }
+    }
+
+    @MainActor
+    func revokeMCPConsent(_ consent: MCPConsentRecord) async {
+        do {
+            _ = try await MCPUIActions.revokeConsent(
+                id: consent.id, serverId: consent.serverId, toolName: consent.toolName, dispatcher: engine.tools.mcp
+            )
+            mcpConsent = (try? await engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)) ?? mcpConsent
+            statusText = "MCP consent revoked"
+        } catch {
+            setFailureStatus("Revoking MCP consent failed. " + UserFacingError.cause(error, action: "revoke MCP consent"), cause: error)
+        }
+    }
+
+    @MainActor
+    func callMCPToolWithInput(server: MCPServer, tool: MCPTool, input: [String: JSONValue]) async {
+        if let validation = MCPUIActions.validationMessage(
+            schema: tool.inputSchema,
+            values: input
+        ) {
+            statusText = "MCP input refused: \(validation)"
+            return
+        }
+        do {
+            latestMCPCall = try await MCPUIActions.callMCPTool(
+                serverId: server.id, toolName: tool.name, input: input,
+                dataRoot: engine.dataRoot, authority: .runtime(dataRoot: engine.dataRoot)
+            )
+            if latestMCPCall?.evidenceStatus == "recorded" {
+                refreshMCPHubRecentCall()
+            } else if let latestMCPCall {
+                mcpRecentCallState = .sessionOnly(latestMCPCall)
+            }
+            statusText = "MCP \(tool.name): \(latestMCPCall?.status ?? "done")"
+            await refreshAll()
+        } catch {
+            mcpRecentCallState = .latestAttemptFailed(UserFacingError.cause(error, action: "call that MCP tool"))
+            setFailureStatus(error, action: "call that MCP tool")
+        }
+    }
+
 }

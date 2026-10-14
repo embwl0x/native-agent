@@ -142,165 +142,20 @@ public func promptSafeCapabilityText(_ raw: String?, limit: Int = 500) -> String
 }
 
 
-// MARK: - Source #3: list_tools
-//
-// Port of the retired daemon:
-//   def list_tools(self) -> list[dict[str, Any]]:
-//       tools = read_json(self.tools_path, [])
-//       return sorted(tools, key=lambda item: str(item.get("updatedAt") or item.get("createdAt") or ""), reverse=True)
-//
-// Path: <dataRoot>/tools/registry.json
-//
-// NOTE: SwiftNativeToolRegistry exists with the same surface. We re-read
-// directly here because:
-//   (1) the aggregator wants the dict bag, not the typed ToolRecord;
-//       round-tripping through ToolRecord would lose `permissions`,
-//       `triggers`, and the per-tool `useCount` which the aggregator
-//       consumes verbatim.
-//   (2) avoids actor-isolation friction for what is a pure read.
+// MARK: - Authored abilities
+
 public func listTools(
     dataRoot: URL,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
 ) async throws -> [[String: JSONValue]] {
-    let path = dataRoot
-        .appendingPathComponent("tools", isDirectory: true)
-        .appendingPathComponent("registry.json")
-    let raw = try await persistence.readJSON(path, ifMissing: .array([]))
-    guard case .array(let items) = raw else { return [] }
-    let dicts: [[String: JSONValue]] = items.compactMap {
-        if case .object(let o) = $0 { return o }
+    try ToolRegistryActions.entries(dataRoot: dataRoot).compactMap {
+        if case .object(let fields) = $0 { return fields }
         return nil
+    }.sorted { lhs, rhs in
+        let left = jsonString(lhs, "updatedAt").isEmpty ? jsonString(lhs, "createdAt") : jsonString(lhs, "updatedAt")
+        let right = jsonString(rhs, "updatedAt").isEmpty ? jsonString(rhs, "createdAt") : jsonString(rhs, "updatedAt")
+        return left > right
     }
-    return dicts.sorted { lhs, rhs in
-        let lk = jsonString(lhs, "updatedAt").isEmpty
-            ? jsonString(lhs, "createdAt") : jsonString(lhs, "updatedAt")
-        let rk = jsonString(rhs, "updatedAt").isEmpty
-            ? jsonString(rhs, "createdAt") : jsonString(rhs, "updatedAt")
-        return lk > rk
-    }
-}
-
-// MARK: - Source #4: manifest_registered_skills
-//
-// Port of the retired daemon. Merges two on-disk registries
-// keyed by skill-name; second source wins:
-//   1. ~/Library/Application Support/NativeAgent/skills/manifest_registry.json (legacy)
-//   2. <dataRoot>/skills/manifest_registry.json
-//
-// Returns `{"schemaVersion": 1, "skills": {<name>: {...entry, sourceRoot, registryPath}}}`.
-// Python uses `setdefault` so previously-stamped sourceRoot/registryPath
-// are preserved on the legacy side and overwritten on the modern side
-// (because the second iteration's `setdefault` is a no-op once the key is set).
-//
-// Catches Exception per file and `continue` — we mirror with try?.
-public func manifestRegisteredSkills(
-    dataRoot: URL,
-    persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async throws -> [String: JSONValue] {
-    var merged: [String: JSONValue] = [
-        "schemaVersion": .int(1),
-        "skills": .object([:]),
-    ]
-    var skillsAccum: [String: JSONValue] = [:]
-
-    let legacyDir = FileManager.default.urls(
-        for: .applicationSupportDirectory, in: .userDomainMask
-    ).first?
-        .appendingPathComponent("NativeAgent", isDirectory: true)
-        .appendingPathComponent("skills", isDirectory: true)
-        .appendingPathComponent("manifest_registry.json")
-
-    let modernPath = dataRoot
-        .appendingPathComponent("skills", isDirectory: true)
-        .appendingPathComponent("manifest_registry.json")
-
-    // Python iteration order: legacy, then modern.
-    var pathsToScan: [URL] = []
-    if let legacy = legacyDir { pathsToScan.append(legacy) }
-    pathsToScan.append(modernPath)
-
-    for path in pathsToScan {
-        let raw = try await persistence.readJSON(
-            path,
-            ifMissing: .object(["schemaVersion": .int(1), "skills": .object([:])])
-        )
-        guard case .object(let topObj) = raw,
-              case .object(let skills) = topObj["skills"] ?? .null else {
-            continue
-        }
-        for (name, entry) in skills {
-            guard case .object(var item) = entry else { continue }
-            // setdefault sourceRoot, registryPath
-            let dirPath = path.deletingLastPathComponent().path
-            if item["sourceRoot"] == nil {
-                item["sourceRoot"] = .string(dirPath)
-            }
-            if item["registryPath"] == nil {
-                item["registryPath"] = .string(path.path)
-            }
-            skillsAccum[name] = .object(item)
-        }
-    }
-    merged["skills"] = .object(skillsAccum)
-    return merged
-}
-
-// Insertion-order-preserving variant of `manifestRegisteredSkills`. Python's
-// dict preserves insertion order and `list(items())[:150]` slices in that
-// order — the dict-returning variant above loses it via Swift's unordered
-// dictionary. The aggregator's stage 4 uses this so the same legacy-then-
-// modern subset is taken when >150 entries exist.
-public func manifestRegisteredSkillsOrdered(
-    dataRoot: URL,
-    persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async throws -> (schemaVersion: Int, skills: [(String, JSONValue)]) {
-    var ordered: [(String, JSONValue)] = []
-    var indexByKey: [String: Int] = [:]
-
-    let legacyDir = FileManager.default.urls(
-        for: .applicationSupportDirectory, in: .userDomainMask
-    ).first?
-        .appendingPathComponent("NativeAgent", isDirectory: true)
-        .appendingPathComponent("skills", isDirectory: true)
-        .appendingPathComponent("manifest_registry.json")
-
-    let modernPath = dataRoot
-        .appendingPathComponent("skills", isDirectory: true)
-        .appendingPathComponent("manifest_registry.json")
-
-    var pathsToScan: [URL] = []
-    if let legacy = legacyDir { pathsToScan.append(legacy) }
-    pathsToScan.append(modernPath)
-
-    for path in pathsToScan {
-        let raw = try await persistence.readJSON(
-            path,
-            ifMissing: .object(["schemaVersion": .int(1), "skills": .object([:])])
-        )
-        guard case .object(let topObj) = raw,
-              case .object(let skills) = topObj["skills"] ?? .null else {
-            continue
-        }
-        // Python's `merged[name] = item` keeps a key's first-seen insertion
-        // position on re-assignment; setdefault is a no-op once stamped.
-        for (name, entry) in skills {
-            guard case .object(var item) = entry else { continue }
-            let dirPath = path.deletingLastPathComponent().path
-            if item["sourceRoot"] == nil {
-                item["sourceRoot"] = .string(dirPath)
-            }
-            if item["registryPath"] == nil {
-                item["registryPath"] = .string(path.path)
-            }
-            if let existing = indexByKey[name] {
-                ordered[existing] = (name, .object(item))
-            } else {
-                indexByKey[name] = ordered.count
-                ordered.append((name, .object(item)))
-            }
-        }
-    }
-    return (schemaVersion: 1, skills: ordered)
 }
 
 // MARK: - Source #5: list_workflows
@@ -498,7 +353,7 @@ public func capabilityRecordsFull(
     }
 
     // 2. Canonical installed skills → kind: skill
-    let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot, personaRoot: personaRoot)
+    let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot)
     for entry in skills.prefix(230) {
         let skill = entry.row
         var rec = capabilityTrustMetadata(skill)
@@ -514,7 +369,7 @@ public func capabilityRecordsFull(
         )
         rec["triggers"] = .array(jsonStringArray(skill, "triggers").map { .string($0) })
         rec["permissions"] = .array([])
-        rec["riskClass"] = .string("instruction")
+        rec["riskClass"] = .string("routine")
         rec["autoload"] = .bool(false)
         rec["useCount"] = .int(Int64(jsonInt(skill, "useCount")))
         rec["lastUsedAt"] = skill["lastUsedAt"] ?? .null
@@ -555,15 +410,9 @@ public func capabilityRecordsFull(
     }
 
     // 4. manifest_registered_skills → kind: tool|skill
-    // Use the ordered variant so the prefix(150) slice matches Python's
-    // `list(manifest_skills.items())[:150]` (insertion order: legacy first,
-    // then any modern-only keys). The dict-returning variant above loses
-    // order via Swift's unordered dictionary.
-    let manifestOrdered = try await manifestRegisteredSkillsOrdered(
-        dataRoot: dataRoot, persistence: persistence
-    )
-    for (manifestName, entry) in manifestOrdered.skills.prefix(150) {
-        guard case .object(let entryObj) = entry else { continue }
+    for entry in skills.prefix(150) {
+        let manifestName = entry.name
+        let entryObj = entry.row
         // kind = entry.type or entry.kind or "skill"
         let kindRaw = jsonString(entryObj, "type").isEmpty
             ? (jsonString(entryObj, "kind").isEmpty ? "skill" : jsonString(entryObj, "kind"))

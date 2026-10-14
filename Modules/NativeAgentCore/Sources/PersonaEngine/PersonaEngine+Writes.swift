@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -137,7 +138,7 @@ extension SwiftNativePersonaEngine {
             // double, lists are string arrays. PersistenceCore's
             // `serialize(pretty: true)` == Python `json.dumps(indent=2,
             // sort_keys=True)` (keys sorted by UTF-8 byte order).
-            let jv = Self.profileToJSONValue(normalized)
+            let jv = JSONValue.object(Self.profileFields(normalized))
             let text = try jv.serialize(pretty: true)
             try Self.atomicWriteText(text, to: profileURL)
 
@@ -338,16 +339,17 @@ extension SwiftNativePersonaEngine {
             return []  // create_missing=False pre-onboarding → no scaffold.
         }
 
+        let missing = Self.personalityDocSpecsFixed.filter {
+            $0.id != "SOUL" && $0.id != "USER"
+                && !fileManagerForWrites.fileExists(atPath: personaRoot.appendingPathComponent($0.filename).path)
+        }
+        guard !missing.isEmpty else { return [] }
         let profile = PersonaCompiler.loadProfile(dataRoot: dataRootURL)
         let persistence = SwiftNativePersistenceCore()
         var written: [String] = []
 
-        for spec in Self.personalityDocSpecsFixed {
-            // SOUL exists (it's the gate); the daemon only writes when the file
-            // is missing. Skip SOUL explicitly — it is never auto-scaffolded.
-            if spec.id == "SOUL" || spec.id == "USER" { continue }
+        for spec in missing {
             let path = personaRoot.appendingPathComponent(spec.filename)
-            if fileManagerForWrites.fileExists(atPath: path.path) { continue }
 
             let body = SwiftNativePersonaEngine.defaultPersonalityDocContent(
                 id: spec.id,
@@ -481,59 +483,19 @@ extension SwiftNativePersonaEngine {
     /// needs `fileExists`, which `.default` answers identically).
     private var fileManagerForWrites: FileManager { .default }
 
-    /// CompiledPersonalityProfile -> raw `[String: Any]` dict in the exact
-    /// shape `normalize_personality` consumes AND `write_json` serializes.
-    /// Field set + nesting matches daemon `normalize_personality`'s return
-    /// so a round-trip is a fixed point.
-    static func profileToRawDict(_ p: CompiledPersonalityProfile) -> [String: Any] {
-        let traits: [String: Any] = [
-            "warmth": p.traits.warmth,
-            "directness": p.traits.directness,
-            "humor": p.traits.humor,
-            "proactivity": p.traits.proactivity,
-            "rigor": p.traits.rigor,
-            "autonomy": p.traits.autonomy,
-            "creativity": p.traits.creativity,
-            "brevity": p.traits.brevity,
-        ]
-        var out: [String: Any] = [
-            "schemaVersion": p.schemaVersion,
-            "personaEngineVersion": p.personaEngineVersion,
-            "name": p.name,
-            "personaKind": p.personaKind,
-            "essence": p.essence,
-            "voice": p.voice,
-            "customDirective": p.customDirective,
-            "traits": traits,
-            "examples": p.examples,
-            "forbiddenPatterns": p.forbiddenPatterns,
-            "instincts": p.instincts,
-            "boundaries": p.boundaries,
-            "surfaceOverrides": p.surfaceOverrides,
-            "updatedAt": p.updatedAt,
-        ]
-        // Splat the lossless extras (unknown profile.json keys) back into the
-        // raw dict so `existing = self.personality()` carries them into the
-        // merge — mirroring Python where `dict(existing)` already holds the
-        // `{**raw}` extras. Keys here are disjoint from the known set above
-        // (guaranteed by `PersonaCompiler.normalize`), so this never clobbers a
-        // known field. On the merge path a body key with the same name as an
-        // extra still overrides it (Python `merged.update(body)`), and the
-        // re-normalize re-derives extras from the merged dict — so a body that
-        // promotes/removes an extra is honored.
-        for (key, value) in p.extras where out[key] == nil {
-            out[key] = value.foundationValue
-        }
-        return out
+    /// Use the same typed fields for normalization and persistence, preserving
+    /// Foundation's NSNumber leaves and unknown profile keys.
+    package static func profileToRawDict(_ p: CompiledPersonalityProfile) -> [String: Any] {
+        profileFields(p).mapValues { $0.foundationValue }
     }
 
-    /// CompiledPersonalityProfile -> JSONValue in the exact field set + leaf
+    /// CompiledPersonalityProfile -> JSON fields in the exact field set + leaf
     /// types `write_json` serializes. schemaVersion = int; traits = doubles;
     /// list fields = string arrays; surfaceOverrides = string->string object.
     /// Matches the daemon `normalize_personality` return (the retired daemon
     /// L35143-35156) so a Swift write is byte-identical to a daemon write of
     /// the same normalized profile.
-    static func profileToJSONValue(_ p: CompiledPersonalityProfile) -> JSONValue {
+    static func profileFields(_ p: CompiledPersonalityProfile) -> [String: JSONValue] {
         let traits: JSONValue = .object([
             "warmth": .double(p.traits.warmth),
             "directness": .double(p.traits.directness),
@@ -570,7 +532,7 @@ extension SwiftNativePersonaEngine {
         for (key, value) in p.extras where obj[key] == nil {
             obj[key] = value
         }
-        return .object(obj)
+        return obj
     }
 
     /// `str(value)[:cap]` by Unicode SCALAR (code point), matching Python.
@@ -714,16 +676,7 @@ extension CompiledPersonalityProfile {
             essence: essence,
             voice: voice,
             customDirective: customDirective.isEmpty ? nil : customDirective,
-            traits: PersonalityTraits(
-                warmth: traits.warmth,
-                directness: traits.directness,
-                humor: traits.humor,
-                proactivity: traits.proactivity,
-                rigor: traits.rigor,
-                autonomy: traits.autonomy,
-                creativity: traits.creativity,
-                brevity: traits.brevity
-            ),
+            traits: traits,
             examples: examples,
             forbiddenPatterns: forbiddenPatterns,
             instincts: instincts,
@@ -735,3 +688,14 @@ extension CompiledPersonalityProfile {
 }
 
 extension PersonaDocSpec: Identifiable {}
+
+extension SwiftNativePersonaEngine {
+    public func saveName(_ rawName: String) async throws -> PersonalityProfile {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw PersonaWriteError.invalidInput("Enter a name before saving.") }
+        guard !NativeAgentIdentity.displayName(name, fallback: "").isEmpty else {
+            throw PersonaWriteError.invalidInput("Choose a specific name instead of a generic persona label.")
+        }
+        return try await savePersonality(body: ["name": .string(name)]).sharedProfile
+    }
+}

@@ -161,26 +161,6 @@ public enum REMGrowthEvictionHistory {
         loadAll(dataRoot: dataRoot).last { $0.id == id }
     }
 
-    /// THE EVICTIONS THAT ACTUALLY HAPPENED. An id whose only row is `pending`
-    /// was retained and then the pass died before the splice — GROWTH.md still
-    /// holds that text, so counting it as evicted would be a false record in an
-    /// append-only file nobody can correct.
-    ///
-    /// THE COMMITTED ROW, NOT THE FIRST ROW. An id normally has two rows —
-    /// `pending` then `committed` — and returning the first match handed back
-    /// the pending one, so every caller read the state (and any later field) of
-    /// a row that says the eviction had not happened. The LATEST committed row
-    /// per id is the one that stands.
-    public static func committedRecords(dataRoot: URL) -> [REMGrowthEvictionRecord] {
-        var latest: [String: REMGrowthEvictionRecord] = [:]
-        var order: [String] = []
-        for row in loadAll(dataRoot: dataRoot) where row.isCommitted {
-            if latest[row.id] == nil { order.append(row.id) }
-            latest[row.id] = row
-        }
-        return order.compactMap { latest[$0] }
-    }
-
     /// REPAIR THE INTERRUPTED SPLICE. The passage leaves GROWTH.md before the
     /// `committed` row is appended, so a crash (or a failed append) between the
     /// two leaves an id whose only row says `pending` while the text is already

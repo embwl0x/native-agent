@@ -131,7 +131,7 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
     public let blockedAccessCount: Int
     public let templateAttentionCount: Int
     public let schedulerActions: [String]
-    public let createsJobs: Bool
+    public var createsJobs: Bool { false }
     public let lazyContract: JSONValue
     public let createdAt: String
     private let lightweight: Bool
@@ -144,7 +144,6 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
         blockedAccessCount: Int,
         templateAttentionCount: Int,
         schedulerActions: [String],
-        createsJobs: Bool,
         lazyContract: JSONValue,
         createdAt: String,
         lightweight: Bool = false
@@ -156,7 +155,6 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
         self.blockedAccessCount = blockedAccessCount
         self.templateAttentionCount = templateAttentionCount
         self.schedulerActions = schedulerActions
-        self.createsJobs = createsJobs
         self.lazyContract = lazyContract
         self.createdAt = createdAt
         self.lightweight = lightweight
@@ -209,59 +207,7 @@ public protocol LocalPIMStatusProvider: Sendable {
     /// Expected keys: `"status"` plus optional `"nextStep"` and `"detail"`.
     /// Status values should use the same vocabulary as access rows:
     /// ready, probe_needed, needs_permission, needs_setup, failed.
-    func localStatus(id: String) async -> [String: JSONValue]
-}
-
-// MARK: - Swift-native conservative provider impls
-
-public struct SwiftNativeConservativeConnectorProofProvider: ConnectorProofProvider {
-    public init() {}
-    public func proofStatus(provider: String) async -> [String: JSONValue] {
-        return [
-            "verified": .bool(false),
-            "nextStep": .string("Configure connector proof in the NativeAgent app"),
-        ]
-    }
-}
-
-public struct SwiftNativeConservativeMobilePushStatusProvider: MobilePushStatusProvider {
-    public init() {}
-    public func pushStatus() async -> [String: JSONValue] {
-        return [
-            "status": .string("unknown"),
-            "nextStep": .string("Configure mobile push in NativeAgent settings"),
-        ]
-    }
-}
-
-public struct SwiftNativeConservativeDispatcherToolAvailabilityProvider: DispatcherToolAvailabilityProvider {
-    public init() {}
-    public func isAvailable(toolName: String) async -> Bool { false }
-}
-
-public struct SwiftNativeConservativeLocalPIMStatusProvider: LocalPIMStatusProvider {
-    public init() {}
-    public func localStatus(id: String) async -> [String: JSONValue] { [:] }
-}
-
-// MARK: - Static test impls
-
-public struct StaticConnectorProofProvider: ConnectorProofProvider {
-    public let proofs: [String: [String: JSONValue]]
-    public init(proofs: [String: [String: JSONValue]] = [:]) {
-        self.proofs = proofs
-    }
-    public func proofStatus(provider: String) async -> [String: JSONValue] {
-        proofs[provider] ?? ["verified": .bool(false)]
-    }
-}
-
-public struct StaticMobilePushStatusProvider: MobilePushStatusProvider {
-    public let value: [String: JSONValue]
-    public init(value: [String: JSONValue] = [:]) {
-        self.value = value
-    }
-    public func pushStatus() async -> [String: JSONValue] { value }
+    func localStatuses() async -> [String: [String: JSONValue]]
 }
 
 public struct StaticDispatcherToolAvailabilityProvider: DispatcherToolAvailabilityProvider {
@@ -271,16 +217,6 @@ public struct StaticDispatcherToolAvailabilityProvider: DispatcherToolAvailabili
     }
     public func isAvailable(toolName: String) async -> Bool {
         availableTools.contains(toolName)
-    }
-}
-
-public struct StaticLocalPIMStatusProvider: LocalPIMStatusProvider {
-    public let statuses: [String: [String: JSONValue]]
-    public init(statuses: [String: [String: JSONValue]] = [:]) {
-        self.statuses = statuses
-    }
-    public func localStatus(id: String) async -> [String: JSONValue] {
-        statuses[id] ?? [:]
     }
 }
 
@@ -298,22 +234,19 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
     private let push: MobilePushStatusProvider
     private let dispatcherTools: DispatcherToolAvailabilityProvider
     private let localPIM: LocalPIMStatusProvider
-    private let now: @Sendable () -> Date
 
     public init(
         loadTrustPolicy: @escaping @Sendable () async -> [String: JSONValue],
-        proofs: ConnectorProofProvider = SwiftNativeConservativeConnectorProofProvider(),
-        push: MobilePushStatusProvider = SwiftNativeConservativeMobilePushStatusProvider(),
-        dispatcherTools: DispatcherToolAvailabilityProvider = SwiftNativeConservativeDispatcherToolAvailabilityProvider(),
-        localPIM: LocalPIMStatusProvider = SwiftNativeConservativeLocalPIMStatusProvider(),
-        now: @escaping @Sendable () -> Date = { Date() }
+        proofs: ConnectorProofProvider,
+        push: MobilePushStatusProvider,
+        dispatcherTools: DispatcherToolAvailabilityProvider,
+        localPIM: LocalPIMStatusProvider
     ) {
         self.loadTrustPolicy = loadTrustPolicy
         self.proofs = proofs
         self.push = push
         self.dispatcherTools = dispatcherTools
         self.localPIM = localPIM
-        self.now = now
     }
 
     public func macAssistantStatus(lightweight: Bool) async throws -> MacAssistantStatusResult {
@@ -332,9 +265,10 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
         }
         let notificationsAllowed = notificationsKeyPresent ? notificationsAllowedRaw : true
 
+        async let pushRead = push.pushStatus()
         let emailProof = await proofs.proofStatus(provider: "email")
         let calendarProof = await proofs.proofStatus(provider: "calendar")
-        let pushStatus = await push.pushStatus()
+        let pushStatus = await pushRead
 
         func proofState(_ proof: [String: JSONValue]) -> String {
             if case .bool(true)? = proof["verified"] { return "ready" }
@@ -363,8 +297,9 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
         var pushNextStep = ""
         if case .string(let s)? = pushStatus["nextStep"] { pushNextStep = s }
 
+        let localStatuses = await localPIM.localStatuses()
         func localAccessState(id: String, toolName: String) async -> (status: String, detail: String?, nextStep: String?) {
-            let local = await localPIM.localStatus(id: id)
+            let local = localStatuses[id] ?? [:]
             let localStatus: String? = {
                 if case .string(let s)? = local["status"] {
                     let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -629,7 +564,7 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
             "jobCreation": .string("explicit scheduler action only"),
             "providerProbe": .string("status/read action only, never during status rendering"),
         ])
-        let createdAt = MacAssistantStatusResult.isoTimestamp(now())
+        let createdAt = NativeTimestampFormat.fractionalUTCOffset(Date())
 
         return MacAssistantStatusResult(
             status: blocked == 0 ? "ready" : "attention",
@@ -639,7 +574,6 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
             blockedAccessCount: blocked,
             templateAttentionCount: templateAttention,
             schedulerActions: ["scheduler.schedule_job", "scheduler.create_job", "scheduler.list_jobs", "scheduler.cancel_job"],
-            createsJobs: false,
             lazyContract: lazyContract,
             createdAt: createdAt,
             lightweight: lightweight
@@ -662,22 +596,16 @@ extension MacAssistantStatusResult {
         case .object(let o): return !o.isEmpty
         }
     }
-
-    /// ISO-8601 with fractional seconds + `+00:00` (matches the retired
-    /// `now_iso()`; same convention as SystemOps.isoTimestamp).
-    static func isoTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalUTCOffset(date)
-    }
 }
 
 // MARK: - Factory
 
 public func makeMacAssistantStatusClient(
     loadTrustPolicy: (@Sendable () async -> [String: JSONValue])? = nil,
-    proofs: ConnectorProofProvider = SwiftNativeConservativeConnectorProofProvider(),
-    push: MobilePushStatusProvider = SwiftNativeConservativeMobilePushStatusProvider(),
-    dispatcherTools: DispatcherToolAvailabilityProvider = SwiftNativeConservativeDispatcherToolAvailabilityProvider(),
-    localPIM: LocalPIMStatusProvider = SwiftNativeConservativeLocalPIMStatusProvider()
+    proofs: ConnectorProofProvider,
+    push: MobilePushStatusProvider,
+    dispatcherTools: DispatcherToolAvailabilityProvider,
+    localPIM: LocalPIMStatusProvider
 ) -> any MacAssistantStatusClient {
     let loader: @Sendable () async -> [String: JSONValue] = loadTrustPolicy ?? {
         await SwiftNativeTrustCenter().loadTrustPolicy()
@@ -689,4 +617,29 @@ public func makeMacAssistantStatusClient(
         dispatcherTools: dispatcherTools,
         localPIM: localPIM
     )
+}
+
+extension MacAssistantStatusResult {
+    public static func mailReadiness(from result: JSONValue) -> (status: String, word: String, next: String?) {
+        guard case .object(let out) = result else {
+            return ("failed", "Check failed", "Mail gave no answer I could read.")
+        }
+        let text = { (key: String) -> String? in
+            if case .string(let s)? = out[key], !s.isEmpty { return s }
+            return nil
+        }
+        switch text("status") {
+        case "completed":
+            return ("ready", "Ready", nil)
+        case "denied":
+            return ("needs_permission", "Needs macOS permission",
+                    "Allow NativeAgent to control Mail in System Settings → Privacy & Security → Automation.")
+        default:
+            if text("reason") == "not_configured" {
+                return ("needs_setup", "Needs setup", text("fix"))
+            } else {
+                return ("failed", "Check failed", text("error") ?? text("reason").map { "Mail said: \($0.replacingOccurrences(of: "_", with: " "))." })
+            }
+        }
+    }
 }

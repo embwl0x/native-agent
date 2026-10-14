@@ -5,16 +5,61 @@ import DoctorChecks
 import NativeAgentShared
 import TrustCenter
 import PersistenceCore
+import AppToolRuntime
+import ToolRegistry
 
 /// `NativeAgentEngine.doctor` (S10): Doctor, this runtime's health and the
 /// background-loop watchdog for one data root, in core types. Diagnostics,
 /// Status, the health pill, the menu line, Setup and Support Snapshot render
 /// this state; the health read is nonisolated so the phone lane uses the same
-/// owner. Checks run through the app's Doctor port (`AppDoctorPort`:
-/// `runDoctor`, `liveDoctorCoverageChecks`, `getHealthCard`).
+/// owner. `EngineDoctorRuntime` interprets live owners and selects repairs;
+/// the app's Doctor port supplies platform observations and callbacks.
 @MainActor
 @Observable
 public final class DoctorFacade {
+    /// What a Doctor run actually produced.
+    ///
+    /// gpt-5.5 review BLOCKING 2 (2026-08-02): `runDoctor` used to return a Bool
+    /// that meant "a report came back", and onboarding read it as "the repair
+    /// worked". A repair that ran to completion over a store it could NOT fix
+    /// returned `true`, so the wizard showed "<Agent> is ready" over a broken
+    /// scaffold. The two questions are now distinct on the type.
+    public enum RunOutcome: Equatable {
+        /// No report: another run held the lock, or the run threw.
+        case unavailable(String)
+        /// A report came back. `failingChecks` are its `status == fail|error`
+        /// rows — the run completing says nothing about them.
+        case completed(status: String, failingChecks: [CheckResult])
+
+        /// True when the run produced a report at all. This is the old Bool's
+        /// meaning; callers that only wanted "did it run" keep using it.
+        public var didRun: Bool {
+            if case .completed = self { return true }
+            return false
+        }
+
+        /// Failing rows outside the `live.*` namespace, which covers optional
+        /// user-configured subsystems (Telegram token, SearXNG URL). Those are
+        /// real Doctor findings but they are NOT the app-owned scaffold, and
+        /// blocking onboarding on them would strand a user who skipped setup.
+        public var failingScaffoldChecks: [CheckResult] {
+            guard case .completed(_, let failing) = self else { return [] }
+            return failing.filter { !$0.id.hasPrefix("live.") }
+        }
+
+        /// One line naming what to fix, for a user-facing surface.
+        public var failureDetail: String {
+            switch self {
+            case .unavailable(let reason):
+                return reason
+            case .completed:
+                let failing = failingScaffoldChecks
+                guard !failing.isEmpty else { return "Health checks reported a failure with no failing check." }
+                return failing.map { "\($0.title): \($0.detail)" }.joined(separator: " ")
+            }
+        }
+    }
+
     public nonisolated let dataRoot: URL
 
     /// The last Doctor report, as of the last run or live-row refresh.
@@ -27,10 +72,6 @@ public final class DoctorFacade {
     public var reportCompletedAt: Date?
     /// This runtime's health, as of the last probe.
     public var health: RuntimeHealth?
-    /// The LAST health probe's own outcome, not the row it fell back to. A
-    /// failed read leaves `health` on its cached row, so anything that says
-    /// "online" has to ask this first.
-    public var healthProbeFailed = false
     /// The background-loop watchdog, as of the last read.
     public var watchdog: WatchdogStatus?
     /// The health pill's card, as of the last read.
@@ -38,6 +79,17 @@ public final class DoctorFacade {
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
+    }
+
+    public func toolStatusEnvelope() async throws -> JSONValue {
+        guard let report else {
+            return AppToolExecutor.failure("doctor_not_run", "No Doctor report yet. Run doctor.run, then read this page.")
+        }
+        return try await AppToolExecutor.doctorStatus(report: report) { dataRoot in
+            try await ProvidersFacade(dataRoot: dataRoot).list().map {
+                AppToolProviderHealth(providerID: $0.provider_id, authState: $0.auth_status.state)
+            }
+        }
     }
 
     /// When THIS runtime started. `ProcessInfo.systemUptime` measures the
@@ -86,16 +138,13 @@ public final class DoctorFacade {
             ])
         })
         return WatchdogStatus(
-            daemon: "swift",
             uptimeSeconds: uptime,
-            daemonLifecycleStatus: lifecycleStatus,
-            daemonLifecycleDetail: running
+            runtimeLifecycleStatus: lifecycleStatus,
+            runtimeLifecycleDetail: running
                 ? (failedLoops.isEmpty
                     ? "Swift background loops are running in NativeAgent.app."
                     : "Swift background loops are running with \(failedLoops.count) loop failure(s): \(failedLoops.map(\.name).sorted().joined(separator: ", ")).")
                 : "Swift background loops are not running.",
-            launchAgentStatus: "not_applicable",
-            launchAgentDetail: "NativeAgent.app owns background loops; legacy daemon launch agents are retired.",
             runningImprovements: loopStatuses.filter { $0.executing && $0.name == "self_improvement_sweep" }.count,
             runningExecutions: loopStatuses.filter { $0.executing && ["mission_executor", "workshop_pump"].contains($0.name) }.count,
             lastActivity: lastActivity,
@@ -126,37 +175,54 @@ public struct DoctorReport: Equatable, Sendable {
 }
 
 extension WatchdogStatus {
-    public var runtimeBadgeText: String {
-        let trimmed = (daemon ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "RUNTIME" : trimmed.uppercased()
-    }
-
     public var runtimeBadgeStatus: String {
-        switch runtimeLifecycleStatus.lowercased() {
-        case "ok", "running", "active": return "ok"
-        case "stopped", "warn", "warning", "degraded": return "warn"
-        case "fail", "failed", "error": return "error"
-        default:
-            let daemon = daemon ?? ""
-            return daemon.lowercased() == "swift" ? "ok" : (daemon.isEmpty ? "unknown" : daemon)
+        switch runtimeLifecycleStatus {
+        case "ok": return "ok"
+        case "stopped", "degraded": return "warn"
+        default: return "error"
         }
     }
+}
 
-    public var runtimeLifecycleStatus: String {
-        let lifecycle = (daemonLifecycleStatus ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !lifecycle.isEmpty { return lifecycle }
-        if daemon?.lowercased() == "swift", launchAgentStatus == "not_applicable" {
-            return "ok"
+public enum SystemHealthSummary: Sendable, Equatable {
+    case unknown
+    case ok
+    case warn(count: Int)
+    case error(count: Int)
+}
+
+extension DoctorFacade {
+    public var systemHealthSummary: SystemHealthSummary {
+        // Prefer an explicit Doctor run. Otherwise reuse the health card that
+        // Chat already keeps current instead of launching a second full Doctor
+        // pass from this always-mounted toolbar control.
+        func summarize(_ statuses: [String]) -> SystemHealthSummary {
+            let buckets = statuses.map { DoctorPlainCopy.bucket(for: $0) }
+            let failCount = buckets.filter { $0 == "failing" }.count
+            let warnCount = buckets.filter { $0 == "warning" }.count
+            if failCount > 0 { return .error(count: failCount) }
+            if warnCount > 0 { return .warn(count: warnCount) }
+            if buckets.isEmpty || buckets.contains("unclear") { return .unknown }
+            return .ok
         }
-        return launchAgentStatus ?? ""
+        if let checks = report?.checks {
+            return summarize(checks.map(\.status))
+        }
+        guard let subsystems = healthCard?.subsystems else { return .unknown }
+        return summarize(subsystems.map(\.status))
     }
+}
 
-    public var runtimeLifecycleDetail: String {
-        let lifecycle = (daemonLifecycleDetail ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !lifecycle.isEmpty { return lifecycle }
-        if daemon?.lowercased() == "swift", launchAgentStatus == "not_applicable" {
-            return "Swift runtime is owned by NativeAgent.app."
+extension DoctorFacade {
+    public nonisolated static func repairCompletionMessage(report: DoctorReport) -> String {
+        let remaining = report.checks.filter { DoctorSafeRepairPolicy.isAdverse($0.status) }.count
+        if report.repaired {
+            return remaining == 0
+                ? "Repair applied safe fixes."
+                : "Repair applied safe fixes, but \(remaining) issue\(remaining == 1 ? " remains" : "s remain")."
         }
-        return launchAgentDetail ?? ""
+        return remaining == 0
+            ? "Repair finished; no changes were needed."
+            : "Repair finished, but no safe fixes were applied."
     }
 }

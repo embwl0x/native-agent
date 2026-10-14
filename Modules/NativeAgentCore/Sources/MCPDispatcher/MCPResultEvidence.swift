@@ -4,7 +4,7 @@ import PersistenceCore
 import Privacy
 import NativeAgentCore
 
-enum MCPResultEvidence {
+public enum MCPResultEvidence {
     static let maxProjectionBytes = 8 * 1024
     static let maxPreviewBytes = 4 * 1024
 
@@ -165,4 +165,141 @@ enum MCPResultEvidence {
         }
         return ""
     }
+}
+
+public enum MCPHubRecentCallState {
+    case notLoaded
+    case absent
+    case durable(MCPCallResult)
+    case partial(MCPCallResult?, rejectedRows: Int)
+    case sessionOnly(MCPCallResult)
+    case latestAttemptFailed(String)
+    case unavailable(String)
+}
+
+
+extension MCPResultEvidence {
+    private static let readChunkBytes = 65_536
+    private static let maximumReceiptBytes = 1_048_576
+
+    private struct ActivityReceiptRow: Decodable {
+        let id: String
+        let kind: String
+        let detail: String?
+        let createdAt: String
+        let payload: JSONValue?
+    }
+
+    public static func readRecentCall(root: URL) throws -> MCPHubRecentCallState {
+        let path = root
+            .appendingPathComponent("activity", isDirectory: true)
+            .appendingPathComponent("events.jsonl")
+        guard FileManager.default.fileExists(atPath: path.path) else { return .absent }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var rejectedRows = 0
+        var reversedLine: [UInt8] = []
+        var oversized = false
+        func finishLine() -> MCPHubRecentCallState? {
+            defer {
+                reversedLine.removeAll(keepingCapacity: true)
+                oversized = false
+            }
+            if oversized {
+                rejectedRows += 1
+                return nil
+            }
+            guard !reversedLine.isEmpty else { return nil }
+            guard let row = try? decoder.decode(ActivityReceiptRow.self, from: Data(reversedLine.reversed())) else {
+                rejectedRows += 1
+                return nil
+            }
+            guard row.kind == "mcp_tool" else { return nil }
+            guard let result = callResult(from: row) else {
+                rejectedRows += 1
+                return nil
+            }
+            return rejectedRows == 0 ? .durable(result) : .partial(result, rejectedRows: rejectedRows)
+        }
+        do {
+            let handle = try FileHandle(forReadingFrom: path)
+            defer { try? handle.close() }
+            var offset = try handle.seekToEnd()
+            // Start at the newest row and stop at the first usable MCP receipt.
+            // Both each read and an individual row stay bounded.
+            while offset > 0 {
+                let count = Int(min(offset, UInt64(readChunkBytes)))
+                offset -= UInt64(count)
+                try handle.seek(toOffset: offset)
+                guard let chunk = try handle.read(upToCount: count), chunk.count == count else {
+                    return .unavailable("Activity changed while reading its receipts. Refresh to try again.")
+                }
+                for byte in chunk.reversed() {
+                    if byte == 10 || byte == 13 {
+                        if let result = finishLine() { return result }
+                    } else if !oversized {
+                        if reversedLine.count < maximumReceiptBytes { reversedLine.append(byte) }
+                        else { oversized = true }
+                    }
+                }
+            }
+            if let result = finishLine() { return result }
+        }
+        return rejectedRows == 0 ? .absent : .partial(nil, rejectedRows: rejectedRows)
+    }
+
+    private static func callResult(from row: ActivityReceiptRow) -> MCPCallResult? {
+        guard case .object(let payload)? = row.payload,
+              case .string(let serverID)? = payload["serverId"],
+              case .string(let toolName)? = payload["toolName"],
+              case .string(let status)? = payload["toolStatus"]
+        else { return nil }
+        let callID: String
+        if case .string(let value)? = payload["callId"] { callID = value } else { callID = row.id }
+        return MCPCallResult(
+            id: callID,
+            serverId: serverID,
+            toolName: toolName,
+            status: status,
+            approvalId: nil,
+            durationSeconds: double(payload["durationSeconds"]),
+            createdAt: row.createdAt,
+            result: payload["result"],
+            resultPreview: row.detail,
+            resultByteCount: integer(payload["resultByteCount"]),
+            redactedByteCount: integer(payload["redactedByteCount"]),
+            resultTruncated: bool(payload["resultTruncated"]),
+            resultDigest: string(payload["resultDigest"]),
+            receiptId: row.id,
+            evidenceStatus: "recorded",
+            evidenceError: nil
+        )
+    }
+
+    private static func string(_ value: JSONValue?) -> String? {
+        guard case .string(let result)? = value else { return nil }
+        return result
+    }
+
+    private static func bool(_ value: JSONValue?) -> Bool? {
+        guard case .bool(let result)? = value else { return nil }
+        return result
+    }
+
+    private static func integer(_ value: JSONValue?) -> Int? {
+        switch value {
+        case .int(let result): return Int(result)
+        case .double(let result): return Int(exactly: result)
+        default: return nil
+        }
+    }
+
+    private static func double(_ value: JSONValue?) -> Double? {
+        switch value {
+        case .int(let result): return Double(result)
+        case .double(let result): return result
+        default: return nil
+        }
+    }
+
 }

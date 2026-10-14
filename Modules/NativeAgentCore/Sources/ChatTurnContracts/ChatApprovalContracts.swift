@@ -80,7 +80,6 @@ public enum AutonomyGateError: Error, LocalizedError, Equatable {
     case toolDenied(reason: String)
     case notRun(ToolNotRunStatus)
     case noApprovalInboxWired
-    case approvalTimeout(toolName: String, seconds: Double)
     case approvalFilingFailed(String)
 
     public var notRunStatus: ToolNotRunStatus {
@@ -88,7 +87,6 @@ public enum AutonomyGateError: Error, LocalizedError, Equatable {
         case .toolDenied: return .blocked
         case .notRun(let status): return status
         case .noApprovalInboxWired: return .approvalUnavailable
-        case .approvalTimeout: return .approvalTimedOut
         case .approvalFilingFailed: return .approvalFilingFailed
         }
     }

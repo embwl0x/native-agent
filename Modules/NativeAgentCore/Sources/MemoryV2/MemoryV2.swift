@@ -225,62 +225,6 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
     }
 }
 
-// MARK: - MemoryRecallQuery / MemoryRecallHit / MemoryRecallResult
-
-/// Recall query. `kinds` and `tagsFilter` are reserved for a future filtered
-/// recall pass. Today's recall honors `q` and `k`; client code can still pass
-/// the reserved fields so the wire shape does not change when filtering lights
-/// up. `surface` (2026-07-21 audit fix) names the calling surface so the
-/// disclosure policy actually gates this lane — leave nil ONLY for genuinely
-/// surfaceless internal callers (permits() treats nil as allow-all).
-public struct MemoryRecallQuery: Sendable, Codable, Equatable {
-    public var query: String
-    public var k: Int
-    public var kinds: [String]?
-    public var tagsFilter: [String]?
-    public var surface: String?
-
-    public init(
-        query: String,
-        k: Int = 10,
-        kinds: [String]? = nil,
-        tagsFilter: [String]? = nil,
-        surface: String? = nil
-    ) {
-        self.query = query
-        self.k = k
-        self.kinds = kinds
-        self.tagsFilter = tagsFilter
-        self.surface = surface
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case query
-        case k
-        case kinds
-        case tagsFilter = "tags_filter"
-        case surface
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.query = try c.decodeIfPresent(String.self, forKey: .query) ?? ""
-        self.k = try c.decodeIfPresent(Int.self, forKey: .k) ?? 10
-        self.kinds = try c.decodeIfPresent([String].self, forKey: .kinds)
-        self.tagsFilter = try c.decodeIfPresent([String].self, forKey: .tagsFilter)
-        self.surface = try c.decodeIfPresent(String.self, forKey: .surface)
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(query, forKey: .query)
-        try c.encode(k, forKey: .k)
-        try c.encodeIfPresent(kinds, forKey: .kinds)
-        try c.encodeIfPresent(tagsFilter, forKey: .tagsFilter)
-        try c.encodeIfPresent(surface, forKey: .surface)
-    }
-}
-
 /// One hit from `/v1/memory/recall`. Daemon emits search-result rows
 /// (score / session_id / role / ts / preview / source / rankingSignals), NOT
 /// full MemoryRecord dicts. Unknown keys land in `extras`.
@@ -348,59 +292,6 @@ public struct MemoryRecallHit: Sendable, Codable, Equatable {
     }
 }
 
-/// Recall response. `hits` is the daemon's actual return shape; `records`
-/// stays optional because some recall paths (Phase B and beyond) may also
-/// carry full durable MemoryRecord dicts alongside the search hits.
-/// `rawResponse` keeps the entire body for forward-compat (query echo,
-/// scoring metadata, ranking_signals, ...).
-public struct MemoryRecallResult: Sendable, Codable, Equatable {
-    public var hits: [MemoryRecallHit]
-    public var records: [MemoryRecord]?
-    public var rawResponse: JSONValue
-
-    public init(
-        hits: [MemoryRecallHit],
-        records: [MemoryRecord]? = nil,
-        rawResponse: JSONValue
-    ) {
-        self.hits = hits
-        self.records = records
-        self.rawResponse = rawResponse
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case hits
-        case records
-        case rawResponse = "raw_response"
-    }
-}
-
-// MARK: - DeleteMemoryResult
-
-/// Result returned by `deleteMemory(id:)`. The Swift implementation deletes
-/// directly and returns `.ok`; Trust authorizes the caller upstream before
-/// invoking the mutation. This storage result does not queue approvals.
-public struct DeleteMemoryResult: Sendable, Equatable {
-    public enum Status: String, Sendable, Equatable {
-        case ok
-        case pendingApproval = "pending_approval"
-    }
-
-    public var status: Status
-    /// ApprovalInbox identifier when a caller supplies a pending result.
-    public var approvalId: String?
-    /// Optional human-readable result message.
-    public var message: String?
-
-    public init(status: Status, approvalId: String? = nil, message: String? = nil) {
-        self.status = status
-        self.approvalId = approvalId
-        self.message = message
-    }
-
-    public static let ok = DeleteMemoryResult(status: .ok)
-}
-
 // MARK: - Errors
 
 public enum MemoryV2Error: Error, LocalizedError {
@@ -426,29 +317,16 @@ public enum MemoryV2Error: Error, LocalizedError {
     }
 }
 
-// MARK: - Protocol
-
-/// MemoryV2 surface. SwiftNative reads and writes the SQLite memory store and
-/// performs recall through the configured embedding provider. There is no
-/// daemon fallback.
-public protocol MemoryV2Protocol: Sendable {
-    func listMemory(kind: String?) async throws -> [MemoryRecord]
-    func recallMemory(_ query: MemoryRecallQuery) async throws -> MemoryRecallResult
-    func updateMemory(id: String, update: JSONValue) async throws -> MemoryRecord
-    func deleteMemory(id: String) async throws -> DeleteMemoryResult
-    func v2Status() async throws -> JSONValue
-}
-
 // MARK: - SwiftNative impl
 
-/// SwiftNative MemoryV2 actor. Use ``makeMemoryV2`` or ``SwiftNativeMemoryV2.shared``
+/// SwiftNative MemoryV2 actor. Use ``SwiftNativeMemoryV2.shared``
 /// for production so storage/embedder are wired.
-public actor SwiftNativeMemoryV2: MemoryV2Protocol {
+public actor SwiftNativeMemoryV2 {
     // Embedder (Core ML MiniLM in production, MockEmbeddingProvider in tests)
     // plus SQLite-backed MemoryStorage. Optional so tests can construct an
     // unwired actor and assert it fails closed.
     internal var embedder: (any EmbeddingProvider)?
-    internal var storage: (any MemoryStorageProtocol)?
+    internal var storage: MemoryStorageBridge?
     internal var canonicalDataRoot: URL?
     internal var canonicalAttachmentReady: Task<Void, Never>?
     internal var userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?
@@ -465,15 +343,9 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
             contentHash = row.contentHash
         }
     }
-    // Launch owns the three-attempt retry loop. Carry candidates across only
-    // its two drift retries; success, other failures, and exhaustion release them.
+    // Reuse candidates only while their provider epoch and canonical content match.
     private var embeddingRetryVectors: [EmbeddingRetryKey: [Float]] = [:]
-    private var embeddingRetryAttempt = 0
     private var embeddingReindexID: UUID?
-    /// Error-level diagnostic sink (defaults to NSLog). Actor-isolated and
-    /// per-instance on purpose: a global sink would leak between concurrently
-    /// running tests. Set it to prove the persona-recall dead-lane alarm fires.
-    internal var diagnosticSink: (@Sendable (String) -> Void)?
     /// (persona|surface) signatures whose persona-recall starvation has already
     /// been reported. The alarm fires on the zero-hit path, which a tool loop
     /// re-enters on every call: unbounded, it spams one error AND pays for one
@@ -483,16 +355,8 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     /// each other.
     internal var reportedStarvationSignatures: Set<String> = []
 
-    public func setDiagnosticSink(_ sink: (@Sendable (String) -> Void)?) {
-        diagnosticSink = sink
-    }
-
     internal func emitDiagnostic(_ message: String) {
-        if let diagnosticSink {
-            diagnosticSink(message)
-        } else {
-            nativeLog("%@", message)
-        }
+        nativeLog("%@", message)
     }
 
     public init() {
@@ -508,7 +372,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
 
     public init(
         embedder: any EmbeddingProvider,
-        storage: any MemoryStorageProtocol
+        storage: MemoryStorageBridge
     ) {
         self.embedder = embedder
         self.storage = storage
@@ -520,39 +384,13 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         return try await storage.listMemory(kind: kind)
     }
 
-    public func recallMemory(_ query: MemoryRecallQuery) async throws -> MemoryRecallResult {
-        // 2026-07-21 audit fix: thread the caller's surface into recall so
-        // the disclosure policy actually gates this lane. nil stays the
-        // allow-all escape hatch for genuinely surfaceless internal callers
-        // (e.g. the cognitive substrate's ambient reads) — never for a lane
-        // whose caller knows its surface.
-        let result = try await recall(
-            MemoryV2RecallRequest(text: query.query, topK: query.k, persona: nil, surface: query.surface)
-        )
-        return MemoryRecallResult(
-            hits: result.hits,
-            records: nil,
-            rawResponse: .object([
-                "query": .string(query.query),
-                "k": .int(Int64(query.k)),
-                "hits": .array(result.hits.map { hit in
-                    .object([
-                        "score": .double(hit.score),
-                        "preview": .string(hit.preview),
-                    ])
-                }),
-            ])
-        )
-    }
-
     public func updateMemory(id: String, update: JSONValue) async throws -> MemoryRecord {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         let existingKind: String?
         if case .object(let patch) = update, Self.patchKind(patch) == nil,
            patch["text"] != nil || patch["content"] != nil {
-            guard let lookup = storage as? any MemoryRecordLookupStorage,
-                  let existing = try await lookup.lookupMemoryRecord(id: id) else {
+            guard let existing = try await storage.lookupMemoryRecord(id: id) else {
                 throw MemoryV2Error.recordNotFound
             }
             existingKind = existing.memoryKind ?? MemoryRecallScoring.kind(of: existing.extras)
@@ -579,7 +417,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     private func gateUpdatedContentAgainstTombstones(
         update: JSONValue,
         embedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?,
-        storage: any MemoryStorageProtocol
+        storage: MemoryStorageBridge
     ) async throws {
         guard let embedding, case .object(let obj) = update else { return }
         let newText: String? = {
@@ -598,11 +436,6 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         }
     }
 
-    public func deleteMemory(id: String) async throws -> DeleteMemoryResult {
-        _ = try await deleteMemoryIfPresent(id: id)
-        return .ok
-    }
-
     /// Foreground callers that distinguish a missing row use the atomic
     /// deletion result while sharing the canonical projection completion.
     public func deleteMemoryIfPresent(id: String) async throws -> Bool {
@@ -612,28 +445,6 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         await flushDerivedMemoryChanges()
         return deleted
     }
-
-    public func v2Status() async throws -> JSONValue {
-        try await ensureCanonicalAttachment()
-        guard let embedder, storage != nil else { throw MemoryV2Error.storageUnavailable }
-        return .object([
-            "phase": .string("B"),
-            "backend": .string("swift-native"),
-            "embedder": .string(embedder.modelId),
-            "dimensions": .int(Int64(embedder.dimensions)),
-        ])
-    }
-
-    /// Model id of the active embedder, if wired. `nil` when storage is
-    /// unconfigured. "mock" indicates the deterministic stand-in is active.
-    ///
-    /// WARNING: a non-"mock" value (e.g. "all-MiniLM-L6-v2") does NOT prove
-    /// real CoreML embeddings are running — under the fail-closed contract
-    /// `ManagedEmbeddingProvider.modelId` returns the CoreML name whenever
-    /// CoreML is requested, even when resources are missing and `embed()`
-    /// will throw. Use `embeddingRuntimeSnapshot().effectiveBackend` for the
-    /// terminal-state check (coreMLBackend / mockBackend / failClosedBackend).
-    public func embedderModelId() -> String? { embedder?.modelId }
 
     /// Embedder vector dimensionality, when wired.
     public func embedderDimensions() -> Int? { embedder?.dimensions }
@@ -727,7 +538,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     }
 
     func flushDerivedMemoryChanges() async {
-        if let bridge = storage as? MemoryStorageBridge {
+        if let bridge = storage {
             let underlying = await bridge.underlyingStorage()
             await underlying.flushProjectionHooks()
         }
@@ -735,10 +546,10 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     }
 
     public func configureEmbeddingMemoryMode(_ mode: String) async throws {
-        guard let managed = embedder as? ManagedEmbeddingProvider else {
+        guard embedder is ManagedEmbeddingProvider else {
             throw MemoryV2Error.underlying("embedding runtime is not configurable")
         }
-        try await managed.setMemoryMode(mode)
+        // Legacy mode requests already resolve to the single performance mode.
     }
 
     @discardableResult
@@ -751,7 +562,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
 
     public func memoryEmbeddingEpochState() async throws -> MemoryEmbeddingEpochState {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage as? MemoryStorageBridge else {
+        guard let bridge = storage else {
             throw MemoryV2Error.storageUnavailable
         }
         return try await bridge.underlyingStorage().embeddingEpochState()
@@ -766,15 +577,13 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     ) async throws -> MemoryEmbeddingEpochActivationReport {
         try await ensureCanonicalAttachment()
         guard let embedder,
-              let bridge = storage as? MemoryStorageBridge else {
+              let bridge = storage else {
             throw MemoryV2Error.storageUnavailable
         }
         let invocation = UUID()
         embeddingReindexID = invocation
         var reusable = embeddingRetryVectors
-        let attempt = embeddingRetryAttempt + 1
         embeddingRetryVectors = [:]
-        embeddingRetryAttempt = 0
         let concreteStorage = await bridge.underlyingStorage()
         let corpus = try await concreteStorage.embeddingCorpusSnapshot()
         guard corpus.count <= 50_000 else {
@@ -836,7 +645,6 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
                 embeddingRetryVectors = Dictionary(uniqueKeysWithValues: staged.map {
                     (EmbeddingRetryKey(epoch: candidateEpoch, row: $0.row), $0.vector)
                 })
-                embeddingRetryAttempt = attempt
             }
             throw error
         }
@@ -893,14 +701,4 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         let trimmed = kind.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
-}
-
-
-// MARK: - Factory
-
-public func makeMemoryV2() -> any MemoryV2Protocol {
-    // Hand back the wired singleton (real SQLite storage, CoreML-or-Mock
-    // embedder, Spotlight hook installed) instead of an unconfigured actor
-    // that throws storageUnavailable on every call.
-    return SwiftNativeMemoryV2.shared
 }

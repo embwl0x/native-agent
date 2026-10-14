@@ -24,7 +24,7 @@ public enum MemoryDataProvenance {
         if sources.isEmpty, fields["untrusted_remote_data"] == .bool(true) {
             sources.append("untrusted stored content")
         }
-        return Array(sources.prefix(8))
+        return sources
     }
 
     public static func fields(in metadata: JSONValue?, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> [String: JSONValue] {
@@ -42,7 +42,7 @@ public enum MemoryDataProvenance {
     static func merging(existing: JSONValue?, incoming: JSONValue?) -> [String: JSONValue] {
         var sources = sources(in: existing)
         for source in self.sources(in: incoming) where !sources.contains(source) {
-            if sources.count < 8 { sources.append(source) }
+            sources.append(source)
         }
         return fields(in: .object(["peer_sources": .array(sources.map(JSONValue.string))]))
     }
@@ -75,7 +75,7 @@ public enum MemoryDataProvenance {
     }
 
     public static func consume(_ metadata: JSONValue?, dataRoot: URL = PersistenceCore.defaultDataRoot()) {
-        // Recorded taint cannot be cleared by a later elevation of its source.
-        for source in sources(in: metadata, dataRoot: dataRoot) { PeerDataTaint.markConsumed(peer: source, attested: false) }
+        // Retain every recorded principal; the turn gates read current trust.
+        for source in sources(in: metadata, dataRoot: dataRoot) { PeerDataTaint.markConsumed(peer: source) }
     }
 }

@@ -318,7 +318,6 @@ extension NativeCognitionRuntime {
         // retains one slow daily integrity sweep for out-of-process writes and
         // crash-window event loss.
         if kind == .dreamCompleted || kind == .remIntegrated {
-            eventDrivenReplayAttemptCount &+= 1
             let reason = "replay_event:\(kind.rawValue)"
             let outcome = await runEventDrivenReplayWithDeadline(reason: reason)
             await handleEventDrivenReplayOutcome(outcome, reason: reason, allowRetry: true)
@@ -328,30 +327,6 @@ extension NativeCognitionRuntime {
             // and-forget with its own single-flight; budget gates stay inside.
             scheduleEventDrivenReflection(reason: "reflection_event:\(kind.rawValue)")
         }
-    }
-
-    /// Deterministic visibility for the bounded organism persistence lane.
-    /// Production has no caller; accelerated tests use it to prove that a
-    /// blocked writer still owns only one drain and one coalesced generation.
-    func organismPersistenceStatusForProof() -> (
-        requestedGeneration: UInt64,
-        completedGeneration: UInt64,
-        drainActive: Bool
-    ) {
-        (
-            requestedGeneration: organismPersistenceRequestedGeneration,
-            completedGeneration: organismPersistenceCompletedGeneration,
-            drainActive: organismPersistenceDrainTask != nil
-        )
-    }
-
-    /// Durability barrier for work already accepted by the test runtime. It
-    /// does not enqueue a synthetic write or create another generation.
-    func flushOrganismPersistenceForProof() async -> Bool {
-        guard microcycleSchedulingMode == .manuallyFlushed else { return false }
-        let generation = organismPersistenceRequestedGeneration
-        guard generation > 0 else { return true }
-        return await awaitOrganismContinuityPersistence(through: generation)
     }
 
     public func setOrganismKernelEnabled(_ enabled: Bool) async {
@@ -417,10 +392,6 @@ extension NativeCognitionRuntime {
         return await organismKernel.behaviorPosture()
     }
 
-    public func resetOrganismContinuity() async -> OrganismSnapshot {
-        await resetOrganismContinuityChecked().snapshot
-    }
-
     /// Reset only commits after the new empty baseline is durable. The old
     /// state remains both on disk and in memory when the writer refuses.
     public func resetOrganismContinuityChecked() async -> OrganismContinuityApplyOutcome {
@@ -459,10 +430,6 @@ extension NativeCognitionRuntime {
         return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
     }
 
-    public func settleOrganismContinuity() async -> OrganismSnapshot {
-        await settleOrganismContinuityChecked().snapshot
-    }
-
     /// Settle is likewise a checked durable mutation. A failed writer restores
     /// the pre-settle state instead of leaving the screen to imply success.
     public func settleOrganismContinuityChecked() async -> OrganismContinuityApplyOutcome {
@@ -485,11 +452,6 @@ extension NativeCognitionRuntime {
         let snapshot = await organismKernel.snapshot()
         publishRuntimeChange(reason: "organism:settled")
         return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
-    }
-
-    struct OrganismBodySample {  // internal for actor extensions (move-only Wave C)
-        let read: OrganismBodyRead
-        let integratesChemistry: Bool
     }
 
     /// Item 4 (2026-09-02) — THE BODY'S CLOCK, pushed from the ONE source the
@@ -523,13 +485,13 @@ extension NativeCognitionRuntime {
         let sample = await organismBodySample(at: fixedAt)
         let canonicalAffect = await substrate.canonicalAffectProjection(at: fixedAt)
         await organismKernel.refreshBodySchema(
-            sample.read,
-            integratesChemistry: sample.integratesChemistry,
+            sample,
+            integratesChemistry: false,
             canonicalAffect: canonicalAffect
         )
     }
 
-    func organismBodySample(at fixedAt: Date) async -> OrganismBodySample {  // internal for actor extensions (move-only Wave C)
+    func organismBodySample(at fixedAt: Date) async -> OrganismBodyRead {  // internal for actor extensions (move-only Wave C)
         // The frozen per-turn read (`refreshBodySchemaAndFrozenRead`) enters
         // here too, so the clock is fresh for the capsule as well as for the
         // background refresh above.
@@ -567,23 +529,18 @@ extension NativeCognitionRuntime {
             liveRead.providerPathBelief = nil
             liveRead.providersHealthy = false
         }
-        let read: OrganismBodyRead
-        let integratesChemistry: Bool
         if let override = organismDebugBodyOverride, override.expiresAt > fixedAt {
-            read = Self.simulatedOrganismBodyRead(
+            return Self.simulatedOrganismBodyRead(
                 base: liveRead,
                 scenario: override.scenario,
                 now: fixedAt
             )
-            integratesChemistry = false
         } else {
             organismDebugBodyOverride = nil
             // Phase 5 E3: provider, tool, memory, phone and thermal facts are
             // health for the ops posture, never a feeling.
-            integratesChemistry = false
-            read = liveRead
+            return liveRead
         }
-        return OrganismBodySample(read: read, integratesChemistry: integratesChemistry)
     }
 
     private func activeOrganismDebugBodyOverride(now: Date) -> OrganismDebugBodyOverride? {
@@ -670,7 +627,7 @@ extension NativeCognitionRuntime {
         }
         return await withCheckedContinuation { continuation in
             organismPersistenceWaiters[generation, default: []].append(continuation)
-            // An awaited save (quit, proof flush) never waits out the debounce.
+            // An awaited save never waits out the debounce.
             organismPersistenceDebounceTask?.cancel()
         }
     }
@@ -728,11 +685,7 @@ extension NativeCognitionRuntime {
         guard let state = await organismKernel.exportPersistentState() else { return false }
         do {
             let url = organismPersistentStateURL
-            if let organismPersistenceWriterOverride {
-                try await organismPersistenceWriterOverride(state, url)
-            } else {
-                try await Self.writeOrganismPersistentState(state, to: url)
-            }
+            try await Self.writeOrganismPersistentState(state, to: url)
             return true
         } catch {
             await substrate.recordReceipt(
@@ -1346,13 +1299,7 @@ extension NativeCognitionRuntime {
 
     private nonisolated static func parseISODate(_ string: String) -> Date? {
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: trimmed) { return date }
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return standard.date(from: trimmed)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
     }
 
     private nonisolated static func newestFileModificationDate(in directory: URL, suffix: String) -> Date? {

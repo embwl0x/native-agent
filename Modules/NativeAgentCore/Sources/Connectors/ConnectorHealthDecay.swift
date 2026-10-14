@@ -2,46 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - Connector health decays (Fable 5.1 sweep item 49, 2026-09-01)
-//
-// THE LIE THIS REPLACES. `connectors/registry.json` carried `lastCheckedAt`
-// frozen at 2026-06-02 with `healthStatus: "ok"` for every row, and the read
-// path re-derived that "ok" from OAUTH-TOKEN-FILE PRESENCE
-// (`connectorRowWithRuntimeOverlay`) — never from a live call. A token file on
-// disk is proof that a sign-in once completed. It is not proof that the
-// integration works now: the grant can be revoked, the app deleted, the scope
-// dropped, the service down. Rendering that as a green "ok" is a claim the
-// code cannot back (NORTHSTAR clause 2).
-//
-// THE SHAPE OF THE FIX — a clock, not a probe. Same shape as the affect
-// half-lives: nothing polls, nothing probes, nothing schedules. A signal
-// arrives when a real call succeeds, and DECAYS on its own when none does.
-//   • proven by a real successful connector call inside the window → FRESH
-//     ("ok"), stamped with that call's timestamp.
-//   • proven once, but not within the window            → STALE ("unverified")
-//   • credential present, never proven by a call        → CONFIGURED
-//     ("configured, unverified")
-// Only a row that currently CLAIMS a live connection (`healthStatus == "ok"`)
-// AND whose green came from CREDENTIAL PRESENCE can decay. A row that already
-// says needs_auth / not_connected / ready / planned / coming_soon is untouched
-// — this layer only downgrades an unproven green claim; it never invents a
-// state.
-//
-// WHY THE SECOND CONDITION (2026-09-01 review, HIGH). "healthStatus == ok" was
-// the whole test, so every overlay row that reads green decayed — including the
-// LOCAL readiness claims that are not credential claims at all: Telegram
-// (a configured, enabled bot) and EventKit Calendar (a granted OS permission).
-// Neither ever emits a connector-action receipt, so neither can ever be
-// "proven"; on a fresh install or a fresh permission grant they flipped
-// straight to `configured/unverified` — a NEW lie in place of the old one. The
-// eligibility bit is therefore stamped explicitly by the overlay that derived
-// the green (`ConnectorHealthDecay.proofSourceKey`), never inferred here.
-//
-// The evidence is the connector-action receipt ledger
-// (`connectors/actions/receipts.jsonl`, written by
-// `appendConnectorActionReceipt`), which is the one place a connector call
-// that actually reached a provider is recorded. A DRY RUN is not evidence: it
-// never touched the provider, so it cannot refresh a health claim.
+// Credential-backed health follows the latest real action receipt. A failure
+// of authorization or transport supersedes success; proof decays without polling. Local
+// readiness (Telegram configuration or EventKit permission) has its own owner.
 
 public enum ConnectorHealthDecay {
     /// A connector untouched for this long stops reading green. Seven days —
@@ -96,14 +59,13 @@ public enum ConnectorHealthDecay {
 
     /// Apply the decay to one already-derived registry row.
     ///
-    /// `lastSuccessAt` is the newest successful, non-dry-run connector call for
-    /// this row's connector (see `ConnectorProofLedger`). Rows that do not
+    /// `outcome` is the newest non-dry-run connection outcome. Rows that do not
     /// claim health "ok", and rows whose green did not come from credential
     /// presence (no `proofSourceKey == credentialProofSource` stamp from the
     /// overlay), are returned unchanged.
     public static func apply(
         to row: [String: JSONValue],
-        lastSuccessAt: Date?,
+        outcome: (at: Date, succeeded: Bool, authorizationFailed: Bool)?,
         now: Date,
         window: TimeInterval = provenWindow
     ) -> [String: JSONValue] {
@@ -111,6 +73,13 @@ public enum ConnectorHealthDecay {
               stringField(row[proofSourceKey])?.lowercased() == credentialProofSource
         else { return row }
         var out = row
+        if let outcome, !outcome.succeeded {
+            if outcome.authorizationFailed { out["authState"] = .string("failed") }
+            out["healthStatus"] = .string("failed")
+            out["lastCheckedAt"] = .string(isoTimestamp(outcome.at))
+            return out
+        }
+        let lastSuccessAt = outcome?.at
         switch verification(lastSuccessAt: lastSuccessAt, now: now, window: window) {
         case .fresh:
             // Keep "ok" — and replace the frozen registry stamp with the
@@ -142,9 +111,9 @@ public enum ConnectorHealthDecay {
     }
 }
 
-// MARK: - The proof: successful connector-action receipts
+// MARK: - Connector-action outcomes
 
-/// Reads the newest successful connector call per connector out of
+/// Reads the newest connector outcome per connector out of
 /// `connectors/actions/receipts.jsonl`. This is the ONLY "the integration
 /// actually worked" signal in the system — every connector action lands a
 /// receipt there through `appendConnectorActionReceipt`.
@@ -167,46 +136,69 @@ public enum ConnectorProofLedger {
             .appendingPathComponent("receipts.jsonl")
     }
 
-    /// Newest successful call per connector family, keyed by `canonicalID`.
-    public static func lastSuccessByConnector(
+    /// Newest success or connection rejection per family, keyed by `canonicalID`.
+    public static func latestByConnector(
         root: URL,
         maxTailBytes: Int = maxTailBytes
-    ) -> [String: Date] {
-        lastSuccessByConnector(receiptsPath: receiptsPath(root: root), maxTailBytes: maxTailBytes)
+    ) -> [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] {
+        latestByConnector(receiptsPath: receiptsPath(root: root), maxTailBytes: maxTailBytes)
     }
 
-    public static func lastSuccessByConnector(
+    public static func latestByConnector(
         receiptsPath path: URL,
         maxTailBytes: Int = maxTailBytes
-    ) -> [String: Date] {
-        var newest: [String: Date] = [:]
+    ) -> [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] {
+        var newest: [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] = [:]
         for line in tailLines(path: path, maxTailBytes: maxTailBytes) {
             guard let data = line.data(using: .utf8),
                   case .object(let row)? = try? JSONValue.parse(data) else { continue }
             guard let connector = string(row["connectorId"]).map(canonicalID),
                   !connector.isEmpty else { continue }
+            // GitHub's HTTP owner records the actual wire result. Action receipts
+            // can describe local work or a cached read, neither of which verifies it.
+            if connector == "github", string(row["actionId"]) != "github.http" { continue }
             // A dry run proves nothing about the live integration.
             if case .bool(true)? = row["dryRun"] { continue }
-            // Only Slack and GitHub status actions contact their providers.
+            guard let status = string(row["status"])?.lowercased(),
+                  successStatuses.contains(status) || status == "failed" else { continue }
+            let rejection = connectionRejection(row["output"])
+            if status == "failed", rejection == nil { continue }
+            // Local status success proves no transport; a failed credential
+            // check still invalidates an earlier successful call.
             if let action = string(row["actionId"])?.lowercased(),
-               action.hasSuffix(".status"), action != "slack.status", action != "github.status" {
+               status != "failed", action.hasSuffix(".status"), action != "slack.status", action != "github.status" {
                 continue
             }
-            guard let status = string(row["status"])?.lowercased(),
-                  successStatuses.contains(status) else { continue }
             guard let created = string(row["createdAt"]),
                   let date = NativeTimestampFormat.parseISO8601FractionalFirst(created) else { continue }
-            if let existing = newest[connector], existing >= date { continue }
-            newest[connector] = date
+            if let existing = newest[connector], existing.at > date { continue }
+            newest[connector] = (date, successStatuses.contains(status), status == "failed" && rejection == true)
         }
         return newest
     }
 
+    /// True for rejected authorization, false for a failed transport, nil for
+    /// action/local failures that say nothing about the connection's health.
+    private static func connectionRejection(_ output: JSONValue?) -> Bool? {
+        guard case .object(let fields)? = output else { return nil }
+        let error = string(fields["error"])?.lowercased() ?? ""
+        if error == "transport_failed" { return false }
+        if ["invalid_auth", "not_authed", "token_revoked", "account_inactive",
+            "invalid_token", "token_expired", "invalid_grant", "invalid_client",
+            "unauthorized_client", "refresh_rejected"].contains(error) { return true }
+        let code: Int?
+        if case .int(let value)? = fields["statusCode"] ?? fields["httpStatus"] {
+            code = Int(value)
+        } else { code = error.hasPrefix("http_") ? Int(error.dropFirst(5)) : nil }
+        if code == 401 { return true }
+        if let code, (500...599).contains(code) { return false }
+        return nil
+    }
+
     /// Registry ids and receipt `connectorId`s spell the same integration
     /// differently (the registry says `gcal`/`gmail`; receipts say
-    /// `calendar`/`email`). Fold both onto one family key — the same aliasing
-    /// `SwiftNativeConnectorAuthClient.providerID` already uses — so proof
-    /// recorded under one spelling reaches the row under the other.
+    /// `calendar`/`email`). Fold both onto one family key so proof recorded
+    /// under one spelling reaches the row under the other.
     public static func canonicalID(_ raw: String) -> String {
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "email", "gmail": return "gmail"

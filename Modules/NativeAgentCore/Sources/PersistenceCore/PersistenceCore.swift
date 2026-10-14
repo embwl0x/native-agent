@@ -4,6 +4,169 @@ import Foundation
 import Darwin
 import NativeAgentCore
 
+private extension JSONValue {
+    var objectValue: [String: JSONValue]? { if case .object(let fields) = self { fields } else { nil } }
+    var arrayValue: [JSONValue]? { if case .array(let values) = self { values } else { nil } }
+    var stringValue: String? { if case .string(let text) = self { text } else { nil } }
+}
+
+extension CapabilityLifecycle {
+    private static let offStatuses = ["off", "disabled", "trashed", "archived", "quarantined", "dormant", "rejected"]
+    private static let retirementFields = ["trashedAt", "droppedAt", "archivedAt", "archivedStatus", "archiveReason",
+                                           "quarantinedAt", "quarantinedStatus", "quarantineReason", "quarantinePath",
+                                           "unavailableReason", "retired", "suspended"]
+
+    /// Raw file mutations cannot bypass the ability lifecycle, including by
+    /// replacing a parent folder. Other protected stores recheck the turn's steer.
+    public static func requireFileMutation(_ path: URL, dataRoot: URL, personaRoot: URL? = nil) throws {
+        let path = path.standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
+        func reaches(_ store: URL) -> Bool {
+            let store = store.standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
+            return path == store || path.hasPrefix(store + "/") || store.hasPrefix(path == "/" ? path : path + "/")
+        }
+        let abilities = [dataRoot, libraryAppSupportFallback(appBundleIdentifier: canonicalPublicBundleIdentifier)]
+            .flatMap { root in Store.allCases.map { $0.directory(in: root) } + [root.appendingPathComponent("abilities")] }
+        if abilities.contains(where: reaches) || protectedStores.contains(where: { reaches(dataRoot.appendingPathComponent($0)) })
+            || reaches(personaRoot ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)) {
+            try requireWrite()
+        }
+        if abilities.contains(where: reaches) {
+            throw PersistenceCoreError.ioFailure("Ability stores require lifecycle actions; use the sense, tool or skill action for this change.")
+        }
+    }
+
+    /// Every ability registry and program writer enters here, including repair.
+    /// Accounting may change under peer steering; executable content may not.
+    public static func writeData(_ data: Data, to path: URL, registry: Bool = false, exclusively: Bool = false) throws {
+        if writeRefusal != nil {
+            let before = FileManager.default.fileExists(atPath: path.path) ? try Data(contentsOf: path) : Data()
+            let changed: Bool
+            if registry, let proposed = try? JSONValue.parse(data), let current = try? JSONValue.parse(before) {
+                changed = abilityContents(proposed) != abilityContents(current)
+            } else {
+                changed = data != before
+            }
+            if changed { try requireWrite() }
+        }
+        if exclusively {
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: path, options: .withoutOverwriting)
+        } else {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
+        }
+    }
+
+    public static func requiresOwnerToEnable(_ row: [String: JSONValue]) -> Bool {
+        return requiresOwnerToEnable(isOff: offStatuses.contains((row["state"] ?? row["status"])?.stringValue ?? ""),
+                                     disabledBy: row["disabledBy"]?.stringValue)
+    }
+
+    /// Reconcile under the registry lock. Off ownership belongs to the ability,
+    /// not its selected version or the snapshot an upgrade was assembled from.
+    public static func preservingOwnerOff(_ proposed: [String: JSONValue], before current: [String: JSONValue]?,
+                                          ownerAuthorized: Bool = false, enabling: Bool = false, preview: Bool = false) throws -> [String: JSONValue] {
+        let key = proposed["state"] == nil ? "status" : "state"
+        if let attribution = current?["disabledBy"], attribution != .null,
+           ![JSONValue.string("owner"), .string("agent")].contains(attribution) {
+            throw PersistenceCoreError.ioFailure("The ability's off ownership is unreadable. Repair its registry entry before changing it.")
+        }
+        let ownerOff = current.map(requiresOwnerToEnable) ?? false
+        var row = proposed
+        if ownerOff, !ownerAuthorized {
+            if enabling {
+                let name = current?["name"]?.stringValue ?? current?["id"]?.stringValue ?? "this ability"
+                throw NSError(domain: "CapabilityLifecycle", code: 403, userInfo: [NSLocalizedDescriptionKey:
+                    "The owner turned \(name) off; they turn it back on. Ask them."])
+            }
+            for field in [key, "phase", "enabledAt"] + retirementFields {
+                row[field] = current?[field]
+            }
+            row["disabledBy"] = .string("owner")
+        } else {
+            row["disabledBy"] = offStatuses.contains(row[key]?.stringValue ?? "") ? .string(ownerAuthorized ? "owner" : "agent") : nil
+            if enabling, !offStatuses.contains(row[key]?.stringValue ?? "") {
+                for field in retirementFields { row.removeValue(forKey: field) }
+            }
+        }
+        if !preview, abilityContents(.object(row)) != abilityContents(current.map(JSONValue.object) ?? .null) { try requireWrite() }
+        return row
+    }
+
+    public static func preservingOwnerOff<Record: Codable>(_ proposed: Record, before current: Record?,
+                                                           ownerAuthorized: Bool = false, enabling: Bool = false, preview: Bool = false) throws -> Record {
+        let row = try preservingOwnerOff(JSONRow(JSONValue.fromEncodable(proposed)).fields,
+            before: current.map { try JSONRow(JSONValue.fromEncodable($0)).fields }, ownerAuthorized: ownerAuthorized, enabling: enabling, preview: preview)
+        return try JSONDecoder().decode(Record.self, from: JSONValue.object(row).serializedData(pretty: false))
+    }
+
+    /// The retained sense history and the flat tool/skill rows use the same rule.
+    public static func preservingOwnerOff(_ proposed: JSONValue, before current: JSONValue,
+                                          ownerAuthorized: Bool = false, enabling: Bool = false) throws -> JSONValue {
+        if abilityContents(proposed) != abilityContents(current) { try requireWrite() }
+        if case .array(let rows) = proposed {
+            let previous = current.arrayValue ?? current.objectValue?["tools"]?.arrayValue ?? current.objectValue?["skills"]?.arrayValue ?? []
+            return .array(try rows.map { value in
+                guard let row = value.objectValue else { return value }
+                let old = previous.first { $0.objectValue?["id"] == row["id"] }?.objectValue
+                    ?? previous.first { $0.objectValue?["id"] == row["replaces"]?.objectValue?["id"] }?.objectValue
+                if old == row { return value }
+                return .object(try preservingOwnerOff(row, before: old, ownerAuthorized: ownerAuthorized,
+                    enabling: enabling))
+            })
+        }
+        guard case .object(var store) = proposed, case .array(var entries)? = store["senses"] else { return proposed }
+        let previous = (current.objectValue?["senses"]?.arrayValue ?? []).compactMap { value -> [String: JSONValue]? in
+            let entry = value.objectValue
+            return entry?["versions"]?.arrayValue?.first {
+                $0.objectValue?["record"]?.objectValue?["version"] == entry?["currentVersion"]
+            }?.objectValue?["record"]?.objectValue
+        }
+        for i in entries.indices {
+            guard case .object(var entry) = entries[i], case .array(var versions)? = entry["versions"],
+                  let j = versions.firstIndex(where: { $0.objectValue?["record"]?.objectValue?["version"] == entry["currentVersion"] }),
+                  case .object(var version) = versions[j], let record = version["record"]?.objectValue else { continue }
+            let old = previous.first { $0["id"] == entry["id"] }
+                ?? (previous.contains { $0["corner"] == record["corner"] && $0["status"] == .string("on") } ? nil
+                    : previous.first { $0["corner"] == record["corner"] && requiresOwnerToEnable($0) })
+            if old == record { continue }
+            version["record"] = .object(try preservingOwnerOff(record, before: old, ownerAuthorized: ownerAuthorized,
+                enabling: enabling))
+            versions[j] = .object(version); entry["versions"] = .array(versions); entries[i] = .object(entry)
+        }
+        store["senses"] = .array(entries)
+        return .object(store)
+    }
+
+    /// Usage evidence is not an ability edit. Only these existing row fields
+    /// are accounting; unknown fields and all program/fixture bytes stay protected.
+    private static func abilityContents(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .array(let rows): return .array(rows.map(abilityContents))
+        case .object(var fields):
+            if case .array(let entries)? = fields["senses"] {
+                fields["senses"] = .array(entries.map { value in
+                    guard case .object(var entry) = value, case .array(let versions)? = entry["versions"] else { return value }
+                    entry["versions"] = .array(versions.map { value in
+                        guard case .object(var version) = value, let record = version["record"] else { return value }
+                        version["record"] = abilityContents(record)
+                        return .object(version)
+                    })
+                    return .object(entry)
+                })
+            } else {
+                for key in ["tools", "skills"] {
+                    if let rows = fields[key] { fields[key] = abilityContents(rows) }
+                }
+                if let original = fields["builtIn"] { fields["builtIn"] = abilityContents(original) }
+                for field in ["uses", "useCount", "lastUsedAt", "lastRunVersion", "lastRun", "failuresInARow",
+                              "lastCleanCode", "lastCleanVersion", "lastCleanDigest", "runs"] { fields.removeValue(forKey: field) }
+            }
+            return .object(fields)
+        default: return value
+        }
+    }
+}
+
 // MARK: - Errors
 
 /// Errors raised by the persistence layer.
@@ -50,8 +213,7 @@ public protocol PersistenceCoreProtocol: Sendable {
     /// `any PersistenceCoreProtocol`, and a protocol-extension-only method on an
     /// existential dispatches STATICALLY to the default — the real
     /// implementation would never run and every desk read would report a clean
-    /// feed. Declaring them here makes the witness table carry them. Defaults
-    /// live in the extension below, so no existing conformer breaks.
+    /// feed. Declaring them here makes the witness table carry them.
     func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport)
     func appendJSONLDurable(_ record: JSONValue, to path: URL) async throws
     /// Atomic replacement of an ALREADY-SERIALIZED payload with the same
@@ -107,93 +269,9 @@ public struct JSONLReadReport: Sendable, Equatable {
 }
 
 extension PersistenceCoreProtocol {
-    /// Non-file-backed conformers have no physical JSONL rows beyond the
-    /// bounded values they return. Native file persistence supplies the real
-    /// malformed-row accounting through its witness.
-    public func tailJSONLReadReceipt(
-        _ path: URL,
-        limit: Int,
-        maxBytes: Int?
-    ) async throws -> SwiftNativePersistenceCore.JSONLTailReadReceipt {
-        let rows = try await tailJSONL(path, limit: limit, maxBytes: maxBytes)
-        return SwiftNativePersistenceCore.JSONLTailReadReceipt(
-            rows: rows,
-            physicalRowsScanned: rows.count,
-            malformedJSONRowCount: 0,
-            bytesRead: 0,
-            truncatedToByteWindow: false
-        )
-    }
-
-    /// `readJSONL` plus what the scan discarded.
-    ///
-    /// THE DEFAULT NEVER CLAIMS A CLEAN SCAN IT HAS NOT PROVEN (gpt-5.5 review
-    /// 2026-08-02, finding 4). The previous default hard-coded `.clean`, which
-    /// is only true for a conformer with no file behind it. A file-backed
-    /// wrapper — a decorator that implements `readJSONL` by delegating to
-    /// `SwiftNativePersistenceCore` and simply never thinks about this method —
-    /// inherited "clean" for a feed that had malformed rows on disk, and the
-    /// compaction gate it feeds then rewrote the file and erased them. Nothing
-    /// about that conformance is visibly wrong at the call site, which is
-    /// exactly why the default has to be safe rather than convenient.
-    ///
-    /// So: if a real file exists at `path`, the report is derived from THOSE
-    /// BYTES via the canonical scanner — the same bytes compaction is about to
-    /// rewrite — and only a path with no file falls back to describing the rows
-    /// the conformer returned. A delegating wrapper therefore reports honestly
-    /// whether or not its author remembered this method; an in-memory shim
-    /// still reports clean, because for it that IS the truth. The cost is one
-    /// extra read for delegating conformers only; `SwiftNativePersistenceCore`
-    /// overrides this method outright and never pays it.
-    public func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport) {
-        let rows = try await readJSONL(path)
-        guard FileManager.default.fileExists(atPath: path.path) else {
-            return (rows, JSONLReadReport(physicalLineCount: rows.count))
-        }
-        let fileReport = try await SwiftNativePersistenceCore().readJSONLReporting(path).report
-        return (rows, fileReport)
-    }
-
-    /// Durable append: the bytes are on the platter before this returns.
-    ///
-    /// The default delegates to the plain `appendJSONL` — a shim with no real
-    /// file has nothing to flush. `SwiftNativePersistenceCore` overrides it with
-    /// an `F_FULLFSYNC` before the descriptor closes.
-    public func appendJSONLDurable(_ record: JSONValue, to path: URL) async throws {
-        try await appendJSONL(record, to: path)
-    }
-
-    /// Durable atomic replacement of pre-serialized bytes.
-    ///
-    /// The default routes through the canonical writer rather than
-    /// `Data.write(.atomic)` so a delegating wrapper that never thinks about
-    /// this method still gets the temp-fsync + rename + parent-dir-fsync
-    /// guarantees. An in-memory shim that wants different behavior overrides it.
-    public func writeDataAtomicDurable(_ data: Data, to path: URL) async throws {
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
-    }
-}
-
-extension PersistenceCoreProtocol {
     /// Default tail: last 20 records, scanning up to 1 MiB from end of file.
     public func tailJSONL(_ path: URL) async throws -> [JSONValue] {
         try await tailJSONL(path, limit: 20, maxBytes: 1_048_576)
-    }
-
-    /// Default atomic JSONL replacement (op-log compaction truncate).
-    ///
-    /// A conformer that inherits this implementation must retain the same
-    /// durability contract as the native writer. Compaction writes its base
-    /// first; accepting a non-durable truncate afterward would make a power
-    /// loss look like a successful commit while losing the replay tail.
-    public func replaceJSONL(_ records: [JSONValue], to path: URL) async throws {
-        var payload = Data()
-        for record in records {
-            payload.append(contentsOf: try record.serialize(pretty: false).utf8)
-            payload.append(0x0A)
-        }
-        try await writeDataAtomicDurable(payload, to: path)
-        _ = chmod(path.path, 0o600)
     }
 }
 
@@ -202,18 +280,6 @@ extension PersistenceCoreProtocol {
 /// Native Swift implementation. Pure file IO — stateless and implicitly Sendable.
 public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     public init() {}
-
-    /// Observable only through task-local evaluation scope. Keeping the
-    /// durability phases beside the real atomic writer lets a boundary eval
-    /// distinguish a crash-atomic rename from the required parent-directory
-    /// flush without changing the product's I/O path.
-    enum AtomicWriteDurabilityPhase: Sendable, Equatable {
-        case temporaryFileSynced
-        case parentDirectorySynced
-    }
-
-    @TaskLocal static var atomicWriteDurabilityObserver:
-        (@Sendable (AtomicWriteDurabilityPhase) -> Void)?
 
     public func readJSON(_ path: URL, ifMissing: JSONValue) async throws -> JSONValue {
         let data: Data
@@ -304,10 +370,6 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     }
 
     private func appendRecords(_ records: [JSONValue], to path: URL, durable: Bool) throws {
-        try appendCurrentRecords(records, to: path, durable: durable)
-    }
-
-    private func appendCurrentRecords(_ records: [JSONValue], to path: URL, durable: Bool) throws {
         guard !records.isEmpty else { return }
         let dir = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -335,23 +397,8 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         _ = chmod(path.path, 0o600)
     }
 
-    /// JSONL append that does NOT chmod the target and creates with
-    /// umask-derived permissions. Used for audit-style files where an existing
-    /// 0644 mode must be preserved rather than tightened to 0600.
-    /// Identical to `appendJSONL` otherwise. Callers that own the file
-    /// exclusively should prefer `appendJSONL`. The caller is responsible for
-    /// holding the cross-process `withFileLock` around this when shared.
-    public func appendAuditLine(_ record: JSONValue, to path: URL) async throws {
-        let dir = path.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var line = try record.serialize(pretty: false)
-        line += "\n"
-        try Self.appendBytes(Data(line.utf8), to: path, createMode: 0o666)
-    }
-
-    /// Append a pre-serialized JSON line (no re-encode) under the SAME file-mode
-    /// posture as `appendAuditLine` (0o666 create-mode ⇒ umask-derived 0644,
-    /// no chmod on an existing file).
+    /// Append a pre-serialized JSON line (no re-encode) with 0o666 create-mode
+    /// (umask-derived 0644) and no chmod on an existing file.
     /// Used when the caller has already produced byte-exact output via
     /// `serializeOrderedObjectPython` and must NOT have it re-sorted by the
     /// `serialize` path. A trailing newline is appended (one row per line). The
@@ -467,28 +514,43 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         limit: Int,
         maxBytes: Int?
     ) async throws -> JSONLTailReadReceipt {
+        let read = try Self.tailPhysicalLines(path, limit: limit, maxBytes: maxBytes)
+        let tail = read.lines
+        var rows: [JSONValue] = []
+        rows.reserveCapacity(tail.count)
+        var malformedJSONRowCount = 0
+        for line in tail {
+            if let row = try? JSONValue.parse(Data(line.utf8)) {
+                rows.append(row)
+            } else {
+                malformedJSONRowCount += 1
+            }
+        }
+        return JSONLTailReadReceipt(
+            rows: rows,
+            physicalRowsScanned: tail.count,
+            malformedJSONRowCount: malformedJSONRowCount,
+            bytesRead: read.bytesRead,
+            truncatedToByteWindow: read.truncatedToByteWindow
+        )
+    }
+
+    /// Tail raw physical lines so typed readers can keep their own decoding rules.
+    public static func tailPhysicalLines(
+        _ path: URL,
+        limit: Int,
+        maxBytes: Int?
+    ) throws -> (lines: [String], bytesRead: Int, truncatedToByteWindow: Bool) {
         guard limit > 0, maxBytes.map({ $0 > 0 }) ?? true,
               FileManager.default.fileExists(atPath: path.path) else {
-            return JSONLTailReadReceipt(
-                rows: [],
-                physicalRowsScanned: 0,
-                malformedJSONRowCount: 0,
-                bytesRead: 0,
-                truncatedToByteWindow: false
-            )
+            return ([], 0, false)
         }
         let handle = try FileHandle(forReadingFrom: path)
         defer { try? handle.close() }
         // Size and bytes must belong to the same inode if a writer rotates it.
         let size = Int(try handle.seekToEnd())
         if size == 0 {
-            return JSONLTailReadReceipt(
-                rows: [],
-                physicalRowsScanned: 0,
-                malformedJSONRowCount: 0,
-                bytesRead: 0,
-                truncatedToByteWindow: false
-            )
+            return ([], 0, false)
         }
 
         let toRead: Int
@@ -525,24 +587,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // Match Python's tail_jsonl: take the last N PHYSICAL lines first, then
         // parse and skip malformed entries. So when some of the trailing lines
         // are malformed the return count is < limit (matches Python).
-        let tail = lines.suffix(limit)
-        var rows: [JSONValue] = []
-        rows.reserveCapacity(tail.count)
-        var malformedJSONRowCount = 0
-        for line in tail {
-            if let row = try? JSONValue.parse(Data(line.utf8)) {
-                rows.append(row)
-            } else {
-                malformedJSONRowCount += 1
-            }
-        }
-        return JSONLTailReadReceipt(
-            rows: rows,
-            physicalRowsScanned: tail.count,
-            malformedJSONRowCount: malformedJSONRowCount,
-            bytesRead: data.count,
-            truncatedToByteWindow: seekFromEnd
-        )
+        return (Array(lines.suffix(limit)), data.count, seekFromEnd)
     }
 
     /// Decode utf-8 with replacement, split on `\n`, drop trailing empty line, and
@@ -590,8 +635,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         _ data: Data,
         to path: URL,
         createMode: mode_t = 0o600,
-        durable: Bool = false,
-        syscalls: FlushSyscalls = .system
+        durable: Bool = false
     ) throws {
         // F2 (2026-08-28) — THE cap chokepoint. Every JSONL append variant
         // (`appendJSONL`, the batch form, `appendJSONLDurable`, `appendAuditLine`,
@@ -629,7 +673,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
             throw PersistenceCoreError.ioFailure("open(append) failed: \(String(cString: strerror(errno)))")
         }
         var handedOff = false
-        defer { if !handedOff { _ = syscalls.close(fd) } }
+        defer { if !handedOff { _ = Darwin.close(fd) } }
         try payload.withUnsafeBytes { raw in
             var ptr = raw.baseAddress!
             var remaining = raw.count
@@ -646,28 +690,12 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // The write landed in the page cache. Everything that makes this append
         // DURABLE happens below, BEFORE we return — never in a defer.
         handedOff = true
-        try flushAndClose(fd: fd, path: path, durable: durable, syscalls: syscalls)
+        try flushAndClose(fd: fd, path: path, durable: durable)
         if durable {
             // Also persist the entry if this append created the file, including
             // a retry after an earlier append failed to sync the directory.
             try syncDirectory(path.deletingLastPathComponent())
         }
-    }
-
-    /// The three syscalls the durability tail depends on, behind a seam so a
-    /// test can make them FAIL. Each closure returns 0 on success or the errno
-    /// it failed with — the real ones read the global `errno` immediately, so
-    /// nothing downstream depends on a global that a later call may clobber.
-    struct FlushSyscalls: Sendable {
-        var fullFsync: @Sendable (Int32) -> Int32
-        var fsync: @Sendable (Int32) -> Int32
-        var close: @Sendable (Int32) -> Int32
-
-        static let system = FlushSyscalls(
-            fullFsync: { fd in Darwin.fcntl(fd, F_FULLFSYNC) == -1 ? errno : 0 },
-            fsync: { fd in Darwin.fsync(fd) == -1 ? errno : 0 },
-            close: { fd in Darwin.close(fd) == -1 ? errno : 0 }
-        )
     }
 
     /// errnos that mean "this filesystem does not implement `F_FULLFSYNC`",
@@ -698,13 +726,12 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     static func flushAndClose(
         fd: Int32,
         path: URL,
-        durable: Bool,
-        syscalls: FlushSyscalls = .system
+        durable: Bool
     ) throws {
         var flushError: PersistenceCoreError?
         if durable {
             do {
-                try fullSync(fd: fd, path: path, syscalls: syscalls)
+                try fullSync(fd: fd, path: path)
             } catch let error as PersistenceCoreError {
                 flushError = error
             }
@@ -712,7 +739,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // Close EXACTLY ONCE regardless — retrying close(2) on EINTR is a
         // double-close on Darwin (the descriptor is already gone) and could
         // close a descriptor another thread has since been handed.
-        let closeErrno = syscalls.close(fd)
+        let closeErrno = Darwin.close(fd) == -1 ? errno : 0
         if let flushError { throw flushError }
         if closeErrno != 0 && closeErrno != EINTR {
             let message = "close(append \(path.lastPathComponent)) failed: \(String(cString: strerror(closeErrno)))"
@@ -723,10 +750,10 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
 
     /// `F_FULLFSYNC`, with the ONE legitimate fallback. Throws when the bytes
     /// cannot be proven durable.
-    private static func fullSync(fd: Int32, path: URL, syscalls: FlushSyscalls) throws {
+    private static func fullSync(fd: Int32, path: URL) throws {
         var lastErrno: Int32 = 0
         for _ in 0..<8 {
-            lastErrno = syscalls.fullFsync(fd)
+            lastErrno = Darwin.fcntl(fd, F_FULLFSYNC) == -1 ? errno : 0
             if lastErrno == 0 { return }
             if lastErrno != EINTR { break }
         }
@@ -748,7 +775,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // result is now CHECKED.
         var fsyncErrno: Int32 = 0
         for _ in 0..<8 {
-            fsyncErrno = syscalls.fsync(fd)
+            fsyncErrno = Darwin.fsync(fd) == -1 ? errno : 0
             if fsyncErrno == 0 { return }
             if fsyncErrno != EINTR { break }
         }
@@ -769,10 +796,6 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     /// still lose; the full flush costs ~4 ms each, so the generic writer on
     /// the turn path keeps plain fsync.
     package static func atomicWrite(_ data: Data, to path: URL, fullFlush: Bool = false) throws {
-        try atomicWriteCurrent(data, to: path, fullFlush: fullFlush)
-    }
-
-    private static func atomicWriteCurrent(_ data: Data, to path: URL, fullFlush: Bool) throws {
         let dir = path.deletingLastPathComponent()
         let name = path.lastPathComponent
         let pid = getpid()
@@ -827,12 +850,11 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // filesystem does not implement F_FULLFSYNC — the documented pattern,
         // not a silent downgrade.
         if fullFlush {
-            try fullSync(fd: fd, path: tmpPath, syscalls: .system)
+            try fullSync(fd: fd, path: tmpPath)
         } else if fsync(fd) != 0 {
             let err = String(cString: strerror(errno))
             throw PersistenceCoreError.ioFailure("fsync(tmp) failed: \(err)")
         }
-        atomicWriteDurabilityObserver?(.temporaryFileSynced)
         if close(fd) != 0 {
             fdClosed = true
             let err = String(cString: strerror(errno))
@@ -851,7 +873,6 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // the file contents reached storage. Callers receive an error on an
         // uncertain commit and can re-read the canonical path before retrying.
         try syncDirectory(dir, fullFlush: fullFlush)
-        atomicWriteDurabilityObserver?(.parentDirectorySynced)
     }
 
     /// Persist directory-entry changes before a transaction advances.
@@ -864,21 +885,13 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         }
         defer { _ = close(directoryFD) }
         if fullFlush {
-            try fullSync(fd: directoryFD, path: dir, syscalls: .system)
+            try fullSync(fd: directoryFD, path: dir)
         } else if fsync(directoryFD) != 0 {
             throw PersistenceCoreError.ioFailure(
                 "fsync(parent directory) failed: \(String(cString: strerror(errno)))"
             )
         }
     }
-}
-
-// MARK: - Factory
-
-/// Returns the SwiftNative impl unconditionally — persistence is the foundation
-/// every other migrated subsystem builds on, so it migrates first and stays migrated.
-public func makePersistenceCore() -> any PersistenceCoreProtocol {
-    return SwiftNativePersistenceCore()
 }
 
 /// Append `record` to a JSONL feed ONLY if no existing row shares its
@@ -1039,6 +1052,8 @@ package enum VerifiedPath {
         for component in components.dropLast() {
             var next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             if next < 0, createIntermediates, errno == ENOENT {
+                do { try Task.checkCancellation() }
+                catch { _ = Darwin.close(fd); throw error }
                 // EEXIST: someone else made it in the gap — reopen and let the
                 // O_NOFOLLOW reopen judge whatever is there now.
                 if mkdirat(fd, component, 0o755) != 0, errno != EEXIST {
@@ -1088,6 +1103,7 @@ package enum VerifiedPath {
 
 
     package static func transfer(from source: URL, to target: URL, copy: Bool, overwrite: Bool) throws {
+        try Task.checkCancellation()
         let from = try openParent(of: source)
         defer { from.release() }
         var metadata = stat()
@@ -1116,8 +1132,12 @@ package enum VerifiedPath {
             guard targetFD >= 0 else { throw Failure.posix(errno) }
             defer { _ = Darwin.close(targetFD); _ = unlinkat(to.fd, temporary, 0) }
             guard fcopyfile(sourceFD, targetFD, nil, copyfile_flags_t(COPYFILE_ALL)) == 0 else { throw Failure.posix(errno) }
+            try Task.checkCancellation()
             guard renameatx_np(to.fd, temporary, to.fd, to.name, flags) == 0 else { throw Failure.posix(errno) }
-        } else if renameatx_np(from.fd, from.name, to.fd, to.name, flags) != 0 { throw Failure.posix(errno) }
+        } else {
+            try Task.checkCancellation()
+            guard renameatx_np(from.fd, from.name, to.fd, to.name, flags) == 0 else { throw Failure.posix(errno) }
+        }
     }
 
     #endif

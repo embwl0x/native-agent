@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import Transcripts
 
@@ -135,15 +136,12 @@ struct SlackSessionStore: Sendable {
         currentKeys: Set<String>,
         now: Date
     ) {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let legacyFormatter = ISO8601DateFormatter()
         func updatedAt(_ value: JSONValue) -> Date {
             guard case .object(let entry) = value,
                   case .string(let stamp)? = entry["updatedAt"] ?? entry["createdAt"] else {
                 return .distantPast
             }
-            return formatter.date(from: stamp) ?? legacyFormatter.date(from: stamp) ?? .distantPast
+            return NativeTimestampFormat.parseISO8601FractionalFirst(stamp) ?? .distantPast
         }
         let threads = sessions.filter { $0.key.hasPrefix("thread:") }
             .sorted {
@@ -230,12 +228,6 @@ struct SlackSessionStore: Sendable {
         dataRoot
             .appendingPathComponent("slack", isDirectory: true)
             .appendingPathComponent("session_map.json")
-    }
-
-    private var sessionsPath: URL {
-        dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
     }
 
     private static let persistence = SwiftNativePersistenceCore()

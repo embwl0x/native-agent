@@ -189,24 +189,8 @@ private struct SealedSenseWebView: NSViewRepresentable {
                 eventTask = Task { [weak self] in
                     guard let self else { return }
                     defer { eventTask = nil }
-                    let hub = SensesHub.shared
-                    guard let registry = hub.registry, let source = hub.source,
-                          let receiver = hub.runner as? any SenseViewEventReceiver else {
-                        report("This sense cannot receive view events yet.")
-                        return
-                    }
-                    do {
-                        guard let record = try await registry.all().first(where: {
-                            $0.id == presentation.senseID && $0.version == presentation.version && $0.status == .on
-                        }), !Task.isCancelled else {
-                            if !cancelled { report("This sense is off or its view has changed.") }
-                            return
-                        }
-                        try await receiver.receiveViewEvent(event, for: record, source: source)
-                        if !cancelled { report(nil) }
-                    } catch {
-                        if !cancelled { report("This sense could not handle the event: \(error.localizedDescription)") }
-                    }
+                    let message = await SensesHub.shared.receiveViewEvent(event, presentation: presentation)
+                    if !cancelled { report(message) }
                 }
             } catch {
                 report("This sense sent an invalid event: \(error.localizedDescription)")

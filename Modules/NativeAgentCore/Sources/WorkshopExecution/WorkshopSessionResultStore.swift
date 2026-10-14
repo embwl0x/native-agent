@@ -8,11 +8,9 @@ import Desk
 /// visible/canonical lifecycle and this file is deleted only by retention.
 public struct WorkshopSessionResultStore: Sendable {
     let dataRoot: URL
-    let platform: any WorkshopPumpPlatform
 
-    public init(dataRoot: URL, platform: any WorkshopPumpPlatform) {
+    public init(dataRoot: URL) {
         self.dataRoot = dataRoot
-        self.platform = platform
     }
 
     private var directory: URL {
@@ -20,7 +18,7 @@ public struct WorkshopSessionResultStore: Sendable {
     }
 
     func path(reservationId: String) -> URL? {
-        guard let safe = try? platform.validateArtifactComponent(reservationId) else { return nil }
+        guard let safe = try? WorkshopArtifactWriter.validateSafeComponent(reservationId) else { return nil }
         return directory.appendingPathComponent("\(safe).json")
     }
 
@@ -80,7 +78,7 @@ public struct WorkshopSessionResultStore: Sendable {
     }
 
     public func hasClaim(reservationId: String) -> Bool {
-        guard let safe = try? platform.validateArtifactComponent(reservationId) else { return false }
+        guard let safe = try? WorkshopArtifactWriter.validateSafeComponent(reservationId) else { return false }
         return FileManager.default.fileExists(atPath: dataRoot
             .appendingPathComponent("workshop/reservation_claims/\(safe).claim").path)
     }

@@ -77,10 +77,11 @@ public struct GrokReplyInput: Codable, Sendable {
         guard data.count <= maximumBytes,
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               Set(object.keys) == ["message_id", "text"],
-              let value = try? JSONDecoder().decode(Self.self, from: data),
-              UUID(uuidString: value.message_id)?.uuidString.lowercased() == value.message_id,
-              !value.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              value.text.utf8.count <= 64_000 else { throw GrokLinkCredential.Failure.invalid }
-        return value
+              let messageID = object["message_id"] as? String,
+              let text = object["text"] as? String,
+              UUID(uuidString: messageID)?.uuidString.lowercased() == messageID,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              text.utf8.count <= 64_000 else { throw GrokLinkCredential.Failure.invalid }
+        return Self(message_id: messageID, text: text)
     }
 }

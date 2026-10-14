@@ -29,7 +29,6 @@ func readDreamPersonaDocs(
     for id in ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"] {
         let raw = snapshot.packet.activeDocs[id] ?? ""
         switch id {
-        case "GROWTH": docs["\(id).md"] = DreamREMGrowthHygiene.stripEpisodicLines(raw)
         case "USER": docs["\(id).md"] = UserMDAutogenMarkers.promptText(raw, pinnedCore: userCore)
         default: docs["\(id).md"] = raw
         }
@@ -123,18 +122,6 @@ public actor REMTombstoneStore {
         let dir = dataRoot.appendingPathComponent("harness", isDirectory: true)
         self.path = dir.appendingPathComponent(".rem_tombstones.json")
     }
-
-    /// Test seam — accept an explicit path so test suites that need to
-    /// validate the harness/.rem_tombstones.json location can also pin a
-    /// tmpdir without re-deriving the path from a dataRoot URL.
-    public init(path: URL) {
-        self.path = path
-    }
-
-    /// Test introspection — return the file URL this store writes to.
-    /// Used by `remTombstoneStore_uses_harness_path_not_dream_diary` to
-    /// assert the path lives under `harness/.rem_tombstones.json`.
-    public func tombstonesPath() -> URL { path }
 
     private func ensureDir() throws {
         let dir = path.deletingLastPathComponent()
@@ -250,6 +237,14 @@ public actor REMTombstoneStore {
         let fp = _tombstone_fp(proposal.proposalText)
         let dict = try loadAll()
         return dict[fp] != nil
+    }
+
+    /// Reload after distillation so denials committed during the LLM call apply
+    /// to the whole batch; never reuse the pre-run authority validation.
+    public func filterTombstoned(_ proposals: [REMProposal]) throws -> [REMProposal] {
+        guard !proposals.isEmpty else { return [] }
+        let dict = try loadAll()
+        return proposals.filter { dict[_tombstone_fp($0.proposalText)] == nil }
     }
 }
 

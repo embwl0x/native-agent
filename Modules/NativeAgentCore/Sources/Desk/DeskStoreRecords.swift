@@ -4,6 +4,7 @@ import PersistenceCore
 
 public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case unknownHandle(String)
+    case findingArchived(handle: String)
     case terminalStatusRefusedNonTerminalChild(handle: String, childHandle: String)
     case childRefusedTerminalParent(parentHandle: String)
     case nonTerminalStatusRefusedTerminalAncestor(handle: String, ancestorHandle: String)
@@ -53,6 +54,8 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
         switch self {
         case .unknownHandle(let h):
             return "desk: no item with handle \(h)"
+        case .findingArchived(let handle):
+            return "desk: this finding already belongs to archived item \(handle); review its history instead of filing it again"
         case let .terminalStatusRefusedNonTerminalChild(handle, childHandle):
             return "desk: cannot close \(handle) — child \(childHandle) is not terminal (done/canceled)"
         case .childRefusedTerminalParent(let parentHandle):

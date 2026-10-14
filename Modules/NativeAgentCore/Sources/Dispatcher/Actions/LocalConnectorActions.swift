@@ -4,7 +4,7 @@ import Darwin
 
 // MARK: - Native connector-action registry
 //
-// NativeActionDispatch composes the shipped read-only registries unconditionally.
+// NativeActionDispatch uses the shipped read-only selection unconditionally.
 // SwiftNativeDispatcher runs registered handlers in-process and writes a dispatch
 // receipt. An absent registry or missing handler fails closed; no HTTP fallback.
 
@@ -45,8 +45,6 @@ public struct LocalConnectorActions: Sendable {
         return h(input, ctx)
     }
 
-    public var toolNames: Set<String> { Set(handlers.keys) }
-
     public static func saveAttachment(_ attachment: (filename: String, data: Data),
         input: [String: JSONValue], ctx: ConnectorActionContext) -> JSONValue {
         let folder = FileSystemActions.resolvePath(FileSystemActions.stringField(input, "path"), repoRoot: ctx.repoRoot)
@@ -78,7 +76,7 @@ public struct LocalConnectorActions: Sendable {
     }
 
     /// All file, repository and persona/system handlers available in this module.
-    /// Production NativeActionDispatch composes the read-only subsets below.
+    /// Production NativeActionDispatch uses the read-only selection below.
 
     public static let fileSystemDefault = LocalConnectorActions(
         handlers: [
@@ -112,66 +110,16 @@ public struct LocalConnectorActions: Sendable {
         ]
     )
 
-    /// Read-only persona document and skill-body reader.
-    public static let personaReadOnly = LocalConnectorActions(
-        handlers: [
-            "persona_read": { PersonaSystemActions.personaRead($0, $1) },
-        ],
-        sideEffecting: [],
-        trivialVerify: ["persona_read"]
-    )
-
-    /// Read-only workspace directory listing; never creates directories.
-    public static let workspaceListReadOnly = LocalConnectorActions(
-        handlers: [
-            "workspace_list": { PersonaSystemActions.workspaceList($0, $1) },
-        ],
-        sideEffecting: [],
-        trivialVerify: ["workspace_list"]
-    )
-
-    /// Read-only clock and timezone lookup.
-    public static let timeNowReadOnly = LocalConnectorActions(
-        handlers: [
-            "time_now": { PersonaSystemActions.timeNow($0, $1) },
-        ],
-        sideEffecting: [],
-        trivialVerify: ["time_now"]
-    )
-
-    /// Read-only checked skill inventory with pagination.
-    public static let personaListSkillsReadOnly = LocalConnectorActions(
-        handlers: [
-            "persona_list_skills": { PersonaSystemActions.personaListSkills($0, $1) },
-        ],
-        sideEffecting: [],
-        trivialVerify: ["persona_list_skills"]
-    )
-
-    /// Read-only text and image reader with sandbox and sensitive-path fences.
-    public static let readFileReadOnly = LocalConnectorActions(
-        handlers: [
-            "read_file": { FileSystemActions.readFile($0, $1) },
-        ],
-        sideEffecting: [],
-        trivialVerify: ["read_file"]
-    )
-
-    /// Read-only line-window reader with the same file-path fences.
-    public static let fileExcerptReadOnly = LocalConnectorActions(
-        handlers: [
-            "file_excerpt": { FileSystemActions.fileExcerpt($0, $1) },
-        ],
-        sideEffecting: [],
-        trivialVerify: ["file_excerpt"]
-    )
-
-    /// Read-only macOS system-state probe.
-    public static let systemInfoReadOnly = LocalConnectorActions(
-        handlers: [
-            "system_info": { FileSystemActions.systemInfo($0, $1) },
-        ],
-        sideEffecting: [],
-        trivialVerify: ["system_info"]
-    )
+    /// The exact read-only tools exposed by native actions and slash commands.
+    public static let nativeReadOnly: LocalConnectorActions = {
+        let names: Set<String> = [
+            "persona_read", "workspace_list", "time_now", "persona_list_skills",
+            "read_file", "file_excerpt", "system_info",
+        ]
+        return LocalConnectorActions(
+            handlers: fileSystemDefault.handlers.filter { names.contains($0.key) },
+            sideEffecting: fileSystemDefault.sideEffecting.intersection(names),
+            trivialVerify: fileSystemDefault.trivialVerify.intersection(names)
+        )
+    }()
 }

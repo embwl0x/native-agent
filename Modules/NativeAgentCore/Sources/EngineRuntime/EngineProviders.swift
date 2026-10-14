@@ -4,6 +4,8 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
+import Cognition
+import DeviceSync
 
 /// `NativeAgentEngine.providers` (S10): provider routing for one data root.
 /// The chat picker, Setup, Telegram and the Providers page render
@@ -25,6 +27,31 @@ public final class ProvidersFacade {
     public private(set) var accountModelRevision = 0
     private var accountModelRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var accountModelUpdatesTask: Task<Void, Never>?
+
+    public struct ChatBrainSelection: Equatable, Sendable {
+        public var model: String
+        public var reasoningEffort: String
+        public var fastMode: Bool
+
+        public init(model: String, reasoningEffort: String, fastMode: Bool) {
+            self.model = model
+            self.reasoningEffort = reasoningEffort
+            self.fastMode = fastMode
+        }
+    }
+
+    public enum ChatBrainSaveResult: Equatable, Sendable {
+        case unchanged(ChatBrainSelection)
+        case saved(ChatBrainSelection)
+        case failed(message: String, rolledBackTo: ChatBrainSelection?, cause: String? = nil)
+    }
+
+    public var isSavingChatBrain = false
+    @ObservationIgnored public var chatBrainCanonicalSelection: ChatBrainSelection?
+    @ObservationIgnored var chatBrainPendingSave: (generation: UInt64, selection: ChatBrainSelection)?
+    @ObservationIgnored public var chatBrainSaveGeneration: UInt64 = 0
+    @ObservationIgnored var chatBrainLastSaveResult: (generation: UInt64, result: ChatBrainSaveResult)?
+    @ObservationIgnored public internal(set) var chatBrainSaveTask: Task<Void, Never>?
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -83,6 +110,49 @@ public final class ProvidersFacade {
 // MARK: - Connections
 
 extension ProvidersFacade {
+    // PATCH-2026-05-07: model-default-bump. One-time migration for a saved
+    // chatModel/telegramModel this build no longer carries.
+    //
+    // 2026-09-13 (User): it CLEARS the stale value instead of bumping it to a
+    // model chosen in code. A saved id that is gone is not a pick, and an empty
+    // pick is the honest state — the surface then follows its Providers group,
+    // and the page says where the choice came from. Substituting a literal here
+    // put people on a model they never chose and hid the retirement.
+    public nonisolated static func clearRetiredModelSelection(_ key: String) {
+        let retired: Set<String> = [
+            "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3", "gpt-4o", "gpt-4-turbo",
+            "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-haiku-4-5",
+            "claude-opus-4-5", "claude-opus-4-6",
+        ]
+        let clearedKey = "\(key).retiredPickCleared.v3"
+        if UserDefaults.standard.bool(forKey: clearedKey) { return }
+        let current = UserDefaults.standard.string(forKey: key) ?? ""
+        if retired.contains(current) {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        UserDefaults.standard.set(true, forKey: clearedKey)
+    }
+
+    public nonisolated func disconnectProvider(
+        _ id: String, clearProvider: @Sendable () async throws -> Void
+    ) async throws -> (ok: Bool, detail: String) {
+        try await clearProvider()
+        // OAuth credentials have their own store; removing the registry row
+        // alone must never claim the account was disconnected.
+        let clearedOAuth = NativeOAuthFlow.clearTokens(providerId: id, dataRoot: dataRoot)
+        let oauthID = NativeOAuthFlow.normalizedOAuthProviderId(id)
+        if ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].contains(oauthID),
+           !clearedOAuth {
+            return (false, "Clear failed: the OAuth credential could not be removed.")
+        }
+        // CLI adoption is declined by sign-out, so inspect the shared file
+        // itself rather than the credential path chat would now use.
+        let detail = NativeOAuthFlow.sharedCodexCLISessionRemains(providerId: id)
+            ? "Shared Codex auth is still signed in. Sign out from Codex to remove it."
+            : "Credentials removed."
+        return (true, detail)
+    }
+
     public nonisolated func list(
         codexCacheURL: URL? = nil,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment
@@ -141,6 +211,70 @@ extension ProvidersFacade {
         throw NSError(domain: "NativeAgentProvider", code: 404, userInfo: [
             NSLocalizedDescriptionKey: "provider not found: \(trimmed)"
         ])
+    }
+}
+
+public extension NativeAgentEngine {
+    @MainActor
+    func clearSurfaceOverride(
+        surface: String, applySelection: @MainActor (SurfacePreference) -> Void
+    ) async throws {
+        try await providers.routing.clearSurfaceOverride(surface: surface)
+        if let preference = try await providers.routing.checkedRoutingSnapshot().preferences[surface] {
+            applySelection(preference)
+        }
+        if surface == "cognition_reflection" {
+            await Self.liveCognition.refreshConfiguration()
+        }
+        Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
+    }
+
+    @MainActor
+    func saveProviderGroupSelection(
+        group: ProviderSurfaceGroup, providerID: String?, model: String?,
+        reasoningEffort: String?, serviceTier: String?, clearOverride: Bool,
+        applySnapshot: @MainActor (ProviderRoutingSnapshot) -> Void
+    ) async throws -> ProviderGroupWriteResult {
+        let result = try await providers.routing.saveGroupSelection(
+            group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier, clearOverride: clearOverride
+        )
+        applySnapshot(result.snapshot)
+        if group.surfaces.contains("cognition_reflection") {
+            await Self.liveCognition.refreshConfiguration()
+        }
+        Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
+        return result
+    }
+
+    @MainActor
+    func configureSurfaceSelection(
+        surface: String, providerID: String, model: String, reasoningEffort: String, serviceTier: String?,
+        applySelection: @MainActor (ModelCatalogResponse) -> Void
+    ) async throws -> ModelCatalogResponse {
+        let response = try await providers.saveSurfaceSelection(
+            surface: surface, model: model, reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier, providerID: providerID
+        )
+        providers.catalog = response
+        applySelection(response)
+        if surface == "cognition_reflection" {
+            await Self.liveCognition.refreshConfiguration()
+        }
+        Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
+        return response
+    }
+
+    @MainActor
+    func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws {
+        try await providers.configureProvider(id: id, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
+        Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
+    }
+
+    @MainActor
+    func clearProvider(_ id: String) async throws {
+        try await providers.clearProvider(id)
+        Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
     }
 }
 

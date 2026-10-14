@@ -1,39 +1,6 @@
 import PersistenceCore
 import Foundation
 
-/// Read-aloud's voice and the one switch that guarantees silence.
-///
-/// `quiet` is deliberately enforced at `VoiceOutputController.speak`, the
-/// single door both routes go through, rather than at each caller: a promise
-/// of "no audio out" that depends on every future call site remembering to ask
-/// is not a promise. The tool that renders speech to a FILE is unaffected, and
-/// correctly so — it never opens an output device.
-///
-/// `name` is empty by default, which means the Mac's chosen system voice
-/// locally and the route's default voice in the cloud — what shipped.
-public enum VoicePreference {
-    public static let quietKey = "nativeagent.voice.quiet"
-    public static let nameKey = "nativeagent.voice.name"
-
-    /// The cloud voice used before this preference existed. Kept as the
-    /// fallback so an unset name renders exactly as it always has.
-    public static let cloudDefaultName = "alloy"
-
-    public static func quiet(in defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: quietKey)
-    }
-
-    public static func name(in defaults: UserDefaults = .standard) -> String {
-        (defaults.string(forKey: nameKey) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    public static func cloudVoice(in defaults: UserDefaults = .standard) -> String {
-        let chosen = name(in: defaults)
-        return chosen.isEmpty ? cloudDefaultName : chosen
-    }
-}
-
 /// The revert seam. On for a fresh install (User: fresh installs turn every
 /// feature on; users switch off what they want), off in one flip, and the same
 /// key the agent reads and writes through `app_settings_list` /
@@ -116,4 +83,22 @@ public enum HazeColor: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+}
+
+/// MOMENTS THE AGENT KEEPS — the one owner of the moments-lane switch key.
+///
+/// `AdaptiveMemoryPromoter` lives in a module that must never read
+/// UserDefaults, so it receives this as an injected closure at launch
+/// (AppDelegate+Launch). Default ON: the lane shipped on, and an install that
+/// never opens Setup keeps the behavior it already had.
+public enum MomentsLaneSetting {
+    public static let defaultsKey = "momentsLaneEnabled"
+
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: defaultsKey) as? Bool ?? true
+    }
+
+    public static func setEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: defaultsKey)
+    }
 }

@@ -22,11 +22,11 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// here; a client built without one refuses `notify` instead of posting
     /// around it.
     private let notificationCenterAdapter: (any NotificationCenterAdapter)?
-    let appleScriptAdapter: AppleScriptAdapter
-    let processAdapter: ProcessAdapter
-    let fileManagerAdapter: FileManagerAdapter
-    let appControlAdapter: AppControlAdapter
-    let openTargetAdapter: OpenTargetAdapter
+    let appleScriptAdapter = SystemAppleScriptAdapter()
+    let processAdapter = SystemProcessAdapter()
+    let fileManagerAdapter = SystemFileManagerAdapter()
+    let appControlAdapter = SystemAppControlAdapter()
+    let openTargetAdapter = SystemOpenTargetAdapter()
     /// Read-only accessibility perception seam (W1). Production reads live
     /// AXUIElement state; tests inject a synthetic tree so the caps and the
     /// ranking are pinned without a window server.
@@ -51,7 +51,7 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// TCC permission; this seam only ever PREFLIGHTS it (never prompts, never
     /// toggles) and reports the answer honestly.
     let screenCaptureSource: any MacScreenCaptureSource
-    let pointerPositionSource: any MacPointerPositionSource
+    let pointerPositionSource = SystemMacPointerPositionSource()
     /// W3.5 — set-of-marks renderer. Injectable so the placement math and the
     /// byte budget are pinned with no window server in the loop.
     let screenImageRenderer: any MacScreenImageRenderer
@@ -87,17 +87,11 @@ public actor SwiftNativeMacControl: MacControlClient {
     public init(
         now: @escaping @Sendable () -> Date = { Date() },
         notificationCenterAdapter: (any NotificationCenterAdapter)? = nil,
-        appleScriptAdapter: AppleScriptAdapter = SystemAppleScriptAdapter(),
-        processAdapter: ProcessAdapter = SystemProcessAdapter(),
-        fileManagerAdapter: FileManagerAdapter = SystemFileManagerAdapter(),
-        appControlAdapter: AppControlAdapter = SystemAppControlAdapter(),
-        openTargetAdapter: OpenTargetAdapter = SystemOpenTargetAdapter(),
         accessibilitySource: any MacAXElementSource = defaultMacAXElementSource(),
         eventSink: any MacEventSink = defaultMacEventSink(),
         accessibilityActSource: any MacAXActSource = defaultMacAXActSource(),
         effectObserverSource: any MacAXEffectObserverSource = defaultMacAXEffectObserverSource(),
         screenCaptureSource: any MacScreenCaptureSource = defaultMacScreenCaptureSource(),
-        pointerPositionSource: any MacPointerPositionSource = defaultMacPointerPositionSource(),
         screenImageRenderer: any MacScreenImageRenderer = defaultMacScreenImageRenderer(),
         screenViewStore: MacScreenViewStore = .shared,
         lookFrameStore: MacLookFrameStore = .shared,
@@ -111,17 +105,11 @@ public actor SwiftNativeMacControl: MacControlClient {
     ) {
         self.now = now
         self.notificationCenterAdapter = notificationCenterAdapter
-        self.appleScriptAdapter = appleScriptAdapter
-        self.processAdapter = processAdapter
-        self.fileManagerAdapter = fileManagerAdapter
-        self.appControlAdapter = appControlAdapter
-        self.openTargetAdapter = openTargetAdapter
         self.accessibilitySource = accessibilitySource
         self.eventSink = DriverCheckedMacEventSink(base: eventSink)
         self.accessibilityActSource = accessibilityActSource
         self.effectObserverSource = effectObserverSource
         self.screenCaptureSource = screenCaptureSource
-        self.pointerPositionSource = pointerPositionSource
         self.screenImageRenderer = screenImageRenderer
         self.screenViewStore = screenViewStore
         self.lookFrameStore = lookFrameStore
@@ -201,8 +189,8 @@ public actor SwiftNativeMacControl: MacControlClient {
         return MacControlResult(
             ok: false, action: reply.action, output: .object(output),
             error: MacAttentionSessionStore.driverRefusal, durationMs: reply.durationMs,
-            viaSwift: reply.viaSwift, httpStatus: 409, operationId: reply.operationId,
-            operationState: reply.operationState, verification: .unverified
+            httpStatus: 409, operationId: reply.operationId,
+            operationState: reply.operationState, verification: .unverified, nativePage: reply.nativePage
         )
     }
 
@@ -336,7 +324,6 @@ public actor SwiftNativeMacControl: MacControlClient {
                 ]),
                 error: "operation already active",
                 durationMs: 0,
-                viaSwift: true,
                 httpStatus: 409,
                 operationId: operationId,
                 operationState: record.state,
@@ -492,7 +479,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             return MacControlResult(ok: false, action: action,
                 output: .object(["status": .string("display_obstructed"),
                     "message": .string(MacScreenLock.passiveReply)]),
-                error: "display_obstructed", durationMs: 0, viaSwift: true)
+                error: "display_obstructed", durationMs: 0)
         }
         do {
             try await MacScreenLock.wakeIfCovered {
@@ -515,7 +502,7 @@ public actor SwiftNativeMacControl: MacControlClient {
            !["look", "view", "read", "file/read", "spotlight", "ax_status", "ax_tree", "ax_find", "clipboard_read"].contains(normalized) {
             return MacControlResult(ok: false, action: normalized,
                 output: .object(["message": .string("raw view · passive observation · desktop effects are unavailable")]),
-                error: "passive_observation", durationMs: 0, viaSwift: true)
+                error: "passive_observation", durationMs: 0)
         }
         // GATE PRE-FLIGHT (wave 30 W01). When a live policy is available, run
         // the W4 MacControlGate read-only refusal pipeline IN-PROCESS, in the
@@ -553,7 +540,7 @@ public actor SwiftNativeMacControl: MacControlClient {
            ["look", "view", "ax_tree", "ax_find"].contains(normalized), MacScreenLock.isCovered() {
             return MacControlResult(ok: false, action: normalized,
                 output: .object(["status": .string("display_obstructed"), "message": .string(MacScreenLock.passiveReply)]),
-                error: "display_obstructed", durationMs: 0, viaSwift: true)
+                error: "display_obstructed", durationMs: 0)
         }
         if MacObservationMode.current != .passive,
            ["look", "view", "act", "hand", "menu", "menu_press"].contains(normalized) {
@@ -571,7 +558,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 return MacControlResult(
                     ok: false, action: normalized,
                     output: .object(["status": .string(code), "message": .string(message), "guidance": .string(message)]),
-                    error: code, durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true
+                    error: code, durationMs: Int(now().timeIntervalSince(started) * 1000)
                 )
             }
         }
@@ -941,7 +928,6 @@ public actor SwiftNativeMacControl: MacControlClient {
             ]),
             error: reason,
             durationMs: 0,
-            viaSwift: true,
             httpStatus: 403
         )
     }
@@ -959,7 +945,6 @@ public actor SwiftNativeMacControl: MacControlClient {
             ]),
             error: error,
             durationMs: 0,
-            viaSwift: true,
             httpStatus: 501
         )
     }
@@ -1108,8 +1093,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 action: "notify",
                 output: .object(["title": .string(title), "message": .string(message)]),
                 error: "notify failed: \(error)",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
@@ -1135,8 +1119,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             action: "notify",
             output: .object(outputFields),
             error: nil,
-            durationMs: durationMs,
-            viaSwift: true
+            durationMs: durationMs
         )
     }
 
@@ -1165,8 +1148,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 "note": .string(MacAccessibilityReader.notTrustedNote),
             ]),
             error: error,
-            durationMs: 0,
-            viaSwift: true
+            durationMs: 0
         )
     }
 
@@ -1199,7 +1181,6 @@ public actor SwiftNativeMacControl: MacControlClient {
             output: .object(output),
             error: error,
             durationMs: 0,
-            viaSwift: true,
             httpStatus: status
         )
     }
@@ -1295,7 +1276,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         if let refusal = MacWorkContinuation.current?.refusal() {
             return MacControlResult(ok: false, action: action,
                 output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
-                durationMs: 0, viaSwift: true)
+                durationMs: 0)
         }
         let sessionId = body.stringValue("attention_session")
         let userSequence = Self.intValue(body, "attention_user_sequence").map(Int64.init)
@@ -1326,7 +1307,6 @@ public actor SwiftNativeMacControl: MacControlClient {
                 ]),
                 error: reason,
                 durationMs: 0,
-                viaSwift: true,
                 httpStatus: 409
             )
         }

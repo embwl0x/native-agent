@@ -27,10 +27,6 @@ public struct EmbeddingRuntimeSnapshot: Sendable, Equatable {
 }
 
 public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
-    /// The legacy loader argument is always false: the model stays on the Neural Engine.
-    public typealias Loader = @Sendable (_ lowMemory: Bool) throws -> any EmbeddingProvider
-    public typealias AvailabilityProbe = @Sendable () -> Bool
-
     public static let coreMLBackend = "coreml-minilm"
     public static let mockBackend = "mock"
     /// Reported by `snapshot()` when the user wanted CoreML, CoreML couldn't
@@ -39,8 +35,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     /// `mockBackend`, which is the explicit user opt-in.
     public static let failClosedBackend = "fail-closed"
     public static let performanceMode = "performance"
-    public static let balancedMode = "balanced"
-    public static let lowMemoryMode = "low_memory"
 
     private struct State {
         var coreMLProvider: (any EmbeddingProvider)?
@@ -51,34 +45,18 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         var lastLoadError: String?
         var loadCount: Int = 0
         var unloadCount: Int = 0
-        var generation: UInt64 = 0
         /// Activity and idle scheduling must not invalidate a cold load.
         var loadGeneration: UInt64 = 0
     }
 
     private let dataRoot: URL
-    private let loader: Loader
-    private let availabilityProbe: AvailabilityProbe
     private let mock: MockEmbeddingProvider
     private let lock = NSLock()
     private let loadLock = NSLock()
     private var state = State()
 
-    public init(
-        dataRoot: URL,
-        dimensions: Int = 384,
-        loader: Loader? = nil,
-        availabilityProbe: AvailabilityProbe? = nil
-    ) {
+    public init(dataRoot: URL, dimensions: Int = 384) {
         self.dataRoot = dataRoot
-        // The defaults see the data root so an installed extras model
-        // (`extras/coreml/embedding.json`) wins over the bundled one.
-        self.loader = loader ?? { lowMemory in
-            try CoreMLEmbeddingProvider.bundled(extrasRoot: dataRoot, lowMemory: lowMemory)
-        }
-        self.availabilityProbe = availabilityProbe ?? {
-            CoreMLEmbeddingProvider.bundledResourcesAvailable(extrasRoot: dataRoot)
-        }
         self.mock = MockEmbeddingProvider(dimensions: dimensions)
     }
 
@@ -90,7 +68,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     public var dimensions: Int {
-        guard Self.readConfig(dataRoot: dataRoot).backend != Self.mockBackend else { return mock.dimensions }
+        guard Self.readBackend(dataRoot: dataRoot) != Self.mockBackend else { return mock.dimensions }
         if let loaded = lock.withLock({ state.coreMLProvider?.dimensions }) { return loaded }
         // Not resident yet: report the model that WOULD load, not the mock's
         // width, so status surfaces do not read "384d" beside a 1024-d model.
@@ -105,19 +83,19 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     public var modelId: String {
-        let config = Self.readConfig(dataRoot: dataRoot)
-        guard config.backend != Self.mockBackend else { return mock.modelId }
+        let config = Self.readBackend(dataRoot: dataRoot)
+        guard config != Self.mockBackend else { return mock.modelId }
         return lock.withLock { state.coreMLProvider?.modelId ?? resolvedModelID }
     }
 
     public var embeddingEpoch: MemoryEmbeddingEpoch {
-        let config = Self.readConfig(dataRoot: dataRoot)
-        if config.backend == Self.mockBackend { return mock.embeddingEpoch }
+        let config = Self.readBackend(dataRoot: dataRoot)
+        if config == Self.mockBackend { return mock.embeddingEpoch }
         if let loaded = lock.withLock({ state.coreMLProvider }) {
             return loaded.embeddingEpoch
         }
         if ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1",
-           !availabilityProbe() {
+           !CoreMLEmbeddingProvider.bundledResourcesAvailable(extrasRoot: dataRoot) {
             return mock.embeddingEpoch
         }
         return (try? CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: dataRoot))
@@ -149,7 +127,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     /// Residency is independent of whether semantic search is selected.
     public func warmUp() async throws {
         if lock.withLock({ state.coreMLProvider != nil }) { return }
-        let provider = try loadCoreMLProvider(config: Self.readConfig(dataRoot: dataRoot))
+        let provider = try loadCoreMLProvider(config: Self.readBackend(dataRoot: dataRoot))
         _ = try await provider.embed(["warmup"])
     }
 
@@ -157,16 +135,16 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     /// never take `loadLock`. Nil when cold, mismatched or mock; the caller
     /// falls back to what it can do without vectors.
     public func embedIfResident(_ texts: [String]) async -> [[Float]]? {
-        let config = Self.readConfig(dataRoot: dataRoot)
-        guard config.backend != Self.mockBackend, !texts.isEmpty else { return nil }
+        let config = Self.readBackend(dataRoot: dataRoot)
+        guard config != Self.mockBackend, !texts.isEmpty else { return nil }
         guard let provider = lock.withLock({ state.coreMLProvider }) else { return nil }
         noteUse()
         return try? await provider.embed(texts)
     }
 
     public func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
-        let config = Self.readConfig(dataRoot: dataRoot)
-        guard config.backend != Self.mockBackend else {
+        let config = Self.readBackend(dataRoot: dataRoot)
+        guard config != Self.mockBackend else {
             return try await mock.embedWithEpoch(texts)
         }
 
@@ -199,24 +177,26 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     public func snapshot() -> EmbeddingRuntimeSnapshot {
-        let config = Self.readConfig(dataRoot: dataRoot)
-        let resourcesAvailable = availabilityProbe()
+        let config = Self.readBackend(dataRoot: dataRoot)
         let mockEnvOptIn = ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1"
         // A broken installed model is named before the first embed() tries it,
         // so status never shows a plain "missing" for a model that is there
         // but unusable.
-        let installedModelProblem: String? = {
-            guard config.backend != Self.mockBackend else { return nil }
-            do {
-                _ = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)
-                return nil
-            } catch {
-                return error.localizedDescription
-            }
-        }()
+        let installedModel: CoreMLEmbeddingProvider.InstalledExtrasModel?
+        let installedModelProblem: String?
+        let resourcesAvailable: Bool
+        do {
+            installedModel = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)
+            installedModelProblem = nil
+            resourcesAvailable = installedModel != nil || CoreMLEmbeddingProvider.bundledFloorResourcesAvailable()
+        } catch {
+            installedModel = nil
+            installedModelProblem = config == Self.mockBackend ? nil : error.localizedDescription
+            resourcesAvailable = false
+        }
         return lock.withLock {
             let loadedProvider = state.coreMLProvider
-            let requestedCoreML = config.backend != Self.mockBackend
+            let requestedCoreML = config != Self.mockBackend
             let loaded = loadedProvider != nil
             let effectiveBackend: String
             if !requestedCoreML {
@@ -244,15 +224,17 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             let modelId: String = {
                 if !requestedCoreML { return mock.modelId }
                 if let loadedProvider { return loadedProvider.modelId }
-                return resourcesAvailable ? resolvedModelID : mock.modelId
+                return resourcesAvailable
+                    ? installedModel?.modelID ?? CoreMLEmbeddingProvider.bundledModelID
+                    : mock.modelId
             }()
             return EmbeddingRuntimeSnapshot(
-                requestedBackend: config.backend,
+                requestedBackend: config,
                 effectiveBackend: effectiveBackend,
-                mode: config.mode,
+                mode: Self.performanceMode,
                 modelId: modelId,
                 dimensions: effectiveBackend == Self.mockBackend
-                    ? mock.dimensions : loadedProvider?.dimensions ?? resolvedModelDimensions,
+                    ? mock.dimensions : loadedProvider?.dimensions ?? installedModel?.dimensions ?? 384,
                 embeddingEpoch: loadedProvider?.embeddingEpoch.rawValue
                     ?? (effectiveBackend == Self.mockBackend
                         ? mock.embeddingEpoch.rawValue
@@ -273,7 +255,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     public func setBackend(enabled: Bool) async throws {
-        let previous = Self.readConfig(dataRoot: dataRoot).backend
+        let previous = Self.readBackend(dataRoot: dataRoot)
         try await writeConfigValue(
             path: Self.backendPath(dataRoot: dataRoot),
             key: "backend",
@@ -282,14 +264,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         if previous != (enabled ? Self.coreMLBackend : Self.mockBackend) {
             lock.withLock { state.loadGeneration &+= 1 }
         }
-    }
-
-    public func setMemoryMode(_ mode: String) async throws {
-        try await writeConfigValue(
-            path: Self.modePath(dataRoot: dataRoot),
-            key: "mode",
-            value: Self.performanceMode
-        )
     }
 
     @discardableResult
@@ -301,27 +275,26 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             state.coreMLProvider = nil
             state.lastUnloadedAt = Date()
             state.unloadReason = reason
-            state.generation &+= 1
             state.loadGeneration &+= 1
         }
         return snapshot()
     }
 
-    private func loadCoreMLProvider(config: (backend: String, mode: String)) throws -> any EmbeddingProvider {
+    private func loadCoreMLProvider(config: String) throws -> any EmbeddingProvider {
         // Cold requests must share the resident model instead of compiling and
         // allocating a full model each before choosing a winner. Keep status
         // and release independent of the expensive synchronous loader.
         loadLock.lock()
         defer { loadLock.unlock() }
         let (existing, generation) = try lock.withLock {
-            guard Self.readConfig(dataRoot: dataRoot) == config else { throw CancellationError() }
+            guard Self.readBackend(dataRoot: dataRoot) == config else { throw CancellationError() }
             return (state.coreMLProvider, state.loadGeneration)
         }
         if let existing { return existing }
         let modelID = resolvedModelID
         let provider: any EmbeddingProvider
         do {
-            provider = try loader(false)
+            provider = try CoreMLEmbeddingProvider.bundled(extrasRoot: dataRoot)
         } catch {
             // Record failure before admitting another load, so an older
             // failure cannot evict a newer successful model.
@@ -330,14 +303,13 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         }
         return try lock.withLock {
             guard state.loadGeneration == generation,
-                  Self.readConfig(dataRoot: dataRoot) == config,
+                  Self.readBackend(dataRoot: dataRoot) == config,
                   resolvedModelID == modelID else { throw CancellationError() }
             state.coreMLProvider = provider
             state.lastLoadedAt = Date()
             state.unloadReason = nil
             state.lastLoadError = nil
             state.loadCount += 1
-            state.generation &+= 1
             return provider
         }
     }
@@ -345,7 +317,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     private func noteUse() {
         lock.withLock {
             state.lastUsedAt = Date()
-            state.generation &+= 1
         }
     }
 
@@ -365,7 +336,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             state.unloadReason = mockOptIn
                 ? "load failed; mock embedder active via NATIVE_AGENT_EMBEDDING_MOCK"
                 : "load failed; fail-closed (embed() will throw)"
-            state.generation &+= 1
         }
     }
 
@@ -376,13 +346,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         }
     }
 
-    private static func readConfig(dataRoot: URL) -> (backend: String, mode: String) {
-        let backend = readStringValue(from: backendPath(dataRoot: dataRoot), key: "backend")
-        let mode = readStringValue(from: modePath(dataRoot: dataRoot), key: "mode")
-        return (
-            normalizeBackend(backend),
-            normalizeMode(mode)
-        )
+    private static func readBackend(dataRoot: URL) -> String {
+        normalizeBackend(readStringValue(from: backendPath(dataRoot: dataRoot), key: "backend"))
     }
 
     private static func normalizeBackend(_ backend: String?) -> String {
@@ -392,10 +357,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         default:
             return coreMLBackend
         }
-    }
-
-    private static func normalizeMode(_ mode: String?) -> String {
-        performanceMode
     }
 
     private static func readStringValue(from path: URL, key: String) -> String? {
@@ -411,12 +372,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             .appendingPathComponent("embeddings.json")
     }
 
-    private static func modePath(dataRoot: URL) -> URL {
-        dataRoot
-            .appendingPathComponent("embeddings", isDirectory: true)
-            .appendingPathComponent("mode.json")
-    }
-
     private static func isoString(_ date: Date?) -> String? {
         guard let date else { return nil }
         return ISO8601DateFormatter().string(from: date)
@@ -428,5 +383,53 @@ private extension NSLock {
         lock()
         defer { unlock() }
         return try work()
+    }
+}
+
+extension SwiftNativeMemoryV2 {
+    public func warmUpEmbeddingsAtLaunch() async {
+        guard let snapshot = embeddingRuntimeSnapshot() else {
+            nativeLog("[embedding-warmup] SKIP: embeddingRuntimeSnapshot() returned nil — memoryV2 actor not initialized yet?")
+            OrganPulse.record("embedding_warmup", .skipped, note: "memory store not attached")
+            return
+        }
+        nativeLog("[embedding-warmup] snapshot: mode=\(snapshot.mode) backend=requested:\(snapshot.requestedBackend)/effective:\(snapshot.effectiveBackend) coreMLLoaded=\(snapshot.coreMLLoaded) modelLoadable=\(snapshot.modelLoadable) resourcesAvailable=\(snapshot.coreMLResourcesAvailable) modelId=\(snapshot.modelId)")
+        if snapshot.coreMLLoaded {
+            nativeLog("[embedding-warmup] SKIP: already loaded by another path")
+            OrganPulse.record("embedding_warmup", .nothing, note: "already loaded")
+            return
+        }
+        // Intentionally NOT gating on modelLoadable. If resources aren't on
+        // disk we'll catch the failure below; better to ATTEMPT and surface
+        // a real error than to defer to a probe that was wrong about my
+        // staging path the first time.
+        nativeLog("[embedding-warmup] attempting load — modelLoadable=\(snapshot.modelLoadable)")
+        do {
+            try await warmUpEmbedder()
+            nativeLog("[embedding-warmup] SUCCESS: MiniLM eagerly warmed for Fast mode")
+            OrganPulse.record("embedding_warmup", .worked, note: "embedder loaded")
+            let after = embeddingRuntimeSnapshot()
+            nativeLog("[embedding-warmup] post-load snapshot: coreMLLoaded=\(after?.coreMLLoaded ?? false) effectiveBackend=\(after?.effectiveBackend ?? "nil")")
+        } catch {
+            nativeLog("[embedding-warmup] FAILED: \(error.localizedDescription)")
+        }
+    }
+
+    public static func configureEmbeddingBackendAndReindex(enabled: Bool, dataRoot: URL) async throws -> (report: MemoryEmbeddingEpochActivationReport, runtime: EmbeddingRuntimeSnapshot) {
+        let memory = resolvedOwner(dataRoot: dataRoot)
+        let before = await memory.embeddingRuntimeSnapshot()
+        do {
+            try await memory.configureEmbeddingBackend(enabled: enabled)
+            let report = try await memory.reindexAllMemoryEmbeddingsForCurrentProvider()
+            let runtime = try await MemoryStatusProjection.embeddingRuntime(dataRoot: dataRoot)
+            return (report, runtime)
+        } catch {
+            // A backend is not allowed to change while canonical vectors stay
+            // in the prior space. Restore the requested backend so recall
+            // immediately returns to the previously active epoch.
+            let wasEnabled = before?.requestedBackend != ManagedEmbeddingProvider.mockBackend
+            try? await memory.configureEmbeddingBackend(enabled: wasEnabled)
+            throw error
+        }
     }
 }

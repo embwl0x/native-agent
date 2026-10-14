@@ -12,7 +12,7 @@ import AgentConversations
 /// permission card in `AutonomyGatedDispatcher`, which reads the same taint
 /// box this one latches. What survives here is the one thing that has to see
 /// the tool's ARGUMENTS: Agent's provenance requirement on her own memory
-/// notes.
+/// notes and the refusal of peer-steered ability changes.
 public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Sendable {
     private let inner: any ToolDispatchClient
     /// The peers the PERSON has elevated in Trust → Connected agents. Nil on
@@ -27,6 +27,21 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         self.dataRoot = dataRoot
     }
 
+    /// Preview and execution read the same live trust and peer approval floor.
+    public static func peerApproval(tool: String, capabilities: [String], input: [String: JSONValue],
+                                    surface: String, fullMac: Bool, protectedAction: Bool,
+                                    peerName: String? = nil) -> (requester: String?, required: Bool) {
+        let taint = PeerDataTaint.current
+        let requester = PeerDataTaint.trustedTurn && taint?.isTainted != true ? nil : PeerTurnEffectPolicy.peerRequester(
+            surface: surface, peerID: ChatToolSessionContext.envelope?.verifiedUserId, peerName: peerName,
+            taintSource: taint.flatMap { $0.isTainted ? $0.sourceDescription : nil })
+        let steered = requester != nil || !(taint?.elevatedSources ?? []).isEmpty
+        let required = steered && (fullMac
+            ? PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: capabilities, input: input, fullMac: true)
+            : requester != nil && protectedAction)
+        return (requester, required)
+    }
+
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         // Peer provenance for THIS turn: either its words arrived as a tool
         // result (the latch) or the whole turn came in over the peer bridge.
@@ -39,7 +54,7 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         let readPeerData = taint?.isTainted == true
         if let taint, readPeerData {
             peerIdentity = PeerTurnEffectPolicy.PeerIdentity(name: taint.sourceDescription)
-        } else if PeerTurnEffectPolicy.isPeerBridge(surface: surface) {
+        } else if PeerTurnEffectPolicy.isPeerBridge(surface: surface), !PeerDataTaint.trustedTurn {
             let peerID = ChatToolSessionContext.envelope?.verifiedUserId
             peerIdentity = PeerTurnEffectPolicy.PeerIdentity(
                 id: peerID,
@@ -48,8 +63,12 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         } else {
             peerIdentity = nil
         }
+        if input["preview"] != .bool(true), let action = AppActionPolicy.action(tool: tool, input: input),
+           action.lifecycle != nil, !action.read, let refusal = CapabilityLifecycle.writeRefusal {
+            throw AutonomyGateError.toolDenied(reason: refusal)
+        }
         if let peerIdentity,
-           let refusal = PeerTurnEffectPolicy.memoryProvenanceRefusal(
+           let refusal = PeerTurnEffectPolicy.provenanceRefusal(
             tool: tool, input: input, peer: peerIdentity, readPeerData: readPeerData,
             person: readPeerData && taint?.restored != true && PeerTurnEffectPolicy.normalized(tool) == "commit_memory"
                 ? await personOnOwnDoor(surface: surface) : nil
@@ -66,7 +85,7 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
             fields["untrusted_remote_data"] = .bool(true)
             fields["source_boundary"] = .bool(true)
             result = .object(fields)
-            PeerDataTaint.markConsumed(peer: "web content", line: Self.peerLine(in: result, depth: 0) ?? "", attested: false)
+            PeerDataTaint.markConsumed(peer: "web content", line: Self.peerLine(in: result, depth: 0) ?? "")
         }
         // Latch on the RESULT's own provenance label rather than on a list of
         // tool names, so a transport added later is covered the day it starts
@@ -76,7 +95,7 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
             // Trusted transports label their own content before returning it.
             // A selected route or a result-supplied name cannot clear a nested
             // source's explicit untrusted provenance.
-            PeerDataTaint.markConsumed(peer: peer, line: line, attested: false)
+            PeerDataTaint.markConsumed(peer: peer, line: line)
         }
         return result
     }
@@ -140,6 +159,7 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
               }) else { return result }
         fields["agent"] = .string(agent)
         fields["untrusted_remote_data"] = .bool(!PeerTrust.ownerTrusts(agent, dataRoot: dataRoot))
+        PeerDataTaint.markConsumed(peer: agent)
         return .object(fields)
     }
 

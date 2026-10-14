@@ -2,13 +2,7 @@ import Foundation
 @preconcurrency import Dispatch
 import NativeAgentCore
 import PersistenceCore
-
-#if DEBUG
-internal enum CodexAdapterDebugCounters {
-    internal static let timeoutScheduled = LockBox(0)
-    internal static let timeoutCancelled = LockBox(0)
-}
-#endif
+import MacControl
 
 /// Incremental UTF-8 decoder for chunked byte streams. A multibyte codepoint
 /// (2-4 bytes) can be split across two reads; naive per-read decoding drops
@@ -101,71 +95,6 @@ private final class CodexProcessShutdown: @unchecked Sendable {
             // cancellation caller or the cooperative executor.
             process.waitUntilExit()
         }
-    }
-}
-
-private final class NonblockingPipeReader: @unchecked Sendable {
-    private let fd: Int32
-    private let onData: @Sendable (Data) -> Void
-    private let done = DispatchSemaphore(value: 0)
-    private let lock = NSLock()
-    private var stopped = false
-    private var started = false
-
-    init(fileDescriptor: Int32, onData: @escaping @Sendable (Data) -> Void) {
-        self.fd = fileDescriptor
-        self.onData = onData
-    }
-
-    func start() {
-        lock.lock()
-        guard !started else {
-            lock.unlock()
-            return
-        }
-        started = true
-        lock.unlock()
-
-        let flags = fcntl(fd, F_GETFL, 0)
-        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-
-        DispatchQueue.global(qos: .userInitiated).async { [self] in
-            defer { done.signal() }
-            var chunk = [UInt8](repeating: 0, count: 65_536)
-            while true {
-                var madeProgress = false
-                while true {
-                    let n = read(fd, &chunk, chunk.count)
-                    if n > 0 {
-                        madeProgress = true
-                        onData(Data(bytes: chunk, count: n))
-                        continue
-                    }
-                    if n == 0 { return }
-                    if errno == EINTR { continue }
-                    if errno == EAGAIN || errno == EWOULDBLOCK { break }
-                    return
-                }
-                if isStopped() { return }
-                usleep(madeProgress ? 1_000 : 5_000)
-            }
-        }
-    }
-
-    func stopAndWait() {
-        lock.lock()
-        stopped = true
-        let wasStarted = started
-        lock.unlock()
-        if wasStarted {
-            _ = done.wait(timeout: .now() + .seconds(5))
-        }
-    }
-
-    private func isStopped() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return stopped
     }
 }
 
@@ -322,18 +251,7 @@ public final class CodexAdapter: LLMAdapter {
         base: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
         var environment = base
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let additions = [
-            "\(home)/.local/bin",
-            "\(home)/bin",
-            "\(home)/.cargo/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin",
-        ]
+        let additions = SwiftCodexDeviceLoginManager.executableSearchDirectories
         let inherited = (base["PATH"] ?? "").split(separator: ":").map(String.init)
         var seen = Set<String>()
         environment["PATH"] = (additions + inherited).filter { seen.insert($0).inserted }.joined(separator: ":")
@@ -713,12 +631,10 @@ public final class CodexAdapter: LLMAdapter {
             model: model,
             requested: LLMCallContext.reasoningEffort,
             transport: .codexCLI,
-            supportedEfforts: CodexAccountModelCatalog.load(
-                cacheURL: CodexAccountModelCatalog.matchingCacheCandidate(
-                    oauthAuthURL: cacheURL.deletingLastPathComponent().appendingPathComponent("auth.json"),
-                    fallbackCacheURL: cacheURL
-                ),
-                useDefaultCacheWhenNil: false
+            supportedEfforts: CodexAccountModelCatalog.matchingModels(
+                providerID: "codex",
+                oauthAuthURL: cacheURL.deletingLastPathComponent().appendingPathComponent("auth.json"),
+                fallbackCacheURL: cacheURL
             ).first { $0.id == model }?.supportedReasoningEfforts
         ) {
             args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(effort)\""])
@@ -757,10 +673,7 @@ public final class CodexAdapter: LLMAdapter {
     ///   - Consumer cancellation (`onTermination`) → register terminator fires
     ///     `proc.terminate()`, the terminationHandler then finishes the stream.
     ///
-    /// Reader hygiene: stdout/stderr avoid `FileHandle.readabilityHandler`.
-    /// Foundation implements that API with dispatch sources, and fast-exit
-    /// subprocess churn in the full SwiftPM suite can close descriptors while
-    /// libdispatch still owns a source. The explicit readers have a bounded stop.
+    /// MacControl's event-driven readers settle capture before closing descriptors.
     public static let defaultStreamingRunner: CodexStreamingProcessRunner = { inv in
         AsyncThrowingStream { continuation in
             let activity = ProviderStreamContext.activity
@@ -786,23 +699,34 @@ public final class CodexAdapter: LLMAdapter {
             // decoding returns nil for the partial-bytes read and drops the
             // bytes silently. See `Utf8StreamDecoder` for details.
             let utf8Decoder = Utf8StreamDecoder()
-            let stdoutReader = NonblockingPipeReader(
-                fileDescriptor: outPipe.fileHandleForReading.fileDescriptor
-            ) { data in
-                // stdout carries only the model's answer: the request was admitted.
-                if !data.isEmpty { activity?(); admitted?() }
-                if let s = utf8Decoder.append(data) {
-                    continuation.yield(s)
+            let stdoutReader: SystemProcessAdapter.PipeDrain
+            let stderrReader: SystemProcessAdapter.PipeDrain
+            do {
+                stdoutReader = try SystemProcessAdapter.PipeDrain(
+                    handle: outPipe.fileHandleForReading
+                ) { data in
+                    // stdout carries only the model's answer: the request was admitted.
+                    if !data.isEmpty { activity?(); admitted?() }
+                    if let s = utf8Decoder.append(data) {
+                        continuation.yield(s)
+                    }
                 }
+
+                do {
+                    stderrReader = try SystemProcessAdapter.PipeDrain(
+                        handle: errPipe.fileHandleForReading
+                    ) { data in
+                        if !data.isEmpty { activity?() }
+                        stderrBuf.mutate { $0.append(data) }
+                    }
+                } catch {
+                    stdoutReader.stopAndWait()
+                    throw error
+                }
+            } catch {
+                continuation.finish(throwing: LLMError.underlying(message: "codex: \(error)"))
+                return
             }
-            let stderrReader = NonblockingPipeReader(
-                fileDescriptor: errPipe.fileHandleForReading.fileDescriptor
-            ) { data in
-                if !data.isEmpty { activity?() }
-                stderrBuf.mutate { $0.append(data) }
-            }
-            stdoutReader.start()
-            stderrReader.start()
 
             @Sendable func finishStream(_ block: () -> Result<Void, Error>) {
                 if finished.swap(true) { return }
@@ -860,12 +784,7 @@ public final class CodexAdapter: LLMAdapter {
                     slot = nil
                     return s
                 }
-                if late != nil {
-                    late?.cancel()
-                    #if DEBUG
-                    CodexAdapterDebugCounters.timeoutCancelled.mutate { $0 += 1 }
-                    #endif
-                }
+                late?.cancel()
             }
 
             do {
@@ -931,9 +850,6 @@ public final class CodexAdapter: LLMAdapter {
                 // timeoutCancelled.
                 return
             }
-            #if DEBUG
-            CodexAdapterDebugCounters.timeoutScheduled.mutate { $0 += 1 }
-            #endif
             // Termination can cancel the item just before scheduling. GCD may
             // then retain the inert closure until the deadline; the cancelled
             // body cannot signal a dead process. Closing that retention window
@@ -982,14 +898,20 @@ public final class CodexAdapter: LLMAdapter {
             // returned truncated output.
             let stdoutBuf = LockBox(Data())
             let stderrBuf = LockBox(Data())
-            let stdoutReader = NonblockingPipeReader(
-                fileDescriptor: outPipe.fileHandleForReading.fileDescriptor
-            ) { data in stdoutBuf.mutate { $0.append(data) } }
-            let stderrReader = NonblockingPipeReader(
-                fileDescriptor: errPipe.fileHandleForReading.fileDescriptor
-            ) { data in stderrBuf.mutate { $0.append(data) } }
-            stdoutReader.start()
-            stderrReader.start()
+            let stdoutReader: SystemProcessAdapter.PipeDrain
+            let stderrReader: SystemProcessAdapter.PipeDrain
+            do {
+                stdoutReader = try SystemProcessAdapter.PipeDrain(handle: outPipe.fileHandleForReading) { data in stdoutBuf.mutate { $0.append(data) } }
+                do {
+                    stderrReader = try SystemProcessAdapter.PipeDrain(handle: errPipe.fileHandleForReading) { data in stderrBuf.mutate { $0.append(data) } }
+                } catch {
+                    stdoutReader.stopAndWait()
+                    throw error
+                }
+            } catch {
+                finish { .failure(LLMError.underlying(message: "codex: \(error)")) }
+                return
+            }
 
             @Sendable func collectedResult(exitCode: Int32, timedOut: Bool) -> CodexProcessResult {
                 stdoutReader.stopAndWait()

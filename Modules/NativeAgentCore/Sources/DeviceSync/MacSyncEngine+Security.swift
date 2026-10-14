@@ -42,14 +42,14 @@ extension MacSyncEngine {
         _pairingSecret = nil
     }
 
-    public func finishPairingSecretRotation(with persistedSecret: Data?) {
+    public func finishPairingSecretRotation(with persistedSecret: Data?) async {
         _pairingSecret = persistedSecret
         pairingSecretRotationInProgress = false
         // Revoke the old Drive write generation and republish into this key's
         // directory. Late writes remain confined to their captured old URL.
-        if isActive, inboxDir != nil, let docsURL = activeDocsURL {
+        if inboxDir != nil, let docsURL = activeDocsURL {
             stop()
-            start(docsURL: docsURL)
+            await start(docsURL: docsURL)
         }
     }
 
@@ -173,10 +173,7 @@ extension MacSyncEngine {
     /// executed is answered from its ledger row no matter how long the
     /// redelivery took, and freshness only ever gates NEW work.
     func inboxActionFreshnessError(_ action: InboxAction) -> String? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let formatter2 = ISO8601DateFormatter() // without fractional seconds fallback
-        guard let ts = formatter.date(from: action.createdAt) ?? formatter2.date(from: action.createdAt) else {
+        guard let ts = NativeTimestampFormat.parseISO8601FractionalFirst(action.createdAt) else {
             return "invalid timestamp: \(action.createdAt)"
         }
         let age = Date().timeIntervalSince(ts)
@@ -189,23 +186,13 @@ extension MacSyncEngine {
         return nil
     }
 
-    /// Validate incoming InboxAction:
-    ///   1. Timestamp must be within ±5 minutes of now (unless the caller runs
-    ///      the freshness check itself, at its own point in the sequence).
-    ///   2. HMAC-SHA256 of the canonical body (JSON with keys sorted, signature excluded)
-    ///      must match the "signature" field.
+    /// HMAC-SHA256 of the canonical body (JSON with keys sorted, signature excluded)
+    /// must match the "signature" field. Freshness gates new work after ledger lookup.
     /// Returns nil on success, or an error string to log/reject.
     func validateInboxAction(
         data: Data,
-        action: InboxAction,
-        enforceFreshness: Bool = true
+        action: InboxAction
     ) async -> String? {
-        // 1. Timestamp freshness check.
-        if enforceFreshness, let stale = inboxActionFreshnessError(action) {
-            return stale
-        }
-
-        // 2. Signature check.
         guard let sig = action.signature else {
             // S.2: write an upgrade-required response so old iOS apps get a clear error
             // instead of timing out waiting for a response that never comes.

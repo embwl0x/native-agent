@@ -122,7 +122,6 @@ public final class ScopedWaiter: @unchecked Sendable {
     /// the very leak this type exists to prevent.
     private var parked: [(id: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
     private var resolved = false
-    private var cancelledFlag = false
     /// Identity per park, so a cancelled parker unparks ITSELF without
     /// resolving the shared waiter for everyone else.
     private var nextParkID: UInt64 = 0
@@ -132,33 +131,30 @@ public final class ScopedWaiter: @unchecked Sendable {
 
     public init() {}
 
-    public var isCancelled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cancelledFlag
-    }
-
-    public var isResolved: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return resolved
-    }
-
     /// Resolves the waiter. Returns true only for the call that won.
     @discardableResult
-    public func resume() -> Bool { resolve(cancelled: false) }
+    public func resume() -> Bool {
+        lock.lock()
+        guard !resolved else {
+            lock.unlock()
+            return false
+        }
+        resolved = true
+        let waiting = parked
+        parked.removeAll()
+        cancelledParks.removeAll()
+        lock.unlock()
+        waiting.forEach { $0.continuation.resume() }
+        return true
+    }
 
-    /// Resolves the waiter as cancelled. Returns true only for the winner.
-    @discardableResult
-    public func cancel() -> Bool { resolve(cancelled: true) }
-
-    /// Parks until someone calls `resume()`/`cancel()`, or until THIS parker's
+    /// Parks until someone calls `resume()`, or until THIS parker's
     /// task is cancelled. Returns immediately if the waiter already resolved.
     ///
     /// fix-park-cancellation (2026-08-02): a bare
     /// `withCheckedContinuation(Void, Never)` ignores cancellation entirely
     /// (empirically confirmed), so a parker whose task was cancelled with no
-    /// later `resume`/`cancel` stayed in `parked` forever — the exact leak this
+    /// later `resume` stayed in `parked` forever — the exact leak this
     /// type claims to prevent. The guarantee now lives INSIDE the primitive
     /// instead of in whichever caller remembered to add its own handler.
     ///
@@ -205,53 +201,6 @@ public final class ScopedWaiter: @unchecked Sendable {
         lock.unlock()
         continuation.resume()
     }
-
-    /// Parks with a deadline. Returns false when the deadline (or a cancel)
-    /// resolved the waiter instead of a real `resume()`.
-    ///
-    /// Preferred over wrapping `park()` in `BoundedWait.run`: this deadline
-    /// RESOLVES the waiter, so the parked continuation is actually released,
-    /// whereas `BoundedWait.run` would return on time but leave the park
-    /// abandoned in the background. Use this whenever the wait is a
-    /// `ScopedWaiter`.
-    ///
-    /// `false` means "no real resume was observed" — a deadline, a `cancel()`,
-    /// or this parker's own task being cancelled.
-    @discardableResult
-    public func park(timeoutSeconds: TimeInterval, reason: String) async -> Bool {
-        let deadline = BoundedWait.clampedDeadline(timeoutSeconds, reason: reason)
-        let expiry = Task { [weak self] in
-            try await Task.sleep(nanoseconds: BoundedWait.nanoseconds(deadline))
-            guard let self, self.cancel() else { return }
-            BoundedWait.logger.error(
-                "bounded wait expired after \(deadline, privacy: .public)s: \(reason, privacy: .public)"
-            )
-        }
-        await park()
-        expiry.cancel()
-        // A cancelled parker did not observe a real resume, even though the
-        // waiter itself is still unresolved.
-        return !isCancelled && !Task.isCancelled
-    }
-
-    private func resolve(cancelled: Bool) -> Bool {
-        lock.lock()
-        // Set `cancelledFlag` ONLY when this call actually resolves the waiter.
-        // A deadline that fires a hair after a real resume must not relabel a
-        // genuine wake-up as a timeout.
-        guard !resolved else {
-            lock.unlock()
-            return false
-        }
-        if cancelled { cancelledFlag = true }
-        resolved = true
-        let waiting = parked
-        parked.removeAll()
-        cancelledParks.removeAll()
-        lock.unlock()
-        waiting.forEach { $0.continuation.resume() }
-        return true
-    }
 }
 
 // MARK: - OnceByKey
@@ -261,8 +210,7 @@ public final class ScopedWaiter: @unchecked Sendable {
 ///
 /// Unlike a bare `[Key: Task]` memo table, the in-flight `Task` (and everything
 /// its closure captured — typically a whole store/executor instance) is dropped
-/// once the run finishes; only a completion marker is kept. `reset()` exists so
-/// tests do not accumulate one entry per temp root for the process lifetime.
+/// once the run finishes; only a completion marker is kept.
 public actor OnceByKey<Key: Hashable & Sendable> {
     private enum State {
         case running(Task<Void, Error>)
@@ -270,22 +218,7 @@ public actor OnceByKey<Key: Hashable & Sendable> {
     }
 
     private var states: [Key: State] = [:]
-    public let name: String
-
-    public init(name: String) { self.name = name }
-
-    /// Awaits the single run for `key`, starting it if this is the first call.
-    ///
-    /// fix-once-marker-ownership (2026-08-02): the `.done` transition used to
-    /// happen in the AWAITING caller after `task.value` returned, which made
-    /// the table's cleanup depend on caller behaviour — a class of retention
-    /// this primitive exists to remove. The run now marks itself done from
-    /// inside the spawned task, before that task completes, so the entry (and
-    /// the operation's captures) is dropped whether or not anybody is still
-    /// waiting on it.
-    public func run(_ key: Key, _ operation: @escaping @Sendable () async -> Void) async {
-        try? await runChecked(key, operation)
-    }
+    public init() {}
 
     /// Failed operations leave the key pending, and every waiting caller sees
     /// the failure before it can cross its admission barrier.
@@ -313,8 +246,7 @@ public actor OnceByKey<Key: Hashable & Sendable> {
         }
     }
 
-    /// Called by the run itself. Only advances a still-`running` entry, so a
-    /// `reset()` mid-flight is not resurrected by a late completion.
+    /// The run itself releases its captures before its waiting callers resume.
     private func markDone(_ key: Key) {
         guard case .running = states[key] else { return }
         states[key] = .done
@@ -325,16 +257,6 @@ public actor OnceByKey<Key: Hashable & Sendable> {
         states[key] = nil
     }
 
-    public func hasCompleted(_ key: Key) -> Bool {
-        if case .done = states[key] { return true }
-        return false
-    }
-
-    public var trackedKeys: Int { states.count }
-
-    /// Test seam — drops completion markers so a temp-root-per-test suite does
-    /// not grow the table for the process lifetime.
-    public func reset() { states.removeAll() }
 }
 
 // MARK: - BoundedWait
@@ -372,52 +294,6 @@ public enum BoundedWait {
     /// the overflow that would TRAP the process on a hostile env value.
     public static let maxDeadlineSeconds: TimeInterval = 900
 
-    private enum Outcome<Value: Sendable>: @unchecked Sendable {
-        case value(Value)
-        case failure(Error)
-    }
-
-    /// One-shot race resolver. Whichever of {operation, deadline, caller
-    /// cancellation} settles first wins; every later settle is dropped, and the
-    /// losing side is never awaited.
-    private final class RaceBox<Value: Sendable>: @unchecked Sendable {
-        private let lock = NSLock()
-        private var continuation: CheckedContinuation<Outcome<Value>, Never>?
-        private var pending: Outcome<Value>?
-        private var settled = false
-
-        func attach(_ continuation: CheckedContinuation<Outcome<Value>, Never>) {
-            lock.lock()
-            if let pending {
-                self.pending = nil
-                lock.unlock()
-                continuation.resume(returning: pending)
-                return
-            }
-            self.continuation = continuation
-            lock.unlock()
-        }
-
-        @discardableResult
-        func settle(_ outcome: Outcome<Value>) -> Bool {
-            lock.lock()
-            guard !settled else {
-                lock.unlock()
-                return false
-            }
-            settled = true
-            if let waiting = continuation {
-                continuation = nil
-                lock.unlock()
-                waiting.resume(returning: outcome)
-            } else {
-                pending = outcome
-                lock.unlock()
-            }
-            return true
-        }
-    }
-
     /// Runs `operation` with a deadline that holds even when `operation` does
     /// NOT cooperate with cancellation. On expiry a LOGGED `BoundedWaitTimeout`
     /// naming `reason` is thrown and this call returns immediately.
@@ -450,42 +326,18 @@ public enum BoundedWait {
             throw BoundedWaitTimeout(reason: reason, seconds: max(0, seconds))
         }
         let deadline = clampedDeadline(seconds, reason: reason)
-        let box = RaceBox<T>()
-        let work = Task {
-            do {
-                box.settle(.value(try await operation()))
-            } catch {
-                box.settle(.failure(error))
-            }
-        }
-        let expiry = Task {
-            do {
-                try await Task.sleep(nanoseconds: nanoseconds(deadline))
-            } catch {
-                return  // cancelled: the operation already settled the race
-            }
-            guard box.settle(.failure(BoundedWaitTimeout(reason: reason, seconds: deadline)))
-            else { return }
+        do {
+            let value = try await TurnDeadline.withThrowingDeadline(seconds: deadline, operation)
+            try Task.checkCancellation()
+            return value
+        } catch is TurnDeadline.DeadlineExceeded {
+            try Task.checkCancellation()
             logger.error(
                 "bounded wait expired after \(deadline, privacy: .public)s: \(reason, privacy: .public)"
             )
-        }
-        let outcome = await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Outcome<T>, Never>) in
-                box.attach(continuation)
-            }
-        } onCancel: {
-            box.settle(.failure(CancellationError()))
-            work.cancel()
-        }
-        expiry.cancel()
-        // Abandon the loser — requested to stop, never awaited.
-        work.cancel()
-        try Task.checkCancellation()
-        switch outcome {
-        case .value(let value):
-            return value
-        case .failure(let error):
+            throw BoundedWaitTimeout(reason: reason, seconds: deadline)
+        } catch {
+            try Task.checkCancellation()
             throw error
         }
     }
@@ -503,23 +355,6 @@ public enum BoundedWait {
             """
         )
         return maxDeadlineSeconds
-    }
-
-    /// Overflow-safe nanosecond conversion. Inputs are already clamped, so this
-    /// can never trap the process on a hostile value.
-    static func nanoseconds(_ seconds: TimeInterval) -> UInt64 {
-        let bounded = min(max(0, seconds), maxDeadlineSeconds)
-        return UInt64((bounded * 1_000_000_000).rounded())
-    }
-
-    /// Bounded variant that reports expiry instead of throwing — for seams
-    /// whose caller cannot throw. Still logged; never silent.
-    public static func runReportingTimeout<T: Sendable>(
-        seconds: TimeInterval,
-        reason: String,
-        operation: @escaping @Sendable () async -> T
-    ) async -> T? {
-        try? await run(seconds: seconds, reason: reason, operation: operation)
     }
 
     /// Reads a positive TimeInterval override from the environment, falling

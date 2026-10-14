@@ -32,10 +32,6 @@ public struct MemoryConsolidationHygieneRunner: LoopRunner {
         self.interval = interval
     }
 
-    public func tick() async {
-        _ = await tickOutcome()
-    }
-
     public func tickOutcome() async -> LoopTickOutcome {
         // Settings ▸ "Nightly memory consolidation": off means this tick does
         // not run. Read fresh on the tick, so a flip lands on the next run.

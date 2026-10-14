@@ -211,7 +211,11 @@ public struct AgentConversationLiveStore: Sendable {
     /// helper's entry (by message id) is the closer view, so it wins.
     public func current(for row: AgentConversationRecord) -> AgentConversationLive? {
         guard ["sending", "waiting"].contains(row.phase) else { return nil }
-        let rows = all()
+        return Self.current(for: row, in: all())
+    }
+
+    public static func current(for row: AgentConversationRecord, in rows: [String: AgentConversationLive]) -> AgentConversationLive? {
+        guard ["sending", "waiting"].contains(row.phase) else { return nil }
         if case .string(let message)? = row.readInput?["message_id"],
            let live = rows[AgentConversationLiveTarget.messageKey(agent: row.agent, messageID: message)] {
             return live
@@ -220,15 +224,16 @@ public struct AgentConversationLiveStore: Sendable {
         return live
     }
 
-    @discardableResult func merge(_ changed: [AgentConversationLive]) throws -> [String: AgentConversationLive] {
+    @discardableResult func merge(_ changed: [AgentConversationLive], records checkedRecords: [AgentConversationRecord]? = nil) throws -> [String: AgentConversationLive] {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])
         return try CredentialFileLock.withLock(fileURL) {
             var rows = all()
             let before = rows
-            // The record owns settlement. Read it inside the live-file lock so
-            // a late progress write cannot restore waiting after settlement.
-            let records = try AgentConversationStore(dataRoot: dataRoot).recordsUnlocked()
+            // Reconciliation holds the record lock. Progress flushes read inside
+            // the live-file lock so a late write cannot undo settlement.
+            let store = AgentConversationStore(dataRoot: dataRoot)
+            let records = try checkedRecords.map(store.reconcilingExpiredReplies) ?? store.recordsUnlocked()
             for live in changed {
                 if let id = live.recordID {
                     guard let row = records.first(where: { $0.id == id }), row.operationID == live.operationID else { continue }

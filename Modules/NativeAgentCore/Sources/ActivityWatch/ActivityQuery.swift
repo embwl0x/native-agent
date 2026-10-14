@@ -112,7 +112,7 @@ public struct ActivityQueryService: Sendable {
             throw QueryError.badRange("the requested range is longer than 366 days; ask for a shorter range")
         }
 
-        let store = try ActivitySpanStore(dataRoot: dataRoot)
+        let store = try await ActivitySpanStore.acquire(dataRoot: dataRoot)!
         // W5 LAYER 2 — query-time exclusion. The policy is passed to the store,
         // which re-filters on read, because exclusion lists change: adding
         // 1Password today must make yesterday unanswerable even for rows that
@@ -145,33 +145,11 @@ public struct ActivityQueryService: Sendable {
         bundleIDFilter: String?,
         policy: ActivityPolicy
     ) -> JSONValue {
-        var topRows = bundle.topApps.rows
-        var buckets = bundle.buckets
-        var exemplars = bundle.exemplars
-        var truncated = bundle.truncatedSections
-
-        if let filter = bundleIDFilter, !filter.isEmpty {
-            topRows = topRows.filter { $0.bundleId == filter }
-            buckets = buckets.filter { $0.bundleId == filter }
-            exemplars = exemplars.filter { $0.bundleId == filter }
-        }
-
-        // The cap is enforced HERE as well as inside answerBundle, because the
-        // caller can lower it and because a future section would otherwise
-        // slip past the one check. Anything dropped is named.
-        let rowTotal = topRows.count + buckets.count + exemplars.count
-        if rowTotal > Self.maxRows {
-            let overflow = rowTotal - Self.maxRows
-            let trimmed = min(overflow, buckets.count)
-            buckets = Array(buckets.prefix(buckets.count - trimmed))
-            truncated.append("buckets: \(trimmed) further rows dropped by the \(Self.maxRows)-row answer cap")
-        }
-
         // Broken into named sub-expressions rather than one literal: the single
         // literal exceeded the type-checker's budget outright (it refused to
         // compile), and a nested `.object([...])` tree is exactly the shape
         // that does that.
-        let topJSON: [JSONValue] = topRows.map { row in
+        let topJSON: [JSONValue] = bundle.topApps.rows.map { row in
             var out: [String: JSONValue] = [:]
             out["bundle_id"] = .string(row.bundleId)
             out["app_name"] = .string(row.appName)
@@ -180,7 +158,7 @@ public struct ActivityQueryService: Sendable {
             out["event_count"] = .int(Int64(row.eventCount))
             return .object(out)
         }
-        let bucketJSON: [JSONValue] = buckets.map { bucket in
+        let bucketJSON: [JSONValue] = bundle.buckets.map { bucket in
             var out: [String: JSONValue] = [:]
             out["start"] = .double(bucket.start)
             out["end"] = .double(bucket.end)
@@ -191,7 +169,7 @@ public struct ActivityQueryService: Sendable {
             out["event_count"] = .double(bucket.eventCount)
             return .object(out)
         }
-        let exemplarJSON: [JSONValue] = exemplars.map { span in
+        let exemplarJSON: [JSONValue] = bundle.exemplars.map { span in
             var out: [String: JSONValue] = [:]
             out["started_at"] = .double(span.startedAt)
             out["ended_at"] = span.endedAt.map { JSONValue.double($0) } ?? .null
@@ -236,7 +214,7 @@ public struct ActivityQueryService: Sendable {
         out["exemplars"] = .array(exemplarJSON)
         // HONEST TRUNCATION. Empty array means "this is the whole answer";
         // a non-empty one names every section that lost rows and why.
-        out["truncated"] = .array(truncated.map { JSONValue.string($0) })
+        out["truncated"] = .array(bundle.truncatedSections.map { JSONValue.string($0) })
         out["row_count"] = .int(Int64(topJSON.count + bucketJSON.count + exemplarJSON.count))
         out["row_cap"] = .int(Int64(Self.maxRows))
         out["recording_limits"] = .object(limits)

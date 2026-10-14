@@ -1,3 +1,5 @@
+import Cognition
+import EngineRuntime
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -5,8 +7,10 @@ import ScreenCaptureKit
 import ScreenVision
 import Speech
 import AVFoundation
+import EventKit
 import UniformTypeIdentifiers
 import NativeAgentShared
+import NativeAgentCore
 import MemoryV2
 import PersistenceCore
 import Connectors
@@ -19,6 +23,9 @@ import CloudKit
 #endif
 
 enum ConnectorUIState: Equatable {
+    static func resolve(_ connector: ConnectorRecord) -> Self {
+        resolve(authState: connector.authState, healthStatus: connector.healthStatus)
+    }
     case live
     case ready
     /// Credential present, but no successful connector call has proven it
@@ -42,6 +49,7 @@ enum ConnectorUIState: Equatable {
         if health == ConnectorHealthDecay.unverifiedHealth {
             return .unverified
         }
+        if auth == "failed" || health == "failed" { return .unknown }
         if auth == "connected_unverified"
             || auth == "not_connected"
             || auth == "needs_auth"
@@ -260,6 +268,7 @@ enum WorkspaceAddOutcome: Equatable {
 
 struct ConnectorsView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @State private var workspaceName = ""
     @State private var workspacePath = ""
     @State private var workspaceWritable = false
@@ -269,8 +278,16 @@ struct ConnectorsView: View {
     @State private var wizardPresentation = ConnectorWizardPresentationState()
     @State private var connectorStatusMessage: ConnectorsStatusMessagePresentation.Message?
     @State private var isAddingWorkspace = false
+    @State private var checkedAccounts: Result<[ConnectorRecord], Error> = .success([])
+    @State private var accountsGeneration = 0
 
     var body: some View {
+        // Screenshot hosts suppress liveTask, so their first render reads the same checked records.
+        let checked = quietOffscreenRead
+            ? Result { try ConnectorStatusProjection.checkedConnectorRecords(root: appModel.engine.dataRoot, platform: AppConnectorStatusPlatform()) }
+            : checkedAccounts
+        let accountsReadFailed = if case .failure = checked { true } else { false }
+        let registryRowsForDisplay = registryRowsForDisplay((try? checked.get()) ?? [])
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 if let connectorStatusMessage {
@@ -349,9 +366,26 @@ struct ConnectorsView: View {
             .padding(.bottom, 32)
         }
         .navigationTitle("Connectors")
+        .liveTask {
+            await appModel.refreshForSidebarItem(.connectors)
+            let root = appModel.engine.dataRoot
+            let credentials = ["github", "slack", "notion", "gmail", "calendar", "x", "email"].flatMap { id in
+                ["oauth_tokens/\(id).json", "connectors/\(id)/auth.json", "connectors/\(id)/oauth_app.json"].map { root.appendingPathComponent($0) }
+            }
+            await EventDeadlinePhysiology.refreshOnChanges(paths: [ConnectorStatusProjection.connectorRegistryPath(root: root),
+                ConnectorProofLedger.receiptsPath(root: root)] + credentials +
+                ["telegram/config.json", "research/config.json", "slack/config.json", "slack/state.json",
+                 "slack", "connectors/slack/save_intent.json"].map { root.appendingPathComponent($0) },
+                notifications: [NSApplication.didBecomeActiveNotification, .NSSystemClockDidChange, .EKEventStoreChanged]) {
+                await refreshAccounts()
+            }
+        }
         .pageActions {
             Button(accountsReading ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise") {
-                Task { await appModel.refreshForSidebarItem(.connectors) }
+                Task {
+                    await appModel.refreshForSidebarItem(.connectors)
+                    await refreshAccounts()
+                }
             }
             .accessibilityLabel("Refresh connectors")
             .disabled(accountsReading)
@@ -374,6 +408,17 @@ struct ConnectorsView: View {
                 .environment(appModel)
             }
         }
+    }
+
+    private func refreshAccounts() async {
+        accountsGeneration &+= 1
+        let generation = accountsGeneration
+        let root = appModel.engine.dataRoot
+        let checked = await Task.detached(priority: .userInitiated) {
+            Result { try ConnectorStatusProjection.checkedConnectorRecords(root: root, platform: AppConnectorStatusPlatform()) }
+        }.value
+        guard !Task.isCancelled, generation == accountsGeneration else { return }
+        checkedAccounts = checked
     }
 
     private var shareFolderSection: some View {
@@ -593,12 +638,8 @@ struct ConnectorsView: View {
         appModel.panelRefreshCounts[.connectors, default: 0] > 0
     }
 
-    private var accountsReadFailed: Bool {
-        appModel.panelRefreshStatus[.connectors]?.failedEndpoints.contains("connectors") == true
-    }
-
-    private var registryRowsForDisplay: [ConnectorRecord] {
-        appModel.connectors.sorted { lhs, rhs in
+    private func registryRowsForDisplay(_ records: [ConnectorRecord]) -> [ConnectorRecord] {
+        records.sorted { lhs, rhs in
             let lhsRank = connectorDisplayRank(lhs)
             let rhsRank = connectorDisplayRank(rhs)
             if lhsRank != rhsRank { return lhsRank < rhsRank }
@@ -608,7 +649,7 @@ struct ConnectorsView: View {
     }
 
     private func connectorUIState(_ connector: ConnectorRecord) -> ConnectorUIState {
-        ConnectorUIState.resolve(authState: connector.authState, healthStatus: connector.healthStatus)
+        ConnectorUIState.resolve(connector)
     }
 
     private func connectorDisplayRank(_ connector: ConnectorRecord) -> Int {

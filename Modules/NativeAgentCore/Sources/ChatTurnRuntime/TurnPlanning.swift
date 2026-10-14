@@ -112,13 +112,13 @@ public struct TurnPlan: Equatable, Sendable {
 
 public actor TurnPlanner {
     private let dataRoot: URL
-    private let router: any RouterPlanClient
+    private let router: SwiftNativeRouterPlanClient
     private let trustCenter: SwiftNativeTrustCenter
     private let clock: @Sendable () -> Date
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        router: any RouterPlanClient = SwiftNativeRouterPlanClient(),
+        router: SwiftNativeRouterPlanClient = SwiftNativeRouterPlanClient(),
         trustCenter: SwiftNativeTrustCenter? = nil,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
@@ -513,31 +513,10 @@ extension SwiftNativeTurnEngine {
         // Always consume the request-scoped candidate here, even for a task
         // turn. It must never leak through a later context transform.
         guard !additions.isEmpty || context.naturalExpressionCue != nil else { return context }
-        let appended = SwiftNativeTurnEngine.contextByAppendingRuntimeContext(
+        var appended = SwiftNativeTurnEngine.contextByAppendingRuntimeContext(
             context, runtimeContext: additions.joined(separator: "\n\n")
         )
-        return TurnContext(
-            surface: context.surface,
-            personaID: context.personaID,
-            personaDocs: context.personaDocs,
-            personaFingerprint: context.personaFingerprint,
-            recalled: context.recalled,
-            modelId: context.modelId,
-            reasoningEffort: context.reasoningEffort,
-            providerId: context.providerId,
-            serviceTier: context.serviceTier,
-            toolsAvailable: context.toolsAvailable,
-            systemPrompt: appended.systemPrompt,
-            userMessage: context.userMessage,
-            toolSchemas: context.toolSchemas,
-            systemSegments: appended.systemSegments,
-            imageBlocks: context.imageBlocks,
-            fluidContextTurn: context.fluidContextTurn,
-            naturalExpressionCue: nil,
-            historyMessages: context.historyMessages,
-            turnVolatileBlock: context.turnVolatileBlock,
-            historyWindowReceipt: context.historyWindowReceipt,
-            preparationMs: context.preparationMs
-        )
+        appended.naturalExpressionCue = nil
+        return appended
     }
 }

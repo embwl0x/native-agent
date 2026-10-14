@@ -1,3 +1,4 @@
+import MemoryV2
 import AppToolRuntime
 import Cognition
 import Context
@@ -5,12 +6,13 @@ import Foundation
 import PersistenceCore
 import NativeAgentShared
 import ProviderRouting
+import Research
 import TrustCenter
 import TriggerScheduler
 
 /// Adapts the settings catalog to the same observed model actions as the UI.
 @MainActor
-class AppQuietSettingsHost: QuietSettingsHost {
+class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     let appModel: AppModel
 
     init(_ appModel: AppModel) { self.appModel = appModel }
@@ -67,24 +69,12 @@ class AppQuietSettingsHost: QuietSettingsHost {
     func listQuietProviderAccounts() async throws -> [QuietProviderAccount] {
         let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         return try await appModel.engine.providers.list().map {
-            // The Providers page's own list and fallback levels
-            // (`ProviderSettingsView.modelsForProvider`). A ready account
-            // whose last test failed for its current key needs a reconnect,
-            // so no `*_account` list offers it.
-            let failed = $0.auth_status.state == "ready"
-                && LLMProviderStatusFeed.failedTest(providerID: $0.provider_id, dataRoot: root) == "key rejected"
-            return QuietProviderAccount(id: $0.provider_id, authState: failed ? "needs_reconnect" : $0.auth_status.state, models: $0.models.map {
-                QuietProviderModel(
-                    id: $0.id,
-                    defaultEffort: $0.default_reasoning_effort ?? "high",
-                    efforts: $0.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"],
-                    supportsFast: $0.supports_fast == true)
-            })
+            QuietProviderAccount(providerID: $0.provider_id, authState: $0.auth_status.state, models: $0.models, dataRoot: root)
         }
     }
 
     func agentAccessMode(from policy: TrustPolicy) -> String {
-        AppModel.agentAccessMode(from: policy)
+        TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy)
     }
 
     func applyTrustPreset(
@@ -141,14 +131,7 @@ class AppQuietSettingsHost: QuietSettingsHost {
 
     /// The same runtime setters the Settings and Cognition pages call.
     func setCognitionLane(_ lane: QuietCognitionLane, enabled: Bool) async {
-        let runtime = NativeAgentEngine.liveCognition
-        switch lane {
-        case .capsule: await runtime.setCapsuleEnabled(enabled)
-        case .background: await runtime.setBackgroundEnabled(enabled)
-        case .reflection: await runtime.setReflectionEnabled(enabled)
-        case .organism: await runtime.setOrganismKernelEnabled(enabled)
-        case .viewsExperiment: await runtime.setViewsExperimentEnabled(enabled)
-        }
+        await lane.setEnabled(enabled, runtime: NativeAgentEngine.liveCognition)
     }
     func setReflectionBudget(_ budget: Int) async {
         await NativeAgentEngine.liveCognition.setReflectionBudget(budget)
@@ -164,10 +147,10 @@ class AppQuietSettingsHost: QuietSettingsHost {
     }
 
     func memoryMode() async throws -> String {
-        EmbeddingsSettingsStatusPresentation(status: try await AppModel.embeddingsStatus(dataRoot: appModel.engine.dataRoot)).memoryMode
+        EmbeddingsSettingsStatusPresentation(status: try await MemoryStatusProjection.embeddingsStatus(dataRoot: appModel.engine.dataRoot)).memoryMode
     }
     func setMemoryMode(_ mode: String) async throws {
-        let result = try await AppModel.setEmbeddingsMemoryMode(mode, dataRoot: appModel.engine.dataRoot)
+        let result = try await MemoryStatusProjection.setEmbeddingsMemoryMode(mode, dataRoot: appModel.engine.dataRoot)
         if let error = result.error {
             throw QuietSettingError.unavailable(result.detail.map { "\(error): \($0)" } ?? error)
         }
@@ -181,13 +164,16 @@ class AppQuietSettingsHost: QuietSettingsHost {
     }
 
     func saveSearchServiceURL(_ url: String) async throws {
-        _ = try await appModel.saveSearXNGBaseURL(url)
+        appModel.searxngBaseURL = try await SwiftNativeResearchClient(dataRoot: appModel.engine.dataRoot)
+            .saveSearXNGBaseURL(url)
     }
     func findSearchService() async throws -> String {
         switch await appModel.autodetectSearXNG() {
         // Find, then Save — the page's two buttons in the order a person
         // presses them.
-        case .found(let url): return try await appModel.saveSearXNGBaseURL(url)
+        case .found(let url):
+            try await saveSearchServiceURL(url)
+            return appModel.searxngBaseURL
         case .notFound(let detail), .failed(let detail): throw QuietSettingError.unavailable(detail)
         }
     }

@@ -25,7 +25,7 @@ extension SwiftToolDispatcher {
                     throw ContextExpansionError.invalidCharacterOffset
                 }
             }
-            let maximum = max(1, min(optionalInt(input, "max_characters") ?? 8_000, 12_000))
+            let maximum = max(1, min(Self.jsonInt(input["max_characters"]) ?? 8_000, 12_000))
             let result = try await impl_read_chat_message(input: [
                 "session_id": .string(sessionID),
                 "message_id": .string(String(locator.dropFirst("history:".count))),

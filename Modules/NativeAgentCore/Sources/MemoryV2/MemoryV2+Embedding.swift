@@ -224,7 +224,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
 
     /// The embedding model always uses CPU + Neural Engine, never the GPU.
     #if canImport(CoreML) && !os(Linux)
-    public static func modelConfiguration(lowMemory: Bool) -> MLModelConfiguration? {
+    public static func modelConfiguration() -> MLModelConfiguration? {
         let configuration = MLModelConfiguration()
         // 2026-10-01: off the GPU. MiniLM compiling GPU pipelines at launch
         // was caught alongside SwiftUI's RenderBox aborting on its own Metal
@@ -239,15 +239,12 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
     #endif
 
-    /// - Parameter lowMemory: retained for source compatibility; compute units
-    ///   always include the Neural Engine.
     public init(
         modelURL: URL,
         vocabURL: URL? = nil,
         dimensions: Int = 384,
         modelId: String = CoreMLEmbeddingProvider.bundledModelID,
-        maxSeqLength: Int = 128,
-        lowMemory: Bool = false
+        maxSeqLength: Int = 128
     ) throws {
         self.modelURL = modelURL
         self.dimensions = dimensions
@@ -307,7 +304,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         var loadedModel: MLModel?
         var loadFailure: Error?
         // A5.4: nil configuration == the untouched CoreML default path.
-        let configuration = Self.modelConfiguration(lowMemory: lowMemory)
+        let configuration = Self.modelConfiguration()
         do {
             let urlToLoad: URL
             if ext == "mlpackage" {
@@ -593,16 +590,14 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     /// `Bundle.module`, which is the MemoryV2 target's resource bundle).
     public static func bundled(
         _ bundle: Bundle? = nil,
-        extrasRoot: URL? = nil,
-        lowMemory: Bool = false
+        extrasRoot: URL? = nil
     ) throws -> CoreMLEmbeddingProvider {
         if let installed = try installedExtrasModel(root: extrasRoot) {
             return try CoreMLEmbeddingProvider(
                 modelURL: installed.modelURL,
                 vocabURL: installed.vocabURL,
                 dimensions: installed.dimensions,
-                modelId: installed.modelID,
-                lowMemory: lowMemory
+                modelId: installed.modelID
             )
         }
         let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
@@ -610,7 +605,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             throw EmbeddingError.modelNotFound(path: "Bundle.module/minilm.mlpackage")
         }
         let vocab = resolved.url(forResource: "minilm_vocab", withExtension: "txt")
-        return try CoreMLEmbeddingProvider(modelURL: url, vocabURL: vocab, lowMemory: lowMemory)
+        return try CoreMLEmbeddingProvider(modelURL: url, vocabURL: vocab)
     }
 
     /// A larger embedding model installed under `<dataRoot>/extras/coreml/`,
@@ -922,7 +917,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
 public enum EmbeddingError: Error, LocalizedError {
     case modelNotFound(path: String)
     case modelNotLoaded(reason: String)
-    case dimensionMismatch(expected: Int, got: Int)
     case invalidModelURL(reason: String)
     case installedModelUnusable(manifest: String, reason: String)
 
@@ -930,7 +924,6 @@ public enum EmbeddingError: Error, LocalizedError {
         switch self {
         case .modelNotFound(let p): return "embedding model not found at \(p)"
         case .modelNotLoaded(let r): return "embedding model not loaded: \(r)"
-        case .dimensionMismatch(let e, let g): return "embedding dimension mismatch: expected \(e), got \(g)"
         case .invalidModelURL(let r): return "invalid embedding model URL: \(r)"
         case .installedModelUnusable(let m, let r): return "installed embedding model did not load (\(m)): \(r)"
         }

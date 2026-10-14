@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
+import FeedPolicy
 
 public enum GitHubConnectorError: Error, Sendable, Equatable, LocalizedError, ConnectorCredentialsMissing {
     case invalidInput(String)
@@ -37,6 +38,7 @@ public enum GitHubConnectorError: Error, Sendable, Equatable, LocalizedError, Co
 public enum GitHubConnectorActions {
     private static let baseURL = URL(string: "https://api.github.com")!
     @TaskLocal private static var scopedRequestToken: String?
+    @TaskLocal private static var checkingCandidateToken = false
 
     public static func status(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
         _ = input
@@ -234,8 +236,9 @@ public enum GitHubConnectorActions {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         credentialStore: GitHubCredentialStore = .shared
     ) async throws -> [String: Any] {
-        let token = try await loadToken(dataRoot: dataRoot, credentialStore: credentialStore)
-        return try await validateToken(token)
+        try await withResolvedToken(dataRoot: dataRoot, credentialStore: credentialStore) {
+            try userResponse(await call(path: "user", dataRoot: dataRoot))
+        }
     }
 
     public static func validateToken(_ token: String) async throws -> [String: Any] {
@@ -243,7 +246,12 @@ public enum GitHubConnectorActions {
         guard !trimmed.isEmpty else {
             throw GitHubConnectorError.notConfigured
         }
-        let response = try await call(path: "user", token: trimmed)
+        return try await $checkingCandidateToken.withValue(true) {
+            try userResponse(await call(path: "user", token: trimmed))
+        }
+    }
+
+    private static func userResponse(_ response: Any) throws -> [String: Any] {
         guard let user = response as? [String: Any] else {
             throw GitHubConnectorError.invalidResponse("/user returned non-object JSON")
         }
@@ -446,6 +454,31 @@ public enum GitHubConnectorActions {
         return rows
     }
 
+    static func pullRequestDetails(
+        repository: String, number: Int, sha: String?, issueCommentCount: Int,
+        includeIssueComments: Bool, expectedIssueCommentIdentifier: String?, dataRoot: URL
+    ) async throws -> (reviews: Any, reviewComments: Any, checkRuns: Any, combinedStatus: Any, issueComments: Any) {
+        async let reviews = paginatedArray(path: "repos/\(repository)/pulls/\(number)/reviews", dataRoot: dataRoot)
+        async let reviewComments = paginatedArray(path: "repos/\(repository)/pulls/\(number)/comments", dataRoot: dataRoot)
+        async let checkRuns: Any = {
+            guard let sha else { return ["check_runs": []] }
+            return try await completeCheckRuns(path: "repos/\(repository)/commits/\(sha)/check-runs", dataRoot: dataRoot)
+        }()
+        async let combinedStatus: Any = {
+            guard let sha else { return ["statuses": []] }
+            return try await call(path: "repos/\(repository)/commits/\(sha)/status", dataRoot: dataRoot)
+        }()
+        async let issueComments: Any = {
+            guard issueCommentCount > 0, includeIssueComments else { return [] }
+            return try await issueCommentsIncludingExpected(
+                repository: repository, number: number, commentCount: issueCommentCount,
+                expectedIdentifier: expectedIssueCommentIdentifier, dataRoot: dataRoot
+            )
+        }()
+        // Preserve failure precedence and cancel unfinished siblings when a read fails.
+        return try await (reviews, reviewComments, checkRuns, combinedStatus, issueComments)
+    }
+
     static func call(
         path: String,
         params: [String: String] = [:],
@@ -478,6 +511,7 @@ public enum GitHubConnectorActions {
         do {
             (data, resp) = try await URLSession.shared.data(for: req)
         } catch {
+            await recordConnectionProof(statusCode: nil, dataRoot: dataRoot)
             throw GitHubConnectorError.transport(error.localizedDescription)
         }
         let parsed = (try? JSONSerialization.jsonObject(with: data)) ?? [
@@ -485,8 +519,10 @@ public enum GitHubConnectorActions {
             "rawPreview": String(data: data.prefix(300), encoding: .utf8) ?? "",
         ]
         guard let http = resp as? HTTPURLResponse else {
+            await recordConnectionProof(statusCode: nil, dataRoot: dataRoot)
             throw GitHubConnectorError.invalidResponse("missing HTTP response")
         }
+        await recordConnectionProof(statusCode: http.statusCode, dataRoot: dataRoot)
         // A stored OAuth sign-in that GitHub rejects gets one refresh and one retry.
         if http.statusCode == 401, explicitToken == nil {
             let fresh: String?
@@ -512,30 +548,53 @@ public enum GitHubConnectorActions {
             } else {
                 message = "HTTP \(http.statusCode)"
             }
-            let remaining = http.value(forHTTPHeaderField: "X-RateLimit-Remaining").flatMap(Int.init)
-            let reset = http.value(forHTTPHeaderField: "X-RateLimit-Reset")
-                .flatMap(TimeInterval.init)
-                .map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0)) }
-            if let backoff = secondaryRateBackoff(
-                status: http.statusCode,
-                message: message,
-                retryAfterHeader: http.value(forHTTPHeaderField: "Retry-After"),
-                rateLimitRemaining: remaining
-            ) {
-                await GitHubRateLimitGate.shared.trip(seconds: backoff)
-                nativeLog(
-                    "[github] secondary rate limit — backing off %ds (status %d, remaining %@)",
-                    Int(backoff), http.statusCode, remaining.map(String.init) ?? "n/a"
-                )
-            }
-            throw GitHubConnectorError.http(
-                status: http.statusCode,
-                message: message,
-                rateLimitRemaining: remaining,
-                rateLimitReset: reset
-            )
+            throw await httpFailure(http, message: message)
         }
         return (parsed, http)
+    }
+
+    static func httpFailure(_ http: HTTPURLResponse, message: String) async -> GitHubConnectorError {
+        let remaining = http.value(forHTTPHeaderField: "X-RateLimit-Remaining").flatMap(Int.init)
+        let reset = http.value(forHTTPHeaderField: "X-RateLimit-Reset")
+            .flatMap(TimeInterval.init)
+            .map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0)) }
+        if let backoff = secondaryRateBackoff(
+            status: http.statusCode,
+            message: message,
+            retryAfterHeader: http.value(forHTTPHeaderField: "Retry-After"),
+            rateLimitRemaining: remaining
+        ) {
+            await GitHubRateLimitGate.shared.trip(seconds: backoff)
+            nativeLog(
+                "[github] secondary rate limit — backing off %ds (status %d, remaining %@)",
+                Int(backoff), http.statusCode, remaining.map(String.init) ?? "n/a"
+            )
+        }
+        return GitHubConnectorError.http(
+            status: http.statusCode, message: message,
+            rateLimitRemaining: remaining, rateLimitReset: reset
+        )
+    }
+
+    static func recordConnectionProof(statusCode: Int?, dataRoot: URL) async {
+        // A pasted or refreshed candidate says nothing about the installed account.
+        guard !checkingCandidateToken else { return }
+        let proof: JSONValue = .object([
+            "id": .string(UUID().uuidString.lowercased()),
+            "actionId": .string("github.http"), "connectorId": .string("github"),
+            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
+            "status": .string(statusCode.map { (200..<300).contains($0) } == true ? "completed" : "failed"),
+            "dryRun": .bool(false),
+            "output": .object(statusCode.map { ["statusCode": .int(Int64($0))] }
+                ?? ["error": .string("transport_failed")]),
+        ])
+        do {
+            try await appendJSONLCapped(proof, to: dataRoot.appendingPathComponent("connectors/actions/receipts.jsonl"),
+                using: SwiftNativePersistenceCore(), maxLines: JSONLLineCaps.actionReceipts, logLabel: "GitHub.connection")
+        } catch {
+            // Proof storage cannot undo a request GitHub already accepted.
+            nativeLog("GitHub.connection: could not record transport proof: %@", error.localizedDescription)
+        }
     }
 
     static func requireRateLimitAdmission() async throws {

@@ -29,13 +29,13 @@ public enum MacControlActionRoutes {
         // raw bytes, or invalid JSON), reject locally — coercing to `[:]`
         // would silently drop the caller's payload. Empty body is fine
         // (treated as `{}`).
-        let bodyIsObjectOrEmpty: Bool = {
-            if bodyData.isEmpty { return true }
-            guard let parsed = try? JSONValue.parse(bodyData) else { return false }
-            if case .object = parsed { return true }
-            return false
+        let bodyDict: [String: JSONValue]? = {
+            if bodyData.isEmpty { return [:] }
+            guard let parsed = try? JSONValue.parse(bodyData),
+                  case .object(let object) = parsed else { return nil }
+            return object
         }()
-        if bodyIsObjectOrEmpty,
+        if let bodyDict,
            let action = Self.macControlActionFromPath(path) {
             // W1b: the bridge route must accept every action
             // SwiftNativeMacControl.dispatch will accept — that is
@@ -53,16 +53,6 @@ public enum MacControlActionRoutes {
                 localWorkbench ? SecurityOriginContext(surface: "native_actions") : nil,
                 auditPath(dataRoot: dataRoot)
             )
-            let bodyDict: [String: JSONValue]
-            if bodyData.isEmpty {
-                bodyDict = [:]
-            } else if let parsed = try? JSONValue.parse(bodyData),
-                      case .object(let obj) = parsed {
-                bodyDict = obj
-            } else {
-                // Unreachable: guarded by bodyIsObjectOrEmpty above. Defensive.
-                bodyDict = [:]
-            }
             do {
                 // W2/W3-FIX INJECTION FENCE. This route is the HTTP /
                 // iOS-remote bridge: the request body comes from OFF this
@@ -131,8 +121,7 @@ public enum MacControlActionRoutes {
                     case .unknownAction: return 404
                     case .missingField: return 400
                     case .sensitivePathDenied, .shellNotWhitelisted: return 403
-                    case .proxyFailed(let s, _): return s
-                    case .transport, .malformedResponse, .ioFailure,
+                    case .malformedResponse, .ioFailure,
                          .notificationFailed, .applescriptFailed, .appControlFailed,
                          .operation:
                         return 500
@@ -294,4 +283,80 @@ public enum MacControlActionRoutes {
         return dict
     }
 
+}
+
+public enum MacControlWorkbenchAvailability: Equatable {
+    case ready
+    case disabled(String)
+    case unavailable(String)
+
+    public var isEnabled: Bool {
+        if case .ready = self { return true }
+        return false
+    }
+
+    public var message: String? {
+        switch self {
+        case .ready:
+            nil
+        case .disabled(let message), .unavailable(let message):
+            message
+        }
+    }
+
+    public var isUnavailable: Bool {
+        if case .unavailable = self { return true }
+        return false
+    }
+}
+
+/// The only action routes the mounted workbench can invoke. Keeping route,
+/// native action name, policy gate, and user-facing label together prevents a
+/// button from quietly drifting onto an unsupported 501 action.
+public enum MacControlWorkbenchAction: String, CaseIterable {
+    case shell
+    case fileRead = "file/read"
+    case fileWrite = "file/write"
+    case notify
+
+    public var path: String { "/v1/mac_control/\(rawValue)" }
+
+    public func availability(
+        policy: TrustMacControlPolicy,
+        policySaved: Bool,
+        hasRequiredInput: Bool = true
+    ) -> MacControlWorkbenchAvailability {
+        guard !macControlUnsupportedActions.contains(rawValue) else {
+            return .unavailable("This version of NativeAgent does not support this action.")
+        }
+        guard policySaved else {
+            return .disabled("Save your Mac Control permissions before trying an action.")
+        }
+        guard policy.enabled else {
+            return .disabled("Turn on Mac Control before using this action.")
+        }
+        guard categoryAllowed(by: policy) else {
+            return .disabled("Enable \(categoryName) in Mac Control categories first.")
+        }
+        guard hasRequiredInput else {
+            return .disabled("Enter the required input before running this action.")
+        }
+        return .ready
+    }
+
+    private var categoryName: String {
+        switch self {
+        case .shell: "Terminal commands"
+        case .fileRead, .fileWrite: "File Operations"
+        case .notify: "Notifications"
+        }
+    }
+
+    private func categoryAllowed(by policy: TrustMacControlPolicy) -> Bool {
+        switch self {
+        case .shell: policy.shellAllowed
+        case .fileRead, .fileWrite: policy.fileOpsAllowed
+        case .notify: policy.notificationsAllowed
+        }
+    }
 }

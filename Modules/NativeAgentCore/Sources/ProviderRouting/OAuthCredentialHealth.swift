@@ -39,7 +39,7 @@ public enum ProviderOAuthCredentialMaintenance {
         let boundRefresh = OAuthRefreshBinding.permitsRefresh(object, provider: provider)
         let canRefresh = hasRefresh && boundRefresh
         let rawExpiry = object["expires_at"] ?? nested["expires_at"]
-        var expiry = rawExpiry.flatMap(AnthropicOAuthDirectAdapter.parseExpiresAt)
+        var expiry = rawExpiry.flatMap(parseExpiresAt)
         if provider == "openai_oauth_direct" {
             expiry = OpenAIOAuthDirectAdapter.persistedExpiresAt(blob: object, tokens: nested)
                 .map { Date(timeIntervalSince1970: TimeInterval($0)) }

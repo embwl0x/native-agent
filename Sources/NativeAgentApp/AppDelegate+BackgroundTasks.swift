@@ -1,84 +1,78 @@
+import Agents
+import MacControl
 import Foundation
 import AppKit
+import EngineRuntime
 import BackgroundLoops
+import BackgroundWork
+import DoctorChecks
+import NativeAgentCore
 import NativeAgentShared
 
 extension AppDelegate {
-    // Swift-native cutover/fin-integration: NSBackgroundActivityScheduler entries.
-    // No periodic dream wrapper is registered here: unattended dreams have
-    // exactly one owner, the `nativeagent-nightly-dream` TriggerScheduler job at
-    // 03:30 America/Chicago.
-    //
-    // RETIRED 2026-08-31: `rem_cycle`. Weekly REM has exactly one owner, the
-    // `nativeagent-weekly-rem` TriggerScheduler job (Sun 04:30 America/Chicago
-    // → BackgroundLoopsAssembly.runRem). Live evidence: every row in
-    // `data/rem_proposals.jsonl` and every `rem.proposal` approval card carries
-    // a Sunday ~09:30Z stamp — the scheduler job's minute. The duplicate loop's
-    // own weekly tick (last 2026-08-28T14:43:32Z) has never produced a single
-    // proposal, so it would have tripped DoctorLoopHealth's dormancy bound
-    // (~2026-09-18) while the real lane was healthy.
-    static var bgTaskIdentifiers: [String] {
-        [
-            NativeAgentICloudBridgeConstants.backgroundTaskIdentifier("memory_consolidation"),
-            NativeAgentICloudBridgeConstants.backgroundTaskIdentifier("self_improvement_sweep"),
-        ]
-    }
-
-    /// Activity identifiers an OLDER build scheduled with `repeats = true`.
-    /// NSBackgroundActivityScheduler persists those registrations per bundle,
-    /// so dropping a row from `bgTaskIdentifiers` is not enough — the OS keeps
-    /// waking the retired identifier until something invalidates it.
-    private static var retiredTaskIdentifiers: [String] {
-        [
-            // Loose-cadence dream wrapper: the 03:30 Central scheduler job owns
-            // unattended dreams, and this could wake independently of it.
-            NativeAgentICloudBridgeConstants.backgroundTaskIdentifier("dream_cycle"),
-            // Duplicate weekly REM lane (retired 2026-08-31) — see above.
-            NativeAgentICloudBridgeConstants.backgroundTaskIdentifier("rem_cycle"),
-        ]
-    }
-
-    private static var backgroundLoopIDsByTaskIdentifier: [String: String] {
-        [
-            NativeAgentICloudBridgeConstants.backgroundTaskIdentifier("memory_consolidation"): "memory_consolidation",
-            NativeAgentICloudBridgeConstants.backgroundTaskIdentifier("self_improvement_sweep"): "self_improvement_sweep",
-        ]
-    }
-
-    private static var backgroundTaskIntervalsByIdentifier: [String: TimeInterval] {
-        [
-            NativeAgentICloudBridgeConstants.backgroundTaskIdentifier("memory_consolidation"): 7 * 24 * 60 * 60,
-            NativeAgentICloudBridgeConstants.backgroundTaskIdentifier("self_improvement_sweep"): 7 * 24 * 60 * 60,
-        ]
-    }
-
     static func registerBackgroundTaskHandlers() {
-        // Cancel every retired activity an older build may still have on the
-        // OS scheduler. Dropping the row from `bgTaskIdentifiers` alone leaves
-        // the persisted registration waking forever.
-        for retired in retiredTaskIdentifiers {
-            NSBackgroundActivityScheduler(identifier: retired).invalidate()
+        for loopId in BackgroundLoopsManager.retiredSystemBackgroundActivities {
+            NSBackgroundActivityScheduler(
+                identifier: NativeAgentICloudBridgeConstants.backgroundTaskIdentifier(loopId)).invalidate()
         }
-
-        // BGTaskScheduler is iOS-only; on macOS use NSBackgroundActivityScheduler.
-        for id in bgTaskIdentifiers {
-            let activity = NSBackgroundActivityScheduler(identifier: id)
-            guard let interval = backgroundTaskIntervalsByIdentifier[id],
-                  let loopId = backgroundLoopIDsByTaskIdentifier[id] else { continue }
-            activity.interval = interval
+        for entry in BackgroundLoopsManager.systemBackgroundActivities {
+            let activity = NSBackgroundActivityScheduler(
+                identifier: NativeAgentICloudBridgeConstants.backgroundTaskIdentifier(entry.loopId))
+            activity.interval = entry.interval
             activity.tolerance = 12 * 60 * 60
             activity.repeats = true
             activity.qualityOfService = .utility
             activity.schedule { completion in
                 Task.detached(priority: .utility) {
-                    let outcome = await BackgroundLoopsManager.shared.runTickIfDue(loopId: loopId)
-                    if case .failed = outcome {
-                        completion(.deferred)
-                    } else {
-                        completion(.finished)
-                    }
+                    let outcome = await BackgroundLoopsManager.shared.runTickIfDue(loopId: entry.loopId)
+                    if case .failed = outcome { completion(.deferred) }
+                    else { completion(.finished) }
                 }
             }
+        }
+    }
+}
+
+/// Mounted Inspector and bridge effects for the engine's Doctor owner.
+struct AppDoctorPort: EngineDoctorPlatformPort {
+    let dataRoot: URL
+    var backgroundLoopsManager: BackgroundLoopsManager = .shared
+
+    var runtime: EngineDoctorRuntime<AppDoctorPort> { EngineDoctorRuntime(dataRoot: dataRoot, port: self) }
+    var doctorEngine: NativeAgentEngine { .live }
+    var doctorManager: BackgroundLoops.BackgroundLoopsManager { backgroundLoopsManager }
+
+    func doctorRestartLoop(id: String) async -> LoopRestartOutcome {
+        await NativeAgentEngine.restartBackgroundLoop(id: id, manager: backgroundLoopsManager)
+    }
+    func doctorStartBridge(name: String) async {
+        switch name {
+        case "ClaudeBridge": await ClaudeBridgeRuntime.shared.startServer()
+        case "MacControlBridge": MacControlBridge.shared.start()
+        case "BrowserIPC": await BrowserWindowController.shared.startIPCServer()
+        default: break
+        }
+    }
+
+
+    func doctorBridgeSnapshots() async -> [DoctorBridgeSnapshot] {
+        let browserIPC = await BrowserWindowController.shared.ipcListenerHealth
+        let bridges: [(name: String, health: NativeLoopbackListener.Health, expected: Bool)] = [
+            ("ClaudeBridge", ClaudeBridgeRuntime.shared.listenerHealth, true),
+            ("MacControlBridge", MacControlBridge.shared.listenerHealth, MacControlBridge.shared.startGateAllows()),
+            ("BrowserIPC", browserIPC, true),
+        ]
+        return bridges.map { ($0.name, ($0.health.failure, $0.health.boundPort, $0.health.isActive, $0.health.port), $0.expected) }
+    }
+
+    func doctorInspectorCheck() async -> CheckResult {
+        await TurnInspectorDoctor.check()
+    }
+
+    func doctorInspectorRepair(for check: CheckResult) async -> DoctorExecutableRepair? {
+        guard check.id == "live.inspector_feed", check.status == "fail" else { return nil }
+        return DoctorExecutableRepair(checkID: check.id) {
+            await TurnInspectorDoctor.repairDeadSink()
         }
     }
 }

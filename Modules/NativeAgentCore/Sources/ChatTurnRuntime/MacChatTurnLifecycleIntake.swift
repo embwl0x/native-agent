@@ -1,6 +1,9 @@
 import Foundation
 import Privacy
 import TurnTrace
+import NativeAgentCore
+import NativeAgentShared
+import Transcripts
 
 public extension MacChatTurnPresentationPort {
     /// Opens the exact generation for one accepted Mac turn. This is the only
@@ -439,4 +442,108 @@ public extension MacChatTurnPresentationPort {
         nativeLog("Mac chat turn lifecycle %@ failed: %@", operation, safe)
     }
 
+}
+
+/// Every door fires the same trace milestones as a Mac turn, so this reads them into
+/// the same lifecycle the card, the thinking glow and Work read. Display only:
+/// no task, no Stop, no durable receipt, and a Mac turn in the session always
+/// wins. It keeps every session's open turn, seeded from the engine's run
+/// registry when it starts, so a turn already running when a chat is opened or
+/// returned to shows too.
+@MainActor
+public final class OtherDoorTurns {
+    public static let shared = OtherDoorTurns()
+    /// Each session's other-door turn that began and has not ended.
+    private var open: [String: MacChatTurnLifecycleState] = [:]
+    private var started = false
+    /// Her words reaching the surface: movement, and the card reads "replying".
+    private static let outputKinds: Set<String> = [
+        TurnLifecycleMilestone.providerFirstDelta.rawValue,
+        TurnLifecycleMilestone.surfaceOutputEnqueued.rawValue,
+        TurnLifecycleMilestone.surfaceFirstRender.rawValue,
+    ]
+
+    public func start(_ appModel: any MacChatTurnPresentationPort) {
+        guard !started else { return }
+        started = true
+        Task { await run(appModel) }
+    }
+
+    /// Puts the session's open turn on its card, unless a Mac turn holds it.
+    public func show(_ sessionId: String, _ appModel: any MacChatTurnPresentationPort) {
+        guard let state = open[sessionId] else { return }
+        let turns = appModel.macChatTurns
+        if let held = turns.lifecycle(for: sessionId), held.identity.turnId != state.identity.turnId,
+           !held.presentation.isTerminal { return }
+        turns.lifecycleBySession[sessionId] = state
+    }
+
+    private func run(_ appModel: any MacChatTurnPresentationPort) async {
+        let subscription = await TurnTraceBus.shared.subscribe(capacity: 256)
+        for turn in ChatCancelFlag.inFlightTurns(dataRoot: appModel.macChatTurns.dataRoot) {
+            admit(MacChatTurnIdentity(sessionId: turn.sessionId, turnId: turn.turnId), at: turn.acceptedAt, appModel)
+        }
+        for sessionId in open.keys { show(sessionId, appModel) }
+        for await event in subscription.stream {
+            guard let sessionId = event.sessionId, let ended = reduce(event, appModel) else { continue }
+            if ended {
+                // A refresh that started while the card was up is dropped by
+                // its lifecycle guard; this one lands the reply.
+                await appModel.refreshChatMessagesAfterTurn(sessionId: sessionId, messagesAlreadyRefreshed: false)
+            } else {
+                show(sessionId, appModel)
+            }
+        }
+    }
+
+    /// Opens a turn another door started: false when it is already open or
+    /// the Mac holds it.
+    @discardableResult
+    private func admit(_ identity: MacChatTurnIdentity, at startedAt: Date, _ appModel: any MacChatTurnPresentationPort) -> Bool {
+        let sessionId = identity.sessionId
+        let turns = appModel.macChatTurns
+        guard open[sessionId]?.identity != identity,
+              !turns.busySessions.contains(sessionId),
+              turns.activeTurnIDsBySession[sessionId] != identity.turnId,
+              turns.lifecycle(for: sessionId)?.identity.turnId != identity.turnId
+        else { return false }
+        open[sessionId] = MacChatTurnLifecycleState(identity: identity, startedAt: startedAt)
+        return true
+    }
+
+    /// Folds one event in: nil when it is not an other-door turn's, else
+    /// whether that turn ended.
+    private func reduce(_ event: TurnTraceEvent, _ appModel: any MacChatTurnPresentationPort) -> Bool? {
+        guard let sessionId = event.sessionId else { return nil }
+        let turns = appModel.macChatTurns
+        let identity = MacChatTurnIdentity(sessionId: sessionId, turnId: event.turnId)
+        if event.kind == TurnLifecycleMilestone.turnAccepted.rawValue {
+            return admit(identity, at: event.ts, appModel) ? false : nil
+        }
+        guard let state = open[sessionId], state.identity == identity else { return nil }
+        let kind: MacChatTurnLifecycleInput.Kind
+        switch event.kind {
+        case "tool.dispatch":
+            var action: String?
+            if case .object(let payload) = event.payload, payload["phase"] == .string("begin"),
+               case .string(let name)? = payload["shown"] ?? payload["name"] {
+                action = ToolActivityPresentation.progress(name)
+            }
+            kind = .working(action: action)
+        case let output where Self.outputKinds.contains(output):
+            kind = .streamProgress(accumulatedUTF16Length: state.presentation.streamedTextLength + 1)
+        case "turn.terminal", "turn.cancelled", "turn.failed":
+            open[sessionId] = nil
+            if turns.lifecycle(for: sessionId)?.identity == identity {
+                turns.lifecycleBySession.removeValue(forKey: sessionId)
+            }
+            return true
+        default:
+            return nil
+        }
+        open[sessionId] = MacChatTurnLifecycleReducer.reduce(
+            state, input: MacChatTurnLifecycleInput(identity: identity, kind: kind, occurredAt: event.ts)
+        )
+        return false
+    }
 }

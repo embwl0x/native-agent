@@ -809,22 +809,46 @@ function appendJSONLineAtomicUnlocked(file, record) {
 }
 
 async function appendReplyDeliveryReceipt(receipt) {
-  const lockDir = `${REPLY_DELIVERIES_PATH}.append.lock`;
-  await withDirLock(lockDir, async () => {
-    appendJSONL(REPLY_DELIVERIES_PATH, receipt);
-    let size = 0;
-    try { size = fs.statSync(REPLY_DELIVERIES_PATH).size; } catch {}
-    const maxBytes = 16 * 1024 * 1024;
-    if (size <= maxBytes) return;
-    let lines = fs.readFileSync(REPLY_DELIVERIES_PATH, "utf8")
-      .split("\n")
-      .filter((line) => line.trim() !== "")
-      .slice(-5000);
-    while (lines.length > 1 && Buffer.byteLength(`${lines.join("\n")}\n`) > maxBytes) {
-      lines.shift();
-    }
-    writeTextAtomic(REPLY_DELIVERIES_PATH, `${lines.join("\n")}\n`);
-  }, { waitMs: 10000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+  fs.mkdirSync(path.dirname(REPLY_DELIVERIES_PATH), { recursive: true, mode: 0o700 });
+  const lock = `${REPLY_DELIVERIES_PATH}.lock`;
+  // Descriptor mode leaves the flock on fd 3 through exec into the writer.
+  await new Promise((resolve, reject) => {
+    const child = spawn("/bin/sh", ["-c",
+      'umask 077; exec 3>>"$1"; shift; /usr/bin/lockf 3 && exec "$@"',
+      "reply-ledger", lock, process.execPath, "-e",
+      'require(process.argv[1]).appendReplyDeliveryReceiptUnlocked(JSON.parse(require("fs").readFileSync(0, "utf8")))',
+      __filename], { stdio: ["pipe", "ignore", "pipe"] });
+    let detail = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { detail += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Reply receipt append failed: ${detail.trim() || code}`));
+    });
+    child.stdin.on("error", reject);
+    child.stdin.end(JSON.stringify(receipt));
+  });
+}
+
+function appendReplyDeliveryReceiptUnlocked(receipt) {
+  // An orphan reaper may unlink the sidecar while lockf waits on its inode.
+  const held = fs.fstatSync(3, { bigint: true });
+  const atPath = fs.statSync(`${REPLY_DELIVERIES_PATH}.lock`, { bigint: true });
+  if (held.dev !== atPath.dev || held.ino !== atPath.ino) {
+    throw new Error("Reply receipt lock sidecar replaced while waiting; retry the delivery");
+  }
+  appendJSONL(REPLY_DELIVERIES_PATH, receipt);
+  const maxBytes = 16 * 1024 * 1024;
+  if (fs.statSync(REPLY_DELIVERIES_PATH).size <= maxBytes) return;
+  let lines = fs.readFileSync(REPLY_DELIVERIES_PATH, "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .slice(-5000);
+  while (lines.length > 1 && Buffer.byteLength(`${lines.join("\n")}\n`) > maxBytes) {
+    lines.shift();
+  }
+  writeTextAtomic(REPLY_DELIVERIES_PATH, `${lines.join("\n")}\n`);
 }
 
 async function appendHangWatchdogReceipt(receipt, config) {
@@ -2330,6 +2354,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  appendReplyDeliveryReceiptUnlocked,
   appendPending,
   attachConsumeAndReplyDelivery,
   brainControlsForEntries,

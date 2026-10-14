@@ -101,14 +101,13 @@ public enum OrganismResidualRepair {
     public static let resourceRecheckInterval: TimeInterval = 5 * 60
 
     public static func combinedPressure(
-        _ components: OrganismSleepPressureComponents,
-        weights: OrganismSleepPressureWeights = .preregistered
+        _ components: OrganismSleepPressureComponents
     ) -> Double {
-        let product = (1 - weights.prediction * components.predictionResidual)
-            * (1 - weights.transitionSurprise * components.transitionSurprise)
-            * (1 - weights.contradiction * components.contradictionResidual)
-            * (1 - weights.fieldCharge * components.fieldChargeResidual)
-            * (1 - weights.calibration * components.calibrationResidual)
+        let product = (1 - 0.30 * components.predictionResidual)
+            * (1 - 0.25 * components.transitionSurprise)
+            * (1 - 0.20 * components.contradictionResidual)
+            * (1 - 0.15 * components.fieldChargeResidual)
+            * (1 - 0.10 * components.calibrationResidual)
         return (1 - product).clamped01()
     }
 
@@ -118,9 +117,7 @@ public enum OrganismResidualRepair {
         repairState: OrganismDreamRepairState,
         lastSignalAt: Date?,
         at now: Date,
-        resourcePressure: OrganismResourcePressure = .nominal,
-        supplemental: OrganismSupplementalSleepResiduals = .empty,
-        weights: OrganismSleepPressureWeights = .preregistered
+        resourcePressure: OrganismResourcePressure = .nominal
     ) -> OrganismResidualRepairOpportunity {
         let lastRepairAt = repairState.lastReceipt?.generatedAt
         let acknowledgedFieldGeneration = repairState.lastReceipt?.sourceFieldGeneration ?? 0
@@ -209,12 +206,12 @@ public enum OrganismResidualRepair {
             : min(1, 0.55 * ledger.strategyCaution + 0.45 * (1 - bodyConfidenceMean))
         let components = OrganismSleepPressureComponents(
             predictionResidual: predictionResidual,
-            transitionSurprise: max(derivedSurprise, supplemental.transitionSurprise),
-            contradictionResidual: max(derivedContradiction, supplemental.contradiction),
+            transitionSurprise: derivedSurprise,
+            contradictionResidual: derivedContradiction,
             fieldChargeResidual: max(fieldCharge, fieldUncertainty),
-            calibrationResidual: max(derivedCalibration, supplemental.calibration)
+            calibrationResidual: derivedCalibration
         )
-        let measuredPressure = combinedPressure(components, weights: weights)
+        let measuredPressure = combinedPressure(components)
         let measuredLocalRepairPressure = min(
             1,
             components.predictionResidual + components.fieldChargeResidual + fieldUncertainty
@@ -269,7 +266,6 @@ public enum OrganismResidualRepair {
                 observedAt: updated
             ))
         }
-        provenance.append(contentsOf: supplemental.evidence)
         provenance = Array(Dictionary(grouping: provenance, by: \.id).compactMap { $0.value.first }
             .sorted { $0.id < $1.id }.prefix(32))
         let evidenceGeneration = generationFingerprint(
@@ -292,7 +288,6 @@ public enum OrganismResidualRepair {
         let latestEvidenceAt = [trustedIngestionAt, trustedRepairAt].compactMap { $0 }.max()
             ?? fallbackEvidenceAt
         let localQuietUntil = latestEvidenceAt?.addingTimeInterval(quietInterval) ?? now
-        let recalibrationQuietUntil = latestEvidenceAt?.addingTimeInterval(recalibrationQuietInterval) ?? now
         let dreamQuietUntil = latestEvidenceAt?.addingTimeInterval(dreamQuietInterval) ?? now
         let resourceInhibited = resourcePressure != .nominal
         let localEligible = localRepairPressure >= minimumPressure
@@ -325,24 +320,6 @@ public enum OrganismResidualRepair {
             dreamNext = now
         }
 
-        let evidenceClasses = Set(provenance.map(\.evidenceClass))
-        let controlledOnly = !provenance.isEmpty
-            && evidenceClasses.isSubset(of: [.generated, .frozenControlled])
-        let recalibrationDisposition: OrganismSleepLaneDisposition
-        if pressure < recalibrationPressure || supplemental.evidence.isEmpty {
-            recalibrationDisposition = .inactive
-        } else if resourceInhibited {
-            recalibrationDisposition = .resourceInhibited
-        } else if !controlledOnly {
-            recalibrationDisposition = .privacyGateRequired
-        } else if repairState.sleepControl.lastGeneratedEvidenceGeneration == evidenceGeneration {
-            recalibrationDisposition = .refractory
-        } else if now < recalibrationQuietUntil {
-            recalibrationDisposition = .waitingForQuiet
-        } else {
-            recalibrationDisposition = .ready
-        }
-
         let lanes = [
             OrganismSleepLaneOpportunity(
                 lane: .quietLocalRepair,
@@ -364,8 +341,7 @@ public enum OrganismResidualRepair {
                 lane: .generatedFrozenRecalibration,
                 threshold: recalibrationPressure,
                 quietInterval: recalibrationQuietInterval,
-                disposition: recalibrationDisposition,
-                nextEligibleAt: recalibrationDisposition == .waitingForQuiet ? recalibrationQuietUntil : nil
+                disposition: .inactive
             ),
         ]
 
@@ -375,11 +351,11 @@ public enum OrganismResidualRepair {
             .min()
         // The pressure-driven Dream consumer is retired. Its eligibility is
         // diagnostic only; only deadlines with live consumers wake the runtime.
-        let candidateDeadlines = [localNext, pendingPredictionDue, supplemental.nextModelReviewAt]
+        let candidateDeadlines = [localNext, pendingPredictionDue]
             .compactMap { $0 }
             .filter { $0 > now }
         // Below threshold, monotonic residual decay cannot create a crossing;
-        // only exact pending prediction/model expiries are worth scheduling.
+        // only exact pending prediction expiries are worth scheduling.
         //
         // F4-M1 (2026-07-23): under resource inhibition BOTH localNext (above)
         // and this aggregate wake were nil'd, so the deadline runner armed no
@@ -394,7 +370,7 @@ public enum OrganismResidualRepair {
         if resourceInhibited {
             let uninhibitedLocalNext = localEligible ? max(now, localQuietUntil) : nil
             let uninhibitedCandidateDeadlines =
-                [uninhibitedLocalNext, pendingPredictionDue, supplemental.nextModelReviewAt]
+                [uninhibitedLocalNext, pendingPredictionDue]
                     .compactMap { $0 }
                     .filter { $0 > now }
             let wouldWakeAbsentInhibition = localEligible

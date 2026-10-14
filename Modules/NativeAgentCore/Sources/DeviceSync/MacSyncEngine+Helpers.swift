@@ -3,7 +3,7 @@ import PersistenceCore
 import AgentConversations
 
 extension MacSyncEngine {
-    func startHelpersSnapshotObservation() {
+    func startHelpersSnapshotObservation() async {
         helpersSnapshotWatcher?.cancel()
         let root = PersistenceCore.defaultDataRoot()
         let generation = snapshotLifecycleGeneration
@@ -13,12 +13,14 @@ extension MacSyncEngine {
                      "ui/layout.json"]
         let bridges = InstallPaths.current.bridgeConfigRoot(dataRoot: root)
         let inboxes = ["claude", "codex", "omp"].compactMap { AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: bridges) }
-        helpersSnapshotWatcher = FileChangeWatcher(paths: paths.map { root.appendingPathComponent($0) } + inboxes) { [weak self] _ in
+        let watcher = await FileChangeWatcher.armed(paths: paths.map { root.appendingPathComponent($0) } + inboxes) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
                 await self.writeSnapshots()
             }
         }
+        guard isActive, generation == snapshotLifecycleGeneration else { watcher.cancel(); return }
+        helpersSnapshotWatcher = watcher
     }
 
     func helpersSnapshotData() async -> SnapshotGroupBuild {

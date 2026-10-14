@@ -1,3 +1,4 @@
+import Cognition
 import AppToolRuntime
 import SwiftUI
 import ChatOrchestration
@@ -53,8 +54,8 @@ struct AgentScreenView: View {
         }
         .task(id: Watch(root: root, scope: scope, room: room)) {
             let root = root, room = room
-            await ViewFileRefreshTask.run(paths: HerScreenPreview.watchedPaths.map { root.appendingPathComponent($0) }) {
-                pane = await Self.paneText(room, root: root, scope: scope)
+            await EventDeadlinePhysiology.refreshOnChanges(paths: HerScreenPreview.watchedPaths.map { root.appendingPathComponent($0) }) {
+                pane = await HerScreenPreview.paneText(room, root: root, scope: scope)
             }
         }
     }
@@ -62,10 +63,4 @@ struct AgentScreenView: View {
     /// Home, the places the layout shows (ui/layout.json), then home's rooms.
     @MainActor static var tabs: [String] { HerScreenPreview.tabs(SurfaceLayoutLive.shared.layout, profile: SimpleViewMode.agent) }
 
-    /// The pane for one tab, exactly as shown; app_page_read page=agent reads this.
-    static func paneText(_ room: String, root: URL, scope: String) async -> String {
-        let said = await HerScreenPreview.glance(dataRoot: root, scope: scope)
-        let text = await HerScreenPreview.render(room, dataRoot: root, scope: scope)
-        return (said ?? "(no glance this turn)") + "\n\n" + text
-    }
 }

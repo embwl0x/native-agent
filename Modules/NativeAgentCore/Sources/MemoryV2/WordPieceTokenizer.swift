@@ -8,22 +8,9 @@ import Foundation
 
 public final class WordPieceTokenizer: @unchecked Sendable {
     public let vocab: [String: Int]
-    public let unkToken: String
-    public let clsToken: String
-    public let sepToken: String
-    public let padToken: String
-    public let maxInputCharsPerWord: Int
-    public let doLowerCase: Bool
+    private let unkToken = "[UNK]"
 
-    public init(
-        vocabURL: URL,
-        unkToken: String = "[UNK]",
-        clsToken: String = "[CLS]",
-        sepToken: String = "[SEP]",
-        padToken: String = "[PAD]",
-        maxInputCharsPerWord: Int = 100,
-        doLowerCase: Bool = true
-    ) throws {
+    public init(vocabURL: URL) throws {
         let raw = try String(contentsOf: vocabURL, encoding: .utf8)
         var dict: [String: Int] = [:]
         var idx = 0
@@ -36,23 +23,14 @@ public final class WordPieceTokenizer: @unchecked Sendable {
             idx += 1
         }
         self.vocab = dict
-        self.unkToken = unkToken
-        self.clsToken = clsToken
-        self.sepToken = sepToken
-        self.padToken = padToken
-        self.maxInputCharsPerWord = maxInputCharsPerWord
-        self.doLowerCase = doLowerCase
     }
 
     public func tokenize(_ text: String) -> [String] {
-        var s = text
-        if doLowerCase { s = s.lowercased() }
+        var s = text.lowercased()
         s = (s as NSString).precomposedStringWithCanonicalMapping
-        if doLowerCase {
-            s = String(String.UnicodeScalarView(s.decomposedStringWithCanonicalMapping.unicodeScalars.filter {
-                $0.properties.generalCategory != .nonspacingMark
-            }))
-        }
+        s = String(String.UnicodeScalarView(s.decomposedStringWithCanonicalMapping.unicodeScalars.filter {
+            $0.properties.generalCategory != .nonspacingMark
+        }))
         s = String(String.UnicodeScalarView(s.unicodeScalars.compactMap { scalar in
             if CharacterSet.whitespacesAndNewlines.contains(scalar) { return UnicodeScalar(0x20) }
             return scalar.value >= 0x20 && scalar.value != 0x7F ? scalar : nil
@@ -62,7 +40,7 @@ public final class WordPieceTokenizer: @unchecked Sendable {
         var output: [String] = []
         for word in words {
             if word.isEmpty { continue }
-            if word.count > maxInputCharsPerWord {
+            if word.count > 100 {
                 output.append(unkToken)
                 continue
             }
@@ -77,9 +55,9 @@ public final class WordPieceTokenizer: @unchecked Sendable {
     }
 
     public func encode(_ text: String, maxLength: Int) -> (inputIds: [Int], attentionMask: [Int]) {
-        let cls = vocab[clsToken] ?? 2
-        let sep = vocab[sepToken] ?? 3
-        let pad = vocab[padToken] ?? 0
+        let cls = vocab["[CLS]"] ?? 2
+        let sep = vocab["[SEP]"] ?? 3
+        let pad = vocab["[PAD]"] ?? 0
 
         let tokens = tokenize(text)
         var ids = convertTokensToIds(tokens)

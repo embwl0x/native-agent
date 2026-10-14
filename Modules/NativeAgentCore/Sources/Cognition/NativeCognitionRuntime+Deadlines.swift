@@ -13,10 +13,7 @@ import ProviderRouting
 /// One coalesced, cancellable exact-deadline wake. Extracted (C6) from the two
 /// sites that hand-rolled the identical structure — residual-repair and
 /// cognition-maintenance — each of which owned a generation counter, the armed
-/// trailing-edge sleep task, the last scheduled instant, and (under
-/// `manuallyFlushed` proof scheduling) a mirror of the pending
-/// `(generation, deadline)` so accelerated tests can fire the exact same path
-/// without sleeping.
+/// trailing-edge sleep task, and the last scheduled instant.
 ///
 /// The struct owns only *state and mechanics*; each site keeps its own
 /// projection/short-circuit/fire body. Generation is the single monotonic
@@ -34,12 +31,8 @@ struct CoalescingDeadline {  // internal for actor extensions (move-only Wave C)
     /// cognition-maintenance unchanged-deadline short-circuit; the residual site
     /// never reads it (stays nil there).
     var scheduledAt: Date?
-    /// Under `manuallyFlushed` scheduling, the pending arm the generated-evidence
-    /// proof seam fires against instead of sleeping.
-    var pendingForProof: (generation: UInt64, deadline: Date)?
-
-    /// Bump the generation and tear down any armed task, remembered schedule, and
-    /// proof mirror. Every reschedule/cancel path begins here; the returned value
+    /// Bump the generation and tear down any armed task and remembered schedule.
+    /// Every reschedule/cancel path begins here; the returned value
     /// is the fresh generation the caller binds its armed task and fire receipts
     /// to. (Cancelling an already-nil task and re-nilling nil fields is inert, so
     /// this is byte-equivalent to the residual site — which never set
@@ -50,7 +43,6 @@ struct CoalescingDeadline {  // internal for actor extensions (move-only Wave C)
         task?.cancel()
         task = nil
         scheduledAt = nil
-        pendingForProof = nil
         return generation
     }
 
@@ -77,21 +69,12 @@ struct CoalescingDeadline {  // internal for actor extensions (move-only Wave C)
         }
     }
 
-    /// Record the pending `(generation, deadline)` for a `manuallyFlushed` proof
-    /// run in place of arming a live sleep task.
-    mutating func armForProof(generation: UInt64, deadline: Date) {
-        pendingForProof = (generation, deadline)
-    }
-
-    /// Clear the armed task, remembered schedule, and proof mirror as a fire body
+    /// Clear the armed task and remembered schedule as a fire body
     /// begins executing (the fired task is consuming itself).
     mutating func consumeForFire() {
         task = nil
         scheduledAt = nil
-        pendingForProof = nil
     }
-
-    var proofDeadline: Date? { pendingForProof?.deadline }
 }
 
 extension NativeCognitionRuntime {
@@ -126,14 +109,13 @@ extension NativeCognitionRuntime {
         // folded in) rides the same events and owns no timer either. See
         // NativeCognitionRuntime+Reach.swift.
         considerReach()
+        let carriedDeadline = await considerCarried()
+        guard generation == residualDeadline.generation else { return }
         // The same exact-deadline owner also wakes at pending prediction/model
         // expiry. That wake only re-derives pressure and may schedule the quiet
         // repair boundary; it does not perform cognition or call a provider.
-        guard let deadline = opportunity.nextWakeAt ?? opportunity.nextRepairAt else {
-            return
-        }
-        if microcycleSchedulingMode == .manuallyFlushed {
-            residualDeadline.armForProof(generation: generation, deadline: deadline)
+        guard let deadline = [opportunity.nextWakeAt ?? opportunity.nextRepairAt, carriedDeadline]
+            .compactMap({ $0 }).min() else {
             return
         }
         residualDeadline.arm(
@@ -213,15 +195,11 @@ extension NativeCognitionRuntime {
         // from the post-wake clock.
         if !force,
            cognitionDeadline.scheduledAt == deadline,
-           cognitionDeadline.task != nil || cognitionDeadline.pendingForProof != nil {
+           cognitionDeadline.task != nil {
             return
         }
         let generation = cognitionDeadline.invalidate()
         cognitionDeadline.scheduledAt = deadline
-        if microcycleSchedulingMode == .manuallyFlushed {
-            cognitionDeadline.armForProof(generation: generation, deadline: deadline)
-            return
-        }
         cognitionDeadline.arm(
             deadline: deadline,
             now: now(),
@@ -265,21 +243,8 @@ extension NativeCognitionRuntime {
         case .failed(let error):
             tick = .failed(error: String(String(describing: error).prefix(180)))
         }
-        if let loopResultReporterOverride {
-            let completedWork: Bool
-            if case .completed = tick { completedWork = true } else { completedWork = false }
-            await loopResultReporterOverride(loopId, String(describing: tick), completedWork)
-            return
-        }
         await BackgroundLoops.BackgroundLoopsManager.shared
             .recordOutOfBandOutcome(loopId: loopId, outcome: tick)
-    }
-
-    /// Test seam for the reporting door above.
-    func setLoopResultReporterForProof(
-        _ reporter: (@Sendable (String, String, Bool) async -> Void)?
-    ) {
-        loopResultReporterOverride = reporter
     }
 
     /// R-F4: re-anchor the exact-deadline cognition timers after a system wake.
@@ -301,56 +266,5 @@ extension NativeCognitionRuntime {
         guard bootstrapTask != nil, !isFlushedForTermination else { return }
         await rescheduleCognitionMaintenanceDeadline(force: true)
         await rescheduleResidualRepairDeadline()
-    }
-
-    /// Generated-evidence seam for the exact same resident deadline path. It
-    /// never sleeps and refuses to fire before the injected analytic clock has
-    /// reached the recorded deadline.
-    func flushResidualRepairDeadlineForProof() async {
-        guard microcycleSchedulingMode == .manuallyFlushed,
-              let pending = residualDeadline.pendingForProof,
-              now() >= pending.deadline else { return }
-        await runResidualRepairDeadline(
-            generation: pending.generation
-        )
-    }
-
-    func residualRepairDeadlineForProof() -> Date? {
-        residualDeadline.proofDeadline
-    }
-
-    /// 2026-07-21 flake hunt: when the proof deadline reads nil, this dump
-    /// tells the NEXT occurrence WHY (arm machinery vs opportunity input)
-    /// instead of a bare Expectation-failed. Proof-only seam, no behavior.
-    func residualRepairDiagnosticsForProof() async -> String {
-        let opportunity = await organismKernel.residualRepairOpportunity()
-        return "proofDeadline=\(String(describing: residualDeadline.proofDeadline)) "
-            + "generation=\(residualDeadline.generation) "
-            + "mode=\(microcycleSchedulingMode) "
-            + "nextWakeAt=\(String(describing: opportunity.nextWakeAt)) "
-            + "nextRepairAt=\(String(describing: opportunity.nextRepairAt)) "
-            + "ready=\(opportunity.ready)"
-    }
-
-    func flushCognitionMaintenanceDeadlineForProof() async {
-        guard microcycleSchedulingMode == .manuallyFlushed,
-              let pending = cognitionDeadline.pendingForProof,
-              now() >= pending.deadline else { return }
-        await runCognitionMaintenanceDeadline(
-            generation: pending.generation,
-            scheduledAt: pending.deadline
-        )
-    }
-
-    func cognitionMaintenanceDeadlineForProof() -> Date? {
-        cognitionDeadline.proofDeadline
-    }
-
-    /// R-F4 proof seam: the current cognition-maintenance arm generation. A wake
-    /// re-anchor forces a re-arm (generation bumps) even when the projected
-    /// deadline Date is unchanged, so a test can prove the re-arm fired past the
-    /// unchanged-deadline idempotency short-circuit.
-    func cognitionMaintenanceGenerationForProof() -> UInt64 {
-        cognitionDeadline.generation
     }
 }

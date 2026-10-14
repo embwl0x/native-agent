@@ -116,7 +116,6 @@ extension SwiftToolDispatcher {
         // adapters must not fall back to the process-default credentials just
         // because the worker is assembled here instead of by the chat factory.
         let providerAssembly = SwarmProviderAssembly(dataRoot: dataRoot)
-        swarmProviderAssemblyObserver?(providerAssembly)
         let llm = SwiftNativeLLMClient(
             router: router,
             codex: CodexAdapter(processEnvironmentOverride: providerAssembly.codexEnvironment),
@@ -144,15 +143,6 @@ extension SwiftToolDispatcher {
             moonshotCatalogDataRoot: dataRoot
         )
         let workerTools = AgentSwarmInheritedToolScope(inner: self)
-        let workerCodexFactory: (@Sendable ([String: String]?) -> any LLMAdapter)?
-        if let observer = swarmWorkerCodexEnvironmentObserver {
-            workerCodexFactory = { environment in
-                observer(environment)
-                return CodexAdapter(processEnvironmentOverride: environment)
-            }
-        } else {
-            workerCodexFactory = nil
-        }
         let workerClient = swarmChatFactory.makeClient(
             tools: workerTools,
             dataRoot: dataRoot,
@@ -160,8 +150,7 @@ extension SwiftToolDispatcher {
             // credential authority so they do not fall onto the alternate-root
             // fail-closed lane or borrow process-default credentials.
             approvalFiler: swarmApprovalFiler,
-            providerLifecycleObserver: providerLifecycleObserver,
-            codexAdapterFactory: workerCodexFactory
+            providerLifecycleObserver: providerLifecycleObserver
         )
         return SwiftNativeAgentSwarmExecutor(
             llm: SwarmAdmittedLLMClient(inner: llm, routing: routing),

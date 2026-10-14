@@ -136,29 +136,19 @@ extension MacFourVerbs {
         )
     }
 
-    /// Wait until a signal arrives or `window` elapses. The granularity is a
-    /// lock-guarded read of an in-process collector — no AX walk, no capture —
-    /// which is what makes it affordable at 50 ms while the old loop was
-    /// unaffordable at 500 ms. It is paced through `clock` so a 60-second
-    /// budget stays a 60-second budget in production and costs nothing in a
-    /// test.
+    /// A signal wakes the consumer directly; the capture-rate floor still
+    /// coalesces bursts without extending the caller's deadline.
     private func awaitSignal(
         _ signals: MacWaitSignals,
         window: Double,
         notBefore: Double
     ) async -> Bool {
         let deadline = clock.monotonicSeconds() + window
-        var fired = false
-        while !Task.isCancelled, clock.monotonicSeconds() < deadline {
-            if signals.consume() { fired = true }
-            // Latched, but held until the capture-rate floor passes. Holding
-            // rather than dropping is what keeps a fast signal from being lost:
-            // the wake still happens, it just happens on the floor.
-            if fired, clock.monotonicSeconds() >= notBefore { return true }
-            await clock.sleep(seconds: min(Self.signalPollSeconds, max(0, deadline - clock.monotonicSeconds())))
+        let fired = await signals.waitForSignal(seconds: window)
+        if fired, !Task.isCancelled {
+            await clock.sleep(seconds: max(0, min(notBefore, deadline) - clock.monotonicSeconds()))
         }
-        if signals.consume() { fired = true }
-        return fired
+        return signals.consume() || fired
     }
 
     static let defaultWaitSeconds: Double = 10
@@ -168,7 +158,5 @@ extension MacFourVerbs {
     static let settleQuietSeconds: Double = 0.5
     /// The SAFETY NET cadence, used only when no observer could be installed.
     static let fallbackPollSeconds: Double = 5.0
-    /// How often the wait drains the collector. A lock read, not a look.
-    static let signalPollSeconds: Double = 0.05
 
 }

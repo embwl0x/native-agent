@@ -38,7 +38,7 @@ struct ToolsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            LazyVStack(alignment: .leading, spacing: 16) {
                 if let message = ToolsRefreshPresentation.message(for: appModel.toolsRefreshState) {
                     Text(message)
                         .font(ShellType.label)
@@ -53,6 +53,7 @@ struct ToolsView: View {
 
                 catalogContent(ChatToolCatalogPresentation.catalogState(
                     catalog: appModel.engine.tools.catalog,
+                    authored: appModel.engine.tools.authored,
                     loadFailed: appModel.engine.tools.catalogLoadError != nil,
                     loadError: appModel.engine.tools.catalogLoadError
                 ))
@@ -310,6 +311,28 @@ enum ToolsFullMacBannerPresentation {
     }
 }
 
+/// The authored-tools row is a projection of the same promotion boundary the
+/// action repeats. Keeping its enabled state and refusal copy here prevents a
+/// mounted SwiftUI control from becoming a second, untested eligibility rule.
+enum ToolApprovalPresentation {
+    struct Control: Equatable {
+        let accessibilityIdentifier: String
+        let isEnabled: Bool
+        let help: String
+        let refusal: String?
+    }
+
+    static func control(for tool: ToolRecord) -> Control {
+        let refusal = ToolApprovalEligibility.refusal(for: tool, ownerAuthorized: true)
+        return Control(
+            accessibilityIdentifier: "tools.authored.approve.\(tool.id)",
+            isEnabled: refusal == nil,
+            help: refusal ?? "Approve this validated proposal and activate it.",
+            refusal: refusal
+        )
+    }
+}
+
 // MARK: - Chat Tool Catalog
 
 /// The catalog envelope is produced by the shared runtime. Keep the decisions
@@ -370,6 +393,7 @@ enum ChatToolCatalogPresentation {
 
     static func catalogState(
         catalog: ChatToolCatalogSnapshot?,
+        authored: [ToolRecord],
         loadFailed: Bool,
         loadError: String?
     ) -> CatalogState {
@@ -377,27 +401,29 @@ enum ChatToolCatalogPresentation {
         guard let catalog else {
             return loadFailed ? .unavailable(detail: detail) : .loading
         }
-        let result = bucketResult(for: catalog)
+        let result = bucketResult(for: catalog, authored: authored)
         if loadFailed {
             return .stale(catalog: catalog, buckets: result, detail: detail)
         }
-        return catalog.tools.isEmpty
+        return result.visibleToolCount == 0 && result.withheldToolCount == 0
             ? .empty
             : .available(catalog: catalog, buckets: result)
     }
 
-    static func buckets(for catalog: ChatToolCatalogSnapshot) -> [Bucket] {
-        bucketResult(for: catalog).buckets
+    static func buckets(for catalog: ChatToolCatalogSnapshot, authored: [ToolRecord]) -> [Bucket] {
+        bucketResult(for: catalog, authored: authored).buckets
     }
 
-    static func bucketResult(for catalog: ChatToolCatalogSnapshot) -> BucketResult {
+    static func bucketResult(for catalog: ChatToolCatalogSnapshot, authored: [ToolRecord]) -> BucketResult {
         var toolsByBucket = Dictionary(uniqueKeysWithValues: ChatToolCatalogBucket.allCases.map {
             ($0.rawValue, [ChatCatalogTool]())
         })
 
-        let normalizedNames = catalog.tools.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let authoredIDs = Set(authored.map(\.id))
+        let runtimeTools = catalog.tools.filter { !authoredIDs.contains($0.name) }
+        let normalizedNames = runtimeTools.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) }
         let nameCounts = Dictionary(normalizedNames.map { ($0, 1) }, uniquingKeysWith: { $0 + $1 })
-        let validTools = zip(catalog.tools, normalizedNames).compactMap { tool, normalizedName -> ChatCatalogTool? in
+        let validTools = zip(runtimeTools, normalizedNames).compactMap { tool, normalizedName -> ChatCatalogTool? in
             guard !normalizedName.isEmpty, nameCounts[normalizedName] == 1 else { return nil }
             return tool
         }
@@ -422,7 +448,7 @@ enum ChatToolCatalogPresentation {
         return BucketResult(
             buckets: buckets,
             visibleToolCount: validTools.count,
-            withheldToolCount: catalog.tools.count - validTools.count,
+            withheldToolCount: runtimeTools.count - validTools.count,
             unclassifiedToolCount: toolsByBucket[ChatToolCatalogBucket.unclassified.rawValue]?.count ?? 0
         )
     }
@@ -575,10 +601,10 @@ private struct ChatToolCatalogSection: View {
 
     @State private var expanded: Set<String> = []
     @State private var searchState = ChatToolCatalogSearchState()
+    @State private var filteredBuckets: [ChatToolCatalogPresentation.Bucket] = []
 
     var body: some View {
-        let filteredBuckets = searchState.filteredBuckets(bucketResult.buckets)
-        VStack(alignment: .leading, spacing: 12) {
+        LazyVStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("Chat tools")
                     .font(ShellType.labelSemibold)
@@ -642,7 +668,7 @@ private struct ChatToolCatalogSection: View {
 
             if let banner = ToolsFullMacBannerPresentation.state(
                 catalogFullMacActive: catalog.fullMacActive,
-                trustFullMacActive: trustPolicy.map { AppModel.fullMacGrantIsActive($0) },
+                trustFullMacActive: trustPolicy.map { TrustAccessModeCapabilityCatalog.fullMacGrantIsActive($0) },
                 hasTrustRefreshAttempt: trustRefreshStatus != nil,
                 trustPolicyReadFailed: trustRefreshStatus?.failedEndpoints.contains("trust policy") == true
             ) {
@@ -683,6 +709,12 @@ private struct ChatToolCatalogSection: View {
                     bucketView(bucket)
                 }
             }
+        }
+        .onChange(of: bucketResult.buckets, initial: true) { _, buckets in
+            filteredBuckets = searchState.filteredBuckets(buckets)
+        }
+        .onChange(of: searchState.query) { _, _ in
+            filteredBuckets = searchState.filteredBuckets(bucketResult.buckets)
         }
     }
 
@@ -733,7 +765,7 @@ private struct ChatToolCatalogSection: View {
                     .foregroundStyle(NativeAgentShell.secondary)
             }
         } content: {
-            VStack(alignment: .leading, spacing: 12) {
+            LazyVStack(alignment: .leading, spacing: 12) {
                 ForEach(bucket.tools) { tool in
                     toolRow(tool)
                 }
@@ -771,7 +803,7 @@ private struct ChatToolCatalogSection: View {
                     }
                 ))
             }
-            Text(CapabilitiesPlainCopy.toolDescription(tool.name, catalogDescription: tool.description))
+            Text(ChatCatalogTool.toolDescription(tool.name, catalogDescription: tool.description))
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .lineLimit(isExpanded ? nil : 2)
@@ -809,7 +841,7 @@ private struct ChatToolCatalogSection: View {
 enum AuthoredToolPresentation {
     enum Action: Equatable {
         case approve
-        case autoRun
+
         case quarantine
     }
 
@@ -822,11 +854,9 @@ enum AuthoredToolPresentation {
         let refusal: String?
     }
 
-    static func autoRunTitle(_ tool: ToolRecord) -> String {
-        "Auto-run unavailable"
-    }
 
-    static func canQuarantine(_ tool: ToolRecord) -> Bool { tool.status != "quarantined" }
+
+    static func canQuarantine(_ tool: ToolRecord) -> Bool { tool.status != "disabled" }
 
     /// Authored rows are durable registry records, not live dispatcher
     /// receipts. Keep their distinct lifecycle labels explicit rather than
@@ -840,10 +870,8 @@ enum AuthoredToolPresentation {
             return .init(title: "active", systemImage: "circle.fill", tone: .positive)
         case "proposed":
             return .init(title: "proposed", systemImage: "clock", tone: .warning)
-        case "quarantined":
-            return .init(title: "quarantined", systemImage: "exclamationmark.triangle", tone: .danger)
-        case "archived":
-            return .init(title: "archived", systemImage: "clock", tone: .warning)
+        case "disabled":
+            return .init(title: "off", systemImage: "pause.circle", tone: .warning)
         default:
             return .init(title: "status unavailable", systemImage: "questionmark.circle", tone: .warning)
         }
@@ -865,22 +893,15 @@ enum AuthoredToolPresentation {
                 refusal: approval.refusal
             ))
         }
-        controls.append(ActionControl(
-            action: .autoRun,
-            title: autoRunTitle(tool),
-            isEnabled: false,
-            accessibilityIdentifier: nil,
-            help: "Auto-run does not control execution. Quarantine the tool to stop it.",
-            refusal: nil
-        ))
+
         controls.append(ActionControl(
             action: .quarantine,
-            title: "Quarantine",
+            title: "Turn off",
             isEnabled: canQuarantine(tool),
             accessibilityIdentifier: nil,
             help: canQuarantine(tool)
-                ? "Quarantine this tool so I stop using it."
-                : "This tool is already quarantined.",
+                ? "Turn this tool off so I stop using it."
+                : "This tool is already off.",
             refusal: nil
         ))
         return controls
@@ -896,26 +917,28 @@ private struct AuthoredToolsSection: View {
 
     var body: some View {
         AdvancedSection(title: "Tools I wrote", card: .single) {
-            ForEach(tools) { tool in
-                authoredRow(tool)
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(tools) { tool in
+                    authoredRow(tool)
+                }
             }
         }
         .confirmationDialog(
-            "Quarantine \(quarantineCandidate?.name ?? "tool")?",
+            "Turn off \(quarantineCandidate?.name ?? "tool")?",
             isPresented: Binding(
                 get: { quarantineCandidate != nil },
                 set: { if !$0 { quarantineCandidate = nil } }
             ),
             titleVisibility: .visible
         ) {
-            Button("Quarantine", role: .destructive) {
+            Button("Turn off", role: .destructive) {
                 guard let tool = quarantineCandidate else { return }
                 quarantineCandidate = nil
                 Task { await appModel.quarantineTool(tool) }
             }
             Button("Cancel", role: .cancel) { quarantineCandidate = nil }
         } message: {
-            Text("The tool will stop being available to \(appModel.agentDisplayName) until it is reviewed and reactivated.")
+            Text("The tool will stop being available to \(appModel.agentDisplayName) until you turn it back on.")
         }
     }
 
@@ -970,7 +993,7 @@ private struct AuthoredToolsSection: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
-            if let path = tool.activePath ?? tool.proposalPath ?? tool.quarantinePath {
+            if let path = tool.activePath ?? tool.proposalPath {
                 Text(UserDisplayFormatters.tildifyPath(path))
                     .font(ShellType.code)
                     .foregroundStyle(NativeAgentShell.secondary)
@@ -994,11 +1017,6 @@ private struct AuthoredToolsSection: View {
                             .foregroundStyle(NativeAgentShell.secondary)
                     }
                 }
-                let autoRun = actionCatalog.first(where: { $0.action == .autoRun })!
-                Button(autoRun.title) {
-                    Task { await appModel.setToolAutoRun(tool, autoRun: !(tool.autoRun ?? false)) }
-                }
-                .disabled(!autoRun.isEnabled)
                 let quarantine = actionCatalog.first(where: { $0.action == .quarantine })!
                 Button(quarantine.title) {
                     quarantineCandidate = tool
@@ -1059,5 +1077,69 @@ private struct ToolsFold<Label: View, Content: View>: View {
                     .transition(NativeAgentMotion.arrivalFade)
             }
         }
+    }
+}
+/// A result from a tool mutation that the Tools surface must keep visible.
+/// This is intentionally separate from the app-wide one-line `statusText`:
+/// repeated failures are separate observations even when their wording is
+/// identical, and an unmounted tab must not drop a result.
+struct ToolOperationStatusReceipt: Identifiable, Equatable, Sendable {
+    enum Outcome: String, Equatable, Sendable {
+        case succeeded
+        case failed
+
+
+        var systemImage: String {
+            switch self {
+            case .succeeded: return "checkmark.circle"
+            case .failed: return "exclamationmark.triangle"
+            }
+        }
+    }
+
+    let id: UUID
+    let message: String
+    let outcome: Outcome
+    init(message: String, outcome: Outcome) {
+        self.id = UUID()
+        self.message = message
+        self.outcome = outcome
+    }
+}
+
+enum ToolsStatusFeed {
+    static let maximumRetainedReceipts = 8
+
+    static func appending(
+        message: String,
+        outcome: ToolOperationStatusReceipt.Outcome,
+        to existing: [ToolOperationStatusReceipt]
+    ) -> [ToolOperationStatusReceipt] {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return existing }
+        let next = ToolOperationStatusReceipt(message: trimmed, outcome: outcome)
+        return Array(([next] + existing).prefix(maximumRetainedReceipts))
+    }
+}
+
+extension AppModel {
+    /// Records every completed/failed Tools mutation independently of whether
+    /// the Tools tab is mounted. Keep `statusText` for existing global status
+    /// consumers, but never use its equality as the receipt identity.
+    @MainActor
+    func recordToolOperationStatus(
+        _ message: String,
+        outcome: ToolOperationStatusReceipt.Outcome,
+        cause: Error? = nil
+    ) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        statusText = trimmed
+        statusCause = cause?.localizedDescription
+        toolOperationStatusReceipts = ToolsStatusFeed.appending(
+            message: trimmed,
+            outcome: outcome,
+            to: toolOperationStatusReceipts
+        )
     }
 }

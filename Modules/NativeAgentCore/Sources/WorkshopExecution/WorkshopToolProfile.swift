@@ -398,26 +398,6 @@ public struct WorkshopArtifactWriter: Sendable {
         public let truncated: Bool
     }
 
-    /// Resolve a caller-supplied relative path against the handle root with full
-/// containment. Does NOT write — pure, so the containment rule is unit-
-    /// testable without touching disk.
-    public func containedURL(relativePath rawPath: String) throws -> Written {
-        let root = try rootURL()
-        let components = try Self.validatedPathComponents(rawPath)
-        var candidate = root
-        for component in components {
-            candidate = candidate.appendingPathComponent(component)
-        }
-        // Canonicalize both sides and assert the target is strictly under root.
-        let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath().path
-        let resolvedTarget = candidate.standardizedFileURL.resolvingSymlinksInPath().path
-        let rootPrefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
-        guard resolvedTarget.hasPrefix(rootPrefix) else {
-            throw WorkshopMembraneError.pathEscapesRoot(rawPath)
-        }
-        return Written(relativePath: components.joined(separator: "/"), url: candidate)
-    }
-
     @discardableResult
     public func write(relativePath: String, content: String) throws -> Written {
         let components = try Self.validatedPathComponents(relativePath)

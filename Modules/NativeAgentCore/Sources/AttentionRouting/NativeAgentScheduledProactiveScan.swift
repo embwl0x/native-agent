@@ -83,8 +83,7 @@ public enum NativeAgentScheduledProactiveScan {
         dataRoot: URL,
         payload: [String: JSONValue],
         persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
-        now: Date = Date(),
-        deskItemsProvider: (@Sendable (URL) async -> [DeskItem])? = nil
+        now: Date = Date()
     ) async throws -> Result {
         let limit = max(1, min(int(payload["limit"], default: 10), 50))
         let surfaceLimit = max(0, min(int(payload["surfaceLimit"] ?? payload["surface_limit"], default: 4), 12))
@@ -108,12 +107,7 @@ public enum NativeAgentScheduledProactiveScan {
         let approvalsRaw = try await persistence.readJSON(approvalsPath, ifMissing: .array([]))
 
         let deskStaleDays = max(1, int(payload["staleDays"] ?? payload["stale_days"], default: defaultDeskStaleDays))
-        let deskItems: [DeskItem]
-        if let deskItemsProvider {
-            deskItems = await deskItemsProvider(dataRoot)
-        } else {
-            deskItems = (try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? []
-        }
+        let deskItems = (try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? []
 
         let surfacedIDs = alreadySurfacedOpportunityIDs(inboxRows)
         var live = liveOpportunities(
@@ -129,7 +123,6 @@ public enum NativeAgentScheduledProactiveScan {
             dataRoot: dataRoot
         ))
         let eligible = latestByID(live)
-            .filter(isEligible)
             .sorted { lhs, rhs in
                 if lhs.score != rhs.score { return lhs.score > rhs.score }
                 return lhs.title < rhs.title
@@ -383,10 +376,6 @@ public enum NativeAgentScheduledProactiveScan {
             }
         }
         return ids
-    }
-
-    private static func isEligible(_ opportunity: Opportunity) -> Bool {
-        !opportunity.id.isEmpty
     }
 
     private static func source(kind: String, id: String) -> String {

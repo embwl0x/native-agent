@@ -1,25 +1,11 @@
 import Foundation
+import NativeAgentCore
 
 // MARK: - Persona template generator
 
 /// Baseline document values for onboarding; the client owns canonical writes.
 enum PersonaTemplates {
     static let validTypes: Set<String> = ["female", "male", "ai"]
-
-    /// Mirrors Python `_now_iso` — `datetime.now(timezone.utc).isoformat()`.
-    /// Python emits e.g. `2026-06-01T12:34:56.789012+00:00` (microseconds + `+00:00`).
-    /// Swift's `ISO8601DateFormatter` emits e.g. `2026-06-01T12:34:56.789Z` —
-    /// the only consumer is GROWTH.md's first journal line, which is a
-    /// human-readable timestamp. The two formats are not byte-identical but
-    /// they are semantically equivalent ISO-8601 UTC strings; tests that pin
-    /// the timestamp use the value the generator emits, so the divergence is
-    /// captured at the wire boundary, not compared against the Python output.
-    static func nowISO() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        f.timeZone = TimeZone(identifier: "UTC")
-        return f.string(from: Date())
-    }
 
     struct Docs: Sendable, Equatable {
         let soul: String
@@ -33,7 +19,7 @@ enum PersonaTemplates {
         guard validTypes.contains(ptype) else {
             throw OnboardingError.ioFailure("Unknown persona_type '\(personaType)'. Valid: ai, female, male")
         }
-        let ts = nowISO()
+        let ts = NativeTimestampFormat.fractionalZulu(Date())
 
         func sub(_ tmpl: String) -> String {
             tmpl

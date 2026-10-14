@@ -81,9 +81,7 @@ extension TelegramPollLoop {
         await turnCoordinator.requestStop(
             destination: destination,
             turnId: turnId,
-            pauseQueuedTurns: pauseQueuedTurns,
-            confirmationTimeoutNanoseconds: turnStopConfirmationNanoseconds,
-            sleeper: turnCardSleeper
+            pauseQueuedTurns: pauseQueuedTurns
         )
     }
 

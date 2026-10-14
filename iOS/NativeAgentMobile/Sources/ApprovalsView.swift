@@ -421,7 +421,7 @@ struct ApprovalsView: View {
         .task {
             await store.refresh(client: bridgeClient, pairingStore: pairingStore)
         }
-        .onReceive(iCloudSyncEngine.shared.$approvals) { _ in
+        .onChange(of: iCloudSyncEngine.shared.approvals, initial: true) { _, _ in
             guard pairingStore.usesICloudTransport, store.isVisible else { return }
             store.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false)
         }
@@ -616,6 +616,7 @@ struct PayloadPreview: View {
     /// Chat's inline card is shorter: fewer lines before "Details".
     var maxLines = 6
     @State private var showsDetails = false
+    @State private var lines: [Line]?
 
     static let missingLine = "Full details appear once your Mac sends them."
 
@@ -627,8 +628,8 @@ struct PayloadPreview: View {
     }
 
     var body: some View {
+        Group {
         if let payload {
-            let lines = Self.readableLines(payload)
             VStack(alignment: .leading, spacing: 6) {
                 if let lines {
                     ForEach(Array(lines.prefix(maxLines).enumerated()), id: \.offset) { _, line in
@@ -665,6 +666,10 @@ struct PayloadPreview: View {
                 .font(.footnote)
                 .foregroundStyle(AlivePalette.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+        }
+        .onChange(of: payload, initial: true) { _, payload in
+            lines = payload.flatMap(Self.readableLines)
         }
     }
 
@@ -769,19 +774,6 @@ private struct ApprovalDetailsSheet: View {
             }
             .toolbar { Button("Done", action: onDone) }
         }
-    }
-}
-
-// MARK: - Risk badge
-
-struct RiskBadge: View {
-    let risk: String
-    let color: Color
-
-    var body: some View {
-        Text("\(risk.capitalized) risk")
-            .font(.caption)
-            .foregroundStyle(AlivePalette.secondary)
     }
 }
 

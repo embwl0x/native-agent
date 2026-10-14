@@ -21,7 +21,7 @@ extension SwiftToolDispatcher {
         return s
     }
 
-    func jsonInt(_ value: JSONValue?) -> Int? {
+    static func jsonInt(_ value: JSONValue?) -> Int? {
         switch value {
         case .some(.int(let i)): return Int(i)
         case .some(.double(let d)): return Int(exactly: d.rounded(.towardZero))

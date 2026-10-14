@@ -1,5 +1,6 @@
 import PersistenceCore
 import Foundation
+import NativeAgentCore
 
 // MARK: - RunLedger
 
@@ -62,7 +63,7 @@ public enum RunLedger {
             "id": .string(id),
             "kind": .string(kind),
             "status": .string(status),
-            "createdAt": .string(Self.isoTimestamp(createdAt)),
+            "createdAt": .string(NativeTimestampFormat.fractionalZulu(createdAt)),
         ]
         if let model, !model.isEmpty { row["model"] = .string(model) }
         if let reasoningEffort { row["reasoningEffort"] = .string(reasoningEffort) }
@@ -145,7 +146,7 @@ public enum RunLedger {
     /// backups past `maxCorruptBackups`. Abort the append if preservation fails.
     private static func preserveCorruptLedger(at path: URL) throws {
         let fm = FileManager.default
-        let stamp = isoTimestamp(Date()).replacingOccurrences(of: ":", with: "-")
+        let stamp = NativeTimestampFormat.fractionalZulu(Date()).replacingOccurrences(of: ":", with: "-")
         let backup = path.deletingLastPathComponent()
             .appendingPathComponent("\(path.lastPathComponent).corrupt-\(stamp).bak")
         try fm.copyItem(at: path, to: backup)
@@ -166,11 +167,4 @@ public enum RunLedger {
         return String(text.prefix(cap)) + "\n[truncated \(text.count - cap) chars]"
     }
 
-    /// Fractional-second ISO-8601 so same-second rows still sort stably under
-    /// the reader's lexicographic `createdAt` sort.
-    static func isoTimestamp(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
-    }
 }

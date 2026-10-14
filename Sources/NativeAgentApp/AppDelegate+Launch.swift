@@ -1,9 +1,13 @@
+import MacControl
+import ActivityWatch
 import ApprovalTransactions
+import Agents
 import Foundation
 import AppKit
 import UserNotifications
 import AppIntents
 import NativeAgentCore
+import EngineRuntime
 import WorkshopExecution
 import SelfImprovement
 import ChatOrchestration
@@ -30,20 +34,6 @@ import DeviceSync
 import AppToolRuntime
 import NativeAgentShared
 
-private struct AppDerivedStateInvalidationSink: DerivedStateInvalidationSink {
-    let dataRoot: URL
-
-    func sourceDidChange(_ changes: [DerivedSourceChange]) async {
-        let memoryPath = dataRoot.appendingPathComponent("memory/memory.sqlite").standardizedFileURL.path
-        if changes.contains(where: {
-            $0.namespace == "memory-v2" && $0.canonicalLocator == memoryPath
-        }) {
-            await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots(includeMemories: true)
-        }
-        await DerivedPersonaPinInvalidationSink(dataRoot: dataRoot).sourceDidChange(changes)
-    }
-}
-
 extension AppDelegate {
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -56,34 +46,9 @@ extension AppDelegate {
         // A clicked banner has to reach the app: without a delegate, the
         // identity a Desk reminder carries goes nowhere.
         UNUserNotificationCenter.current().delegate = self
-        // Her `app` actions read by their buttons' words on every door.
-        // A folded action is shown as its tool (files.write → write_file).
-        let labels = AppActions.all.flatMap { action in
-            [(action.id, action.label)] + (action.isFold && action.label != action.tool ? [(action.tool, action.label)] : [])
-        }
-        ToolActivityPresentation.installActionLabels(
-            Dictionary(labels, uniquingKeysWith: { first, _ in first }))
+        NativeAgentEngine.installActionLabelsAtLaunch()
         NativeAgentNotificationActions.register()
-        AnchorReplyMirror.start()
-        NativeAgentShortcuts.updateAppShortcutParameters()
-        approvalNotificationTask = Task { @MainActor in
-            await NativeAgentApprovalNotifications.observe()
-        }
-        do {
-            try NativeAgentBuildIdentity.current.writeLaunchStamp(root: NativeAgentPaths.dataRoot)
-        } catch {
-            nativeLog("[launch] Could not record app start time: %@", error.localizedDescription)
-        }
-        do {
-            _ = try NativeAgentWorkspaceRoot.prepare(dataRoot: NativeAgentPaths.dataRoot)
-            nativeLog("[workspace] canonical work root ready")
-        } catch {
-            // Chat and private state can still start; file/build tools will
-            // return their normal checked failure if the directory remains
-            // unavailable. Do not replace a recoverable workspace error with a
-            // second app-lifecycle gate.
-            nativeLog("[workspace] canonical work root unavailable: %@", error.localizedDescription)
-        }
+        TurnContinuationRuntime.installReplyMirror()
         Task { await finishLaunching() }
     }
 
@@ -95,12 +60,19 @@ extension AppDelegate {
 
     @MainActor
     private func finishLaunching() async {
+        do { try await NativeAgentAppCoordinator.shared.prepare() }
+        catch {
+            NSApp.terminate(nil)
+            return
+        }
+        NativeAgentShortcuts.updateAppShortcutParameters()
+        approvalNotificationTask = Task { await NativeAgentApprovalNotifications.observe() }
         // Wire restart before the migration suspension: SwiftUI can already
         // accept turns while Workshop prepares its execution records.
         await AppRestartCoordinator.shared.configure(
             scheduleTerminate: { graceSeconds in
                 DispatchQueue.main.asyncAfter(deadline: .now() + graceSeconds) {
-                    nativeLog("[restart_app] grace elapsed — terminating for relaunch")
+                    ModuleLog.app("[restart_app] grace elapsed — terminating for relaunch")
                     // Off this main-queue block: a held quit spins a nested run
                     // loop, and the main queue cannot drain while one of its own
                     // blocks is still on the stack — MainActor work would stall.
@@ -109,28 +81,14 @@ extension AppDelegate {
                     }
                 }
             },
-            spawnRelauncher: AppRelauncher.spawnDetached(argv:)
+            spawnRelauncher: AppRestartCoordinator.spawnDetached(argv:)
         )
         // Finish updating the folder before the runtime can ask Chrome to reload it.
         await Task.detached(priority: .utility) { ChromeExtensionFolder.refreshIfPresent() }.value
         do {
-            // 2026-09-18: a first-format migration can visit every execution.
-            // Let AppKit finish launching while it runs; runtime ingress and
-            // schedulers below still start only after the migration succeeds.
-            let report = try await WorkshopStorageMigrator.prepareForReading(dataRoot: NativeAgentPaths.dataRoot)
-            if report.didMigrate {
-                // P2-7: the legacy missions/ absorption is deleted; the only
-                // passes that can report didMigrate now are the execution.json
-                // record rename and receipts_dir pointer repair.
-                nativeLog(
-                    "[workshop-migration] normalized execution records: changed=%d conflicts=%d receipt=%@",
-                    report.moved.count,
-                    report.conflictsPreservedInArchive.count,
-                    report.receiptRelativePath ?? "none"
-                )
-            }
+            try await NativeAgentEngine.prepareExecutionStorageAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
         } catch {
-            nativeLog("%@", "[workshop-migration] failed: \(error)")
+            ModuleLog.app("%@", "[workshop-migration] failed: \(error)")
             let alert = NSAlert()
             alert.alertStyle = .critical
             alert.messageText = "Desk execution storage migration failed"
@@ -141,32 +99,8 @@ extension AppDelegate {
             NSApp.terminate(nil)
             return
         }
-        // Normalize skills before background work and remote tool ingress start.
-        await SkillRegistryMigration.runIfNeeded(dataRoot: PersistenceCore.defaultDataRoot())
-        do { try await SwiftNativeSkillsClient(root: PersistenceCore.defaultDataRoot()).migrateScriptInterpreter() }
-        catch { NSLog("Skill interpreter migration failed: %@", error.localizedDescription) }
-        // Before Slack's ingress starts: its tokens move from files to Keychain.
-        do { try SlackCredentials.migrate(dataRoot: NativeAgentPaths.dataRoot) }
-        catch { nativeLog("[slack-credential] Keychain migration failed: %@", error.localizedDescription) }
-        do { try await ConnectorOAuthRegistry.migrateXCredentials(dataRoot: NativeAgentPaths.dataRoot) }
-        catch { nativeLog("[x-credential] Keychain migration repair state unavailable: %@", error.localizedDescription) }
-        Task.detached(priority: .utility) {
-            let logger = Logger(subsystem: "com.nativeagent.app", category: "github-credential")
-            await GitHubCommandRuntime.shared.replayResidentStateAtLaunch()
-            do {
-                let configured = try await GitHubCredentialStore.shared.reconcileAtLaunch(
-                    dataRoot: NativeAgentPaths.dataRoot
-                )
-                if configured {
-                    logger.info("GitHub credential Keychain reconciliation complete")
-                    await GitHubCommandRuntime.shared.recoverAtLaunch()
-                }
-            } catch {
-                logger.error(
-                    "GitHub credential Keychain reconciliation failed: \(String(describing: type(of: error)), privacy: .public)"
-                )
-            }
-        }
+        await NativeAgentEngine.reconcileConnectorCredentialsAtLaunch(
+            dataRoot: PersistenceCore.defaultDataRoot(), github: { .shared })
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
@@ -180,25 +114,7 @@ extension AppDelegate {
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
-        Task.detached(priority: .utility) {
-            // 2026-09-06: the invalidation sink belongs to the app, not to
-            // Context Flow. It used to be installed inside the Context Flow
-            // startup, so with Context Flow off nothing was subscribed and a
-            // GROWTH.md edit left retracted REM pins live until the next weekly
-            // cycle. Install it here, before the runtime starts; Context Flow
-            // then subscribes its coordinator to it.
-            await DerivedStateInvalidationCenter.shared.install(
-                AppDerivedStateInvalidationSink(dataRoot: NativeAgentPaths.dataRoot)
-            )
-            await NativeAgentEngine.live.contextFlow.start()
-        }
-
-        // U1 (User, 2026-09-10): after the app updates, the agent had no way to
-        // know what changed — someone asked theirs and it could not find out.
-        // On the first launch after CFBundleShortVersionString changes, leave
-        // the agent ONE note; the turn engine reads it into the next turn's
-        // dynamic context. A fresh install stores the version and says nothing.
-        AppUpdateNoteStore.recordLaunchAtStartup()
+        NativeAgentEngine.startContextFlowAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
 
         // PATCH-2026-05-07: use .regular activation policy
         // so the dock icon stays visible. The
@@ -210,347 +126,36 @@ extension AppDelegate {
 
         // Speech consent belongs to a voice action. Only reconcile an existing
         // grant here, including changes made in System Settings between launches.
-        Task.detached(priority: .utility) {
-            await BackgroundLoopsAssembly.retireSystemPermissionCardIfGranted(
-                dataRoot: NativeAgentPaths.dataRoot
-            )
-        }
+        NativeAgentEngine.reconcileSpeechPermissionAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
 
         // Process-wide app services and route retention must not depend on the
         // main SwiftUI Window appearing. The coordinator is configured from
         // NativeAgentApp.init with the shared AppModel, then started exactly
         // once from this guaranteed application lifecycle callback.
         NativeAgentAppCoordinator.shared.applicationDidFinishLaunching()
-        Task.detached(priority: .utility) {
-            await NativeAgentEngine.live.chrome.observeBrowserLaunches()
-            await NativeAgentEngine.live.chrome.reconcilePolicy()
-        }
-
-        // MemoryV2 Path C: one-shot JSON → SQLite migration. Idempotent;
-        // a sentinel file under <dataRoot>/memory skips subsequent launches.
-        // Detached so first-launch I/O doesn't gate UI ready.
-        Task.detached(priority: .utility) {
-            let logger = Logger(subsystem: "com.nativeagent.app", category: "memory-migration")
-            let canonicalStorage: MemoryStorage
-            do {
-                canonicalStorage = try await SwiftNativeMemoryV2.resolvedStorage(
-                    dataRoot: NativeAgentPaths.dataRoot
-                )
-            } catch {
-                logger.error("MemoryV2 canonical storage unavailable; migration and projections refused: \(String(describing: error), privacy: .public)")
-                await MainActor.run {
-                    let alert = NSAlert()
-                    alert.alertStyle = .critical
-                    alert.messageText = "Memory did not open"
-                    alert.informativeText = "NativeAgent is running without memory this session: nothing is recalled or saved. Doctor shows the details under Live memory store."
-                    alert.addButton(withTitle: "OK")
-                    alert.runModal()
+        NativeAgentEngine.startResidentWorkAtLaunch(
+            dataRoot: PersistenceCore.defaultDataRoot(),
+            embeddingDescriptorURL: Bundle.main.url(forResource: "embedding-download", withExtension: "json"),
+            storageUnavailable: {
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "Memory did not open"
+                alert.informativeText = "NativeAgent is running without memory this session: nothing is recalled or saved. Doctor shows the details under Live memory store."
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            },
+            reindexMemory: { await MemorySpotlightBootstrap.shared.reindexAll() },
+            registerBackgroundTasks: Self.registerBackgroundTaskHandlers,
+            waitForSenses: { try await SensesAssembly.waitUntilReady() },
+            resumeMacTurn: { checkpoint, runtime in
+                guard let model = await NativeAgentAppCoordinator.shared.appModel else { throw MacChatTurnLifecycleStoreError.invalidRecord }
+                try await model.resumeMacChatTurn(checkpoint) { progress in
+                    try await runtime.resumeTurn(checkpoint, progress: progress)
                 }
-                return
-            }
-            let report = await MemoryV2Migrator(
-                dataRoot: NativeAgentPaths.dataRoot,
-                storage: RealMemoryStorage(storage: canonicalStorage)
-            ).migrate()
-            if report.skippedAlreadyMigrated {
-                logger.info("MemoryV2 migration: already complete; skipped")
-            } else {
-                logger.info(
-                    "MemoryV2 migration: memories=\(report.memoriesImported, privacy: .public) proposals=\(report.proposalsImported, privacy: .public) tombstones=\(report.tombstonesImported, privacy: .public) errors=\(report.errors.count, privacy: .public)"
-                )
-                for err in report.errors.prefix(5) {
-                    logger.error("MemoryV2 migration error: \(err, privacy: .public)")
-                }
-            }
-            await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
-                namespace: "memory-v2",
-                stableID: "migration",
-                operation: .reconcile,
-                reason: "memory_migration_finished"
-            ))
-            await DerivedStateInvalidationCenter.shared.flush()
-            guard report.requiredFailures == 0 else {
-                logger.error("MemoryV2 derived projection reconciliation refused because migration is incomplete")
-                return
-            }
-
-            // A full graph rebuild is only required when this launch actually
-            // crossed the canonical migration boundary. On healthy launches,
-            // the shared MemoryV2 startup hook performs a bounded additive
-            // backfill instead of deleting and recreating every graph row.
-            // 2026-09-11: a pending statement retired by its own correction must
-            // not leave a tombstone that blocks the correction (Astra comb 1).
-            // Idempotent, no-op once clean.
-            await SwiftNativeMemoryV2.shared.repairSupersededTombstones()
-            if !report.skippedAlreadyMigrated {
-                do {
-                    _ = try await SwiftNativeMemoryV2.shared.reconcileKnowledgeGraphProjection()
-                } catch {
-                    logger.error("MemoryV2 Knowledge Graph reconciliation failed: \(String(describing: error), privacy: .public)")
-                }
-            }
-            if let generator = await SwiftNativeMemoryV2.shared.bindUserMDGenerator(
-                dataRoot: NativeAgentPaths.dataRoot,
-                personaRoot: NativeAgentPaths.personaRoot
-            ) {
-                do {
-                    _ = try await generator.regenerate()
-                } catch UserMDGeneratorError.onboardingIncomplete {
-                    // Expected on a blank install; onboarding owns first write.
-                } catch {
-                    logger.error("MemoryV2 USER.md reconciliation failed: \(String(describing: error), privacy: .public)")
-                }
-            }
-            await MemorySpotlightBootstrap.shared.reindexAll()
-        }
-
-        // Swift-native cutover/fin-integration: these are macOS
-        // NSBackgroundActivityScheduler entries, registered after migration.
-        Self.registerBackgroundTaskHandlers()
-
-        // Make the execution planner TOOL-AWARE for EVERY path, incl. the
-        // autonomous trigger scheduler (which builds its runner via the core
-        // makeWorkshopRunner and so can't be wired per-call-site). Configured
-        // SYNCHRONOUSLY here, before any detached loop/trigger task spawns, so
-        // an execution Agent fires on her own plans real tools — not synthesis-only
-        // (2026-06-15, the user: executions do everything, including unattended).
-        WorkshopExecution.WorkshopPlannerCatalog.configure(makeWorkshopPlannerConnectorActionsProvider())
-
-        // HOTFIX 2026-06-03: every subsystem bring-up gets its OWN detached
-        // Task so a wedge in any one (SQLite file-lock contention, slow
-        // iCloud daemon, locked Spotlight index, etc.) cannot cascade into a
-        // launch freeze of the others. Pre-hotfix this was ONE Task with
-        // five `await`s; a single SQLite open block stalled all five. Each
-        // subsystem is now independent; the launch task returns immediately.
-        Task.detached(priority: .utility) {
-            // Lives HERE and not in the window .task — that block only fires
-            // when the main window appears, and the app cold-starts
-            // menu-bar-only (the exact trap the ClaudeBridge comment in
-            // NativeAgentApp.swift records).
-            let downloadDescriptor = Bundle.main.url(forResource: "embedding-download", withExtension: "json")
-                .flatMap { try? Data(contentsOf: $0) }
-                .flatMap { try? EmbeddingModelDownload.Descriptor.parse($0) }
-            if downloadDescriptor?.distribution != "separate-download" {
-                await reconcileMemoryEmbeddingEpochAtLaunch()
-            }
-            await SkillRegistryMigration.inheritBuiltInDescriptions(dataRoot: PersistenceCore.defaultDataRoot())
-        }
-        // The transcript-aging lane defers through the same body throttle as
-        // every other background-cognition lane. Installing the gate is a
-        // synchronous closure store — no bring-up, nothing to wedge.
-        ChatConsolidationGateInstall.install()
-        Task.detached(priority: .utility) {
-            await NativeAgentEngine.liveCognition.bootstrap()
-        }
-        Task.detached(priority: .utility) {
-            let logger = Logger(subsystem: "com.nativeagent.app", category: "chat-reconciliation")
-            do {
-                let report = try await ChatSessionIndexReconciler(
-                    dataRoot: NativeAgentPaths.dataRoot
-                ).reconcile()
-                OrganPulse.record("launch.chat_index", found: report.sessionsRecovered + report.staleRowsRepaired + report.corruptTranscripts,
-                                  note: "recovered \(report.sessionsRecovered), repaired \(report.staleRowsRepaired), corrupt \(report.corruptTranscripts) of \(report.transcriptsExamined)")
-                if report.sessionsRecovered > 0 || report.corruptTranscripts > 0
-                    || report.staleRowsRepaired > 0 {
-                    logger.info(
-                        "Chat reconciliation: recovered=\(report.sessionsRecovered, privacy: .public) repaired=\(report.staleRowsRepaired, privacy: .public) corrupt=\(report.corruptTranscripts, privacy: .public) examined=\(report.transcriptsExamined, privacy: .public)"
-                    )
-                }
-            } catch {
-                logger.error("Chat reconciliation refused: \(String(describing: error), privacy: .public)")
-            }
-        }
-        Task.detached(priority: .utility) {
-            // NativeAgentApp owns composition; Core owns process lifecycle,
-            // execution, and status for the injected manifest.
-            // Prime GitHub's semantic baseline before its refresh loop can
-            // publish. This closes the launch race without replaying old work
-            // as fresh resident physiology.
-            await GitHubCommandRuntime.shared.replayResidentStateAtLaunch()
-            // The one engine root, built here before the loops ask it for clients.
-            _ = NativeAgentEngine.live
-            do { try await SensesAssembly.waitUntilReady() }
-            catch { nativeLog("[senses] Launch registration unavailable: %@", error.localizedDescription) }
-            let loops = BackgroundLoopsAssembly.assembleAllLoops()
-            await installBotProviderCheck()
-            await AbandonedTurnReconciliationHook.arm(completedTurnNotification: .chatTurnCompleted,
-                inFlight: { Set(ChatCancelFlag.inFlightTurns(dataRoot: NativeAgentPaths.dataRoot).map(\.turnId)) },
-                resume: { checkpoint in
-                    let runtime = BackgroundLoopsAssembly.makeTurnContinuationRuntime(dataRoot: NativeAgentPaths.dataRoot)
-                    if checkpoint.capabilityProfile == "mac", checkpoint.surface == "chat", checkpoint.helperDefinition == nil {
-                        guard let model = await QuietSelfAdmin.shared.appModel else { throw MacChatTurnLifecycleStoreError.invalidRecord }
-                        try await model.resumeMacChatTurn(checkpoint) { progress in
-                            try await runtime.resumeTurn(checkpoint, progress: progress)
-                        }
-                    } else { try await runtime.resumeTurn(checkpoint) }
-                })
-            await BackgroundLoopsManager.shared.start(loops: loops)
-        }
-        // Refresh the doctor snapshot ONCE after this launch's first completed
-        // turn, so the turn-behaviour checks in data/doctor/latest.json report
-        // observations instead of the launch-time UNMEASURED.
-        DoctorFirstTurnRefresh.arm()
-        Task.detached(priority: .utility) {
-            // Reconcile historical Desk feeds written before parent/child
-            // terminal-state invariants existed. The store repairs by appending
-            // ordinary set_status ops under its canonical flock; it never
-            // rewrites the event log or hot-edits desk_state.json.
-            do {
-                let ops = try await SwiftNativeDeskStore(
-                    dataRoot: PersistenceCore.defaultDataRoot()
-                ).reconcileTerminalParentsWithNonTerminalDescendants()
-                OrganPulse.record("launch.desk_hierarchy", found: ops.count, note: "\(ops.count) statuses set")
-            } catch {
-                FileHandle.standardError.write(
-                    Data("Desk hierarchy reconciliation failed: \(error)\n".utf8)
-                )
-            }
-        }
-        Task.detached(priority: .utility) {
-            await AdaptiveMemoryPromoter.shared.configure(
-                memory: SwiftNativeMemoryV2.shared,
-                // The fact lane (2026-09-11): the memory manager, on the agent's
-                // real mind, with the memories it already keeps in view. It
-                // replaced the regex template extractor + on-device pass; there
-                // is no rule-based conformer to fall back to, by design.
-                memoryManager: MindMemoryManager(makeLLMClient: {
-                    BackgroundLoopsAssembly.makeSharedLLMClient()
-                }),
-                
-                // Setup ▸ "Moments she keeps". The module never reads
-                // UserDefaults; the switch reaches it as this closure, read
-                // fresh on every turn so flipping it takes effect at once.
-                momentsEnabled: { MomentsLaneSetting.isEnabled() },
-                // Settings ▸ "Memories that recur become facts". Same shape as
-                // the moments switch: read fresh on every turn, so flipping it
-                // takes effect at once.
-                adaptivePromotionEnabled: { MemoryPolicyGate.adaptivePromotionEnabled() },
-                // A memory is about "User", never "the person" (Agent, 2026-09-11).
-                personName: { NativeCognitionRuntime.resolveUserName(dataRoot: PersistenceCore.defaultDataRoot()) }
-            )
-        }
-        Task.detached(priority: .utility) {
-            // U3 wave-1 item 3: stage the one-shot memory-repair approval
-            // cards (truncated daemon-era rows + legacy note duplicate purge)
-            // if the wounds still exist and no card was staged before.
-            // Staging only — NOTHING mutates the memory store until the
-            // card is explicitly approved (resolveApproval → memory.repair
-            // executor), except the one-time archive of retired inventory
-            // rows. Idempotent across launches via stamp/done files.
-            //
-            // Review blocker fix (2026-06-10): reconcile FIRST — a crash
-            // between resolve-persist and the repair executor leaves a
-            // resolved+approved record whose repair never applied, and the
-            // staging stamp would dead-end it forever. The reconciliation
-            // runs the idempotent executor for any resolved memory.repair
-            // record lacking an execution annotation (and, for canceled
-            // ones, clears the stamp so stageIfNeeded below re-stages).
-            let repairs = await MemoryApprovalTransactions.reconcileUnappliedMemoryRepairs(dataRoot: PersistenceCore.defaultDataRoot())
-            OrganPulse.record("launch.memory_repairs", found: repairs, note: "\(repairs) re-run")
-            await MemoryRepairOneShot.stageIfNeeded(
-                dataRoot: PersistenceCore.defaultDataRoot(),
-                presentation: AppMemoryRepairPresentation())
-            // Astra audit 2026-09-11 finding 5: the 13 unscoped LEGACY correction
-            // atoms were still mandatory on every turn, because intake scoping by
-            // design never edits an atom already in the store. One hand-reviewed
-            // pass stamps `context_topics` on the seven task-specific records and
-            // leaves the six interpersonal/authorization ones global. Idempotent
-            // via a version-stamped marker; receipted beside it.
-            await LegacyCorrectionScopeMigration.runIfNeeded(dataRoot: PersistenceCore.defaultDataRoot())
-            // U3 wave-2: same reconcile-then-stage pattern for the kind
-            // backfill (item 5), and the consolidation-swap reconcile
-            // (item 7) — re-drives approved-unexecuted swaps, detects
-            // already-applied by fingerprint, cleans denied/orphaned
-            // candidate stores. All approval-gated; nothing here mutates
-            // the memory store without an approved card.
-            let backfills = await MemoryApprovalTransactions.reconcileUnappliedKindBackfills(dataRoot: PersistenceCore.defaultDataRoot())
-            OrganPulse.record("launch.kind_backfills", found: backfills, note: "\(backfills) re-run")
-            await MemoryApprovalTransactions.stageKindBackfillIfNeeded(
-                dataRoot: PersistenceCore.defaultDataRoot(),
-                ports: MemoryApprovalTransactionPorts(
-                    makeLLMClient: { BackgroundLoopsAssembly.makeSharedLLMClient() }
-                )
-            )
-            var settled = 0, failures: [String] = []
-            for swap in await MemoryConsolidationGate.reconcile(dataRoot: PersistenceCore.defaultDataRoot()) {
-                switch swap {
-                case .applied, .alreadyApplied, .staleRefused, .cleanedUpDenied: settled += 1
-                case .pendingApproval: break
-                case .failed(let runId, let reason), .projectionFailed(let runId, let reason): failures.append("\(runId): \(reason)")
-                }
-            }
-            if failures.isEmpty {
-                OrganPulse.record("launch.consolidation_swaps", found: settled, note: "\(settled) settled")
-            } else {
-                OrganPulse.record("launch.consolidation_swaps", .skipped,
-                                  note: "\(settled) settled, \(failures.count) failed: " + failures.joined(separator: "; "))
-            }
-            // U5 W-A item 3 (2026-06-11): generic resolve→execute crash-
-            // window reconcile for the four kinds that lacked launch
-            // coverage (rem.proposal, execution.step, self_improvement.apply,
-            // browser.open_url). Re-fires the SAME executors resolveApproval
-            // runs, keyed on "resolved + no executedAction annotation";
-            // per-kind idempotency hooks (REM status-flip no-op, execution
-            // in-lock staleApproval guard, approved-only self-improvement,
-            // browser runs.json terminal-state cap) keep re-runs from
-            // double-executing side effects.
-            // Browser Core owns restart recovery for any navigation whose
-            // persisted operation deadline elapsed while the app was down.
-            // Repair before approval reconciliation so a stranded effect is
-            // recorded outcome-unknown/failed and is never reopened merely to
-            // heal an approval annotation.
-            do {
-                let stranded = try await SwiftNativeBrowserClient.defaultClient()
-                    .executeBrowserOperation(.recoverStrandedRunning).recoveredCount
-                OrganPulse.record("launch.browser_stranded", found: stranded, note: "\(stranded) closed as outcome unknown")
-            } catch {
-                nativeLog("[browser] restart recovery failed: %@", String(describing: error))
-            }
-            let approvals = await ApprovalTransactionCoordinator.app().reconcileUnappliedApprovalExecutions()
-            OrganPulse.record("launch.approval_executions", found: approvals, note: "\(approvals) re-run")
-            Task { await ApprovalTransactionCoordinator.settleDeskWaitsOnEveryResolve(dataRoot: PersistenceCore.defaultDataRoot()) }
-            // Terminal-event reconciliation normally stages this exact card.
-            // Launch repair closes the safe crash/restart gap without a poll:
-            // if enough canonical procedure receipts already exist, stage the
-            // same local-only activation review once. First, once ever,
-            // re-check legacy v1 procedures against their reviewed evidence so
-            // the ones that still match load again; any that cannot stay off
-            // and leave one inbox line saying why.
-            let procedureDataRoot = PersistenceCore.defaultDataRoot()
-            let keptOff = await WorkshopProcedureLegacyRevalidation.runIfNeeded(dataRoot: procedureDataRoot)
-            OrganPulse.record("launch.procedure_revalidation", found: keptOff.count, note: "\(keptOff.count) kept off")
-            for line in keptOff {
-                let cardID = "procedure-legacy-revalidation-\(CausalTransitionEvidence.opaqueIdentity(line).prefix(16))"
-                _ = try? await LiveNotificationInbox(
-                    path: LiveNotificationInbox.livePath(dataRoot: procedureDataRoot)
-                ).appendUnique(.object([
-                    "id": .string(cardID),
-                    "created_at": .string(NativeTimestampFormat.fractionalZulu(Date())),
-                    "source": .string("workshop"),
-                    "severity": .string("info"),
-                    "title": .string("A saved procedure stays off"),
-                    "summary": .string(line),
-                    "actions": .array([.object(["id": .string("dismiss"), "label": .string("Dismiss"),
-                                                "description": .string("Dismiss this card")])]),
-                    "status": .string("unread"),
-                ]), id: cardID)
-            }
-            let activationCards = await WorkshopProcedureExactActivationCoordinator
-                .reconcileLocalFileCopyIfQualified()
-            OrganPulse.record("launch.procedure_activation", found: activationCards, note: "\(activationCards) review staged")
-            // Same shape for REM: staging used to run ONLY inside the weekly
-            // job, so a row appended by a pass whose staging failed waited up
-            // to a week for a card (Astra audit 2026-09-11, finding 9). This
-            // generates no REM batch — bounded catch-up through the same
-            // stager, idempotent against the store's approval stamp.
-            let remStaged = await BackgroundLoopsAssembly.stagePendingREMProposalsAtLaunch()
-            OrganPulse.record("launch.rem_staging", found: remStaged, note: "\(remStaged) staged")
-        }
-
-        // PATCH-2026-06-17 dream-single-owner: dream cadence is owned solely
-        // by TriggerScheduler's `nativeagent-nightly-dream` calendar job.
-        // BackgroundLoopsManager and NSBackgroundActivityScheduler must not
-        // register an unattended dream loop.
+            },
+            repairPresentation: AppMemoryRepairPresentation(),
+            momentsEnabled: { MomentsLaneSetting.isEnabled() },
+            approvals: .app())
 
         // W8 (2026-08-14) — the ambient activity watcher.
         //
@@ -589,38 +194,24 @@ extension AppDelegate {
         // DispatchQueue dispatch (not Task.detached) so the actor isolation
         // can't defer it past application launch finish — mirrors
         // MacControlBridge above.
-        nativeLog("[claude-bootstrap] dispatching ClaudeBridge.startServer on dispatch queue")
+        ModuleLog.app("[claude-bootstrap] dispatching ClaudeBridge.startServer on dispatch queue")
         DispatchQueue.global(qos: .userInitiated).async {
-            ClaudeBridge.shared.startSyncForBootstrap()
+            ClaudeBridgeRuntime.shared.startSyncForBootstrap()
             NativeAgentA2AGRPCListener.shared.start()
         }
-        // PATCH-2026-05-07: icloud-bridge start iCloud bridge and wire iOS→Swift runtime forwarding
-        Task { @MainActor in
-            NativeAgentEngine.liveDeviceSync.bridge.setup()
-            NativeAgentEngine.liveDeviceSync.bridge.observeIncomingMessages { msg in
-                // Forward iOS message to the in-process Swift chat runtime.
-                // iCloudBridge only archives the source file after this returns true.
-                await AppDelegate.forwardToSwiftRuntime(msg)
-            }
-        }
-        // AUTO-BOOTSTRAP: publish pairing material to iCloud KVS so iOS can
-        // pair automatically without QR scans or manual key entry.
-        // PairingSecretManager.loadOrGenerateSecret() is the single source of truth
-        // for the HMAC key (same secret MacSyncEngine and iCloudBridge use for signing).
-        // Run off-main so file I/O + KVS write don't compete with UI setup.
-        Task.detached(priority: .userInitiated) {
-            await PairingSecretManager.publishMaterialToKVS()
-        }
-
-        // PATCH-2026-05-07: app-owned runtime Auto-register for login start so
-        // the menu-bar app is always there. Idempotent — calling register()
-        // when already enabled is a no-op.
-        // 2026-09-22: a first run registers once the first greeting has been
-        // delivered (AppModel.maybeSendFirstRunGreeting) instead, so a new
-        // user is not added to login items before setup.
-        if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: NativeAgentPaths.dataRoot) {
-            AppDelegate.registerLoginItemInBackground()
-        }
+        let forwarder = ICloudIncomingTurnForwarder(port: EngineICloudIncomingTurnPort(
+            engine: .live, client: { AppDelegate.residentIOSChatClient },
+            received: { MacChatUnreadSessions.shared.received(in: $0) },
+            presentation: {
+                guard let appModel = NativeAgentAppCoordinator.shared.appModel else {
+                    throw NSError(domain: "NativeAgentControlHandoff", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Mac chat is not attached"])
+                }
+                return appModel
+            }))
+        NativeAgentEngine.startDeviceSyncAtLaunch(
+            forward: { await forwarder.forwardToSwiftRuntime($0) },
+            registerLoginItem: AppDelegate.registerLoginItemInBackground)
 
     }
 
@@ -635,7 +226,10 @@ extension AppDelegate {
         _ application: NSApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
-        NativeAgentEngine.liveDeviceSync.bridge.cloudKitPushRegistrationSucceeded()
+        Task {
+            do { try await NativeAgentAppCoordinator.shared.prepare() } catch { return }
+            NativeAgentEngine.liveDeviceSync.bridge.cloudKitPushRegistrationSucceeded()
+        }
     }
 
     @MainActor
@@ -643,7 +237,10 @@ extension AppDelegate {
         _ application: NSApplication,
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
-        NativeAgentEngine.liveDeviceSync.bridge.cloudKitPushRegistrationFailed(error)
+        Task {
+            do { try await NativeAgentAppCoordinator.shared.prepare() } catch { return }
+            NativeAgentEngine.liveDeviceSync.bridge.cloudKitPushRegistrationFailed(error)
+        }
     }
 
     @MainActor
@@ -654,8 +251,9 @@ extension AppDelegate {
         let payload = Dictionary(uniqueKeysWithValues: userInfo.map {
             (AnyHashable($0.key), $0.value)
         })
-        guard NativeAgentEngine.liveDeviceSync.bridge.recognizesCloudKitRemoteNotification(payload) else { return }
         Task { @MainActor in
+            do { try await NativeAgentAppCoordinator.shared.prepare() } catch { return }
+            guard NativeAgentEngine.liveDeviceSync.bridge.recognizesCloudKitRemoteNotification(payload) else { return }
             await NativeAgentEngine.liveDeviceSync.bridge.handleCloudKitPushWake()
         }
     }
@@ -687,20 +285,15 @@ extension AppDelegate {
     /// are not waited on.
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard NativeAgentAppCoordinator.shared.appModel != nil else { return .terminateNow }
         if Self.quitWaitingForTurns { return .terminateLater }
         let runs = NativeAgentEngine.live.turns.inFlightRunIDs()
         guard !runs.isEmpty, !Self.restartQuit.withLock({ $0 }) else { return .terminateNow }
         Self.quitWaitingForTurns = true
-        nativeLog("[quit] holding quit for %d in-flight turn(s), at most 20s", runs.count)
+        ModuleLog.app("[quit] holding quit for %d in-flight turn(s), at most 20s", runs.count)
         Task.detached {
-            let deadline = ContinuousClock.now + .seconds(20)
-            while !NativeAgentEngine.live.turns.inFlightRunIDs().isDisjoint(with: runs),
-                  ContinuousClock.now < deadline,
-                  !Self.restartQuit.withLock({ $0 }) {
-                try? await Task.sleep(for: .milliseconds(200))
-            }
-            let left = NativeAgentEngine.live.turns.inFlightRunIDs().intersection(runs).count
-            nativeLog("[quit] %@", left == 0 ? "turns finished — quitting" : "\(left) turn(s) still running at the bound — quitting anyway")
+            await NativeAgentEngine.waitForInFlightTurnsBeforeQuit(runs,
+                isRestarting: { Self.restartQuit.withLock { $0 } })
             // A run-loop block, not MainActor.run: if the Quit came from inside
             // a main-queue block (a MainActor task), the main queue cannot drain
             // until that block returns, and the reply would never be delivered.
@@ -719,11 +312,12 @@ extension AppDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         approvalNotificationTask?.cancel()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        guard NativeAgentAppCoordinator.shared.appModel != nil else { return }
         // Stop the loopback bridges first, synchronously: once the listeners are
         // cancelled and their token/descriptor files are gone, no new request can
         // land mid-drain and no stale credential outlives the process.
         NativeAgentA2AGRPCListener.shared.stop()
-        ClaudeBridge.shared.stop()
+        ClaudeBridgeRuntime.shared.stop()
         MacControlBridge.shared.stop()
         MainActor.assumeIsolated {
             BrowserWindowController.shared.stopIPCServer()
@@ -735,84 +329,17 @@ extension AppDelegate {
             NativeAgentEngine.liveDeviceSync.bridge.tearDown()
         }
 
-        let group = DispatchGroup()
-        // Each drain gets its own group entry. Chaining them behind one entry
-        // serialized them under a single 3s budget, so a slow cognition flush
-        // starved the Core-owned loop drain of any budget at all. Independent
-        // drains run concurrently and each gets the full 3s.
-        group.enter()
-        Task.detached {
-            await NativeAgentEngine.live.chrome.stop()
-            group.leave()
-        }
-        group.enter()
-        Task.detached {
-            await NativeAgentEngine.liveCognition.flushForTermination()
-            group.leave()
-        }
-        group.enter()
-        Task.detached {
-            // Wave-1 review (gpt-5.5): TurnPlanTraceWriter is fire-and-forget
-            // on the turn path; drain its chain at quit so a trace enqueued
-            // moments before termination isn't lost.
-            await TurnPlanTraceWriter.shared.drain()
-            group.leave()
-        }
-        group.enter()
-        Task.detached {
-            await BackgroundLoopsManager.shared.shutdown()
-            group.leave()
-        }
-        group.enter()
-        Task.detached {
-            await SensesAssembly.shutdown()
-            group.leave()
-        }
-        // MCP stdio children don't reliably exit on stdin EOF — stop the
-        // pool explicitly or they orphan on quit.
-        group.enter()
-        Task.detached {
-            await SwiftNativeMCPDispatcher.stopAllSharedPools()
-            group.leave()
-        }
-        group.enter()
-        Task.detached {
-            await SwiftToolDispatcher.closeACPConnections()
-            group.leave()
-        }
-        group.enter()
-        Task.detached {
-            await NativeAgentEngine.live.contextFlow.stop()
-            group.leave()
-        }
-        group.enter()
-        // Create the Activity Watch drain ON the main actor before blocking it
-        // in `group.wait`. Dispatching `shutdown()` back to MainActor here used
-        // to guarantee that teardown could not even begin until the 3s wait had
-        // already expired.
-        let activityWatchDrain = ActivityWatchController.shared.makeTerminationDrain()
-        Task.detached {
-            await activityWatchDrain.value
-            group.leave()
-        }
-        _ = group.wait(timeout: .now() + 3.0)
+        NativeAgentEngine.drainResidentWorkForTermination(
+            shutdownSenses: { await SensesAssembly.shutdown() },
+            makeActivityWatchDrain: { ActivityWatchController.shared.makeTerminationDrain() })
     }
 
     @objc private func contextFlowWillSleep(_ notification: Notification) {
-        Task.detached(priority: .utility) {
-            await NativeAgentEngine.live.contextFlow.prepareForSleep()
-        }
+        NativeAgentEngine.prepareContextForSleep()
     }
 
     @objc private func contextFlowDidWake(_ notification: Notification) {
-        Task.detached(priority: .utility) {
-            await NativeAgentEngine.live.contextFlow.reconcileAfterWake()
-            // R-F4: Task.sleep deadlines do not advance across system sleep, so
-            // the cognition maintenance + residual-repair timers fire late until
-            // the next sensory event re-arms them. Re-anchor them to the
-            // post-wake clock, following the ContextFlow re-anchor pattern.
-            await NativeAgentEngine.liveCognition.reanchorDeadlinesAfterWake()
-        }
+        NativeAgentEngine.reconcileContextAfterWake()
     }
 
 }

@@ -1,4 +1,5 @@
 import AgentLinkTransport
+import AgentWorkspace
 import Darwin
 import Foundation
 import PersistenceCore
@@ -29,7 +30,6 @@ public struct AgentRoundTripProof: Codable, Sendable, Equatable {
     public let version: String?
     public let workspace: String
     public let credentialKey: String?
-    public var appBundlePath: String?
     public var appVersion: String?
     /// The recipe the round trip ran on (`AgentRecipeStore`): its version, and
     /// its digest, which also catches a hand edit that bumped nothing.
@@ -66,7 +66,6 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
             proof.recipeDigest = recipe.hostDigest
         }
         guard let app = appBundleIDs.compactMap(AgentHostRow.applicationURL).first else { return }
-        proof.appBundlePath = app.path
         proof.appVersion = Self.appVersion(at: app.path)
     }
 
@@ -106,6 +105,12 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     public var allowElevation: Bool?
     /// Fail-closed reading of the grant above.
     public var elevationAllowed: Bool { allowElevation == true }
+
+    public var elevationCanBeEnabled: Bool { credentialKey != nil }
+
+    public var usesShellEnvironment: Bool {
+        AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.format } == .shellEnvironment
+    }
     /// THE WHOLE PROOF, and the minimum that can carry it: when a real message
     /// last came IN through this connection, and when one last went OUT. Two
     /// timestamps, written only by `recordProof`. Configuration is not
@@ -242,21 +247,18 @@ public struct AgentPeerStore: Sendable {
         return try CredentialFileLock.withLock(fileURL) { try read() }
     }
 
-    /// Names for turn orientation: checked owner state, without a lock or probe.
-    package func connectedNames() throws -> [String] {
+    /// Saved contacts for turn orientation; reachability never removes a contact.
+    package func contactSummaries() throws -> [String] {
         let peers = try read()
-        return peers.filter {
-            $0.grokSetup != "disconnected" && $0.state == .connected
-                && AgentPeerCredentials.isAvailable($0, peers: peers)
-        }.map(\.name).sorted()
-    }
-
-    package func namesMentioned(in text: String) throws -> [String] {
-        try list().map(\.name).filter { name in
-            let pattern = "(?<![\\p{L}\\p{N}_])" + NSRegularExpression.escapedPattern(for: name)
-                + "(?![\\p{L}\\p{N}_])"
-            return text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
-        }
+        let health = AgentLocalHealth.read(fileURL.deletingLastPathComponent().deletingLastPathComponent())
+        return peers.map { peer in
+            let observed = health["peer:" + peer.id]
+            let unavailable = peer.grokSetup == "disconnected" || peer.unavailableAt != nil
+                || !AgentPeerCredentials.isAvailable(peer, peers: peers)
+            let reachability = unavailable ? "unavailable"
+                : observed?.current == true ? observed!.replyStatus.replacingOccurrences(of: "_", with: " ") : "not checked"
+            return "\(peer.name) (reachability: \(reachability); trusted: \(peer.elevationAllowed ? "on" : "off"))"
+        }.sorted()
     }
 
     @discardableResult public func upsert(_ contact: AgentPeerContact, resetProof: Bool = false) throws -> AgentPeerContact {

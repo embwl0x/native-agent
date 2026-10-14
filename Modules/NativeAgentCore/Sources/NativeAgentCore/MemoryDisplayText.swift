@@ -44,15 +44,7 @@ public enum MemoryDisplayText {
         guard !display.isEmpty else { return "" }
         guard !isDateCriticalKind(kind) else { return display }
 
-        display = stripLeadingBracketedTimestamp(display)
-        display = display
-            .replacingOccurrences(
-                of: #"(?i)^(?:createdAt|updatedAt|created|updated|recorded|saved|timestamp|ts|date)\s*(?:at|on)?\s*[:=]\s*"#,
-                with: "",
-                options: .regularExpression
-            )
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        display = stripLeadingISODateStamp(display)
+        display = stripLeadingStamp(display)
         return display.isEmpty
             ? text.trimmingCharacters(in: .whitespacesAndNewlines)
             : display

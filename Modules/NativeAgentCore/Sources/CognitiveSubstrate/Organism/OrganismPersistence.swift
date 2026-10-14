@@ -2,6 +2,12 @@ import Foundation
 import CryptoKit
 
 public struct OrganismPersistentState: Codable, Sendable, Equatable {
+    static let maximumDecayHours: Double = 72
+    private static let maximumPersistedNodes = 96
+    private static let maximumPersistedEdges = 192
+    private static let maximumPersistedPredictions = 96
+    private static let maximumSignalCount = 1_000_000
+
     public var schemaVersion: Int
     public var savedAt: Date
     public var chemicalState: ChemicalState
@@ -126,13 +132,12 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
 
     public func decayed(
         at now: Date,
-        limits: OrganismPersistenceLimits = .defaults,
         settleBodySchema: Bool = true,
         deferringPredictionExpiry deferredIDs: Set<String> = []
     ) -> OrganismPersistentState {
         let elapsedHours = max(0, now.timeIntervalSince(savedAt) / 3_600)
         guard elapsedHours > 0 else { return self }
-        let boundedHours = min(elapsedHours, limits.maximumDecayHours)
+        let boundedHours = min(elapsedHours, Self.maximumDecayHours)
 
         var next = self
         next.savedAt = now
@@ -146,10 +151,10 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         next.chemicalState = decayedChemistry(
             chemicalState, hours: boundedHours, tendernessHours: elapsedHours)
         next.bodySchema = settleBodySchema ? settledBodySchema(bodySchema) : bodySchema
-        next.field = decayedField(field, hours: boundedHours, limits: limits)
+        next.field = decayedField(field, hours: boundedHours)
         next.predictionLedger = decayedPredictions(
-            predictionLedger, now: now, hours: boundedHours, limits: limits, deferredIDs: deferredIDs)
-        next.signalCount = min(max(0, signalCount), limits.maximumSignalCount)
+            predictionLedger, now: now, hours: boundedHours, deferredIDs: deferredIDs)
+        next.signalCount = min(max(0, signalCount), Self.maximumSignalCount)
         return next
     }
 
@@ -160,10 +165,10 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         let slow = pow(0.92, hours)
         let neutral = ChemicalState.neutral
         func towardZero(_ value: Double, factor: Double = quick) -> Double {
-            ChemicalState.clamp(value * factor)
+            (value * factor).clamped01()
         }
         func towardNeutral(_ value: Double, neutral neutralValue: Double, factor: Double = slow) -> Double {
-            ChemicalState.clamp(neutralValue + ((value - neutralValue) * factor))
+            (neutralValue + ((value - neutralValue) * factor)).clamped01()
         }
         return ChemicalState(
             warmth: towardZero(state.warmth, factor: slow),
@@ -207,8 +212,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
 
     private func decayedField(
         _ field: OrganismField,
-        hours: Double,
-        limits: OrganismPersistenceLimits
+        hours: Double
     ) -> OrganismField {
         let activationFactor = pow(0.82, hours)
         let chargeFactor = pow(0.90, hours)
@@ -232,7 +236,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
                 if $0.charge != $1.charge { return $0.charge > $1.charge }
                 return $0.id < $1.id
             }
-            .prefix(limits.maximumPersistedNodes)
+            .prefix(Self.maximumPersistedNodes)
             .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let keptNodeIDs = Set(next.nodes.keys)
         next.edges = Dictionary(next.edges.values
@@ -242,7 +246,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
                 if $0.eligibility != $1.eligibility { return $0.eligibility > $1.eligibility }
                 return $0.id < $1.id
             }
-            .prefix(limits.maximumPersistedEdges)
+            .prefix(Self.maximumPersistedEdges)
             .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         return next
     }
@@ -251,7 +255,6 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         _ ledger: OrganismPredictionLedger,
         now: Date,
         hours: Double,
-        limits: OrganismPersistenceLimits,
         deferredIDs: Set<String>
     ) -> OrganismPredictionLedger {
         var next = ledger
@@ -307,7 +310,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             OrganismPredictiveBody.recordOutcome(.expired, kind: kind, at: now, ledger: &next)
         }
         next.predictions = Dictionary(OrganismPredictionRetention
-            .bounded(decayed, maximum: limits.maximumPersistedPredictions)
+            .bounded(decayed, maximum: Self.maximumPersistedPredictions)
             .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         next.lastUpdatedAt = now
         return next
@@ -351,27 +354,3 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
 
 /// Encodes as `{}`.
 struct RetiredReflexState: Codable, Sendable, Equatable {}
-
-public struct OrganismPersistenceLimits: Sendable, Equatable {
-    public var maximumDecayHours: Double
-    public var maximumPersistedNodes: Int
-    public var maximumPersistedEdges: Int
-    public var maximumPersistedPredictions: Int
-    public var maximumSignalCount: Int
-
-    public init(
-        maximumDecayHours: Double = 72,
-        maximumPersistedNodes: Int = 96,
-        maximumPersistedEdges: Int = 192,
-        maximumPersistedPredictions: Int = 96,
-        maximumSignalCount: Int = 1_000_000
-    ) {
-        self.maximumDecayHours = max(0, maximumDecayHours)
-        self.maximumPersistedNodes = max(0, maximumPersistedNodes)
-        self.maximumPersistedEdges = max(0, maximumPersistedEdges)
-        self.maximumPersistedPredictions = max(0, maximumPersistedPredictions)
-        self.maximumSignalCount = max(0, maximumSignalCount)
-    }
-
-    public static let defaults = OrganismPersistenceLimits()
-}

@@ -26,14 +26,10 @@ public enum VisionRoleGuess {
     public struct Guess: Sendable, Equatable {
         public let role: String
         public let confidence: Double
-        /// The shape fact that produced it, in one phrase, so a reader can
-        /// disagree with the reasoning and not just the answer.
-        public let rationale: String
 
-        public init(role: String, confidence: Double, rationale: String) {
+        public init(role: String, confidence: Double) {
             self.role = role
             self.confidence = VisionConfidence.clamp(confidence)
-            self.rationale = rationale
         }
     }
 
@@ -96,18 +92,17 @@ public enum VisionRoleGuess {
         // clusterer detected (a repeated multi-text band), and no pixel fact
         // is going to overturn it.
         if inputs.sources.contains(.textBand), !inputs.sources.contains(.colorRegion) {
-            return Guess(role: row, confidence: 0.55, rationale: "repeated multi-text y-band")
+            return Guess(role: row, confidence: 0.55)
         }
         if inputs.sources.contains(.textBand), inputs.sources.contains(.colorRegion) {
             return Guess(
                 role: row,
-                confidence: 0.65,
-                rationale: "repeated y-band with a matching filled region"
+                confidence: 0.65
             )
         }
         // A saliency-only blob is exactly as unknown as it sounds.
         if inputs.sources == [.saliency] {
-            return Guess(role: unknown, confidence: 0.2, rationale: "attention blob only")
+            return Guess(role: unknown, confidence: 0.2)
         }
 
         let aspect = inputs.aspect
@@ -119,37 +114,34 @@ public enum VisionRoleGuess {
         if inputs.areaFraction >= 0.12, inputs.containedText.count >= 4 {
             return Guess(
                 role: scrollArea,
-                confidence: 0.45,
-                rationale: "large region containing \(inputs.containedText.count) text runs"
+                confidence: 0.45
             )
         }
         // Small and near-square with a fill of its own: a checkbox/toggle.
         let minSide = min(inputs.rect.w, inputs.rect.h)
         if aspect >= 0.7, aspect <= 1.4, minSide <= max(28, inputs.imageSize.height * 0.05),
            inputs.containedText.isEmpty {
-            return Guess(role: checkBox, confidence: 0.4, rationale: "small square filled region, no caption")
+            return Guess(role: checkBox, confidence: 0.4)
         }
         // Centred short caption inside a filled box: the classic button, and
         // the case rectangle detection misses entirely when the button is
         // filled and borderless (spike v0).
         if !inputs.containedText.isEmpty, short, inputs.textIsCentred, aspect >= 1.2, aspect <= 12 {
-            return Guess(role: button, confidence: 0.6, rationale: "filled region with centred short caption")
+            return Guess(role: button, confidence: 0.6)
         }
         // Wide, and either empty or left-inset: a text entry candidate.
         if aspect >= 2.5, inputs.containedText.isEmpty || inputs.textIsLeftAligned {
             return Guess(
                 role: textField,
-                confidence: 0.5,
-                rationale: inputs.containedText.isEmpty
-                    ? "wide empty region" : "wide region with left-inset text"
+                confidence: 0.5
             )
         }
         if !inputs.containedText.isEmpty, short, aspect >= 1.2 {
             // It has a caption but the caption is not centred and it is not
             // wide enough to read as a field. Lower confidence, honest role.
-            return Guess(role: button, confidence: 0.35, rationale: "captioned region, off-centre caption")
+            return Guess(role: button, confidence: 0.35)
         }
-        return Guess(role: unknown, confidence: 0.15, rationale: "no matching shape")
+        return Guess(role: unknown, confidence: 0.15)
     }
 
     // MARK: - State

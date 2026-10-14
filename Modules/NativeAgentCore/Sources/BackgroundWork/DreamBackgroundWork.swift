@@ -9,6 +9,7 @@ import ApprovalInbox
 import Cognition
 import TrustCenter
 import NotificationInbox
+import AgentWorkspace
 
 /// The app's notification delivery, after the Core-owned REM card is durable.
 public typealias REMProposalNotificationPort = BackgroundWorkNotificationPort
@@ -16,6 +17,104 @@ public typealias REMProposalNotificationPort = BackgroundWorkNotificationPort
 // MARK: - Dreams and Memory Loops
 
 public enum DreamBackgroundWork {
+    public static func runDream(
+        dataRoot: URL,
+        cycle: SwiftNativeDreamREMCycle,
+        cognitionRuntime: NativeCognitionRuntime,
+        force: Bool,
+        trigger: DreamTrigger
+    ) async throws -> [String: Any] {
+        let result = try await cycle.runDream(force: force, trigger: trigger)
+        let response = try foundationDictionary(result.rawResponse)
+        guard var metadata = dreamCompletionMetadataIfCommitted(response, force: force) else {
+            return response
+        }
+        metadata["trigger"] = .string(trigger.rawValue)
+        let feltSummary = try? await makeDreamFeltSummaryProvider(cognitionRuntime: cognitionRuntime)()
+        if let feltSummary, !feltSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            metadata["feltDaySummary"] = .string(feltSummary)
+        }
+        await cognitionRuntime.ingestOrganismSignal(
+            kind: .dreamCompleted,
+            sourceOrgan: "dream",
+            intensity: 0.62,
+            valence: 0.35,
+            arousal: 0.12,
+            metadata: metadata
+        )
+        return response
+    }
+
+    public static func runREM(
+        dataRoot: URL,
+        cycle: SwiftNativeDreamREMCycle,
+        cognitionRuntime: NativeCognitionRuntime,
+        force: Bool
+    ) async throws -> [String: Any] {
+        let result: REMRunResult
+        do { result = try await cycle.runREM(force: force) }
+        catch {
+            if case DreamREMCycleError.remDecodeFailure(let detail) = error {
+                do {
+                    try await HarnessQueue.file(HarnessFinding(key: "loop-failure:nativeagent-weekly-rem",
+                        title: "REM could not read its model's reply", summary: detail,
+                        owner: .agent, refs: [], source: .loop), dataRoot: dataRoot)
+                } catch { nativeLog("REM decode finding could not be filed: %@", error.localizedDescription) }
+            }
+            throw error
+        }
+        if case .object(let response) = result.rawResponse, response["skipReason"] == nil {
+            try await HarnessQueue.resolve(key: "loop-failure:nativeagent-weekly-rem",
+                note: "REM decoded its next run.", dataRoot: dataRoot)
+        }
+        let response = try foundationDictionary(result.rawResponse)
+        guard response["skipReason"] == nil else { return response }
+        let proposals = dreamNumber(response["proposalsGenerated"])
+        let archived = dreamNumber(response["archivedEntries"])
+        await cognitionRuntime.ingestOrganismSignal(
+            kind: .remIntegrated,
+            sourceOrgan: "rem",
+            intensity: proposals > 0 ? 0.58 : 0.22,
+            valence: 0.28,
+            arousal: 0.14,
+            metadata: [
+                "proposalsGenerated": .int(Int64(proposals)),
+                "archivedEntries": .int(Int64(archived)),
+                "force": .bool(force),
+                "feltDaySummary": .string("REM integrated \(proposals) proposal(s) from recent dream evidence."),
+            ]
+        )
+        return response
+    }
+
+    private static func foundationDictionary(_ value: JSONValue) throws -> [String: Any] {
+        let data = try value.serializedData(pretty: false)
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    private static func dreamNumber(_ value: Any?) -> Int {
+        if let int = value as? Int { return int }
+        if let number = value as? NSNumber { return number.intValue }
+        if let string = value as? String { return Int(string) ?? 0 }
+        return 0
+    }
+
+    private static func dreamCompletionMetadataIfCommitted(
+        _ response: [String: Any],
+        force: Bool
+    ) -> [String: JSONValue]? {
+        let entries = dreamNumber(response["entriesWritten"])
+        let disabled = response["disabled"] as? Bool ?? false
+        let errors = response["errors"] as? [String] ?? []
+        guard entries > 0, !disabled, errors.isEmpty else { return nil }
+
+        return [
+            "entriesWritten": .int(Int64(entries)),
+            "sessionsProcessed": .int(Int64(dreamNumber(response["sessionsProcessed"]))),
+            "force": .bool(force),
+        ]
+    }
+
     // RETIRED 2026-08-31: `makeREMCycleLoop` / the `rem_cycle` background lane.
     //
     // Weekly REM has exactly one owner — the `nativeagent-weekly-rem`
@@ -108,12 +207,6 @@ public enum DreamBackgroundWork {
             // is not application, and an approval card is the opposite of an
             // unattended act.
             if yolo.state == .explicitlyBlocked {
-                writeREMFullMacOutcome(
-                    dataRoot: dataRoot,
-                    row: row,
-                    status: "refused",
-                    detail: "rem.proposal is explicitly blocked; no approval was staged."
-                )
                 return nil
             }
             // IDEMPOTENT ensure, not blind create (gpt-5.5 review 2026-06-10):
@@ -241,30 +334,6 @@ public enum DreamBackgroundWork {
         // Her words first: a card shows its first line, and the lesson is the point.
         guard let label = remSupportLabel(row) else { return row.proposalText }
         return row.proposalText + "\n" + label
-    }
-
-    private static func writeREMFullMacOutcome(
-        dataRoot: URL,
-        row: REMProposalRow,
-        status: String,
-        detail: String
-    ) {
-        let path = dataRoot
-            .appendingPathComponent("rem_deferred", isDirectory: true)
-            .appendingPathComponent("\(row.id).json")
-        try? FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let value: JSONValue = .object([
-            "proposal_id": .string(row.id),
-            "status": .string(status),
-            "detail": .string(detail),
-            "at": .string(ISO8601DateFormatter().string(from: Date())),
-        ])
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(value) {
-            try? data.write(to: path, options: .atomic)
-        }
     }
 
     /// Card id == approval id: InboxView's approve/reject buttons route
@@ -423,7 +492,6 @@ public enum DreamBackgroundWork {
     /// provider, mirroring makeDreamMemoryDeltaProvider — otherwise the scheduled
     /// nightly bypasses this assembly and the felt tone is permanently absent.
     public static func makeDreamFeltSummaryProvider(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
         cognitionRuntime: NativeCognitionRuntime
     ) -> DreamFeltSummaryProvider {
         let runtime = cognitionRuntime
@@ -446,7 +514,6 @@ public enum DreamBackgroundWork {
     /// `static` for the same reason as the providers above — the scheduler-driven
     /// path builds its own runner and must wire the identical provider.
     public static func makeDreamFeltOriginProvider(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
         cognitionRuntime: NativeCognitionRuntime
     ) -> DreamFeltOriginProvider {
         let runtime = cognitionRuntime
@@ -467,7 +534,6 @@ public enum DreamBackgroundWork {
     /// does — the substrate's own best-effort ledger write, which keeps every
     /// existing gate (cognition/persistence off → silent no-op).
     public static func makeDreamReceiptSink(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
         cognitionRuntime: NativeCognitionRuntime
     ) -> DreamReceiptSink {
         let runtime = cognitionRuntime
@@ -491,7 +557,6 @@ public enum DreamBackgroundWork {
     /// SwiftNativeDreamREMCycle) builds its own runner and must wire the same sink,
     /// or the scheduled nightly dream never reaches her disposition.
     public static func makeDreamMoodSink(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
         cognitionRuntime: NativeCognitionRuntime
     ) -> DreamDatedMoodSink {
         let runtime = cognitionRuntime

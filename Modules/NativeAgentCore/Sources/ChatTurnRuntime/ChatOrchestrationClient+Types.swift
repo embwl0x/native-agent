@@ -21,6 +21,7 @@ import CognitiveSubstrate
 /// lived in the retired protocol compatibility shell even though production
 /// client paths were its only remaining consumers.
 public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
+    case replyHeldForQuietHours
     case emptyMessage
     case badAttachments(detail: String)
     case invalidResponse(status: Int)
@@ -29,6 +30,7 @@ public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
+        case .replyHeldForQuietHours: return "Reply held for quiet hours."
         case .emptyMessage:
             return "chat: message body must contain non-whitespace content"
         case .badAttachments(let detail):

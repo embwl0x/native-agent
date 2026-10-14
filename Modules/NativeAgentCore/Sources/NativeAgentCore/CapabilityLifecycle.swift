@@ -1,32 +1,59 @@
 import Foundation
 
-/// One lifecycle for every capability she has, her skills and the tools she
-/// wrote (User, 10-03: "a system that tools and skills can be added, upgraded,
-/// retired"). Each store keeps its own rows; the decisions are these.
-///
-/// - Draft → on → archived. Archived is never deleted: it doesn't run, it
-///   stays findable marked archived, and one call restores it.
+/// One lifecycle for every capability she has, her senses, skills and the tools she
+/// wrote. One folder holds current, previous and proposed files.
 /// - Use: a skill's run or `skill.read` (a recall pointer's one act is that
 ///   read), a tool's call. Turning one on restarts the clock.
-/// - Unused for `unusedDays` → archived, every kind.
-/// - Upgrade is a new version with the previous kept: approval and the trust
-///   ladder start over, and rollback brings the previous back drafted.
+/// - Drop removes an ability; rollback swaps current and previous.
 public enum CapabilityLifecycle {
-    public static let unusedDays = 30
-    public static let archived = "archived"
+    public enum Action: Sendable { case change, enable, restore, rollback, drop }
 
-    /// Use was recorded for every kind from this day (2026-10-03); nothing
-    /// counts as unused from before it.
-    static let useRecordedSince = Date(timeIntervalSince1970: 1_790_985_600)
+    public enum Store: String, CaseIterable, Sendable {
+        case skills, tools, senses
 
-    /// The clock: the later of its last use (else its last change) and its
-    /// last turning on.
-    public static func clock(used: String?, enabled: [String?]) -> Date {
-        ([date(used)] + enabled.map(date)).compactMap { $0 }.reduce(useRecordedSince, max)
+        public func directory(in root: URL) -> URL { root.appendingPathComponent(rawValue, isDirectory: true) }
+    }
+    public static let protectedStores = Store.allCases.map(\.rawValue) + ["abilities", "trust", "security", "catalog", "persona", "workflows/approvals",
+                                                                       "approvals", "paired_phones.json", "telegram", "slack"]
+
+    /// Capture existing turn provenance; the returned check reads current trust.
+    /// Storage stays below chat; no bound turn means no peer steering.
+    public static var turnWriteCheck: @Sendable () -> (@Sendable () -> String?) {
+        get { provenanceLock.withLock { provenance } }
+        set { provenanceLock.withLock { provenance = newValue } }
+    }
+    private static let provenanceLock = NSLock()
+    nonisolated(unsafe) private static var provenance: @Sendable () -> (@Sendable () -> String?) = { { nil } }
+
+    public static var ownerTrusts: @Sendable (String) -> Bool {
+        get { provenanceLock.withLock { peerTrust } }
+        set { provenanceLock.withLock { peerTrust = newValue } }
+    }
+    nonisolated(unsafe) private static var peerTrust: @Sendable (String) -> Bool = { _ in false }
+
+    public static var writeRefusal: String? { turnWriteCheck()() }
+
+    public static func peerRefusal(_ who: String) -> String {
+        "This turn was steered by \(who), so it cannot change senses, tools or skills or capture material for growth. Ask the person to start a fresh turn and read the source again for this change."
     }
 
-    public static func isUnused(used: String?, enabled: [String?], now: Date, days: Int = unusedDays) -> Bool {
-        clock(used: used, enabled: enabled) < now.addingTimeInterval(-Double(days) * 86_400)
+    public static func requireWrite() throws {
+        if let refusal = writeRefusal {
+            throw NSError(domain: "CapabilityLifecycle", code: 403, userInfo: [NSLocalizedDescriptionKey: refusal])
+        }
+    }
+
+    public static func requiresOwnerToEnable(isOff: Bool, disabledBy: String?) -> Bool {
+        disabledBy != "agent" && (isOff || disabledBy != nil)
+    }
+
+    public static func nextVersion(_ versions: [Int], requested: Int = 1) throws -> Int {
+        let newest = versions.max() ?? 0
+        guard newest < Int.max else {
+            throw NSError(domain: "CapabilityLifecycle", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Capability version overflow."])
+        }
+        return max(newest + 1, requested)
     }
 
     /// World stops an upgrade could fix. A decide and a floor hand-back
@@ -45,32 +72,12 @@ public enum CapabilityLifecycle {
         faulted && lastClean != nil && lastClean != digest
     }
 
-    /// The versions a store keeps, never more (User: bounded in code): the
-    /// newest copy of each distinct version, the newest `recent` of those
-    /// (current and previous), and the last clean one. `versions` oldest
-    /// first, each its key and the digest a clean run names; returns the
-    /// indices kept, in order.
-    public static func keptVersions(_ versions: [(key: String, digest: String?)], recent: Int, clean: String?) -> [Int] {
-        var newest: [String: Int] = [:]
-        for (i, version) in versions.enumerated() { newest[version.key] = i }
-        var kept = Set(newest.values.sorted().suffix(recent))
-        if let clean, let last = versions.lastIndex(where: { $0.digest == clean }) { kept.insert(last) }
-        return kept.sorted()
-    }
-
     /// The ladder's distinct inputs a row keeps.
     public static let inputLimit = 10
-
-    /// A tool's failures in a row that ask whether to improve it, once per streak.
-    public static let toolFailureStreak = 2
 
     /// ISO-8601, with or without fractional seconds.
     public static func date(_ text: String?) -> Date? {
         guard let text, !text.isEmpty else { return nil }
-        let format = ISO8601DateFormatter()
-        format.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = format.date(from: text) { return date }
-        format.formatOptions = [.withInternetDateTime]
-        return format.date(from: text)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(text)
     }
 }

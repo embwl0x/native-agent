@@ -159,15 +159,6 @@ public struct ActivityRollups: Sendable {
     /// must not hang — but it must also not be told it got the whole decade.
     public static let maxBuckets = 24 * 400
 
-    /// Bucket boundaries in `timezone`, computed with `Calendar` so DST is the
-    /// calendar's problem and not ours. A 25-hour day yields 25 hourly buckets
-    /// and one daily bucket 90,000 s long; a 23-hour day yields 23 and 82,800.
-    public static func bucketBoundaries(
-        from: Double, to: Double, grain: Grain, timezone: TimeZone
-    ) -> [(start: Double, end: Double)] {
-        boundedBuckets(from: from, to: to, grain: grain, timezone: timezone).boundaries
-    }
-
     /// Boundaries plus how far they actually reach.
     ///
     /// `coveredTo` exists because the bucket cap is a SILENT CAP otherwise: ask
@@ -195,25 +186,6 @@ public struct ActivityRollups: Sendable {
             cursor = interval.end
         }
         return (boundaries, min(to, boundaries.last?.end ?? to))
-    }
-
-    /// Per-app buckets over the window. Zero-length buckets (no activity) are
-    /// omitted — an answer full of empty hours is noise, and the caller has the
-    /// window bounds to know what is missing.
-    public func buckets(
-        from: Double, to: Double, grain: Grain, timezone: TimeZone
-    ) async throws -> [ActivityBucket] {
-        let spans = try await store.spansOverlapping(from: from, to: to, policy: policy)
-        return Self.buckets(spans: spans, from: from, to: to, grain: grain, timezone: timezone)
-    }
-
-    /// Pure function over already-fetched spans. Split out so the DST tests can
-    /// hit it with a hand-built fixture and no database at all.
-    public static func buckets(
-        spans: [ActivitySpan], from: Double, to: Double, grain: Grain, timezone: TimeZone
-    ) -> [ActivityBucket] {
-        let boundaries = bucketBoundaries(from: from, to: to, grain: grain, timezone: timezone)
-        return buckets(spans: spans, from: from, to: to, boundaries: boundaries)
     }
 
     /// Chronological sweep over precomputed boundaries. Each source span enters
@@ -292,14 +264,6 @@ public struct ActivityRollups: Sendable {
     }
 
     // MARK: Top-N
-
-    /// Bounded top-N by observed seconds, with the truncation stated.
-    public func topApps(
-        from: Double, to: Double, limit: Int
-    ) async throws -> ActivityTopN {
-        let spans = try await store.spansOverlapping(from: from, to: to, policy: policy)
-        return Self.topApps(spans: spans, from: from, to: to, limit: limit)
-    }
 
     public static func topApps(
         spans: [ActivitySpan], from: Double, to: Double, limit: Int

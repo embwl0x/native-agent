@@ -289,7 +289,6 @@ public enum OrganismHorizonRegister {
     /// semantic lane's conditional entry (see
     /// `CognitiveSubstrate+AppraisalStakes.swift`).
     public static let resolutionPathLabel = "horizonExpectation"
-    public static let labelCharacterCap = 48
     /// Field separator for the encoded source token. Excluded from labels by
     /// `canonicalLabel`, so a label can never split a token.
     private static let separator: Character = "|"
@@ -305,24 +304,7 @@ public enum OrganismHorizonRegister {
     ]
 
     public static func canonicalLabel(_ raw: String) -> String {
-        let lower = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var output = ""
-        var previousWasDash = false
-        for scalar in lower.unicodeScalars {
-            let value = scalar.value
-            let isLetter = value >= 97 && value <= 122
-            let isDigit = value >= 48 && value <= 57
-            if isLetter || isDigit {
-                output.unicodeScalars.append(scalar)
-                previousWasDash = false
-            } else if !previousWasDash {
-                output.append("-")
-                previousWasDash = true
-            }
-            if output.count >= labelCharacterCap { break }
-        }
-        let trimmed = output.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return trimmed.isEmpty ? "unknown" : trimmed
+        OrganismToken.canonicalToken(raw)
     }
 
     /// Deterministic row id. Source kind + label only — NOT the due time — so a
@@ -506,16 +488,6 @@ public struct OrganismPrediction: Codable, Sendable, Equatable, Identifiable {
         // the semantic kind may carry it, so no other lane can grow a row.
         self.horizon = kind == .semanticExpectation ? horizon : nil
     }
-}
-
-public struct OrganismPredictionLimits: Sendable, Equatable {
-    public var maximumPredictions: Int
-
-    public init(maximumPredictions: Int = 96) {
-        self.maximumPredictions = max(0, maximumPredictions)
-    }
-
-    public static let defaults = OrganismPredictionLimits()
 }
 
 /// Time-forgotten counterpart of the lifetime outcome tallies. Fractional

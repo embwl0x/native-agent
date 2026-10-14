@@ -10,7 +10,6 @@ import ProviderRouting
 public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
     case invalidRequest(String)
     case persistenceFailure(String)
-    case unavailable
     case plannerFailure(String)
     case underlying(String)
     // WAVE 41 W01 (REOPEN §6.220-rd2 #1): parity errors for the two daemon
@@ -28,11 +27,6 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
     // The associated value is the same `detail` message string.
     case forbidden(String)
     case workshopExecutionsBusy(String)
-    // EXECUTOR GATE (2026-06-10): submit refuses while no Swift executor
-    // exists (queued executions could never run). Distinct from `.unavailable`
-    // (start()'s generic shape) so consumers can render the actionable
-    // message instead of a bare "executions unavailable".
-    case executorUnavailable(String)
     // STALE APPROVAL (2026-06-10, gpt-5.5 executor-port blocker #3): a
     // resume was requested for an execution that is no longer
     // blocked_on_approval (cancelled/failed/completed in the meantime).
@@ -48,12 +42,10 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
         switch self {
         case .invalidRequest(let m): return "invalid request: \(m)"
         case .persistenceFailure(let m): return "persistence failure: \(m)"
-        case .unavailable: return "Workshop execution unavailable"
         case .plannerFailure(let m): return "planner failure: \(m)"
         case .underlying(let m): return m
         case .forbidden(let m): return m
         case .workshopExecutionsBusy(let m): return m
-        case .executorUnavailable(let m): return m
         case .staleApproval(let m): return m
         case .approvalDeferred: return "Approved Workshop step deferred until execution capacity is available"
         }
@@ -145,19 +137,6 @@ public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
         ]
         if let argumentSchema { object["argument_schema"] = argumentSchema }
         return .object(object)
-    }
-}
-
-/// Result of planWorkshopExecution(). plan is ≥1 step (stub fallback guarantees this);
-/// `fromStub` distinguishes "real LLM plan" from "deterministic fallback"
-/// for tests + observability.
-public struct WorkshopExecutionPlan: Codable, Sendable, Equatable {
-    public var steps: [WorkshopExecutionStep]
-    public var fromStub: Bool
-
-    public init(steps: [WorkshopExecutionStep], fromStub: Bool) {
-        self.steps = steps
-        self.fromStub = fromStub
     }
 }
 
@@ -333,22 +312,6 @@ public struct WorkshopExecutionEnqueueResult: Codable, Sendable, Equatable {
         self.status = status
         self.executionId = executionId
         self.record = record
-    }
-}
-
-/// Envelope returned by start().
-public struct WorkshopExecutionStartResult: Codable, Sendable, Equatable {
-    public var executionId: String
-    public var status: String            // post-start status
-
-    enum CodingKeys: String, CodingKey {
-        case status
-        case executionId = "missionId" // compatibility wire ID
-    }
-
-    public init(executionId: String, status: String) {
-        self.executionId = executionId
-        self.status = status
     }
 }
 
@@ -569,50 +532,6 @@ enum DefaultToolAutonomy {
     }
 }
 
-// MARK: - Protocol
-
-public protocol WorkshopRunnerClient: Sendable {
-    /// Build a plan for `spec`. Always returns ≥1 step (stub fallback).
-    func planWorkshopExecution(spec: WorkshopExecutionSpec) async throws -> WorkshopExecutionPlan
-
-    /// Plan + enqueue. Writes timeline.jsonl ("enqueued") first, then
-    /// mission.json. Returns the persisted record.
-    func submit(spec: WorkshopExecutionSpec) async throws -> WorkshopExecutionEnqueueResult
-
-    /// Kick the executor for an already-enqueued execution. SwiftNative fails
-    /// closed until the executor loop is ported.
-    func start(executionId: String) async throws -> WorkshopExecutionStartResult
-
-    /// Cancel a queued/running execution — the execution-lifecycle WRITE for
-    /// POST /v1/missions/<id>/cancel. Mirrors MissionRunner.cancel
-    ///: idempotent (already-cancelled → no-op,
-    /// returns the unchanged record), sets status="cancelled", persists
-    /// mission.json, appends a `cancelled` timeline event. Returns the
-    /// post-cancel record. Throws .invalidRequest("Workshop execution not found: <id>")
-    /// when the execution directory has no parseable mission.json — matching
-    /// Python's `ValueError(f"Workshop execution not found: {mission_id}")`.
-    ///
-    /// NOTE (retirement_path / KEEP reason): the Python handler ALSO runs two
-    /// daemon-internal side-effects the SwiftNative module cannot yet perform —
-    /// `_purge_mission_scratchpad` (Scratchpad lives in the Dispatcher/runtime,
-    /// not this module) and `_notify_mission(... "cancelled")` (the harness
-    /// incident detector + mobile push). Those are best-effort, non-lifecycle
-    /// side-effects. The DURABLE state transition (status + mission.json +
-    /// timeline) is fully native here; the route stays live until the
-    /// scratchpad-purge and harness-notify subsystems are ported.
-    func cancel(executionId: String) async throws -> WorkshopExecutionRecord
-
-    /// In-place field mutation for the queue-bridge half of POST
-    /// /v1/missions/update. Mirrors the `_missions_allowed()` queue-bridge
-    /// branch of Runtime.update_mission:
-    /// applies title/objective/status/result patches to the queue execution's
-    /// mission.json under flock, clears current_step_id on a terminal status,
-    /// bumps updated_at, and returns the post-patch record. Returns nil when
-    /// the id is NOT a queue execution; callers should surface that historical
-    /// missions.jsonl rows are not handled by the queue bridge.
-    func updateWorkshopExecution(_ patch: WorkshopExecutionUpdate) async throws -> WorkshopExecutionRecord?
-}
-
 /// Field patch for the queue-bridge half of POST /v1/missions/update.
 /// `nil` means "field absent in the request body" → leave unchanged, exactly
 /// like Python's `if "title" in body:` presence checks (L5385-L5398). An
@@ -636,15 +555,9 @@ public struct WorkshopExecutionUpdate: Sendable, Equatable {
         self.result = result
     }
 
-    /// Decode from the daemon's request-body dict. Mirrors the key set Python
-    /// reads at L5370 (`id`/`mission_id`) and L5385-L5398
-    /// (`title`/`objective`/`status`/`summary`/`result`). Presence — not just
-    /// non-nil-ness — is what Python branches on, so we only populate a field
-    /// when its key is actually present in `body`.
     /// Retired truthiness for a JSON value (matches `bool(x)` for the scalar
     /// types `body.get(...)` can return): absent/null/false/0/0.0/""/[]/{}
-    /// are falsy; everything else is truthy. Used by `fromBody` to mirror
-    /// Python's `a or b` falsy-fallback in the summary/result selection.
+    /// are falsy; everything else is truthy.
     static func pyTruthy(_ v: JSONValue?) -> Bool {
         switch v {
         case .none, .some(.null): return false
@@ -655,52 +568,5 @@ public struct WorkshopExecutionUpdate: Sendable, Equatable {
         case .some(.array(let a)): return !a.isEmpty
         case .some(.object(let o)): return !o.isEmpty
         }
-    }
-
-    public static func fromBody(_ body: [String: JSONValue]) -> WorkshopExecutionUpdate {
-        func str(_ key: String) -> String? {
-            switch body[key] {
-            case .some(.string(let s)): return s
-            case .some(.null), .none: return nil
-            case .some(let other):
-                // Python coerces with str(...); mirror for non-string scalars.
-                if case .int(let i) = other { return String(i) }
-                if case .double(let d) = other { return String(d) }
-                if case .bool(let b) = other { return b ? "True" : "False" }
-                return nil
-            }
-        }
-        let id = str("id") ?? str("execution_id") ?? str("mission_id") ?? ""
-        // `summary` is the alias Python reads FIRST for `result`, joined by
-        // Python's `or` (FALSY-fallback, not nil-fallback):
-        //   str(body.get("summary") or body.get("result") or qm.result or "")
-        // So `{"summary": "", "result": "ok"}` must yield "ok" (empty summary is
-        // falsy → falls through), and a falsy scalar (false / 0 / null / "")
-        // also falls through. gpt-5.5 review finding #1: the earlier `??`
-        // (nil-coalescing) diverged — it kept an empty summary over a real
-        // result. We pre-select with retired truthiness, then stringify.
-        let resultPresent = body["summary"] != nil || body["result"] != nil
-        let resultVal: String?
-        if resultPresent {
-            // Python `summary or result` — first truthy wins; if neither is
-            // truthy, the body contribution is "" (qm.result fallback is
-            // applied in updateWorkshopExecution against the persisted record).
-            if Self.pyTruthy(body["summary"]) {
-                resultVal = str("summary") ?? ""
-            } else if Self.pyTruthy(body["result"]) {
-                resultVal = str("result") ?? ""
-            } else {
-                resultVal = ""   // present-but-falsy → empty body contribution
-            }
-        } else {
-            resultVal = nil       // absent → leave unchanged
-        }
-        return WorkshopExecutionUpdate(
-            id: id,
-            title: body["title"] != nil ? (str("title") ?? "") : nil,
-            objective: body["objective"] != nil ? (str("objective") ?? "") : nil,
-            status: body["status"] != nil ? (str("status") ?? "") : nil,
-            result: resultVal
-        )
     }
 }

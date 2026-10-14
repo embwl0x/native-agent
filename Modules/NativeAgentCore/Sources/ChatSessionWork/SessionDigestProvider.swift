@@ -24,13 +24,7 @@ import Transcripts
 ///   2. PARTICIPANT — exact nonempty binding, with the same project. Local Mac
 ///      and paired iOS share the operator; remote identities remain scoped to
 ///      their transport and room. Unknown or mixed participants carry nothing.
-///   3. HUMAN — bridge and probe runs are excluded, on BOTH sides: never
-///      offered as the prior session, and never handed one. The bridge titles
-///      a session with its own first message, so `[from: …, via bridge]` is
-///      the marking; probe/bridge runs also mint slug ids where every real
-///      surface session carries a UUID — except legacy `telegram:<chatId>`
-///      threads, which are human and are carved back in by row source.
-///   4. LIVE — archived rows are out, on both sides: a thread User has put
+///   3. LIVE — archived rows are out, on both sides: a thread User has put
 ///      away is not "your previous session", and an archived current row has
 ///      no carry-over coming to it.
 ///
@@ -83,17 +77,6 @@ package enum PriorChatSession {
         var current: [String: JSONValue]? = nil
         for obj in rows {
             guard string(obj["id"]) == currentSessionId else { continue }
-            // Symmetric with the candidate rule: a machine's conversation has
-            // no human carry-over to be handed either. A bridge or probe run
-            // that opens a fresh session must not be told what User was last
-            // talking to her about on the Mac.
-            guard !isMachineOrigin(
-                id: currentSessionId,
-                title: string(obj["title"]),
-                source: string(obj["source"])
-            ) else {
-                return nil
-            }
             // An archived current row is a thread User has already put away;
             // it has no live carry-over to be handed.
             guard bool(obj["archived"]) != true else { return nil }
@@ -107,9 +90,6 @@ package enum PriorChatSession {
         for obj in rows {
             guard let id = string(obj["id"]), id != currentSessionId else { continue }
             guard sameParticipant(current, obj), let participant = string(obj["continuityParticipant"]) else { continue }
-            guard !isMachineOrigin(
-                id: id, title: string(obj["title"]), source: string(obj["source"])
-            ) else { continue }
             // Archived: retired by hand, not "your previous session".
             guard bool(obj["archived"]) != true else { continue }
             guard let updated = parseTimestamp(
@@ -134,7 +114,7 @@ package enum PriorChatSession {
               lhs["projectSpaceId"] == rhs["projectSpaceId"] else { return false }
         // Shared rooms and Telegram groups never donate a different room's
         // conversation, even when the same sender spoke in both.
-        if participant != "local_operator" {
+        if participant != "local_operator", !participant.hasPrefix("peer:") {
             guard let scope = string(lhs["continuityScope"]), !scope.isEmpty else { return false }
             return lhs["source"] == rhs["source"] && string(rhs["continuityScope"]) == scope
         }
@@ -164,54 +144,6 @@ package enum PriorChatSession {
             ) != nil else { return false }
         }
         return true
-    }
-
-    /// Bridge/probe rows, which are conversations WITH A MACHINE that happen
-    /// to run on chat's surface and permissions. Two markings:
-    ///
-    ///   TITLE — the bridge titles a session with its own first message, so
-    ///   `"[from: "` + `"via bridge]"` is the tell (the same two-part shape
-    ///   the tool preloader uses).
-    ///
-    ///   ID — bridge and probe runs choose their OWN session id. There is no
-    ///   minting prefix to key on: `ClaudeBridge.bridgeMessageSessionID`
-    ///   simply forwards whatever the caller put on the wire, so the live
-    ///   index carries free-form slugs ("generalist-outcome-proof-20260830",
-    ///   "murmur-house-art-review-20260828", "codex-architecture-loop-agent",
-    ///   "telegram-drive-1780552030", "telegram:codex-probe"). Every real
-    ///   Mac/iOS/Telegram session id, by contrast, is a UUID.
-    ///
-    /// The UUID test used to stand alone, and it was over-broad: Telegram's
-    /// own store still mints `telegram:<chatId>` for legacy human threads
-    /// (`TelegramSessionStore.legacySessionId`), and those were being read as
-    /// probes — dropped from the /new pointer AND from `previous_session`.
-    /// So one carve-out, and only one: a `telegram:<chatId>` id whose ROW
-    /// says `source: "telegram"` is human. The row's source is what separates
-    /// it from `telegram:codex-probe`, which the live index carries with
-    /// `source: "app"`. A telegram-shaped id we cannot corroborate against a
-    /// telegram row stays machine — fail closed, as everywhere else here.
-    static func isMachineOrigin(id: String, title: String?, source: String? = nil) -> Bool {
-        let normalized = (title ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        // A conversation that began over the bridge is a conversation with
-        // Claude or Codex, not a machine log (User, 2026-09-12: "you should get
-        // the full Agent"). It digests like any UUID-keyed session.
-        _ = normalized
-        if UUID(uuidString: id) != nil { return false }
-        return !isLegacyTelegramHumanId(id, source: source)
-    }
-
-    /// `telegram:<chatId>` (chatId is an Int, negative for groups) on a row
-    /// whose source really is telegram — the ONE non-UUID id shape a human
-    /// session legitimately carries.
-    static func isLegacyTelegramHumanId(_ id: String, source: String?) -> Bool {
-        guard (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() == "telegram" else { return false }
-        guard id.hasPrefix("telegram:") else { return false }
-        var chatId = Substring(id.dropFirst("telegram:".count))
-        if chatId.first == "-" { chatId = chatId.dropFirst() }
-        return !chatId.isEmpty && chatId.allSatisfy(\.isNumber)
     }
 
     // MARK: value + time helpers
@@ -309,12 +241,6 @@ actor SessionDigestCache {
         store[key] = value
     }
 
-    /// Test hook — clears all settled cache state (simulates eviction).
-    /// In-flight builds are left to land and re-cache on their own.
-    func removeAll() {
-        store.removeAll()
-        insertionOrder.removeAll()
-    }
 }
 
 // MARK: - SessionDigestProvider
@@ -531,7 +457,8 @@ public struct SessionDigestProvider: Sendable {
         let response = try await llm.complete(
             prompt: prompt, system: Self.handoffSystem, model: model, surface: surface, purpose: "digest")
         try Task.checkCancellation()
-        guard case .object(let fields) = try JSONValue.parse(Data(response.utf8)),
+        guard let slice = MemoryMoments.jsonSlice(from: response),
+              case .object(let fields) = try JSONValue.parse(Data(slice.utf8)),
               Set(fields.keys) == Set(["last_decision", "unresolved_ask", "next_step"]) else {
             throw CocoaError(.coderInvalidValue)
         }

@@ -2,148 +2,201 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Senses
+
+public struct SkillManifest: Codable, Identifiable, Sendable {
+    public var id: String { name }
+    public let schemaVersion: Int
+    public let name: String
+    public let version: String
+    public let type: String
+    public let description: String
+    public let author: SkillAuthor?
+    public let permissions: [String]?
+    public let tools: [SkillTool]?
+    public let oauth: SkillOAuth?
+    public let tags: [String]?
+    public let homepage: String?
+}
+
+public struct SkillAuthor: Codable, Sendable {
+    public let name: String
+    public let email: String?
+    public let url: String?
+}
+
+public struct SkillOAuth: Codable, Sendable {
+    public let provider: String
+    public let scopes: [String]
+    public let deviceFlow: Bool?
+}
+
+public struct SkillTool: Codable, Identifiable, Sendable {
+    public var id: String { name }
+    public let name: String
+    public let description: String
+}
+
+public struct SkillInfo: Identifiable, Sendable {
+    public let id: String
+    public let manifest: SkillManifest
+    public let registry: SkillRegistryEntry
+    public let readme: String?
+    public var candidateDigest: String? = nil
+    public var validationStatus: String? = nil
+
+    public static func learnedSkill(_ skill: SkillRecord, review: JSONValue?) -> SkillInfo {
+        let skillId = skill.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? skill.name : skill.id
+        let name = skill.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? skillId : skill.name
+        let rawState = (skill.status ?? "active").lowercased()
+        let state: String = {
+            switch rawState {
+            case "draft": return "drafted"
+            case "disabled": return "dormant"
+            default: return rawState.isEmpty ? "active" : rawState
+            }
+        }()
+        let manifest = SkillManifest(
+            schemaVersion: 1,
+            name: name,
+            version: "runtime",
+            type: skill.kind ?? "learned_skill",
+            description: skill.description,
+            author: nil,
+            permissions: nil,
+            tools: nil,
+            oauth: nil,
+            tags: skill.autoCreated == true ? ["learned"] : nil,
+            homepage: nil
+        )
+        let registry = SkillRegistryEntry(
+            name: skillId,
+            state: state,
+            version: "runtime",
+            type: skill.kind ?? "learned_skill",
+            installedAt: skill.createdAt,
+            path: skill.bodyPath ?? ""
+        )
+        let fields: [String: JSONValue] = if case .object(let value)? = review { value } else { [:] }
+        let candidate: [String: JSONValue] = if case .object(let value)? = fields["candidate"] { value } else { [:] }
+        let version = candidate["digest"] ?? fields["selected_version"]
+        let validation = candidate["validation"] ?? fields["validation"] ?? (fields["runnable"] == .bool(true) ? .string("accepted") : .null)
+        var script: [String: JSONValue] = if case .object(let value)? = candidate["script"] ?? fields["script"] { value } else { [:] }
+        let code = script.removeValue(forKey: "source")
+        let source = JSONValue.object(["description": .string(skill.description), "status": .string(state),
+            "version": version ?? .null, "validation": validation, "versions": fields["versions"] ?? .null,
+            "script": .object(script),
+            "fixtures": candidate["fixtures"] ?? fields["fixtures"] ?? .array([])])
+        let preview = try? source.serialize(pretty: true)
+        let codeText = if case .string(let value)? = code { value } else { "No JS source is selected." }
+        return SkillInfo(id: skillId, manifest: manifest, registry: registry,
+                         readme: review == nil ? nil : preview.map { codeText + "\n\n" + $0 },
+                         candidateDigest: { if case .string(let value)? = version { value } else { nil } }(),
+                         validationStatus: { if case .string(let value) = validation { value } else { nil } }())
+    }
+}
 
 /// The identity and availability projection shared by discovery, UI and recall.
 public enum InstalledSkillInventory {
+    public static func reviewInstallRefusal(
+        version: String, state: String, name: String, hasCandidate: Bool, validationStatus: String?
+    ) -> String? {
+        let state = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if version == "runtime" {
+            guard hasCandidate else { return "No exact JS candidate is available for review. Read Tools census." }
+            guard validationStatus == "valid" else { return "Validate this exact candidate with skill.validate before installing it." }
+        }
+        guard state == "drafted" || validationStatus == "valid" else {
+            let shownState = state.isEmpty ? "missing" : state
+            return "Only a drafted skill can be installed from this review sheet. This skill is currently \(shownState)."
+        }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            return "This draft has no id, so it cannot be installed safely."
+        }
+        return nil
+    }
     public struct Entry: Sendable {
         public let row: [String: JSONValue]
-        public let bodyURL: URL?
-        public var id: String {
-            let value = InstalledSkillInventory.string(row["id"]) ?? ""
-            return value.isEmpty ? name : value
-        }
+        public var id: String { InstalledSkillInventory.string(row["id"]) ?? "" }
         public var name: String { InstalledSkillInventory.string(row["name"]) ?? "" }
         public var isAvailable: Bool { InstalledSkillInventory.isAvailable(row) }
         /// On, with a script whose exact digest an admission binds (`SkillScript`).
         public var isRunnable: Bool { SkillScript.isRunnable(row) }
+        public var summary: JSONValue {
+            var fields = row.filter { ["id", "name", "description", "triggers", "status", "source", "signature", "overrides"].contains($0.key) }
+            if let script = row["script"] {
+                fields["signature"] = .string(SkillScript.signature(script))
+                fields["params"] = script.objectValue?["params"] ?? .object([:])
+                fields["input_schema"] = SkillScript.inputSchema(script)
+                if fields["params"] == .object([:]) { fields["input_note"] = .string("No inputs are declared. Read the routine with skill.read {source:true} before running it.") }
+            }
+            fields["runnable"] = .bool(isRunnable)
+            fields["next_call"] = .object(["action": .string(isRunnable ? "skill.run" : "skill.read"),
+                "args": .object(["name": .string(name)])])
+            return .object(fields)
+        }
     }
 
     public static func isAvailable(_ row: [String: JSONValue]) -> Bool {
-        ["active", "installed"].contains((string(row["status"]) ?? "active").lowercased())
+        ["active", "installed"].contains((string(row["status"] ?? row["state"]) ?? "active").lowercased())
     }
 
-    /// Compact compatibility view. Checked consumers use entries so a bad
-    /// registry cannot be mistaken for permission to expose its loose bodies.
-    public static func list(dataRoot: URL, sourceRoot: URL? = nil, personaRoot: URL? = nil) -> [JSONValue] {
-        (try? entries(dataRoot: dataRoot, sourceRoot: sourceRoot, personaRoot: personaRoot))?.map { entry in
-            var row = entry.row.filter { ["id", "name", "description", "triggers", "status", "source", "signature", "overrides"].contains($0.key) }
-            if let script = entry.row["script"] { row["signature"] = .string(SkillScript.signature(script)) } // rows saved before input.x
-            if row["source"] != .string("runtime_registry") {
-                row["status"] = .string("installed")
-                row.removeValue(forKey: "id")
-                row.removeValue(forKey: "triggers")
-            }
-            return .object(row)
-        } ?? []
+    /// Compact view; checked consumers use entries and report registry errors.
+    public static func list(dataRoot: URL) -> [JSONValue] {
+        (try? entries(dataRoot: dataRoot))?.map(\.summary) ?? []
     }
 
-    public static func entries(dataRoot: URL, sourceRoot: URL? = nil, personaRoot: URL? = nil) throws -> [Entry] {
-        try entries(
-            registryURL: dataRoot.appendingPathComponent("skills/registry.json"),
-            bodiesDirs: [dataRoot.appendingPathComponent("skills/bodies"),
-                         (personaRoot ?? defaultPersonaRoot(dataRoot: dataRoot)).appendingPathComponent("skills/bodies")],
-            sourceRoot: sourceRoot ?? dataRoot.deletingLastPathComponent()
-        )
-    }
-
-    public static func entries(registryURL: URL?, bodiesDirs: [URL], sourceRoot: URL? = nil) throws -> [Entry] {
-        let fm = FileManager.default
-        var registry: [JSONValue] = []
-        if let registryURL, fm.fileExists(atPath: registryURL.path) {
-            let raw = try JSONValue.parse(Data(contentsOf: registryURL))
-            registry = try SkillsRegistry.decode(raw)
-        }
-        var result: [Entry] = []
-        // A registry row claims its handles from loose bodies. It hides a
-        // built-in (persona body) of the same name too, unless it is her
-        // version of that built-in and not on (drafted, off, archived): then
-        // the built-in is still the one in use.
-        var claimed: Set<String> = []
-        var hides: Set<String> = []
-        let base = sourceRoot ?? registryURL?.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    public static func entries(dataRoot: URL) throws -> [Entry] {
+        let registry = try SkillsRegistry.decode(AbilityStore(dataRoot: dataRoot).registry(kind: .skill))
+        var entries: [Entry] = []
         for value in registry {
-            guard case .object(var row) = value else {
-                throw SkillsError.invalidRegistry("skill registry contains a non-object row")
-            }
-            let id = string(row["id"]) ?? ""
-            let name = string(row["name"]) ?? id
-            var candidates: [URL] = []
-            var handles = Set([id, name].filter { !$0.isEmpty }.map { $0.lowercased() })
-            if let raw = string(row["bodyPath"]), !raw.isEmpty {
-                let expanded = (raw as NSString).expandingTildeInPath
-                let url = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded) : base?.appendingPathComponent(expanded)
-                if let url { candidates.append(url) }
-                handles.insert(URL(fileURLWithPath: expanded).deletingPathExtension().lastPathComponent.lowercased())
-            }
-            for handle in [id, name] where safeHandle(handle) {
-                candidates += bodiesDirs.map { $0.appendingPathComponent("\(handle).md") }
-            }
-            claimed.formUnion(handles)
-            let bodyURL = candidates.first { readableBody(at: $0, roots: bodiesDirs) != nil }
-            if let bodyURL, let body = readableBody(at: bodyURL, roots: bodiesDirs),
-               !SkillBodyHygiene.violations(in: body).isEmpty {
-                hides.formUnion(handles)
-                continue
-            }
-            // Her version of a built-in (a persona body of the same name): it
-            // wins by name while it is on, and the built-in file stays as it ships.
-            if let bodyURL, let runtime = bodiesDirs.first, readableBody(at: bodyURL, roots: [runtime]) != nil,
-               [name, id].contains(where: { handle in
-                   safeHandle(handle) && bodiesDirs.dropFirst().contains {
-                       readableBody(at: $0.appendingPathComponent("\(handle).md"), roots: bodiesDirs) != nil
-                   }
-               }) {
-                row["overrides"] = .string("built_in")
-            }
-            if row["overrides"] == nil || isAvailable(row) {
-                hides.formUnion(handles)
-            }
+            guard case .object(var row) = value else { throw SkillsError.invalidRegistry("skill registry contains a non-object row") }
             row["source"] = .string("runtime_registry")
-            result.append(Entry(row: row, bodyURL: bodyURL))
+            entries.append(Entry(row: row))
         }
-        for (index, directory) in bodiesDirs.enumerated() {
-            guard fm.fileExists(atPath: directory.path) else { continue }
-            let files = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
-            for url in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where url.pathExtension.lowercased() == "md" {
-                let name = url.deletingPathExtension().lastPathComponent
-                guard !(index == 0 ? claimed : hides).contains(name.lowercased()),
-                      let body = readableBody(at: url, roots: bodiesDirs),
-                      SkillBodyHygiene.violations(in: body).isEmpty else { continue }
-                claimed.insert(name.lowercased())
-                hides.insert(name.lowercased())
-                result.append(Entry(row: [
-                    "id": .string(name), "name": .string(name),
-                    "description": .string(String((SkillBodyHygiene.firstUsefulLine(in: body) ?? "Skill body.").prefix(240))),
-                    "triggers": .array([]), "kind": .string("skill"), "status": .string("active"),
-                    "autoCreated": .bool(false), "bodyPath": .string(url.path),
-                    "source": .string(index == 0 ? "runtime_body" : "persona_body"),
-                ], bodyURL: url))
+        let bodies = defaultPersonaRoot(dataRoot: dataRoot).appendingPathComponent("skills/bodies")
+        if FileManager.default.fileExists(atPath: bodies.path) {
+            for file in try FileManager.default.contentsOfDirectory(at: bodies, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                where file.pathExtension == "md" {
+                let id = file.deletingPathExtension().lastPathComponent
+                guard !entries.contains(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame }),
+                      let original = try builtIn(["id": .string(id), "overrides": .string("built_in")], dataRoot: dataRoot) else { continue }
+                entries.append(Entry(row: original))
             }
         }
-        // The one name two entries share (in any case) is her version of a
-        // built-in that is not on, and the built-in: the built-in, on, comes first.
-        return result.sorted {
-            let (a, b) = ($0.name.lowercased(), $1.name.lowercased())
-            if a != b { return a < b }
-            if $0.isAvailable != $1.isAvailable { return $0.isAvailable }
-            return $0.name == $1.name ? $0.id < $1.id : $0.name < $1.name
+        return entries.sorted {
+            if $0.name.caseInsensitiveCompare($1.name) == .orderedSame, $0.isAvailable != $1.isAvailable { return $0.isAvailable }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+    }
+
+    /// Bundled originals stay outside the writable ability store.
+    public static func builtIn(_ row: [String: JSONValue], dataRoot: URL) throws -> [String: JSONValue]? {
+        guard row["overrides"] == .string("built_in"), let id = string(row["id"]) else { return nil }
+        guard SkillMutation.isSafeSkillID(id) else { throw SkillsError.invalidRegistry("The built-in skill identity is invalid.") }
+        let file = defaultPersonaRoot(dataRoot: dataRoot).appendingPathComponent("skills/bodies/\(id).md")
+        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
+        try VerifiedPath.confirmNoSymlink(file)
+        let body = try String(contentsOf: file, encoding: .utf8)
+        return ["id": .string(id), "name": row["name"] ?? .string(id),
+                "description": .string(body.split(separator: "\n").first.map(String.init) ?? id),
+                "triggers": .array([]), "status": .string("active"), "source": .string("persona_body"),
+                "bodyPath": .string(file.path), "overrides": .string("built_in")]
+    }
+
+    public static func selected(_ row: [String: JSONValue], dataRoot: URL) throws -> [String: JSONValue] {
+        return row
     }
 
     public static func match(_ name: String, in entries: [Entry]) -> Entry? {
-        entries.first { $0.id.caseInsensitiveCompare(name) == .orderedSame }
-            ?? entries.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        var matches = entries.filter { $0.id.caseInsensitiveCompare(name) == .orderedSame }
+        if matches.isEmpty { matches = entries.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame } }
+        return matches.first { $0.isAvailable } ?? matches.first
     }
 
-    private static func safeHandle(_ name: String) -> Bool {
-        !name.isEmpty && !name.contains("/") && !name.contains("..") && !name.hasPrefix(".")
-    }
-
-    private static func readableBody(at url: URL, roots: [URL]) -> String? {
-        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
-        guard roots.contains(where: { resolved.path.hasPrefix($0.standardizedFileURL.resolvingSymlinksInPath().path + "/") }),
-              (try? resolved.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { return nil }
-        return try? String(contentsOf: resolved, encoding: .utf8)
+    public static func match(_ name: String, in rows: [JSONValue]) -> Entry? {
+        match(name, in: rows.compactMap { $0.objectValue.map { Entry(row: $0) } })
     }
 
     private static func string(_ value: JSONValue?) -> String? {
@@ -153,8 +206,7 @@ public enum InstalledSkillInventory {
 }
 
 /// A repeatable skill's script (skills-as-code PR 2): JavaScript in its
-/// registry row with a small header, never in its body, so body hygiene
-/// neither reads nor rewrites it. A write that adds or changes one lands
+/// ability file with a small header. A write that adds or changes one lands
 /// drafted, and it runs only while an admission binds the exact digest of
 /// script and header, given by whoever may admit what steered it. Every field
 /// here fails closed: missing or malformed means not runnable.
@@ -164,6 +216,7 @@ public enum SkillScript {
     public static let stepLimit = 50
     public static let actionLimit = 50
     static let types: Set<String> = ["string", "int", "number", "bool", "list", "object"]
+    static let verbs: Set<String> = ["read", "find", "log", "expect", "expect_fail", "decide", "step"]
     /// A script whose origin no record names counts as a peer's.
     static let unrecorded = "unrecorded"
 
@@ -173,7 +226,7 @@ public enum SkillScript {
         guard case .object(let raw)? = value else {
             throw refuse("script is an object: {source, params, actions, steps, of}.")
         }
-        if let stray = raw.keys.sorted().first(where: { !["source", "params", "actions", "steps", "of"].contains($0) }) {
+        if let stray = raw.keys.sorted().first(where: { !["source", "params", "actions", "steps", "of", "entry"].contains($0) }) {
             throw refuse("script takes no \(stray); its keys are source, params, actions, steps and of.")
         }
         guard case .string(let source)? = raw["source"], !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -182,26 +235,34 @@ public enum SkillScript {
         }
         var params: [String: JSONValue] = [:]
         if let given = raw["params"], given != .null {
-            guard case .object(let fields) = given else { throw refuse("params maps each input name to its type.") }
+            guard case .object(let fields) = given else { throw refuse("params maps each input name to its type or {type, description}.") }
             for (name, type) in fields {
                 guard name.range(of: "^[A-Za-z_][A-Za-z0-9_]{0,63}$", options: .regularExpression) != nil,
-                      case .string(let spelled) = type,
+                      let spelled = parameterType(type),
                       types.contains(spelled.hasSuffix("?") ? String(spelled.dropLast()) : spelled) else {
                     throw refuse("params maps each input name to string, int, number, bool, list or object; "
                         + "a trailing ? marks it optional.")
                 }
+                if case .object(let declaration) = type {
+                    guard Set(declaration.keys) == ["type", "description"],
+                          let description = string(declaration["description"]), !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw refuse("A described param is {type, description}, with a nonempty description.")
+                    }
+                }
                 params[name] = type
             }
         }
-        guard case .array(let listed)? = raw["actions"], (1...actionLimit).contains(listed.count) else {
-            throw refuse("actions lists the app action ids it may call, 1 to \(actionLimit).")
+        guard case .array(let listed)? = raw["actions"], listed.count <= actionLimit else {
+            throw refuse("actions lists the app action ids it may call, at most \(actionLimit).")
         }
         var actions: [String] = []
         for item in listed {
             guard case .string(let spelled) = item else { throw refuse("each action is an app action id, like memory.recall.") }
             let id = spelled.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard id.range(of: "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$", options: .regularExpression) != nil else {
-                throw refuse("\(spelled) is not an app action id, like memory.recall.")
+            guard !verbs.contains(id.hasPrefix("app.") ? String(id.dropFirst(4)) : id),
+                  id.range(of: "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$", options: .regularExpression) != nil else {
+                throw refuse("\(spelled) is not an app action dependency. actions lists IDs such as memory.recall; "
+                    + "app.read, app.find, app.log, app.expect, app.expect_fail, app.decide and app.step are built in. Use actions:[] for helpers alone.")
             }
             if !actions.contains(id) { actions.append(id) }
         }
@@ -218,6 +279,8 @@ public enum SkillScript {
             "source": .string(source), "params": .object(params),
             "actions": .array(actions.map(JSONValue.string)), "of": .int(of),
         ]
+        guard raw["entry"] == .string("run") else { throw refuse("entry is run: define function run(input).") }
+        script["entry"] = .string("run")
         if let given = raw["steps"], given != .null, given != .array([]) {
             guard case .array(let labels) = given, labels.count == Int(of), labels.allSatisfy({
                 if case .string(let label) = $0 { !label.isEmpty && label.count <= 160 } else { false }
@@ -237,7 +300,6 @@ public enum SkillScript {
               let regex = try? NSRegularExpression(pattern: #"\bapp\s*\.\s*(\w+)\s*\.\s*(\w+)\s*\("#) else { return [] }
         let code = codeMask(source)
         let declared = Set(strings(fields["actions"]))
-        let verbs: Set<String> = ["read", "find", "log", "expect", "expect_fail", "decide", "step"]
         var found: [String] = []
         // app.<name>( that is no runner verb calls nothing that exists (app.call is not the API).
         if let bare = try? NSRegularExpression(pattern: #"\bapp\s*\.\s*(\w+)\s*\("#) {
@@ -332,59 +394,47 @@ public enum SkillScript {
         return String(decoding: masked, as: UTF16.self)
     }
 
-    /// Revision 1 ignored await. Keep the old source's lines and every literal byte.
-    static func legacySource(_ source: String) -> String {
-        let code = codeMask(source)
-        let tokens = try! NSRegularExpression(pattern: #"\bawait(?=\s)"#)
-        var text = Array(source.utf16)
-        for token in tokens.matches(in: code, range: NSRange(code.startIndex..., in: code)) {
-            guard let following = UnicodeScalar(UInt32(text[NSMaxRange(token.range)])),
-                  CharacterSet.whitespacesAndNewlines.contains(following) else { continue }
-            let prefix = (code as NSString).substring(to: token.range.location).trimmingCharacters(in: .whitespacesAndNewlines)
-            if prefix.hasSuffix(".") { continue }
-            for n in token.range.location..<NSMaxRange(token.range) { text[n] = 32 }
-        }
-        return String(decoding: text, as: UTF16.self)
-    }
-
-    @discardableResult
-    static func normalizeInterpreter(_ row: inout [String: JSONValue]) -> Bool {
-        guard case .object(var script)? = row["script"], case .string(let source)? = script["source"],
-              row["actionPin"]?.objectValue?["interpreter"] != .int(Int64(interpreterRevision)) else { return false }
-        let normalized = legacySource(source)
-        script["source"] = .string(normalized)
-        row["script"] = .object(script)
-        var pin = normalized == source ? row["actionPin"]?.objectValue ?? [:] : [:]
-        pin["digest"] = .string(digest(row["script"]) ?? "")
-        pin["interpreter"] = .int(Int64(interpreterRevision))
-        row["actionPin"] = .object(pin)
-        // Revision 1 also stripped literal/comment text. Every affected digest needs review.
-        return source.range(of: #"\bawait\s+"#, options: .regularExpression) != nil
-    }
-
-    /// SHA-256 of the stored script and header, canonical JSON (sorted keys).
-    public static func digest(_ script: JSONValue?) -> String? {
+    /// Source integrity for action pins; executable identity is the owned candidate.
+    public static func sourceChecksum(_ script: JSONValue?) -> String? {
         guard case .object? = script, let text = try? script?.serialize(pretty: false) else { return nil }
         return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// The one line generated from the header; her description stays hers.
+    public static func actions(_ script: JSONValue) -> [String] {
+        guard let fields = script.objectValue else { return [] }
+        var actions = strings(fields["actions"])
+        guard let source = string(fields["source"]) else { return actions }
+        let code = codeMask(source)
+        let calls = try! NSRegularExpression(pattern: #"\bapp\s*\.\s*read\s*\("#)
+        let literal = try! NSRegularExpression(pattern: #"^\s*(['"])([^'"\\]*)\1"#)
+        for call in calls.matches(in: code, range: NSRange(code.startIndex..., in: code)) {
+            let tail = (source as NSString).substring(from: NSMaxRange(call.range))
+            let target = literal.firstMatch(in: tail, range: NSRange(tail.startIndex..., in: tail))
+                .map { (tail as NSString).substring(with: $0.range(at: 2)) }
+            let read = target.map { "read \($0)" } ?? "app.read"
+            if !actions.contains(read) { actions.append(read) }
+        }
+        return actions
+    }
+
+    /// Generated from the stored code and header; her description stays hers.
     public static func signature(_ script: JSONValue) -> String {
         guard case .object(let fields) = script else { return "" }
         var params: [String] = []
         if case .object(let given)? = fields["params"] {
-            params = given.keys.sorted().map { "input.\($0): \(string(given[$0]) ?? "?")" }
+            params = given.keys.sorted().map { "input.\($0): \(parameterType(given[$0]) ?? "?")" }
         }
-        let actions = strings(fields["actions"])
+        let actions = actions(script)
         let of = if case .int(let n)? = fields["of"] { n } else { Int64(0) }
-        return "script {\(params.joined(separator: ", "))} · \(of) step\(of == 1 ? "" : "s") · calls \(actions.joined(separator: ", "))"
+        return "run {\(params.joined(separator: ", "))} · \(of) step\(of == 1 ? "" : "s")"
+            + (actions.isEmpty ? "" : " · calls \(actions.joined(separator: ", "))")
     }
 
     /// Who steered the turn that wrote it: hers, or the peers that did
     /// (their words consumed, an elevated peer's included).
     public static func origin(steeredBy peers: [String]) -> JSONValue {
         peers.isEmpty ? .object(["by": .string("hers")])
-            : .object(["by": .string("peer"), "peers": .array(peers.prefix(8).map(JSONValue.string))])
+            : .object(["by": .string("peer"), "peers": .array(peers.map(JSONValue.string))])
     }
 
     public static func origin(pack: String) -> JSONValue {
@@ -422,7 +472,7 @@ public enum SkillScript {
         var seen: Set<String> = []
         peers = peers.filter { seen.insert($0).inserted }
         guard !peers.isEmpty else { return pack.map(origin(pack:)) ?? origin(steeredBy: []) }
-        var fields: [String: JSONValue] = ["by": .string("peer"), "peers": .array(peers.prefix(8).map(JSONValue.string))]
+        var fields: [String: JSONValue] = ["by": .string("peer"), "peers": .array(peers.map(JSONValue.string))]
         if let pack { fields["pack"] = .string(pack) }
         return .object(fields)
     }
@@ -436,19 +486,21 @@ public enum SkillScript {
         return strings(origin["peers"]) + [string(origin["pack"])].compactMap { $0 }
     }
 
-    public static func admission(_ script: JSONValue, by: String, at: String) -> JSONValue {
-        .object(["digest": .string(digest(script) ?? ""), "by": .string(by), "at": .string(at)])
+    public static func agentMayAdmit(_ origin: JSONValue?) -> Bool {
+        guard let kind = originKind(origin), origin?.objectValue?["pack"] == nil else { return false }
+        return kind == "hers" || kind == "peer" && strings(origin?.objectValue?["peers"]).allSatisfy(CapabilityLifecycle.ownerTrusts)
     }
 
-    /// An admission that binds this row's exact, well-formed script, given by
-    /// User, or by her for a script of her own origin.
+    /// Admission binds the immutable candidate, including source and dependencies.
     public static func admitted(_ row: [String: JSONValue]) -> Bool {
-        guard let stored = row["script"], (try? normalized(stored)) == stored, let digest = digest(stored),
-              case .object(let admission)? = row["admission"], admission["digest"] == .string(digest),
-              let kind = originKind(row["origin"]) else { return false }
+        guard let stored = row["script"], (try? normalized(stored)) == stored,
+              let digest = string(row["codeFingerprint"]), digest.count == 64,
+              digest.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+              case .object(let admission)? = row["admission"], admission["candidate"] == .string(digest),
+              originKind(row["origin"]) != nil else { return false }
         switch string(admission["by"]) {
         case "user": return true
-        case "agent": return kind == "hers"
+        case "agent": return agentMayAdmit(row["origin"])
         default: return false
         }
     }
@@ -457,15 +509,34 @@ public enum SkillScript {
     /// never makes a script runnable.
     public static func isRunnable(_ row: [String: JSONValue]) -> Bool {
         ["active", "installed"].contains(string(row["status"])?.lowercased() ?? "") && admitted(row)
+            && row["script"]?.objectValue?["entry"] == .string("run") && row["codeFingerprint"] != nil
             && row["actionPin"]?.objectValue?["interpreter"] == .int(Int64(interpreterRevision))
-            && row["actionPin"]?.objectValue?["digest"] == digest(row["script"]).map(JSONValue.string)
+            && row["actionPin"]?.objectValue?["digest"] == sourceChecksum(row["script"]).map(JSONValue.string)
+    }
+
+    public static func inputSchema(_ script: JSONValue) -> JSONValue {
+        let params = script.objectValue?["params"]?.objectValue ?? [:]
+        let types = ["string": "string", "int": "integer", "number": "number", "bool": "boolean", "list": "array", "object": "object"]
+        let properties = params.mapValues { value -> JSONValue in
+            let type = parameterType(value) ?? ""
+            var property: [String: JSONValue] = ["type": .string(types[type.hasSuffix("?") ? String(type.dropLast()) : type] ?? "")]
+            if let description = value.objectValue?["description"] { property["description"] = description }
+            return .object(property)
+        }
+        return .object(["type": .string("object"), "properties": .object(properties),
+            "required": .array(params.keys.sorted().filter { !(parameterType(params[$0]) ?? "").hasSuffix("?") }.map(JSONValue.string)),
+            "additionalProperties": .bool(false)])
+    }
+
+    public static func parameterType(_ value: JSONValue?) -> String? {
+        string(value) ?? string(value?.objectValue?["type"])
     }
 
     /// The origin a row already carries, as one to merge: none for a row that
     /// never had a script or an origin, nil (unrecorded) for a script row without one.
     static func recorded(_ row: [String: JSONValue]?) -> [JSONValue?] {
         guard let row, row["script"] != nil || row["origin"] != nil else { return [] }
-        return [row["origin"]]
+        return [row["origin"]] + (row["candidateOrigin"].map { [$0] } ?? [])
     }
 
     /// One rule for every write that leaves a script on a row (save, dedupe,
@@ -482,11 +553,11 @@ public enum SkillScript {
             return
         }
         row["signature"] = .string(signature(script))
-        row["scriptDigest"] = digest(script).map(JSONValue.string)
-        if digest(script) != digest(before?["script"]) {
+        row["scriptDigest"] = sourceChecksum(script).map(JSONValue.string)
+        if script != before?["script"] {
             row.removeValue(forKey: "admission")
             row["status"] = .string("draft")
-            row["actionPin"] = .object(["digest": .string(digest(script) ?? ""),
+            row["actionPin"] = .object(["digest": .string(sourceChecksum(script) ?? ""),
                 "interpreter": .int(Int64(interpreterRevision))])
         } else {
             row["admission"] = before?["admission"]

@@ -1,8 +1,10 @@
+import BackgroundWork
 import ChatOrchestration
 import AppToolRuntime
 import NativeAgentCore
 import SwiftUI
 import StandingBots
+import ProviderRouting
 import ApprovalInbox
 import PersistenceCore
 import Transcripts
@@ -35,7 +37,7 @@ struct BotsShelfView: View {
     @State private var shelfLoaded = false
     @State private var shelfError: String?
     @State private var busy = false
-    /// `BackgroundLoopsAssembly.unattendedWorkAllowed` for this root, read on
+    /// `WorkshopBackgroundWork.unattendedWorkAllowed` for this root, read on
     /// every reload. Off means no bot card may show a next-run time.
     @State private var unattended = true
     /// One shelf read in flight, one pending refresh behind it.
@@ -104,9 +106,12 @@ struct BotsShelfView: View {
         .background { ShellRoomBackdrop() }
         .sheet(isPresented: $editing) {
             BotsEditorSheet(definition: editedBot) { bot in
-                if editedBot == nil { try BotDefinitionStore(dataRoot: root).create(bot) }
-                else { try BotDefinitionStore(dataRoot: root).update(bot) }
-                reload()
+                let store = BotDefinitionStore(dataRoot: root)
+                let creating = editedBot == nil
+                _ = try await Task.detached(priority: .utility) {
+                    try (creating ? store.create(bot) : store.update(bot))
+                }.value
+                await reloadNow()
             }
         }
         .liveTask(id: WatchIdentity(visible: isVisible, records: records.map(\.id))) {
@@ -116,7 +121,8 @@ struct BotsShelfView: View {
             // evidence a held event shows, and the unattended gate all land in
             // these files and must repaint the open card.
             let paths = ["bots/definitions", "bots/shelf-index.json", "bots/run-queue.json", "bots/runner-jobs.json",
-                         "workflows/approvals/requests.json", "bots/last-events.json", "trust/policy.json"]
+                         "workflows/approvals/requests.json", "bots/last-events.json", "trust/policy.json",
+                         "providers/surfaces.json", "providers/active.json"]
                 + records.map { "bots/\($0.id.uuidString)/run.lock" }
             let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) }, emitInitial: true)
             await withTaskCancellationHandler {
@@ -265,7 +271,8 @@ struct BotsShelfView: View {
                         // Pause has nothing to stop on a manual bot with no event.
                         if record.definition.cadence != .manual || record.definition.eventTrigger != nil || record.definition.paused {
                             Button(record.definition.paused ? "Resume" : "Pause") {
-                                perform { _ = try BotDefinitionStore(dataRoot: root).pause(record.id, paused: !record.definition.paused) }
+                                let store = BotDefinitionStore(dataRoot: root)
+                                Task { await perform { _ = try store.pause(record.id, paused: !record.definition.paused) } }
                             }.help("Pause scheduled turns. Run once remains available.")
                         }
                         Button("Edit") { editedBot = record.definition; editing = true }
@@ -341,8 +348,11 @@ struct BotsShelfView: View {
     static func limits(_ bot: BotDefinition) -> String {
         "Limits: \(bot.budget.tokens.formatted()) output tokens and \(Int(bot.budget.seconds)) seconds per run · \((bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens).formatted()) reserved output tokens daily"
     }
-    private func perform(_ action: () throws -> Void) {
-        do { try action(); reload() } catch { notice = Self.problem(error, action: "change that helper") }
+    private func perform(_ action: @escaping @Sendable () throws -> Void) async {
+        do {
+            try await Task.detached(priority: .utility, operation: action).value
+            await reloadNow()
+        } catch { notice = Self.problem(error, action: "change that helper") }
     }
     private func reload() {
         // A settling run writes several watched files in a burst, and each
@@ -370,14 +380,10 @@ struct BotsShelfView: View {
     private func readShelfOnce() async {
         // Definitions, the shelf and the scheduler's jobs are all read under the
         // cross-process store lock. That never belongs on the main actor.
-        let root = root
-        let allowed = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
-        if unattended != allowed { unattended = allowed }
         do {
-            let loaded = try await Task.detached(priority: .userInitiated) {
-                (records: try Self.readRecords(root: root, unattended: allowed),
-                 runs: try BotRunQueue(dataRoot: root).activeAndQueuedIDs())
-            }.value
+            let loaded = try await appModel.engine.botsShelfRead { allowed in
+                if unattended != allowed { unattended = allowed }
+            }
             // Most reloads in a burst find the same shelf. Publishing only what
             // actually changed keeps SwiftUI from re-laying out every card —
             // and keeps the file watcher above (keyed on the record ids) from
@@ -388,26 +394,6 @@ struct BotsShelfView: View {
             shelfLoaded = true
             shelfError = nil
         } catch { shelfError = UserFacingError.message(error, action: "load helpers") }
-    }
-    nonisolated static func readRecords(root: URL, unattended: Bool = true) throws -> [BotsShelfRecord] {
-        let shelf = ShelfStore(dataRoot: root)
-        let dates = try BotRunnerScheduler.scheduledDates(dataRoot: root)
-        let missed = try BotRunnerScheduler.missedRuns(dataRoot: root)
-        let events = (try? BotEventStore(dataRoot: root).lastEvents()) ?? [:]
-        // One checked bulk read for the whole shelf, instead of paginating
-        // every bot's history and then re-reading each row through `entry`
-        // (each of which decoded and sorted every book of every bot).
-        let stored = try shelf.entriesByBot()
-        return try BotDefinitionStore(dataRoot: root).list().map { bot in
-            // The shared shelf-reading boundary, the same one shelf_read and
-            // shelf_entry go through: an approval resolved from Telegram or the
-            // iPhone settles the entry wherever it is read next, not only here.
-            let entries = shelf.reconciling(stored[bot.id] ?? [])
-            return BotsShelfRecord(definition: bot, entries: entries, unreadIDs: [],
-                                   nextRun: bot.paused ? nil : dates[bot.id],
-                                   missed: bot.cadence == .manual ? nil : missed[bot.id], lastEvent: events[bot.id],
-                                   unattendedAllowed: unattended)
-        }.sorted { $0.definition.createdAt < $1.definition.createdAt }
     }
 
     private func continueInChat(_ record: BotsShelfRecord) async {
@@ -432,7 +418,7 @@ struct BotsShelfView: View {
             return
         }
         do {
-            let session = try await Self.chatSession(for: record.definition, root: root)
+            let session = try await StandingBotContinuity.openSession(for: record.definition, dataRoot: root)
             await appModel.selectChatSession(session)
             if appModel.activeChatSessionId == session.id {
                 if !appModel.engine.transcripts.sessions.contains(where: { $0.id == session.id }) { appModel.engine.transcripts.sessions.append(session) }
@@ -451,8 +437,6 @@ struct BotsShelfView: View {
         return .activity(.approvals)
     }
 
-    /// A new bot can be opened before its first turn. Use the ordinary checked
-    /// session index and lock, preserving an existing row if a turn won the race.
     /// A helper-store failure in words: the store's own sentence when it
     /// carries one, otherwise one plain line (the raw error goes to the log).
     static func problem(_ error: Error, action: String) -> String {
@@ -460,27 +444,6 @@ struct BotsShelfView: View {
         return UserFacingError.message(error, action: action)
     }
 
-    static func chatSession(for bot: BotDefinition, root: URL) async throws -> ChatSession {
-        let path = root.appendingPathComponent("chat/sessions.json")
-        let row = try await SwiftNativePersistenceCore().withFileLock(path) {
-            var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
-            if let existing = rows.first(where: { row in
-                guard case .string(let id)? = row["id"] else { return false }
-                return id == bot.sessionID
-            }) {
-                return existing
-            }
-            rows.append([
-                "id": .string(bot.sessionID), "title": .string(bot.name), "source": .string("bot"),
-                "createdAt": .string(ISO8601DateFormatter().string(from: bot.createdAt)),
-                "archived": .bool(false), "messageCount": .int(0)
-            ])
-            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(ChatSessionIndexFile.serializedData(for: rows), to: path)
-            return rows[rows.count - 1]
-        }
-        return try ChatSession(row: row)
-    }
 }
 
 private extension View {
@@ -937,5 +900,14 @@ private struct BotsShelfArtifactLink: View {
             } else { Text("\(artifact.name) · File unavailable") }
             if let error { Text(error).font(.caption).foregroundStyle(.secondary) }
         }
+    }
+}
+
+extension BotRunFeed {
+    /// "Three quiet checks since Sep 10 at 1:47 AM" — the count stays visible.
+    static func quietLine(_ entries: [ShelfEntry]) -> String {
+        let since = entries.last.map { BotsShelfRecord.shortDate($0.runAt) }
+        return "\(TodayWords.spelled(entries.count)) quiet check\(entries.count == 1 ? "" : "s")"
+            + (since.map { " since \($0)" } ?? "")
     }
 }

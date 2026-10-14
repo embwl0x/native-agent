@@ -131,106 +131,59 @@ public enum TurnPresentationReducer {
     ) -> TurnPresentationState {
         guard !state.isTerminal else { return state }
 
+        let phase: TurnPresentationPhase
+        var action: String? = nil
+        var delegate: String? = nil
+        var resetStreamLength = false
         switch event {
         case .acknowledged:
             guard state.phase == .acknowledged else { return state }
-            return transition(
-                state,
-                phase: .acknowledged,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
-        case .working(let action):
-            return transition(
-                state,
-                phase: .working,
-                action: action,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
-        case .tool(let name, let action):
-            return transition(
-                state,
-                phase: .tool,
-                action: action ?? ToolActivityPresentation.progress(name),
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
-        case .delegation(let delegate, let action):
-            return transition(
-                state,
-                phase: .delegation,
-                action: action,
-                delegate: delegate,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
-        case .retrying(let action):
-            return transition(
-                state,
-                phase: .retrying,
-                action: action,
-                at: instant,
-                resetStreamLength: true,
-                additionalRedactor: additionalRedactor
-            )
-        case .waiting(let action):
-            return transition(
-                state,
-                phase: .waiting,
-                action: action,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
+            phase = .acknowledged
+        case .working(let detail):
+            phase = .working
+            action = detail
+        case .tool(let name, let detail):
+            phase = .tool
+            action = detail ?? ToolActivityPresentation.progress(name)
+        case .delegation(let name, let detail):
+            phase = .delegation
+            action = detail
+            delegate = name
+        case .retrying(let detail):
+            phase = .retrying
+            action = detail
+            resetStreamLength = true
+        case .waiting(let detail):
+            phase = .waiting
+            action = detail
         case .blocked(let reason):
-            return transition(
-                state,
-                phase: .blocked,
-                action: reason,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
+            phase = .blocked
+            action = reason
         case .stalled(let reason):
-            return transition(
-                state,
-                phase: .stalled,
-                action: reason,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
+            phase = .stalled
+            action = reason
         case .completed(let summary):
-            return transition(
-                state,
-                phase: .completed,
-                action: summary,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
+            phase = .completed
+            action = summary
         case .failed(let reason):
-            return transition(
-                state,
-                phase: .failed,
-                action: reason,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
+            phase = .failed
+            action = reason
         case .canceled(let reason):
-            return transition(
-                state,
-                phase: .canceled,
-                action: reason,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
+            phase = .canceled
+            action = reason
         case .outcomeUnknown(let reason):
-            return transition(
-                state,
-                phase: .outcomeUnknown,
-                action: reason,
-                at: instant,
-                additionalRedactor: additionalRedactor
-            )
+            phase = .outcomeUnknown
+            action = reason
         }
+        return transition(
+            state,
+            phase: phase,
+            action: action,
+            delegate: delegate,
+            at: instant,
+            resetStreamLength: resetStreamLength,
+            additionalRedactor: additionalRedactor
+        )
     }
 
     /// Records growing assistant output by length only. The text itself never
@@ -282,7 +235,7 @@ public enum TurnPresentationReducer {
         additionalRedactor: AdditionalRedactor? = nil
     ) -> String? {
         guard let raw else { return nil }
-        var redacted = redactSecrets(raw)
+        var redacted = TurnSecretRedactor.redactText(raw)
         if let additionalRedactor {
             redacted = additionalRedactor(redacted)
         }
@@ -367,9 +320,5 @@ public enum TurnPresentationReducer {
         case .waiting, .blocked, .stalled, .completed, .failed, .canceled, .outcomeUnknown:
             return false
         }
-    }
-
-    private static func redactSecrets(_ value: String) -> String {
-        TurnSecretRedactor.redactText(value)
     }
 }

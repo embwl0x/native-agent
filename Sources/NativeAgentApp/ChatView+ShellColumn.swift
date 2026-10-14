@@ -1,3 +1,4 @@
+import EngineRuntime
 import AppToolRuntime
 import ChatOrchestration
 import SwiftUI
@@ -229,10 +230,9 @@ extension ChatView {
     func shellSessionRow(_ session: ChatSession) -> some View {
         let renaming = renamingSessionId == session.id
         let isPinned = shellSessionIsPinned(session)
-        // A thread is named once. When a placeholder-titled session resolves
-        // a first line, that line becomes the stored title, so compaction or
-        // a relaunch can never rename the thread later.
-        let _ = ChatShellNaming.settle(session, appModel: appModel)
+        let _ = ChatShellNaming.settle(session, transcripts: appModel.engine.transcripts) { id, title in
+            await appModel.renameChatSession(id: id, title: title)
+        }
         let selectSession: () -> Void = {
             guard !renaming else { return }
             if renamingSessionId != nil { renamingSessionId = nil }

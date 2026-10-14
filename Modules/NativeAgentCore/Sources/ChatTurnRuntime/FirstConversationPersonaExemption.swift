@@ -161,16 +161,6 @@ public enum FirstConversationPersonaExemption {
         }
     }
 
-    /// The live token, or nil.
-    public static func liveWriteToken(
-        dataRoot: URL,
-        fileManager: FileManager = .default
-    ) -> WriteToken? {
-        let url = personaRoot(forDataRoot: dataRoot, fileManager: fileManager)
-            .appendingPathComponent(writeTokenFilename)
-        return decodeToken(at: url)
-    }
-
     /// The title the exempt write used, live or spent — what the receipt row
     /// matches against so only that one write gets the settled receipt.
     public static func recordedWriteTitle(

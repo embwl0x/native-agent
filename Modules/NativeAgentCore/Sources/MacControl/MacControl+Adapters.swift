@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Senses
+import TrustCenter
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -9,9 +11,11 @@ import CryptoKit
 #endif
 #if canImport(AppKit)
 import AppKit
+import Carbon
+import OSAKit
 #endif
 
-// MARK: - Adapter protocols (test-injectable)
+// MARK: - Adapter results
 
 /// What the notification adapter can prove after a post request returns.
 ///
@@ -69,10 +73,6 @@ public extension NotificationCenterAdapter {
     }
 }
 
-public protocol AppleScriptAdapter: Sendable {
-    func run(script: String) async throws -> String
-}
-
 public struct ProcessRunResult: Sendable, Equatable {
     public let exitCode: Int32
     public let stdout: String
@@ -95,10 +95,6 @@ public struct ProcessRunResult: Sendable, Equatable {
         self.stdoutTruncated = stdoutTruncated
         self.stderrTruncated = stderrTruncated
     }
-}
-
-public protocol ProcessAdapter: Sendable {
-    func run(executable: String, arguments: [String], timeoutSeconds: Int) async throws -> ProcessRunResult
 }
 
 public struct AppControlRunResult: Sendable, Equatable {
@@ -144,49 +140,409 @@ public struct AppControlRunResult: Sendable, Equatable {
     }
 }
 
-public protocol AppControlAdapter: Sendable {
-    func focusApp(named name: String) async throws -> AppControlRunResult
-    /// The running app, or one launched without activating: nothing comes
-    /// to the front.
-    func launchApp(named name: String) async throws -> AppControlRunResult
-    func quitApp(named name: String) async throws -> AppControlRunResult
-}
-
-/// Requests that macOS open a concrete file, folder, or web URL. `true` means
-/// only that Launch Services accepted the request; callers must observe the
-/// screen separately before claiming where it landed.
-public protocol OpenTargetAdapter: Sendable {
-    /// `background`: the handling app is not activated.
-    func requestOpen(_ url: URL, background: Bool) async -> Bool
-}
-
-/// Optional exact postcondition observer for application mutations. The
-/// command result alone proves only that AppKit accepted the request; motor
-/// verification requires a separate observation of the resulting state.
-public protocol AppStateVerificationAdapter: Sendable {
-    func isFrontmostApplication(matching name: String) async -> Bool
-    func isApplicationRunning(matching name: String) async -> Bool
-}
-
-public protocol FileManagerAdapter: Sendable {
-    func readData(at url: URL, maxBytes: Int) throws -> Data
-    func writeData(_ data: Data, to url: URL, append: Bool) throws
-    func listDirectory(at url: URL) throws -> [URL]
-    func moveItem(from src: URL, to dst: URL) throws
-    func trashItem(at url: URL) throws
-}
-
-/// Optional exact postcondition seam for mutation verification. Adapters that
-/// cannot observe filesystem state remain valid, and their mutations are
-/// honestly reported as unverified.
-public protocol FileStateVerificationAdapter: Sendable {
-    func itemExists(at url: URL) -> Bool
-}
-
 // MARK: - System adapters (production impls)
 
-public final class SystemAppleScriptAdapter: AppleScriptAdapter {
+public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
     public init() {}
+
+    public enum AppleScriptError: Error {
+        case permissionDenied(app: String)
+    }
+
+    public static let appleScriptOutcomeUnknownCode = -1002
+
+    public static func automationTarget(_ permission: String) -> String? {
+        let prefix = "applescript:"
+        guard permission.hasPrefix(prefix), permission.count > prefix.count else { return nil }
+        return String(permission.dropFirst(prefix.count))
+    }
+
+    public static func checkAppScript(_ args: [String: JSONValue]) throws {
+        guard let script = args["script"] else { return }
+        guard case .string(let source) = script, !source.isEmpty,
+              Set(args.keys).isSubset(of: ["bundle_id", "script"]) else {
+            throw SenseFailure(code: "bad_input", message: "Pass {bundle_id,script} with an AppleScript body for the declared app.")
+        }
+        // Validate syntax that can change the execution environment, not app
+        // commands. Strings/comments are data; quoted identifiers remain code.
+        let characters = Array(source)
+        var index = 0, depth = 0, quoted = false, code = ""
+        while index < characters.count {
+            let c = characters[index], next = index + 1 < characters.count ? characters[index + 1] : nil
+            if quoted {
+                if c == "\\" { index += 1 }
+                else if c == "\"" { quoted = false }
+            } else if c == "(", next == "*" {
+                depth += 1; index += 1; code += " "
+            } else if depth > 0 {
+                if c == "*", next == ")" { depth -= 1; index += 1 }
+            } else if c == "\"" {
+                quoted = true; code += " "
+            } else if c == "#" || c == "-" && next == "-" {
+                while index < characters.count, characters[index] != "\n", characters[index] != "\r" { index += 1 }
+                code += "\n"
+            } else { code.append(c) }
+            index += 1
+        }
+        let words = code.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "_" }).map(String.init)
+        let importsTerms = words.indices.contains { words[$0] == "using" && words.dropFirst($0 + 1).prefix(2) == ["terms", "from"] }
+        let tellsApp = words.indices.contains { words[$0] == "tell" && ["app", "application"].contains(words.dropFirst($0 + 1).first ?? "") }
+        let currentApp = words.indices.contains { words[$0] == "current" && ["app", "application"].contains(words.dropFirst($0 + 1).first ?? "") }
+        guard !words.contains("use"), !importsTerms, !words.contains("script"),
+              !tellsApp, !currentApp, !words.contains("me"), !words.contains("my"), !code.contains("«") else {
+            throw SenseFailure(code: "undeclared_target", message: "The runner owns the script environment and app target. Resource imports (use / using terms from), script objects (including load script / run script), explicit app tells, self references and raw code terms are refused.")
+        }
+        var tells = 0
+        let lines = code.replacingOccurrences(of: "¬[ \\t]*[\\r\\n]+", with: " ", options: .regularExpression)
+        for line in lines.split(whereSeparator: { $0.isNewline }) {
+            let tokens = line.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "_" })
+            for index in tokens.indices where tokens[index] == "tell" {
+                if index > 0, tokens[index - 1] == "end" { tells -= 1 }
+                else if !tokens.dropFirst(index + 1).contains("to") { tells += 1 }
+            }
+            guard tells >= 0, tokens != ["end"] else {
+                throw SenseFailure(code: "undeclared_target", message: "The script body must not close the runner's app tell. Use explicit end statements for its own blocks.")
+            }
+        }
+    }
+
+    public static func automationPermission(bundleID: String, ask: Bool = false) async -> JSONValue {
+        #if canImport(AppKit)
+        guard let url = await MainActor.run(body: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) }) else {
+            return .object(["bundle_id": .string(bundleID), "state": .string("unavailable"),
+                            "detail": .string("No installed app resolves this bundle id.")])
+        }
+        let pid: pid_t?
+        do {
+            // A stopped target cannot present consent. Only the owner's ask
+            // opens it, without activating it, through the execution owner.
+            pid = ask ? try await appProcess(at: url) : await MainActor.run { runningApp(at: url)?.processIdentifier }
+        } catch {
+            return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path),
+                            "state": .string("unavailable"), "detail": .string(error.localizedDescription)])
+        }
+        return await Task.detached { permission(bundleID: bundleID, url: url, pid: pid, ask: ask) }.value
+        #else
+        return .object(["state": .string("unavailable")])
+        #endif
+    }
+
+    #if canImport(AppKit)
+    @MainActor private static func runningApp(at url: URL) -> NSRunningApplication? {
+        let path = url.standardizedFileURL.resolvingSymlinksInPath()
+        return NSWorkspace.shared.runningApplications.first {
+            !$0.isTerminated && $0.bundleURL?.standardizedFileURL.resolvingSymlinksInPath() == path
+        }
+    }
+
+    @MainActor private static func appProcess(at url: URL) async throws -> pid_t {
+        try Task.checkCancellation()
+        if let app = runningApp(at: url) { return app.processIdentifier }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.createsNewApplicationInstance = true
+        let app = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+        try Task.checkCancellation()
+        guard app.bundleURL?.standardizedFileURL.resolvingSymlinksInPath() == url.standardizedFileURL.resolvingSymlinksInPath(),
+              !app.isTerminated else {
+            throw SenseFailure(code: "app_unavailable", message: "Launch Services did not open the resolved app at \(url.path).")
+        }
+        return app.processIdentifier
+    }
+
+    private static func permission(bundleID: String, url: URL, pid: pid_t?, ask: Bool = false) -> JSONValue {
+        let target = pid.map { NSAppleEventDescriptor(processIdentifier: $0) } ?? NSAppleEventDescriptor(applicationURL: url)
+        let code = AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, ask)
+        let state = code == 0 ? "allowed" : code == -1744 ? "needs_consent" : code == -1743 ? "denied" : "unavailable"
+        return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "code": .int(Int64(code)),
+                        "state": .string(state), "detail": .string(code == -1743
+                            ? "Automation was denied by the owner; only the owner can change it in System Settings › Privacy & Security › Automation."
+                            : code == -1744 ? "macOS Automation consent is still not asked for this app. Allow the permission card to ask macOS."
+                            : code == -600 ? "Open \(url.path), then request Automation consent again." : state)])
+    }
+    #endif
+
+    public func callApp(_ arguments: JSONValue, targets: [String: String]) async throws -> JSONValue {
+        guard case .object(let args) = arguments, case .string(let bundleID)? = args["bundle_id"],
+              let access = targets[bundleID], ["read", "write"].contains(access) else {
+            throw SenseFailure(code: "undeclared_target", message: "Declare read or write reach for this app's bundle id.")
+        }
+        let read = AuthoredToolEffects.appReadOnly(args)
+        guard access == "write" || read else {
+            throw SenseFailure(code: "read_only", message: "A read-declared app refuses modifying or unclassified events.")
+        }
+        try Self.checkAppScript(args)
+        #if canImport(AppKit)
+        guard let url = await MainActor.run(body: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) }) else {
+            throw SenseFailure(code: "app_unavailable", message: "No installed app resolves \(bundleID).")
+        }
+        if args["dictionary"] == .bool(true), args["script"] == nil {
+            return try await Task.detached {
+                var definition: Unmanaged<CFData>?
+                let code = OSACopyScriptingDefinitionFromURL(url as CFURL, 0, &definition)
+                guard code == 0, let data = definition?.takeRetainedValue(),
+                      let text = String(data: data as Data, encoding: .utf8) else {
+                    throw SenseFailure(code: "dictionary_unavailable", message: "Scripting dictionary unavailable for \(url.path) (\(code)).")
+                }
+                return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(true), "sdef": .string(text)])
+            }.value
+        }
+        let pid = try await Self.appProcess(at: url)
+        let permission = await Task.detached { Self.permission(bundleID: bundleID, url: url, pid: pid) }.value
+        guard case .object(let consent) = permission, consent["state"] == .string("allowed") else { return permission }
+        try Task.checkCancellation()
+        let task = Task<JSONValue, Error>.detached {
+            try Task.checkCancellation()
+            do {
+                let value: NSAppleEventDescriptor?
+                if case .string(let source)? = args["script"] {
+                    let target = bundleID.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                    let program = "use AppleScript version \"2.4\"\ntell application id \"\(target)\"\n\(source)\nend tell"
+                    value = try Self.scriptValue(program, pid: pid, authored: true)
+                } else {
+                    let event = NSAppleEventDescriptor.appleEvent(withEventClass: try Self.fourCode(args["event_class"]),
+                        eventID: try Self.fourCode(args["event_id"]), targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
+                        returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+                    if let value = args["parameters"] {
+                        guard case .object(let parameters) = value else { throw Self.badEvent() }
+                        for (key, value) in parameters { event.setParam(try Self.descriptor(value), forKeyword: try Self.fourCode(.string(key))) }
+                    }
+                    // Bound each reply with the Apple Event Manager's standard timeout.
+                    let options: NSAppleEventDescriptor.SendOptions = [.waitForReply, .neverInteract,
+                        .init(rawValue: UInt(kAEDoNotPromptForUserConsent))]
+                    let reply = try event.sendEvent(options: options, timeout: TimeInterval(kAEDefaultTimeout))
+                    let code = reply.paramDescriptor(forKeyword: keyErrorNumber)?.int32Value ?? 0
+                    guard code == 0 else {
+                        throw NSError(domain: "NativeAgentAppleEvent", code: Int(code), userInfo: [NSLocalizedDescriptionKey:
+                            reply.paramDescriptor(forKeyword: keyErrorString)?.stringValue ?? "Apple Event failed (\(code))."])
+                    }
+                    value = reply.paramDescriptor(forKeyword: keyDirectObject)
+                }
+                return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(read),
+                                "code": .int(0), "value": Self.json(value)])
+            } catch {
+                let error = Self.appError(error, pid: pid, app: url.deletingPathExtension().lastPathComponent) as NSError
+                let code = error.userInfo["apple_event_code"] as? Int ?? error.code
+                return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(read),
+                    "code": .int(Int64(code)), "state": .string(error.userInfo["state"] as? String
+                        ?? (code == -1744 ? "needs_consent" : code == -1743 ? "denied" : "failed")),
+                    "message": .string(error.localizedDescription),
+                    "detail": .string(error.userInfo["state"] != nil ? error.localizedDescription
+                        : code == -1743 ? "Automation was denied by the owner; only the owner can change it in System Settings › Privacy & Security › Automation."
+                        : error.localizedDescription)])
+            }
+        }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+        #else
+        throw SenseFailure(code: "unavailable", message: "App events require macOS.")
+        #endif
+    }
+
+    #if canImport(AppKit)
+    public static func runIntegrationScript(_ source: String, bundleID: String) async throws -> String {
+        try Task.checkCancellation()
+        guard let url = await MainActor.run(body: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) }) else {
+            throw NSError(domain: "NativeAgentAppleEvent", code: -600,
+                          userInfo: [NSLocalizedDescriptionKey: "No installed app resolves \(bundleID)."])
+        }
+        let pid = try await appProcess(at: url)
+        let task = Task<String, Error>.detached {
+            try Task.checkCancellation()
+            let consent = permission(bundleID: bundleID, url: url, pid: pid)
+            guard case .object(let fields) = consent, fields["state"] == .string("allowed") else {
+                if case .object(let fields) = consent, case .int(let code)? = fields["code"], ![-1743, -1744].contains(code) {
+                    throw NSError(domain: "NativeAgentAppleScript", code: Int(code),
+                                  userInfo: [NSLocalizedDescriptionKey: "Automation preflight failed for \(url.path) (\(code))."])
+                }
+                throw AppleScriptError.permissionDenied(app: url.deletingPathExtension().lastPathComponent)
+            }
+            let path = url.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            let program = source.replacingOccurrences(of: "tell application \"__NativeAgentApp__\"", with: "tell application \"\(path)\"")
+            let value: NSAppleEventDescriptor
+            do { value = try scriptValue(program, pid: pid, authored: false) }
+            catch { throw appError(error, pid: pid, app: url.deletingPathExtension().lastPathComponent) }
+            guard let text = value.stringValue else {
+                throw NSError(domain: "NativeAgentAppleScript", code: -1700,
+                              userInfo: [NSLocalizedDescriptionKey: "The integration script did not return text."])
+            }
+            return text
+        }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
+    private static func appError(_ error: Error, pid: pid_t, app: String) -> Error {
+        let ns = error as NSError
+        guard (ns.userInfo["apple_event_code"] as? Int ?? ns.code) == -1712 else { return error }
+        var state = "app_timeout"
+        let observation = MacAXLimits.$readDeadline.withValue(Date().addingTimeInterval(MacAXLimits.readSeconds)) {
+            let source = SystemMacAXElementSource()
+            guard source.isTrusted() else { return "Accessibility permission is unavailable, so a dialog could not be checked." }
+            for window in source.windowRoots(pid: pid) {
+                let snapshot = MacAccessibilityReader.walk(source: source, root: window.ref)
+                if let dialog = snapshot.nodes.first(where: {
+                    MacPerceptionCompiler.modalSubroles.contains($0.attributes.role)
+                        || MacPerceptionCompiler.modalSubroles.contains($0.attributes.subrole ?? "")
+                }) {
+                    state = "blocked_by_dialog"
+                    let label = MacPerceptionCompiler.safeDisplay(dialog.attributes.title ?? dialog.attributes.value ?? "")
+                    let kind = dialog.attributes.role == "AXSheet" || dialog.attributes.subrole == "AXSheet" ? "sheet" : "dialog"
+                    return "Accessibility observed a \(kind)\(label.map { ": \($0)" } ?? "")."
+                }
+            }
+            return "No sheet or dialog was observed in the bounded Accessibility read."
+        }
+        var info = ns.userInfo
+        info["state"] = state
+        info[NSLocalizedDescriptionKey] = "\(app) didn't answer in time — it may be showing a dialog or still busy. \(observation) "
+            + (ns.code == appleScriptOutcomeUnknownCode ? ns.localizedDescription : "Observe before retrying.")
+        return NSError(domain: ns.domain, code: ns.code, userInfo: info)
+    }
+
+    private static func scriptValue(_ source: String, pid: pid_t, authored: Bool) throws -> NSAppleEventDescriptor {
+        try Task.checkCancellation()
+        guard let language = OSALanguage(forName: "AppleScript") else {
+            throw SenseFailure(code: "unavailable", message: "AppleScript language is unavailable.")
+        }
+        let instance = OSALanguageInstance(language: language)
+        var target = (pid: pid, authored: authored, refused: false, sent: false)
+        return try withUnsafeMutablePointer(to: &target) { pointer in
+            // A private component confines even computed targets and nested tells;
+            // every send keeps the raw primitive's consent, interaction and reply policy.
+            let sendCode = OSASetSendProc(instance.componentInstance, { event, reply, _, _, _, _, _, refCon in
+                guard let event, let reply, let refCon else { return OSErr(-50) }
+                let target = refCon.assumingMemoryBound(to: (pid: pid_t, authored: Bool, refused: Bool, sent: Bool).self)
+                var pid: pid_t = 0
+                var size = 0
+                let addressCode = AEGetAttributePtr(event, keyAddressAttr, typeKernelProcessID, nil, &pid,
+                                                  MemoryLayout<pid_t>.size, &size)
+                guard addressCode == 0, size == MemoryLayout<pid_t>.size,
+                      pid == target.pointee.pid || !target.pointee.authored && pid == getpid() else {
+                    target.pointee.refused = true
+                    return OSErr(-1743)
+                }
+                if Task<Never, Never>.isCancelled { return OSErr(-128) }
+                target.pointee.sent = true
+                return OSErr(AESendMessage(event, reply, AESendMode(kAEWaitReply | kAENeverInteract | kAEDoNotPromptForUserConsent),
+                                          kAEDefaultTimeout))
+            }, pointer)
+            let activeCode = OSASetActiveProc(instance.componentInstance, { _ in
+                Task<Never, Never>.isCancelled ? OSErr(-128) : 0
+            }, nil)
+            defer {
+                OSASetSendProc(instance.componentInstance, nil, nil)
+                OSASetActiveProc(instance.componentInstance, nil, nil)
+            }
+            guard sendCode == 0, activeCode == 0 else {
+                throw NSError(domain: "NativeAgentAppleEvent", code: Int(sendCode == 0 ? activeCode : sendCode),
+                              userInfo: [NSLocalizedDescriptionKey: "AppleScript target enforcement could not be configured."])
+            }
+            // AppleScript Language Guide, use (scripting additions): any use
+            // disables OSAX unless use/using terms from explicitly enables it.
+            // https://developer.apple.com/library/archive/documentation/AppleScript/Conceptual/AppleScriptLangGuide/reference/ASLR_control_statements.html
+            let script = OSAScript(source: source, from: nil, languageInstance: instance, using: [])
+            var error: NSDictionary?
+            let value = script.compileAndReturnError(&error) ? script.executeAndReturnError(&error) : nil
+            if pointer.pointee.refused {
+                throw NSError(domain: "NativeAgentAppleEvent", code: -1743, userInfo: ["state": "undeclared_target",
+                    NSLocalizedDescriptionKey: "The script must target only the declared app process \(pid)."])
+            }
+            let number = Task<Never, Never>.isCancelled ? -128 : error?[OSAScriptErrorNumber] as? Int ?? 0
+            guard number == 0, let value else {
+                let unknown = pointer.pointee.sent && [ -128, -1712 ].contains(number)
+                if !authored, [-1743, -1744].contains(number) {
+                    throw AppleScriptError.permissionDenied(app: "the declared app")
+                }
+                var message = error?[OSAScriptErrorMessage] as? String ?? "AppleScript failed."
+                if authored, let range = (error?[OSAScriptErrorRange] as? NSValue)?.rangeValue,
+                   range.location <= (source as NSString).length {
+                    let prefix = (source as NSString).substring(to: range.location)
+                    let line = prefix.replacingOccurrences(of: "\r\n", with: "\n").filter { $0.isNewline }.count - 1
+                    message += " (line \(max(1, line)) of your script)"
+                }
+                throw NSError(domain: "NativeAgentAppleScript", code: unknown ? appleScriptOutcomeUnknownCode : number == 0 ? -1 : number,
+                    userInfo: ["apple_event_code": number, NSLocalizedDescriptionKey: unknown
+                        ? "AppleScript stopped after sending an event; its outcome is unknown. Observe before retrying — a retry may repeat it."
+                        : message])
+            }
+            return value
+        }
+    }
+
+    private static func badEvent() -> SenseFailure {
+        SenseFailure(code: "bad_input", message: "Use four-character event codes and JSON descriptors: string, bool, int, double, list, or {type}, {enum}, {record}, {object:{want,form,seld,from}}.")
+    }
+
+    private static func fourCode(_ value: JSONValue?) throws -> OSType {
+        guard case .string(let text)? = value, text.utf8.count == 4, text.utf8.allSatisfy({ $0 < 128 }) else { throw badEvent() }
+        return text.utf8.reduce(0) { ($0 << 8) | UInt32($1) }
+    }
+
+    private static func descriptor(_ value: JSONValue, depth: Int = 0) throws -> NSAppleEventDescriptor {
+        guard depth < 32 else { throw badEvent() }
+        switch value {
+        case .null: return .null()
+        case .string(let text): return NSAppleEventDescriptor(string: text)
+        case .bool(let value): return NSAppleEventDescriptor(boolean: value)
+        case .int(let value):
+            guard let number = NSAppleEventDescriptor(string: String(value)).coerce(toDescriptorType: typeSInt64) else { throw badEvent() }
+            return number
+        case .double(let value): return NSAppleEventDescriptor(double: value)
+        case .array(let values):
+            let list = NSAppleEventDescriptor.list()
+            for (index, value) in values.enumerated() { list.insert(try descriptor(value, depth: depth + 1), at: index + 1) }
+            return list
+        case .object(let fields):
+            guard fields.count == 1 else { throw badEvent() }
+            if let value = fields["type"] { return NSAppleEventDescriptor(typeCode: try fourCode(value)) }
+            if let value = fields["enum"] { return NSAppleEventDescriptor(enumCode: try fourCode(value)) }
+            let record = NSAppleEventDescriptor.record()
+            if case .object(let object)? = fields["object"] {
+                guard Set(object.keys).isSubset(of: ["want", "form", "seld", "from"]), let selected = object["seld"] else { throw badEvent() }
+                record.setDescriptor(NSAppleEventDescriptor(typeCode: try fourCode(object["want"])), forKeyword: AEKeyword(keyAEDesiredClass))
+                record.setDescriptor(NSAppleEventDescriptor(enumCode: try fourCode(object["form"])), forKeyword: AEKeyword(keyAEKeyForm))
+                record.setDescriptor(try descriptor(selected, depth: depth + 1), forKeyword: AEKeyword(keyAEKeyData))
+                record.setDescriptor(try descriptor(object["from"] ?? .null, depth: depth + 1), forKeyword: AEKeyword(keyAEContainer))
+                guard let specifier = record.coerce(toDescriptorType: DescType(typeObjectSpecifier)) else { throw badEvent() }
+                return specifier
+            }
+            guard case .object(let entries)? = fields["record"] else { throw badEvent() }
+            for (key, value) in entries { record.setDescriptor(try descriptor(value, depth: depth + 1), forKeyword: try fourCode(.string(key))) }
+            return record
+        }
+    }
+
+    private static func json(_ value: NSAppleEventDescriptor?) -> JSONValue {
+        guard let value else { return .null }
+        switch value.descriptorType {
+        case typeNull: return .null
+        case typeBoolean: return .bool(value.booleanValue)
+        case typeSInt16, typeSInt32: return .int(Int64(value.int32Value))
+        case typeSInt64:
+            if let text = value.coerce(toDescriptorType: typeUnicodeText)?.stringValue, let number = Int64(text) { return .int(number) }
+        case typeIEEE64BitFloatingPoint: return .double(value.doubleValue)
+        case typeType: return .object(["type": .string(codeText(value.typeCodeValue))])
+        case typeEnumerated: return .object(["enum": .string(codeText(value.enumCodeValue))])
+        case typeAEList: return .array((0..<value.numberOfItems).compactMap { value.atIndex($0 + 1) }.map { json($0) })
+        case DescType(typeObjectSpecifier):
+            return .object(["object": .object([
+                "want": .string(codeText(value.forKeyword(AEKeyword(keyAEDesiredClass))?.typeCodeValue ?? 0)),
+                "form": .string(codeText(value.forKeyword(AEKeyword(keyAEKeyForm))?.enumCodeValue ?? 0)),
+                "seld": json(value.forKeyword(AEKeyword(keyAEKeyData))), "from": json(value.forKeyword(AEKeyword(keyAEContainer)))])])
+        default: break
+        }
+        if value.isRecordDescriptor {
+            var fields: [String: JSONValue] = [:]
+            for index in 0..<value.numberOfItems { fields[codeText(value.keywordForDescriptor(at: index + 1))] = json(value.atIndex(index + 1)) }
+            return .object(["record": .object(fields)])
+        }
+        if let text = value.stringValue { return .string(text) }
+        return .object(["descriptor_type": .int(Int64(value.descriptorType)), "base64": .string(value.data.base64EncodedString())])
+    }
+
+    private static func codeText(_ code: OSType) -> String {
+        String(decoding: [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: code >> $0) }, as: UTF8.self)
+    }
+    #endif
     public func run(script: String) async throws -> String {
         #if canImport(AppKit)
         let result = try await SystemProcessAdapter().run(
@@ -216,27 +572,11 @@ public final class SystemAppleScriptAdapter: AppleScriptAdapter {
 
 }
 
-public final class SystemProcessAdapter: ProcessAdapter {
+public final class SystemProcessAdapter: Sendable {
     public static let defaultOutputByteLimit = 1_048_576
 
-    private let timeoutSnapshotInstalledObserver:
-        (@Sendable (ProcessTreeSnapshot) -> Void)?
-
-    public init() {
-        timeoutSnapshotInstalledObserver = nil
-    }
-
-    /// Narrow deterministic test seam. Production uses `init()` and has no
-    /// observer. The callback runs on the native deadline owner after timeout
-    /// state and its identity-bound process-tree snapshot are installed, but
-    /// before the timeout termination worker is launched.
-    init(
-        timeoutSnapshotInstalledObserver:
-            @escaping @Sendable (ProcessTreeSnapshot) -> Void
-    ) {
-        self.timeoutSnapshotInstalledObserver = timeoutSnapshotInstalledObserver
-    }
-    private final class _Buffer: @unchecked Sendable {
+    public init() {}
+    final class _Buffer: @unchecked Sendable {
         private let lock = NSLock()
         private let byteLimit: Int
         private var data = Data()
@@ -303,26 +643,27 @@ public final class SystemProcessAdapter: ProcessAdapter {
 
     /// Nonblocking readers keep EOF inside the subprocess deadline. A child
     /// exiting does not imply EOF when descendants still own pipe writers.
-    private final class _PipeDrain: @unchecked Sendable {
+    package final class PipeDrain: @unchecked Sendable {
         private let handle: FileHandle
-        private let buffer: _Buffer
+        private let onData: @Sendable (Data) -> Void
         private let queue = DispatchQueue(label: "NativeAgent.process.pipe")
         private let source: DispatchSourceRead
-        private let completion = _ProcessCompletion()
+        private let completion = DispatchGroup()
 
-        init(handle: FileHandle, buffer: _Buffer) throws {
+        package init(handle: FileHandle, onData: @escaping @Sendable (Data) -> Void) throws {
             self.handle = handle
-            self.buffer = buffer
+            self.onData = onData
             let fd = handle.fileDescriptor
             let flags = fcntl(fd, F_GETFL)
             guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
                 throw MacControlError.ioFailure("Could not configure subprocess pipe")
             }
             source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+            completion.enter()
             source.setEventHandler { [self] in drain() }
             source.setCancelHandler { [self] in
                 try? handle.close()
-                completion.finish()
+                completion.leave()
                 source.setEventHandler(handler: nil)
                 source.setCancelHandler(handler: nil)
             }
@@ -335,18 +676,18 @@ public final class SystemProcessAdapter: ProcessAdapter {
             for _ in 0..<64 {
                 let count = read(handle.fileDescriptor, &bytes, bytes.count)
                 if count > 0 {
-                    buffer.append(Data(bytes.prefix(count)))
+                    onData(Data(bytes.prefix(count)))
                 } else if count == 0 {
                     source.cancel()
                     return
                 } else if errno != EINTR {
-                    if errno != EAGAIN { source.cancel() }
+                    if errno != EAGAIN && errno != EWOULDBLOCK { source.cancel() }
                     return
                 }
             }
         }
 
-        func stop() {
+        package func stop() {
             queue.async { [self] in
                 guard !source.isCancelled else { return }
                 drain()
@@ -354,8 +695,19 @@ public final class SystemProcessAdapter: ProcessAdapter {
             }
         }
 
-        func wait() async {
-            await withCheckedContinuation { completion.wait($0) }
+        package func wait(timeout: DispatchTime) -> DispatchTimeoutResult {
+            completion.wait(timeout: timeout)
+        }
+
+        package func stopAndWait() {
+            stop()
+            completion.wait()
+        }
+
+        package func wait() async {
+            await withCheckedContinuation { continuation in
+                completion.notify(queue: .global(qos: .utility)) { continuation.resume() }
+            }
         }
     }
 
@@ -368,8 +720,6 @@ public final class SystemProcessAdapter: ProcessAdapter {
         private let process: Process
         private let initialTree: ProcessTreeSnapshot
         private let onSettled: @Sendable () -> Void
-        private let timeoutSnapshotInstalledObserver:
-            (@Sendable (ProcessTreeSnapshot) -> Void)?
         private var requested = false
         private var timeoutRequested = false
         private var cancelEscalationRequested = false
@@ -381,14 +731,11 @@ public final class SystemProcessAdapter: ProcessAdapter {
         init(
             process: Process,
             initialTree: ProcessTreeSnapshot,
-            onSettled: @escaping @Sendable () -> Void,
-            timeoutSnapshotInstalledObserver:
-                (@Sendable (ProcessTreeSnapshot) -> Void)?
+            onSettled: @escaping @Sendable () -> Void
         ) {
             self.process = process
             self.initialTree = initialTree
             self.onSettled = onSettled
-            self.timeoutSnapshotInstalledObserver = timeoutSnapshotInstalledObserver
         }
 
         func request(timedOut: Bool) {
@@ -444,9 +791,6 @@ public final class SystemProcessAdapter: ProcessAdapter {
             activeTerminationTree = terminationTree
             let cancellationAlreadyEscalated = cancelEscalationRequested
             lock.unlock()
-            if timedOut {
-                timeoutSnapshotInstalledObserver?(terminationTree)
-            }
             if cancellationAlreadyEscalated {
                 let refreshed = ProcessTreeReaper.snapshot(
                     rootPID: terminationTree.rootPID,
@@ -610,7 +954,6 @@ public final class SystemProcessAdapter: ProcessAdapter {
         private let lock = NSLock()
         private let wake = DispatchSemaphore(value: 0)
         private var cancelled = false
-        private var worker: Thread?
 
         func start(seconds: TimeInterval, action: @escaping @Sendable () -> Void) {
             let boundedMilliseconds = max(1, Int((max(0.001, seconds) * 1_000).rounded(.up)))
@@ -623,16 +966,12 @@ public final class SystemProcessAdapter: ProcessAdapter {
                 if shouldFire { action() }
             }
             thread.qualityOfService = .userInitiated
-            lock.lock()
-            worker = thread
-            lock.unlock()
             thread.start()
         }
 
         func cancel() {
             lock.lock()
             cancelled = true
-            worker = nil
             lock.unlock()
             wake.signal()
         }
@@ -652,7 +991,7 @@ public final class SystemProcessAdapter: ProcessAdapter {
 
     /// Shared event-driven subprocess seam for app and core callers that need
     /// a working directory, an exact environment, or stdin. This remains the
-    /// same lifecycle owner as the `ProcessAdapter` entry point above: pipe
+    /// same lifecycle owner as the instance entry point above: pipe
     /// draining, cancellation, timeout escalation, and process-tree reaping
     /// must not be reimplemented by each feature.
     public func run(
@@ -661,8 +1000,9 @@ public final class SystemProcessAdapter: ProcessAdapter {
         currentDirectory: URL?,
         environment: [String: String]?,
         standardInput: Data?,
-        timeoutSeconds: TimeInterval,
-        outputByteLimit: Int? = nil
+        timeoutSeconds: TimeInterval?,
+        outputByteLimit: Int? = nil,
+        launchFailure: @Sendable (Error) -> Error = { MacControlError.ioFailure("Process.run() failed: \($0)") }
     ) async throws -> ProcessRunResult {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
@@ -678,10 +1018,10 @@ public final class SystemProcessAdapter: ProcessAdapter {
 
         let outBuf = _Buffer(byteLimit: outputByteLimit)
         let errBuf = _Buffer(byteLimit: outputByteLimit)
-        let outDrain = try _PipeDrain(handle: outPipe.fileHandleForReading, buffer: outBuf)
-        let errDrain: _PipeDrain
+        let outDrain = try PipeDrain(handle: outPipe.fileHandleForReading) { outBuf.append($0) }
+        let errDrain: PipeDrain
         do {
-            errDrain = try _PipeDrain(handle: errPipe.fileHandleForReading, buffer: errBuf)
+            errDrain = try PipeDrain(handle: errPipe.fileHandleForReading) { errBuf.append($0) }
         } catch {
             outDrain.stop()
             throw error
@@ -695,7 +1035,7 @@ public final class SystemProcessAdapter: ProcessAdapter {
             proc.terminationHandler = nil
             outDrain.stop()
             errDrain.stop()
-            throw MacControlError.ioFailure("Process.run() failed: \(error)")
+            throw launchFailure(error)
         }
         let initialTree = _ProcessTermination.captureTree(rootPID: proc.processIdentifier)
         if let inputPipe, let standardInput {
@@ -718,12 +1058,13 @@ public final class SystemProcessAdapter: ProcessAdapter {
                 outDrain.stop()
                 errDrain.stop()
                 completion.finish()
-            },
-            timeoutSnapshotInstalledObserver: timeoutSnapshotInstalledObserver
+            }
         )
         let deadline = _ProcessDeadline()
-        deadline.start(seconds: timeoutSeconds) {
-            termination.request(timedOut: true)
+        if let timeoutSeconds {
+            deadline.start(seconds: timeoutSeconds) {
+                termination.request(timedOut: true)
+            }
         }
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -754,14 +1095,25 @@ public final class SystemProcessAdapter: ProcessAdapter {
 
 }
 
-public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificationAdapter {
+public final class SystemAppControlAdapter: Sendable {
     public init() {}
 
     public func focusApp(named name: String) async throws -> AppControlRunResult {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
         #if canImport(AppKit)
-        return try await Self.focusAppOnMain(named: query)
+        let result = try await Self.focusAppOnMain(named: query)
+        // Preserve the cold-launch settling window after activation and its
+        // diagnostics; the caller still independently verifies the outcome.
+        let resolvedApp = result.bundleIdentifier ?? result.matchedName ?? query
+        var observedFrontmost = await isFrontmostApplication(matching: resolvedApp)
+        var looks = 0
+        while !observedFrontmost, looks < 16 {
+            try await Task.sleep(nanoseconds: 500_000_000)
+            observedFrontmost = await isFrontmostApplication(matching: resolvedApp)
+            looks += 1
+        }
+        return result
         #else
         throw MacControlError.appControlFailed("AppKit unavailable on this platform")
         #endif
@@ -1155,7 +1507,7 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
     #endif
 }
 
-public struct SystemOpenTargetAdapter: OpenTargetAdapter {
+public struct SystemOpenTargetAdapter: Sendable {
     public init() {}
 
     public func requestOpen(_ url: URL, background: Bool) async -> Bool {
@@ -1178,7 +1530,7 @@ public struct SystemOpenTargetAdapter: OpenTargetAdapter {
     #endif
 }
 
-public final class SystemFileManagerAdapter: FileManagerAdapter, FileStateVerificationAdapter {
+public final class SystemFileManagerAdapter: Sendable {
     public init() {}
     // FileManager.default is NOT Sendable as of Swift 6 — fetch per-call
     // instead of storing on the actor/adapter. Per Apple's own audit it's
@@ -1243,4 +1595,33 @@ public final class SystemFileManagerAdapter: FileManagerAdapter, FileStateVerifi
     public func itemExists(at url: URL) -> Bool {
         FileManager.default.fileExists(atPath: url.path)
     }
+}
+
+extension SystemAppleScriptAdapter {
+    /// Automation consent is per target application.
+    public static let automationTargetApps = ["Mail", "Messages", "Notes", "Music"]
+
+    /// Bundle IDs for the four target apps Agent drives via AppleScript.
+    /// Used by `AEDeterminePermissionToAutomateTarget` — it identifies the
+    /// target by bundle ID, not human-readable name.
+    public static let automationTargetBundleIDs: [String: String] = [
+        "Mail":     "com.apple.mail",
+        "Messages": "com.apple.MobileSMS",
+        "Notes":    "com.apple.Notes",
+        "Music":    "com.apple.Music",
+    ]
+
+    public static func automationStatus(app: String, ask: Bool) async -> String {
+        guard let bundleID = automationTargetBundleIDs[app] else { return "unknown" }
+        let permission = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID, ask: ask)
+        guard case .object(let fields) = permission else { return "unknown" }
+        switch fields["code"] {
+        case .int(0): return "granted"
+        case .int(-1743): return "denied"
+        case .int(-1744): return "not_determined"
+        case .int(-600): return "app_not_running"
+        default: return "unknown"
+        }
+    }
+
 }

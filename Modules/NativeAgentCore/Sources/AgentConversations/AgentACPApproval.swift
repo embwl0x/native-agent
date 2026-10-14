@@ -1,5 +1,4 @@
 import ChatTurnContracts
-import AgentLinkTransport
 import ApprovalInbox
 import Foundation
 import PersistenceCore
@@ -24,22 +23,6 @@ package enum AgentACPApproval {
                 "threadId": route.threadId.map(JSONValue.string) ?? .null,
             ]))
         }
-    }
-
-    /// Never launch the replacement to inspect its version before consent.
-    /// The refused message is not replayed after this fresh setup approval.
-    package static func renewExecutable(_ contact: AgentPeerContact, store: AgentPeerStore,
-                                inbox: any ApprovalInboxProtocol) async throws -> Bool {
-        guard let id = AgentPeerStore.hostRowID(contact.endpoint),
-              let row = AgentHostDirectory.row(named: id), row.acp != nil,
-              let path = contact.approvedExecutablePath, let folder = contact.acpWorkingDirectory else { return false }
-        let current = try? AgentACPExecutable.capture(path: path)
-        let proposal = AgentHostConnection.Proposal(row: row, command: "", descriptorPath: "",
-            existing: contact, workingDirectory: URL(fileURLWithPath: folder), contactID: contact.id,
-            executable: current, executablePath: current?.path)
-        guard try await connect(proposal, appName: "NativeAgent", inbox: inbox), current?.isCurrent == true else { return false }
-        _ = try AgentHostConnection.connect(proposal: proposal, store: store)
-        return true
     }
 
     package static func request(_ request: JSONValue, peer: AgentPeerContact,

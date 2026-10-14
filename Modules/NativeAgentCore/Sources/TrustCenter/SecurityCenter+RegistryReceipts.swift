@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 extension SwiftNativeSecurityCenter {
@@ -74,9 +75,6 @@ extension SwiftNativeSecurityCenter {
     }
 
     static func isoTimestamp(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
 }

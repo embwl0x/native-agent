@@ -439,8 +439,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     // Module-internal (not private) so `ApprovalInbox+InjectionSpend.swift`
     // can build the durable spend marker against the same root/persistence.
     let root: URL
-    let persistence: any PersistenceCoreProtocol
-    let clock: @Sendable () -> Date
+    let persistence = SwiftNativePersistenceCore()
     /// Serializes mutating ops (resolve/archive) against actor reentrancy:
     /// each new mutation chains after the prior one so two concurrent
     /// resolve calls can't interleave their read→mutate→write sequence.
@@ -485,16 +484,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
 
     /// - root: the canonical data root. The approvals
     ///   file lives at `<root>/workflows/approvals/requests.json`.
-    /// - persistence: defaults to SwiftNativePersistenceCore.
-    /// - clock: injectable for tests.
-    public init(
-        root: URL,
-        persistence: (any PersistenceCoreProtocol)? = nil,
-        clock: @escaping @Sendable () -> Date = { Date() }
-    ) {
+    public init(root: URL) {
         self.root = root
-        self.persistence = persistence ?? SwiftNativePersistenceCore()
-        self.clock = clock
     }
 
     /// Canonical approval storage path.
@@ -552,12 +543,12 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
 
     @discardableResult
     public func create(_ body: JSONValue) async throws -> ApprovalRecord {
-        let record = try await runSerialized { [persistence, approvalsPath, clock] in
+        let record = try await runSerialized { [persistence, approvalsPath] in
             try await Self._createImpl(
                 body: body,
                 persistence: persistence,
                 approvalsPath: approvalsPath,
-                now: clock()
+                now: Date()
             )
         }
         ApprovalLifecycleBus.fire(.init(phase: .requested, record: record))
@@ -580,13 +571,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         _ body: JSONValue,
         matchesPending: @escaping @Sendable (JSONValue) -> Bool
     ) async throws -> (record: ApprovalRecord, created: Bool) {
-        let outcome = try await runSerialized { [persistence, approvalsPath, clock] in
+        let outcome = try await runSerialized { [persistence, approvalsPath] in
             try await Self._createOrTouchPendingImpl(
                 body: body,
                 matchesPending: matchesPending,
                 persistence: persistence,
                 approvalsPath: approvalsPath,
-                now: clock()
+                now: Date()
             )
         }
         if outcome.created {
@@ -649,13 +640,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         decision: ApprovalDecision,
         provenance: ApprovalResolutionProvenance
     ) async throws -> ApprovalRecord {
-        let record = try await runSerialized { [persistence, approvalsPath, clock] in
+        let record = try await runSerialized { [persistence, approvalsPath] in
             return try await Self._resolveImpl(
                 id: id, decision: decision,
                 provenance: provenance,
                 persistence: persistence,
                 approvalsPath: approvalsPath,
-                now: clock()
+                now: Date()
             )
         }
         ApprovalLifecycleBus.fire(.init(phase: .resolved, record: record))
@@ -858,7 +849,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         clearQueuedDelivery: Bool = false, settlement: String? = nil,
         assistantDelivery: JSONValue? = nil
     ) async throws -> Bool {
-        let now = clock()
+        let now = Date()
         return try await updateChatContinuation(id) { record, state in
             if let assistantDelivery {
                 guard state["done"] != .bool(true) else { return false }
@@ -884,7 +875,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// 2026-09-18: queueing never replaces a claim, even after a restart.
     public func queueChatContinuation(_ id: String, delivery: JSONValue, alreadyStarted: Bool = false,
                                       previouslyQueued: Bool = false) async throws -> Bool {
-        let now = clock()
+        let now = Date()
         return try await updateChatContinuation(id) { record, state in
             guard (previouslyQueued || Self.continuationIsPending(record, now: now)),
                   state["done"] == nil, state["started"] == nil else { return false }
@@ -1308,8 +1299,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
     }
 
-    /// STRICT JSON bool parse for authority fields. Unlike `pyBool` (Python
-    /// truthiness, used for cosmetic/behavioral flags), this returns nil for
+    /// STRICT JSON bool parse for authority fields. This returns nil for
     /// ANYTHING that is not a literal JSON `true`/`false` — no string coercion,
     /// no numeric coercion. Callers of authority fields treat nil as
     /// "undeclared" and fall back to the fail-CLOSED default.
@@ -1333,18 +1323,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         "workflow_step",
         "mcp_tool",
     ]
-
-    private nonisolated static func pyBool(_ value: JSONValue) -> Bool {
-        switch value {
-        case .null: return false
-        case .bool(let b): return b
-        case .int(let i): return i != 0
-        case .double(let d): return d != 0
-        case .string(let s): return !s.isEmpty
-        case .array(let arr): return !arr.isEmpty
-        case .object(let obj): return !obj.isEmpty
-        }
-    }
 
     /// Matches Python's `now_iso()` shape: an ISO-8601 string with
     /// fractional seconds and a `+00:00` offset.
@@ -1431,19 +1409,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
 
     // MARK: - Data root resolution (delegated to PersistenceCore)
 
-    /// Thin delegator to `PersistenceCore.defaultDataRoot()` — the single
-    /// source of truth for the Python `_resolve_data_root` priority chain.
-    /// Kept on the actor for back-compat with the existing factory + tests.
+    /// Approval storage uses PersistenceCore's canonical data root.
     public nonisolated static func defaultDataRoot() -> URL {
         PersistenceCore.defaultDataRoot()
     }
-}
-
-// MARK: - Factory
-
-/// Always SwiftNative. Callers wanting an in-process or override path should
-/// construct `SwiftNativeApprovalInbox` directly.
-public func makeApprovalInbox() -> any ApprovalInboxProtocol {
-    let root = SwiftNativeApprovalInbox.defaultDataRoot()
-    return SwiftNativeApprovalInbox(root: root)
 }

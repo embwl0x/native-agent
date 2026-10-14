@@ -1,3 +1,4 @@
+import EngineRuntime
 import SwiftUI
 import NativeAgentShared
 

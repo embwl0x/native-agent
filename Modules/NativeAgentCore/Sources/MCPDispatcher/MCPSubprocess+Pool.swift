@@ -15,17 +15,12 @@ public actor MCPSubprocessPool {
     public struct Spec: Sendable, Equatable {
         public var serverId: String
         public var command: String
-        public var env: [String: String]?
-        public var cwd: URL?
         public var executionIdentity: String?
         public init(
-            serverId: String, command: String, env: [String: String]? = nil,
-            cwd: URL? = nil, executionIdentity: String? = nil
+            serverId: String, command: String, executionIdentity: String? = nil
         ) {
             self.serverId = serverId
             self.command = command
-            self.env = env
-            self.cwd = cwd
             self.executionIdentity = executionIdentity
         }
     }
@@ -49,10 +44,6 @@ public actor MCPSubprocessPool {
     private var spawnTasks: [String: Task<MCPSubprocess, Error>] = [:]
     /// Stop retires checkouts too, so their retries cannot resurrect a child.
     private var checkoutGenerations: [String: UUID] = [:]
-    /// Test/telemetry counter for actual spawn bodies entered per server.
-    /// This intentionally increments in `_performSpawn`, not `get()`, so it
-    /// proves concurrent cold callers joined the same spawn task.
-    private var spawnAttemptCounts: [String: Int] = [:]
     /// Bug 5 fix (2026-05-31): per-server "spawn generation" counter.
     /// Bumped every time `get()` produces a fresh process. Crash
     /// recording is now idempotent per (serverId, generation) — the
@@ -64,13 +55,8 @@ public actor MCPSubprocessPool {
     // 2026-09-06: never reuse a generation after a server is removed/re-added;
     // delayed termination callbacks still carry the former incarnation's ID.
     private var nextProcessGeneration = 0
-    /// Per-server set of spawn generations that have already had their
-    /// crash recorded. U5 W-E (2026-06-11): was a flat
-    /// `Set<String>` of `<serverId>:<gen>` composites that grew forever —
-    /// now a dict so removed servers drop their whole entry and old
-    /// generations get pruned on each new spawn (state-lifecycle rule:
-    /// every add has a remove).
-    private var recordedCrashGenerations: [String: Set<Int>] = [:]
+    /// Only the current generation may record a crash; remember its first record.
+    private var recordedCrashGenerations: [String: Int] = [:]
     /// U5 W-E backoff-escalation fix (2026-06-11): timestamp of the last
     /// SUCCESSFUL spawn per server. Used to distinguish "ran stably for a
     /// while then died" (fresh failure streak) from "died right after
@@ -87,23 +73,16 @@ public actor MCPSubprocessPool {
     /// the previous crash streak.
     private let stabilityWindow: TimeInterval = 60
     /// R17: stdio children idle past this are stopped by the pool's reap
-    /// deadline (specs stay — the next get() respawns cold). 0 disables reaping.
+    /// deadline (specs stay — the next get() respawns cold).
     /// lastUsedAt is stamped at request START, and per-request timeouts are
     /// far below this window, so an in-flight call can't be reaped mid-turn.
-    public private(set) var idleTimeout: TimeInterval = 900
-    private static let maximumIdleTimeout: TimeInterval = 7 * 24 * 60 * 60
+    private let idleTimeout: TimeInterval = 900
     /// R17 / living-physiology convergence: one self-owned task sleeps until
     /// the earliest known idle deadline. Checkout, spawn, termination, spec
-    /// replacement, stop, and timeout changes cancel/re-arm it. There is no
+    /// replacement and stop cancel/re-arm it. There is no
     /// periodic quarter-window polling while the children are merely alive.
     private var reapTask: Task<Void, Never>?
     private var reapScheduleGeneration: UInt64 = 0
-    private var scheduledReapDeadline: Date?
-    /// Deterministic test seam delivered immediately after a child/task actor
-    /// hop and before identity revalidation. Nil in production.
-    private var _getPostAwaitHook: (@Sendable () async -> Void)?
-    private let reapNow: @Sendable () -> Date
-    private let reapSleepUntil: @Sendable (Date) async throws -> Void
     /// R17 (review): stamped synchronously in `get()` when a pooled child is
     /// handed to a caller. `lastUsedAt` only updates at request() start (an
     /// actor hop away), so without this a reap pass interleaving between
@@ -112,34 +91,14 @@ public actor MCPSubprocessPool {
     private var lastCheckedOutAt: [String: Date] = [:]
     /// Backoff base — daemon uses ad-hoc bumps; we use a tame exponential
     /// (0.5s, 1s, 2s, 4s, ... cap 30s) capped so a thrash never starves.
-    public var baseBackoff: TimeInterval = 0.5
-    public var maxBackoff: TimeInterval = 30
+    private let baseBackoff: TimeInterval = 0.5
+    private let maxBackoff: TimeInterval = 30
 
-    public init() {
-        self.reapNow = Date.init
-        self.reapSleepUntil = Self.sleepUntil
-    }
-
-    /// Deterministic deadline/clock seam used only by focused pool tests.
-    /// Production callers use `init()` above.
-    init(
-        reapNow: @escaping @Sendable () -> Date,
-        reapSleepUntil: @escaping @Sendable (Date) async throws -> Void
-    ) {
-        self.reapNow = reapNow
-        self.reapSleepUntil = reapSleepUntil
-    }
-
-    private nonisolated static func sleepUntil(_ deadline: Date) async throws {
-        let remaining = deadline.timeIntervalSinceNow
-        guard remaining.isFinite, remaining > 0 else { return }
-        let bounded = min(remaining, maximumIdleTimeout)
-        try await Task.sleep(nanoseconds: UInt64(bounded * 1_000_000_000))
-    }
+    public init() {}
 
     /// Replace the registered spec set. Specs not in the new list have their
     /// running processes stopped (and their pool side-state cleared). A
-    /// same-id spec whose command/env/cwd CHANGED has its running process
+    /// same-id spec whose command or execution identity CHANGED has its running process
     /// bounced — U5 W-E fix (2026-06-11): previously the old subprocess
     /// kept running the stale command until it died on its own. New specs
     /// are NOT spawned eagerly — first `get(serverId)` triggers the spawn.
@@ -166,7 +125,6 @@ public actor MCPSubprocessPool {
             checkoutGenerations.removeValue(forKey: id)
             crashes.removeValue(forKey: id)
             processGenerations.removeValue(forKey: id)
-            spawnAttemptCounts.removeValue(forKey: id)
             recordedCrashGenerations.removeValue(forKey: id)
             lastSpawnAt.removeValue(forKey: id)
             carriedFailures.removeValue(forKey: id)
@@ -188,26 +146,10 @@ public actor MCPSubprocessPool {
             processGenerations.removeValue(forKey: id)
         }
         specs = dict
-        // Test seam: lets a test deterministically interleave a `get()`
-        // inside the stop window (state already swapped, children not yet
-        // stopped) and prove it never sees the stale subprocess.
-        if let hook = _updateSpecsStopWindowHook { await hook() }
         for proc in staleProcesses {
             await proc.stop()
         }
         await rescheduleReapDeadline()
-    }
-
-    /// Test-only seam awaited inside `updateSpecs` AFTER pool state is
-    /// swapped but BEFORE stale children are stopped. Actor re-entrancy
-    /// lets the hook call back into the pool mid-window.
-    private var _updateSpecsStopWindowHook: (@Sendable () async -> Void)?
-    public func _setUpdateSpecsStopWindowHook(_ hook: (@Sendable () async -> Void)?) {
-        _updateSpecsStopWindowHook = hook
-    }
-
-    public func _setGetPostAwaitHook(_ hook: (@Sendable () async -> Void)?) {
-        _getPostAwaitHook = hook
     }
 
     /// Return (spawning if necessary) the subprocess actor for a server id.
@@ -222,7 +164,6 @@ public actor MCPSubprocessPool {
         checkoutGenerations[serverId] = checkoutGeneration
         if let existing = processes[serverId] {
             let existingRunning = await existing.isRunning
-            if let hook = _getPostAwaitHook { await hook() }
             guard checkoutGenerations[serverId] == checkoutGeneration else { throw CancellationError() }
             if existingRunning {
                 // `isRunning` is an actor hop. Spec replacement, stop, or a
@@ -234,7 +175,7 @@ public actor MCPSubprocessPool {
                 }
                 // Checkout stamp + return happen in one synchronous actor
                 // slice — reap can never interleave between them.
-                lastCheckedOutAt[serverId] = reapNow()
+                lastCheckedOutAt[serverId] = Date()
                 rescheduleReapDeadlineFromPoolAnchors()
                 return existing
             }
@@ -281,7 +222,6 @@ public actor MCPSubprocessPool {
         if let inflight = spawnTasks[serverId] {
             let proc = try await inflight.value
             if inflight.isCancelled { throw CancellationError() }
-            if let hook = _getPostAwaitHook { await hook() }
             guard checkoutGenerations[serverId] == checkoutGeneration else { throw CancellationError() }
             guard let pooled = processes[serverId], pooled === proc else {
                 if let current = spawnTasks[serverId], current == inflight {
@@ -298,7 +238,6 @@ public actor MCPSubprocessPool {
         do {
             let proc = try await task.value
             if task.isCancelled { throw CancellationError() }
-            if let hook = _getPostAwaitHook { await hook() }
             guard checkoutGenerations[serverId] == checkoutGeneration else { throw CancellationError() }
             if let current = spawnTasks[serverId], current == task {
                 spawnTasks[serverId] = nil
@@ -325,27 +264,16 @@ public actor MCPSubprocessPool {
     fileprivate func _performSpawn(spec: Spec) async throws -> MCPSubprocess {
         try Task.checkCancellation()
         let serverId = spec.serverId
-        spawnAttemptCounts[serverId, default: 0] += 1
         // Bump the generation BEFORE spawn. Spawn failure also records
         // against this new generation so the next get() honors backoff.
         nextProcessGeneration += 1
         let newGen = nextProcessGeneration
         processGenerations[serverId] = newGen
-        // Prune recorded-crash generations that can no longer get a late
-        // terminationHandler fire (keep a small trailing window for
-        // stragglers). Without this the set grows one entry per spawn for
-        // the life of the pool.
-        if var gens = recordedCrashGenerations[serverId] {
-            gens = gens.filter { $0 >= newGen - 8 }
-            recordedCrashGenerations[serverId] = gens.isEmpty ? nil : gens
-        }
         let proc: MCPSubprocess
         do {
             proc = try MCPSubprocess.fromServerCommand(
                 serverId: spec.serverId,
                 command: spec.command,
-                env: spec.env,
-                cwd: spec.cwd,
                 executionIdentity: spec.executionIdentity
             )
         } catch {
@@ -402,7 +330,7 @@ public actor MCPSubprocessPool {
         // generation. Identity-compare by generation: if the genKey has
         // been recorded, the corpse is this spawn's, throw rather than
         // pool.
-        if recordedCrashGenerations[serverId]?.contains(newGen) == true {
+        if recordedCrashGenerations[serverId] == newGen {
             await proc.stop()
             throw MCPSubprocessError.spawnFailed(
                 "\(spec.serverId) terminated during start handshake (handler race)"
@@ -426,7 +354,7 @@ public actor MCPSubprocessPool {
         if let prior = crashes.removeValue(forKey: serverId) {
             carriedFailures[serverId] = prior.consecutiveFailures
         }
-        let spawnedAt = reapNow()
+        let spawnedAt = Date()
         lastSpawnAt[serverId] = spawnedAt
         lastCheckedOutAt[serverId] = spawnedAt
         processes[serverId] = proc
@@ -439,24 +367,11 @@ public actor MCPSubprocessPool {
 
     // MARK: - R17 idle reap
 
-    /// One reap pass: stop pooled children whose last use (or start, for a
-    /// never-used child) is older than `idleTimeout`. Returns the reaped ids.
-    /// Same two-phase shape as `updateSpecs`: pool state is mutated with an
-    /// identity re-check after every suspension point, children are stopped
-    /// only after they're out of the pool.
-    @discardableResult
-    public func reapIdle(now: Date = Date()) async -> [String] {
-        let reapedIds = await reapIdlePass(now: now)
-        await rescheduleReapDeadline()
-        return reapedIds
-    }
-
     /// One pass without changing the deadline owner. The scheduled-fire path
     /// uses this so a checkout/spec mutation that interleaves at one of the
     /// child actor reads can install a newer generation which the stale fire
     /// is forbidden to overwrite afterward.
-    private func reapIdlePass(now: Date) async -> [String] {
-        guard idleTimeout > 0 else { return [] }
+    private func reapIdlePass(now: Date) async {
         var reapedIds: [String] = []
         var reapedProcs: [MCPSubprocess] = []
         for (id, proc) in processes {
@@ -490,14 +405,13 @@ public actor MCPSubprocessPool {
             nativeLog("MCPSubprocessPool: reaped %d idle stdio child(ren): %@",
                   reapedIds.count, reapedIds.joined(separator: ", "))
         }
-        return reapedIds.sorted()
     }
 
     /// Compute the earliest exact deadline from the freshest authoritative
     /// anchor each child exposes. Identity is rechecked after every actor hop:
     /// a replacement process must never inherit an old child's deadline.
     private func nextReapDeadline() async -> Date? {
-        guard idleTimeout.isFinite, idleTimeout > 0, !processes.isEmpty else { return nil }
+        guard !processes.isEmpty else { return nil }
         var earliest: Date?
         for (id, proc) in processes {
             guard let pooled = processes[id], pooled === proc else { continue }
@@ -518,27 +432,11 @@ public actor MCPSubprocessPool {
         let generation = reapScheduleGeneration
         reapTask?.cancel()
         reapTask = nil
-        scheduledReapDeadline = nil
-
-        guard idleTimeout.isFinite, idleTimeout > 0, !processes.isEmpty else { return }
         guard let deadline = await nextReapDeadline() else { return }
         // `nextReapDeadline()` crosses child actors. A concurrent mutation may
         // have installed a newer schedule while we were suspended.
-        guard generation == reapScheduleGeneration,
-              idleTimeout > 0,
-              !processes.isEmpty else { return }
-
-        scheduledReapDeadline = deadline
-        let sleeper = reapSleepUntil
-        reapTask = Task { [weak self] in
-            do {
-                try await sleeper(deadline)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled, let self else { return }
-            await self.reapDeadlineFired(generation: generation, now: nil)
-        }
+        guard generation == reapScheduleGeneration, !processes.isEmpty else { return }
+        armReapDeadline(deadline, generation: generation)
     }
 
     /// Publish a safe exact deadline using only pool-owned anchors. This is
@@ -552,35 +450,34 @@ public actor MCPSubprocessPool {
         let generation = reapScheduleGeneration
         reapTask?.cancel()
         reapTask = nil
-        scheduledReapDeadline = nil
-        guard idleTimeout.isFinite, idleTimeout > 0, !processes.isEmpty else { return }
         let earliest = processes.keys.compactMap { id -> Date? in
             [lastCheckedOutAt[id], lastSpawnAt[id]].compactMap { $0 }.max()
                 .map { $0.addingTimeInterval(idleTimeout) }
         }.min()
         guard let deadline = earliest else { return }
-        scheduledReapDeadline = deadline
-        let sleeper = reapSleepUntil
+        armReapDeadline(deadline, generation: generation)
+    }
+
+    private func armReapDeadline(_ deadline: Date, generation: UInt64) {
         reapTask = Task { [weak self] in
             do {
-                try await sleeper(deadline)
+                try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow)))
             } catch {
                 return
             }
             guard !Task.isCancelled, let self else { return }
-            await self.reapDeadlineFired(generation: generation, now: nil)
+            await self.reapDeadlineFired(generation: generation)
         }
     }
 
     /// A deadline task may resume after checkout, replacement, stop, or a
-    /// timeout change cancelled it. Generation equality is the fail-closed
+    /// spec change cancelled it. Generation equality is the fail-closed
     /// identity check: only the currently published task may reap or re-arm.
-    private func reapDeadlineFired(generation: UInt64, now: Date?) async {
+    private func reapDeadlineFired(generation: UInt64) async {
         guard generation == reapScheduleGeneration else { return }
         reapTask?.cancel()
         reapTask = nil
-        scheduledReapDeadline = nil
-        _ = await reapIdlePass(now: now ?? reapNow())
+        await reapIdlePass(now: Date())
         guard generation == reapScheduleGeneration else { return }
         await rescheduleReapDeadline()
     }
@@ -644,7 +541,6 @@ public actor MCPSubprocessPool {
         reapTask?.cancel()
         reapTask = nil
         reapScheduleGeneration &+= 1
-        scheduledReapDeadline = nil
         let stopped = Array(processes.values)
         let pending = Array(spawnTasks.values)
         spawnTasks.removeAll()
@@ -696,67 +592,6 @@ public actor MCPSubprocessPool {
         return out.sorted { $0.id < $1.id }
     }
 
-    /// Test seam — directly inject a CrashInfo so the cooldown branch can be
-    /// exercised without forcing a real crash.
-    public func _setCrashInfo(_ info: CrashInfo, for serverId: String) {
-        crashes[serverId] = info
-    }
-
-    /// Test seam — widen/narrow crash-backoff windows without sleeping.
-    public func _setBackoffDurations(base: TimeInterval, max: TimeInterval) {
-        baseBackoff = base
-        maxBackoff = max
-    }
-
-    /// Test seam — replace the actor backing a server id (used by tests that
-    /// want to assert restart semantics without re-running a python helper).
-    public func _injectProcess(_ proc: MCPSubprocess, spec: Spec) async {
-        specs[spec.serverId] = spec
-        processes[spec.serverId] = proc
-        let stamp = reapNow()
-        lastSpawnAt[spec.serverId] = stamp
-        lastCheckedOutAt[spec.serverId] = stamp
-        await rescheduleReapDeadline()
-    }
-
-    /// Test seam — number of actual spawn attempts entered for a server.
-    public func _spawnAttemptCount(for serverId: String) -> Int {
-        spawnAttemptCounts[serverId] ?? 0
-    }
-
-    /// Test seam — read the current crash record for a server (escalation
-    /// tests assert consecutiveFailures across respawn cycles).
-    public func _crashInfo(for serverId: String) -> CrashInfo? {
-        crashes[serverId]
-    }
-
-    /// Test seam — adjust the idle-reap window without waiting 15 minutes.
-    public func _setIdleTimeout(_ seconds: TimeInterval) async {
-        idleTimeout = seconds.isFinite
-            ? min(Self.maximumIdleTimeout, max(0, seconds))
-            : 0
-        await rescheduleReapDeadline()
-    }
-
-    /// Test seam — whether an exact idle deadline is currently armed.
-    public func _reapLoopArmed() -> Bool {
-        reapTask != nil
-    }
-
-    public func _scheduledReapDeadline() -> Date? {
-        scheduledReapDeadline
-    }
-
-    public func _reapScheduleGeneration() -> UInt64 {
-        reapScheduleGeneration
-    }
-
-    /// Deterministically deliver a captured deadline in tests. Production
-    /// delivery comes only from `reapSleepUntil`; stale generations no-op.
-    public func _fireReapDeadlineForTests(generation: UInt64, now: Date) async {
-        await reapDeadlineFired(generation: generation, now: now)
-    }
-
     private func recordCrash(serverId: String, error: Error, generation: Int) {
         recordCrashFromMessage(
             serverId: serverId,
@@ -779,7 +614,7 @@ public actor MCPSubprocessPool {
     ) {
         // A removed/reconfigured server cannot inherit a former launch's backoff.
         guard processGenerations[serverId] == generation else { return }
-        if recordedCrashGenerations[serverId]?.contains(generation) == true {
+        if recordedCrashGenerations[serverId] == generation {
             // Same-death duplicate. Refresh lastError so callers see the
             // latest/most-specific reason (terminationHandler reasons are
             // typically richer than the synthetic placeholder), but do
@@ -790,7 +625,7 @@ public actor MCPSubprocessPool {
             }
             return
         }
-        recordedCrashGenerations[serverId, default: []].insert(generation)
+        recordedCrashGenerations[serverId] = generation
         var priorCount = crashes[serverId]?.consecutiveFailures ?? 0
         if priorCount == 0 {
             // U5 W-E backoff-escalation fix: a successful spawn parked the

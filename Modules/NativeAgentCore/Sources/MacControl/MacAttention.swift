@@ -96,13 +96,6 @@ public enum NativeAgentMotorEpoch {
         lock.unlock()
         return hid.isFinite ? uptime - hid : .infinity
     }
-
-    static func resetForTesting() {
-        lock.lock()
-        lastAgentMotorUptime = -Double.infinity
-        lastPostedHIDUptime = -Double.infinity
-        lock.unlock()
-    }
 }
 
 /// Is the person at the keyboard or mouse right now? Recent input can stop

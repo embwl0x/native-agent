@@ -2,67 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - THE STRUCTURED SCREEN RENDERER (native-screen)
-//
-// docs/build_plans/native-screen.md, written from the consumer's seat: "she
-// needs a live screen to look at… you're literally an LLM, you know exactly
-// what you want to see." What she wants is not prose and not a tree — it is
-// ONE canonical STRUCTURE, the same shape whether the window is Finder, a PDF,
-// System Settings or World of Warcraft:
-//
-//     SCREEN  app · window · FRONT · how many others
-//     WHERE   position inside the app's own navigation
-//     LIST | GRID | TEXT | CANVAS   the dominant content, TYPED, numbered
-//     DO      everything actionable, state inline
-//     SAYS    the read-only values worth knowing
-//
-// Fixed sections, fixed ORDER, fixed vocabulary. An app that lacks a section
-// OMITS it; it never renames it. Predictability is the whole value — she reads
-// this every turn and must be able to find what she needs without reading all
-// of it.
-//
-// ONE INTERPRETER, SOURCE-AGNOSTIC. User: "it interprets the screen, an app, WoW
-// all the same." AX rows, vision rows, or BOTH FUSED enter the SAME function
-// and come out as the same sections in the same order. Provenance and
-// confidence are per-row FIELDS (`ax` / `vision 0.83`) — never a different
-// shape, never a second code path a caller has to know about. There is exactly
-// one `render` here and everything goes through it.
-//
-// NO APP-SPECIFIC LOGIC. Not one branch, heuristic or comment-as-rule in this
-// file tests what app it is looking at (feedback_build_the_general_capability).
-// A game is simply a screen whose dominant content types as CANVAS and whose
-// rows carry vision provenance. The hard instance is the BAR, never the target.
-//
-// PURE. No I/O, no capture, no AX calls, no injection, no clock, no randomness:
-// percept in, text out, byte-identical for byte-identical input. That is what
-// makes it testable headless against three fixtures and what lets the wiring
-// layer (not this file) decide when to call it.
-//
-// WHY IT REPLACES THE JSON SURFACE: today she gets JSON carrying opaque handle
-// tokens plus a `frame_id` she must keep valid, and nine acceptance rounds show
-// nearly every failure lived in that bookkeeping rather than in the work. So:
-// NO HANDLE TOKENS ever reach this output. Handles stay our bookkeeping. She
-// addresses a row by its ORDINAL (1-based, stable, printed) or by its label.
-//
-// TWO HONESTY RULES this renderer enforces mechanically, because both were
-// earned the hard way:
-//
-//   • ELISION IS SPOKEN, IN PLACE. Every omission prints its count and its
-//     recourse — "… 7 more below (scrollable)". A silent cap is what made her
-//     work around us in round 8 ("capped looks can omit needed rows"); a caller
-//     who cannot tell a complete list from a trimmed one will confidently
-//     conclude a row does not exist.
-//   • ABSTAINS ARE VISIBLE. A vision row that abstained prints as ABSTAINED
-//     with its reason, in place, never dropped and never silently upgraded to a
-//     guess. "Confidence labels don't create trust; calibrated refusal and
-//     verified effects do."
-//
-// REDACTION IS NOT RE-IMPLEMENTED HERE. Every printed string comes from
-// `MacScreenText`, whose `display` is the compiler's already-redacted verdict
-// when there is one and the shared `MacScreenViewTextRedaction` standalone
-// shape test when a value was hand-built. A withheld string prints as
-// `⟨redacted⟩` — visibly absent, never a digest and never the clear text. Two
-// redactors drift and the copy that drifts is the one nobody re-reviews.
+// Shared screen evidence and pixel formatting for MacScreenPageCompiler.
+// Text carries the compiler's redaction verdict through both presentations.
 
 // MARK: - The one text channel
 
@@ -264,16 +205,6 @@ public enum MacScreenRender {
         case canvas
 
         var keyword: String { rawValue.uppercased() }
-        /// Fixed section order among contents: type, not arrival. A screen with
-        /// both a grid and a canvas prints them in the same order every time.
-        var order: Int {
-            switch self {
-            case .list: return 0
-            case .grid: return 1
-            case .text: return 2
-            case .canvas: return 3
-            }
-        }
         /// The default noun for the row count when the caller does not name one.
         var defaultNoun: String {
             switch self {
@@ -340,8 +271,7 @@ public enum MacScreenRender {
 
     // MARK: The screen
 
-    /// The source-agnostic input. AX, vision and fused percepts all become one
-    /// of these, and this is the only thing `render` reads.
+    /// The source-agnostic input for native pages and pixel evidence.
     public struct Screen: Sendable, Equatable {
         public let appName: String?
         public let windowTitle: MacScreenText?
@@ -399,66 +329,6 @@ public enum MacScreenRender {
         }
     }
 
-    // MARK: Budget
-
-    /// The render is BOUNDED and says what the bound cost. Every cap here has a
-    /// matching elision line in the output — there is no cap in this file that
-    /// can bite silently.
-    public struct Options: Sendable, Equatable {
-        /// Rows kept per content section.
-        public let maxRows: Int
-        public let maxControls: Int
-        public let maxValues: Int
-        public let maxWhereSteps: Int
-        /// A label longer than this is truncated with an ellipsis. Column
-        /// discipline, not redaction.
-        public let maxLabelChars: Int
-
-        public init(
-            maxRows: Int = 12,
-            maxControls: Int = 24,
-            maxValues: Int = 6,
-            maxWhereSteps: Int = 6,
-            maxLabelChars: Int = 40
-        ) {
-            self.maxRows = max(1, maxRows)
-            self.maxControls = max(1, maxControls)
-            self.maxValues = max(1, maxValues)
-            self.maxWhereSteps = max(1, maxWhereSteps)
-            self.maxLabelChars = max(8, maxLabelChars)
-        }
-
-        public static let `default` = Options()
-    }
-
-    /// What the render cost and what it dropped. The drops are ALSO in the text
-    /// — this struct is for the caller's telemetry, never a substitute for
-    /// saying it in place.
-    public struct Rendering: Sendable, Equatable {
-        public let text: String
-        public let bytes: Int
-        public let rowsDropped: Int
-        public let controlsDropped: Int
-        public let valuesDropped: Int
-        public let abstained: Int
-
-        public init(
-            text: String,
-            bytes: Int,
-            rowsDropped: Int,
-            controlsDropped: Int,
-            valuesDropped: Int,
-            abstained: Int
-        ) {
-            self.text = text
-            self.bytes = bytes
-            self.rowsDropped = rowsDropped
-            self.controlsDropped = controlsDropped
-            self.valuesDropped = valuesDropped
-            self.abstained = abstained
-        }
-    }
-
     // MARK: Layout constants
 
     /// Section keyword column. Everything after it lines up, so a reader's eye
@@ -477,140 +347,31 @@ public enum MacScreenRender {
     /// addressable by its ordinal.
     public static let unlabeledMarker = "⟨unlabeled⟩"
 
-    // MARK: - The one entry point
-
-    /// Render ONE screen. Deterministic: same input, byte-identical output.
-    public static func render(_ screen: Screen, options: Options = .default) -> String {
-        rendering(screen, options: options).text
-    }
-
     /// Add only independently recognized pixel evidence to the AX page. No
     /// second screen title, AX control census or repeated raw text channel.
     static func pixelEvidence(_ screen: Screen) -> String {
-        let wide = Options(maxRows: Int.max, maxControls: Int.max, maxValues: Int.max, maxWhereSteps: Int.max, maxLabelChars: Int.max / 2)
         var lines: [String] = []
         for content in screen.contents {
             let rows = content.rows.filter { $0.provenance.isVision }
             guard !rows.isEmpty || content.kind == .canvas else { continue }
             let onlyPixels = Content(kind: content.kind, noun: content.noun, rows: rows, totalRows: rows.count,
                 scrollable: content.scrollable, canvas: content.canvas)
-            lines.append(contentsOf: contentBlock(onlyPixels, options: wide).lines)
+            lines.append(contentsOf: contentBlock(onlyPixels))
         }
         let controls = screen.controls.filter { $0.provenance.isVision }
         let values = screen.values.filter { $0.provenance.isVision }
         let onlyPixels = Screen(appName: nil, controls: controls, totalControls: controls.count, values: values, totalValues: values.count)
-        if !controls.isEmpty { lines.append(contentsOf: controlBlock(onlyPixels, options: wide).lines) }
-        if !values.isEmpty { lines.append(contentsOf: valueBlock(onlyPixels, options: wide).lines) }
+        if !controls.isEmpty { lines.append(contentsOf: controlBlock(onlyPixels)) }
+        if !values.isEmpty { lines.append(contentsOf: valueBlock(onlyPixels)) }
         guard !lines.isEmpty else { return "" }
         return "\nraw view · on-device screen recognition · These regions are exposed as pixels, with the recognition confidence shown.\n"
             + lines.joined(separator: "\n")
     }
 
-    /// The same render, with the budget accounting the caller may want to log.
-    public static func rendering(_ screen: Screen, options: Options = .default) -> Rendering {
-        var lines: [String] = []
-        var rowsDropped = 0
-        var controlsDropped = 0
-        var valuesDropped = 0
-        var abstained = 0
-
-        // SCREEN — where am I, before anything else.
-        lines.append(screenLine(screen))
-
-        // WHERE — position inside the app's own navigation. Absent when the
-        // source could not tell us; NEVER guessed, and never renamed.
-        if !screen.whereSteps.isEmpty {
-            let kept = Array(screen.whereSteps.prefix(options.maxWhereSteps))
-            let hidden = screen.whereSteps.count - kept.count
-            var rendered = kept.map { step -> String in
-                var part = step.label.display ?? (step.label.withheld ? redactedMarker : unlabeledMarker)
-                if let note = step.note, !note.isEmpty { part += " (\(note))" }
-                return part
-            }.joined(separator: " > ")
-            // One provenance for the path: the WEAKEST step, because a path is
-            // only as trustworthy as its shakiest component.
-            if let weakest = weakestProvenance(kept.map(\.provenance)), weakest.isVision {
-                rendered += "  " + weakest.text
-            }
-            if hidden > 0 {
-                rendered += "  … \(hidden) earlier step\(hidden == 1 ? "" : "s") not shown "
-                    + "(raise maxWhereSteps)"
-            }
-            lines.append(section("WHERE", rendered))
-        }
-
-        // MODAL — it changes what every other control means, so it is stated
-        // before the content rather than buried among the controls.
-        if let modal = screen.modal {
-            lines.append(section("MODAL", modal.display ?? redactedMarker))
-        }
-
-        // The dominant content, TYPED. Fixed order by TYPE so a screen with more
-        // than one never reorders between turns.
-        if screen.unclassifiedOmittedTargets > 0 {
-            lines.append(section("LIMITS", "Semantic read omitted \(screen.unclassifiedOmittedTargets) AX targets; types/locations unknown."))
-        }
-        for content in screen.contents.sorted(by: { $0.kind.order < $1.kind.order }) {
-            let block = contentBlock(content, options: options)
-            lines.append(contentsOf: block.lines)
-            rowsDropped += block.dropped
-            abstained += block.abstained
-        }
-
-        // DO — everything actionable.
-        if !screen.controls.isEmpty || screen.totalControls > 0 || !screen.unlabeledControls.isEmpty {
-            let block = controlBlock(screen, options: options)
-            lines.append(contentsOf: block.lines)
-            controlsDropped = block.dropped
-            abstained += block.abstained
-        }
-
-        // SAYS — the read-only values.
-        if !screen.values.isEmpty || screen.totalValues > 0 {
-            let block = valueBlock(screen, options: options)
-            lines.append(contentsOf: block.lines)
-            valuesDropped = block.dropped
-        }
-
-        let text = lines.joined(separator: "\n") + "\n"
-        return Rendering(
-            text: text,
-            bytes: text.utf8.count,
-            rowsDropped: rowsDropped,
-            controlsDropped: controlsDropped,
-            valuesDropped: valuesDropped,
-            abstained: abstained
-        )
-    }
-
     // MARK: - Sections
 
-    private static func screenLine(_ screen: Screen) -> String {
-        var parts: [String] = [screen.appName ?? "unknown app"]
-        if let title = screen.windowTitle {
-            if let display = title.display {
-                parts.append("window \"\(display)\"")
-            } else if title.withheld {
-                parts.append("window \(redactedMarker)")
-            }
-        }
-        parts.append(screen.isFront ? "FRONT" : "not front")
-        if screen.otherWindows > 0 {
-            parts.append("\(screen.otherWindows) other window\(screen.otherWindows == 1 ? "" : "s")")
-        }
-        var line = parts.joined(separator: " · ")
-        if screen.provenance.isVision { line += "  " + screen.provenance.text }
-        return section("SCREEN", line)
-    }
-
-    private struct Block {
+    private static func contentBlock(_ content: Content) -> [String] {
         var lines: [String] = []
-        var dropped = 0
-        var abstained = 0
-    }
-
-    private static func contentBlock(_ content: Content, options: Options) -> Block {
-        var block = Block()
 
         guard content.kind != .canvas else {
             // CANVAS is a single honest sentence, and it must carry its extent:
@@ -628,46 +389,42 @@ public enum MacScreenRender {
             } else {
                 line = "region, size unknown — not interpreted, act physically"
             }
-            block.lines.append(section(content.kind.keyword, line))
+            lines.append(section(content.kind.keyword, line))
             if content.canvas?.hasRegionTarget == true {
-                block.lines.append("        Target: canvas — move, hover, drag, hold, scroll. Drag endpoints may be 'left side of canvas' / 'right side of canvas'; covered points refuse.")
+                lines.append("        Target: canvas — move, hover, drag, hold, scroll. Drag endpoints may be 'left side of canvas' / 'right side of canvas'; covered points refuse.")
             }
-            return block
+            return lines
         }
 
-        let kept = Array(content.rows.prefix(options.maxRows))
-        // Rows this renderer dropped PLUS rows the source dropped before it.
+        let kept = content.rows
         let hidden = content.totalRows - kept.count
-        block.dropped = hidden
 
         var header = "\(content.totalRows) \(content.noun)"
         if hidden > 0 { header += ", showing \(kept.count)" }
-        block.lines.append(section(content.kind.keyword, header))
+        lines.append(section(content.kind.keyword, header))
 
         for (index, row) in kept.enumerated() {
-            block.lines.append(rowLine(ordinal: index + 1, row: row, options: options))
-            if row.abstain != nil { block.abstained += 1 }
+            lines.append(rowLine(ordinal: index + 1, row: row))
         }
         if hidden > 0 {
             // Spoken, in place, with the recourse. A silent cap is the exact
             // thing this renderer exists to stop.
             let recourse = content.scrollable ? "scrollable" : "inspect this section using part or name the target"
-            block.lines.append(indentedNote("… \(hidden) more below (\(recourse))"))
+            lines.append(indentedNote("… \(hidden) more below (\(recourse))"))
         }
-        return block
+        return lines
     }
 
-    private static func controlBlock(_ screen: Screen, options: Options) -> Block {
-        var block = Block()
-        let kept = Array(screen.controls.prefix(options.maxControls))
+    private static func controlBlock(_ screen: Screen) -> [String] {
+        var lines: [String] = []
+        let kept = screen.controls
         let hidden = screen.totalControls - kept.count
-        block.dropped = hidden
-        block.abstained = kept.filter { $0.abstain != nil }.count
+        let abstained = kept.filter { $0.abstain != nil }.count
 
         var header = "\(screen.totalControls) actionable"
         if hidden > 0 { header += ", showing \(kept.count)" }
-        if block.abstained > 0 { header += ", \(block.abstained) ABSTAINED" }
-        block.lines.append(section("DO", header))
+        if abstained > 0 { header += ", \(abstained) ABSTAINED" }
+        lines.append(section("DO", header))
 
         for control in kept {
             var detail = control.kind
@@ -680,7 +437,7 @@ public enum MacScreenRender {
             let details = [MacScreenText(detail, redacted: .string(detail))]
                 + (control.provenance.isVision
                     ? control.states.map { MacScreenText($0, redacted: .string($0)) } : [])
-            block.lines.append(rowLine(
+            lines.append(rowLine(
                 ordinal: nil,
                 roleAddress: control.ordinal.map { "\(control.kind) \($0)" },
                 row: Row(
@@ -688,19 +445,11 @@ public enum MacScreenRender {
                     detail: details,
                     provenance: control.provenance,
                     abstain: control.abstain
-                ),
-                options: options
+                )
             ))
         }
         if hidden > 0 {
-            let observedHidden = max(0, screen.controls.count - kept.count)
-            if observedHidden > 0 {
-                block.lines.append(indentedNote("… \(observedHidden) observed controls not shown (look again with part: controls, or name a control)"))
-            }
-            let unavailable = max(0, hidden - observedHidden)
-            if unavailable > 0 {
-                block.lines.append(indentedNote("… \(unavailable) further controls outside this observation; inspect the relevant visible region"))
-            }
+            lines.append(indentedNote("… \(hidden) further controls outside this observation; inspect the relevant visible region"))
         }
         // The unlabeled census. Sorted by kind so the bytes are identical every
         // run; counted rather than hidden, because an unnamed control she cannot
@@ -712,41 +461,33 @@ public enum MacScreenRender {
                 .sorted { $0.key == $1.key ? false : $0.key < $1.key }
                 .map { "\($0.key) \($0.value)" }
                 .joined(separator: ", ")
-            block.lines.append(indentedNote(
+            lines.append(indentedNote(
                 "… \(total) unlabeled (\(breakdown)) — not addressable by name, point by region"
             ))
         }
-        return block
+        return lines
     }
 
-    private static func valueBlock(_ screen: Screen, options: Options) -> Block {
-        var block = Block()
-        let kept = Array(screen.values.prefix(options.maxValues))
+    private static func valueBlock(_ screen: Screen) -> [String] {
+        var lines: [String] = []
+        let kept = screen.values
         let hidden = screen.totalValues - kept.count
-        block.dropped = hidden
 
         var header = "\(screen.totalValues) value\(screen.totalValues == 1 ? "" : "s")"
         if hidden > 0 { header += ", showing \(kept.count)" }
-        block.lines.append(section("SAYS", header))
+        lines.append(section("SAYS", header))
 
         for value in kept {
-            let shown = value.text.display.map { "\"\(truncate($0, to: options.maxLabelChars * 2))\"" }
+            let shown = value.text.display.map { "\"\($0)\"" }
                 ?? redactedMarker
             var line = pad(String(repeating: " ", count: rowIndent) + shown, to: rowIndent + labelColumn + detailColumn + 2)
             line += value.provenance.text
-            block.lines.append(trimTrailing(line))
+            lines.append(trimTrailing(line))
         }
         if hidden > 0 {
-            let observedHidden = max(0, screen.values.count - kept.count)
-            if observedHidden > 0 {
-                block.lines.append(indentedNote("… \(observedHidden) observed readouts not shown (look again with part: hud, or name a readout)"))
-            }
-            let unavailable = max(0, hidden - observedHidden)
-            if unavailable > 0 {
-                block.lines.append(indentedNote("… \(unavailable) further values outside this observation; inspect the relevant visible region"))
-            }
+            lines.append(indentedNote("… \(hidden) further values outside this observation; inspect the relevant visible region"))
         }
-        return block
+        return lines
     }
 
     // MARK: - Lines
@@ -754,8 +495,7 @@ public enum MacScreenRender {
     private static func rowLine(
         ordinal: Int?,
         roleAddress: String? = nil,
-        row: Row,
-        options: Options
+        row: Row
     ) -> String {
         var line = ordinal.map { pad("  \($0)", to: rowIndent) }
             ?? roleAddress.map { pad($0, to: rowIndent) }
@@ -763,7 +503,7 @@ public enum MacScreenRender {
 
         let label: String
         if let text = row.label {
-            label = text.display.map { truncate($0, to: options.maxLabelChars) }
+            label = text.display
                 ?? (text.withheld ? redactedMarker : unlabeledMarker)
         } else {
             label = unlabeledMarker
@@ -771,7 +511,7 @@ public enum MacScreenRender {
         line = pad(line + label, to: rowIndent + labelColumn)
 
         let detail = row.detail
-            .map { $0.display.map { truncate($0, to: options.maxLabelChars) } ?? redactedMarker }
+            .map { $0.display ?? redactedMarker }
             .joined(separator: "  ")
         line = pad(line + detail, to: rowIndent + labelColumn + detailColumn)
 
@@ -802,11 +542,6 @@ public enum MacScreenRender {
         return text + String(repeating: " ", count: width - count)
     }
 
-    static func truncate(_ text: String, to limit: Int) -> String {
-        guard text.count > limit, limit > 1 else { return text }
-        return String(text.prefix(limit - 1)) + "…"
-    }
-
     static func trimTrailing(_ text: String) -> String {
         var out = text
         while out.hasSuffix(" ") { out.removeLast() }
@@ -816,27 +551,6 @@ public enum MacScreenRender {
     static func integer(_ value: Double) -> String {
         guard value.isFinite else { return "0" }
         return String(Int(value.rounded()))
-    }
-
-    /// The least-confident of a set. AX is 1 by construction, so a path made of
-    /// AX steps has no confidence to print; one vision step drags the whole path
-    /// down to its number.
-    static func weakestProvenance(_ all: [Provenance]) -> Provenance? {
-        guard !all.isEmpty else { return nil }
-        var weakest: Provenance = .ax
-        var weakestValue = 1.0
-        for item in all {
-            let value: Double
-            switch item {
-            case .ax: value = 1
-            case .vision(let confidence): value = confidence.isFinite ? min(1, max(0, confidence)) : 0
-            }
-            if value < weakestValue {
-                weakestValue = value
-                weakest = item
-            }
-        }
-        return weakest
     }
 
     // MARK: - The fixed KIND vocabulary

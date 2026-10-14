@@ -717,13 +717,10 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// and CLI-adoption consent rules in OpenAIOAuthCredentials.
     /// Effort levels the signed-in account's discovered catalog lists for `model`.
     func accountSupportedEfforts(model: String) -> [String]? {
-        CodexAccountModelCatalog.load(
+        CodexAccountModelCatalog.matchingModels(
             providerID: "openai_oauth_direct",
-            cacheURL: CodexAccountModelCatalog.matchingCacheCandidate(
-                oauthAuthURL: resolveAuthPath(),
-                fallbackCacheURL: CodexAccountModelCatalog.cacheCandidate()
-            ),
-            useDefaultCacheWhenNil: false
+            oauthAuthURL: resolveAuthPath(),
+            fallbackCacheURL: CodexAccountModelCatalog.cacheCandidate()
         ).first { $0.id == model }?.supportedReasoningEfforts
     }
 

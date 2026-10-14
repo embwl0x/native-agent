@@ -137,3 +137,150 @@ public enum DoctorStatusProjection {
         return "ok"
     }
 }
+
+extension DoctorStatusProjection {
+    public static func categoryID(for id: String) -> String {
+        switch id {
+        case "codex_login", "llm", "codex_login_helper", "live.providers": "Provider"
+        case "daemon_lifecycle", "legacy_launch_agent", "launch_agent", "live.background_loops", "live.bridges",
+             // Per-turn prompt-prefix cache health is a property of the running
+             // app, not of stored data.
+             "prompt_prefix_health": "Runtime"
+        // Her subconscious is not a subsystem of the body — it gets its own
+        // group so a capsule that stopped arriving reads as what it is.
+        case "subconscious_vitals": "Cognition"
+        case "searxng", "telegram", "connectors", "live.telegram", "live.search": "Connectors"
+        case "storage", "chat_sessions", "session_identity", "persona_engine", "backups", "write_test", "live.memory": "Data"
+        case "tools", "live.tools": "Tools"
+        case "autonomy", "live.autonomy": "Autonomy"
+        default: "Release"
+        }
+    }
+
+    public static func groupedChecks(_ checks: [CheckResult]) -> [(String, [CheckResult])] {
+        let order = [
+            "Provider", "Runtime", "Cognition", "Connectors", "Data", "Tools",
+            "Autonomy", "Release",
+        ]
+        let grouped = Dictionary(grouping: checks, by: { categoryID(for: $0.id) })
+        let statusOrder = ["failing", "warning", "healthy", "reading", "off", "not needed", "unclear"]
+        return order.compactMap { key in
+            guard let values = grouped[key], !values.isEmpty else { return nil }
+            return (key, values.sorted {
+                let lhs = statusOrder.firstIndex(of: DoctorPlainCopy.bucket(for: $0.status)) ?? statusOrder.count
+                let rhs = statusOrder.firstIndex(of: DoctorPlainCopy.bucket(for: $1.status)) ?? statusOrder.count
+                return lhs == rhs ? $0.title < $1.title : lhs < rhs
+            })
+        }
+    }
+
+
+}
+
+public enum DoctorPlainCopy {
+    public struct Summary: Equatable {
+        public var healthy = 0
+        public var warning = 0
+        public var failing = 0
+        public var unclear = 0
+        public var reading = 0
+        public var off = 0
+        public var notNeeded = 0
+
+        public var total: Int { healthy + warning + failing + unclear + reading + off + notNeeded }
+
+        /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
+        public var statusText: String {
+            if failing > 0 { return "failed" }
+            if warning > 0 { return "warn" }
+            if total == 0 { return "unknown" }
+            if reading > 0 { return "info" }
+            return "ok"
+        }
+    }
+
+    /// Readings stay distinct from health verdicts and use the info tint.
+    public static func bucket(for status: String) -> String {
+        switch status.lowercased() {
+        case "ok", "done", "passed", "succeeded", "active", "valid", "ready", "scheduled":
+            return "healthy"
+        case "warn", "warning", "blocked", "needs_setup", "planned", "interrupted", "disabled":
+            return "warning"
+        case "fail", "failed", "error", "timeout", "quarantined":
+            return "failing"
+        case "unmeasured":
+            return "reading"
+        // Off by config or not needed: no fault, and no healthy work either.
+        case "off", "not needed":
+            return status.lowercased()
+        default:
+            return "unclear"
+        }
+    }
+
+    public static func summarize(_ checks: [CheckResult]) -> Summary {
+        var summary = Summary()
+        for check in checks {
+            switch bucket(for: check.status) {
+            case "healthy": summary.healthy += 1
+            case "warning": summary.warning += 1
+            case "failing": summary.failing += 1
+            case "off": summary.off += 1
+            case "not needed": summary.notNeeded += 1
+            case "reading": summary.reading += 1
+            default: summary.unclear += 1
+            }
+        }
+        return summary
+    }
+
+    public static func headline(for summary: Summary) -> String {
+        if summary.total == 0 { return "No checks have run yet." }
+        if summary.failing > 0 { return "Some parts of the app are not working." }
+        if summary.warning > 0 { return "The app is running, but some parts need attention." }
+        if summary.unclear > 0 { return "The app is running. Some checks came back unclear." }
+        if summary.reading > 0 { return "The app is running. Some checks are readings." }
+        // Off and not needed are not faults, but they are not "everything" either.
+        let inactive = [(summary.off, "off"), (summary.notNeeded, "not needed")]
+            .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+        return inactive.isEmpty ? "Everything looks healthy." : "Healthy; " + inactive.joined(separator: ", ") + "."
+    }
+
+    public static func detail(for summary: Summary) -> String {
+        guard summary.total > 0 else {
+            return "Press Repair to check everything and fix what is broken."
+        }
+        var parts = ["\(summary.healthy) working"]
+        if summary.warning > 0 { parts.append("\(summary.warning) need attention") }
+        if summary.failing > 0 { parts.append("\(summary.failing) not working") }
+        if summary.unclear > 0 { parts.append("\(summary.unclear) unclear") }
+        if summary.reading > 0 { parts.append("\(summary.reading) readings") }
+        if summary.off > 0 { parts.append("\(summary.off) off") }
+        if summary.notNeeded > 0 { parts.append("\(summary.notNeeded) not needed") }
+        let checked = summary.total == 1 ? "1 area checked" : "\(summary.total) areas checked"
+        return "\(checked): " + parts.joined(separator: ", ") + "."
+    }
+
+    /// Turn a loop identifier such as `github_tracking` into `Github tracking`.
+    /// The raw identifier still renders inside the Details disclosure.
+    public static func friendlyLoopName(_ loopId: String) -> String {
+        let spaced = loopId
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: ".", with: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard let first = spaced.first else { return loopId }
+        return String(first).uppercased() + spaced.dropFirst()
+    }
+
+    public static func allLoopsHealthyText(count: Int) -> String {
+        count == 1 ? "1 background task is running normally."
+                   : "All \(count) background tasks are running normally."
+    }
+
+    public static func otherLoopsHealthyText(count: Int) -> String {
+        count == 1 ? "1 other background task is running normally."
+                   : "\(count) other background tasks are running normally."
+    }
+}

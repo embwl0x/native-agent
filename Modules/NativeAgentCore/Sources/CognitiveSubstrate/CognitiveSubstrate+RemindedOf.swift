@@ -213,15 +213,14 @@ extension CognitiveSubstrate {
     /// Called from `prepareFrozenCapsulePresentation` rather than from the
     /// render, because the render is synchronous by construction (it must be:
     /// it mutates a copied presentation value inside one admission) and the
-    /// store lookup is not. The felt line is computed twice as a result — once
-    /// here to ask with, once in the render to speak with — and both are pure
-    /// functions of the same frozen read, so they cannot disagree.
+    /// store lookup is not. Carry the frozen felt inputs into rendering so the
+    /// lookup and capsule use the same computation.
     func remindedOfMoment(
         for request: CognitiveCapsuleRequest,
-        from read: CognitiveFrozenRead
+        from read: CognitiveFrozenRead,
+        felt: inout (signals: FeltSignals, fingerprint: FeltLineRender?)?
     ) async -> CognitiveRecalledMoment? {
         guard read.configuration.enabled,
-              read.configuration.affectEnabled,
               read.configuration.capsuleInjectionEnabled,
               request.mode == .inject,
               request.resolvedTurnKind == .live else { return nil }
@@ -237,13 +236,15 @@ extension CognitiveSubstrate {
             mood: read.mood,
             proxies: read.feltProxies,
             dynamics: dyn)
-        guard let fingerprint = feltFingerprintLine(
+        let fingerprint = feltFingerprintLine(
             signals: signals,
             workspaceItems: items,
             request: request,
             at: read.fixedAt,
             dynamics: dyn,
-            affectEnabled: read.configuration.affectEnabled) else { return nil }
+            affectEnabled: read.configuration.enabled)
+        felt = (signals, fingerprint)
+        guard let fingerprint else { return nil }
         // THE TWO WAYS A FEELING IS SPECIFIC ENOUGH TO DRAG SOMETHING UP: it
         // already names what it is about, or it is strong. A faint, objectless
         // "quiet" is not a cue; asking with it would return whatever the store

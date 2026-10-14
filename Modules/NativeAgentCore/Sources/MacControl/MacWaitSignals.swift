@@ -117,9 +117,7 @@ public final class MacWaitSignals: @unchecked Sendable {
     private let collector = MacAXEffectCollector()
     private let effectGuard: MacAXEffectObserverGuard
     private let activation: (any MacAXEffectObservation)?
-    private let activationBox: MacWaitActivationBox
     private let lock = NSLock()
-    private var consumedNotifications = 0
     private var stopped = false
 
     /// App activation alone says nothing about changes inside a window.
@@ -140,31 +138,17 @@ public final class MacWaitSignals: @unchecked Sendable {
             )
         }
         self.effectGuard = MacAXEffectObserverGuard(installedEffects)
-        // The activation flag is set from the main run loop while the wait runs
-        // off it, exactly like the AX collector.
-        let box = MacWaitActivationBox()
-        self.activation = activationSource.install(onActivation: { box.set() })
-        self.activationBox = box
+        self.activation = activationSource.install(onActivation: { sink.signal() })
         self.isObserving = installedEffects != nil
     }
 
     /// Anything since the last call? Drains both channels.
     public func consume() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        var fired = false
-        // DROPPED COUNTS. `MacAXEffectCollector` retains only the first 64
-        // notifications and counts the rest, so a churning app saturates the
-        // buffer within a second — and comparing `snapshot().count` alone would
-        // then report "nothing since last time" forever, turning a busy screen
-        // into a settle. The TOTAL is retained + dropped.
-        let notifications = collector.snapshot().count + collector.droppedCount()
-        if notifications > consumedNotifications {
-            consumedNotifications = notifications
-            fired = true
-        }
-        if activationBox.take() { fired = true }
-        return fired
+        collector.consumeSignal()
+    }
+
+    func waitForSignal(seconds: Double) async -> Bool {
+        await collector.waitForSignal(seconds: seconds)
     }
 
     /// The notification kinds seen so far, for the wait's structured detail.
@@ -188,25 +172,8 @@ public final class MacWaitSignals: @unchecked Sendable {
         lock.unlock()
         effectGuard.stop()
         activation?.stop()
+        collector.finishWaiting()
     }
 
     deinit { stop() }
-}
-
-/// One bool, safely crossed between the main run loop and the waiting task.
-final class MacWaitActivationBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var pending = false
-
-    func set() {
-        lock.lock(); pending = true; lock.unlock()
-    }
-
-    func take() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        let value = pending
-        pending = false
-        return value
-    }
 }

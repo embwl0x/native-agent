@@ -2,7 +2,7 @@ import SwiftUI
 import ToolRegistry
 import Foundation
 import ChatOrchestration
-import MacControl
+import ChatSessionWork
 import NativeAgentShared
 import PersistenceCore
 
@@ -13,80 +13,45 @@ private extension JSONValue {
     }
 }
 
-enum ToolPillPresentation {
-    enum Outcome: String, Equatable {
-        case pending = "Running"
-        case succeeded = "Completed"
-        case refused = "Refused"
-        case partial = "Partial"
-        case connectionFailed = "Connection failed"
-        case unknown = "Outcome unknown"
-        case failed = "Failed"
-        /// A raised inline card. The call asked the person a question; it did
-        /// not fail, and it has not run (2026-09-14).
-        case needsYou = "Needs you"
-
-        var icon: String {
-            switch self {
-            case .pending: "clock"
-            case .succeeded: "checkmark.circle.fill"
-            case .failed: "xmark.circle.fill"
-            case .refused: "hand.raised"
-            case .partial: "circle.lefthalf.filled"
-            case .connectionFailed: "exclamationmark.triangle"
-            case .unknown: "questionmark.circle"
-            case .needsYou: "person.crop.circle.badge.questionmark"
-            }
-        }
-
-        var color: Color {
-            .secondary
-        }
+struct ToolPillPresentation: Sendable {
+    struct Revision: Equatable, Sendable {
+        let metadata: ChatMessageMetadata?
+        let expanded: Bool
     }
 
-    /// Pure projection of the dispatch envelope, never of the transport success bit.
-    /// The catch boundary projects AutonomyGateError and MCPSubprocessError to
-    /// these exact wire forms; do not search arbitrary result prose for errors.
-    static func outcome(toolName: String = "", result: String? = nil, ok: Bool? = nil) -> Outcome {
-        guard let result else { return ok == false ? .failed : (ok == nil ? .pending : .unknown) }
-        guard let value = try? JSONValue.parse(Data(result.utf8)) else { return ok == false ? .failed : .unknown }
-        let classification = ChatToolOutcome.recordedResultClass(value) ?? ChatToolOutcome.exactResultClass(value)
-        let macOutcome = MacControlReceiptOutcome.projecting(envelope: value)
-        let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
-        let status = fields["status"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let error = fields["error"]?.stringValue
-        switch classification {
-        case .succeeded:
-            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
-            if fields["partial"] == .bool(true) { return .partial }
-            return .succeeded
-        case .refused: return .refused
-        case .failed:
-            if macOutcome == .refused { return .refused }
-            if status == "failed", let error, error.hasPrefix("tool denied: "), fields["reason"] == .string(error) {
-                return .refused
-            }
-            if status == "failed", error == "streamClosed", fields["reason"] == .string("streamClosed") {
-                return .connectionFailed
-            }
-            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
-            return .failed
-        case .cancelled, .timeout: return .unknown
-        case .unknown:
-            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
-            if ChatToolOutcome.isWaitingInteraction(value) { return .needsYou }
-            if status == "partial" || fields["partial"] == .bool(true) { return .partial }
-            if status == "running" || macOutcome == .running { return .pending }
-            return .unknown
-        }
-    }
+    let revision: Revision
+    let title: String
+    let target: String
+    let summary: String
+    let outcome: ChatToolOutcome.DisplayOutcome
+    let durationText: String
+    let fields: [(key: String, value: String)]
+    let remedy: String?
+    let diffLines: [String]?
 
+    init(_ revision: Revision) {
+        self.revision = revision
+        let meta = revision.metadata
+        let call = ToolNameAliases.shown(meta?.toolName ?? "tool", inputJSON: meta?.inputJSON)
+        let input = call.inputJSON.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+        let result = meta?.resultSummary.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+        title = Self.title(call.name)
+        target = Self.boundedLine(Self.target(input), limit: 180)
+        outcome = ChatToolOutcome.displayOutcome(result: result, ok: meta?.ok, hasResult: meta?.resultSummary != nil)
+        summary = Self.boundedLine(ChatToolOutcome.displaySummary(outcome: outcome, input: input, result: result), limit: 240)
+        durationText = Self.durationText(meta?.durationMs)
+        fields = revision.expanded ? Self.fieldLines(input) + Self.fieldLines(result) : []
+        remedy = revision.expanded ? result.flatMap(ChatToolOutcome.remedy) : nil
+        if revision.expanded, call.name == "write_file", let before = meta?.beforeContent, let after = meta?.afterContent {
+            diffLines = ToolDiffPresentation.lines(before: before, after: after)
+        } else { diffLines = nil }
+    }
     static func title(_ name: String) -> String {
         ToolActivityPresentation.title(name)
     }
 
-    static func target(_ input: String?) -> String {
-        guard let input, let value = try? JSONValue.parse(Data(input.utf8)), case .object(let fields) = value else { return "" }
+    static func target(_ input: JSONValue?) -> String {
+        guard case .object(let fields)? = input else { return "" }
         var values = ["path", "file", "file_path", "target", "task", "task_id", "parent", "title", "query", "id"]
             .compactMap { fields[$0]?.stringValue }
         if case .array(let children)? = fields["children"] {
@@ -103,54 +68,6 @@ enum ToolPillPresentation {
             .truncated(to: limit, suffix: "…")
     }
 
-    static func summary(outcome: Outcome, input: String?, result: String?) -> String {
-        let value = result.flatMap { try? JSONValue.parse(Data($0.utf8)) }
-        let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
-        let reason = value.flatMap(ChatToolOutcome.explanation)
-        let macOutcome = value.flatMap { MacControlReceiptOutcome.projecting(envelope: $0) }
-        switch outcome {
-        case .pending: return "No result yet"
-        // A question, not a result. The envelope's own one-liner is the reason
-        // the card exists, so it is what the pill says.
-        case .needsYou:
-            return fields["detail"]?.stringValue ?? "Waiting on your answer"
-        case .unknown:
-            if let macOutcome, macOutcome == .effectUnconfirmed || macOutcome == .timedOut {
-                return MacControlReceiptOutcome.effectUnconfirmed.sentence
-            }
-            return "Response received · completion not confirmed"
-        case .connectionFailed: return "Connection lost · completion unknown"
-        case .refused:
-            if reason == "tool denied: fileAccess=read_only blocks write_file" {
-                return "Reading only is allowed; file not written."
-            }
-            return reason ?? "The request was refused."
-        case .partial:
-            var count = "Partially completed"
-            if case .array(let created)? = fields["created"], let input,
-               let args = try? JSONValue.parse(Data(input.utf8)), case .object(let args) = args,
-               case .array(let children)? = args["children"] {
-                count = "\(created.count) of \(children.count) tasks created"
-            }
-            // Desk breakdown reports "creating child N 'Title': <error>"; say what
-            // did not happen and why. The raw reason stays verbatim in Details.
-            var why = reason
-            if let reason, reason.hasPrefix("creating child "),
-               let open = reason.firstIndex(of: "'"),
-               let close = reason[reason.index(after: open)...].firstIndex(of: "'") {
-                let title = reason[reason.index(after: open)..<close]
-                let rest = reason[close...].dropFirst()
-                let error = rest.hasPrefix(": ") ? rest.dropFirst(2) : rest
-                why = "\(title) not created: \(error)"
-            }
-            return count + (why.map { " · \($0)" } ?? "")
-        case .failed: return reason ?? "The request failed."
-        case .succeeded:
-            if case .string(let text) = value { return text }
-            return fields["summary"]?.stringValue ?? fields["message"]?.stringValue ?? "Completed"
-        }
-    }
-
     /// ui-simplify 2026-09-02: an absent duration used to render the words
     /// "unknown duration" beside every streamed tool call — a confession the
     /// reader could do nothing with. A missing duration now says nothing at
@@ -164,10 +81,9 @@ enum ToolPillPresentation {
     /// person can read — top-level fields in key order, each value one short
     /// line, nested values counted rather than dumped. Raw JSON stays behind
     /// the row's "Raw" toggle. Not an object (or not JSON): no lines.
-    static func fieldLines(_ json: String?, limit: Int = 8) -> [(key: String, value: String)] {
-        guard let json, let value = try? JSONValue.parse(Data(json.utf8)),
-              case .object(let fields) = value else { return [] }
-        let lines = fields.keys.sorted().compactMap { key -> (key: String, value: String)? in
+    static func fieldLines(_ value: JSONValue?, limit: Int = 8) -> [(key: String, value: String)] {
+        guard case .object(let fields)? = value else { return [] }
+        let lines = fields.keys.sorted().lazy.compactMap { key -> (key: String, value: String)? in
             let shown: String
             switch fields[key]! {
             case .null: return nil
@@ -199,13 +115,15 @@ enum ToolDiffPresentation {
     private static func alignedRows(before: [String], after: [String]) -> [String] {
         let m = before.count
         let n = after.count
-        var lengths = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
+        // The inputs are already capped at 1,002 rows. One compact matrix
+        // retains the existing alignment and tie-breaking within that bound.
+        var lengths = Array(repeating: UInt16(0), count: (m + 1) * (n + 1))
         if m > 0, n > 0 {
             for i in stride(from: m - 1, through: 0, by: -1) {
                 for j in stride(from: n - 1, through: 0, by: -1) {
-                    lengths[i][j] = before[i] == after[j]
-                        ? lengths[i + 1][j + 1] + 1
-                        : max(lengths[i + 1][j], lengths[i][j + 1])
+                    lengths[i * (n + 1) + j] = before[i] == after[j]
+                        ? lengths[(i + 1) * (n + 1) + j + 1] + 1
+                        : max(lengths[(i + 1) * (n + 1) + j], lengths[i * (n + 1) + j + 1])
                 }
             }
         }
@@ -217,7 +135,7 @@ enum ToolDiffPresentation {
                 rows.append(" \(before[i])")
                 i += 1
                 j += 1
-            } else if lengths[i + 1][j] >= lengths[i][j + 1] {
+            } else if lengths[(i + 1) * (n + 1) + j] >= lengths[i * (n + 1) + j + 1] {
                 rows.append("-\(before[i])")
                 i += 1
             } else {
@@ -245,29 +163,31 @@ struct ToolPillView: View {
     @State private var showsRaw = false
 
     private var meta: ChatMessageMetadata? { message.metadata }
-    /// An app call reads as the action it ran, over that action's args.
-    private var call: (name: String, inputJSON: String?) {
-        ToolNameAliases.shown(meta?.toolName ?? "tool", inputJSON: meta?.inputJSON)
-    }
-    private var toolName: String { call.name }
-    private var outcome: ToolPillPresentation.Outcome {
-        ToolPillPresentation.outcome(toolName: toolName, result: meta?.resultSummary, ok: meta?.ok)
-    }
-    private var durationText: String { ToolPillPresentation.durationText(meta?.durationMs) }
+    @State private var presentation: ToolPillPresentation?
     private var resultSummary: String { meta?.resultSummary ?? "" }
-    private var title: String { ToolPillPresentation.title(toolName) }
-    private var target: String {
-        ToolPillPresentation.boundedLine(ToolPillPresentation.target(call.inputJSON), limit: 180)
-    }
-    private var summary: String {
-        ToolPillPresentation.boundedLine(
-            ToolPillPresentation.summary(outcome: outcome, input: call.inputJSON, result: meta?.resultSummary),
-            limit: 240)
+    var body: some View {
+        Group {
+            if let presentation, presentation.revision.metadata == meta {
+                pill(presentation)
+            }
+        }
+        .task(id: ToolPillPresentation.Revision(metadata: meta, expanded: expanded)) {
+            if let presentation, presentation.revision.metadata == meta,
+               presentation.revision.expanded || !expanded { return }
+            let revision = ToolPillPresentation.Revision(metadata: meta, expanded: expanded)
+            let prepared = await Task.detached(priority: .userInitiated) { ToolPillPresentation(revision) }.value
+            if !Task.isCancelled { presentation = prepared }
+        }
     }
 
-    var body: some View {
+    private func pill(_ presentation: ToolPillPresentation) -> some View {
+        let target = presentation.target
+        let title = presentation.title
+        let summary = presentation.summary
+        let outcome = presentation.outcome
+        let durationText = presentation.durationText
         let line = headline ?? (target.isEmpty ? title : "\(title) · \(target)")
-        ChatActivityRow(
+        return ChatActivityRow(
             title: line,
             trailing: durationText,
             isExpanded: $expanded,
@@ -282,13 +202,11 @@ struct ToolPillView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(summary)
                     .fixedSize(horizontal: false, vertical: true)
-                if let value = try? JSONValue.parse(Data(resultSummary.utf8)),
-                   let remedy = ChatToolOutcome.remedy(value) {
+                if let remedy = presentation.remedy {
                     Text("Next step: " + remedy)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                let fields = ToolPillPresentation.fieldLines(call.inputJSON)
-                    + ToolPillPresentation.fieldLines(meta?.resultSummary)
+                let fields = presentation.fields
                 ForEach(Array(fields.enumerated()), id: \.offset) { _, field in
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(field.key + ":").foregroundStyle(NativeAgentShell.tertiary)
@@ -296,8 +214,8 @@ struct ToolPillView: View {
                     }
                 }
                 // Inline diff for write_file
-                if toolName == "write_file", let before = meta?.beforeContent, let after = meta?.afterContent {
-                    ToolDiffView(before: before, after: after)
+                if let lines = presentation.diffLines {
+                    ToolDiffView(diffLines: lines)
                 }
                 Button(showsRaw ? "Hide raw" : "Raw") { showsRaw.toggle() }
                     .buttonStyle(.plain)
@@ -322,14 +240,24 @@ struct ToolPillView: View {
     }
 }
 
+extension ChatToolOutcome.DisplayOutcome {
+    var icon: String {
+        switch self {
+        case .pending: "clock"
+        case .succeeded: "checkmark.circle.fill"
+        case .failed: "xmark.circle.fill"
+        case .refused: "hand.raised"
+        case .partial: "circle.lefthalf.filled"
+        case .connectionFailed: "exclamationmark.triangle"
+        case .unknown: "questionmark.circle"
+        case .needsYou: "person.crop.circle.badge.questionmark"
+        }
+    }
+}
+
 // PATCH-2026-05-08: wave2-chat-ux — unified diff viewer for write_file expanded view
 struct ToolDiffView: View {
-    var before: String
-    var after: String
-
-    private var diffLines: [String] {
-        ToolDiffPresentation.lines(before: before, after: after)
-    }
+    let diffLines: [String]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {

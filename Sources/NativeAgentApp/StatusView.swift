@@ -98,20 +98,15 @@ struct StatusView: View {
                 if let watchdog = appModel.engine.doctor.watchdog {
                     NativePanel(title: "Background work", systemImage: "waveform.path.ecg") {
                         HStack {
-                            StatusBadge(text: watchdog.runtimeBadgeText, status: watchdog.runtimeBadgeStatus)
+                            StatusBadge(text: "SWIFT", status: watchdog.runtimeBadgeStatus)
                             Text(watchdog.runtimeLifecycleDetail)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
                         }
-                        Text("Status: \(watchdog.runtimeLifecycleStatus) · Desk tasks running \(watchdog.runningExecutions ?? 0) · improvements \(watchdog.runningImprovements ?? 0)")
+                        Text("Status: \(watchdog.runtimeLifecycleStatus) · Desk tasks running \(watchdog.runningExecutions) · improvements \(watchdog.runningImprovements)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        if let launchAgentStatus = watchdog.launchAgentStatus, !launchAgentStatus.isEmpty {
-                            Text("Old startup helper: \(launchAgentStatus) · \(watchdog.launchAgentDetail ?? "")")
-                                .font(.caption2)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                        }
                     }
                 }
 

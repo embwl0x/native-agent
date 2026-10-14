@@ -6,10 +6,8 @@ public protocol CognitiveEventObserving: Sendable {
 }
 
 public protocol CognitiveContextProviding: Sendable {
-    func prepareCapsule(_ request: CognitiveCapsuleRequest) async -> CognitiveCapsule?
     /// One fixed-time value for the ordinary turn's cognition/organism seam.
-    /// Implementations that own both sides can override this to avoid separate
-    /// posture and capsule reads. The value is advisory and owns no authority.
+    /// The value is advisory and owns no authority.
     func prepareTurnProjection(_ request: CognitiveCapsuleRequest) async -> CognitiveTurnProjection
     /// Commits presentation-only bookkeeping after the caller actually adds
     /// the projection to the provider context. Preparation itself must not
@@ -32,22 +30,7 @@ extension CognitiveContextProviding {
     /// Default keeps every existing conformer source-compatible and inert.
     public func attentionSignals(at date: Date) async -> CognitiveAttentionSignals? { nil }
 
-    /// Compatibility composition for providers that do not own organism state.
-    /// NativeAgent's app runtime overrides this with one fixed-time read.
-    public func prepareTurnProjection(_ request: CognitiveCapsuleRequest) async -> CognitiveTurnProjection {
-        let posture = await (self as? any OrganismPostureProviding)?.organismBehaviorPosture()
-        let capsule = await prepareCapsule(request)
-        return CognitiveTurnProjection(
-            fixedAt: capsule?.generatedAt ?? posture?.generatedAt ?? Date(),
-            capsule: capsule,
-            posture: posture
-        )
-    }
 
-    public func commitTurnProjection(
-        _ projection: CognitiveTurnProjection,
-        request: CognitiveCapsuleRequest
-    ) async {}
 }
 
 /// What her mind is holding right now, shaped for the context selector.
@@ -107,14 +90,13 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
         func bounded(_ text: String, to limit: Int) -> String {
             text.count <= limit ? text : String(text.prefix(limit))
         }
-        func clamp(_ value: Double) -> Double { value.clamped01() }
         // Deterministic keep-order under the caps: strongest first, then
         // lexicographic so equal weights can't reshuffle across calls (the
         // packet fingerprint folds these in — nondeterminism would thrash
         // the selection cache).
         func cappedByWeight(_ dict: [String: Double], cap: Int, keyLimit: Int) -> [String: Double] {
             var entries: [(key: String, value: Double)] = dict.map { entry in
-                (key: bounded(entry.key, to: keyLimit), value: clamp(entry.value))
+                (key: bounded(entry.key, to: keyLimit), value: (entry.value).clamped01())
             }
             entries.sort { lhs, rhs in
                 if lhs.value == rhs.value { return lhs.key < rhs.key }
@@ -353,14 +335,12 @@ public struct CognitiveAffectState: Sendable, Equatable {
         socialWarmth: Double = 0,
         updatedAt: Date = Date(timeIntervalSince1970: 0)
     ) {
-        self.arousal = Self.clamp(arousal)
-        self.uncertainty = Self.clamp(uncertainty)
-        self.taskPressure = Self.clamp(taskPressure)
-        self.socialWarmth = Self.clamp(socialWarmth)
+        self.arousal = (arousal).clamped01()
+        self.uncertainty = (uncertainty).clamped01()
+        self.taskPressure = (taskPressure).clamped01()
+        self.socialWarmth = (socialWarmth).clamped01()
         self.updatedAt = updatedAt
     }
-
-    static func clamp(_ value: Double) -> Double { value.clamped01() }
 }
 
 public enum CognitiveThoughtSeedKind: String, Sendable, Equatable, CaseIterable {

@@ -1,46 +1,17 @@
+import EngineRuntime
 import Foundation
-import Observation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
+import NativeAgentCore
 import SwiftUI
 import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
-import MemoryV2
 import AppToolRuntime
 import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
-import TrustCenter
-import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
 import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
 import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
 import Skills
 import Connectors
-import Browser
 
 struct TelegramSettingsDraftSnapshot: Equatable {
     var enabled: Bool
@@ -56,37 +27,6 @@ extension AppModel {
     }
 }
 
-/// The authored-tools row is a projection of the same promotion boundary the
-/// action repeats. Keeping its enabled state and refusal copy here prevents a
-/// mounted SwiftUI control from becoming a second, untested eligibility rule.
-enum ToolApprovalPresentation {
-    struct Control: Equatable {
-        let accessibilityIdentifier: String
-        let isEnabled: Bool
-        let help: String
-        let refusal: String?
-    }
-
-    static func control(for tool: ToolRecord) -> Control {
-        let refusal = ToolApprovalEligibility.refusal(for: tool)
-        return Control(
-            accessibilityIdentifier: "tools.authored.approve.\(tool.id)",
-            isEnabled: refusal == nil,
-            help: refusal ?? "Approve this validated proposal and activate it.",
-            refusal: refusal
-        )
-    }
-}
-
-/// The result of one SearXNG discovery attempt. Research owns presentation of
-/// this result so an incidental discovery cannot replace the app-wide status
-/// message used by other mounted surfaces.
-enum SearXNGAutodetectOutcome: Equatable {
-    case found(String)
-    case notFound(String)
-    case failed(String)
-}
-
 @MainActor
 extension AppModel {
     @MainActor
@@ -100,51 +40,26 @@ extension AppModel {
         }
     }
 
-    // PATCH-2026-05-06: skill-ui AppModel methods — load registry from filesystem (v1 fallback)
     @MainActor
     func loadSkillManifests() async {
         isLoadingSkillManifests = true
         let root = engine.dataRoot
-        async let registryEntriesTask: [SkillRegistryEntry] = try await makeSkillsClient(root: root).listManifestSkillEntries()
         async let learnedSkillsTask: [SkillRecord] = try await RuntimeReadProjection.skills(dataRoot: engine.dataRoot)
         var failures: [String] = []
-        let entries: [SkillRegistryEntry]
-        do {
-            entries = try await registryEntriesTask
-        } catch {
-            entries = []
-            nativeLog("%@", "[skills] registry read failed: \(error)")
-            failures.append("the skill registry")
-        }
         let learnedSkills: [SkillRecord]
         do {
             learnedSkills = try await learnedSkillsTask
         } catch {
             learnedSkills = []
-            nativeLog("%@", "[skills] learned skills read failed: \(error)")
+            ModuleLog.app("%@", "[skills] learned skills read failed: \(error)")
             failures.append("learned skills")
         }
-        // mainactor_icloud: the per-skill manifest/README reads below use synchronous
-        // Data(contentsOf:)/String(contentsOf:) disk I/O. Run them off the main thread
-        // (awaited to preserve ordering), then hop back to @MainActor for state below.
         let infos: [SkillInfo] = await Task.detached(priority: .utility) {
             var infos: [SkillInfo] = []
-            var seenIds = Set<String>()
             for skill in learnedSkills {
-                let info = SkillInfo.learnedSkill(skill)
+                let review = try? SwiftNativeSkillsClient(root: root).readSkill(name: skill.id, source: true)
+                let info = SkillInfo.learnedSkill(skill, review: review)
                 infos.append(info)
-                seenIds.insert(info.id.lowercased())
-                seenIds.insert(info.manifest.name.lowercased())
-            }
-            for entry in entries {
-                let key = entry.name.lowercased()
-                if seenIds.contains(key) { continue }
-                let manifest = try? Self.readSkillManifest(entry: entry, dataRoot: root)
-                if let manifest {
-                    let readme = try? Self.readSkillReadme(entry: entry, dataRoot: root)
-                    infos.append(SkillInfo(id: entry.name, manifest: manifest, registry: entry, readme: readme))
-                    seenIds.insert(entry.name.lowercased())
-                }
             }
             return infos
         }.value
@@ -157,54 +72,26 @@ extension AppModel {
         isLoadingSkillManifests = false
     }
 
-    /// A manifest-registry skill's manifest.json, from its directory (v1 fallback).
-    private nonisolated static func readSkillManifest(entry: SkillRegistryEntry, dataRoot: URL) throws -> SkillManifest {
-        let data = try Data(contentsOf: skillDirectory(entry, dataRoot: dataRoot).appendingPathComponent("manifest.json"))
-        return try JSONDecoder.nativeAgent.decode(SkillManifest.self, from: data)
-    }
-
-    /// Its README.md if present, previewed past 64 KB (v1 fallback).
-    private nonisolated static func readSkillReadme(entry: SkillRegistryEntry, dataRoot: URL) throws -> String? {
-        let readmeURL = skillDirectory(entry, dataRoot: dataRoot).appendingPathComponent("README.md")
-        guard FileManager.default.fileExists(atPath: readmeURL.path) else { return nil }
-        let attrs = try FileManager.default.attributesOfItem(atPath: readmeURL.path)
-        let byteCount = (attrs[.size] as? NSNumber)?.intValue ?? 0
-        let previewLimit = 64 * 1024
-        if byteCount <= previewLimit {
-            return try String(contentsOf: readmeURL, encoding: .utf8)
-        }
-        let handle = try FileHandle(forReadingFrom: readmeURL)
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: previewLimit) ?? Data()
-        let preview = String(decoding: data, as: UTF8.self)
-        return preview + "\n\n[README preview truncated in the app: \(byteCount) bytes total.]"
-    }
-
-    private nonisolated static func skillDirectory(_ entry: SkillRegistryEntry, dataRoot: URL) -> URL {
-        SwiftNativeSkillsClient(root: dataRoot).manifestDirectory(for: [
-            "name": .string(entry.name), "path": .string(entry.path),
-        ])
-    }
-
     /// `reviewSheet: false` is the agent's `skill_manage enable`, which also
     /// turns a disabled skill back on; the sheet installs drafts only.
     @MainActor
     @discardableResult
     func installReviewedSkill(_ info: SkillInfo, reviewSheet: Bool = true) async -> SkillReviewInstallOutcome {
-        if reviewSheet, let refusal = SkillReviewInstallPresentation.preflight(for: info) {
+        if reviewSheet, let refusal = InstalledSkillInventory.reviewInstallRefusal(
+            version: info.registry.version, state: info.registry.state, name: info.registry.name,
+            hasCandidate: info.candidateDigest != nil && info.readme != nil,
+            validationStatus: info.validationStatus
+        ) {
             return .refused(detail: refusal)
         }
         let requestedName = info.registry.name
         do {
             try await NativeSkillRegistryActions.enableSkill(
                 name: requestedName, dataRoot: engine.dataRoot,
-                reviewedDigest: info.scriptDigest, admitScript: true
+                reviewedDigest: info.candidateDigest, admitScript: true
             )
             await loadSkillManifests()
-            let key = requestedName.lowercased()
-            let recovered = skillManifests.first { info in
-                info.id.lowercased() == key || info.manifest.name.lowercased() == key
-            }
+            let recovered = skillManifests.first { $0.id == info.id }
             guard let recovered,
                   ["installed", "active"].contains(recovered.registry.state.lowercased()) else {
                 let detail = "Install could not be verified after the registry refresh."
@@ -228,66 +115,37 @@ extension AppModel {
     }
 
     @MainActor
-    func setToolAutoRun(_ tool: ToolRecord, autoRun: Bool) async {
+    func quarantineTool(_ tool: ToolRecord, reason: String = "Owner switched off from NativeAgent UI.") async {
         do {
-            let updated = try await engine.tools.updateTool(id: tool.id, autoRun: autoRun)
-            let reloaded = try await engine.tools.listAuthored()
-            guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
-                  confirmed.autoRun == autoRun else {
+            let updated = try await engine.tools.quarantine(id: tool.id, reason: reason, ownerAuthorized: true)
+            guard try await engine.tools.refreshAuthored(confirming: updated.id, status: "disabled") else {
                 recordToolOperationStatus(
-                    "Tool auto-run update could not be confirmed after reloading the registry.",
+                    "Tool off could not be confirmed after reloading the ability.",
                     outcome: .failed
                 )
                 return
             }
-            engine.tools.authored = reloaded
-            recordToolOperationStatus(
-                autoRun ? "Tool auto-run enabled" : "Tool auto-run disabled",
-                outcome: .succeeded
-            )
+            recordToolOperationStatus("Tool off", outcome: .succeeded)
         } catch {
-            recordToolOperationStatus(UserFacingError.message(error, action: "update that tool"), outcome: .failed, cause: error)
-        }
-    }
-
-    @MainActor
-    func quarantineTool(_ tool: ToolRecord, reason: String = "User quarantined from NativeAgent UI.") async {
-        do {
-            let updated = try await engine.tools.quarantine(id: tool.id, reason: reason)
-            let reloaded = try await engine.tools.listAuthored()
-            guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
-                  confirmed.status == "quarantined" else {
-                recordToolOperationStatus(
-                    "Tool quarantine could not be confirmed after reloading the registry.",
-                    outcome: .failed
-                )
-                return
-            }
-            engine.tools.authored = reloaded
-            recordToolOperationStatus("Tool quarantined", outcome: .succeeded)
-        } catch {
-            recordToolOperationStatus(UserFacingError.message(error, action: "quarantine that tool"), outcome: .failed, cause: error)
+            recordToolOperationStatus(UserFacingError.message(error, action: "turn that tool off"), outcome: .failed, cause: error)
         }
     }
 
     @MainActor
     func promoteTool(_ tool: ToolRecord, userRequested: Bool = true) async {
-        if let refusal = ToolApprovalEligibility.refusal(for: tool) {
+        if let refusal = ToolApprovalEligibility.refusal(for: tool, ownerAuthorized: true) {
             recordToolOperationStatus("Tool activation unavailable: \(refusal)", outcome: .failed)
             return
         }
         do {
-            let updated = try await engine.tools.promote(id: tool.id, allowRisky: userRequested)
-            let reloaded = try await engine.tools.listAuthored()
-            guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
-                  confirmed.status == "active" else {
+            let updated = try await engine.tools.promote(id: tool.id, allowRisky: userRequested, ownerAuthorized: true)
+            guard try await engine.tools.refreshAuthored(confirming: updated.id, status: "active") else {
                 recordToolOperationStatus(
                     "Tool activation could not be confirmed after reloading the registry.",
                     outcome: .failed
                 )
                 return
             }
-            engine.tools.authored = reloaded
             recordToolOperationStatus("Tool activated", outcome: .succeeded)
         } catch {
             recordToolOperationStatus(UserFacingError.message(error, action: "turn that tool on"), outcome: .failed, cause: error)
@@ -295,28 +153,19 @@ extension AppModel {
     }
 
     @MainActor
-    func addWorkspace(name: String, path: String, writable: Bool) async -> Bool {
-        if case .verified = await addWorkspaceWithReceipt(name: name, path: path, writable: writable) {
-            return true
-        }
-        return false
-    }
-
-    @MainActor
     func addWorkspaceWithReceipt(name: String, path: String, writable: Bool) async -> WorkspaceAddOutcome {
         do {
-            let added = try await ConnectorRegistryActions.addWorkspace(
+            let result = try await ConnectorRegistryActions.addWorkspace(
                 name: name, path: path, permissions: writable ? ["read", "write"] : ["read"], root: engine.dataRoot
             )
-            let refreshed = try await ConnectorRegistryActions.listWorkspaces(root: engine.dataRoot)
-            guard refreshed.contains(where: { $0.id == added.id }) else {
+            guard result.verified else {
                 let detail = "The workspace registry did not confirm the saved workspace."
                 statusText = "Workspace add failed: \(detail)"
                 return .failed(detail)
             }
-            workspaces = refreshed
+            workspaces = result.refreshed
             statusText = "Workspace added and verified"
-            return .verified(added)
+            return .verified(result.added)
         } catch {
             let detail = UserFacingError.cause(error, action: "add that workspace")
             setFailureStatus("Couldn't add that workspace. " + detail, cause: error)
@@ -338,17 +187,15 @@ extension AppModel {
     @MainActor
     func updateConnector(_ connector: ConnectorRecord, enabled: Bool) async -> ConnectorUpdateOutcome {
         do {
-            let updated = try await ConnectorStatusProjection.updateConnector(
+            let result = try await ConnectorStatusProjection.updateConnectorAndVerify(
                 id: connector.id, enabled: enabled, root: engine.dataRoot, platform: AppConnectorStatusPlatform()
             )
-            let refreshed = try await ConnectorStatusProjection.readConnectorRecords(root: engine.dataRoot, platform: AppConnectorStatusPlatform())
-            guard let confirmed = refreshed.first(where: { $0.id == updated.id }),
-                  confirmed.enabled == enabled else {
+            guard let confirmed = result.confirmed else {
                 let detail = "The registry did not confirm the requested \(enabled ? "enable" : "disable") change."
                 statusText = "Connector update failed: \(detail)"
                 return .failed(detail)
             }
-            connectors = refreshed
+            connectors = result.refreshed
             statusText = "Connector \(confirmed.enabled ? "enabled" : "disabled") and verified"
             return .verified(confirmed)
         } catch {
@@ -362,35 +209,14 @@ extension AppModel {
     func autodetectSearXNG() async -> SearXNGAutodetectOutcome {
         do {
             let detected = try await SwiftNativeResearchClient(dataRoot: engine.dataRoot).autodetectSearXNG()
-            return applySearXNGAutodetect(detected)
+            let outcome = detected.outcome
+            if case .found(let url) = outcome { searxngBaseURL = url }
+            return outcome
         } catch {
             return .failed(UserFacingError.cause(error, action: "find a SearXNG server"))
         }
     }
 
-    /// Applies only a usable discovery response. The UI deliberately receives
-    /// the typed outcome instead of consulting or replacing `statusText`, which
-    /// belongs to cross-app work such as doctor, settings, and tool actions.
-    func applySearXNGAutodetect(_ detected: SearXNGAutodetectResult) -> SearXNGAutodetectOutcome {
-        guard detected.found else {
-            let detail = detected.error?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let detail, !detail.isEmpty {
-                return .notFound(detail)
-            }
-            return .notFound("No reachable local instance was found.")
-        }
-        guard let baseURL = detected.baseURL,
-              !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .failed("SearXNG detection returned no usable URL.")
-        }
-        do {
-            let normalized = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(baseURL)
-            searxngBaseURL = normalized
-            return .found(normalized)
-        } catch {
-            return .failed("SearXNG detection returned an invalid URL: \(error.localizedDescription)")
-        }
-    }
 
     @MainActor
     @discardableResult
@@ -400,7 +226,7 @@ extension AppModel {
         statusText = "Saving Telegram settings..."
         defer { isSavingTelegram = false }
 
-        if let tokenError = TelegramBotTokenPresentation.validationMessage(for: telegramToken) {
+        if let tokenError = TelegramFacade.tokenValidationMessage(for: telegramToken) {
             statusText = "Telegram save failed: \(tokenError)"
             let outcome = TelegramSettingsSaveOutcome.rejected(detail: tokenError)
             telegramSettingsSaveOutcome = outcome
@@ -426,7 +252,7 @@ extension AppModel {
             telegramSettingsSaveOutcome = outcome
             return outcome
         }
-        let normalizedEffort = normalizedReasoningEffort(
+        let normalizedEffort = ProvidersFacade.normalizedReasoningEffort(
             from: engine.providers.catalog,
             model: telegramModel,
             selected: telegramReasoningEffort
@@ -434,14 +260,15 @@ extension AppModel {
         telegramReasoningEffort = normalizedEffort
         let submittedEnabled = telegramEnabled
         do {
-            try await configureTelegram(
+            try await engine.telegram.configureTelegram(
                 token: telegramToken,
                 allowedChatIds: chats.canonicalIDs,
                 allowedUserIds: users.canonicalIDs,
                 requireMention: telegramRequireMention,
                 model: telegramModel,
                 reasoningEffort: normalizedEffort,
-                enabled: submittedEnabled
+                enabled: submittedEnabled,
+                restartPollLoop: { [backgroundLoopsManager] in _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: backgroundLoopsManager) }
             )
             telegramToken = ""
             await refreshAll()
@@ -469,8 +296,11 @@ extension AppModel {
         isSavingTelegram = true
         statusText = "Clearing Telegram bot token..."
         defer { isSavingTelegram = false }
+        let restart: (@Sendable () async -> Void)? = restartPollLoop
+            ? { @Sendable [backgroundLoopsManager] in _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: backgroundLoopsManager) }
+            : nil
         do {
-            try await configureTelegram(
+            try await engine.telegram.configureTelegram(
                 token: "",
                 allowedChatIds: splitIDs(telegramAllowedChats),
                 allowedUserIds: splitIDs(telegramAllowedUsers),
@@ -479,7 +309,7 @@ extension AppModel {
                 reasoningEffort: telegramReasoningEffort,
                 enabled: false,
                 clearToken: true,
-                restartPollLoop: restartPollLoop
+                restartPollLoop: restart
             )
             telegramToken = ""
             await refreshAll()
@@ -501,11 +331,11 @@ extension AppModel {
             let status: TelegramPresentationSnapshot
             var credentialUnavailable = false
             do {
-                status = try await engine.telegram.load(manager: backgroundLoopsManager.coreManager)
+                status = try await engine.telegram.load(manager: backgroundLoopsManager)
             } catch is DeviceSecretKeychain.Failure {
                 // Keep validated authority fields editable for explicit grant
                 // replacement or disconnect; this is not transport readiness.
-                status = try await engine.telegram.load(manager: backgroundLoopsManager.coreManager, credentialUnavailable: true)
+                status = try await engine.telegram.load(manager: backgroundLoopsManager, credentialUnavailable: true)
                 credentialUnavailable = true
             }
             guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
@@ -544,7 +374,7 @@ extension AppModel {
 
         do {
             let chatId = splitIDs(telegramAllowedChats).first ?? splitIDs(telegramAllowedUsers).first
-            let result = try await sendTelegramTestReply(chatId: chatId)
+            let result = try await engine.telegram.sendTelegramTestReply(chatId: chatId, manager: backgroundLoopsManager)
             await refreshAll()
             statusText = TelegramTestReplyPresentation.summary(for: result)
         } catch {
@@ -560,7 +390,7 @@ extension AppModel {
         statusText = "Clearing Telegram diagnostics…"
         defer { isClearingTelegramLogs = false }
         do {
-            let receipt = try await clearTelegramDiagnostics()
+            let receipt = try await engine.telegram.clearTelegramDiagnostics(manager: backgroundLoopsManager)
             engine.telegram.status = receipt.status
             telegramStatusRefreshError = nil
             telegramClearLogsOutcome = .completed(receipt)
@@ -572,52 +402,10 @@ extension AppModel {
         }
     }
 
-    /// What a Doctor run actually produced.
-    ///
-    /// gpt-5.5 review BLOCKING 2 (2026-08-02): `runDoctor` used to return a Bool
-    /// that meant "a report came back", and onboarding read it as "the repair
-    /// worked". A repair that ran to completion over a store it could NOT fix
-    /// returned `true`, so the wizard showed "<Agent> is ready" over a broken
-    /// scaffold. The two questions are now distinct on the type.
-    enum DoctorRunOutcome: Equatable {
-        /// No report: another run held the lock, or the run threw.
-        case unavailable(String)
-        /// A report came back. `failingChecks` are its `status == fail|error`
-        /// rows — the run completing says nothing about them.
-        case completed(status: String, failingChecks: [CheckResult])
-
-        /// True when the run produced a report at all. This is the old Bool's
-        /// meaning; callers that only wanted "did it run" keep using it.
-        var didRun: Bool {
-            if case .completed = self { return true }
-            return false
-        }
-
-        /// Failing rows outside the `live.*` namespace, which covers optional
-        /// user-configured subsystems (Telegram token, SearXNG URL). Those are
-        /// real Doctor findings but they are NOT the app-owned scaffold, and
-        /// blocking onboarding on them would strand a user who skipped setup.
-        var failingScaffoldChecks: [CheckResult] {
-            guard case .completed(_, let failing) = self else { return [] }
-            return failing.filter { !$0.id.hasPrefix("live.") }
-        }
-
-        /// One line naming what to fix, for a user-facing surface.
-        var failureDetail: String {
-            switch self {
-            case .unavailable(let reason):
-                return reason
-            case .completed:
-                let failing = failingScaffoldChecks
-                guard !failing.isEmpty else { return "Health checks reported a failure with no failing check." }
-                return failing.map { "\($0.title): \($0.detail)" }.joined(separator: " ")
-            }
-        }
-    }
 
     @MainActor
     @discardableResult
-    func runDoctor(repair: Bool, repairScope: DoctorRepairScope = .automatic) async -> DoctorRunOutcome {
+    func runDoctor(repair: Bool, repairScope: DoctorRepairScope = .automatic) async -> DoctorFacade.RunOutcome {
         // PATCH-2026-05-30: surface in-flight state to the UI so the user
         // sees a spinner + "Running…" text instead of an apparent freeze.
         // Block concurrent invocations — clicking Run while a run is in
@@ -639,7 +427,7 @@ extension AppModel {
         }
         do {
             var report = try await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
-                .runDoctor(repair: repair, repairScope: repairScope)
+                .runtime.runDoctor(repair: repair, repairScope: repairScope)
             let buttonRepair: Bool
             if case .button = repairScope {
                 buttonRepair = repair && doctor.report?.checks.contains {
@@ -648,13 +436,13 @@ extension AppModel {
             } else {
                 buttonRepair = false
             }
-            let status = await DoctorStatusChecks.run(appModel: self, repairDesk: buttonRepair)
-            report = AppDoctorPort.mergeReport(report, liveChecks: status.checks)
+            let status = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: buttonRepair, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail)
+            report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(report, liveChecks: status.checks)
             report.repaired = report.repaired || status.repaired
             doctor.report = report
             doctor.reportCompletedAt = Date()
             statusText = repair
-                ? DoctorSafeRepairIssuesPresentation.completionMessage(report: report)
+                ? DoctorFacade.repairCompletionMessage(report: report)
                 : "Health checks finished"
             await refreshAll()
             let failing = report.checks.filter {
@@ -672,7 +460,7 @@ extension AppModel {
     /// directly because fresh-install scaffold repair has no prior report.
     @MainActor
     @discardableResult
-    func repairSafeDoctorIssues() async -> DoctorRunOutcome {
+    func repairSafeDoctorIssues() async -> DoctorFacade.RunOutcome {
         let state = DoctorSafeRepairIssuesPresentation.state(
             report: engine.doctor.report,
             isRunning: engine.doctor.isRunning
@@ -691,11 +479,11 @@ extension AppModel {
     func refreshLiveDoctorCoverage() async {
         guard let current = engine.doctor.report else { return }
         let liveChecks = await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
-            .liveDoctorCoverageChecks()
-        let statusChecks = await DoctorStatusChecks.run(appModel: self, repairDesk: false).checks
+            .runtime.liveDoctorCoverageChecks()
+        let statusChecks = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: false, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail).checks
         let withoutRetiredProbe = DoctorReport(status: current.status, repaired: current.repaired,
                                                checks: current.checks.filter { $0.id != "status.app_health" && $0.id != "status.living_sources" })
-        engine.doctor.report = AppDoctorPort.mergeReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
+        engine.doctor.report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
     }
 
     private func splitIDs(_ value: String) -> [String] {

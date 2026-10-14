@@ -225,6 +225,12 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         } else {
             resolvedSessionID = UUID().uuidString
         }
+        do {
+            try await iCloudBridge.bindReplySession(msg, sessionID: resolvedSessionID, dataRoot: PersistenceCore.defaultDataRoot())
+        } catch {
+            nativeLog("[iCloudBridge] reply session could not be retained: %@", error.localizedDescription)
+            return false
+        }
 
         // Read before any suspension: a handoff after this point supersedes it.
         let receivedAtHandoffGeneration = port.controlHandoffGeneration(sessionID: resolvedSessionID)
@@ -690,7 +696,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         }
     }
 
-    nonisolated private static func bridgeAttachments(
+    nonisolated static func bridgeAttachments(
         from attachments: [ChatOrchestration.MultimodalAttachment],
         text: String,
         sessionID: String,

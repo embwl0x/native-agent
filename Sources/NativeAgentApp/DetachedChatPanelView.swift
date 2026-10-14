@@ -1,4 +1,8 @@
+import Cognition
+import EngineRuntime
+import Dispatcher
 import ChatOrchestration
+import ToolRegistry
 // DetachedChatPanelView — the focused chat surface hosted inside a
 // DetachedChatPanel (free-floating window for a single session).
 //
@@ -17,6 +21,7 @@ import ChatOrchestration
 // the main window shows a different session — re-render here live.
 
 import SwiftUI
+import ScreenVision
 import AppKit
 import UniformTypeIdentifiers
 import NativeAgentCore
@@ -97,11 +102,11 @@ struct DetachedChatPanelView: View {
     /// registered slash tools too, or a dynamic command typed here falls
     /// through as chat text while the built-ins toast. Same store the main
     /// window uses; refreshed once per panel.
-    @State private var capabilitiesStore = CapabilitiesStore.shared
+    @State private var capabilitiesStore = NativeAgentEngine.live.tools
     @State private var isCapturing = false
     @State private var isRetryingLoad = false
     @State private var toastMessage: String?
-    @State private var voiceInput = VoiceInputController()
+    @State private var voiceInput = VoiceInputCapture.forChat()
     @State private var voiceDraftBeforeListening = ""
     /// 2026-09-06: this dictation's generation. Bumped by every end — a send,
     /// a stop, the panel closing — so a start still waiting on the microphone
@@ -196,7 +201,8 @@ struct DetachedChatPanelView: View {
     private func openTranscriptSearch() {
         showTranscriptSearch = true
         transcriptSearchFocusRequest &+= 1
-        transcriptSearch.replaceSource(messages: messages, sessionID: sessionId)
+        transcriptSearch.replaceSource(messages: messages, sessionID: sessionId,
+                                      revision: appModel.engine.transcripts.structureVersion(for: sessionId))
     }
 
     private func closeTranscriptSearch() {
@@ -221,7 +227,8 @@ struct DetachedChatPanelView: View {
 
     private func refreshTranscriptSearchIfPresented() {
         guard showTranscriptSearch else { return }
-        transcriptSearch.replaceSource(messages: messages, sessionID: sessionId)
+        transcriptSearch.replaceSource(messages: messages, sessionID: sessionId,
+                                      revision: appModel.engine.transcripts.structureVersion(for: sessionId))
     }
 
     private func refreshTranscriptSearchTailIfPresented() {
@@ -261,7 +268,7 @@ struct DetachedChatPanelView: View {
             // task(id:) re-fires if the panel is somehow rebound to a new
             // session, but in practice sessionId is immutable per panel.
             guard !didInitialLoad else { return }
-            await capabilitiesStore.refresh()
+            await capabilitiesStore.refreshSlashCatalog()
             didInitialLoad = true
             // H5: adopt whatever draft this session had (typed in the main
             // window or a previous panel) into the view-local state.
@@ -286,7 +293,7 @@ struct DetachedChatPanelView: View {
             let transcript = PersistenceCore.defaultDataRoot()
                 .appendingPathComponent("chat/messages", isDirectory: true)
                 .appendingPathComponent("\(safeSessionId).jsonl")
-            await ViewFileRefreshTask.run(
+            await EventDeadlinePhysiology.refreshOnChanges(
                 paths: [transcript],
                 debounceDelay: .milliseconds(100)
             ) {
@@ -549,7 +556,7 @@ struct DetachedChatPanelView: View {
             // after — changes no count and no end id, so open search kept
             // showing results for text that is no longer there. The
             // transcript's own mutation counter catches every such write.
-            .onChange(of: appModel.engine.transcripts.structureVersion) {
+            .onChange(of: appModel.engine.transcripts.structureVersion(for: sessionId)) {
                 refreshTranscriptSearchIfPresented()
                 inlineCards.refreshSoon(sessionID: sessionId)
             }
@@ -729,7 +736,8 @@ struct DetachedChatPanelView: View {
             if MacChatTurnCardProjection.isVisible(
                 appModel.engine.turns.lifecycle(for: sessionId),
                 sessionId: sessionId,
-                approvals: appModel.engine.approvals.records
+                approvals: appModel.engine.approvals.records,
+                parseTimestamp: UserDisplayFormatters.parseFoundationISOTimestamp
             ) {
                 MacChatTurnCardHost(
                     sessionId: sessionId,
@@ -1145,7 +1153,7 @@ private struct DetachedChatComposer: View {
     let draft: ChatComposerDraft
     let sessionId: String
     let placeholder: String
-    let voiceInput: VoiceInputController
+    let voiceInput: VoiceInputCapture
     let screenCaptureAllowed: Bool
     let screenCaptureDisabled: Bool
     let pendingAttachmentCount: Int

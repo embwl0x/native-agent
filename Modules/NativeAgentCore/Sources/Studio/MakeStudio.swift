@@ -1,4 +1,6 @@
 import Foundation
+import Observation
+import NativeAgentCore
 import PersistenceCore
 
 /// What she makes for User: mockups, screens, icons, artwork. Each piece is a
@@ -99,4 +101,135 @@ public struct MakeStudio: Sendable {
         if let ref { response["make_ref"] = .string(ref) }
         return .object(response)
     }
+}
+
+extension MakeStudio {
+    /// What User reads in the header: a mockup's own <title>, else an image's
+    /// prompt, else the file's name. The ref stays in the tooltip.
+    public static func title(_ version: MakeStudio.Version, file: URL) -> String {
+        if webTypes.contains(file.pathExtension.lowercased()),
+           let html = try? String(contentsOf: file, encoding: .utf8),
+           let open = html.range(of: "<title>", options: .caseInsensitive),
+           let close = html.range(of: "</title>", options: .caseInsensitive, range: open.upperBound..<html.endIndex) {
+            let text = html[open.upperBound..<close.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { return text }
+        }
+        if let prompt = version.prompt?.trimmingCharacters(in: .whitespacesAndNewlines), !prompt.isEmpty { return prompt }
+        return file.lastPathComponent
+    }
+
+    public static let webTypes: Set = ["html", "htm", "xhtml", "svg"]
+    public static let imageTypes: Set = ["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff"]
+
+    public static func exportDestination(projectPath: String?, name: String) -> (project: URL?, target: URL?) {
+        let project = projectPath.flatMap { path -> URL? in
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+                ? URL(fileURLWithPath: path, isDirectory: true) : nil
+        }
+        var target = project?.appendingPathComponent(name)
+        // Never over a file already there: the panel asks first.
+        if let planned = target, FileManager.default.fileExists(atPath: planned.path)
+            || FileManager.default.fileExists(atPath: planned.deletingPathExtension().appendingPathExtension("prompt.txt").path) {
+            target = nil
+        }
+        return (project, target)
+    }
+
+    public static func export(_ file: URL, to target: URL, prompt: String) throws -> String {
+        // The same file by identity (a hard link or symlink too), not by path.
+        let identity = { (url: URL) in
+            try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
+        }
+        guard identity(target).map({ $0.isEqual(identity(file)) }) != true else {
+            return "That is the studio's own file, so nothing was saved. Pick another place."
+        }
+        let sidecar = target.deletingPathExtension().appendingPathExtension("prompt.txt")
+        // Written beside the target and swapped in: a failed save leaves what was there.
+        try Data(contentsOf: file).write(to: target, options: .atomic)
+        try prompt.write(to: sidecar, atomically: true, encoding: .utf8)
+        return "Saved to \(target.path)"
+    }
+
+    /// One event-driven index serves the visible shelf and the auto-open signal.
+    @MainActor
+    @Observable
+    public final class Shelf {
+        public static let shared = Shelf()
+        private var metadata: [String: MakeStudio.Meta] = [:]
+        private var refs: [String] = []
+        public private(set) var newest: MakeStudio.Meta?
+        public private(set) var loaded = false
+        private var studio: MakeStudio?
+        private var watcher: FileChangeWatcher?
+        private var armed: [URL] = []
+        private var pending: Set<URL> = []
+        private var loading = false
+
+        public func meta(_ ref: String?) -> MakeStudio.Meta? {
+            ref.map { metadata[$0] } ?? newest
+        }
+
+        public func open(dataRoot: URL) {
+            guard studio?.dataRoot != dataRoot else { return }
+            let studio = MakeStudio(dataRoot: dataRoot)
+            self.studio = studio
+            metadata = [:]
+            refs = []
+            newest = nil
+            loaded = false
+            changed(studio.root)
+        }
+
+        private func changed(_ path: URL) {
+            pending.insert(path)
+            guard !loading else { return }
+            loading = true
+            Task {
+                defer { loading = false }
+                while !pending.isEmpty {
+                    guard let studio = self.studio else { return }
+                    let changes = pending
+                    pending.removeAll()
+                    let previous = metadata
+                    let previousRefs = refs
+                    let fresh = await Task.detached(priority: .utility) {
+                        var refs = previousRefs
+                        if changes.contains(studio.root) {
+                            try? FileManager.default.createDirectory(at: studio.root, withIntermediateDirectories: true)
+                            refs = ((try? FileManager.default.contentsOfDirectory(atPath: studio.root.path)) ?? []).filter(MakeStudio.isRef)
+                        }
+                        let membership = Set(refs)
+                        var result = previous.filter { membership.contains($0.key) }
+                        for ref in refs where result[ref] == nil || changes.contains(studio.folder(ref).appendingPathComponent("meta.json")) {
+                            result[ref] = studio.meta(ref)
+                        }
+                        return (result, refs, refs.compactMap { result[$0] }.max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") })
+                    }.value
+                    guard self.studio?.dataRoot == studio.dataRoot else { continue }
+                    if fresh.0 != metadata { metadata = fresh.0 }
+                    refs = fresh.1
+                    if newest != fresh.2 { newest = fresh.2 }
+                    loaded = true
+                    rearm(studio)
+                }
+            }
+        }
+
+        /// Every ref's meta, not only the shown one's: a new version of another
+        /// ref is the new newest. A new ref changes the set, so it is re-armed.
+        private func rearm(_ studio: MakeStudio) {
+            let paths = [studio.root] + refs.sorted().map { studio.folder($0).appendingPathComponent("meta.json") }
+            guard paths != armed else { return }
+            armed = paths
+            watcher?.cancel()
+            watcher = FileChangeWatcher(paths: paths) { [weak self] path in
+                Task { @MainActor in self?.changed(path.standardizedFileURL) }
+            }
+            // Close the registration race once, using the now-armed source.
+            pending.formUnion(paths)
+            changed(studio.root)
+        }
+    }
+
 }

@@ -278,7 +278,7 @@ extension CognitiveSubstrate {
         dynamics dyn: PersonalityDynamicsConfiguration,
         affectEnabled: Bool? = nil
     ) -> FeltLineRender? {
-        guard affectEnabled ?? configuration.affectEnabled else { return nil }
+        guard affectEnabled ?? configuration.enabled else { return nil }
         guard let parts = CognitiveSubstrate.feltFingerprintParts(
             signals, intensityFloor: dyn.feltIntensityFloor) else { return nil }
 
@@ -390,8 +390,8 @@ extension CognitiveSubstrate {
     ) -> FeltSignals {
         let now = explicitNow ?? dependencies.now()
         let dyn = capturedDynamics ?? dynamics
-        let mood = explicitMood ?? derivedMood(at: now)
-        let currentAffect = explicitAffect ?? projectedAffect(at: now)
+        let currentAffect = explicitAffect ?? projectedAffect(at: now, dynamics: dyn)
+        let mood = explicitMood ?? derivedMood(at: now, dynamics: dyn, affect: currentAffect)
         // Immediate workspace tint (User, 2026-07-08): what she's HOLDING right now colors
         // her felt valence. RECENCY-WEIGHTED with a SHORT half-life (the fast layer) so the
         // CURRENT emotional moment leads — a fresh sting reads through even amid a good
@@ -640,7 +640,7 @@ extension CognitiveSubstrate {
     /// Always available (uncertainty is always defined once affect is on), so
     /// unlike the other two this one does not return nil.
     func substrateClarityProxy(affect: CognitiveAffectState, at now: Date) -> Double? {
-        guard configuration.affectEnabled else { return nil }
+        guard configuration.enabled else { return nil }
         var clarity = 1 - affect.uncertainty.clamped01()
         if let pending = pendingCompletion {
             let age = now.timeIntervalSince(pending.recordedAt)
@@ -652,14 +652,6 @@ extension CognitiveSubstrate {
             }
         }
         return clarity.clamped01()
-    }
-
-    /// Test/diagnostic hook: the FeltSignals for a request against the current live
-    /// workspace, so a mood-journey test can print exactly why a felt word landed.
-    func debugFeltSignals(for request: CognitiveCapsuleRequest) async -> FeltSignals {
-        let workspace = await workspaceSnapshot()
-        let capsuleItems = workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
-        return feltSignalsForCapsule(from: capsuleItems, request: request)
     }
 
 }

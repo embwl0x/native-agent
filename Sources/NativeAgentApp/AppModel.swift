@@ -1,4 +1,9 @@
+import EngineRuntime
 import Foundation
+import AttentionRouting
+import ApprovalTransactions
+import Privacy
+import WidgetKit
 import AppIntents
 import Observation
 import Darwin
@@ -41,6 +46,86 @@ import Skills
 import Connectors
 import Browser
 import DeviceSync
+import SchedulerExecution
+import TrustPersistence
+
+@MainActor
+extension AppModel: FirstRunWelcomePort {
+    var firstRunDataRoot: URL { dataRootOverride ?? PersistenceCore.defaultDataRoot() }
+    var firstRunIsPublicRelease: Bool { InstallPaths.isPublicReleaseBundle }
+    var firstRunSessionIsBusy: Bool { engine.turns.busySessions.contains(activeChatSessionId) }
+    var firstRunSyntheticErrorIDPrefix: String { Self.syntheticErrorIDPrefix }
+
+    func firstRunMessages(for sessionID: String) -> [ChatMessage] {
+        engine.transcripts.messages(for: sessionID)
+    }
+
+    func markFirstRunWelcomePending() {
+        firstRunWelcomeTransaction.markFirstRunWelcomePending(port: self)
+    }
+
+    @discardableResult
+    func maybeSendFirstRunGreeting() async -> FirstRunGreetingOutcome {
+        let outcome = await firstRunWelcomeTransaction.maybeSendFirstRunGreeting(port: self)
+        // `.delivered` means the greeting turn has finished, whichever trigger
+        // started it — only now may macOS post its "Login Item Added" banner.
+        if case .delivered = outcome { AppDelegate.registerLoginItemInBackground() }
+        return outcome
+    }
+
+    /// The exact section title the first conversation's write used, or nil when
+    /// this persona has no first conversation on record.
+    ///
+    /// The settled receipt is restricted to writes matching this (Sol P2-10),
+    /// so it is read here rather than in a view body: once it answers, it is
+    /// answered for the process.
+    var firstConversationReceiptTitle: String? {
+        engine.transcripts.firstConversationReceiptTitle
+    }
+
+    /// The person's own name, as the persona documents know it — the only
+    /// source for the exact section title the write must use.
+    var firstConversationPersonName: String {
+        engine.transcripts.firstConversationPersonName
+    }
+
+    /// Production requires a fresh successful provider read. An old cached
+    /// ready row is not authority to create a first-run turn after a failed
+    /// refresh.
+    func firstRunGreetingHasReadyProvider() async -> Bool {
+        if let firstRunGreetingProviderReadyOverride {
+            return await firstRunGreetingProviderReadyOverride()
+        }
+        let providersFresh = await loadProvidersForChat()
+        return providersFresh && engine.providers.hasReadyConnection
+    }
+
+    /// The injected handoff remains behind every real first-run gate and claim;
+    /// production always reaches the normal `sendChat` turn owner.
+    func sendFirstRunGreeting(
+        _ kickoff: String,
+        sessionID: String
+    ) async -> ChatTurnAcceptance {
+        if let firstRunGreetingSendOverride {
+            return await firstRunGreetingSendOverride(kickoff, sessionID, true)
+        }
+        return await sendChat(kickoff, sessionId: sessionID, hideUserBubble: true, requireIdleAndEmpty: true)
+    }
+
+}
+
+@MainActor
+extension AppModel {
+    /// Preserve the last committed endpoint when refreshed configuration is invalid.
+    func applyRefreshedSearXNGBaseURL(_ value: String?) {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        do {
+            searxngBaseURL = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(value)
+        } catch {
+            statusText = "SearXNG configuration unavailable: \(error.localizedDescription)"
+        }
+    }
+}
 
 @MainActor
 @Observable
@@ -69,34 +154,10 @@ final class AppModel: Sendable {
     private let activeChatSessionIDWriter: @MainActor (String?) -> Void
     let backgroundLoopsManager: BackgroundLoopsManager
     private let chatSnapshotPublisher: @MainActor () -> Void
-    var approvalResolverOverride: (@MainActor (String, String) async throws -> ApprovalRecord)?
     var inboxActionOverride: (@MainActor (String, String) async throws -> Void)?
     var inboxSnapshotWriterOverride: (@MainActor () async -> Void)?
     var inboxReloadGeneration = 0
-    let chatSessionTransactions = MacChatSessionTransactions()
 
-    // PATCH-2026-05-07: model-default-bump. One-time migration for a saved
-    // chatModel/telegramModel this build no longer carries.
-    //
-    // 2026-09-13 (User): it CLEARS the stale value instead of bumping it to a
-    // model chosen in code. A saved id that is gone is not a pick, and an empty
-    // pick is the honest state — the surface then follows its Providers group,
-    // and the page says where the choice came from. Substituting a literal here
-    // put people on a model they never chose and hid the retirement.
-    static func _clearRetiredModelSelection(_ key: String) {
-        let retired: Set<String> = [
-            "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3", "gpt-4o", "gpt-4-turbo",
-            "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-haiku-4-5",
-            "claude-opus-4-5", "claude-opus-4-6",
-        ]
-        let clearedKey = "\(key).retiredPickCleared.v3"
-        if UserDefaults.standard.bool(forKey: clearedKey) { return }
-        let current = UserDefaults.standard.string(forKey: key) ?? ""
-        if retired.contains(current) {
-            UserDefaults.standard.removeObject(forKey: key)
-        }
-        UserDefaults.standard.set(true, forKey: clearedKey)
-    }
 
     // PATCH-2026-05-07: observable-bindings All these were UserDefaults-only
     // computed properties — `@Observable` only tracks STORED properties so
@@ -134,7 +195,7 @@ final class AppModel: Sendable {
     /// an empty id). 2026-09-13: this used to default to a literal primary model,
     /// which is a choice made in code rather than at the picker.
     var chatModel: String = {
-        AppModel._clearRetiredModelSelection("chatModel")
+        ProvidersFacade.clearRetiredModelSelection("chatModel")
         return UserDefaults.standard.string(forKey: "chatModel") ?? ""
     }() {
         didSet { UserDefaults.standard.set(chatModel, forKey: "chatModel") }
@@ -154,7 +215,7 @@ final class AppModel: Sendable {
 
     /// Empty means "no pick of my own" — see `chatModel`.
     var telegramModel: String = {
-        AppModel._clearRetiredModelSelection("telegramModel")
+        ProvidersFacade.clearRetiredModelSelection("telegramModel")
         return UserDefaults.standard.string(forKey: "telegramModel") ?? ""
     }() {
         didSet { UserDefaults.standard.set(telegramModel, forKey: "telegramModel") }
@@ -167,18 +228,18 @@ final class AppModel: Sendable {
     /// The bars cache the same checked selection every other door reads.
     @MainActor
     func refreshSurfacePickerCache() async {
-        let saveGeneration = chatBrainSaveGeneration
+        let saveGeneration = engine.providers.chatBrainSaveGeneration
         let chatWasSaving = isSavingChatBrain
         do {
             let snapshot = try await engine.providers.routing.checkedRoutingSnapshot()
             applySurfacePickerSnapshot(snapshot, applyChat: !chatWasSaving
-                && !isSavingChatBrain && saveGeneration == chatBrainSaveGeneration)
+                && !isSavingChatBrain && saveGeneration == engine.providers.chatBrainSaveGeneration)
         } catch {
-            if !chatWasSaving && !isSavingChatBrain && saveGeneration == chatBrainSaveGeneration {
+            if !chatWasSaving && !isSavingChatBrain && saveGeneration == engine.providers.chatBrainSaveGeneration {
                 chatModel = ""
                 chatReasoningEffort = ""
                 chatFastMode = false
-                chatBrainCanonicalSelection = nil
+                engine.providers.chatBrainCanonicalSelection = nil
             }
             telegramModel = ""
             telegramReasoningEffort = ""
@@ -192,7 +253,7 @@ final class AppModel: Sendable {
             chatReasoningEffort = chat.reasoningEffort
             chatFastMode = chat.serviceTier == "priority"
             chatProvider = snapshot.activeProviders["chat"] ?? ""
-            chatBrainCanonicalSelection = ChatBrainSelection(
+            engine.providers.chatBrainCanonicalSelection = ProvidersFacade.ChatBrainSelection(
                 model: chat.model, reasoningEffort: chat.reasoningEffort, fastMode: chatFastMode
             )
         }
@@ -317,15 +378,12 @@ final class AppModel: Sendable {
     /// The engine for this model's root: the live one, or a body-less one
     /// over an override. The memory pages observe `engine.memory`.
     @ObservationIgnored let engine: NativeAgentEngine
+    @ObservationIgnored private let workStatusPublication = WorkStatusPublication()
     /// The Mac surface keeps one immutable orchestration body resident. It
     /// owns no canonical mind state; it reuses the root's live cognition,
     /// memory, routing, TrustCenter and tool owners while preserving their
     /// per-turn reads and effect-time checks.
     @ObservationIgnored lazy var macChatClient = engine.chatClient(profile: .mac)
-    @ObservationIgnored var widgetContainerUnavailableLogged = false
-    /// One overview read at a time; edges during a read ask for one more.
-    @ObservationIgnored var workStatusInFlight = false
-    @ObservationIgnored var workStatusDirty = false
     var personality: PersonalityProfile? {
         didSet {
             if oldValue?.name != personality?.name {
@@ -333,19 +391,13 @@ final class AppModel: Sendable {
             }
         }
     }
-    private var cachedAgentDisplayName = UserDefaults.standard.string(forKey: "cachedAgentDisplayName")
 
     /// Memory hygiene learns the name she goes by, so a fact "about Agent" is
     /// kept out of the user's profile whatever the persona is called. Called
     /// wherever the profile is assigned; a `didSet` on an @Observable stored
     /// property took the chat room down (2026-09-02), so it is explicit.
     func teachMemoryHygieneName() {
-        if let personality {
-            cachedAgentDisplayName = personality.name
-            UserDefaults.standard.set(personality.name, forKey: "cachedAgentDisplayName")
-        }
-        let name = personality?.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        if !name.isEmpty { AdaptiveCandidateHygiene.insertAssistantName(name) }
+        engine.memory.teachAssistantName(personality)
         // Every sentence about the agent, wherever it is built, speaks in
         // the persona's name and the chosen pronoun.
         AgentVoice.live = AgentVoice.current(name: agentDisplayName)
@@ -442,53 +494,10 @@ final class AppModel: Sendable {
     var workspaces: [WorkspaceRecord] = []
     var workspaceSearchResults: [WorkspaceSearchResult] = []
     var evals: [EvalRun] = []
-    var releaseChecklist: ReleaseChecklist?
-    var trainingArtifacts: [TrainingArtifact] = []
-    var isSavingChatBrain = false
-    /// One captured chat-brain tuple. Picker fields are optimistic UI caches;
-    /// this value is updated only from a checked canonical read or a successful
-    /// configure response. It lets a failed optimistic edit roll back without
-    /// firing a second write for the rollback itself.
-    struct ChatBrainSelection: Equatable, Sendable {
-        var model: String
-        var reasoningEffort: String
-        var fastMode: Bool
+    var isSavingChatBrain: Bool {
+        get { engine.providers.isSavingChatBrain }
+        set { engine.providers.isSavingChatBrain = newValue }
     }
-
-    enum ChatBrainSaveResult: Equatable, Sendable {
-        case unchanged(ChatBrainSelection)
-        case saved(ChatBrainSelection)
-        case failed(message: String, rolledBackTo: ChatBrainSelection?, cause: String? = nil)
-
-        var userMessage: String {
-            switch self {
-            case .unchanged(let selection), .saved(let selection):
-                return "Chat brain saved: \(selection.model) / \(selection.reasoningEffort)\(selection.fastMode ? " / Fast" : "")"
-            case .failed(let message, _, _):
-                return "Couldn't save the model choice. \(message)"
-            }
-        }
-
-        /// What the agent's tool result says: the same line plus the raw cause.
-        var agentMessage: String {
-            if case .failed(_, _, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
-            return userMessage
-        }
-    }
-
-    struct ChatBrainWriteReceipt {
-        var selection: ChatBrainSelection
-        var catalog: ModelCatalogResponse?
-    }
-
-    @ObservationIgnored var chatBrainCanonicalSelection: ChatBrainSelection?
-    @ObservationIgnored var chatBrainPendingSave: (generation: UInt64, selection: ChatBrainSelection)?
-    @ObservationIgnored var chatBrainSaveGeneration: UInt64 = 0
-    @ObservationIgnored var chatBrainLastSaveResult: (generation: UInt64, result: ChatBrainSaveResult)?
-    @ObservationIgnored var chatBrainSaveTask: Task<Void, Never>?
-    /// Hermetic seams for concurrency/failure tests. Production leaves both nil.
-    @ObservationIgnored var chatBrainWriteOverride: (@MainActor @Sendable (ChatBrainSelection) async throws -> ChatBrainWriteReceipt)?
-    @ObservationIgnored var chatBrainReadOverride: (@MainActor @Sendable () async throws -> ChatBrainSelection)?
     // PATCH-2026-05-07: chat-provider-picker Cache the active chat provider
     // so the chat screen can render a Provider→Model dual picker without
     // re-fetching every render (the list is `engine.providers.connections`).
@@ -538,11 +547,6 @@ final class AppModel: Sendable {
     // section failures are observable instead of silently blanking the UI.
     var lastRefreshError: String? = nil
     @ObservationIgnored let firstRunWelcomeTransaction = FirstRunWelcomeTransaction()
-    /// Backing cache for `firstConversationReceiptTitle`. The recorded title
-    /// never changes once the first conversation has armed its write token, so
-    /// a positive answer is cached for the process; a negative one is re-read,
-    /// because arming can happen mid-launch.
-    @ObservationIgnored var firstConversationReceiptTitleCache: String?
     /// Hermetic first-run-greeting seams. Production uses the public-release
     /// bundle check, fresh provider read, and real chat-turn handoff below;
     /// isolated behavior evals exercise that same durable marker owner without
@@ -550,10 +554,6 @@ final class AppModel: Sendable {
     @ObservationIgnored var firstRunGreetingPublicReleaseOverride: Bool?
     @ObservationIgnored var firstRunGreetingProviderReadyOverride: (@MainActor @Sendable () async -> Bool)?
     @ObservationIgnored var firstRunGreetingSendOverride: (@MainActor @Sendable (String, String, Bool) async -> ChatTurnAcceptance)?
-    /// Completion receipt for the mounted onboarding wizard. The route records
-    /// a deferred or rejected first greeting instead of silently dismissing
-    /// into Chat as though the kickoff had happened.
-    var onboardingWizardCompletionReceipt: OnboardingWizardCompletionReceipt?
     var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading {
         get { engine.turns.runtime.chatTurnTranscriptProofReader }
         set { engine.turns.runtime.chatTurnTranscriptProofReader = newValue }
@@ -561,18 +561,6 @@ final class AppModel: Sendable {
     var chatTurnLifecycleRepairCompleted: Bool {
         get { engine.turns.runtime.chatTurnLifecycleRepairCompleted }
         set { engine.turns.runtime.chatTurnLifecycleRepairCompleted = newValue }
-    }
-    /// User, 2026-09-06: a profile repair that landed while a turn was running.
-    /// The resident refresh stops and restarts Context Flow and reloads
-    /// cognition, so it waits for the last active turn to close rather than
-    /// pulling the ground out from under a turn in flight.
-    @ObservationIgnored var residentRefreshPendingAfterActiveTurns = false
-    /// Hermetic queue-drain seam. Production leaves this nil and starts the
-    /// real chat turn; tests can prove FIFO/promotion without touching a
-    /// provider, transcript, or the user's runtime root.
-    var queuedChatTurnStartOverride: (@MainActor @Sendable (QueuedChatTurn, String) async -> ChatTurnAcceptance)? {
-        get { engine.turns.runtime.queuedChatTurnStartOverride }
-        set { engine.turns.runtime.queuedChatTurnStartOverride = newValue }
     }
     var chatSelectionGeneration = 0
 
@@ -599,9 +587,9 @@ final class AppModel: Sendable {
         }
     }
     var agentDisplayName: String {
-        let profileName = (personality?.name ?? cachedAgentDisplayName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let profileName = (personality?.name ?? engine.memory.cachedAgentDisplayName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !profileName.isEmpty { return profileName }
-        return canonicalAgentDisplayName(chatPersona)
+        return NativeAgentIdentity.displayName(chatPersona)
     }
 
     /// The agent's name for the surfaces that ADDRESS it — the window title and
@@ -615,7 +603,7 @@ final class AppModel: Sendable {
     /// `agentDisplayName` is left alone because its callers want the raw
     /// profile name.
     var agentAddressName: String {
-        canonicalAgentDisplayName(personality?.name ?? cachedAgentDisplayName ?? chatPersona, fallback: "The agent")
+        NativeAgentIdentity.displayName(personality?.name ?? engine.memory.cachedAgentDisplayName ?? chatPersona, fallback: "The agent")
     }
     // PATCH-2026-05-06: skill-ui AppModel state — skill lifecycle registry
     var skillManifests: [SkillInfo] = []
@@ -724,33 +712,22 @@ final class AppModel: Sendable {
         self.backgroundLoopsManager = backgroundLoopsManager
         self.activeChatSessionIDWriter = activeChatSessionIDWriter
         self.chatSnapshotPublisher = chatSnapshotPublisher
-        // Render-cost audit F13: these hooks keep `pendingActivityCount`
-        // derived from EVERY mutation path, not just the badge refresh — see
-        // the invariant note on `recomputePendingActivityCount()`.
-        engine.approvals.recordsDidChange = { [weak self] in
-            self?.recomputePendingActivityCount()
-            Task { [weak self] in await self?.publishWorkStatus() }
-        }
-        engine.inbox.itemsDidChange = { [weak self] in
-            self?.recomputePendingActivityCount()
-            Task { [weak self] in await self?.publishWorkStatus() }
-        }
-        engine.turns.activityDidChange = { [weak self] in
-            Task { [weak self] in await self?.publishWorkStatus() }
-        }
-        // Every policy read or write re-syncs the chat's access mode.
-        engine.trust.policyDidChange = { [weak self] in
-            guard let self, let policy = engine.trust.policy else { return }
-            let syncedMode = Self.agentAccessMode(from: policy, fallback: chatFileAccess)
-            if chatFileAccess != syncedMode {
-                chatFileAccess = syncedMode
+        engine.bindResidentPresentation(
+            activityCountChanged: { [weak self] in self?.recomputePendingActivityCount() },
+            publishWorkStatus: { [weak self] in await self?.publishWorkStatus() },
+            policyChanged: { [weak self] in
+                guard let self, let policy = engine.trust.policy else { return }
+                let syncedMode = TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy, fallback: chatFileAccess)
+                if chatFileAccess != syncedMode { chatFileAccess = syncedMode }
+            },
+            memoryProposalsChanged: { [weak self] in
+                guard let self else { return }
+                recomputePendingActivityCount()
+                if let reminder = engine.memory.reviewReminder(pending: pendingMemoryProposalsCount, agentName: agentDisplayName) {
+                    NativeAgentNotifications.post(title: reminder.title, body: reminder.body)
+                }
             }
-        }
-        engine.memory.proposalsDidChange = { [weak self] in
-            guard let self else { return }
-            recomputePendingActivityCount()
-            MemoryReviewReminder.consider(pending: pendingMemoryProposalsCount, agentName: agentDisplayName)
-        }
+        )
         guard startBackgroundTasks else { return }
         Task { @MainActor in await self.refreshSurfacePickerCache() }
         // Every Desk write in this process re-reads the overview, so a new
@@ -787,8 +764,6 @@ final class AppModel: Sendable {
     // turn a multi-lane outage into whichever error happened to finish last.
     var refreshAllFailureDetails: [String] = []
     var isRecordingRefreshAllFailures = false
-    var chatStateLoadInFlight = false
-    var chatStateLoadWaiters: [CheckedContinuation<Void, Never>] = []
 
     // FIX: refreshAll previously wrapped ~70 daemon calls in bare `try?`, so any
     // decode/network throw silently blanked that section with no log and no way
@@ -846,5 +821,782 @@ final class AppModel: Sendable {
             refreshAllFailureDetails.append(detail)
         }
         lastRefreshError = refreshAllFailureDetails.joined(separator: "\n")
+    }
+}
+
+extension AppModel {
+    func publishWorkStatus() async {
+        await workStatusPublication.publishWorkStatus(engine: engine, displayName: { self.agentDisplayName },
+            publishAttention: { waiting, kinds in
+                self.setIfChanged(\.ownerWaitingCount, waiting)
+                self.setIfChanged(\.ownerWaitingKinds, kinds)
+            }, reloadWidget: {
+                if #available(macOS 27, *) {
+                    WidgetCenter.shared.reloadTimelines(ofKind: NativeAgentWidgetSnapshot.kind)
+                }
+            })
+    }
+}
+
+extension NightlyReflectionJobOutcome {
+    var message: String {
+        switch self {
+        case .added:
+            return "Nightly reflection added."
+        case .alreadyPresent:
+            return "Nightly reflection is already scheduled."
+        case .repaired:
+            return "Nightly reflection schedule repaired."
+        case .failed(let message):
+            return "Nightly reflection could not be added: \(message)"
+        }
+    }
+
+    var succeeded: Bool {
+        if case .failed = self { return false }
+        return true
+    }
+}
+
+/// The scheduler read result belongs to the scheduler surface. Its detail is
+/// carried with the read rather than recovered later from AppModel.statusText,
+/// which any unrelated operation may replace before SchedulerView renders.
+enum SchedulerJobsRefreshResult: Equatable {
+    case current
+    case partial(detail: String)
+    case unavailable(detail: String)
+
+    var failureDetail: String? {
+        switch self {
+        case .current:
+            nil
+        case .partial(let detail), .unavailable(let detail):
+            detail
+        }
+    }
+
+    static func make(from feed: SchedulerJobsFeedState) -> Self {
+        switch feed {
+        case .current:
+            return .current
+        case .partial(let rows, let rejectedRows):
+            return .partial(detail: SchedulerJobsFeedState.partial(rows, rejectedRows: rejectedRows).failureDetail
+                ?? "Schedule is partially unavailable.")
+        case .sourceAbsent:
+            return .unavailable(detail: SchedulerJobsFeedState.sourceAbsent.failureDetail
+                ?? "Schedule source is absent.")
+        case .unavailable(let detail):
+            return .unavailable(detail: SchedulerJobsFeedState.unavailable(detail).failureDetail
+                ?? "Schedule source is unavailable.")
+        }
+    }
+}
+
+@MainActor
+extension AppModel {
+    @MainActor
+    @discardableResult
+    func refreshSchedulerJobs() async -> SchedulerJobsRefreshResult {
+        let feed = await engine.desk.refreshJobs()
+        let result = SchedulerJobsRefreshResult.make(from: feed)
+        switch feed {
+        case .current:
+            return result
+        case .partial:
+            statusText = result.failureDetail ?? "Schedule is partially unavailable."
+            return result
+        case .sourceAbsent:
+            statusText = result.failureDetail ?? "Schedule source is absent."
+            return result
+        case .unavailable:
+            statusText = result.failureDetail ?? "Schedule source is unavailable."
+            return result
+        }
+    }
+
+    /// Pause / resume one scheduled job from the Scheduler screen (item 36).
+    /// The row's state is not repainted from the click — it is repainted from
+    /// the job the writer actually persisted, so a refused write can never
+    /// leave the switch sitting in a position the store never accepted.
+    @MainActor
+    func setSchedulerJobEnabled(id: String, enabled: Bool) async -> SchedulerJobToggleOutcome {
+        do {
+            let job = try await engine.desk.setJobEnabled(id: id, enabled: enabled)
+            await refreshSchedulerJobs()
+            return .verified(job)
+        } catch {
+            // Re-read regardless: the switch must show the store's truth, not
+            // the click's optimism.
+            await refreshSchedulerJobs()
+            return .failed(UserFacingError.cause(error, action: "change that job"))
+        }
+    }
+
+    @MainActor
+    func createDreamJob() async -> NightlyReflectionJobOutcome {
+        do {
+            let scheduler: SchedulerDueJobRunner
+            if let dataRootOverride {
+                scheduler = SchedulerDueJobRunner(root: dataRootOverride)
+            } else {
+                scheduler = .shared
+            }
+            let outcome = try await engine.desk.ensureNightlyReflection(scheduler: scheduler)
+            if case .failed(let message) = outcome {
+                statusText = "Nightly reflection failed: \(message)"
+            } else {
+                statusText = outcome.message
+            }
+            return outcome
+        } catch {
+            let outcome = NightlyReflectionJobOutcome.failed(UserFacingError.cause(error, action: "add nightly reflection"))
+            statusText = outcome.message
+            return outcome
+        }
+    }
+
+    @MainActor
+    func createWorkshopTask(title: String, objective: String) async {
+        do {
+            _ = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
+            statusText = NewDeskTaskPresentation.successStatus
+            await refreshAll()
+        } catch {
+            setFailureStatus(NewDeskTaskPresentation.failureStatus(UserFacingError.cause(error, action: "create the Desk task")), cause: error)
+        }
+    }
+
+    @MainActor
+    func saveWorkshopPolicyToggle(enabled: Bool? = nil, showTimeline: Bool? = nil) async {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot)
+                .saveWorkshopPolicyToggle(enabled: enabled, showTimeline: showTimeline)
+            applySavedTrustPolicy(savedPolicy, status: "Desk execution policy saved")
+        } catch {
+            setFailureStatus(error, action: "save the Desk execution policy")
+        }
+    }
+
+    @MainActor
+    // PATCH-2026-05-06: dev-mode added as parameter, forwarded to daemon payload
+    @discardableResult
+    func saveTrustPolicy(permissionLevel: String, autonomyDefault: String, requireBackups: Bool, outsideDefault: String, developerMode: Bool = false, dreamScheduler: Bool? = nil) async -> Bool {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveTrustPolicyFull(
+                permissionLevel: permissionLevel,
+                autonomyDefault: autonomyDefault,
+                requireBackups: requireBackups,
+                outsideDefault: outsideDefault,
+                developerMode: developerMode,
+                dreamScheduler: dreamScheduler
+            )
+            applySavedTrustPolicy(savedPolicy, status: "Trust policy saved")
+            await refreshAll()
+            return true
+        } catch {
+            recordTrustActionFailure(UserFacingError.message(error, action: "save trust settings"), cause: error)
+            return false
+        }
+    }
+
+    @MainActor
+    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMemoryPolicy(
+                consolidationEnabled: consolidationEnabled,
+                crossSessionRecall: crossSessionRecall
+            )
+            applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
+        } catch {
+            recordTrustActionFailure(UserFacingError.message(error, action: "save the memory policy"), cause: error)
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    func saveMultimodalPolicy(_ policy: TrustMultimodalPolicy) async -> Bool {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMultimodalPolicy(policy)
+            applySavedTrustPolicy(savedPolicy, status: "Multimodal policy saved")
+            return true
+        } catch {
+            // A failed canonical write can mean the underlying policy bytes
+            // became unreadable between the UI read and this mutation. Do not
+            // leave a stale OpenAI-voice grant available to playback.
+            engine.trust.policy = nil
+            recordTrustActionFailure(UserFacingError.message(error, action: "save the multimodal policy"), cause: error)
+            return false
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    func patchMemoryPolicy(
+        knowledgeGraphEnabled: Bool? = nil,
+        adaptivePromotion: Bool? = nil,
+        hygieneEnabled: Bool? = nil
+    ) async -> Bool {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).patchMemoryPolicy(
+                knowledgeGraphEnabled: knowledgeGraphEnabled,
+                adaptivePromotion: adaptivePromotion,
+                hygieneEnabled: hygieneEnabled
+            )
+            applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
+            return true
+        } catch {
+            recordTrustActionFailure(UserFacingError.message(error, action: "save the memory policy"), cause: error)
+            return false
+        }
+    }
+
+    @MainActor
+    func saveEnableAutonomy(_ enabled: Bool) async {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveEnableAutonomy(enabled)
+            applySavedTrustPolicy(savedPolicy, status: enabled ? "Autonomy enabled" : "Autonomy disabled")
+        } catch {
+            recordTrustActionFailure(UserFacingError.message(error, action: "save autonomy"), cause: error)
+        }
+    }
+
+    @MainActor
+    func saveChromeControlEnabled(_ enabled: Bool) async {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveChromeControlEnabled(enabled)
+            applySavedTrustPolicy(
+                savedPolicy,
+                status: enabled ? "Chrome control enabled" : "Chrome control disabled"
+            )
+            await NativeAgentEngine.live.chrome.reconcilePolicy()
+        } catch {
+            recordTrustActionFailure(UserFacingError.message(error, action: "save Chrome control"), cause: error)
+        }
+    }
+
+    @MainActor
+    func saveKillSwitchEnabled(_ enabled: Bool) async -> Bool {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveKillSwitchEnabled(enabled)
+            applySavedTrustPolicy(savedPolicy, status: enabled ? "Everything paused" : "Pause lifted")
+            return true
+        } catch {
+            recordTrustActionFailure(UserFacingError.message(error, action: "save Pause everything"), cause: error)
+            return false
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async -> Bool {
+        do {
+            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot)
+                .saveAgentAccessMode(mode, currentPolicy: engine.trust.policy, developerMode: developerMode)
+            let status = "Agent access saved: \(Self.agentAccessLabel(mode))"
+            applySavedTrustPolicy(savedPolicy, status: status)
+            chatFileAccess = TrustAccessModeCapabilityCatalog.normalizedMode(mode)
+            return true
+        } catch {
+            recordTrustActionFailure(UserFacingError.message(error, action: "save agent access"), cause: error)
+            return false
+        }
+    }
+
+    @MainActor
+    func applySavedTrustPolicy(_ policy: TrustPolicy, status: String? = nil) {
+        engine.trust.policy = policy
+        if let status {
+            statusText = status
+            trustCenterActionOutcome = .saved(status)
+        }
+    }
+
+    func recordTrustActionFailure(_ message: String, cause: Error? = nil) {
+        statusText = message
+        statusCause = cause?.localizedDescription
+        trustCenterActionOutcome = .failed(message)
+    }
+
+    nonisolated static func agentAccessLabel(_ mode: String) -> String {
+        switch TrustAccessModeCapabilityCatalog.normalizedMode(mode) {
+        case "read_only": return "Read"
+        case "workspace": return "Workspace"
+        case "full": return "Full Mac"
+        default: return "Auto"
+        }
+    }
+
+    /// The backup, or nil; either way `statusText` carries the receipt.
+    @MainActor
+    @discardableResult
+    func createBackup(reason: String) async -> BackupRecord? {
+        let receipt: String
+        var cause: String?
+        var created: BackupRecord?
+        do {
+            let backup = try await TrustBackupPersistence.createBackup(
+                reason: reason, dataRoot: PersistenceCore.defaultDataRoot(), host: .app
+            )
+            created = backup
+            receipt = "Backup created at \(backup.createdAt): \(backup.reason)"
+        } catch {
+            receipt = UserFacingError.message(error, action: "make a backup")
+            cause = error.localizedDescription
+        }
+        await refreshBackupList(preserving: receipt, cause: cause)
+        return created
+    }
+
+    @MainActor
+    func restoreBackup(_ backup: BackupRecord) async {
+        let receipt: String
+        var cause: String?
+        do {
+            let result = try await TrustBackupPersistence.restoreBackup(
+                id: backup.id, dataRoot: PersistenceCore.defaultDataRoot(), host: .app
+            )
+            if result.requiresRestart {
+                statusText = "Restore validated and staged with safety backup \(result.safetyBackupId ?? "created"). NativeAgent is restarting to restore before any live state owner opens."
+                AppRestartCoordinator.relaunchApp(terminate: {
+                    RunLoop.main.perform(inModes: [.common]) {
+                        MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
+                    }
+                }, onSpawnFailure: { error in
+                    ModuleLog.app("[relaunch] failed to spawn relaunch helper for %@: %@", Bundle.main.bundlePath, "\(error)")
+                })
+                return
+            }
+            let scopes = TrustBackupPersistence.scopeNames(for: result.restored)
+            let restoredDescription = scopes.isEmpty ? "no matching data scopes" : scopes.joined(separator: ", ")
+            receipt = "Restore completed at \(result.restoredAt): \"\(backup.reason)\" from \(backup.createdAt). Safety backup created first. Restored: \(restoredDescription)."
+        } catch {
+            receipt = "Restore failed for \"\(backup.reason)\" from \(backup.createdAt). "
+                + UserFacingError.cause(error, action: "restore that backup")
+            cause = error.localizedDescription
+        }
+        await refreshBackupList(preserving: receipt, cause: cause)
+    }
+
+    @MainActor
+    private func refreshBackupList(preserving receipt: String, cause: String? = nil) async {
+        do {
+            try await engine.trust.refreshBackups()
+            statusText = receipt
+            statusCause = cause
+        } catch {
+            statusText = "\(receipt) " + UserFacingError.message(error, action: "refresh the backup list")
+            statusCause = [cause, error.localizedDescription].compactMap { $0 }.joined(separator: "; ")
+        }
+    }
+
+}
+
+@MainActor
+extension AppModel {
+    /// Guidance text to show in chat when no AI provider is usable at all;
+    /// `nil` when at least one provider looks connected.
+    func missingProviderChatGuidance() -> String? {
+        guard !SwiftNativeProviderRouting(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).hasUsableCredentials() else { return nil }
+        return """
+        No AI provider is connected yet, so I can't reply.
+
+        Use Open Providers below to connect one.
+        """
+    }
+
+    @MainActor
+    @discardableResult
+    func refreshToolsFromToolbar() async -> ToolsRefreshPresentation.State {
+        guard !isRefreshingTools else {
+            return .alreadyRefreshing
+        }
+        isRefreshingTools = true
+        toolsRefreshState = .refreshing
+        defer { isRefreshingTools = false }
+
+        await refreshForSidebarItem(.tools)
+        let result = ToolsRefreshPresentation.completion(
+            panelRefresh: panelRefreshStatus[.tools],
+            catalogLoadFailed: engine.tools.catalogLoadError != nil,
+            hasCatalog: engine.tools.catalog != nil
+        )
+        toolsRefreshState = result
+        if let message = ToolsRefreshPresentation.message(for: result) {
+            statusText = message
+        }
+        return result
+    }
+
+    @discardableResult
+    func enqueueChatBrainDefaultsSave() -> UInt64? {
+        engine.providers.enqueueChatBrainSave(
+            currentChatBrainSelection,
+            failure: { UserFacingError.cause($0, action: "save the model choice") },
+            completion: { [weak self] result, error in
+                guard let self else { return }
+                switch result {
+                case .saved(let selection):
+                    self.applyCanonicalChatBrainSelection(selection)
+                    self.statusText = result.userMessage
+                    self.publishProviderCatalogStatusAfterBrainSave()
+                case .unchanged:
+                    self.statusText = result.userMessage
+                case .failed(_, let canonical, _):
+                    if let canonical { self.applyCanonicalChatBrainSelection(canonical) }
+                    if let error { self.setFailureStatus(result.userMessage, cause: error) }
+                    else { self.statusText = result.userMessage }
+                }
+            }
+        )
+    }
+
+    @discardableResult
+    func saveChatBrainDefaults() async -> ProvidersFacade.ChatBrainSaveResult {
+        guard let generation = enqueueChatBrainDefaultsSave() else {
+            return .unchanged(currentChatBrainSelection)
+        }
+        let result = await engine.providers.awaitChatBrainSave(generation: generation)
+        if case .failed(_, _, nil) = result { statusText = result.userMessage }
+        return result
+    }
+
+    private var currentChatBrainSelection: ProvidersFacade.ChatBrainSelection {
+        .init(model: chatModel, reasoningEffort: chatReasoningEffort, fastMode: chatFastMode)
+    }
+
+    private func applyCanonicalChatBrainSelection(_ selection: ProvidersFacade.ChatBrainSelection) {
+        if chatModel != selection.model { chatModel = selection.model }
+        if chatReasoningEffort != selection.reasoningEffort {
+            chatReasoningEffort = selection.reasoningEffort
+        }
+        if chatFastMode != selection.fastMode { chatFastMode = selection.fastMode }
+    }
+
+    private func publishProviderCatalogStatusAfterBrainSave() {
+        Task {
+            _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
+        }
+    }
+
+    /// PATCH-2026-05-07: chat-provider-picker Load + cache the providers
+    /// list so the chat screen's Provider dropdown stays populated. Also
+    /// reads the canonical providers/active.json owner for `chatProvider`.
+    /// M12 (gpt-5.5 review, 2026-07-09): returns whether the provider list
+    /// actually refreshed, so the chat panel's staleness tracking can record
+    /// a carried-over dropdown instead of silently impersonating a live one.
+    @MainActor
+    @discardableResult
+    func loadProvidersForChat() async -> Bool {
+        defer { engine.providers.refreshAccountModelsInBackground() }
+        let saveGeneration = engine.providers.chatBrainSaveGeneration
+        let chatWasSaving = isSavingChatBrain
+        var providersFresh = true
+        do {
+            let snapshot = try await engine.providers.routing.checkedProviderSnapshot()
+            engine.providers.connections = try ProvidersFacade.connections(from: snapshot)
+            applySurfacePickerSnapshot(snapshot.routing, applyChat: !chatWasSaving
+                && !isSavingChatBrain && saveGeneration == engine.providers.chatBrainSaveGeneration)
+            Task {
+                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
+            }
+        } catch {
+            // keep prior list on screen, but say so
+            providersFresh = false
+        }
+        return providersFresh
+    }
+
+    /// PATCH-2026-05-07: chat-provider-picker Set chat provider (POST to
+    /// /v1/providers/active) and update local state.
+    @MainActor
+    func setChatProvider(_ providerId: String, previous: String? = nil) async -> Bool {
+        let rollbackProvider = previous ?? chatProvider
+        do {
+            try await engine.providers.routing.setActiveProvider(surface: "chat", providerId: providerId)
+            chatProvider = providerId
+            Task {
+                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
+            }
+            statusText = "Chat provider → \(providerId)"
+            return true
+        } catch {
+            chatProvider = rollbackProvider
+            setFailureStatus(error, action: "switch the chat provider")
+            return false
+        }
+    }
+
+    @MainActor
+    func adoptProviderForBlankSurfaces(_ providerId: String) async {
+        let adopted = await engine.providers.adoptProviderForBlankSurfaces(
+            providerId, dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            failure: { error, action in setFailureStatus(error, action: action) }
+        ) { surface in
+            try await clearSurfaceOverride(surface: surface)
+        }
+        if adopted { await loadProvidersForChat() }
+    }
+}
+
+extension ProvidersFacade.ChatBrainSaveResult {
+    var userMessage: String {
+        switch self {
+        case .unchanged(let selection), .saved(let selection):
+            return "Chat brain saved: \(selection.model) / \(selection.reasoningEffort)\(selection.fastMode ? " / Fast" : "")"
+        case .failed(let message, _, _):
+            return "Couldn't save the model choice. \(message)"
+        }
+    }
+
+    /// What the agent's tool result says: the same line plus the raw cause.
+    var agentMessage: String {
+        if case .failed(_, _, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
+        return userMessage
+    }
+}
+
+extension AppModel {
+
+    // MARK: Approvals
+    /// Overload of the existing `resolveApproval(_:decision:)` for callers that
+    /// hold only the approval id (inline cards, sidebar rows). Concurrent
+    /// callers share one task because a terminal approval may start a real
+    /// executor after its durable decision is written.
+    func resolveApproval(id: String, decision: String) async throws -> ApprovalRecord {
+        try await engine.approvals.resolveApproval(
+            id: id, decision: decision,
+            coordinator: .app(dataRootOverride: dataRootOverride)
+        ) { id, active in
+            if active { approvalResolutionInFlightIDs.insert(id) }
+            else { approvalResolutionInFlightIDs.remove(id) }
+        }
+    }
+
+    // MARK: Chat context / tools
+    func getSessionContext(sessionId: String, model: String? = nil) async throws -> SessionContextStatus {
+        try await RuntimeReadProjection.getSessionContext(
+            sessionId: sessionId, model: model, dataRoot: engine.dataRoot, configuredThresholdTokens: nil)
+    }
+
+    /// ChatOrchestration's canonical transcript compactor, so automatic and
+    /// manual requests share validation, verified backup, durable
+    /// replacement, traces, and optional distillation.
+    func compactSession(
+        sessionId: String,
+        model: String? = nil,
+        providerID: String? = nil,
+        force: Bool = false
+    ) async throws -> ChatSessionCompactionOutcome {
+        try await engine.compactSession(
+            sessionId: sessionId, model: model, providerID: providerID, force: force, client: macChatClient
+        )
+    }
+
+    /// A slash command's tool run. The caller serializes its input on the
+    /// main actor so only Sendable data crosses into the dispatcher.
+    func dispatchToolData(tool: String, inputData: Data, sessionId: String?) async throws -> DispatchResult {
+        try await engine.dispatchToolData(tool: tool, inputData: inputData, sessionId: sessionId)
+    }
+
+    // MARK: Connectors
+    func getConnectorRegistrationStatus(provider: String) async throws -> ConnectorRegistrationStatus {
+        try await ConnectorWizardActions.getConnectorRegistrationStatus(provider: provider)
+    }
+
+    func registerConnectorApp(provider: String) async throws -> ConnectorRegisterAppResponse {
+        try await ConnectorWizardActions.registerConnectorApp(provider: provider)
+    }
+
+    // MARK: Onboarding
+    func startOnboarding() async throws -> OnboardingStartResult {
+        try await engine.onboarding.startOnboarding()
+    }
+
+    func completeOnboarding(agentName: String, personaType: String, userName: String) async throws -> OnboardingCompleteResult {
+        try await engine.completeOnboarding(
+            payload: OnboardingCompletePayload(agentName: agentName, personaType: personaType, userName: userName),
+            resident: .live
+        )
+    }
+
+    func resumePendingOnboarding() async throws -> OnboardingCompleteResult {
+        try await engine.resumePendingOnboarding(resident: .live)
+    }
+
+    func repairOnboardingProfile(agentName: String, personaType: String, userName: String) async throws -> OnboardingCompleteResult {
+        try await engine.repairOnboardingProfile(
+            payload: OnboardingCompletePayload(agentName: agentName, personaType: personaType, userName: userName),
+            publishProfile: { await self.reloadPersonality() }, resident: .live
+        )
+    }
+
+    func resetOnboarding(confirm: Bool = true) async throws -> OnboardingResetResult {
+        try await engine.resetOnboarding(confirm: confirm, resident: .live)
+    }
+
+    func refreshResidentMindAfterOnboardingTransition() async {
+        await NativeAgentEngine.live.refreshResidentMindAfterOnboardingTransition()
+    }
+
+    // MARK: Mac assistant / Mac control
+    func getMacAssistantStatus() async throws -> MacAssistantStatusResult {
+        // UI consumes the full access/template lists — request non-lightweight.
+        try await AppConnectorActionPlatform(dataRoot: engine.dataRoot).macAssistantStatusClient()
+            .macAssistantStatus(lightweight: false)
+    }
+
+    func saveMacIntegrationPreset(_ preset: String, currentPolicy: TrustPolicy? = nil) async throws -> TrustPolicy {
+        try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMacIntegrationPreset(preset, currentPolicy: currentPolicy)
+    }
+
+    /// Overload of the existing `runConnectorAction(_:)` for the id/dryRun/input
+    /// call shape used by the Mac-data probe.
+    func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue] = [:]) async throws -> ConnectorActionReceipt {
+        try await ConnectorActions(platform: AppConnectorActionPlatform(dataRoot: engine.dataRoot))
+            .runConnectorAction(id: id, dryRun: dryRun, input: input)
+    }
+
+    func fullMacYoloAuthorityAdmitted(tool: String, surface: String) async -> Bool {
+        await ConnectorActions.fullMacYoloAdmitted(tool: tool, surface: surface, dataRoot: engine.dataRoot)
+    }
+
+    func saveMacControlPolicy(
+        _ policy: TrustMacControlPolicy,
+        guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
+    ) async throws -> TrustPolicy {
+        try await TrustPolicyActions(dataRoot: engine.dataRoot)
+            .saveMacControlPolicy(policy, guardedByLockedPolicy: guardedByLockedPolicy)
+    }
+
+    func macControlNotify(title: String, message: String) async throws -> Bool {
+        try await engine.trust.notify(
+            title: title, message: message, notificationCenterAdapter: NativeAgentMacControlNotificationAdapter()
+        )
+    }
+
+    func macControlRun(path: String, bodyData: Data) async throws -> MacControlRunResult {
+        try await engine.trust.runMacControl(
+            path: path, bodyData: bodyData, notificationCenterAdapter: NativeAgentMacControlNotificationAdapter()
+        )
+    }
+
+    // MARK: Providers
+    func clearSurfaceOverride(surface: String) async throws {
+        try await engine.clearSurfaceOverride(surface: surface) { preference in
+            applySurfacePickerSelection(
+                surface: surface, model: preference.model,
+                reasoningEffort: preference.reasoningEffort, serviceTier: preference.serviceTier
+            )
+        }
+    }
+
+    func saveProviderGroupSelection(
+        group: ProviderSurfaceGroup, providerID: String? = nil, model: String? = nil,
+        reasoningEffort: String? = nil, serviceTier: String? = nil, clearOverride: Bool = false
+    ) async throws -> ProviderGroupWriteResult {
+        try await engine.saveProviderGroupSelection(
+            group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier, clearOverride: clearOverride,
+            applySnapshot: { applySurfacePickerSnapshot($0) }
+        )
+    }
+
+    func configureSurfaceSelection(
+        surface: String, providerID: String, model: String, reasoningEffort: String, serviceTier: String?
+    ) async throws -> ModelCatalogResponse {
+        try await engine.configureSurfaceSelection(
+            surface: surface, providerID: providerID, model: model,
+            reasoningEffort: reasoningEffort, serviceTier: serviceTier
+        ) { response in
+            applySurfacePickerSelection(
+                surface: surface, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier
+            )
+            if surface == "chat" {
+                chatProvider = providerID
+                let canonical = response.current.chat
+                engine.providers.chatBrainCanonicalSelection = ProvidersFacade.ChatBrainSelection(
+                    model: canonical.model, reasoningEffort: canonical.reasoningEffort,
+                    fastMode: canonical.serviceTier == "priority"
+                )
+            }
+        }
+    }
+
+    private func applySurfacePickerSelection(
+        surface: String,
+        model: String,
+        reasoningEffort: String,
+        serviceTier: String?
+    ) {
+        switch surface {
+        case "chat":
+            chatModel = model
+            chatReasoningEffort = reasoningEffort
+            chatFastMode = serviceTier == "priority"
+        case "telegram":
+            telegramModel = model
+            telegramReasoningEffort = reasoningEffort
+        default:
+            break
+        }
+    }
+
+    func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String? = nil) async throws {
+        try await engine.configureProvider(id, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
+    }
+
+    /// `apiKeyOverride` is the unsaved key typed into the provider sheet; when
+    /// present the probe tests THAT credential instead of the one on disk
+    /// (User, 2026-09-06).
+    func testProvider(_ id: String, apiKeyOverride: String? = nil) async throws -> NativeAgentShared.ProviderTestResult {
+        try await engine.providers.testProvider(id, apiKeyOverride: apiKeyOverride)
+    }
+
+    func clearProvider(_ id: String) async throws {
+        try await engine.clearProvider(id)
+    }
+
+    /// The provider sheet's Remove the key, which provider.disconnect runs
+    /// too: the registry row, then the sign-in. `detail` is the sheet's status
+    /// line; `ok` false claims no removal.
+    func disconnectProvider(_ id: String) async -> (ok: Bool, detail: String, cause: String?) {
+        do {
+            let result = try await engine.providers.disconnectProvider(id) {
+                try await self.clearProvider(id)
+            }
+            _ = await loadProvidersForChat()
+            return (result.ok, result.detail, nil)
+        } catch {
+            return (false, UserFacingError.message(error, action: "remove the sign-in"), error.localizedDescription)
+        }
+    }
+
+    // MARK: Integrations / inbox
+    func inboxAction(_ id: String, action: String) async throws {
+        if let inboxActionOverride {
+            return try await inboxActionOverride(id, action)
+        }
+        try await InboxCardActions.perform(id, action: action, dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects())
+    }
+}
+
+extension AppModel {
+    nonisolated func nextGenActionReceipt(
+        id: String,
+        dryRun: Bool,
+        surface: String = "nextgen_action"
+    ) async throws -> NextGenReceipt {
+        try await engine.nextGenActionReceipt(
+            id: id, dryRun: dryRun, surface: surface,
+            backgroundLoopsManager: backgroundLoopsManager,
+            healthCard: { [self] in
+                try await AppDoctorPort(
+                    dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager
+                ).runtime.getHealthCard()
+            },
+            routePlan: { message in
+                try JSONValue.fromEncodable(IntentRoutePlan(await SwiftNativeRouterPlanClient().planRoute(message: message)))
+            }
+        )
     }
 }

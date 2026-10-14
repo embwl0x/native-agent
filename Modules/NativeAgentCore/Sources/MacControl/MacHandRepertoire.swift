@@ -55,18 +55,8 @@ public enum MacHandStep: Sendable, Equatable {
 }
 
 extension MacHandStep {
-    public var mouseEvent: MacMouseEvent? {
-        if case .mouse(let event) = self { return event }
-        return nil
-    }
-
     public var keyEvent: MacKeyEvent? {
         if case .key(let event) = self { return event }
-        return nil
-    }
-
-    public var scrollEvent: MacScrollEvent? {
-        if case .scroll(let event) = self { return event }
         return nil
     }
 }
@@ -139,16 +129,6 @@ public struct MacHandHoldFailure: Error {
     }
 }
 
-/// Which way a swipe travels. Deltas follow the seam's sign convention: a
-/// positive `deltaY` scrolls content the way a two-finger swipe DOWN the
-/// trackpad does.
-public enum MacSwipeDirection: String, Sendable, Equatable, CaseIterable {
-    case up
-    case down
-    case left
-    case right
-}
-
 // MARK: - The repertoire
 
 public enum MacHandRepertoire {
@@ -168,13 +148,8 @@ public enum MacHandRepertoire {
     /// Points in one `dragPath`. A path with more corners than this is not a
     /// gesture, it is a drawing — and drawing is composed of many gestures.
     public static let maximumPathPoints = 64
-    /// Clicks in one burst: single, double, triple. macOS has no quadruple.
-    public static let maximumClickCount = 3
     /// A single planned dwell/hold. Longer waits are the caller's business.
     public static let maximumWaitMilliseconds = 60_000
-    /// Discrete scroll pushes one swipe is split into.
-    public static let minimumSwipeSteps = 1
-    public static let maximumSwipeSteps = 60
 
     /// Virtual keycodes of the modifier keys, for holds. `MacKeyEvent` carries
     /// modifiers as FLAGS, which is right for a chord — but a flag lives on an
@@ -253,15 +228,8 @@ public enum MacHandRepertoire {
         count: Int = 1
     ) throws -> [MacHandStep] {
         let seam = try seamButton(button)
-        let clicks = max(1, min(count, maximumClickCount))
-        var steps: [MacHandStep] = [
-            .mouse(MacMouseEvent(phase: .move, button: seam, x: point.x, y: point.y, clickCount: 1))
-        ]
-        for index in 1...clicks {
-            steps.append(.mouse(MacMouseEvent(phase: .down, button: seam, x: point.x, y: point.y, clickCount: index)))
-            steps.append(.mouse(MacMouseEvent(phase: .up, button: seam, x: point.x, y: point.y, clickCount: index)))
-        }
-        return steps
+        return MacEventPlanner.click(x: point.x, y: point.y, button: seam, count: count)
+            .map { MacHandStep.mouse($0) }
     }
 
     /// A straight drag from A to B, interpolated.
@@ -369,42 +337,6 @@ public enum MacHandRepertoire {
     /// (notched wheel) or pixel (trackpad-grade) granularity.
     public static func scroll(dx: Int32, dy: Int32, unit: MacScrollUnit = .line) -> [MacHandStep] {
         [.scroll(MacScrollEvent(deltaX: dx, deltaY: dy, unit: unit))]
-    }
-
-    /// A swipe: `amount` of travel in `direction`, split into `steps` discrete
-    /// pushes. Split rather than one big delta because a swipe is motion over
-    /// time — momentum scrolling, rubber-banding and paged carousels all read
-    /// the sequence, not the sum. The split is exact: the emitted deltas always
-    /// total `amount`, with the remainder distributed to the earliest steps so
-    /// a swipe never silently travels less far than asked.
-    ///
-    /// At the event seam a two-finger swipe IS a scroll; this is the honest
-    /// general form of it, not a substitution for a different gesture.
-    public static func swipe(
-        direction: MacSwipeDirection,
-        amount: Int,
-        steps: Int = 5,
-        unit: MacScrollUnit = .pixel
-    ) -> [MacHandStep] {
-        let magnitude = abs(amount)
-        guard magnitude > 0 else { return [] }
-        let count = max(minimumSwipeSteps, min(steps, maximumSwipeSteps))
-        let base = magnitude / count
-        let remainder = magnitude % count
-
-        var plan: [MacHandStep] = []
-        for index in 0..<count {
-            let travel = base + (index < remainder ? 1 : 0)
-            guard travel > 0 else { continue }
-            let signed = Int32(travel)
-            switch direction {
-            case .up:    plan.append(.scroll(MacScrollEvent(deltaX: 0, deltaY: signed, unit: unit)))
-            case .down:  plan.append(.scroll(MacScrollEvent(deltaX: 0, deltaY: -signed, unit: unit)))
-            case .left:  plan.append(.scroll(MacScrollEvent(deltaX: signed, deltaY: 0, unit: unit)))
-            case .right: plan.append(.scroll(MacScrollEvent(deltaX: -signed, deltaY: 0, unit: unit)))
-            }
-        }
-        return plan
     }
 
     /// Pinch to zoom. DESCRIBABLE, not plannable: magnification is a
@@ -569,14 +501,6 @@ public enum MacHandRepertoire {
     /// no button down.
     public static func isBalanced(_ plan: [MacHandStep]) -> Bool {
         residualHeldKeys(in: plan).isEmpty && residualHeldButtons(in: plan).isEmpty
-    }
-
-    /// Total time the plan asks the caller to wait.
-    public static func plannedWaitMilliseconds(in plan: [MacHandStep]) -> Int {
-        plan.reduce(0) { total, step in
-            if case .wait(let ms) = step { return total + ms }
-            return total
-        }
     }
 
     // MARK: - Private

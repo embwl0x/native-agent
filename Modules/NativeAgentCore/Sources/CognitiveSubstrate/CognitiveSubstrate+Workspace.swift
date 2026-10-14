@@ -34,7 +34,7 @@ extension CognitiveSubstrate {
         // Observatory ablation is a real read-side intervention: it must
         // change the exact workspace the panel and capsule consume, rather
         // than merely recording a checkbox in experiment metadata.
-        guard configuration.enabled, configuration.workspaceEnabled,
+        guard configuration.enabled,
               ablations["workspace"] != false else {
             return CognitiveWorkspaceSnapshot(generatedAt: now, items: [])
         }
@@ -55,7 +55,7 @@ extension CognitiveSubstrate {
         settledNodes: [CognitiveNode],
         currentSessionId: String? = nil
     ) -> CognitiveWorkspaceSnapshot {
-        guard configuration.workspaceEnabled else {
+        guard configuration.enabled else {
             return CognitiveWorkspaceSnapshot(generatedAt: now, items: [])
         }
         let sessionId = Self.cleanedSessionId(currentSessionId)
@@ -75,8 +75,9 @@ extension CognitiveSubstrate {
         // mood-congruent (a node whose stored feeling matches her mood surfaces a little
         // more readily). Neutral mood + untagged nodes → the mood term is 0 everywhere,
         // so scores/reasons stay byte-identical to pre-Wave-C.
-        let mood = derivedMood(at: now)
-        let currentAffect = projectedAffect(at: now)
+        let dyn = dynamics
+        let currentAffect = projectedAffect(at: now, dynamics: dyn)
+        let mood = derivedMood(at: now, dynamics: dyn, affect: currentAffect)
         return makeWorkspaceSnapshot(
             at: now,
             nodes: nodes,
@@ -96,15 +97,13 @@ extension CognitiveSubstrate {
     ) async -> CognitiveFrozenRead {
         let frozenConfiguration = configuration
         let frozenDynamics = dynamics
-        let fixedAffect = projectedAffect(at: fixedAt)
-        let fixedMood = derivedMood(at: fixedAt)
+        let fixedAffect = projectedAffect(at: fixedAt, dynamics: frozenDynamics)
+        let fixedMood = derivedMood(at: fixedAt, dynamics: frozenDynamics, affect: fixedAffect)
         let fixedThoughtSeeds = projectedThoughtSeeds(at: fixedAt).sorted(by: thoughtSeedPrioritySort)
         let frozenStandingViewCandidates = standingViewCapsuleCandidates()
-        let frozenStandingViewInnerLine = frozenStandingViewCandidates.first?.line
         // Sound selection must happen after the capsule has derived this turn's
         // actual felt mode/valence. Capture its immutable inputs here instead of
         // preselecting with nil/default register values.
-        let frozenSoundEchoLine: String? = nil // retained wire/source compatibility
         let frozenSoundLandingScores = soundLandingScoreSnapshot()
         let frozenPresentationState = capsulePresentationStateSnapshot()
         let frozenPendingCompletionOpen = pendingCompletion != nil
@@ -113,95 +112,45 @@ extension CognitiveSubstrate {
             + fixedThoughtSeeds.flatMap { $0.sourcePeerIds ?? [] })
         let frozenTrustedPeers = Set(peerIds.filter { dependencies.peerTrusted($0) })
         // W4/P2: captured, never recomputed downstream (see CognitiveFeltProxyReads).
-        // Curiosity is workspace-relative, so it is captured per branch below where
+        // Curiosity is workspace-relative, so it is captured below where
         // the frozen workspace is known; the other two are workspace-independent.
         let frozenFatigue = substrateFatigueProxy(at: fixedAt)
         let frozenClarity = substrateClarityProxy(affect: fixedAffect, at: fixedAt)
-        guard frozenConfiguration.enabled else {
-            let empty = CognitiveSubstrateSnapshot(
-                generatedAt: fixedAt,
-                enabled: false,
-                maximumActiveNodes: frozenConfiguration.maximumActiveNodes,
-                nodes: [],
-                persistenceHealth: persistenceHealth
-            )
-            return CognitiveFrozenRead(
-                fixedAt: fixedAt,
-                stateRevision: dirtyRevision,
-                thoughtSeedRevision: thoughtSeedRevision,
-                configuration: frozenConfiguration,
-                personalityDynamics: frozenDynamics,
-                snapshot: empty,
-                workspace: CognitiveWorkspaceSnapshot(generatedAt: fixedAt, items: []),
-                affect: fixedAffect,
-                mood: fixedMood,
-                thoughtSeeds: fixedThoughtSeeds,
-                standingViewInnerLine: frozenStandingViewInnerLine,
-                soundEchoLine: frozenSoundEchoLine,
-                feltProxies: CognitiveFeltProxyReads(
-                    fatigue: frozenFatigue, curiosity: nil, clarity: frozenClarity),
-                standingViewCapsuleCandidates: frozenStandingViewCandidates,
-                soundLandingScores: frozenSoundLandingScores,
-                capsulePresentationState: frozenPresentationState,
-                pendingCompletionOpen: frozenPendingCompletionOpen,
-                associationSuppressions: frozenSuppressions,
-                trustedPeerIds: frozenTrustedPeers
-            )
-        }
         var copiedField = field
-        let settledNodes = copiedField.snapshot(at: fixedAt, configuration: frozenConfiguration)
+        let settledNodes = frozenConfiguration.enabled
+            ? copiedField.snapshot(at: fixedAt, configuration: frozenConfiguration) : []
         let snapshot = CognitiveSubstrateSnapshot(
             generatedAt: fixedAt,
-            enabled: true,
+            enabled: frozenConfiguration.enabled,
             maximumActiveNodes: frozenConfiguration.maximumActiveNodes,
             nodes: settledNodes,
             persistenceHealth: persistenceHealth
         )
-        guard frozenConfiguration.workspaceEnabled, ablations["workspace"] != false else {
-            return CognitiveFrozenRead(
-                fixedAt: fixedAt,
-                stateRevision: dirtyRevision,
-                thoughtSeedRevision: thoughtSeedRevision,
-                configuration: frozenConfiguration,
-                personalityDynamics: frozenDynamics,
-                snapshot: snapshot,
-                workspace: CognitiveWorkspaceSnapshot(generatedAt: fixedAt, items: []),
-                affect: fixedAffect,
-                mood: fixedMood,
-                thoughtSeeds: fixedThoughtSeeds,
-                standingViewInnerLine: frozenStandingViewInnerLine,
-                soundEchoLine: frozenSoundEchoLine,
-                feltProxies: CognitiveFeltProxyReads(
-                    fatigue: frozenFatigue, curiosity: nil, clarity: frozenClarity),
-                standingViewCapsuleCandidates: frozenStandingViewCandidates,
-                soundLandingScores: frozenSoundLandingScores,
-                capsulePresentationState: frozenPresentationState,
-                pendingCompletionOpen: frozenPendingCompletionOpen,
-                associationSuppressions: frozenSuppressions,
-                trustedPeerIds: frozenTrustedPeers
-            )
-        }
-        let sessionId = Self.cleanedSessionId(currentSessionId)
-        let turnKindsByNodeID = Dictionary(settledNodes.map {
-            ($0.id, copiedField.cachedTurnKind(for: $0))
-        }, uniquingKeysWith: { first, _ in first })
-        let eligible = settledNodes.filter {
-            workspaceEligible(
-                $0,
-                currentSessionId: sessionId,
+        let workspace: CognitiveWorkspaceSnapshot
+        if frozenConfiguration.enabled, ablations["workspace"] != false {
+            let sessionId = Self.cleanedSessionId(currentSessionId)
+            let turnKindsByNodeID = Dictionary(settledNodes.map {
+                ($0.id, copiedField.cachedTurnKind(for: $0))
+            }, uniquingKeysWith: { first, _ in first })
+            let eligible = settledNodes.filter {
+                workspaceEligible(
+                    $0,
+                    currentSessionId: sessionId,
+                    at: fixedAt,
+                    turnKind: turnKindsByNodeID[$0.id]
+                )
+            }
+            workspace = makeWorkspaceSnapshot(
                 at: fixedAt,
-                turnKind: turnKindsByNodeID[$0.id]
+                nodes: eligible,
+                associatedNodeIds: copiedField.associatedNodeIDs(),
+                mood: fixedMood,
+                affect: fixedAffect,
+                turnKindsByNodeID: turnKindsByNodeID
             )
+        } else {
+            workspace = CognitiveWorkspaceSnapshot(generatedAt: fixedAt, items: [])
         }
-        let associatedNodeIds = copiedField.associatedNodeIDs()
-        let workspace = makeWorkspaceSnapshot(
-            at: fixedAt,
-            nodes: eligible,
-            associatedNodeIds: associatedNodeIds,
-            mood: fixedMood,
-            affect: fixedAffect,
-            turnKindsByNodeID: turnKindsByNodeID
-        )
         return CognitiveFrozenRead(
             fixedAt: fixedAt,
             stateRevision: dirtyRevision,
@@ -213,8 +162,6 @@ extension CognitiveSubstrate {
             affect: fixedAffect,
             mood: fixedMood,
             thoughtSeeds: fixedThoughtSeeds,
-            standingViewInnerLine: frozenStandingViewInnerLine,
-            soundEchoLine: frozenSoundEchoLine,
             feltProxies: CognitiveFeltProxyReads(
                 fatigue: frozenFatigue,
                 // Curiosity is novelty of what she is HOLDING, so it is captured
@@ -231,11 +178,6 @@ extension CognitiveSubstrate {
             associationSuppressions: frozenSuppressions,
             trustedPeerIds: frozenTrustedPeers
         )
-    }
-
-    /// Pure mutation sentinel for a frozen epoch.
-    public func frozenRevisionToken() -> String {
-        "\(dirtyRevision):\(thoughtSeedRevision)"
     }
 
     private func makeWorkspaceSnapshot(
@@ -330,11 +272,6 @@ extension CognitiveSubstrate {
     }
 
     @discardableResult
-    public func runMicrocycle(reason: String) async -> CognitiveWorkspaceSnapshot? {
-        try? await runMicrocycleChecked(reason: reason)
-    }
-
-    @discardableResult
     public func runMicrocycleChecked(reason: String) async throws -> CognitiveWorkspaceSnapshot? {
         await waitForMaintenanceTransition()
         guard configuration.enabled, configuration.backgroundMicrocyclesEnabled else { return nil }
@@ -357,7 +294,7 @@ extension CognitiveSubstrate {
         // Clear before any awaiting persistence work: a concurrent event will
         // set it again and must survive this cycle's completion.
         dirtySince = nil
-        if configuration.thoughtSeedsEnabled,
+        if configuration.enabled,
            currentAffect.uncertainty > 0.45 || currentAffect.taskPressure > 0.45 {
             _ = await addThoughtSeed(
                 kind: currentAffect.uncertainty > currentAffect.taskPressure ? .anomaly : .followUp,
@@ -375,7 +312,7 @@ extension CognitiveSubstrate {
                 // node writes here. Affect, thought seeds, nodes, pruning, and
                 // the receipt are one canonical SQLite transaction—not four
                 // sequential commits for one physiological settlement.
-                var artifacts: [CognitiveArtifactWrite] = configuration.affectEnabled
+                var artifacts: [CognitiveArtifactWrite] = configuration.enabled
                     ? [CognitiveArtifactWrite(
                         kind: "affect",
                         id: stableArtifactID("affect"),
@@ -400,7 +337,7 @@ extension CognitiveSubstrate {
                         payload: capsulePresentationArtifactPayload(at: workspace.generatedAt)
                     ))
                 }
-                let seedRows = configuration.thoughtSeedsEnabled
+                let seedRows = configuration.enabled
                     ? thoughtSeeds.values.map {
                         CognitiveArtifactReplacement(
                             id: $0.id,
@@ -410,12 +347,6 @@ extension CognitiveSubstrate {
                         )
                     }
                     : nil
-                // R-F2 deterministic interleave seam: nil in production. A test
-                // uses it to attempt a maintenance run while this cycle is
-                // inside its commit window (see maintenanceCommitInFlight).
-                if let probe = microcycleCommitInterleaveProbe {
-                    await probe()
-                }
                 try await persistMaintenanceTransition(
                     nodes: settledNodes,
                     thoughtSeeds: seedRows,
@@ -493,7 +424,7 @@ extension CognitiveSubstrate {
         var artifacts: [CognitiveArtifactWrite] = []
         var receipts: [CognitiveReceiptWrite] = []
         var stagedTimelineEvents: [CognitiveDevelopmentalTimelineEvent] = []
-        if configuration.affectEnabled {
+        if configuration.enabled {
             artifacts.append(CognitiveArtifactWrite(
                 kind: "affect",
                 id: stableArtifactID("affect"),
@@ -529,7 +460,7 @@ extension CognitiveSubstrate {
         do {
             try await persistMaintenanceTransition(
                 nodes: nodes,
-                thoughtSeeds: configuration.thoughtSeedsEnabled
+                thoughtSeeds: configuration.enabled
                     ? thoughtSeeds.values.map {
                         CognitiveArtifactReplacement(
                             id: $0.id,
@@ -574,7 +505,7 @@ extension CognitiveSubstrate {
         var dueReasons: [String] = []
         var futureDeadlines: [Date] = []
 
-        if configuration.affectEnabled {
+        if configuration.enabled {
             let consolidationAt = lastEmotionalConsolidationAt?
                 .addingTimeInterval(Self.emotionalConsolidationInterval) ?? now
             if consolidationAt <= now {
@@ -584,7 +515,7 @@ extension CognitiveSubstrate {
             }
         }
 
-        if configuration.thoughtSeedsEnabled {
+        if configuration.enabled {
             for seed in thoughtSeeds.values {
                 let currentPriority = effectiveThoughtSeedPriority(seed, at: now)
                 if currentPriority < Self.minimumRetainedThoughtSeedPriority {
@@ -636,7 +567,7 @@ extension CognitiveSubstrate {
         reason: String,
         at now: Date
     ) -> EmotionalConsolidationTransition? {
-        guard configuration.affectEnabled else { return nil }
+        guard configuration.enabled else { return nil }
         if let last = lastEmotionalConsolidationAt,
            now.timeIntervalSince(last) < Self.emotionalConsolidationInterval {
             return nil
@@ -850,7 +781,7 @@ extension CognitiveSubstrate {
         case .appLifecycle: kindBoost = 0
         case .feltResolution: kindBoost = 0.06
         }
-        let affectBoost = configuration.affectEnabled
+        let affectBoost = configuration.enabled
             ? min(0.12, currentAffect.taskPressure * 0.08 + currentAffect.uncertainty * 0.04)
             : 0
         // Wave C mood-congruent recall — small, gated to felt nodes under a non-neutral
@@ -867,7 +798,7 @@ extension CognitiveSubstrate {
         // boilerplate she emitted, not something she has to think about.
         case .mechanical: turnKindMultiplier = 0.1
         }
-        return clamp(base * turnKindMultiplier)
+        return (base * turnKindMultiplier).clamped01()
     }
 
     private func workspaceReasons(
@@ -882,7 +813,7 @@ extension CognitiveSubstrate {
         if node.kind == .correction { reasons.append("correction-priority") }
         let turnKind = resolvedTurnKind ?? node.turnKind
         if turnKind != .live { reasons.append("turn-\(turnKind.rawValue)") }
-        if configuration.affectEnabled && currentAffect.taskPressure > 0.4 { reasons.append("task-pressure") }
+        if configuration.enabled && currentAffect.taskPressure > 0.4 { reasons.append("task-pressure") }
         if associatedNodeIds.contains(node.id) { reasons.append("spreading-activation") }
         // Wave C: a meaningful mood-congruent contribution is named so provenance is honest.
         if moodCongruence(for: node, mood: mood) > Self.moodCongruenceReasonThreshold {

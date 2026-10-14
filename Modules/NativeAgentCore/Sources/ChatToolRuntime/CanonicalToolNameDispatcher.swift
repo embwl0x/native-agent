@@ -114,8 +114,11 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
 
     private func dispatchWithWorkspacePorts(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let result = try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
-            let result = try await dispatchNormalized(tool: tool, input: input, surface: surface)
-            if Self.canonical(tool) == "agent_read", case .object(var fields) = result,
+            let result = try await AgentRecipeStore.$dryRun.withValue(Self.canonical(tool) == "agent_message" && input["dry_run"] == .bool(true)) {
+                try await dispatchNormalized(tool: tool, input: input, surface: surface)
+            }
+            if !AgentConversationContext.isInternalRead, Self.canonical(tool) == "agent_read",
+               case .object(var fields) = result,
                case .string(let agent)? = fields["agent_id"] ?? fields["agent"], agent.lowercased() == "claude" {
                 fields["worklog"] = AgentConversationView.claudeWorklog()
                 return .object(fields)
@@ -135,7 +138,8 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         // adding synthetic chat turns, or changing the cached prompt prefix.
         // The person's own thread send has no agent reading its result, so it
         // must not use up her arrival notices.
-        guard !AgentWorkspaceArrivals.insideWorkspaceDispatch, PersonInitiatedSend.current == nil,
+        guard !AgentConversationContext.isInternalRead,
+              !AgentWorkspaceArrivals.insideWorkspaceDispatch, PersonInitiatedSend.current == nil,
               case .object(var fields) = result,
               fields["workspace_arrivals"] == nil,
               let notice = await AgentWorkspaceArrivals.pending(dataRoot: peerDataRoot,
@@ -260,7 +264,9 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
            let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
             return try await AgentConversationSession.dispatch(tool: tool, input: input, surface: surface,
                 scope: scope, dataRoot: root) { tool, input in
-                    try await self.dispatchExact(tool: tool, input: input, surface: surface)
+                    try await AgentConversationContext.$isInternalRead.withValue(true) {
+                        try await self.dispatch(tool: tool, input: input, surface: surface)
+                    }
                 }
         }
         return try await dispatchExact(tool: tool, input: input, surface: surface)

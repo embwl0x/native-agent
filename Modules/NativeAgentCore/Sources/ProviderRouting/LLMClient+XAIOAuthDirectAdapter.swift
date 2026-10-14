@@ -316,21 +316,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         // already records decoder.usage; without this the body never asked for
         // it, so xAI streaming token telemetry was always nil.
         if stream { body["stream_options"] = ["include_usage": true] }
-        if let tools, !tools.isEmpty {
-            body["tools"] = try tools.map { schema in
-                let parameters = try JSONSerialization.jsonObject(with: schema.parametersJSON)
-                return [
-                    "type": "function",
-                    "function": [
-                        "name": schema.name,
-                        "description": schema.description,
-                        "parameters": parameters,
-                    ],
-                ]
-            }
-            body["tool_choice"] = "auto"
-            body["parallel_tool_calls"] = true
-        }
+        try OpenAIAdapter.applyTools(to: &body, tools: tools)
         FirstPartyExecutionControls.applyXAIControls(to: &body, model: model)
         return body
     }
@@ -447,7 +433,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         req.timeoutInterval = 20
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.httpBody = formEncode([
+        req.httpBody = NativeOAuthSupport.formEncode([
             "grant_type": "refresh_token",
             "client_id": Self.clientID,
             "refresh_token": state.refreshToken,
@@ -608,10 +594,6 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         return String(clean.prefix(limit)) + "... [truncated]"
     }
 
-    private static func tierDeniedMessage(data: Data) -> String {
-        "xAI OAuth account is not authorized for this Grok API surface. xAI may require a different SuperGrok/X Premium+ tier. Response: \(boundedBodyString(data))"
-    }
-
     private static func redactedErrorBody(_ raw: String) -> String {
         var out = raw
         if let re = try? NSRegularExpression(
@@ -633,27 +615,8 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
 }
 
 
-private func formEncode(_ params: [String: String]) -> String {
-    var allowed = CharacterSet.urlQueryAllowed
-    allowed.remove(charactersIn: "+&=")
-    return params.map { key, value in
-        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
-        let encodedValue = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-        return "\(encodedKey)=\(encodedValue)"
-    }.joined(separator: "&")
-}
-
 private func jwtExpiry(_ token: String) -> Date? {
-    let parts = token.split(separator: ".")
-    guard parts.count >= 2 else { return nil }
-    var body = String(parts[1])
-    while body.count % 4 != 0 { body.append("=") }
-    body = body.replacingOccurrences(of: "-", with: "+")
-        .replacingOccurrences(of: "_", with: "/")
-    guard let data = Data(base64Encoded: body),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        return nil
-    }
+    guard let obj = jwtPayload(token) else { return nil }
     if let exp = obj["exp"] as? Int { return Date(timeIntervalSince1970: TimeInterval(exp)) }
     if let exp = obj["exp"] as? Double { return Date(timeIntervalSince1970: exp) }
     return nil
@@ -662,13 +625,12 @@ private func jwtExpiry(_ token: String) -> Date? {
 /// The `expires_at` this adapter itself persisted on the last refresh, in
 /// either the top-level or the PKCE-nested shape. `parseExpiresAt` accepts ISO
 /// basic, full ISO (with or without fractional seconds) and unix stamps; it
-/// lives on the Anthropic adapter but is a plain date parser with nothing
-/// provider-specific in it (User, 2026-09-06).
+/// is shared with the other OAuth adapters.
 private func persistedExpiry(_ obj: [String: Any]) -> Date? {
     let raw = obj["expires_at"]
         ?? (obj["tokens"] as? [String: Any])?["expires_at"]
     guard let raw else { return nil }
-    return AnthropicOAuthDirectAdapter.parseExpiresAt(raw)
+    return parseExpiresAt(raw)
 }
 
 private func isoNow() -> String {

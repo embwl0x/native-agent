@@ -31,11 +31,6 @@ public enum ChatContentBlock: Equatable, Sendable {
     case prose(String)
     /// `language` is the fence info string when the model supplied one.
     case code(language: String?, code: String)
-
-    public var isProse: Bool {
-        if case .prose = self { return true }
-        return false
-    }
 }
 
 public enum ChatRichContentParser {

@@ -79,6 +79,18 @@ extension TelegramPollLoop {
         }
     }
 
+    public static let defaultSendSilentRichMessage: @Sendable (
+        String, TelegramDestination, TelegramInputRichMessage
+    ) async throws -> Int = { token, destination, richMessage in
+        let result = try await _tgPostJSON(token: token, method: "sendRichMessage", resultType: TelegramAPIMessageResult.self) {
+            var fields = _tgDestinationFields(destination)
+            fields["rich_message"] = richMessage.jsonValue
+            fields["disable_notification"] = .bool(true)
+            return try JSONValue.object(fields).serializedData(pretty: false)
+        }
+        return result.value.messageId
+    }
+
     public static let defaultSendMessageWithReplyMarkupReturningId:
         @Sendable (String, TelegramDestination, String, JSONValue) async throws -> Int = {
             token, destination, text, replyMarkup in
@@ -182,18 +194,6 @@ extension TelegramPollLoop {
         )
     }
 
-    /// The same send without a sound or alert (Bot API `disable_notification`):
-    /// the text lands in the chat for context but does not ping the phone.
-    public static let defaultSendSilentMessage: @Sendable (String, TelegramDestination, String) async throws -> Void = { token, destination, text in
-        try await sendMessage(
-            token: token,
-            chatId: destination.chatId,
-            text: text,
-            threadId: destination.threadId,
-            silent: true
-        )
-    }
-
     /// Concrete ordinary-reply transport.  Kept separately from the closure
     /// default so a hermetic URLProtocol session can execute this exact request
     /// and validator path, including flood-control retry semantics.
@@ -202,7 +202,6 @@ extension TelegramPollLoop {
         chatId: Int,
         text: String,
         threadId: Int? = nil,
-        silent: Bool = false,
         // nil = the bounded reply session. `.shared` here overrode every bound
         // (7-day resource timeout), so a stalled send could hold the chat lane.
         session: URLSession? = nil,
@@ -224,23 +223,18 @@ extension TelegramPollLoop {
                         TelegramDestination(chatId: chatId, threadId: threadId)
                     )
                     body["text"] = chunk
-                    if silent { body["disable_notification"] = true }
                     return try JSONSerialization.data(withJSONObject: body)
                 }
             }
         }
     }
 
-    public static let defaultSendPhoto: @Sendable (String, TelegramDestination, String, String?) async throws -> Void = { token, destination, imagePath, caption in
+    public static let defaultSendPhoto: @Sendable (String, TelegramDestination, String, Data, String?) async throws -> Void = { token, destination, imagePath, imageData, caption in
         try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
             guard let url = _tgBuildBotURL(token: token, method: "sendPhoto") else {
                 throw TelegramBotError.invalidRequest
             }
             let fileURL = URL(fileURLWithPath: imagePath)
-            guard FileManager.default.fileExists(atPath: fileURL.path) else {
-                throw TelegramBotError.underlying("sendPhoto file missing")
-            }
-            let imageData = try Data(contentsOf: fileURL)
             guard !imageData.isEmpty else {
                 throw TelegramBotError.underlying("sendPhoto file empty")
             }

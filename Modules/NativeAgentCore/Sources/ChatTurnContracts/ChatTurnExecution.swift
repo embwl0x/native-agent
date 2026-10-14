@@ -91,7 +91,6 @@ package final class ChatTurnExecution: @unchecked Sendable {
     /// say it instead, and the card's own copy is the only honest wording for
     /// that sentence.
     private var pendingNeed: InlineInteraction?
-    package var waitingInteractionID: String? { lock.lock(); defer { lock.unlock() }; return pendingInteraction }
     package var waitingInteraction: InlineInteraction? { lock.lock(); defer { lock.unlock() }; return pendingNeed }
     package var waitingForInteraction: Bool { lock.lock(); defer { lock.unlock() }; return pendingInteraction != nil }
     /// The row the transcript keeps for this waiting turn — the card-lane one

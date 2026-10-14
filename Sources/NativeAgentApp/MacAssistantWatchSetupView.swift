@@ -1,5 +1,6 @@
 import MacAssistantStatus
 import SwiftUI
+import MacIntegration
 import Observation
 
 /// Appearance, manual refresh, and completed setup/probe actions can overlap.
@@ -228,27 +229,8 @@ struct MacAssistantWatchSetupView: View {
         isCheckingMail = true
         defer { isCheckingMail = false }
         do {
-            guard case .object(let out) = try await MacAppleScriptBridge.mailListRecent(input: ["limit": .int(1)]) else {
-                mailCheck = ("failed", "Check failed", "Mail gave no answer I could read.")
-                return
-            }
-            let text = { (key: String) -> String? in
-                if case .string(let s)? = out[key], !s.isEmpty { return s }
-                return nil
-            }
-            switch text("status") {
-            case "completed":
-                mailCheck = ("ready", "Ready", nil)
-            case "denied":
-                mailCheck = ("needs_permission", "Needs macOS permission",
-                             "Allow NativeAgent to control Mail in System Settings → Privacy & Security → Automation.")
-            default:
-                if text("reason") == "not_configured" {
-                    mailCheck = ("needs_setup", "Needs setup", text("fix"))
-                } else {
-                    mailCheck = ("failed", "Check failed", text("error") ?? text("reason").map { "Mail said: \($0.replacingOccurrences(of: "_", with: " "))." })
-                }
-            }
+            mailCheck = MacAssistantStatusResult.mailReadiness(
+                from: try await MacAppleScriptBridge.mailListRecent(input: ["limit": .int(1)]))
         } catch {
             mailCheck = ("failed", "Check failed", UserFacingError.cause(error, action: "check Mail"))
         }
@@ -388,4 +370,53 @@ struct MacAssistantWatchSetupView: View {
         "Enable Calendar access for NativeAgent in System Settings > Privacy & Security.": "Allow Calendar for NativeAgent in System Settings → Privacy & Security.",
         "Enable Reminders access for NativeAgent in System Settings > Privacy & Security.": "Allow Reminders for NativeAgent in System Settings → Privacy & Security.",
     ]
+}
+
+enum MacAssistantWatchSetupLoadState: Equatable {
+    case loading
+    case current(MacAssistantStatusResult)
+    case stale(MacAssistantStatusResult, message: String)
+    case unavailable(message: String)
+
+    var response: MacAssistantStatusResult? {
+        switch self {
+        case .current(let response), .stale(let response, _): response
+        case .loading, .unavailable: nil
+        }
+    }
+
+    var badgeText: String {
+        switch self {
+        case .loading: "Loading"
+        case .current(let response): response.status.replacingOccurrences(of: "_", with: " ").capitalized
+        case .stale: "Stale"
+        case .unavailable: "Unavailable"
+        }
+    }
+
+    var badgeStatus: String {
+        switch self {
+        case .loading: "unknown"
+        case .current(let response): response.status
+        case .stale: "attention"
+        case .unavailable: "failed"
+        }
+    }
+
+    var diagnosticText: String? {
+        switch self {
+        case .stale(_, let message), .unavailable(let message): message
+        case .loading, .current: nil
+        }
+    }
+
+    var isCurrent: Bool {
+        if case .current = self { return true }
+        return false
+    }
+
+    func afterFailure(_ message: String) -> Self {
+        guard let response else { return .unavailable(message: message) }
+        return .stale(response, message: message)
+    }
 }

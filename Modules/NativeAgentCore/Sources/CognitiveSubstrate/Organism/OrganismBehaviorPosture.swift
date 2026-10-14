@@ -1,5 +1,4 @@
 import Foundation
-import PersistenceCore
 
 public protocol OrganismPostureProviding: Sendable {
     func organismBehaviorPosture() async -> OrganismBehaviorPosture?
@@ -95,12 +94,7 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         )
     }
 
-    public func privateRuntimeContext(
-        runId: String,
-        sessionId: String,
-        surface: String,
-        fileAccess: String
-    ) -> String {
+    public func privateRuntimeContext() -> String {
         // Phase 5A (2026-10-03): ops, not a feeling, and only when it says
         // something. The labels (posture, tool_claims, …) restated what the
         // directives already say, and the one always-on directive is GROWTH's
@@ -112,21 +106,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
     }
 
     static let defaultDirective = "Tie completion claims to observed results, not intention."
-
-    public func toolResultJSON(tool: String, surface: String) -> JSONValue {
-        let object: [String: JSONValue] = [
-            "posture": .string(posture),
-            "tool_claims": .string(claimDiscipline.rawValue),
-            "tool_strategy": .string(toolStrategy.rawValue),
-            "loop_budget": .string(loopBudget.rawValue),
-            "notification_requires_receipt": .bool(notificationRequiresReceipt),
-            "tool": .string(cleanToken(tool)),
-            "surface": .string(cleanToken(surface)),
-            "directive_count": .int(Int64(directives.count)),
-            "review_signal_count": .int(Int64(reviewSignals.count)),
-        ]
-        return .object(object)
-    }
 
     private static func postureName(
         chemicalState: ChemicalState,
@@ -272,9 +251,5 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return fallback }
         return String(trimmed.prefix(limit))
-    }
-
-    private func cleanToken(_ value: String) -> String {
-        Self.clean(value, limit: 80, fallback: "unknown")
     }
 }

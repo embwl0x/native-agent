@@ -574,8 +574,7 @@ extension SwiftToolDispatcher {
 
         // Detail branch: authoritative base + tail state, with retained events.
         if let id, !id.isEmpty {
-            let state = try await ledger.listTasks().first { $0.taskId == id }
-            let forTask = try await ledger.readEventsUnlocked().filter { $0.taskId == id }
+            let (state, forTask) = try await ledger.taskDetail(id: id)
             guard let state else {
                 return .object([
                     "status": .string("not_found"),

@@ -71,7 +71,7 @@ public enum ConnectorRegistryActions {
         return .object(overlay)
     }
 
-    public static func addWorkspace(name: String, path: String, permissions: [String], root: URL) async throws -> WorkspaceRecord {
+    public static func addWorkspace(name: String, path: String, permissions: [String], root: URL) async throws -> (added: WorkspaceRecord, refreshed: [WorkspaceRecord], verified: Bool) {
         // DAEMON-DEAD PORT P4: append a new row to <dataRoot>/connectors/
         // workspaces.json under flock. Matches the reader path in
         // Connectors.swift L132.
@@ -100,7 +100,7 @@ public enum ConnectorRegistryActions {
             createdAt: now,
             lastUsedAt: nil
         )
-        return try await core.withFileLock(wsPath) {
+        let added = try await core.withFileLock(wsPath) {
             let fm = FileManager.default
             try fm.createDirectory(at: wsPath.deletingLastPathComponent(), withIntermediateDirectories: true)
             var rows: [[String: Any]] = []
@@ -137,6 +137,8 @@ public enum ConnectorRegistryActions {
             try out.write(to: wsPath, options: .atomic)
             return record
         }
+        let refreshed = try await listWorkspaces(root: root)
+        return (added, refreshed, refreshed.contains { $0.id == added.id })
     }
 
     private static func workspaceValidationError(_ message: String) -> NSError {
@@ -144,12 +146,12 @@ public enum ConnectorRegistryActions {
     }
 
     public static func listWorkspaces(root: URL) async throws -> [WorkspaceRecord] {
-        let rows = try await makeConnectorsClient(root: root).listWorkspaces()
+        let rows = try await SwiftNativeConnectorsClient(root: root).listWorkspaces()
         return try JSONDecoder().decode([WorkspaceRecord].self, from: JSONValue.array(rows).serializedData(pretty: false))
     }
 
     public static func searchWorkspace(query: String, root: URL) async throws -> WorkspaceSearchResponse {
-        let impl = makeConnectorsClient(root: root)
+        let impl = SwiftNativeConnectorsClient(root: root)
         let envelope = try await impl.searchWorkspaces(query: query)
             ?? .object(["query": .string(query), "results": .array([])])
         return try JSONDecoder().decode(WorkspaceSearchResponse.self, from: envelope.serializedData(pretty: false))

@@ -176,22 +176,7 @@ public actor DreamDiaryReader {
             if $0.date == $1.date { return ($0.filename ?? "") < ($1.filename ?? "") }
             return $0.date < $1.date
         }
-        guard let since else { return entries }
-        // 2026-09-06: the window is a range of DIARY DATES in the LOCAL
-        // calendar, INCLUSIVE of the boundary day. It used to parse the stem
-        // with `.withFullDate` (midnight UTC) and require `> since`, where
-        // `since` was `now − 7 days` — a wall-clock instant. The weekly REM
-        // fires Sunday 04:30 local, so the boundary Sunday's own dream (written
-        // that night, hours AFTER the run) parsed to an instant strictly BEFORE
-        // `since` on every following week too: Sunday's dream was never once
-        // consolidated. Comparing calendar days and including the boundary day
-        // closes that permanent hole; a day seen twice is deduped downstream by
-        // proposal id, a day never seen is lost forever.
-        let boundary = Self.startOfLocalDay(since)
-        return entries.filter { entry in
-            guard let parsed = Self.localDate(fromDateStem: entry.date) else { return false }
-            return parsed >= boundary
-        }
+        return entries
     }
 
     /// A `YYYY-MM-DD` diary stem as midnight in the LOCAL calendar.
@@ -238,8 +223,6 @@ public actor DreamDiaryReader {
 ///
 /// Error/drop surface (all reset at the start of each `consolidate`):
 /// - `lastParseErrors`: every per-doc parse error encountered (plural).
-/// - `lastParseError`: legacy single-error getter — returns the most-recent
-///   entry of `lastParseErrors`. Prefer the plural form; kept for back-compat.
 /// - `lastTargetMismatchDrops`: count of proposals dropped because their
 ///   `targetDoc` did not match the document the LLM was asked about.
 /// - `lastEvidenceDateDrops`: count of proposals dropped because an
@@ -247,9 +230,6 @@ public actor DreamDiaryReader {
 ///   sent to the LLM in this consolidate call.
 public actor SwiftNativeREMConsolidator {
     public private(set) var lastParseErrors: [String] = []
-    /// Legacy single-error accessor — returns the most-recent entry of
-    /// `lastParseErrors`. Kept for back-compat; prefer `lastParseErrors`.
-    public var lastParseError: String? { lastParseErrors.last }
     public private(set) var lastTargetMismatchDrops: Int = 0
     public private(set) var lastEvidenceDateDrops: Int = 0
     /// Count of replies the JSON decode could not read at all (2026-09-06).
@@ -260,11 +240,9 @@ public actor SwiftNativeREMConsolidator {
     public private(set) var lastDecodeFailures: Int = 0
 
     private let llm: any LLMClient
-    private let diary: DreamDiaryReader
 
-    public init(llm: any LLMClient, diary: DreamDiaryReader) {
+    public init(llm: any LLMClient) {
         self.llm = llm
-        self.diary = diary
     }
 
     private struct LLMPassageDTO: Decodable {
@@ -325,7 +303,7 @@ public actor SwiftNativeREMConsolidator {
     }
 
     public func consolidate(
-        since: Date,
+        entries: [DreamEntry],
         personaDocs: [String: String],
         system: String? = nil,
         model: String? = nil,
@@ -338,7 +316,6 @@ public actor SwiftNativeREMConsolidator {
         lastDecodeFailures = 0
         lastPassageDrops = 0
 
-        let entries = try await diary.entriesSince(since)
         if entries.isEmpty { return [] }
         let entryDateSet = Set(entries.map { $0.date })
 
@@ -480,19 +457,6 @@ public actor SwiftNativeREMConsolidator {
         return bound
     }
 
-    /// Best-effort extraction of the JSON array from a model reply that may
-    /// wrap it in markdown fences or surround it with prose. The 2026-06-28
-    /// weekly REM pass called Opus once (558 output tokens of real content)
-    /// and kept ZERO proposals — the strict bare-array decode below threw on
-    /// the wrapper and the error landed in a counter nobody read. Strategy:
-    /// strip ``` fences if present, then slice from the first `[` to the last
-    /// `]`. The strict decode still runs on the extracted slice, so malformed
-    /// JSON keeps failing loudly into `lastParseErrors`.
-    nonisolated static func extractJSONArray(_ raw: String) -> String {
-        let s = stripFences(raw)
-        return candidateJSONArraySpans(s).first ?? s
-    }
-
     /// Drop a leading ``` / ```json fence line and its closing fence.
     private nonisolated static func stripFences(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -573,22 +537,26 @@ public actor SwiftNativeREMConsolidator {
         // falls through to the strict whole-payload decode below so the
         // failure lands in lastParseErrors exactly as before.
         let stripped = Self.stripFences(raw)
-        var candidate: String? = nil
+        var candidates: [LLMProposalDTO]?
         for span in Self.candidateJSONArraySpans(stripped) {
             if let d = span.data(using: .utf8),
-               (try? JSONDecoder().decode([LLMProposalDTO].self, from: d)) != nil {
-                candidate = span
+               let dtos = try? JSONDecoder().decode([LLMProposalDTO].self, from: d) {
+                candidates = dtos
                 break
             }
         }
-        let trimmed = candidate ?? stripped
-        guard let data = trimmed.data(using: .utf8) else {
-            lastParseErrors.append("empty utf8 payload")
-            lastDecodeFailures += 1
-            return []
-        }
         do {
-            let dtos = try JSONDecoder().decode([LLMProposalDTO].self, from: data)
+            let dtos: [LLMProposalDTO]
+            if let candidates {
+                dtos = candidates
+            } else {
+                guard let data = stripped.data(using: .utf8) else {
+                    lastParseErrors.append("empty utf8 payload")
+                    lastDecodeFailures += 1
+                    return []
+                }
+                dtos = try JSONDecoder().decode([LLMProposalDTO].self, from: data)
+            }
             let createdAt = isoNow()
             var result: [REMProposal] = []
             guard Self.normalizedTargetDoc(target) == "GROWTH.md" else {

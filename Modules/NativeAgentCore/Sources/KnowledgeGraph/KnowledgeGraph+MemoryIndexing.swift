@@ -94,33 +94,30 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     /// (2026-09-06 — see `collectGarbage`).
     nonisolated let knownPeople: [String]
 
-    /// U5 W-C re-entry fix, layer 1: per-memory-id serialization. The actor is
-    /// re-entrant at every await, and the call site
-    /// (MemoryV2+SharedInstance.attachKnowledgeGraphHook) spawns an unordered
-    /// Task per mutation — so two indexMemory calls for the SAME id could
-    /// interleave across the old read-hash/write gap and double-count
-    /// mentions. Each id gets a task chain: a new call awaits the previous
-    /// call's completion before running. Lifecycle: `perIDPending` counts
-    /// in-flight calls per id; when it drains to 0 both dictionary entries are
-    /// removed (every add has a remove).
-    private var perIDTails: [String: Task<Void, Never>] = [:]
-    private var perIDPending: [String: Int] = [:]
     private var projectionGeneration = 0
     private var reconciledProjectionGeneration: Int?
+    private var projectionProducing: Bool?
 
     public func markProjectionDirty() {
         projectionGeneration += 1
     }
 
     public func reconcileProjectionIfNeeded(producing: Bool) async throws {
-        let generation = projectionGeneration
-        guard reconciledProjectionGeneration != generation else { return }
-        if producing {
-            _ = try await reconcileMemoryIndexFingerprints()
-        } else {
-            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: false)
+        if projectionProducing != producing {
+            projectionProducing = producing
+            projectionGeneration += 1
         }
-        reconciledProjectionGeneration = generation
+        while reconciledProjectionGeneration != projectionGeneration {
+            let generation = projectionGeneration
+            if projectionProducing == true {
+                _ = try await reconcileMemoryIndexFingerprints()
+            } else {
+                _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: false)
+            }
+            // A superseded startup rebuild can finish after retirement. Its
+            // completion must repair the current mode rather than certify it.
+            reconciledProjectionGeneration = projectionGeneration == generation ? generation : nil
+        }
     }
 
     /// The pool resolves lazily through KnowledgeGraphPoolCache to the owning
@@ -138,14 +135,16 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         self.explicitPrimaryUserName = primaryUserName
         self.primaryUserProfileURL = memorySQLitePath.deletingLastPathComponent()
             .appendingPathComponent("profile.json")
-        let resolved = Self.resolvePrimaryUserName(
-            explicit: primaryUserName,
-            profileURL: self.primaryUserProfileURL
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let profileNames = Self.profileNames(profileURL: self.primaryUserProfileURL)
+        let resolved = if let primaryUserName {
+            Self.resolvePrimaryUserName(explicit: primaryUserName, profileURL: self.primaryUserProfileURL)
+        } else {
+            profileNames.user ?? "the user"
+        }
         // The agent is a person in her own graph. Without her name here the
         // tagger filed "Agent" as a concept in one row and a person in the
         // next, and every rebuild kept both.
-        let agent = Self.resolveAgentName(profileURL: self.primaryUserProfileURL)
+        let agent = profileNames.agent
         var people: [String] = []
         if !resolved.isEmpty, resolved.lowercased() != "the user" { people.append(resolved) }
         if let agent, !people.contains(where: { $0.lowercased() == agent.lowercased() }) {
@@ -161,22 +160,6 @@ public actor SwiftNativeKnowledgeGraphIndexer {
 
     private static let builtInPeerAgents = ["Claude", "Codex"]
 
-    /// The configured agent name from the persona profile beside the store,
-    /// nil when the profile is missing or the name is unusable.
-    private static func resolveAgentName(profileURL: URL) -> String? {
-        guard let data = try? Data(contentsOf: profileURL),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let raw = object["name"] as? String else { return nil }
-        let trimmed = raw
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count <= 80,
-              !["assistant", "the assistant", "agent", "the agent"].contains(trimmed.lowercased()),
-              trimmed.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
-        else { return nil }
-        return trimmed
-    }
-
     /// Resolve the owning MemoryStorage's pool. The indexer never opens or
     /// creates memory.sqlite: a bare DatabasePool open here once minted a
     /// store with an EMPTY grdb_migrations ledger, and MemoryStorage's next
@@ -189,52 +172,12 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     }
 
     public func indexMemory(
-        _ fact: KnowledgeGraphMemoryFact, deleted: Bool = false, producing: Bool = true
+        _ id: String, deleted: Bool = false, producing: Bool = true
     ) async throws {
-        let memoryID = fact.id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !memoryID.isEmpty else { return }
-
-        // Enqueue onto this id's chain. The prologue (read tail, bump pending,
-        // publish new tail) has NO suspension points, so it is atomic with
-        // respect to the actor — concurrent callers serialize in arrival order.
-        let predecessor = perIDTails[memoryID]
-        perIDPending[memoryID, default: 0] += 1
-        let work = Task<Result<Void, any Error>, Never> { [predecessor] in
-            _ = await predecessor?.value
-            let result: Result<Void, any Error>
-            do {
-                try await self.performIndex(fact, memoryID: memoryID, deleted: deleted, producing: producing)
-                result = .success(())
-            } catch {
-                result = .failure(error)
-            }
-            self.finishChained(memoryID: memoryID)
-            return result
-        }
-        perIDTails[memoryID] = Task { _ = await work.value }
-        // `work` is non-throwing, so this await is not a cancellation point:
-        // the chain entry ALWAYS completes and cleans up, even if our caller
-        // is cancelled while waiting.
-        if case .failure(let error) = await work.value { throw error }
-    }
-
-    /// Chain bookkeeping — runs on the actor after each chained call finishes.
-    private func finishChained(memoryID: String) {
-        let remaining = (perIDPending[memoryID] ?? 1) - 1
-        if remaining <= 0 {
-            perIDPending.removeValue(forKey: memoryID)
-            perIDTails.removeValue(forKey: memoryID)
-        } else {
-            perIDPending[memoryID] = remaining
-        }
-    }
-
-    private func performIndex(
-        _ fact: KnowledgeGraphMemoryFact,
-        memoryID: String,
-        deleted: Bool,
-        producing: Bool
-    ) async throws {
+        let memoryID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        // MemoryStorage orders the hooks; reconciliation owns retirement when
+        // production is disabled, so subsequent mutations have nothing to do.
+        guard !memoryID.isEmpty, producing else { return }
         let dbPool = try await pool()
         let primaryUserName = resolvedPrimaryUserName()
         do {
@@ -243,21 +186,12 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                 // database MemoryV2 and KG share this exact transaction domain,
                 // so re-read the canonical row now. A delayed update task that
                 // arrives after a delete can no longer resurrect stale entities.
-                let hasMemoryTable = (try Int.fetchOne(db, sql: """
-                    SELECT COUNT(*) FROM sqlite_master
-                    WHERE type = 'table' AND name = 'memories'
-                    """) ?? 0) > 0
                 let canonicalFact: KnowledgeGraphMemoryFact?
-                if deleted || !producing {
-                    // 2026-09-06: the caller's `deleted` is authority in BOTH
-                    // branches. It used to be read only when there was no
-                    // memories table, so the production hook's "graph disabled
-                    // — retire this node" (MemoryV2+SharedInstance) reread the
-                    // live row and indexed it anyway: committing a memory with
-                    // the Knowledge graph switch off still minted nodes and
-                    // edges. Retire the node, never index.
+                if deleted {
+                    // A delete retires the node even if the canonical memory
+                    // row is still active.
                     canonicalFact = nil
-                } else if hasMemoryTable {
+                } else {
                     let columns = Set(try Row.fetchAll(
                         db, sql: "PRAGMA table_info(memories)"
                     ).compactMap { row -> String? in row["name"] })
@@ -270,20 +204,16 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     }
                     canonicalFact = try Row.fetchOne(
                         db,
-                        sql: "SELECT * FROM memories WHERE id = ?",
+                        sql: """
+                            SELECT id, content, source, status, created_at, updated_at,
+                                   lifecycle, metadata_json
+                            FROM memories WHERE id = ?
+                            """,
                         arguments: [memoryID]
                     ).flatMap { row -> KnowledgeGraphMemoryFact? in
                             let content: String = row["content"] ?? ""
                             let status: String = row["status"] ?? ""
-                            // v5 introduced lifecycle; supported older/minimal
-                            // stores mean confirmed when the column is absent.
-                            // If it is present, the canonical row remains the
-                            // authority and corrected/contradicted/deleted/graduated
-                            // facts stay excluded (MemoryLifecycle.recallExcluded,
-                            // which this module cannot import).
-                            let lifecycle: String = columns.contains("lifecycle")
-                                ? (row["lifecycle"] ?? "confirmed")
-                                : "confirmed"
+                            let lifecycle: String = row["lifecycle"] ?? "confirmed"
                             let recallExcludedLifecycle: Set<String> = [
                                 "corrected", "contradicted", "deleted", "graduated",
                             ]
@@ -294,54 +224,31 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                                   !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                                 return nil
                             }
-                            let metadata: JSONValue? = if columns.contains("metadata_json") {
-                                (row["metadata_json"] as String?).flatMap {
-                                    try? JSONValue.parse(Data($0.utf8))
-                                }
-                            } else {
-                                fact.metadata
+                            let metadata = (row["metadata_json"] as String?).flatMap {
+                                try? JSONValue.parse(Data($0.utf8))
                             }
                             return KnowledgeGraphMemoryFact(
                                 id: row["id"] ?? memoryID,
                                 content: content,
-                                source: columns.contains("source") ? row["source"] : fact.source,
+                                source: row["source"],
                                 status: status,
-                                createdAt: columns.contains("created_at")
-                                    ? (row["created_at"] ?? "") : fact.createdAt,
-                                updatedAt: columns.contains("updated_at")
-                                    ? (row["updated_at"] ?? "") : fact.updatedAt,
+                                createdAt: row["created_at"] ?? "",
+                                updatedAt: row["updated_at"] ?? "",
                                 metadata: metadata
                             )
                         }
-                } else if fact.status != "active"
-                            || fact.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    canonicalFact = nil
-                } else {
-                    canonicalFact = fact
                 }
 
                 guard let canonicalFact else {
-                    if hasMemoryTable {
-                        throw IndexingControl.requiresCanonicalRebuild(excludingMemoryID: memoryID)
-                    }
-                    try Self.deleteMemoryFactEntity(db, memoryID: memoryID)
-                    try db.execute(
-                        sql: "DELETE FROM kg_memory_index WHERE memory_id = ?",
-                        arguments: [memoryID]
-                    )
-                    return
+                    throw IndexingControl.requiresCanonicalRebuild(excludingMemoryID: memoryID)
                 }
 
                 let content = canonicalFact.content
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let contentHash = Self.factFingerprint(canonicalFact, content: content)
-                let now = Self.nowISO8601()
-                let extracted = Self.extractEntities(from: content, knownPeople: knownPeople)
-
-                // U5 W-C re-entry fix, layer 2: the hash check runs INSIDE the
-                // same write transaction as the upserts. A changed hash cannot
-                // be incrementally overlaid: that would retain entities/edges
-                // extracted from the old claim. Escape the transaction and run
+                // The hash check shares the upserts' write transaction. A
+                // changed hash cannot be incrementally overlaid: entities and
+                // edges from the old claim would survive. Escape the transaction and run
                 // an exact canonical rebuild instead.
                 let existingHash = try String.fetchOne(
                     db,
@@ -356,13 +263,13 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     memoryID: memoryID,
                     content: content,
                     contentHash: contentHash,
-                    now: now,
-                    extracted: extracted,
+                    now: Self.nowISO8601(),
+                    extracted: Self.extractEntities(from: content, knownPeople: knownPeople),
                     primaryUserName: primaryUserName
                 )
             }
         } catch IndexingControl.requiresCanonicalRebuild(let excludedMemoryID) {
-            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: producing, excludingMemoryID: excludedMemoryID)
+            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(excludingMemoryID: excludedMemoryID)
         }
     }
 
@@ -502,15 +409,6 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                 metadataJSON(metadata),
             ])
         return id
-    }
-
-    private static func deleteMemoryFactEntity(_ db: Database, memoryID: String) throws {
-        let id = memoryFactEntityID(for: memoryID)
-        try db.execute(
-            sql: "DELETE FROM kg_relationships WHERE from_id = ? OR to_id = ?",
-            arguments: [id, id]
-        )
-        try db.execute(sql: "DELETE FROM kg_entities WHERE id = ?", arguments: [id])
     }
 
     /// Stable graph identity for the source-backed node derived from one

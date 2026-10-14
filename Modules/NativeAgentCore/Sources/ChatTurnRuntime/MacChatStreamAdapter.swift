@@ -11,44 +11,6 @@ public enum MacChatStreamAdapter {
     // @unchecked Sendable wrapper safe.
     public final class MetaBox: @unchecked Sendable {
         public init() {}
-        private final class ProducerCompletion: @unchecked Sendable {
-            private let lock = NSLock()
-            private var resolved = false
-            private var waiters: [CheckedContinuation<Void, Never>] = []
-
-            func resolve() {
-                lock.lock()
-                guard !resolved else {
-                    lock.unlock()
-                    return
-                }
-                resolved = true
-                let pending = waiters
-                waiters.removeAll(keepingCapacity: false)
-                lock.unlock()
-                pending.forEach { $0.resume() }
-            }
-
-            func wait() async {
-                await withCheckedContinuation { continuation in
-                    lock.lock()
-                    guard !resolved else {
-                        lock.unlock()
-                        continuation.resume()
-                        return
-                    }
-                    waiters.append(continuation)
-                    lock.unlock()
-                }
-            }
-
-            var isResolved: Bool {
-                lock.lock()
-                defer { lock.unlock() }
-                return resolved
-            }
-        }
-
         public enum StreamTerminalEvidence: Sendable, Equatable {
             case finalResponse
             case explicitFailure(String)
@@ -63,7 +25,7 @@ public enum MacChatStreamAdapter {
         }
 
         private let lock = NSLock()
-        private let producerCompletion = ProducerCompletion()
+        private let producerCompletion = ChatStreamProducerControl()
         private var _final: (reply: String, sessionId: String?, workingCommentaryCharacters: Int?)?
         private var _terminalEvidence: StreamTerminalEvidence?
         /// The core's final result: its reply, the session the turn ran on,
@@ -116,7 +78,6 @@ public enum MacChatStreamAdapter {
         }
         public func recordProducerFinished() { producerCompletion.resolve() }
         public func waitForProducerTermination() async { await producerCompletion.wait() }
-        public var producerHasFinished: Bool { producerCompletion.isResolved }
     }
 
     // PATCH-2026-05-06: hotpath-4 streaming chat — yields delta strings via AsyncThrowingStream, done event carries metadata

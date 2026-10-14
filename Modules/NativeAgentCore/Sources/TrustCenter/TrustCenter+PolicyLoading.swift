@@ -241,7 +241,7 @@ extension SwiftNativeTrustCenter {
         return TrustPolicyAuthorizationSnapshot(
             // An empty policy file (setup writes `{}` before the person has
             // chosen anything) is a fresh install too.
-            policy: normalizedTrustPolicy(saved: saved, freshInstall: !sourcePresent || saved.isEmpty),
+            policy: normalizedTrustPolicy(saved: saved, defaults: defaults, freshInstall: !sourcePresent || saved.isEmpty),
             userConfiguredAutonomyOverrides: overrides,
             securityPolicyProvenance: Self.securityPolicyProvenance(
                 saved: saved,
@@ -359,9 +359,9 @@ extension SwiftNativeTrustCenter {
     ///   policy file exists on disk.
     func normalizedTrustPolicy(
         saved savedDict: [String: JSONValue],
+        defaults: [String: JSONValue],
         freshInstall: Bool = false
     ) -> [String: JSONValue] {
-        let defaults = defaultTrustPolicy()
         var merged = defaults
         // Wave 4 read-both (phase A): a saved policy written by a future build
         // may carry `workshopPolicy`. Fold it onto the WIRE key here, at the one
@@ -399,10 +399,8 @@ extension SwiftNativeTrustCenter {
             merged,
             defaultProviderPolicy: defaultProviderPolicy
         )
-        // Backfill Workshop executions.DEFAULT_TOOL_AUTONOMY into toolAutonomy. Saved
-        // values always win; missing default keys are added so new bootstraps
-        // pick up new defaults without resetting saved policies.
-        var toolAutonomy: [String: JSONValue] = Self.workshopExecutionsDefaultToolAutonomy
+        // Backfill Workshop-only keys beneath the main defaults and saved values.
+        var toolAutonomy = Self.workshopToolAutonomyAdditions
         if case .object(let saved)? = normalized["toolAutonomy"] {
             for (k, v) in saved { toolAutonomy[k] = v }
         }
@@ -412,7 +410,7 @@ extension SwiftNativeTrustCenter {
     }
 
     private func failClosedTrustPolicy() -> [String: JSONValue] {
-        var policy = normalizedTrustPolicy(saved: [:])
+        var policy = normalizedTrustPolicy(saved: [:], defaults: defaultTrustPolicy())
         policy["developerMode"] = .bool(false)
         policy["permissionLevel"] = .string("balanced")
         policy["autonomyDefault"] = .string("supervised")

@@ -1,41 +1,18 @@
 import Foundation
 import PersistenceCore
 
-public enum ProcedureReplayMode: String, Codable, Sendable, Equatable {
-    case historicalExact = "historical_exact"
-    case generatedFault = "generated_fault"
-}
-
 public enum ProcedureReplayStatus: String, Codable, Sendable, Equatable {
     case matched
     case fallback
     case abstained
 }
 
-public enum ProcedureReplayReason: String, Codable, Sendable, Equatable {
-    case exactMatch = "exact_match"
-    case novelInput = "novel_input"
-    case authorityDiverged = "authority_diverged"
-    case canonicalEvidenceMismatch = "canonical_evidence_mismatch"
-    case externalSendIneligible = "external_send_ineligible"
-}
-
 public struct ProcedureReplayResult: Sendable, Equatable {
-    public let mode: ProcedureReplayMode
     public let status: ProcedureReplayStatus
-    public let reason: ProcedureReplayReason
     public let matchedStepCount: Int
-    public let canonicalOracle: ProcedureCanonicalOracle
-    public let fallback: ProcedureFallbackRoute
-}
-
-public enum ProcedureInvocationMode: String, Codable, Sendable, Equatable {
-    case manual
-    case canary
 }
 
 public struct ProcedureDryRunContext: Sendable, Equatable {
-    public let invocationMode: ProcedureInvocationMode
     public let taskFamily: String
     public let inputClass: String
     public let parameterSchemaIdentity: String
@@ -49,7 +26,6 @@ public struct ProcedureDryRunContext: Sendable, Equatable {
     public let cancellationRequested: Bool
 
     public init(
-        invocationMode: ProcedureInvocationMode,
         taskFamily: String,
         inputClass: String,
         parameterSchemaIdentity: String,
@@ -62,7 +38,6 @@ public struct ProcedureDryRunContext: Sendable, Equatable {
         canonicalApprovalOwnerRechecked: Bool,
         cancellationRequested: Bool
     ) {
-        self.invocationMode = invocationMode
         self.taskFamily = taskFamily
         self.inputClass = inputClass
         self.parameterSchemaIdentity = parameterSchemaIdentity
@@ -103,42 +78,35 @@ public struct ProcedureDryRunResult: Sendable, Equatable {
     public let reason: ProcedureDryRunReason
     public let proposedRule: ProcedureTransitionRule?
     public let fallback: ProcedureFallbackRoute
-    public let dispatchedAction: Bool
 }
 
 public enum ProcedureReplayEngine {
     public static func replay(
         _ artifact: DeclarativeProcedureArtifact,
-        against trajectory: ProcedureTrajectory,
-        mode: ProcedureReplayMode
+        against trajectory: ProcedureTrajectory
     ) -> ProcedureReplayResult {
         func result(
             _ status: ProcedureReplayStatus,
-            _ reason: ProcedureReplayReason,
             matched: Int
         ) -> ProcedureReplayResult {
             ProcedureReplayResult(
-                mode: mode,
                 status: status,
-                reason: reason,
-                matchedStepCount: matched,
-                canonicalOracle: artifact.canonicalOracle,
-                fallback: artifact.deterministicFallback
+                matchedStepCount: matched
             )
         }
         guard artifact.inputContract.taskFamily == trajectory.taskFamily,
               artifact.inputContract.inputClass == trajectory.inputClass,
               artifact.inputContract.acceptedParameterSchemaIdentities.contains(
                 trajectory.parameterSchemaIdentity
-              ) else { return result(.abstained, .novelInput, matched: 0) }
+              ) else { return result(.abstained, matched: 0) }
         guard artifact.authorityClass == trajectory.authorityClass else {
-            return result(.fallback, .authorityDiverged, matched: 0)
+            return result(.fallback, matched: 0)
         }
         guard !trajectory.externalEffectClasses.contains("external_send") else {
-            return result(.abstained, .externalSendIneligible, matched: 0)
+            return result(.abstained, matched: 0)
         }
         guard artifact.transitionTable.count == trajectory.steps.count else {
-            return result(.fallback, .canonicalEvidenceMismatch, matched: 0)
+            return result(.fallback, matched: 0)
         }
         var matched = 0
         for (index, pair) in zip(artifact.transitionTable, trajectory.steps).enumerated() {
@@ -155,11 +123,11 @@ public enum ProcedureReplayEngine {
                   rule.afterState == step.afterState,
                   rule.verificationClass == step.verificationClass,
                   rule.terminalClass == step.terminalClass else {
-                return result(.fallback, .canonicalEvidenceMismatch, matched: matched)
+                return result(.fallback, matched: matched)
             }
             matched += 1
         }
-        return result(.matched, .exactMatch, matched: matched)
+        return result(.matched, matched: matched)
     }
 
     /// Pure current-state eligibility check. It returns a declarative rule and
@@ -177,17 +145,13 @@ public enum ProcedureReplayEngine {
                 status: status,
                 reason: reason,
                 proposedRule: rule,
-                fallback: artifact.deterministicFallback,
-                dispatchedAction: false
+                fallback: artifact.deterministicFallback
             )
         }
         if context.cancellationRequested {
             return result(.cancelled, .cancellationRequested)
         }
-        if context.invocationMode == .manual, !artifact.manualInvocationEligible {
-            return result(.abstained, .invocationNotEligible)
-        }
-        if context.invocationMode == .canary, !artifact.canaryEligible {
+        if !artifact.manualInvocationEligible {
             return result(.abstained, .invocationNotEligible)
         }
         guard context.taskFamily == artifact.inputContract.taskFamily,

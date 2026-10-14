@@ -187,12 +187,6 @@ final class InboxStore: ObservableObject {
         fetched.isEmpty && !snapshotLoaded && (!knownIDs.isEmpty || !items.isEmpty)
     }
 
-    #if DEBUG
-    func debugKnownIDs() -> Set<String> {
-        knownIDs
-    }
-    #endif
-
     // MARK: - Local notifications
 
     func requestNotificationAuthorization() {
@@ -285,7 +279,7 @@ struct InboxView: View {
     @EnvironmentObject private var pairingStore: PairingStore
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var store: InboxStore
-    @StateObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var groupFilter: InboxRelatedGroup?
     @State private var selectedDetailItem: InboxItemRecord?
     @State private var showsAllEarlier = false
@@ -363,7 +357,7 @@ struct InboxView: View {
             store.isVisible = true
             await store.refresh(client: bridgeClient, pairingStore: pairingStore)
         }
-        .onReceive(sync.$inboxItems) { _ in
+        .onChange(of: sync.inboxItems, initial: true) { _, _ in
             guard pairingStore.usesICloudTransport, store.isVisible else { return }
             store.applySyncedInboxFromSnapshot(animated: false, notifyNewArrivals: false)
         }

@@ -204,12 +204,7 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
             throw BackgroundPersonaContextError.emptyCompiledPrompt(surface: surface)
         }
         let organismPosture = await cognitionRuntime.organismBehaviorPosture()?
-            .privateRuntimeContext(
-                runId: "background",
-                sessionId: "background",
-                surface: surface,
-                fileAccess: "background"
-            )
+            .privateRuntimeContext()
         let boundary = """
         # Background Personality Context
         You are doing app-owned NativeAgent background work for the user. Keep the same identity, voice, care, and boundaries as normal chat. Preserve each background loop's specific instructions below; do not dispatch actions or mutate identity unless that loop explicitly stages a reviewable proposal.

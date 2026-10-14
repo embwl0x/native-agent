@@ -25,7 +25,8 @@ struct MacWorkOverviewDetail: View {
                 if let item = inboxItem {
                     InboxItemDetailSheet(item: item, onAction: { action in
                         await actionFlight.perform {
-                            try await InboxCardActions.perform(item.id, action: action, dataRootOverride: appModel.dataRootOverride)
+                            try await InboxCardActions.perform(item.id, action: action,
+                                dataRootOverride: appModel.dataRootOverride, effects: AppInboxCardActionEffects())
                         }
                     }, onOpenGroup: { group = $0 }, closesOnGroupSelection: false, onClose: onDone)
                 } else {

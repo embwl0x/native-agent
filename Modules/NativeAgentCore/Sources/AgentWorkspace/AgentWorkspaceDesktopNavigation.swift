@@ -88,7 +88,7 @@ extension AgentWorkspaceNavigation {
     /// Her newest conversation per contact, oldest first so the strip shows
     /// the most recent one nearest the front.
     private static func conversationWindows(dataRoot: URL) -> [AgentWorkspaceLocation] {
-        let rows = (try? AgentWorkspaceConversationReader(dataRoot: dataRoot).records()) ?? []
+        let rows = (try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)) ?? []
         var windows: [(at: Date, agent: String, location: AgentWorkspaceLocation)] = rows.filter { $0.phase != "sending" }.map { row in
             var input: [String: JSONValue] = ["agent": .string(row.agent)]
             if !row.agent.hasPrefix("bot:") { input["conversation"] = .string(row.label) }

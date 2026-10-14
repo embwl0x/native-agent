@@ -258,7 +258,7 @@ package enum AgentConversationSession {
             // The queued message this thread is reserved for goes now; any other
             // message waits behind the reply and every queued message before it.
             let reserved = reservation != nil && row.queueReservation == reservation
-            if !reserved, inFlight(row, peer?.transport, dataRoot: dataRoot),
+            if !reserved, inFlight(row, peer?.transport),
                let queued = try queue(behind: row, name: name, peer: peer, args: args, scope: scope,
                                       surface: surface, dataRoot: dataRoot, perform: perform) {
                 return queued
@@ -291,7 +291,8 @@ package enum AgentConversationSession {
         let replyRoute = ChatToolSessionContext.replyRoute.map { route in
             ["surface": route.surface, "destinationId": route.destinationId,
              "threadId": route.threadId, "sourceKey": route.sourceKey,
-             "replyTo": route.replyTo, "correlationId": route.correlationId].compactMapValues { $0 }
+             "replyTo": route.replyTo, "correlationId": route.correlationId,
+             "requesterUserId": route.requesterUserId].compactMapValues { $0 }
         }
         let row = try store.begin(scopeSessionID: scope, agent: agent, name: name, label: label, record: fresh ? nil : previous?.id,
                                   fresh: fresh, sourceSurface: surface, fingerprint: fingerprint, replyRoute: replyRoute,
@@ -516,15 +517,13 @@ package enum AgentConversationSession {
                   retained == nil || row.operationID == retained?.operationID else { outcome = "not_opened"; break }
             latest = row
             if watching == nil { watching = row.id; AgentConversationRunning.shared.watch(row.id) }
-            guard replyInFlight(row, transport, dataRoot: dataRoot) else {
+            guard replyInFlight(row, transport) else {
                 if outcome != "nothing_in_flight" { outcome = "settled" }
                 break
             }
             outcome = "still_waiting"
             if Date() >= deadline { break }
-            // A live hand-off answers in a chat of its own, which is no store write: look again shortly.
-            await AgentConversationRunning.shared.change(after: seen,
-                until: liveHandOff(row) ? min(deadline, Date().addingTimeInterval(15)) : deadline)
+            await AgentConversationRunning.shared.change(after: seen, until: deadline)
         }
         if Task.isCancelled { outcome = "cancelled" }
         // Out of time (or stopped): the saved snapshot, never another read
@@ -569,18 +568,17 @@ package enum AgentConversationSession {
 
     /// The thread is occupied: its reply is still coming, or a queued message
     /// is ahead (waiting or taken to go next). A new message queues behind.
-    static func inFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?, dataRoot: URL?) -> Bool {
-        replyInFlight(row, transport, dataRoot: dataRoot) || row.queueReservation != nil
+    static func inFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?) -> Bool {
+        replyInFlight(row, transport) || row.queueReservation != nil
             || row.queued?.contains(where: { $0.held == nil }) == true
     }
 
     /// The reply ahead is still coming. A "sending" row only counts while this
     /// process still owns that send.
-    static func replyInFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?, dataRoot: URL?) -> Bool {
+    static func replyInFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?) -> Bool {
         if row.phase == "sending" { return AgentConversationRunning.shared.live(row: row.id, operation: row.operationID) }
-        // A live hand-off settles on its answer turn having completed, an FYI on
-        // delivery; a release only lets go once no answer turn is mid-way (`settled`).
-        if liveHandOff(row), row.phase == "waiting" || stoppedOrReleased(row) { return !settled(row, dataRoot: dataRoot) }
+        // A live hand-off settles on its own reply, delivery of an FYI, or release.
+        if liveHandOff(row), row.phase == "waiting" || stoppedOrReleased(row) { return !settled(row) }
         if unsettledAttention(row) { return true }
         guard row.phase == "waiting" else { return false }
         // A desktop answer, or a background send, is watched by this process; none after a restart.
@@ -737,7 +735,7 @@ package enum AgentConversationSession {
         let transport = peer?.transport
         guard let queued = try store.enqueue(id: row.id, text: text,
                 byPerson: PersonInitiatedSend.current?.matches(args) == true,
-                stillInFlight: { inFlight($0, transport, dataRoot: dataRoot) }) else { return nil }
+                stillInFlight: { inFlight($0, transport) }) else { return nil }
         let (saved, item) = queued
         let carried = args.filter { ["session_id", "__session_id"].contains($0.key) }
         _ = AgentConversationRunning.shared.adopt(item.id)
@@ -829,7 +827,7 @@ package enum AgentConversationSession {
         // A reply still being handed to her as a turn goes first, too. Order
         // among queued messages is `takeQueued`'s (only the head, one at a time).
         let ready: (AgentConversationRecord) -> Bool = {
-            !replyInFlight($0, transport, dataRoot: dataRoot) && $0.deliveryState != "delivering"
+            !replyInFlight($0, transport) && $0.deliveryState != "delivering"
         }
         while !Task.isCancelled {
             let seen = AgentConversationRunning.shared.seen
@@ -860,12 +858,9 @@ package enum AgentConversationSession {
                 }
                 return
             }
-            // Every settle is a store write, which wakes this. The one piece of
-            // evidence that is not (a live hand-off's answer, which lands as a
-            // chat of its own) is looked for once a minute. No time settles anything.
+            // Exact reply settlement writes the store and wakes this waiter.
             let deadline = awaitingApproval(row) ? min(giveUp, Date().addingTimeInterval(15))
-                : liveHandOff(row) && replyInFlight(row, transport, dataRoot: dataRoot)
-                ? min(giveUp, Date().addingTimeInterval(60)) : giveUp
+                : giveUp
             await AgentConversationRunning.shared.change(after: seen, until: deadline)
         }
     }
@@ -882,7 +877,7 @@ package enum AgentConversationSession {
         let latest = (try? store.records().first { $0.id == row.id }) ?? row
         // A send no process owns any more (a restart mid-send) still counts, so it can be released.
         let orphan = latest.phase == "sending" && ownerless(latest)
-        let flying = orphan || replyInFlight(latest, peer?.transport, dataRoot: dataRoot)
+        let flying = orphan || replyInFlight(latest, peer?.transport)
         // Admission first: the lane owner's stop runs through agent_cancel's own
         // gate, and nothing here (queue, stop state) changes unless it clears.
         // With nothing in flight it carries no lane target, so it stops nothing.
@@ -1003,8 +998,7 @@ package enum AgentConversationSession {
         let talk = (asks + replies).sorted { ($0.0 ?? .distantPast) < ($1.0 ?? .distantPast) }.suffix(8)
         guard case .object(var fields) = result, !talk.isEmpty else { return result }
         if !replies.isEmpty {
-            // Its words are remote data: consumed now, unless its owner is trusted.
-            if peer?.elevationAllowed != true { PeerDataTaint.markConsumed(peer: agent) }
+            PeerDataTaint.markConsumed(peer: peer.map { "peer:" + $0.id } ?? agent)
             // The current ask's own state comes from its request id (refreshed
             // above). A late answer to a superseded ask shows here but never
             // reads as the answer to the one still waiting.
@@ -1235,11 +1229,12 @@ package enum AgentConversationSession {
             // Evidence only (walk 2, 09-25): a contact's "answered" that carries no
             // reply field, not even an empty one, is a status, never an answer.
             row.phase = "attention"
+        } else if row.agent == "claude", state == "delivered", row.awaitsReply, reply(value) == nil {
+            row.phase = "waiting"
         } else if value["needs_input"] == .bool(true) || value["completed"] == .bool(true)
                     || value["terminal"] == .bool(true) || ["replied", "completed", "succeeded", "done", "answered", "sent", "delivered"].contains(state)
                     || (state == "delivered_live" && reply(value) != nil) {
             // A live hand-off whose answer came back (a bridge reply naming it) is answered.
-            // delivered: in Claude's inbox; she answers in a chat of her own.
             row.phase = "ready"
         } else if ["enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending", "delivered_live", "delivery_unknown"].contains(state) {
             // delivered_live: in the agent's live session; its answer is a chat of its own (`settled`).
@@ -1264,7 +1259,7 @@ package enum AgentConversationSession {
         let receipt = row.receipt ?? .object(["status": .string("unknown")])
         guard case .object = receipt else { return receipt }
         let peer = row.agent.hasPrefix("peer:") ? (try? AgentPeerStore(dataRoot: dataRoot).list())?.first { "peer:" + $0.id == row.agent } : nil
-        var result = details ? receipt : conversationPresentation(row, transport: peer?.transport, dataRoot: dataRoot)
+        var result = details ? receipt : conversationPresentation(row, transport: peer?.transport)
         if !details, includeHistory, returnsHistory {
             result = AgentConversationHistoryView.adding(to: result, row: row,
                 before: historyBefore, exchange: historyExchange, dataRoot: dataRoot)
@@ -1306,35 +1301,23 @@ package enum AgentConversationSession {
         return job
     }
 
-    /// Handed straight into the agent's live session (Claude): no reply comes
-    /// back on the job; the agent answers in a bridge chat of its own.
+    /// Handed straight into the agent's live session (Claude).
     package static func liveHandOff(_ row: AgentConversationRecord) -> Bool {
         guard let job = builtInJob(row) else { return false }
         return (job["run_status"] ?? job["status"]) == .string("delivered_live")
     }
 
-    /// A live hand-off is settled only on evidence, never elapsed time (Sol,
-    /// 09-25: a resend before its answer duplicates work): the agent has written
-    /// in a chat since. An FYI is settled on delivery: nothing is owed, so a next
-    /// message is no resend. An explicit cancel of the thread settles it here too.
-    static func settled(_ row: AgentConversationRecord, dataRoot: URL?) -> Bool {
-        let released = stoppedOrReleased(row)
-        if !row.awaitsReply && !released { return true }
-        let handed = row.operationStartedAt ?? row.updatedAt
-        guard let dataRoot else { return false }
-        let answers = HerScreen.bridgeChats(dataRoot: dataRoot).filter { $0.who == row.agent && ($0.heard ?? .distantPast) > handed }
-        // An answer counts once her turn on it has completed (her reply is that
-        // chat's last word), not while it is still being written.
-        guard answers.allSatisfy({ $0.answered == true }) else { return false }
-        return released || !answers.isEmpty
+    /// Only this exchange's settlement can release an owed reply.
+    static func settled(_ row: AgentConversationRecord) -> Bool {
+        stoppedOrReleased(row) || !row.awaitsReply || row.phase == "ready"
     }
 
-    package static func conversationPresentation(_ row: AgentConversationRecord, transport: AgentPeerTransport? = nil, dataRoot: URL? = nil) -> JSONValue {
+    package static func conversationPresentation(_ row: AgentConversationRecord, transport: AgentPeerTransport? = nil) -> JSONValue {
         let receipt = row.receipt ?? .object(["status": .string("unknown")])
         guard case .object(let root) = receipt else { return receipt }
         var value = root
         if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
-        let handOff = liveHandOff(row), handOffSettled = handOff && settled(row, dataRoot: dataRoot)
+        let handOff = liveHandOff(row), handOffSettled = handOff && settled(row)
         let status = GrokBotRoute.normalizedStatus(string(value["run_status"]) ?? string(value["status"]) ?? row.phase)
         // The session behind this name is gone (OMP's "Main", walk 09-25).
         let deadThread = (string(value["reason"]) ?? string(value["execution_error"])) == "continuation_unavailable"

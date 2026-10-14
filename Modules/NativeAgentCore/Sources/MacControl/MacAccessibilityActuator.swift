@@ -22,16 +22,7 @@ import Carbon.HIToolbox
 
 // 2026-09-06: screen reads restore the observed scrollbar value, never the
 // requested wheel distance (an end probe can move zero or a clipped distance).
-protocol MacDocumentScrollRestoring: Sendable {
-    func restore() -> Bool
-    var isRestored: Bool { get }
-}
-
-protocol MacDocumentScrollRestorationSource: Sendable {
-    func captureScrollRestoration(container: MacAXElementRef) -> (any MacDocumentScrollRestoring)?
-}
-
-final class MacDocumentScrollRestoration: MacDocumentScrollRestoring, @unchecked Sendable {
+final class MacDocumentScrollRestoration: @unchecked Sendable {
     #if canImport(ApplicationServices) && os(macOS)
     private let owner: AXUIElement
     private let scrollbar: AXUIElement
@@ -44,10 +35,7 @@ final class MacDocumentScrollRestoration: MacDocumentScrollRestoring, @unchecked
     }
     #endif
 
-    static func capture(source: any MacAXElementSource, container: MacAXElementRef) -> (any MacDocumentScrollRestoring)? {
-        if let source = source as? any MacDocumentScrollRestorationSource {
-            return source.captureScrollRestoration(container: container)
-        }
+    static func capture(source: any MacAXElementSource, container: MacAXElementRef) -> MacDocumentScrollRestoration? {
         #if canImport(ApplicationServices) && os(macOS)
         guard let source = source as? SystemMacAXElementSource else { return nil }
         var candidate = source.element(container)
@@ -1266,7 +1254,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         return windows.enumerated().map { index, window in
             MacAXWindowRef(
                 handle: mint(window),
-                identity: MacAXWindowIdentityRead.copy(window, pid: pid, index: index)
+                identity: MacAXAttributeRead.copyWindowIdentity(window, pid: pid, index: index)
             )
         }
         #else
@@ -1301,7 +1289,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         let index = windows.firstIndex(where: { CFEqual($0, focused) }) ?? 0
         return MacAXWindowRef(
             handle: mint(focused),
-            identity: MacAXWindowIdentityRead.copy(focused, pid: pid, index: index)
+            identity: MacAXAttributeRead.copyWindowIdentity(focused, pid: pid, index: index)
         )
         #else
         return nil
@@ -1471,17 +1459,15 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             setRaiseDiagnostic(automationDeniedNote(app, bundleID: bundleID))
             return
         }
-        // Escaped defensively even though a bundle id cannot legally contain a
-        // quote or a backslash: this string is compiled as source.
-        let escaped = bundleID
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        guard let script = NSAppleScript(source: "tell application id \"\(escaped)\" to activate") else { return }
-        var error: NSDictionary?
+        let event = NSAppleEventDescriptor.appleEvent(withEventClass: kAEMiscStandards, eventID: kAEActivate,
+            targetDescriptor: NSAppleEventDescriptor(processIdentifier: app.processIdentifier),
+            returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
         guard MacDriverContext.binding?.allowsEmission == true else { return }
-        script.executeAndReturnError(&error)
-        guard let error else { return }
-        let code = (error[NSAppleScript.errorNumber] as? Int) ?? 0
+        let code: Int
+        do {
+            let reply = try event.sendEvent(options: [.waitForReply, .canInteract], timeout: 5)
+            code = Int(reply.paramDescriptor(forKeyword: keyErrorNumber)?.int32Value ?? 0)
+        } catch { code = (error as NSError).code }
         if code == Int(errAEEventNotPermitted) {
             setRaiseDiagnostic(automationDeniedNote(app, bundleID: bundleID))
         } else if code != 0 {
@@ -1952,22 +1938,6 @@ public enum MacEventPlanner {
         return events
     }
 
-    /// Drag: move to origin → press → dragged to destination → release.
-    public static func drag(
-        fromX: Double,
-        fromY: Double,
-        toX: Double,
-        toY: Double,
-        button: MacMouseButton
-    ) -> [MacMouseEvent] {
-        [
-            MacMouseEvent(phase: .move, button: button, x: fromX, y: fromY),
-            MacMouseEvent(phase: .down, button: button, x: fromX, y: fromY),
-            MacMouseEvent(phase: .drag, button: button, x: toX, y: toY),
-            MacMouseEvent(phase: .up, button: button, x: toX, y: toY),
-        ]
-    }
-
     /// Smooth deterministic drag path. The model chooses only endpoints and an
     /// optional duration; interpolation stays local so no frame-by-frame model
     /// calls or coordinate chatter are needed. `steps` is bounded by the caller.
@@ -2330,22 +2300,14 @@ public struct MacInjectionCapability: Sendable, Equatable {
 public actor MacInjectionCapabilityLedger {
     public static let shared = MacInjectionCapabilityLedger()
 
-    private var consumed: Set<String> = []
     private var consumedAt: [String: Date] = [:]
 
     /// Consume `nonce`. Returns false if it was already spent.
     public func consume(nonce: String, now: Date = Date()) -> Bool {
         prune(now: now)
-        guard !consumed.contains(nonce) else { return false }
-        consumed.insert(nonce)
+        guard consumedAt[nonce] == nil else { return false }
         consumedAt[nonce] = now
         return true
-    }
-
-    /// Test seam: forget everything (hermetic tests must not inherit nonces).
-    public func reset() {
-        consumed.removeAll()
-        consumedAt.removeAll()
     }
 
     /// Entries older than an hour cannot authorize anything anyway (the TTL is
@@ -2353,7 +2315,6 @@ public actor MacInjectionCapabilityLedger {
     private func prune(now: Date) {
         guard consumedAt.count > 256 else { return }
         for (nonce, stamp) in consumedAt where now.timeIntervalSince(stamp) > 3600 {
-            consumed.remove(nonce)
             consumedAt.removeValue(forKey: nonce)
         }
     }
@@ -2437,8 +2398,6 @@ public actor MacInjectionSecretVault {
         guard now.timeIntervalSince(entry.storedAt) <= Self.ttlSeconds else { return nil }
         return entry.secrets
     }
-
-    public func reset() { entries.removeAll() }
 
     private func prune(now: Date) {
         entries = entries.filter { now.timeIntervalSince($0.value.storedAt) <= Self.ttlSeconds }

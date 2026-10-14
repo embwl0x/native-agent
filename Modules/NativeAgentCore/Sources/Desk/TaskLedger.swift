@@ -19,7 +19,7 @@ import PersistenceCore
 //
 // STORE (matches the build plan, Claude 2026-06-11):
 //   • <dataRoot>/orchestration/task_ledger.jsonl — append-only EVENTS feed.
-//   • <dataRoot>/orchestration/task_ledger_state.json — derived COMPACTED view.
+//   • <dataRoot>/orchestration/task_ledger_base.json — compaction snapshot.
 //   Both under the events-feed flock discipline (withFileLock + the shared
 //   `<path>.lock` sidecar). Bound: snapshot+tail compaction (B4) at newest-5000
 //   with a threshold/4 keep-tail (audit 2026-07-21 hysteresis).
@@ -328,8 +328,8 @@ public struct TaskLedgerTaskDeleted: Error, LocalizedError, Sendable {
 // MARK: - Reader / writer
 
 /// Append-under-flock task-ledger store. Stateless — all state lives on disk.
-/// The events feed and the derived state file share the events feed's flock,
-/// so a state recompaction can never race an append.
+/// The events feed and compaction base share the events feed's flock,
+/// so replay and compaction can never race an append.
 public struct SwiftNativeTaskLedger: Sendable {
     public static let logLabel = "TaskLedger"
     /// The feed never exceeds this many lines: crossing it triggers the
@@ -349,8 +349,7 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// Terminal tasks (`done`/`cancelled`) whose last update is older than
     /// this are evicted from the compaction base at fold time (audit
     /// 2026-07-21, mirrors DeskStore's live-handle pruning). Without eviction
-    /// the base — and the derived task_ledger_state.json — kept every taskId
-    /// ever written.
+    /// the base kept every taskId ever written.
     static let terminalTaskRetention: TimeInterval = 30 * 24 * 60 * 60
     /// Per-task cap on the derived `refs` union. Without it a long-lived task
     /// that attaches a ref per event grows the derived state — and the
@@ -359,27 +358,9 @@ public struct SwiftNativeTaskLedger: Sendable {
 
     public let dataRoot: URL
     public let persistence: SwiftNativePersistenceCore
-    /// Injectable trim knobs so tests can drive compaction without writing 5000
-    /// events. `compactionThreshold` defaults to `opsCompactionThreshold` and
-    /// `keepTail` to `compactionKeepTail` (threshold/4 hysteresis).
-    let compactionThreshold: Int
-    let keepTail: Int
-
     public init(dataRoot: URL, persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()) {
         self.dataRoot = dataRoot
         self.persistence = persistence
-        self.compactionThreshold = Self.opsCompactionThreshold
-        self.keepTail = Self.compactionKeepTail
-    }
-
-    /// Test-only initializer that scales the compaction trim down so a handful
-    /// of events exercise the snapshot+tail path. `keepTail` is clamped to at
-    /// least 1 (an empty tail would lose the newest event).
-    init(dataRoot: URL, persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(), compactionThreshold: Int, keepTail: Int) {
-        self.dataRoot = dataRoot
-        self.persistence = persistence
-        self.compactionThreshold = max(2, compactionThreshold)
-        self.keepTail = max(1, keepTail)
     }
 
     /// `<dataRoot>/orchestration/task_ledger.jsonl`.
@@ -387,13 +368,6 @@ public struct SwiftNativeTaskLedger: Sendable {
         dataRoot
             .appendingPathComponent("orchestration", isDirectory: true)
             .appendingPathComponent("task_ledger.jsonl")
-    }
-
-    /// `<dataRoot>/orchestration/task_ledger_state.json`.
-    public var statePath: URL {
-        dataRoot
-            .appendingPathComponent("orchestration", isDirectory: true)
-            .appendingPathComponent("task_ledger_state.json")
     }
 
     /// `<dataRoot>/orchestration/task_ledger_base.json` — the compaction snapshot
@@ -405,13 +379,12 @@ public struct SwiftNativeTaskLedger: Sendable {
             .appendingPathComponent("task_ledger_base.json")
     }
 
-    /// Append one event under the events-feed flock, cap to newest-5000, then
-    /// recompact the derived state file IN THE SAME LOCK (so the state view
-    /// never lags a committed append and a concurrent recompaction can't race).
+    /// Append one event and compact if needed under the events-feed flock.
     @discardableResult
     public func append(_ event: TaskLedgerEvent) async throws -> TaskLedgerEvent {
         try await persistence.withFileLock(eventsPath) {
-            try await appendAndRecompactUnlocked(event)
+            let feed = try await readFeedUnlocked().feed
+            try await appendAndRecompactUnlocked(event, feed: feed)
         }
         return event
     }
@@ -422,13 +395,13 @@ public struct SwiftNativeTaskLedger: Sendable {
     public func delete(_ event: TaskLedgerEvent, expectedTitle: String) async throws -> Bool {
         guard event.kind == .deleted else { return false }
         return try await persistence.withFileLock(eventsPath) {
-            let feed = try await readFeedUnlocked()
+            let feed = try await readFeedUnlocked().feed
             guard let current = Self.compact(base: feed.base, feed.events).first(where: { $0.taskId == event.taskId }) else { return false }
             guard current.status != .deleted else {
                 throw TaskLedgerTaskDeleted(taskId: event.taskId)
             }
             guard current.title == expectedTitle else { return false }
-            try await appendAndRecompactUnlocked(event)
+            try await appendAndRecompactUnlocked(event, feed: feed)
             return true
         }
     }
@@ -441,10 +414,10 @@ public struct SwiftNativeTaskLedger: Sendable {
             throw TaskLedgerInvalidClaimEvent(kind: event.kind)
         }
         try await persistence.withFileLock(eventsPath) {
+            let feed = try await readFeedUnlocked().feed
             if !force {
                 // Fold base + tail so a claim CAS still sees an owner whose
                 // founding events were compacted into the base.
-                let feed = try await readFeedUnlocked()
                 let current = Self.compact(base: feed.base, feed.events)
                 if let task = current.first(where: { $0.taskId == event.taskId }),
                    let owner = task.owner,
@@ -457,15 +430,14 @@ public struct SwiftNativeTaskLedger: Sendable {
                     )
                 }
             }
-            try await appendAndRecompactUnlocked(event)
+            try await appendAndRecompactUnlocked(event, feed: feed)
         }
         return event
     }
 
-    private func appendAndRecompactUnlocked(_ event: TaskLedgerEvent) async throws {
+    private func appendAndRecompactUnlocked(_ event: TaskLedgerEvent, feed: TaskLedgerFeed) async throws {
         // The caller holds the flock: deletion cannot race this refusal.
-        let existing = try await readFeedUnlocked()
-        if Self.compact(base: existing.base, existing.events).contains(where: {
+        if Self.compact(base: feed.base, feed.events).contains(where: {
             $0.taskId == event.taskId && $0.status == .deleted
         }) {
             throw TaskLedgerTaskDeleted(taskId: event.taskId)
@@ -474,23 +446,37 @@ public struct SwiftNativeTaskLedger: Sendable {
         // newest-N line cap, which dropped a quiet task's founding events
         // outright. The caller already holds the flock.
         try await persistence.appendJSONLDurable(event.toJSON(), to: eventsPath)
-        // Recompact derived state from base + tail (folds compacted tasks too).
-        let feed = try await readFeedUnlocked()
-        let state = Self.compact(base: feed.base, feed.events)
-        try await persistence.writeJSON(Self.stateJSON(state), to: statePath)
+        var next = feed
+        // Match the wire form's omitted empty optional fields.
+        var committed = event
+        if committed.title?.isEmpty == true { committed.title = nil }
+        if committed.note?.isEmpty == true { committed.note = nil }
+        if committed.id == feed.base?.lastCompactedOpId {
+            next.events.removeAll()
+        } else {
+            next.events.append(committed)
+        }
+        next.fileEventCount += 1
+        next.integrity = next.integrity.appendingRows(1)
+        // The durable append terminates a torn last line before its new row,
+        // making the old fragment malformed rather than a tolerated tail.
+        if next.integrity.trailingPartialLine {
+            next.integrity.malformedLineCount += 1
+            next.integrity.trailingPartialLine = false
+        }
         // End-of-transaction snapshot+truncate once the feed file crosses the
         // threshold: fold the pre-tail prefix into the base, keep the newest tail.
-        try await compactIfNeededUnlocked(feed: feed)
+        try await compactIfNeededUnlocked(feed: next)
     }
 
     /// Snapshot the pre-tail prefix into the base and truncate the feed to the
-    /// newest `keepTail` events, once the raw file crosses `compactionThreshold`.
+    /// newest `compactionKeepTail` events, once the raw file crosses `opsCompactionThreshold`.
     /// The base is written atomically BEFORE the feed rewrite; the replay
     /// prefix-drop makes the in-between crash window safe (never lost, never
     /// double-applied). The caller holds the events flock.
     private func compactIfNeededUnlocked(feed: TaskLedgerFeed) async throws {
         // PHYSICAL rows, not decoded events — see `TaskLedgerFeed.compactionRowCount`.
-        guard feed.compactionRowCount >= compactionThreshold else { return }
+        guard feed.compactionRowCount >= Self.opsCompactionThreshold else { return }
         // THE UNKNOWN-ROW GATE (audit 2026-08-02, finding 1) — identical policy
         // to DeskStore, enforced from the same place. A newer writer's event
         // kind read by a stale `task-ledger` binary would otherwise be folded
@@ -498,9 +484,9 @@ public struct SwiftNativeTaskLedger: Sendable {
         guard SnapshotTailOpLog.mayCompact(feed.integrity, feed: Self.logLabel, path: eventsPath) else { return }
         // `feed.events` is already base+tail (prefix-dropped). Fold everything
         // EXCEPT the kept tail into the (existing) base.
-        guard feed.events.count > keepTail else { return }
-        let prefix = Array(feed.events.dropLast(keepTail))
-        let tail = Array(feed.events.suffix(keepTail))
+        guard feed.events.count > Self.compactionKeepTail else { return }
+        let prefix = Array(feed.events.dropLast(Self.compactionKeepTail))
+        let tail = Array(feed.events.suffix(Self.compactionKeepTail))
         guard let lastPrefix = prefix.last else { return }
         // "Now" for the retention fold is the FEED'S OWN newest stamp, never
         // wall-clock (mirrors GitHubCommandStore's terminal retirement, which
@@ -542,7 +528,7 @@ public struct SwiftNativeTaskLedger: Sendable {
     }
 
     /// Read all events in the FILE (no lock, no base). Post-compaction this is
-    /// only the tail (the newest `keepTail`, plus a stale prefix in the crash
+    /// only the tail (the newest `compactionKeepTail`, plus a stale prefix in the crash
     /// window) — identical to the window the old newest-N cap left behind, so
     /// callers reading raw events see the same recent slice they always did.
     /// Use `readFeedUnlocked` / `listTasks` for the base-folded authoritative view.
@@ -584,7 +570,7 @@ public struct SwiftNativeTaskLedger: Sendable {
             path: eventsPath,
             physicalRowCount: integrity.physicalRowCount,
             byteCount: SnapshotTailOpLog.OpLogHealth.fileSize(eventsPath),
-            compactionThreshold: compactionThreshold,
+            compactionThreshold: Self.opsCompactionThreshold,
             integrity: integrity
         )
     }
@@ -596,8 +582,12 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// a crash between base write and feed truncate. A base file that EXISTS but
     /// does not decode throws (folding the tail alone would blank compacted
     /// tasks). No base file → genesis: the whole feed folds from empty.
-    func readFeedUnlocked() async throws -> TaskLedgerFeed {
+    func readFeedUnlocked() async throws -> (feed: TaskLedgerFeed, rawEvents: [TaskLedgerEvent]) {
         let (events, integrity) = try await readEventsWithIntegrityUnlocked()
+        return (try readFeedUnlocked(events: events, integrity: integrity), events)
+    }
+
+    private func readFeedUnlocked(events: [TaskLedgerEvent], integrity: SnapshotTailOpLog.OpLogIntegrity) throws -> TaskLedgerFeed {
         let fileEventCount = events.count
         guard FileManager.default.fileExists(atPath: basePath.path) else {
             return TaskLedgerFeed(base: nil, events: events, fileEventCount: fileEventCount, integrity: integrity)
@@ -623,9 +613,19 @@ public struct SwiftNativeTaskLedger: Sendable {
         return TaskLedgerFeed(base: base, events: tail, fileEventCount: fileEventCount, integrity: integrity)
     }
 
+    public func taskWithEvents(taskID: String) async throws -> (task: TaskLedgerTaskState, events: [TaskLedgerEvent])? {
+        let snapshot = try await persistence.withFileLock(eventsPath) {
+            try await readFeedUnlocked()
+        }
+        let feed = snapshot.feed
+        guard let task = Self.compact(base: feed.base, feed.events).first(where: {
+            $0.taskId == taskID && $0.status != .deleted
+        }) else { return nil }
+        return (task, snapshot.rawEvents.filter { $0.taskId == taskID })
+    }
+
     /// List the derived compacted task states, newest-updated first. Reads the
-    /// events feed directly (always current) rather than the cached state file,
-    /// so a list right after a CLI append reflects it without a recompaction.
+    /// canonical base + events feed, so a list right after a CLI append reflects it.
     ///
     /// UNDER THE EVENTS FLOCK (2026-08-01). `readFeedUnlocked` reads events
     /// FIRST and the base SECOND, and unlike GitHubCommandStore the ledger's
@@ -644,7 +644,7 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// `readFeedUnlocked` directly: they already hold this lock.
     public func listTasks(includeTerminal: Bool = true) async throws -> [TaskLedgerTaskState] {
         let feed = try await persistence.withFileLock(eventsPath) {
-            try await readFeedUnlocked()
+            try await readFeedUnlocked().feed
         }
         var states = Self.compact(base: feed.base, feed.events)
         states = states.filter { $0.status != .deleted }
@@ -652,6 +652,17 @@ public struct SwiftNativeTaskLedger: Sendable {
             states = states.filter { $0.status != .done && $0.status != .cancelled }
         }
         return states.sorted { $0.updatedTs > $1.updatedTs }
+    }
+
+    /// Folded state and raw retained events share one locked read; a stale
+    /// pre-compaction prefix remains evidence, never replayed twice into state.
+    public func taskDetail(id: String) async throws -> (state: TaskLedgerTaskState?, events: [TaskLedgerEvent]) {
+        try await persistence.withFileLock(eventsPath) {
+            let (events, integrity) = try await readEventsWithIntegrityUnlocked()
+            let feed = try readFeedUnlocked(events: events, integrity: integrity)
+            return (Self.compact(base: feed.base, feed.events).first { $0.taskId == id && $0.status != .deleted },
+                    events.filter { $0.taskId == id })
+        }
     }
 
     /// Tasks with an active CLAIM older than `staleAfter` and no update since.
@@ -706,8 +717,8 @@ public struct SwiftNativeTaskLedger: Sendable {
                 for r in e.refs where !s.refs.contains(r) { s.refs.append(r) }
                 // Bound the union: refs were the one unbounded field in the
                 // derived state — a long-lived task accumulating a ref per
-                // event grew task_ledger_state.json AND the compaction base
-                // forever. Newest-wins (suffix), matching every other tail cap
+                // event grew the compaction base forever. Newest-wins
+                // (suffix), matching every other tail cap
                 // in the store.
                 if s.refs.count > Self.maxRefsPerTask { s.refs = Array(s.refs.suffix(Self.maxRefsPerTask)) }
                 byTask[e.taskId] = s
@@ -726,14 +737,5 @@ public struct SwiftNativeTaskLedger: Sendable {
             }
         }
         return order.compactMap { byTask[$0] }
-    }
-
-    /// Wrap the compacted states in the on-disk state-file envelope.
-    static func stateJSON(_ states: [TaskLedgerTaskState]) -> JSONValue {
-        .object([
-            "version": .int(1),
-            "generatedTs": .string(TaskLedgerClock.nowISO()),
-            "tasks": .array(states.map { $0.toJSON() }),
-        ])
     }
 }

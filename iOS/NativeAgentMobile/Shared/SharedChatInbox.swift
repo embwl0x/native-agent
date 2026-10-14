@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentShared
 
-struct SharedChatItem: Codable, Identifiable {
+struct SharedChatItem: Codable, Identifiable, Sendable {
     let id: UUID
     let createdAt: Date
     let text: String
@@ -29,6 +29,25 @@ enum SharedChatInbox {
     static func pendingFiles() throws -> [URL] {
         try FileManager.default.contentsOfDirectory(at: directory(), includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    static func readPendingItems() throws -> (items: [(URL, SharedChatItem)], errors: [String]) {
+        var items: [(URL, SharedChatItem)] = []
+        var errors: [String] = []
+        for url in try pendingFiles() {
+            do { items.append((url, try JSONDecoder().decode(SharedChatItem.self, from: Data(contentsOf: url)))) }
+            catch {
+                do {
+                    let directory = url.deletingLastPathComponent().appendingPathComponent("Unreadable", isDirectory: true)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    try FileManager.default.moveItem(at: url, to: directory.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
+                    errors.append("A shared item could not be read. Its original file was kept in ChatShareInbox/Unreadable: \(url.lastPathComponent)")
+                } catch {
+                    errors.append("A shared item could not be moved aside and is still waiting: \(url.lastPathComponent) — \(error.localizedDescription)")
+                }
+            }
+        }
+        return (items.sorted { $0.1.createdAt < $1.1.createdAt }, errors)
     }
 
     static func save(_ item: SharedChatItem) throws {

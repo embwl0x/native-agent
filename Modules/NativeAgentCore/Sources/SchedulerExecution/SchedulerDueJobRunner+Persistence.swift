@@ -8,93 +8,19 @@ import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DeviceSync
+import AppToolRuntime
+import Synchronization
 
 extension SchedulerDueJobRunner {
     func update(job: DueJob, result: JobResult, at runDate: Date) async throws {
         // FIX 2 (A4.4): a park (retry cap reached) must leave a user-visible
         // receipt. The park decision is made under the jobs lock; the receipt
         // is emitted afterward so the two file locks never nest.
-        let parkedAttempts: Int? = try await persistence.withFileLock(jobsPath) { () async throws -> Int? in
-            var rows = try Self.readJobRowsChecked(at: jobsPath)
-            var parkedAttempts: Int?
-            var found = false
-            for idx in rows.indices {
-                guard case .object(var obj) = rows[idx],
-                      (SchedulerJobRuntime.string(obj["id"]) ?? "") == job.id else {
-                    continue
-                }
-                guard case .object(let active)? = obj["activeOccurrence"],
-                      SchedulerJobRuntime.string(active["key"]) == job.occurrenceKey else {
-                    throw NSError(domain: "NativeAgentScheduler", code: -409, userInfo: [
-                        NSLocalizedDescriptionKey: "occurrence claim changed before settlement: \(job.occurrenceKey)"
-                    ])
-                }
-                found = true
-                obj["lastRunAt"] = .string(Self.iso(runDate))
-                obj["lastRunStatus"] = .string(result.status)
-                obj["lastRunDetail"] = .string(String(result.detail.prefix(1000)))
-                if result.status == "error" {
-                    obj["lastRunError"] = .string(String(result.detail.prefix(1000)))
-                } else {
-                    obj.removeValue(forKey: "lastRunError")
-                }
-
-                let oneShot = SchedulerJobRuntime.bool(obj["oneShot"], default: false)
-                if oneShot {
-                    obj["enabled"] = .bool(false)
-                    obj["completedAt"] = .string(Self.iso(runDate))
-                    Self.clearRetryState(&obj)
-                } else if let retryFloor = Self.retryEpoch(from: result.output, runDate: runDate) {
-                    // FIX 2 (A4.4): per-job retry count + exponential backoff +
-                    // a daily attempt cap. The retry stamp IS the backoff
-                    // carrier and composes with FIX 1 (catch-up honors
-                    // retryPendingUntilEpoch as a floor).
-                    let todayKey = NativeAgentDreamCycleSchedule.runDateKey(runDate)
-                    let sameDay = SchedulerJobRuntime.string(obj["retryDayKey"]) == todayKey
-                    let priorCount = sameDay ? SchedulerJobRuntime.int(obj["retryCount"], default: 0) : 0
-                    let attempt = priorCount + 1
-                    obj["retryDayKey"] = .string(todayKey)
-                    obj["retryCount"] = .int(Int64(attempt))
-                    if attempt > Self.maxRetryAttemptsPerDay {
-                        // Cap reached: PARK. Stop retrying today, reschedule to
-                        // the next natural run, drop the pending-retry floor,
-                        // and mark the day parked so catch-up stays disarmed.
-                        // A receipt is emitted below (never a silent give-up).
-                        obj["retryParkedDateKey"] = .string(todayKey)
-                        obj.removeValue(forKey: "retryPendingUntilEpoch")
-                        if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
-                            Self.stampNextRun(&obj, epoch: next)
-                        }
-                        parkedAttempts = attempt - 1
-                    } else {
-                        let backoff = runDate
-                            .addingTimeInterval(Double(Self.retryBackoffSeconds(attempt: attempt)))
-                            .timeIntervalSince1970
-                        let retry = max(retryFloor, backoff)
-                        Self.stampNextRun(&obj, epoch: retry)
-                        obj["retryPendingUntilEpoch"] = .int(Int64(retry))
-                    }
-                } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
-                    Self.stampNextRun(&obj, epoch: next)
-                    Self.clearRetryState(&obj)
-                } else {
-                    obj["enabled"] = .bool(false)
-                    obj["disabledReason"] = .string("could not compute next scheduled run")
-                    Self.clearRetryState(&obj)
-                }
-                obj["lastOccurrenceKey"] = .string(job.occurrenceKey)
-                obj.removeValue(forKey: "activeOccurrence")
-                rows[idx] = .object(obj)
-                break
-            }
-            guard found else {
-                throw NSError(domain: "NativeAgentScheduler", code: -404, userInfo: [
-                    NSLocalizedDescriptionKey: "claimed scheduler job disappeared before settlement: \(job.id)"
-                ])
-            }
-            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
-            return parkedAttempts
-        }
+        let parkedAttempts = try await schedulerJobs.settleOccurrence(
+            jobId: job.id, occurrenceKey: job.occurrenceKey, status: result.status,
+            detail: result.detail, output: result.output, at: runDate,
+            runDateKey: NativeAgentDreamCycleSchedule.runDateKey(runDate)
+        )
 
         if let attempts = parkedAttempts {
             let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
@@ -105,20 +31,6 @@ extension SchedulerDueJobRunner {
                 severity: "important",
                 jobId: job.id
             )
-        }
-    }
-
-    /// Record retirement durably before removing rows under the jobs lock.
-    @discardableResult
-    func pruneRetiredJobs(now: Date) async throws -> Int {
-        try await persistence.withFileLock(jobsPath) { () async throws -> Int in
-            let rows = try Self.readJobRowsChecked(at: jobsPath)
-            let result = Self.pruneRetiredRows(rows, now: now)
-            guard !result.retired.isEmpty else { return 0 }
-            try await persistence.appendJSONLDurable(result.retired, to: jobsPath.deletingLastPathComponent()
-                .appendingPathComponent("retired.jsonl"))
-            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(result.rows), to: jobsPath)
-            return result.retired.count
         }
     }
 
@@ -272,33 +184,6 @@ extension SchedulerDueJobRunner {
         return false
     }
 
-    func markDefaultCycleJobRun(id: String, detail: String, at runDate: Date) async throws {
-        try await persistence.withFileLock(jobsPath) {
-            var rows = try Self.readJobRowsChecked(at: jobsPath)
-            for idx in rows.indices {
-                guard case .object(var obj) = rows[idx],
-                      (SchedulerJobRuntime.string(obj["id"]) ?? "") == id else {
-                    continue
-                }
-                obj["lastRunAt"] = .string(Self.iso(runDate))
-                obj["lastRunStatus"] = .string("completed")
-                obj["lastRunDetail"] = .string(detail)
-                obj.removeValue(forKey: "lastRunError")
-                // FIX 2 (A4.4): a successful/backfilled completion clears the
-                // retry backoff so it self-heals once the outage clears.
-                Self.clearRetryState(&obj)
-                if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
-                    obj["nextRunAt"] = .string(SchedulerJobRuntime.floatString(next))
-                    obj["nextRunAtEpoch"] = .int(Int64(next))
-                    obj["nextRunAtISO"] = .string(SchedulerJobRuntime.decorationISO(epoch: next))
-                }
-                rows[idx] = .object(obj)
-                break
-            }
-            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
-        }
-    }
-
     func postCycleNotification(title: String, body: String, jobId: String, source: String, itemId: String? = nil) async -> JSONValue {
         await cycleNotificationDelivery(title, body, jobId, source, itemId)
     }
@@ -314,6 +199,7 @@ extension SchedulerDueJobRunner {
         var delivered: [JSONValue] = []
         var errors: [JSONValue] = []
         var notDelivered: [JSONValue] = []
+        let macResult = Mutex<NativeAgentNotificationPostResult?>(nil)
 
         do {
             // 2026-09-13: urgency is projected by the router from the class
@@ -332,7 +218,11 @@ extension SchedulerDueJobRunner {
                 importance: .informational,
                 title: title,
                 body: body,
-                userInfo: userInfo
+                userInfo: userInfo,
+                postMacBanner: {
+                    let mac = await platform.postNotification(title: title, body: body)
+                    macResult.withLock { $0 = mac }
+                }
             )
             // Report what actually happened, from the ROUTER'S OWN projection —
             // the same one `TriggerNotifierBinding` reads — instead of "no
@@ -359,25 +249,18 @@ extension SchedulerDueJobRunner {
             errors.append(.string("push: \(error.localizedDescription)"))
         }
 
-        // The Mac banner obeys the router's quiet hours, like the push.
-        var macFields: JSONValue?
-        if AttentionRouter.holdsMacBanner(.informational) {
-            notDelivered.insert(.string("mac: deferred"), at: 0)
+        let mac = macResult.withLock { $0 }
+        if let mac {
+            if mac.posted { delivered.insert(.string("mac"), at: 0) }
+            else { errors.insert(.string("mac: \(mac.error ?? mac.delivery)"), at: 0) }
         } else {
-            let mac = await platform.postNotification(title: title, body: body)
-            if mac.posted {
-                delivered.insert(.string("mac"), at: 0)
-            } else {
-                errors.insert(.string("mac: \(mac.error ?? mac.delivery)"), at: 0)
-            }
-            macFields = .object(mac.deliveryFields())
+            notDelivered.insert(.string("mac: deferred"), at: 0)
         }
-
         var fields: [String: JSONValue] = [
             "delivered": .array(delivered),
             "errors": .array(errors),
         ]
-        if let macFields { fields["mac"] = macFields }
+        if let mac { fields["mac"] = .object(mac.deliveryFields()) }
         if !notDelivered.isEmpty { fields["not_delivered"] = .array(notDelivered) }
         return .object(fields)
     }

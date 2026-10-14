@@ -3,21 +3,18 @@ import NativeAgentCore
 import PersistenceCore
 import Senses
 
-/// Call-local proof supplied by the canonical view capture, never by app-name
-/// matching. A source that cannot bind pixels to this look is discarded.
+/// Call-local proof supplied by the canonical view capture, never
+/// by app-name matching. Pixels that cannot bind to this look are discarded.
 final class MacSightCaptureBinding: @unchecked Sendable {
     @TaskLocal static var current: MacSightCaptureBinding?
     let frameID: String
     private let lock = NSLock()
-    private var confirmed = false
     private var validate: (@Sendable () async -> Bool)?
     init(frameID: String) { self.frameID = frameID }
     func confirm(validate: @escaping @Sendable () async -> Bool = { true }) {
         lock.lock(); defer { lock.unlock() }
-        confirmed = true
         self.validate = validate
     }
-    var isConfirmed: Bool { lock.lock(); defer { lock.unlock() }; return confirmed }
     func isCurrent() async -> Bool {
         let check = lock.withLock { validate }
         return await check?() ?? false
@@ -306,7 +303,7 @@ extension MacFourVerbs {
         /// Additional exact natural names for this SAME target. These never
         /// create a second address or carry a second handle; they let transient
         /// state such as keyboard focus name the element already in the model.
-        let aliases: [String]
+        var aliases: [String]
         let kind: String
         let secret: Bool
         /// The content-row ordinal the render printed.
@@ -383,6 +380,7 @@ extension MacFourVerbs {
     /// `seek`: a name the caller is about to act on. When the ordinary walk
     /// stops short of it, the look searches deeper and frames it (`seekScoped`).
     func sight(part: String?, app: String? = nil, seek: String? = nil) async -> Sighted {
+        let captureBinding = MacSightCaptureBinding(frameID: UUID().uuidString)
         let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
         let app = continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app
         let result: MacControlResult
@@ -396,7 +394,9 @@ extension MacFourVerbs {
             if let app { body["app"] = .string(app) }
             if let part { body["section"] = .string(part) }
             if let seek = seek ?? part, !seek.isEmpty { body["seek"] = .string(seek) }
-            result = try await host.dispatch(action: "look", body: body)
+            result = try await MacSightCaptureBinding.$current.withValue(captureBinding) {
+                try await host.dispatch(action: "look", body: body)
+            }
         } catch {
             return .blind(MacFourVerbsReply(
                 ok: false,
@@ -528,7 +528,6 @@ extension MacFourVerbs {
         var pointerFrame: MacAXFrame?
         var supplementalDiagnostics: [String: JSONValue] = [:]
         var nativeAXSupplement: MacFourVerbsSupplement?
-        let captureBinding = MacSightCaptureBinding(frameID: frameId)
         let supplement = await MacSightCaptureBinding.$current.withValue(captureBinding) {
             await supplementalSource?.observe(app: app)
         }
@@ -665,32 +664,11 @@ extension MacFourVerbs {
                 // having no label. Focus gives that same safe handle a natural
                 // name; otherwise the duplicate target would leave it visible
                 // yet impossible to address by the focused label.
-                let existing = targets[index]
-                if existing.label == nil {
-                    targets[index] = ActTarget(
-                        handle: existing.handle,
-                        label: label,
-                        aliases: Self.editableKinds.contains(kind)
-                            ? Self.focusedEditableAliases(kind: kind)
-                            : [],
-                        kind: existing.kind,
-                        secret: existing.secret,
-                        ordinal: existing.ordinal,
-                        roleOrdinal: existing.roleOrdinal,
-                        enabled: existing.enabled,
-                        frame: existing.frame,
-                        observedFrame: existing.observedFrame,
-                        excludedFrames: existing.excludedFrames,
-                        viewId: existing.viewId,
-                        mark: existing.mark,
-                        regionOnly: existing.regionOnly,
-                        physicalOnly: existing.physicalOnly,
-                        motionUncertain: existing.motionUncertain,
-                        sourceAXPath: existing.sourceAXPath,
-                        actions: existing.actions,
-                        settableAttributes: existing.settableAttributes
-                    )
-                    targets[index].placeholder = existing.placeholder
+                if targets[index].label == nil {
+                    targets[index].label = label
+                    targets[index].aliases = Self.editableKinds.contains(kind)
+                        ? Self.focusedEditableAliases(kind: kind)
+                        : []
                     full = Self.adding(
                         controls: [MacScreenRender.Control(
                             label: MacScreenText(label, redacted: .string(label)),
@@ -701,28 +679,7 @@ extension MacFourVerbs {
                         to: full
                     )
                 } else if Self.editableKinds.contains(kind) {
-                    targets[index] = ActTarget(
-                        handle: existing.handle,
-                        label: existing.label,
-                        aliases: Self.focusedEditableAliases(kind: kind),
-                        kind: existing.kind,
-                        secret: existing.secret,
-                        ordinal: existing.ordinal,
-                        roleOrdinal: existing.roleOrdinal,
-                        enabled: existing.enabled,
-                        frame: existing.frame,
-                        observedFrame: existing.observedFrame,
-                        excludedFrames: existing.excludedFrames,
-                        viewId: existing.viewId,
-                        mark: existing.mark,
-                        regionOnly: existing.regionOnly,
-                        physicalOnly: existing.physicalOnly,
-                        motionUncertain: existing.motionUncertain,
-                        sourceAXPath: existing.sourceAXPath,
-                        actions: existing.actions,
-                        settableAttributes: existing.settableAttributes
-                    )
-                    targets[index].placeholder = existing.placeholder
+                    targets[index].aliases = Self.focusedEditableAliases(kind: kind)
                 }
             } else {
                 targets.append(ActTarget(
@@ -753,7 +710,7 @@ extension MacFourVerbs {
             }
         }
 
-        let zoom = part.flatMap { Self.zoom(full, part: $0, options: options) }
+        let zoom = part.flatMap { Self.zoom(full, part: $0) }
         let pointerLine: String? = {
             guard let pointer else { return nil }
             guard let frame = pointerFrame else { return "POINTER: observed; surface position unavailable." }
@@ -775,16 +732,9 @@ extension MacFourVerbs {
         // The AX native page already represents its text, values and controls
         // together. The legacy render remains the independent pixel surface;
         // it must never be appended as a second copy of an AX document.
-        guard let value = output["native_page"] else {
+        guard var nativePage = result.nativePage else {
             return .blind(MacFourVerbsReply(ok: false,
                 text: "raw view · accessibility · The look reader did not return a native screen page.",
-                detail: ["error": .string("screen_page_unavailable")]))
-        }
-        var nativePage: NativePage
-        do { nativePage = try JSONDecoder().decode(NativePage.self, from: value.serializedData(pretty: false)) }
-        catch {
-            return .blind(MacFourVerbsReply(ok: false,
-                text: "raw view · accessibility · The native screen page could not be decoded: \(error.localizedDescription)",
                 detail: ["error": .string("screen_page_unavailable")]))
         }
         // Resolve the names and presses the native page actually offers,
@@ -979,8 +929,31 @@ extension MacFourVerbs {
         )
     }
 
-    /// Each acquisition loop keeps its own budget and target-resolution rules.
-    /// The observation step shares the delay and foreground-app identity check.
+    /// Keep temporal evidence and both drag endpoints in the same fresh sight.
+    func reacquireSight(
+        for target: String,
+        sighting: inout Sighting,
+        whileMissing: ([ActTarget]) -> Bool
+    ) async -> (reply: MacFourVerbsReply?, samples: Int) {
+        guard Self.isPotentialDynamicVisualReference(target) else { return (nil, 0) }
+        let temporal = Self.hasTemporalQualifier(target)
+        let sampledApp = sighting.bundleIdentifier ?? sighting.appName
+        var previousTargets = sighting.targets
+        var samples = 0
+        for sample in 0..<(temporal ? 3 : 1) {
+            guard whileMissing(sighting.targets) else { break }
+            if sample == 2, !Self.canConfirmTemporalTurn(target, previous: previousTargets, current: sighting.targets) { break }
+            switch await resampleSight(temporal: temporal, expectedApp: sampledApp) {
+            case .blind(let reply): return (reply, samples)
+            case .seen(let refreshed):
+                previousTargets = sighting.targets
+                sighting = refreshed
+                samples += 1
+            }
+        }
+        return (nil, samples)
+    }
+
     func resampleSight(temporal: Bool, expectedApp: String?) async -> Sighted {
         if temporal { await clock.sleep(seconds: 0.06) }
         let observed = await sight(part: nil)

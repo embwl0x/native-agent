@@ -12,13 +12,13 @@ extension CognitiveSubstrate {
     /// per-axis pull accessors — warmth/pressure now ride refreshBodySchema's
     /// canonicalAffect parameter in one actor admission.)
     public func canonicalAffectProjection(at fixedAt: Date) -> CognitiveAffectState? {
-        guard configuration.enabled, configuration.affectEnabled else { return nil }
+        guard configuration.enabled else { return nil }
         return projectedAffect(at: fixedAt)
     }
 
     @discardableResult
     func decayAffectInMemory(to now: Date) -> Bool {
-        guard configuration.enabled, configuration.affectEnabled,
+        guard configuration.enabled,
               now.timeIntervalSince(affect.updatedAt) > 0 else { return false }
         affect = projectedAffect(at: now)
         return true
@@ -36,7 +36,7 @@ extension CognitiveSubstrate {
         precomputedAppraisal: AffectAppraisal? = nil,
         precomputedWarmthBoost: Double? = nil
     ) -> CognitiveAffectState {
-        guard configuration.enabled, configuration.affectEnabled,
+        guard configuration.enabled,
               event.turnKind.contributesToLivedState else { return affect }
         // An event whose OWNER measured its feeling takes no additional flat
         // per-kind delta: the per-kind arms below are inferences for events that
@@ -485,7 +485,7 @@ extension CognitiveSubstrate {
     }
 
     func reconcileRestoredAffectWithRecentConversation(nodes: [CognitiveNode]) async {
-        guard configuration.affectEnabled else { return }
+        guard configuration.enabled else { return }
         // A modern affect artifact carries the canonical presence epoch and is
         // already restart-equivalent. Keep this heuristic only for legacy or
         // partially persisted artifacts that predate temporal anchors; otherwise
@@ -531,14 +531,14 @@ extension CognitiveSubstrate {
     /// social warmth lingers for hours. This "honest decay" gives each axis real dynamic
     /// range across a day instead of one shared 1h half-life that blurred fast and slow
     /// feelings together and let active conversation peg every axis at the ceiling.
-    // W4/P1: the four half-lives now live in PersonalityDynamicsConfiguration
-    // (`arousalHalfLife` / `uncertaintyHalfLife` / `taskPressureHalfLife` /
-    // `socialWarmthHalfLife`), so a persona's pace of feeling is configurable
-    // rather than welded in.
 
     /// Decay an affect state to `now` using per-axis half-lives. Centralizes the decay
     /// math used by the pure live projection and persisted checkpoints.
-    private func decayedAffect(_ state: CognitiveAffectState, to now: Date) -> CognitiveAffectState {
+    private func decayedAffect(
+        _ state: CognitiveAffectState,
+        to now: Date,
+        dynamics capturedDynamics: PersonalityDynamicsConfiguration?
+    ) -> CognitiveAffectState {
         let elapsed = max(0, now.timeIntervalSince(state.updatedAt))
         guard elapsed > 0 else {
             var carried = state
@@ -546,7 +546,7 @@ extension CognitiveSubstrate {
             return carried
         }
         func decay(_ halfLife: TimeInterval) -> Double { pow(0.5, elapsed / halfLife) }
-        let dyn = dynamics
+        let dyn = capturedDynamics ?? dynamics
         return CognitiveAffectState(
             arousal: state.arousal * decay(dyn.arousalHalfLife),
             uncertainty: state.uncertainty * decay(dyn.uncertaintyHalfLife),
@@ -562,11 +562,11 @@ extension CognitiveSubstrate {
     /// so an axis under sustained input settles below the ceiling with headroom to still
     /// register a stronger moment — and decay can always pull it back down.
     private func saturatingApproach(_ value: Double, _ delta: Double) -> Double {
-        let v = clamp(value)
+        let v = (value).clamped01()
         if delta >= 0 {
-            return clamp(v + delta * (1 - v))
+            return (v + delta * (1 - v)).clamped01()
         } else {
-            return clamp(v + delta * v)
+            return (v + delta * v).clamped01()
         }
     }
 
@@ -601,10 +601,13 @@ extension CognitiveSubstrate {
         return next
     }
 
-    func projectedAffect(at now: Date) -> CognitiveAffectState {
-        guard configuration.enabled, configuration.affectEnabled else { return affect }
+    func projectedAffect(
+        at now: Date,
+        dynamics capturedDynamics: PersonalityDynamicsConfiguration? = nil
+    ) -> CognitiveAffectState {
+        guard configuration.enabled else { return affect }
         let source = affect
-        var next = decayedAffect(source, to: now)
+        var next = decayedAffect(source, to: now, dynamics: capturedDynamics)
         guard let lastPresence = lastUserPresenceAt else { return ruminated(next, at: now) }
         let quietBoundary = lastPresence.addingTimeInterval(Self.ambientPresenceGap)
         guard now >= quietBoundary else { return ruminated(next, at: now) }

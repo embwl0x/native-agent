@@ -23,61 +23,6 @@ import MacControl
 // four verbs), not the legacy mac_look. Which is also why every
 // stage of this is testable headless, on real pixels.
 
-public struct VisionPerceptionConfig: Sendable {
-    public let text: VisionTextLayerConfig
-    public let colorRegion: VisionColorRegionConfig
-    public let textBand: VisionTextBandConfig
-    public let saliency: VisionSaliencyConfig
-    public let redaction: VisionRedactionConfig
-    /// Two candidates overlapping by at least this IoU are ONE element seen by
-    /// two layers — merged (sources unioned), not abstained on.
-    public let mergeIoU: Double
-    /// A colour region essentially coincident with an OCR box is the TEXT
-    /// itself, not a control around it.
-    public let glyphRunIoU: Double
-    /// …and a region this much of which lies INSIDE one recognized string is
-    /// glyph ink (a bold letter's counter, a bar of an "E").
-    public let glyphInsetCoverage: Double
-    /// A text box this much of whose area lies inside a candidate is that
-    /// candidate's caption.
-    public let containmentFraction: Double
-    /// Readouts: a standalone text this many times the median text height is
-    /// PROMINENT (the number a calculator shows, a headline).
-    public let readoutProminence: Double
-    public let maxReadouts: Int
-    public let maxAffordances: Int
-
-    public init(
-        text: VisionTextLayerConfig = .default,
-        colorRegion: VisionColorRegionConfig = .default,
-        textBand: VisionTextBandConfig = .default,
-        saliency: VisionSaliencyConfig = .default,
-        redaction: VisionRedactionConfig = .default,
-        mergeIoU: Double = 0.6,
-        glyphRunIoU: Double = 0.5,
-        glyphInsetCoverage: Double = 0.8,
-        containmentFraction: Double = 0.6,
-        readoutProminence: Double = 1.25,
-        maxReadouts: Int = 8,
-        maxAffordances: Int = 60
-    ) {
-        self.text = text
-        self.colorRegion = colorRegion
-        self.textBand = textBand
-        self.saliency = saliency
-        self.redaction = redaction
-        self.mergeIoU = mergeIoU
-        self.glyphRunIoU = glyphRunIoU
-        self.glyphInsetCoverage = glyphInsetCoverage
-        self.containmentFraction = containmentFraction
-        self.readoutProminence = readoutProminence
-        self.maxReadouts = maxReadouts
-        self.maxAffordances = maxAffordances
-    }
-
-    public static let `default` = VisionPerceptionConfig()
-}
-
 public enum VisionPerceptionError: Error, LocalizedError {
     case undecodableImage
 
@@ -90,8 +35,7 @@ public enum VisionPerceptionError: Error, LocalizedError {
 }
 
 /// One candidate's working state between the element layer and the emitted
-/// row. File-scoped rather than nested because `compile` is generic over the
-/// recognizer and a generic function may not nest a type.
+/// row.
 struct VisionRowDraft {
     let candidate: VisionCandidate
     let guess: VisionRoleGuess.Guess
@@ -102,22 +46,19 @@ struct VisionRowDraft {
 }
 
 public struct VisionPerceptionCompiler: Sendable {
-    public let config: VisionPerceptionConfig
-    /// Saliency is OPTIONAL — stage (c). Absent, the percept is (a)+(b) and
-    /// says so through its evidence counts rather than pretending.
-    public let salience: (any VisionSalienceProviding)?
+    private let mergeIoU = 0.6
+    private let glyphRunIoU = 0.5
+    private let glyphInsetCoverage = 0.8
+    private let containmentFraction = 0.6
+    private let readoutProminence = 1.25
+    private let maxReadouts = 8
+    private let maxAffordances = 60
 
-    public init(
-        config: VisionPerceptionConfig = .default,
-        salience: (any VisionSalienceProviding)? = nil
-    ) {
-        self.config = config
-        self.salience = salience
-    }
+    public init() {}
 
+    #if canImport(Vision)
     public func compile(
         image: CGImage,
-        using recognizer: some VisionTextRecognizing,
         excludedRegions: [VisionRect] = []
     ) throws -> VisionPercept {
         try Task.checkCancellation()
@@ -130,7 +71,7 @@ public struct VisionPerceptionCompiler: Sendable {
         }
         guard let grid = VisionPixelGrid.sample(
             image: image,
-            longAxisSamples: config.colorRegion.gridLongAxisSamples
+            longAxisSamples: VisionColorRegionLayer.gridLongAxisSamples
         ) else { throw VisionPerceptionError.undecodableImage }
         try Task.checkCancellation()
 
@@ -140,7 +81,7 @@ public struct VisionPerceptionCompiler: Sendable {
         //    string can reach a label, a readout, a handle fingerprint or a
         //    glance line. There is no downstream path that sees raw OCR text.
         let textResult = try VisionTextLayer.recognize(
-            image: image, using: recognizer, config: config.text,
+            image: image, using: VisionKitTextRecognizer(),
             ignoredForRefinement: excludedRegions
         )
         try Task.checkCancellation()
@@ -151,7 +92,7 @@ public struct VisionPerceptionCompiler: Sendable {
             )
         }
         let allRedactedTexts = VisionTextRedaction.redact(
-            boxes: textResult.boxes, imageSize: imageSize, config: config.redaction
+            boxes: textResult.boxes, imageSize: imageSize
         )
         // Preserve redaction's whole-frame caption context before excluding
         // foreign-window text from the app's percept.
@@ -163,12 +104,12 @@ public struct VisionPerceptionCompiler: Sendable {
         }
 
         // 3. ELEMENT LAYER (a) colour regions, (b) y-band rows.
-        let colorResult = VisionColorRegionLayer.candidates(grid: grid, config: config.colorRegion)
+        let colorResult = VisionColorRegionLayer.candidates(grid: grid)
         if colorResult.capped {
-            notes.append("colour-region layer hit its \(config.colorRegion.maxCandidates)-candidate cap")
+            notes.append("colour-region layer hit its \(VisionColorRegionLayer.maxCandidates)-candidate cap")
         }
         let bandCandidates = VisionTextBandLayer.rowCandidates(
-            from: visibleTextBoxes, config: config.textBand
+            from: visibleTextBoxes
         )
 
         // A colour region that IS a recognized string, or that sits INSIDE
@@ -179,8 +120,8 @@ public struct VisionPerceptionCompiler: Sendable {
         // checkbox unless it is dropped here.
         let colorCandidates = colorResult.candidates.filter { candidate in
             isVisible(candidate.rect) && !visibleTextBoxes.contains { box in
-                box.rect.iou(candidate.rect) >= config.glyphRunIoU
-                    || candidate.rect.coverage(by: box.rect) >= config.glyphInsetCoverage
+                box.rect.iou(candidate.rect) >= glyphRunIoU
+                    || candidate.rect.coverage(by: box.rect) >= glyphInsetCoverage
             }
         }
 
@@ -188,34 +129,32 @@ public struct VisionPerceptionCompiler: Sendable {
 
         // 4. ELEMENT LAYER (c) saliency — rank, and add what (a)+(b) missed.
         try Task.checkCancellation()
-        if let salience {
-            do {
-                let regions = try salience.salientRegions(in: image).filter { isVisible($0.rect) }
-                try Task.checkCancellation()
-                candidates = VisionSaliencyLayer.fold(
-                    salient: regions, into: candidates, imageSize: imageSize, config: config.saliency
-                )
-            } catch {
-                if error is CancellationError { throw error }
-                try Task.checkCancellation()
-                // Saliency is additive: an ordinary failure retains text and
-                // colour evidence, but cancellation must not publish a frame.
-            }
+        do {
+            let regions = try VisionKitSalienceProvider().salientRegions(in: image).filter { isVisible($0.rect) }
+            try Task.checkCancellation()
+            candidates = VisionSaliencyLayer.fold(
+                salient: regions, into: candidates, imageSize: imageSize
+            )
+        } catch {
+            if error is CancellationError { throw error }
+            try Task.checkCancellation()
+            // Saliency is additive: an ordinary failure retains text and
+            // colour evidence, but cancellation must not publish a frame.
         }
         candidates = candidates.filter { isVisible($0.rect) }
         let considered = candidates.count
-        if candidates.count > config.maxAffordances {
+        if candidates.count > maxAffordances {
             notes.append(
-                "\(candidates.count - config.maxAffordances) candidate(s) beyond the "
-                    + "\(config.maxAffordances) cap were dropped"
+                "\(candidates.count - maxAffordances) candidate(s) beyond the "
+                    + "\(maxAffordances) cap were dropped"
             )
-            candidates = Array(candidates.prefix(config.maxAffordances))
+            candidates = Array(candidates.prefix(maxAffordances))
         }
 
         // 5. ROLES, STATES, LABELS.
         let drafts: [VisionRowDraft] = candidates.map { candidate in
             let contained = texts.filter {
-                $0.0.rect.coverage(by: candidate.rect) >= config.containmentFraction
+                $0.0.rect.coverage(by: candidate.rect) >= containmentFraction
             }.map { (box: $0.0, redacted: $0.1) }
             let guess = VisionRoleGuess.guess(VisionRoleGuess.Inputs(
                 rect: candidate.rect,
@@ -277,7 +216,6 @@ public struct VisionPerceptionCompiler: Sendable {
 
         // 8. ROWS with the five confidences.
         var rows: [VisionAffordanceRow] = []
-        var reasonCounts: [String: Int] = [:]
         for (index, draft) in drafts.enumerated() {
             let state = VisionRoleGuess.stateGuess(
                 role: draft.guess.role,
@@ -288,9 +226,6 @@ public struct VisionPerceptionCompiler: Sendable {
             )
             let textConfidence = draft.containedText.map(\.box.confidence).max() ?? 0
             let ambiguous = abstainReasons[index]
-            if let ambiguous {
-                reasonCounts[abstainKind(ambiguous), default: 0] += 1
-            }
             let target = targetPrior(
                 bounds: draft.candidate.boundsConfidence,
                 role: draft.guess.confidence,
@@ -304,7 +239,6 @@ public struct VisionPerceptionCompiler: Sendable {
                 handle: minted[index].handle,
                 handleAmbiguity: minted[index].ambiguity,
                 roleGuess: draft.guess.role,
-                roleRationale: draft.guess.rationale,
                 label: draft.label,
                 rect: draft.candidate.rect,
                 confidence: VisionConfidence(
@@ -333,20 +267,13 @@ public struct VisionPerceptionCompiler: Sendable {
             claimed: drafts.flatMap { $0.containedText.map(\.box.rect) },
             imageSize: imageSize
         )
-        let readouts = Array(readoutsAll.prefix(config.maxReadouts))
+        let readouts = Array(readoutsAll.prefix(maxReadouts))
 
         try Task.checkCancellation()
         return VisionPercept(
             rows: rows,
             readouts: readouts,
-            abstain: VisionAbstainReport(
-                // The EMITTED set, so the rate cannot be deflated by rows the
-                // cap dropped before their ambiguity was ever assessed.
-                considered: rows.count,
-                abstained: rows.filter { $0.ambiguous != nil }.count,
-                reasons: reasonCounts,
-                droppedBeyondCap: max(0, considered - rows.count)
-            ),
+            droppedBeyondCap: max(0, considered - rows.count),
             frameSize: imageSize,
             textTiled: textResult.tiled,
             textTilingReason: textResult.tilingReason,
@@ -358,6 +285,8 @@ public struct VisionPerceptionCompiler: Sendable {
         )
     }
 
+    #endif
+
     // MARK: - Fusion helpers
 
     /// One element seen by two layers is ONE element. Merged largest-first so
@@ -366,7 +295,7 @@ public struct VisionPerceptionCompiler: Sendable {
     func merge(_ candidates: [VisionCandidate]) -> [VisionCandidate] {
         var kept: [VisionCandidate] = []
         for candidate in candidates.sorted(by: { $0.rect.area > $1.rect.area }) {
-            if let index = kept.firstIndex(where: { $0.rect.iou(candidate.rect) >= config.mergeIoU }) {
+            if let index = kept.firstIndex(where: { $0.rect.iou(candidate.rect) >= mergeIoU }) {
                 var merged = kept[index]
                 for source in candidate.sources {
                     merged = merged.adding(source: source, salience: candidate.salience)
@@ -428,10 +357,6 @@ public struct VisionPerceptionCompiler: Sendable {
         return out
     }
 
-    func abstainKind(_ reason: String) -> String {
-        reason.hasPrefix("overlapping") ? "overlapping_targets" : "unlabeled_unknown_role"
-    }
-
     /// The `target` PRIOR: with no query, how separately addressable is this
     /// row? Bounds dominate because a target you cannot bound is a target you
     /// cannot hit; ambiguity caps it hard, because an abstaining row must not
@@ -465,9 +390,9 @@ public struct VisionPerceptionCompiler: Sendable {
         guard !heights.isEmpty else { return [] }
         let median = heights[heights.count / 2]
         let free = texts.filter { entry in
-            !claimed.contains { entry.0.rect.coverage(by: $0) >= config.containmentFraction }
+            !claimed.contains { entry.0.rect.coverage(by: $0) >= containmentFraction }
         }
-        let prominent = free.filter { $0.0.rect.h >= median * config.readoutProminence }
+        let prominent = free.filter { $0.0.rect.h >= median * readoutProminence }
         return prominent
             .sorted { lhs, rhs in
                 if abs(lhs.0.rect.h - rhs.0.rect.h) > 0.5 { return lhs.0.rect.h > rhs.0.rect.h }

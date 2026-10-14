@@ -1,5 +1,47 @@
 import Foundation
 
+/// The door's read names. Layout block ids remain storage keys, never aliases on disk.
+public enum AppDoorNames {
+    public static let places = ["desk": "ongoing", "mac": "computer", "memories": "memory", "bots": "helpers", "notifications": "notify"]
+
+    public static let aliases: [String: String] = [
+        "approvals": "today", "approval": "today", "pending approvals": "today",
+        "inbox policy": "notifications", "inbox_policy": "notifications", "proactive": "notifications",
+        "memory": "memories", "moments": "memories", "provider": "providers", "models": "providers",
+        "trust center": "trust", "trust_center": "trust", "permissions": "trust",
+        "setup": "settings", "preferences": "settings", "iphone": "pairing", "phone": "pairing",
+        "pair": "pairing", "pairing devices": "pairing", "iphone pairing": "pairing", "chrome": "browser",
+        "ongoing": "desk", "computer": "mac", "skill": "skills", "agent": "agents",
+        "bot": "bots", "helpers": "bots", "connector": "connectors", "mac integration": "mac_integration",
+        "skills & tools": "skills",
+        "twitter": "x", "stocks": "markets", "health": "status", "doctor": "diagnostics/doctor",
+    ]
+
+    /// Places without a rail page keep their own room and all of its capabilities.
+    public static let homeItems: Set<String> = [
+        "research", "replies", "create", "connections", "crews", "delegations", "code",
+        "gmail", "agentmail", "gcal", "notify", "status", "activity",
+    ]
+
+    public static func resolve(_ raw: String) -> String {
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return aliases[key] ?? key
+    }
+
+    public static let items: [String: [String: String]] = [
+        "chat": ["<conversation id>": "background read with page:chat and item:<conversation id>: the composer and latest messages, 8 or args {limit} up to 16 messages, with whether app chat.reply can answer it. "
+                 + "For older history, resolve with chat.list, then chat.search {session_id, sort:newest, limit:12} without query; follow next_call and use chat.message for full truncated bodies. Screen controls are separate actions."],
+        "inbox": ["all": "compact notes newest first, archived and dismissed too, up to 200; read a note id for details and actions"],
+        "desk": ["<exact title or handle>": "the matching Desk record; duplicate titles require the exact desk number"],
+        "diagnostics": ["doctor": "Doctor's last report; run doctor.run for fresh checks"],
+        "telegram": ["status": "the poller's health, config and log freshness; never tokens or ids"],
+        "skills": ["<skill name>": "the routine's description, signature, status, selected version and admission",
+                   "census": "conversion progress and blockers, including preserved historical originals"],
+        "tools": ["<tool id>": "the selected digest, retained versions and validation results, and what rollback or drop would do",
+                  "census": "Your ability census: what tools, skills and senses you have, and what you built yourself. Lists authored tools, skill routines and persona procedures, senses, active and retired statuses, retained versions, orphan proposals, conversion counterparts and cutover blockers."],
+    ]
+}
+
 /// How each surface lays out its named blocks: their order, which are hidden,
 /// whether a fold starts open, and per view (a profile: simple, advanced or
 /// agent, the `nativeagent.viewMode` values) which blocks that view leaves

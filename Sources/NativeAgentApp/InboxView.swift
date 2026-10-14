@@ -1,5 +1,8 @@
+import BackgroundWork
+import ApprovalTransactions
 // PATCH-2026-05-07: proactive-inbox-1 InboxView — proactive inbox card strip
 import SwiftUI
+import ApprovalTransactions
 import Observation
 import NativeAgentShared
 import NativeAgentCore
@@ -11,53 +14,6 @@ import DeviceSync
 
 /// Presentation over the core inbox card (`NotificationInbox.InboxItemRecord`).
 extension InboxItemRecord {
-    var isHiddenFromDefaultInbox: Bool {
-        normalizedStatus == "archived" || normalizedStatus == "dismissed"
-    }
-    var hasLinkedApproval: Bool { !(related_approval_id ?? "").isEmpty }
-    var isProactiveCard: Bool { source.lowercased().hasPrefix("proactive_autonomy:") }
-    var isApprovalBacklogCard: Bool {
-        let lowerSource = source.lowercased()
-        let lowerDetail = (detail ?? "").lowercased()
-        return hasLinkedApproval
-            || lowerSource.hasPrefix("proactive_autonomy:approval_backlog:")
-            || lowerDetail.contains("suggested action: approvals.triage")
-    }
-
-    var fallbackPrimaryAction: InboxActionRecord? {
-        if isApprovalBacklogCard {
-            return InboxActionRecord(
-                id: "open_approvals",
-                label: "Open Approvals",
-                description: "Review pending approvals"
-            )
-        }
-        if isProactiveCard {
-            return nil
-        }
-        if severity.lowercased() == "actionable" || relatedWorkshopExecutionId != nil {
-            return InboxActionRecord(id: "act", label: "Act", description: "Take primary action")
-        }
-        return nil
-    }
-
-    var effectiveActions: [InboxActionRecord] {
-        if !actions.isEmpty { return actions }
-        var fallback = [InboxActionRecord(id: "view", label: "View", description: "See full detail")]
-        if let primary = fallbackPrimaryAction {
-            fallback.append(primary)
-        }
-        fallback.append(contentsOf: [
-            InboxActionRecord(id: "archive", label: "Archive", description: "Archive this item"),
-            InboxActionRecord(id: "dismiss", label: "Dismiss", description: "Dismiss this item"),
-        ])
-        return fallback
-    }
-
-    var actionIDs: Set<String> {
-        Set(effectiveActions.map(\.id))
-    }
-
     var severityColor: Color {
         switch severity {
         case "actionable": return .orange
@@ -69,7 +25,6 @@ extension InboxItemRecord {
     /// Everything else — deliberately the DEFAULT. An unrecognized source is a
     /// card nobody has classified yet; putting it in front of User is the
     /// recoverable error, hiding it in a lane he does not open is not.
-    var isForYouLane: Bool { !isSystemLane }
 
     var sourceIcon: String {
         if hasLinkedApproval { return "checkmark.shield.fill" }
@@ -162,50 +117,6 @@ enum InboxSourceBadgePresentation {
     }
 }
 
-typealias InboxRelatedGroup = NativeAgentShared.InboxRelatedGroup
-typealias InboxActionRecord = NativeAgentShared.InboxActionRecord
-
-extension InboxRelatedGroup {
-    func matches(_ item: InboxItemRecord) -> Bool {
-        matches(itemID: item.id, title: item.title)
-    }
-}
-
-/// The persisted inbox action list includes control verbs which the Desk owns
-/// itself: opening a card marks it read, and viewing/replying are not direct
-/// button operations. Project once at the presentation boundary so every Desk
-/// surface offers exactly the native action that its button will invoke.
-enum InboxVisibleActionsPresentation {
-    private static let hiddenActionIDs: Set<String> = ["view", "read", "reply"]
-    private static let executableActionIDs: Set<String> = Set([
-        "act", "approve", "reject",
-    ]).union(HeartbeatCardAction.ids)
-
-    static func actions(for item: InboxItemRecord) -> [InboxActionRecord] {
-        guard !item.isHiddenFromDefaultInbox else { return [] }
-        var seen: Set<String> = []
-        var visible: [InboxActionRecord] = []
-
-        for action in item.effectiveActions {
-            let normalizedID = action.id
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            let canonicalID = normalizedID == "deny" ? "reject" : normalizedID
-            guard !hiddenActionIDs.contains(canonicalID),
-                  executableActionIDs.contains(canonicalID)
-            else { continue }
-
-            let label = action.label.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !label.isEmpty, seen.insert(canonicalID).inserted else { continue }
-            visible.append(InboxActionRecord(
-                id: canonicalID,
-                label: label,
-                description: action.description
-            ))
-        }
-        return visible
-    }
-}
 
 extension TriggerConfig: @retroactive Identifiable {
     public var id: String { name }
@@ -366,7 +277,7 @@ struct InboxItemDetailSheet: View {
     }
 
     private var relatedGroups: [InboxRelatedGroup] {
-        InboxDetailGroupProjection.groups(item: item, allItems: allItems)
+        InboxDigestGroupProjection.groups(item: item, allItems: allItems)
     }
 
     var body: some View {
@@ -543,15 +454,6 @@ enum InboxDetailActionPresentation {
     }
 }
 
-enum InboxDetailGroupProjection {
-    static func groups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
-        InboxDigestGroupProjection.groups(item: item, allItems: allItems)
-    }
-
-    static func legacyGroups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
-        InboxDigestGroupProjection.legacyGroups(item: item, allItems: allItems)
-    }
-}
 
 // MARK: - Full inbox list (accessible from chat header or settings)
 
@@ -582,10 +484,6 @@ enum InboxLane: String, CaseIterable, Identifiable {
 /// same list population InboxView renders. Keeping it here prevents a group
 /// selection from becoming a detail-sheet-only presentation effect.
 enum InboxReviewGroupSelection {
-    static func select(_ group: InboxRelatedGroup) -> InboxRelatedGroup {
-        group
-    }
-
     static func displayItems(
         items: [InboxItemRecord],
         lane: InboxLane,
@@ -596,55 +494,6 @@ enum InboxReviewGroupSelection {
             .filter { lane.matches($0) }
         guard let groupFilter else { return base }
         return base.filter { groupFilter.matches($0) }
-    }
-}
-
-/// WHAT STILL NEEDS THE PERSON, as opposed to what she has already told him.
-///
-/// The inbox was one flat list per lane in arrival order, and opening a card
-/// marked it read — so an approval he opened, thought about and did not act on
-/// sank under the next hour of notices and was gone. READING IS NOT
-/// RESOLVING. This derives prominence from the authoritative records the card
-/// already carries (its linked approval, and the actions that resolve real
-/// work), never from read state, and it deliberately spans BOTH lanes: a
-/// request that happens to have been filed under System is still a request.
-///
-/// Resolution is what removes it. A resolved approval's card stops coming back
-/// from the reload, which is the existing tombstone path — no second source of
-/// truth about what is outstanding.
-enum InboxNeedsYou {
-    /// Action ids that mean the person still has to do something. `read` and
-    /// `dismiss` are deliberately absent: acknowledging is not deciding.
-    static let resolvingActionIDs: Set<String> = [
-        "act", "approve", "reject", "open_approvals", "repair",
-    ]
-
-    struct Sections {
-        let needsYou: [InboxItemRecord]
-        let rest: [InboxItemRecord]
-
-        var isEmpty: Bool { needsYou.isEmpty && rest.isEmpty }
-    }
-
-    static func needsYou(_ item: InboxItemRecord) -> Bool {
-        guard !item.isHiddenFromDefaultInbox else { return false }
-        if item.hasLinkedApproval { return true }
-        return item.actions.contains { resolvingActionIDs.contains($0.id) }
-    }
-
-    /// - Parameter everywhere: the visible population across every lane, so a
-    ///   System-lane request is not hidden from the person it is waiting on.
-    /// - Parameter lane: the lane's own visible population, which keeps its
-    ///   arrival order below.
-    static func sections(
-        everywhere: [InboxItemRecord],
-        lane: [InboxItemRecord]
-    ) -> Sections {
-        let needsYou = everywhere
-            .filter(needsYou)
-            .sorted { $0.created_at > $1.created_at }
-        let claimed = Set(needsYou.map(\.id))
-        return Sections(needsYou: needsYou, rest: lane.filter { !claimed.contains($0.id) })
     }
 }
 
@@ -713,7 +562,7 @@ enum InboxAppModelMirror {
 /// reader's own error text goes to the log, not the page.
 enum InboxLoadFailurePresentation {
     static func banner(error: any Error, retainedItemCount: Int) -> String {
-        nativeLog("%@", "[inbox] read failed: \(error.localizedDescription)")
+        ModuleLog.app("%@", "[inbox] read failed: \(error.localizedDescription)")
         return retainedItemCount > 0
             ? "Couldn't refresh, so these notes may be out of date. Try Refresh."
             : "Couldn't read your notes. Try Refresh."
@@ -948,7 +797,7 @@ struct InboxView: View {
             onAction: { Task { await loadAndSync() } },
             onMarkedRead: { markRead(item.id) },
             onSelectGroup: { group in
-                groupFilter = InboxReviewGroupSelection.select(group)
+                groupFilter = group
             }
         )
     }
@@ -1041,7 +890,7 @@ final class InboxRowActionFlight {
             return .succeeded
         } catch {
             // The writer's text goes to the log; the page says what to do.
-            nativeLog("%@", "[inbox] action failed: \(error.localizedDescription)")
+            ModuleLog.app("%@", "[inbox] action failed: \(error.localizedDescription)")
             return .failed(message: "That didn't go through. Try again in a moment.")
         }
     }
@@ -1097,7 +946,7 @@ struct InboxListRow: View {
 
     @ViewBuilder
     var body: some View {
-        if item.source == InteractionCardDelivery.source {
+        if item.source == InlineInteractionDelivery.source {
             InteractionInboxCard(item: item)
         } else {
             ordinaryRow
@@ -1195,7 +1044,8 @@ struct InboxListRow: View {
     /// durable write, so the two surfaces cannot drift on read vs. resolution.
     private func performAction(_ actionID: String) async -> InboxRowActionFlight.Outcome {
         let outcome = await actionFlight.perform {
-            try await InboxCardActions.perform(item.id, action: actionID, dataRootOverride: dataRootOverride)
+            try await InboxCardActions.perform(item.id, action: actionID,
+                dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects())
         }
         return InboxRowActionCompletion.apply(
             outcome,

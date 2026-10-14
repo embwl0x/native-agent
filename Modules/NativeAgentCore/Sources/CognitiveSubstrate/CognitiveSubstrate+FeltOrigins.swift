@@ -45,7 +45,7 @@ public extension CognitiveSubstrate {
     /// Empty when cognition or affect is off, or nothing was felt — the same
     /// silence the summary returns nil for.
     func feltDayOrigins(at now: Date) async -> [CognitiveFeltOrigin] {
-        guard configuration.enabled, configuration.affectEnabled else { return [] }
+        guard configuration.enabled else { return [] }
         let felt = field.peekNodes().filter { node in
             guard feltDirection(
                 valence: node.emotionalValence,

@@ -50,17 +50,14 @@ public enum ContextBudgetPolicy {
     /// model's prompt.
     static let floorWindowTokens = 32_768
 
-    /// The chat/mac floor total as RENDERED: history 22,000 + memory
+    /// The shared floor total as RENDERED: history 22,000 + memory
     /// 5×(1,200 + per-row markup) + capsule 4,000. Used as the denominator that
-    /// turns "characters this window can afford" into a scale factor applied to
-    /// every surface's own floors, so telegram and iOS scale from THEIR floors
-    /// and keep their relative size.
+    /// turns "characters this window can afford" into a scale factor.
     ///
     /// The markup term is not cosmetic: `memoryBlockChars` bounds rendered
     /// rows, so leaving it out of the denominator makes the scale factor
-    /// slightly too generous and `governedTotalChars` overshoots the allowance
-    /// on mid-size windows. `derivedTotalNeverExceedsUtilizationFraction`
-    /// caught exactly that.
+    /// slightly too generous and the governed total overshoots the allowance
+    /// on mid-size windows.
     static let referenceFloorTotalCharacters =
         22_000 + (5 * (1_200 + memoryRowOverheadChars)) + 4_000
 
@@ -170,59 +167,17 @@ public enum ContextBudgetPolicy {
         public let relevantItemCap: Int
     }
 
-    /// Surface floors lifted verbatim from `SessionHistoryPromptRenderer
-    /// .budget(for:)` as it stood at sweep R4 W2.
-    static func floors(forSurface surface: String) -> Floors {
-        switch surface.lowercased() {
-        case "telegram":
-            return Floors(
-                historyChars: 9_000,
-                userCap: 900,
-                assistantCap: 1_100,
-                systemCap: 700,
-                compactionSummaryCap: 4_000,
-                toolCap: 220,
-                relevantChars: 1_600,
-                relevantItemCap: 420
-            )
-        case "ios", "mobile", "iphone", "icloud":
-            return Floors(
-                historyChars: 13_000,
-                userCap: 1_100,
-                assistantCap: 1_400,
-                systemCap: 900,
-                compactionSummaryCap: 6_000,
-                toolCap: 260,
-                relevantChars: 2_000,
-                relevantItemCap: 520
-            )
-        case "chat", "mac", "default":
-            return Floors(
-                historyChars: 22_000,
-                userCap: 1_800,
-                assistantCap: 2_200,
-                systemCap: 1_200,
-                // Sized to ChatCompactionDistiller.maxSummaryChars — on
-                // chat/mac the 22,000-char history budget can carry a full
-                // recollection AND ~10k of live turns.
-                compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
-                toolCap: 320,
-                relevantChars: 2_400,
-                relevantItemCap: 650
-            )
-        default:
-            return Floors(
-                historyChars: 11_000,
-                userCap: 1_000,
-                assistantCap: 1_200,
-                systemCap: 800,
-                compactionSummaryCap: 5_000,
-                toolCap: 240,
-                relevantChars: 1_700,
-                relevantItemCap: 460
-            )
-        }
-    }
+    /// Every door assembles the same model input; delivery owns reply limits.
+    static let floors = Floors(
+        historyChars: 22_000,
+        userCap: 1_800,
+        assistantCap: 2_200,
+        systemCap: 1_200,
+        compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
+        toolCap: 320,
+        relevantChars: 2_400,
+        relevantItemCap: 650
+    )
 
     /// Surface-independent floors (memory recall, capsule, ranked packet).
     /// These were literals at their own call sites, not in the history table.
@@ -265,12 +220,6 @@ public enum ContextBudgetPolicy {
         // Provenance (trace)
         public let windowTokens: Int?
         public let isDerived: Bool
-
-        /// The three blocks the utilization fraction governs. Bounded by
-        /// `derivedCharacterAllowance` whenever `isDerived` is true.
-        public var governedTotalChars: Int {
-            historyChars + memoryBlockChars + capsuleChars
-        }
     }
 
     /// Characters the utilization fraction allows for a given window. Exposed
@@ -303,15 +252,13 @@ public enum ContextBudgetPolicy {
     /// The one entry point. `windowTokens == nil` (unknown/unresolved model)
     /// or a window at/below `floorWindowTokens` returns the floor table with no
     /// arithmetic applied.
-    public static func resolve(windowTokens: Int?, surface: String) -> Resolved {
-        let floors = floors(forSurface: surface)
+    public static func resolve(windowTokens: Int?) -> Resolved {
         guard let windowTokens, windowTokens > floorWindowTokens else {
             return floorBudget(floors: floors, windowTokens: windowTokens)
         }
 
         let allowance = derivedCharacterAllowance(windowTokens: windowTokens)
-        // Scale is relative to the chat/mac floor total, so every surface grows
-        // proportionally from its OWN floor and never below it.
+        // Scale from the shared floor total and never below it.
         let scale = max(1.0, Double(allowance) / Double(referenceFloorTotalCharacters))
         let rowScale = min(scale, maximumRowScale)
 
@@ -376,14 +323,12 @@ public enum ContextBudgetPolicy {
     public static func resolve(
         model: String?,
         providerID: String? = nil,
-        dataRoot: URL? = nil,
-        surface: String
+        dataRoot: URL? = nil
     ) -> Resolved {
         resolve(
             windowTokens: windowTokens(
                 forModel: model, providerID: providerID, dataRoot: dataRoot
-            ),
-            surface: surface
+            )
         )
     }
 

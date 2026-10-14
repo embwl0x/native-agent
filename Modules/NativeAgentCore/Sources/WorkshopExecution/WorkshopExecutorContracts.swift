@@ -33,32 +33,10 @@ public struct WorkshopStepApprovalRequest: Sendable, Equatable {
 /// that was never filed).
 public typealias WorkshopStepApprovalStager = @Sendable (WorkshopStepApprovalRequest) async -> String?
 
-/// LLM completion for "llm"/"report"/chat.synthesize steps. Returns
-/// (model, text) — the daemon's run_codex(prompt, timeout=120) pair.
-///
-/// NOTE (synthesize-quality fix, 2026-06-11): a BARE completion via this
-/// closure has NO tool access — the model cannot read the files / memory the
-/// synthesize step is supposed to summarize, so it tends to refuse ("I can't
-/// access your filesystem"). Prefer the tool-capable closure below; this
-/// stays as the honest fallback (with a `synthesize_untooled` timeline note).
-public typealias WorkshopStepLLM = @Sendable (_ prompt: String) async throws -> (model: String, text: String)
-
-/// TOOL-CAPABLE synthesize turn (synthesize-quality fix, 2026-06-11). Same
-/// (model, text) return as the bare closure, but the prompt is run through a
-/// tool loop wired (in BackgroundLoopsAssembly) to a RESTRICTED, READ-ONLY
-/// tool set — read_file / list_dir / search_chat_history / recall_memory and
-/// their read aliases ONLY; no shell, no write tools, no workshop_submit
-/// (recursion). The autonomy gate still governs the dispatched tools. When
-/// this is wired the executor routes synthesize steps here instead of the
-/// bare `llmStep`, so the model can actually fetch what it's asked to
-/// synthesize rather than refusing for lack of access.
-public typealias WorkshopStepTooledLLM = @Sendable (_ prompt: String) async throws -> (model: String, text: String)
-
 /// Exact accounting returned by production Workshop-owned model seams. The
 /// removable count is narrower than the provider count: synthesis still
 /// needs cognition after a procedure is compiled, while orchestration/planning
-/// may disappear. Legacy tuple closures remain supported but cannot fabricate
-/// these facts.
+/// may disappear.
 public struct WorkshopStepLLMCompletion: Sendable, Equatable {
     public let model: String
     public let text: String

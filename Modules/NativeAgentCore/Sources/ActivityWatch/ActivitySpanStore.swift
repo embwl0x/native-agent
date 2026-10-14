@@ -10,26 +10,48 @@ import GRDB
 /// ONE table. There is no `activity_event` table (cut in the cold pass — it had
 /// zero readers). The `title_redacted` column holds redacted window titles.
 public actor ActivitySpanStore {
+    private actor Stores {
+        var stores: [URL: (store: ActivitySpanStore, identity: NSObject)] = [:]
+
+        func acquire(dataRoot: URL, existingOnly: Bool) throws -> ActivitySpanStore? {
+            let url = ActivityWatchPaths.databaseURL(dataRoot: dataRoot).standardizedFileURL
+            let current: NSObject?
+            do { current = try identity(at: url) }
+            catch CocoaError.fileReadNoSuchFile { current = nil }
+            catch CocoaError.fileNoSuchFile { current = nil }
+            if let cached = stores[url], let current, cached.identity.isEqual(current) {
+                return cached.store
+            }
+            stores[url] = nil
+            if existingOnly, current == nil { return nil }
+            let store = try ActivitySpanStore(databaseURL: url)
+            stores[url] = (store, try identity(at: url))
+            return store
+        }
+
+        private func identity(at url: URL) throws -> NSObject {
+            guard let identity = try url.resourceValues(forKeys: [.fileResourceIdentifierKey])
+                .fileResourceIdentifier as? NSObject else {
+                throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: url.path])
+            }
+            return identity
+        }
+    }
+
+    private static let stores = Stores()
+
+    public static func acquire(dataRoot: URL, existingOnly: Bool = false) async throws -> ActivitySpanStore? {
+        try await stores.acquire(dataRoot: dataRoot, existingOnly: existingOnly)
+    }
+
     /// W10 default retention. v0 shipped 7 d because it was a throwaway probe;
     /// v1's ceiling is 30 d (build plan W3) and it is configurable through
     /// `ActivityPolicy.retentionDays`.
     public static let defaultRetention: TimeInterval =
         Double(ActivityPolicy.defaultRetentionDays) * 86_400
 
-    /// The maintenance pass must not leave a sidecar larger than this multiple
-    /// of the durable database. A bounded WAL is evidence that checkpoints are
-    /// actually happening, rather than a journal-size pragma masking a stopped
-    /// maintenance path.
-    public static let maximumWALToDatabaseMultiplier: Int64 = 4
-
     public let databaseURL: URL
     let dbQueue: DatabaseQueue
-
-    public init(dataRoot: URL) throws {
-        let directory = ActivityWatchPaths.directory(dataRoot: dataRoot)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try self.init(databaseURL: ActivityWatchPaths.databaseURL(dataRoot: dataRoot))
-    }
 
     public init(databaseURL: URL) throws {
         let directory = databaseURL.deletingLastPathComponent()
@@ -79,31 +101,6 @@ public actor ActivitySpanStore {
         }
     }
 
-    @discardableResult
-    public func openSpan(
-        id: String = UUID().uuidString,
-        bundleId: String,
-        appName: String,
-        titleRedacted: String? = nil,
-        at timestamp: Double,
-        tzOffsetMin: Int = ActivitySpan.currentTZOffsetMinutes()
-    ) throws -> ActivitySpan {
-        let span = ActivitySpan(
-            id: id,
-            startedAt: timestamp,
-            endedAt: nil,
-            lastSeenAt: timestamp,
-            bundleId: bundleId,
-            appName: appName,
-            titleRedacted: titleRedacted,
-            eventCount: 0,
-            closeReason: nil,
-            tzOffsetMin: tzOffsetMin
-        )
-        try openSpan(span)
-        return span
-    }
-
     /// Applies one engine command. The store's write API and
     /// `ActivityStoreCommand` are one-to-one on purpose: no translation layer
     /// means no place for the live path and the simulated path to diverge.
@@ -122,10 +119,6 @@ public actor ActivitySpanStore {
         case .reconcileAbandoned:
             try reconcileAbandonedSpans()
         }
-    }
-
-    public func apply(_ commands: [ActivityStoreCommand]) throws {
-        for command in commands { try apply(command) }
     }
 
     /// One processed event: advances `last_seen_at` and bumps `event_count`.
@@ -264,29 +257,9 @@ public actor ActivitySpanStore {
 
     // MARK: - Read path
 
-    public func querySpans(
-        from: Double,
-        to: Double,
-        limit: Int = 5_000,
-        policy: ActivityPolicy? = nil
-    ) throws -> [ActivitySpan] {
-        let excluded = policy.map { Array($0.effectiveExcludedBundleIDs) } ?? []
-        return try dbQueue.read { db in
-            return try Self.fetchSpans(
-                db,
-                predicate: "started_at >= ? AND started_at <= ?",
-                arguments: [from, to],
-                excluded: excluded,
-                order: "started_at ASC",
-                limit: limit
-            )
-        }
-    }
-
     /// Spans OVERLAPPING the window — the shape every rollup needs. A span that
     /// began yesterday and ran into today belongs to today's buckets for the
-    /// part that lands in them; `querySpans`'s `started_at BETWEEN` filter drops
-    /// it entirely and silently under-reports the morning.
+    /// part that lands in them, even when its start precedes the window.
     public func spansOverlapping(
         from: Double,
         to: Double,
@@ -313,35 +286,6 @@ public actor ActivitySpanStore {
                 order: "started_at ASC",
                 limit: limit
             )
-        }
-    }
-
-    /// Exact pre-cap count for human-facing exports. `dump` must never claim a
-    /// complete history after applying its bounded display limit.
-    public func countSpansOverlapping(
-        from: Double,
-        to: Double,
-        policy: ActivityPolicy? = nil,
-        bundleID: String? = nil
-    ) throws -> Int {
-        let excluded = policy.map { Array($0.effectiveExcludedBundleIDs) } ?? []
-        return try dbQueue.read { db in
-            var predicate = "started_at <= ? AND COALESCE(ended_at, last_seen_at) >= ?"
-            var arguments: [DatabaseValueConvertible] = [to, from]
-            if let bundleID, !bundleID.isEmpty {
-                predicate += " AND bundle_id = ?"
-                arguments.append(bundleID)
-            }
-            if !excluded.isEmpty {
-                let placeholders = Array(repeating: "?", count: excluded.count).joined(separator: ", ")
-                predicate += " AND bundle_id NOT IN (\(placeholders))"
-                arguments.append(contentsOf: excluded)
-            }
-            return try Int.fetchOne(
-                db,
-                sql: "SELECT COUNT(*) FROM activity_span WHERE \(predicate)",
-                arguments: StatementArguments(arguments)
-            ) ?? 0
         }
     }
 
@@ -448,98 +392,6 @@ public actor ActivitySpanStore {
         }
     }
 
-    public func stats(
-        from: Double,
-        to: Double,
-        policy: ActivityPolicy? = nil
-    ) throws -> ActivityStats {
-        // QUERY-TIME FILTER applies to aggregates too. A count that includes an
-        // app the user just excluded is still an answer about that app.
-        let excluded = policy.map { Array($0.effectiveExcludedBundleIDs) } ?? []
-        // Explicitly NUMBERED placeholders (?3, ?4, …). The window predicate
-        // already uses ?1/?2 twice each; mixing bare `?` into a statement that
-        // reuses numbered ones is a silent-misbinding trap.
-        let exclusionClause = excluded.isEmpty
-            ? ""
-            : "AND bundle_id NOT IN ("
-                + (0..<excluded.count).map { "?\($0 + 3)" }.joined(separator: ", ")
-                + ")"
-        return try dbQueue.read { db in
-            let row = try Row.fetchOne(
-                db,
-                sql: """
-                -- OVERLAP, not "starts inside" (gpt-5.5 IMPORTANT, 2026-08-14).
-                -- A span that began before `from` and ran into the window was
-                -- being dropped entirely, and one that ran past `to` counted its
-                -- whole duration. Both skew the events/hour number that is v0's
-                -- entire reason to exist.
-                --
-                -- The denominator is the summed OBSERVED span time, clamped to
-                -- the window -- NOT first-start-to-last-end. The old denominator
-                -- swallowed every lock, sleep and idle gap between spans, so a
-                -- laptop shut for eight hours between two spans reported a rate
-                -- ~8x too low. Observed-time gives "AX callbacks per hour of
-                -- ACTIVE use", which is the number the capture design needs.
-                -- Events are PRORATED by the same overlap fraction that clamps
-                -- the denominator (gpt-5.5 IMPORTANT, 2026-08-14). Clamping only
-                -- the seconds was an asymmetry: a 2 h span carrying 100 events,
-                -- queried over its first 5 minutes, reported all 100 events
-                -- against 300 observed seconds = 1200 events/hour. Prorating
-                -- both halves of the ratio keeps the rate stable regardless of
-                -- where the window edges fall.
-                SELECT COUNT(*) AS spans,
-                       CAST(ROUND(COALESCE(SUM(
-                           event_count * CASE
-                               WHEN COALESCE(ended_at, last_seen_at) > started_at
-                               THEN MAX(0,
-                                        MIN(COALESCE(ended_at, last_seen_at), ?2)
-                                        - MAX(started_at, ?1))
-                                    / (COALESCE(ended_at, last_seen_at) - started_at)
-                               ELSE 1.0
-                           END
-                       ), 0)) AS INTEGER) AS events,
-                       COUNT(DISTINCT bundle_id) AS apps,
-                       COALESCE(SUM(
-                           MAX(0,
-                               MIN(COALESCE(ended_at, last_seen_at), ?2)
-                               - MAX(started_at, ?1))
-                       ), 0) AS observed
-                FROM activity_span
-                WHERE started_at <= ?2
-                  AND COALESCE(ended_at, last_seen_at) >= ?1
-                  \(exclusionClause)
-                """,
-                arguments: StatementArguments([from, to] as [DatabaseValueConvertible] + excluded)
-            )
-            let spans: Int = row?["spans"] ?? 0
-            let events: Int = row?["events"] ?? 0
-            let apps: Int = row?["apps"] ?? 0
-            // Boundary approximation, stated honestly: a span straddling the
-            // window edge contributes its full `event_count` against its
-            // clamped duration. Spans are minute-scale and windows are day-scale,
-            // so the edge effect is negligible; splitting would require
-            // per-event rows, which v0 deliberately does not keep.
-            let wall: Double = max(0, row?["observed"] ?? 0)
-            return ActivityStats(
-                from: from,
-                to: to,
-                totalSpans: spans,
-                totalEvents: events,
-                distinctApps: apps,
-                wallClockSeconds: wall
-            )
-        }
-    }
-
-    /// Column names actually present in `activity_span`. Used by the schema
-    /// guard test that proves no column carries a window title.
-    public func columnNames() throws -> [String] {
-        try dbQueue.read { db in
-            try Row.fetchAll(db, sql: "PRAGMA table_info(activity_span)")
-                .compactMap { $0["name"] as String? }
-        }
-    }
-
     private static func span(from row: Row) -> ActivitySpan {
         ActivitySpan(
             id: row["id"],
@@ -598,16 +450,5 @@ public actor ActivitySpanStore {
                 """)
         }
         return migrator
-    }
-}
-
-extension ActivitySpanStore {
-    /// The journal mode actually in force. Read by the retro-delete test so the
-    /// WAL-sidecar assertion cannot pass vacuously on a database that turned out
-    /// not to be in WAL mode at all.
-    public func journalMode() throws -> String {
-        try dbQueue.read { db in
-            try String.fetchOne(db, sql: "PRAGMA journal_mode") ?? "unknown"
-        }
     }
 }

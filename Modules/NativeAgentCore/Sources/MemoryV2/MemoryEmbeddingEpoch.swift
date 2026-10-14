@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import NativeAgentCore
 
 /// Immutable identity of one vector space. Dimensions alone are deliberately
 /// insufficient: backend, model/tokenizer artifacts, preprocessing, pooling,
@@ -93,5 +94,28 @@ public struct MemoryEmbeddingBatch: Sendable, Equatable {
     public init(epoch: MemoryEmbeddingEpoch, vectors: [[Float]]) {
         self.epoch = epoch
         self.vectors = vectors
+    }
+}
+
+extension SwiftNativeMemoryV2 {
+    @discardableResult
+    public func reconcileEmbeddingEpochAtLaunch() async -> Bool {
+        do {
+            let state = try await memoryEmbeddingEpochState()
+            guard let providerEpoch = embeddingEpoch() else {
+                return false
+            }
+            guard state.activeEpoch != providerEpoch.rawValue else {
+                return true
+            }
+            guard let report = try await reconcileMemoryEmbeddingEpoch() else {
+                return true
+            }
+            nativeLog("[memory-epoch] activated %@ across %d canonical rows", report.epoch, report.total)
+            return true
+        } catch {
+            nativeLog("[memory-epoch] activation failed; prior corpus retained: %@", String(describing: error))
+            return false
+        }
     }
 }

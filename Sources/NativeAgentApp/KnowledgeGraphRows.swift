@@ -291,3 +291,62 @@ private struct KGEdgeRow: View {
         .padding(.vertical, 2)
     }
 }
+
+extension KnowledgeGraphPresentation {
+    enum EntityDetailRelationships: Equatable {
+        case loading
+        case failed(String)
+        case notLoaded
+        case none
+        case loaded(count: Int)
+        case partial(visibleCount: Int, omittedUnrelatedCount: Int)
+    }
+
+    static func relationshipLabel(_ kind: String) -> String {
+        let words = kind.replacingOccurrences(of: "_", with: " ")
+        return words.prefix(1).uppercased() + words.dropFirst()
+    }
+
+    /// Relationship navigation uses the same filtered selection boundary as
+    /// the list and canvas; it never silently clears filters to reveal a node.
+    static func relationshipNavigationDestination(
+        edge: KnowledgeGraphEdge,
+        rootID: String,
+        visibleIDs: Set<String>
+    ) -> String? {
+        guard edge.from == rootID || edge.to == rootID else { return nil }
+        let destination = edge.from == rootID ? edge.to : edge.from
+        guard !destination.isEmpty, destination != rootID else { return nil }
+        return reconciledSelection(destination, visibleIDs: visibleIDs)
+    }
+
+    /// A detail response must only render edges connected to the entity whose
+    /// pane is open. Corrupt or stale rows for another root are evidence of an
+    /// incomplete response, never a relationship of the selected entity.
+    static func visibleRelationshipEdges(
+        rootID: String,
+        response: KnowledgeGraphNeighborhood?
+    ) -> [KnowledgeGraphEdge] {
+        (response?.edges ?? []).filter { $0.from == rootID || $0.to == rootID }
+    }
+
+    static func entityDetailRelationships(
+        isLoading: Bool,
+        error: String?,
+        rootID: String,
+        response: KnowledgeGraphNeighborhood?
+    ) -> EntityDetailRelationships {
+        if isLoading { return .loading }
+        if let error {
+            let detail = error.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .failed(detail.isEmpty ? "Relationship details could not be loaded." : detail)
+        }
+        guard let response else { return .notLoaded }
+        let visible = visibleRelationshipEdges(rootID: rootID, response: response)
+        let omitted = response.edges.count - visible.count
+        if omitted > 0 {
+            return .partial(visibleCount: visible.count, omittedUnrelatedCount: omitted)
+        }
+        return visible.isEmpty ? .none : .loaded(count: visible.count)
+    }
+}

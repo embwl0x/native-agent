@@ -60,6 +60,7 @@ let package = Package(
                 .product(name: "NativeAgentShared", package: "NativeAgentShared"),
                 .product(name: "NativeAgentCore", package: "NativeAgentCore"),
                 .product(name: "EngineRuntime", package: "NativeAgentCore"),
+                .product(name: "ChatSessionWork", package: "NativeAgentCore"),
                 .product(name: "AppToolRuntime", package: "NativeAgentCore"),
                 .product(name: "ApprovalTransactions", package: "NativeAgentCore"),
                 .product(name: "ApprovalInbox", package: "NativeAgentCore"),

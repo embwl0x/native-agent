@@ -20,6 +20,14 @@ public enum PeerTurnEffectPolicy {
         relativeBases: [URL] = [],
         fullMac: Bool = false
     ) -> Bool {
+        if case .object(let primitive)? = input["__authored_primitive"],
+           case .string(let operation)? = primitive["operation"],
+           case .object(let arguments)? = primitive["arguments"] {
+            let effects = AuthoredToolEffects.primitiveEffects(operation, arguments: primitive["arguments"])
+            return requiresPeerApproval(operation, capabilities: Array(Set(capabilities).union(effects)),
+                externalToolIsEffect: { _ in !effects.contains("safe_read") }, input: arguments,
+                workspaceRoot: workspaceRoot, relativeBases: relativeBases, fullMac: fullMac)
+        }
         let name = normalized(tool)
         // These dispatchers own their connection, route and executable checks.
         // A host-backed message may carry a shell capability for its transport;
@@ -27,6 +35,8 @@ public enum PeerTurnEffectPolicy {
         // claude/codex/omp_message are not exempt; they carry no shell or
         // process capability, so they card only on the floors below.
         if ["agent_message", "agent_read", "bot_ask"].contains(name) { return false }
+        // An app write can send or delete through the declared app's own reach.
+        if name == "apps_call", !AuthoredToolEffects.appReadOnly(input) { return true }
         let destructive: Set<String> = ["destructive", "filesystem_delete", "system_permission_reset"]
         if !destructive.isDisjoint(with: capabilities) { return true }
         if isPersonaSettingWrite(tool: name, input: input) { return true }
@@ -47,9 +57,9 @@ public enum PeerTurnEffectPolicy {
             // before the table is installed does a missing entry card.
             if name == "app", input["preview"] == .bool(true) { return false }
             if name == "app", !passesThrough, !action.isEmpty, appAction == nil, !AppActionPolicy.isRegistered { return true }
-            if !passesThrough, appAction?.isHis == true || appAction?.irreversible == true { return true }
             // A delete to trash is reversible, but still belongs on the delete floor.
-            if name == "app", action == "skill.delete" { return true }
+            if !passesThrough, appAction?.isHis == true || appAction?.irreversible == true
+                || appAction?.lifecycle == .drop { return true }
             if capabilities.contains("external_send"), !capabilities.contains("notification"),
                !capabilities.contains("approval_stage"),
                !["claude_message", "codex_message", "omp_message"].contains(name) { return true }
@@ -285,6 +295,9 @@ public enum PeerTurnEffectPolicy {
         // Name the act itself: through the app door that is the action, not "app".
         var shown = tool
         if tool == "app", case .string(let action)? = input["action"] { shown = action }
+        if case .object(let primitive)? = input["__authored_primitive"], case .string(let operation)? = primitive["operation"] {
+            shown = operation
+        }
         let kind: String
         if ["chat.send"].contains(shown) || tool == "github_mutate" || capabilities.contains("external_send") {
             kind = "a send in your name"
@@ -354,15 +367,16 @@ public enum PeerTurnEffectPolicy {
         }
     }
 
-    public static func memoryProvenanceRefusal(
+    public static func provenanceRefusal(
         tool: String,
         input: [String: JSONValue],
         peer: PeerIdentity,
         readPeerData: Bool = false,
         person: String? = nil
     ) -> String? {
-        guard normalized(tool) == "commit_memory" else { return nil }
         let who = peer.display
+        let name = normalized(ToolNameAliases.ranTool(tool, input: input))
+        guard name == "commit_memory" else { return nil }
         // Sol, 2026-09-15: this used to scan every argument for the substring
         // "peer", which any sentence satisfies by accident and which rejected
         // an honest "Sam told me…" because the turn only knew to look for the

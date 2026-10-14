@@ -52,11 +52,6 @@ struct AdaptiveDrainPolicy: Equatable {
         return idleInterval
     }
 
-    /// True when `lastDrainAt` is old enough that the next tick should drain.
-    func isDrainDue(now: Date, lastDrainAt: Date) -> Bool {
-        now.timeIntervalSince(lastDrainAt) >= interval(now: now)
-    }
-
     /// Delay for a one-shot fallback timer. A transport that has never drained
     /// gets one prompt fast-cadence check; after that, the timer sleeps exactly
     /// until the policy's next useful deadline instead of waking every eight

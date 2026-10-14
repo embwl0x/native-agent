@@ -82,10 +82,18 @@ extension AgentConversationExchange {
 
     static func bounded(_ history: [Self]) throws -> [Self] {
         var result = Array(history.suffix(countLimit))
-        while try JSONEncoder().encode(result).count > byteLimit, result.count > 1 { result.removeFirst() }
+        let encoder = JSONEncoder()
+        let sizes = try result.map { try encoder.encode($0).count }
+        var size = 2 + sizes.reduce(0, +) + max(0, sizes.count - 1)
+        var removed = 0
+        while size > byteLimit, result.count - removed > 1 {
+            size -= sizes[removed] + 1
+            removed += 1
+        }
+        result.removeFirst(removed)
         // JSON escaping can exceed raw UTF-8 size. Preserve the newest exchange
         // with explicit clipping even for heavily escaped source text.
-        while try JSONEncoder().encode(result).count > byteLimit, !result.isEmpty {
+        while size > byteLimit, !result.isEmpty {
             let last = result.count - 1
             if let reply = result[last].reply, reply.utf8.count > 0 {
                 result[last].reply = clipped(reply, limit: reply.utf8.count / 2).text
@@ -94,6 +102,7 @@ extension AgentConversationExchange {
                 result[last].prompt = clipped(prompt, limit: prompt.utf8.count / 2).text
                 result[last].promptTruncated = true
             } else { throw AgentConversationStore.Failure(message: "This conversation history exceeds its storage limit.") }
+            size = try encoder.encode(result).count
         }
         try validate(result)
         return result

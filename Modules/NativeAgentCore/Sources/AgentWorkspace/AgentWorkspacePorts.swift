@@ -6,6 +6,7 @@ import MacIntegration
 /// target shares values, never the store, settlement, or send authority.
 package protocol AgentWorkspaceConversationPort: Sendable {
     func refreshHealth(dataRoot: URL)
+    func liveHealth(dataRoot: URL) -> [String: AgentLocalHealth]
     func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord]
     func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord?
     func peers(dataRoot: URL) throws -> [AgentWorkspacePeer]
@@ -31,6 +32,7 @@ package struct AgentWorkspacePeer: Sendable {
 
 /// Chat-owned catalog and provenance decisions remain at the dispatch boundary.
 package protocol AgentWorkspaceToolPort: Sendable {
+    func usableAgentLanes(dataRoot: URL) -> Set<String>
     func modelVisibleCatalogToolNames(_ names: Set<String>) -> Set<String>
     /// The `app` action a tool folded into, nil for a tool of its own.
     func appAction(_ tool: String) -> String?
@@ -43,6 +45,7 @@ package protocol AgentWorkspaceToolPort: Sendable {
     /// Saved service blockers, without a network probe. Discovery keeps the
     /// action and its reason; workspace controls wait until setup is ready.
     func unreadyTools(dataRoot: URL) -> [String: String]
+    func builtAbilities(dataRoot: URL, now: Date) async -> String
 }
 
 /// Bound by the chat entry points for the whole structured workspace operation.
@@ -61,40 +64,5 @@ package enum AgentWorkspacePorts {
     package static var current: Binding {
         guard let binding else { preconditionFailure("Workspace entry point requires its owner ports") }
         return binding
-    }
-}
-
-struct AgentWorkspaceConversationReader {
-    let dataRoot: URL
-    func records() throws -> [AgentConversationRecord] {
-        try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)
-    }
-    func recordsUnlocked() throws -> [AgentConversationRecord] {
-        try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: false)
-    }
-    func find(scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord? {
-        try AgentWorkspacePorts.current.conversations.find(dataRoot: dataRoot, scopeSessionID: scopeSessionID, agent: agent, label: label)
-    }
-}
-
-struct AgentWorkspacePeerReader {
-    let dataRoot: URL
-    func list() throws -> [AgentWorkspacePeer] {
-        try AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot)
-    }
-}
-
-enum AgentWorkspaceConversationProjection {
-    static func liveHandOff(_ row: AgentConversationRecord) -> Bool {
-        AgentWorkspacePorts.current.conversations.liveHandOff(row)
-    }
-    static func unsettledAttention(_ row: AgentConversationRecord) -> Bool {
-        AgentWorkspacePorts.current.conversations.unsettledAttention(row)
-    }
-    static func workspaceChangeObservation(_ row: AgentConversationRecord,
-                                          location: AgentWorkspaceLocation,
-                                          previous: AgentWorkspaceChanges.Stamp?) -> AgentWorkspaceChanges.Observation? {
-        AgentWorkspaceChanges.evaluate(location: location,
-            result: AgentWorkspacePorts.current.conversations.presentation(row), previous: previous)
     }
 }

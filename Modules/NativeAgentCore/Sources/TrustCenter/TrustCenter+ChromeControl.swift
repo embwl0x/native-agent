@@ -20,18 +20,18 @@ extension SwiftNativeTrustCenter {
     /// cached by a relay session: every navigation,
     /// snapshot, click, fill, type, wait, and scroll calls this exact seam again.
     public func authorizeChromeControlEffect(tool: String = "browser.chrome", origin: SecurityOriginContext? = nil) async throws {
-        let policy: [String: JSONValue]
+        let snapshot: TrustPolicyAuthorizationSnapshot
         do {
-            policy = try await loadTrustPolicyChecked()
+            snapshot = try await loadAuthorizationSnapshotChecked()
         } catch {
             throw ChromeControlAuthorityError.unavailable
         }
         if let origin {
             let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-                .fullMacYoloAuthority(tool: tool, origin: origin)
+                .fullMacYoloAuthority(tool: tool, origin: origin, snapshot: snapshot)
             if authority.admitted { return }
         }
-        guard case .object(let chromePolicy)? = policy["chromeControlPolicy"],
+        guard case .object(let chromePolicy)? = snapshot.policy["chromeControlPolicy"],
               case .bool(true)? = chromePolicy["enabled"] else {
             throw ChromeControlAuthorityError.disabled
         }

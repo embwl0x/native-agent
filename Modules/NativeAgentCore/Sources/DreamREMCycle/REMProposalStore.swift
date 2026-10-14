@@ -164,22 +164,9 @@ public struct REMProposalStore: Sendable {
     /// Newest feed rows always retained after a compaction (recency + torn-read
     /// margin); older terminal rows fold to the base.
     static let compactionKeepTail = 256
-    private let compactionThreshold: Int
-    private let keepTail: Int
 
     public init(dataRoot: URL) {
         self.dataRoot = dataRoot
-        self.compactionThreshold = Self.compactionThreshold
-        self.keepTail = Self.compactionKeepTail
-    }
-
-    /// Test-only: scale the compaction trim down so a handful of rows exercise
-    /// the snapshot+tail path. `keepTail` clamps to ≥1 (an empty tail could lose
-    /// the newest row); `compactionThreshold` to ≥2.
-    init(dataRoot: URL, compactionThreshold: Int, keepTail: Int) {
-        self.dataRoot = dataRoot
-        self.compactionThreshold = max(2, compactionThreshold)
-        self.keepTail = max(1, keepTail)
     }
 
     public var proposalsURL: URL {
@@ -231,16 +218,7 @@ public struct REMProposalStore: Sendable {
         }
         var baseRows: [REMProposalRow] = []
         if let base = try readIfPresent(basePath) {
-            let value = try JSONDecoder().decode(JSONValue.self, from: base)
-            guard case .object(let object) = value, case .array(let rows)? = object["rows"] else {
-                throw PersistenceCoreError.ioFailure("REM proposal base has an invalid shape")
-            }
-            baseRows = try rows.map {
-                guard let row = Self.decodeRowJSON($0) else {
-                    throw PersistenceCoreError.ioFailure("REM proposal base has an invalid row")
-                }
-                return row
-            }
+            baseRows = try JSONDecoder().decode(REMProposalCompactionBase.self, from: base).rows
         }
         return Self.fold(feedRows: feedRows, baseRows: baseRows)
     }
@@ -281,21 +259,17 @@ public struct REMProposalStore: Sendable {
     /// folded terminal row (gpt-5.5 fix round, MED).
     func readBaseRows() -> [REMProposalRow]? {
         guard FileManager.default.fileExists(atPath: basePath.path) else { return [] }
-        guard let data = try? Data(contentsOf: basePath),
-              let jv = try? JSONDecoder().decode(JSONValue.self, from: data),
-              case .object(let obj) = jv,
-              case .array(let rows)? = obj["rows"] else {
-            nativeLog("REMProposalStore: base at %@ exists but did not decode — folding feed only",
-                  basePath.path)
-            return nil
-        }
-        let decoded = rows.compactMap(Self.decodeRowJSON)
-        guard decoded.count == rows.count else {
+        do {
+            let data = try Data(contentsOf: basePath)
+            return try JSONDecoder().decode(REMProposalCompactionBase.self, from: data).rows
+        } catch PersistenceCoreError.ioFailure("REM proposal base has an invalid row") {
             nativeLog("REMProposalStore: base at %@ contains malformed rows — folding feed only",
                   basePath.path)
-            return nil
+        } catch {
+            nativeLog("REMProposalStore: base at %@ exists but did not decode — folding feed only",
+                  basePath.path)
         }
-        return decoded
+        return nil
     }
 
     private func requireReadableBaseRows() throws -> [REMProposalRow] {
@@ -391,12 +365,12 @@ public struct REMProposalStore: Sendable {
         guard !proposals.isEmpty else { return AppendReceipt(appended: 0) }
         return try await lockCore.withFileLock(proposalsURL) {
             // Compaction can throw; finish it before committing new proposals.
-            try await self.compactIfNeededLocked()
+            let feedRows = try await self.compactIfNeededLocked()
             // Dedupe against base AND feed: an id folded to base is a settled
             // decision, and re-appending it as pending would shadow it
             // (gpt-5.5 fix round, HIGH). Corrupt base (nil) degrades to
             // feed-only dedupe — loadAll's terminal-shadow refusal still holds.
-            var seen = Set(Self.readLines(self.proposalsURL).compactMap(Self.decodeRow).map(\.id))
+            var seen = Set(feedRows.map(\.id))
             seen.formUnion((self.readBaseRows() ?? []).map(\.id))
             var buffer = Data()
             var appended = 0
@@ -648,14 +622,16 @@ public struct REMProposalStore: Sendable {
     /// hold the feed flock. A feed of only pending rows never compacts — but
     /// pending rows resolve to terminal quickly, and terminal accumulation (not
     /// pending) was the unbounded-growth failure mode.
-    private func compactIfNeededLocked() async throws {
+    @discardableResult
+    private func compactIfNeededLocked() async throws -> [REMProposalRow] {
         let feedLines = Self.readLines(proposalsURL)
         let feedRows = feedLines.compactMap(Self.decodeRow)
         // A torn or malformed physical row is repair evidence. The snapshot
         // writer only accepts decoded rows, so leave this feed intact.
-        guard feedRows.count == feedLines.count else { return }
-        guard feedRows.count >= compactionThreshold, feedRows.count > keepTail else { return }
-        let keepSuffixIDs = Set(feedRows.suffix(keepTail).map(\.id))
+        guard feedRows.count == feedLines.count else { return feedRows }
+        guard feedRows.count >= Self.compactionThreshold,
+              feedRows.count > Self.compactionKeepTail else { return feedRows }
+        let keepSuffixIDs = Set(feedRows.suffix(Self.compactionKeepTail).map(\.id))
         var toBase: [REMProposalRow] = []
         var keepInFeed: [REMProposalRow] = []
         for row in feedRows {
@@ -666,14 +642,14 @@ public struct REMProposalStore: Sendable {
                 keepInFeed.append(row)
             }
         }
-        guard !toBase.isEmpty else { return }
+        guard !toBase.isEmpty else { return feedRows }
         // FAIL CLOSED on a corrupt base: rewriting it from an "empty" merge
         // would permanently discard every previously folded terminal row.
         // Skipping compaction just leaves the feed longer until a human or a
         // repair pass restores the base (gpt-5.5 fix round, MED).
         guard let existingBase = readBaseRows() else {
             nativeLog("REMProposalStore: base unreadable — compaction skipped to avoid overwriting folded terminal rows")
-            return
+            return feedRows
         }
         // Merge into the existing base, id-keyed, newest (the just-folded row) wins.
         var byID: [String: REMProposalRow] = [:]
@@ -684,18 +660,15 @@ public struct REMProposalStore: Sendable {
             byID[r.id] = r
         }
         let mergedBase = order.compactMap { byID[$0] }
-        let base = REMProposalCompactionBase(
-            rows: mergedBase,
-            compactedAt: ISO8601DateFormatter().string(from: Date()),
-            compactedCount: mergedBase.count
-        )
+        let base = REMProposalCompactionBase(rows: mergedBase)
         try await SnapshotTailOpLog.commitCompaction(
-            baseJSON: base.toJSON(),
+            baseJSON: base.toJSON(compactedAt: ISO8601DateFormatter().string(from: Date())),
             tailRows: try keepInFeed.map(Self.encodeRowJSON),
             basePath: basePath,
             opsPath: proposalsURL,
             persistence: lockCore
         )
+        return keepInFeed
     }
 
     // MARK: Line helpers
@@ -763,13 +736,6 @@ public struct REMProposalStore: Sendable {
         return try JSONDecoder().decode(JSONValue.self, from: enc.encode(row))
     }
 
-    /// Decode one base row from its JSONValue form (tolerant — a malformed row is
-    /// skipped, mirroring the feed's per-line tolerance).
-    static func decodeRowJSON(_ value: JSONValue) -> REMProposalRow? {
-        guard let data = try? JSONEncoder().encode(value) else { return nil }
-        return try? JSONDecoder().decode(REMProposalRow.self, from: data)
-    }
-
     private static func appendData(_ data: Data, to url: URL) throws {
         let fm = FileManager.default
         let dir = url.deletingLastPathComponent()
@@ -810,15 +776,35 @@ public struct REMProposalStore: Sendable {
 /// genesis (`loadBaseRows()` → `[]`).
 struct REMProposalCompactionBase: Sendable, Equatable {
     let rows: [REMProposalRow]
-    let compactedAt: String
-    let compactedCount: Int
 
-    func toJSON() -> JSONValue {
+    func toJSON(compactedAt: String) -> JSONValue {
         .object([
             "version": .int(1),
             "compactedAt": .string(compactedAt),
-            "compactedCount": .int(Int64(compactedCount)),
+            "compactedCount": .int(Int64(rows.count)),
             "rows": .array(rows.compactMap { try? REMProposalStore.encodeRowJSON($0) }),
         ])
+    }
+}
+
+extension REMProposalCompactionBase: Decodable {
+    private enum CodingKeys: String, CodingKey { case rows }
+
+    init(from decoder: any Decoder) throws {
+        var container: any UnkeyedDecodingContainer
+        do {
+            container = try decoder.container(keyedBy: CodingKeys.self).nestedUnkeyedContainer(forKey: .rows)
+        } catch {
+            throw PersistenceCoreError.ioFailure("REM proposal base has an invalid shape")
+        }
+        var rows: [REMProposalRow] = []
+        do {
+            while !container.isAtEnd {
+                rows.append(try container.decode(REMProposalRow.self))
+            }
+        } catch {
+            throw PersistenceCoreError.ioFailure("REM proposal base has an invalid row")
+        }
+        self.init(rows: rows)
     }
 }

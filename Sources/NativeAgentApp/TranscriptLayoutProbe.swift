@@ -1,7 +1,6 @@
 import SwiftUI
 import Foundation
 import os
-import PersistenceCore
 
 /// Per-row layout cost for the chat transcript.
 ///
@@ -67,17 +66,6 @@ final class TranscriptLayoutLedger: @unchecked Sendable {
 
     private init() {}
 
-    /// Test seam: the current window's counters, without flushing them. The
-    /// ledger's whole value is that its numbers are real, so they have to be
-    /// readable by something other than the file it writes.
-    func snapshotForTesting() -> [String: RowCost]? {
-        lock.lock()
-        defer { lock.unlock() }
-        return rows
-    }
-
-    static var maximumRowsPerWindowForTesting: Int { maximumRowsPerWindow }
-
     func record(rowID: String, kind: String, nanos: UInt64) {
         lock.lock()
         if rows[rowID] == nil, rows.count >= Self.maximumRowsPerWindow {
@@ -94,7 +82,7 @@ final class TranscriptLayoutLedger: @unchecked Sendable {
         if shouldFlush { flush() }
     }
 
-    /// Writes one JSON line per window and clears the counters. Called from the
+    /// Logs the ranked window and clears the counters. Called from the
     /// record path on a timer boundary and safe to call by hand.
     func flush() {
         lock.lock()
@@ -134,23 +122,13 @@ final class TranscriptLayoutLedger: @unchecked Sendable {
             "top": ranked,
         ]
 
-        Self.logger.info(
-            "transcript layout: \(snapshot.count, privacy: .public) rows, \(totalMeasures, privacy: .public) measures, \(Double(totalNanos) / 1_000_000, privacy: .public) ms"
-        )
-
-        guard
-            let data = try? JSONSerialization.data(withJSONObject: record),
-            var line = String(data: data, encoding: .utf8)
-        else { return }
-        line.append("\n")
-        append(line)
-    }
-
-    private func append(_ line: String) {
-        let url = NativeAgentPaths.dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("transcript_layout.jsonl")
-        try? SwiftNativePersistenceCore.appendLines(Data(line.utf8), to: url)
+        do {
+            let data = try JSONSerialization.data(withJSONObject: record)
+            let line = String(decoding: data, as: UTF8.self)
+            Self.logger.info("transcript layout: \(line, privacy: .public)")
+        } catch {
+            Self.logger.error("Transcript layout diagnostic could not be encoded: \(error.localizedDescription, privacy: .public)")
+        }
     }
 }
 

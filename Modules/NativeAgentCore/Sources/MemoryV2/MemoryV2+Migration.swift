@@ -20,139 +20,6 @@ import PersistenceCore
 // refresh-only-if-the-canonical-row-is-empty, decided inside the storage write
 // (`importLegacyMemory`) rather than by a check before the embed.
 
-// MARK: - MemoryStorage seam
-//
-// The migrator depends only on this protocol; production wiring uses
-// `RealMemoryStorage` over the GRDB `MemoryStorage` actor, and the
-// MemoryV2Tests target pins an in-memory stub (moved out of this module
-// 2026-07-21 — it was cutover residue whose own comment said to delete it).
-
-public protocol MemoryV2Storage: Sendable {
-    func memoryExists(id: String) async throws -> Bool
-    func insertMemory(_ record: MemoryRecord, embedding: [Float]) async throws
-    func upsertMemory(_ record: MemoryRecord, embedding: [Float]) async throws -> Bool
-    func deleteProposal(id: String) async throws -> Bool
-    func tombstoneExists(_ key: String) async throws -> Bool
-    func insertTombstone(_ key: String) async throws
-    /// 2026-09-06: insert-if-absent / refresh-only-if-empty, with the decision
-    /// made inside the storage write. Replaces the migrator's check-then-upsert
-    /// pairs, which raced a live writer and had no way to repair a blank
-    /// canonical row behind the one-way completion sentinel.
-    func importLegacyMemory(_ record: MemoryRecord, embedding: [Float]) async throws -> MemoryLegacyImportOutcome
-}
-
-public enum MemoryLegacyImportOutcome: Sendable {
-    case inserted
-    case refreshedEmpty
-    case skippedExisting
-
-    /// True when the canonical store now holds this legacy row because of us.
-    public var landed: Bool { self != .skippedExisting }
-}
-
-public extension MemoryV2Storage {
-    /// Non-atomic fallback for storages with no transactional gate of their own
-    /// (the in-memory test stub). Same DECISION, without the atomicity.
-    func importLegacyMemory(
-        _ record: MemoryRecord,
-        embedding: [Float]
-    ) async throws -> MemoryLegacyImportOutcome {
-        if try await memoryExists(id: record.id) { return .skippedExisting }
-        try await insertMemory(record, embedding: embedding)
-        return .inserted
-    }
-}
-
-// MARK: - RealMemoryStorage — MemoryV2Storage backed by the GRDB MemoryStorage actor
-
-/// Wraps the SQLite-backed `MemoryStorage` so the migrator writes into the
-/// real on-disk store (`<dataRoot>/memory/memory.sqlite`). Constructed by
-/// MemoryV2Migrator's default init; unit tests inject an in-memory stub
-/// instead.
-public actor RealMemoryStorage: MemoryV2Storage {
-    private let storage: MemoryStorage
-
-    public init(storage: MemoryStorage) {
-        self.storage = storage
-    }
-
-    public func memoryExists(id: String) async throws -> Bool {
-        return try await storage.memory(id: id) != nil
-    }
-
-    public func insertMemory(_ record: MemoryRecord, embedding: [Float]) async throws {
-        let stored = MemoryStorageBridge.toStoredMemory(
-            record, embedding: embedding.isEmpty ? nil : embedding, embeddingEpoch: nil,
-            defaultPersonaID: Self.personaID(from: record))
-        _ = try await storage.insertMemory(stored)
-    }
-
-    public func upsertMemory(_ record: MemoryRecord, embedding: [Float]) async throws -> Bool {
-        let stored = MemoryStorageBridge.toStoredMemory(
-            record, embedding: embedding.isEmpty ? nil : embedding, embeddingEpoch: nil,
-            defaultPersonaID: Self.personaID(from: record))
-        if try await storage.memory(id: stored.id) == nil {
-            _ = try await storage.insertMemory(stored)
-            return true
-        }
-        _ = try await storage.updateMemory(
-            id: stored.id,
-            patch: MemoryPatch(
-                content: stored.content,
-                source: stored.source,
-                confidence: stored.confidence,
-                embedding: stored.embedding,
-                status: stored.status,
-                lifecycle: stored.lifecycle,
-                validFrom: stored.validFrom,
-                validTo: stored.validTo,
-                observedAt: stored.observedAt,
-                evidence: stored.evidence,
-                metadata: stored.metadata
-            )
-        )
-        return false
-    }
-
-    /// Atomic legacy-import gate — the decision happens inside the SQLite write
-    /// transaction, so a live writer cannot slip between it and the write.
-    public func importLegacyMemory(
-        _ record: MemoryRecord,
-        embedding: [Float]
-    ) async throws -> MemoryLegacyImportOutcome {
-        let stored = MemoryStorageBridge.toStoredMemory(
-            record, embedding: embedding.isEmpty ? nil : embedding, embeddingEpoch: nil,
-            defaultPersonaID: Self.personaID(from: record))
-        switch try await storage.importLegacyMemory(stored) {
-        case .inserted: return .inserted
-        case .refreshedEmpty: return .refreshedEmpty
-        case .skippedExisting: return .skippedExisting
-        }
-    }
-
-    public func deleteProposal(id: String) async throws -> Bool {
-        try await storage.deleteProposal(id: id)
-    }
-
-    public func tombstoneExists(_ key: String) async throws -> Bool {
-        return try await storage.isTombstoned(content: key)
-    }
-
-    public func insertTombstone(_ key: String) async throws {
-        try await storage.addTombstone(content: key, reason: nil)
-    }
-
-    private static func personaID(from record: MemoryRecord) -> String {
-        if case .object(let obj)? = record.extras,
-           case .string(let persona)? = obj["legacy_persona"] {
-            let trimmed = persona.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return trimmed }
-        }
-        return MemoryV2Defaults.personaID
-    }
-
-}
-
 // MARK: - MigrationReport
 
 public struct MigrationReport: Sendable, Equatable {
@@ -189,22 +56,19 @@ public struct MigrationReport: Sendable, Equatable {
 
 public actor MemoryV2Migrator {
     private let dataRoot: URL
-    private let providedStorage: (any MemoryV2Storage)?
-    private let embedder: any EmbeddingProvider
+    private let storage: MemoryStorage
+    private let providedEmbedder: (any EmbeddingProvider)?
+    private lazy var embedder: any EmbeddingProvider = providedEmbedder
+        ?? Self.defaultEmbeddingProvider(dataRoot: dataRoot)
 
-    /// Default init opens the REAL GRDB-backed `MemoryStorage` at
-    /// `<dataRoot>/memory/memory.sqlite`. If that open throws (disk perms,
-    /// schema migration failure), `providedStorage` stays nil and
-    /// `migrate()` aborts WITHOUT writing the sentinel — re-running on the
-    /// next launch then gets another chance.
     public init(
         dataRoot: URL = defaultDataRoot(),
-        storage: (any MemoryV2Storage)? = nil,
+        storage: MemoryStorage,
         embedder: (any EmbeddingProvider)? = nil
     ) {
         self.dataRoot = dataRoot
-        self.providedStorage = storage
-        self.embedder = embedder ?? Self.defaultEmbeddingProvider(dataRoot: dataRoot)
+        self.storage = storage
+        self.providedEmbedder = embedder
     }
 
     /// Pick the embedding provider for the legacy → SQLite migration pass.
@@ -249,19 +113,6 @@ public actor MemoryV2Migrator {
             return report
         }
 
-        // Resolve storage. Default: real SQLite. If the GRDB open throws we
-        // refuse to mark migration "done" — sentinel ONLY lands when we have
-        // a real store that successfully accepted the rows.
-        let storage: any MemoryV2Storage
-        if let provided = providedStorage {
-            storage = provided
-        } else if let real = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot) {
-            storage = RealMemoryStorage(storage: real)
-        } else {
-            report.errors.append("MemoryV2Migrator: real SQLite storage unavailable; sentinel NOT written")
-            return report
-        }
-
         try? fm.createDirectory(at: memoryDir, withIntermediateDirectories: true)
 
         await migrateMemories(storage: storage, into: &report)
@@ -297,7 +148,7 @@ public actor MemoryV2Migrator {
 
     // MARK: memories
 
-    private func migrateMemories(storage: any MemoryV2Storage, into report: inout MigrationReport) async {
+    private func migrateMemories(storage: MemoryStorage, into report: inout MigrationReport) async {
         let memoryFile = memoryDir.appendingPathComponent("memory.json")
         guard FileManager.default.fileExists(atPath: memoryFile.path) else { return }
         // The file EXISTS from here on — any failure to read or decode it
@@ -386,7 +237,7 @@ public actor MemoryV2Migrator {
     /// Import already-committed legacy note memories. `notes.jsonl` is the
     /// durable output of `commit_memory`; pending/rejected proposal files live
     /// elsewhere and are handled by `migrateProposals`.
-    private func migrateLegacyNotes(storage: any MemoryV2Storage, into report: inout MigrationReport) async {
+    private func migrateLegacyNotes(storage: MemoryStorage, into report: inout MigrationReport) async {
         let fm = FileManager.default
         let entries: [URL]
         do {
@@ -444,12 +295,8 @@ public actor MemoryV2Migrator {
                         report.requiredFailures += 1
                         continue
                     }
-                    // 2026-09-06: the migration retries whenever it left a
-                    // required failure behind, and `upsertMemory` UPDATES an
-                    // existing row — so a retry overwrote the canonical memory a
-                    // prior attempt had already imported (and anything that
-                    // edited it since) with the legacy text. Gated, but by
-                    // `importLegacyMemory`, not by a bare existence check: the
+                    // Retry only through the atomic import gate: a prior
+                    // attempt may have imported and then edited the row. The
                     // decision belongs inside the storage write (the coordinator
                     // is already running, so check-then-write races it), and a
                     // blank canonical row still needs a repair path or the
@@ -558,7 +405,7 @@ public actor MemoryV2Migrator {
 
     // MARK: proposals
 
-    private func migrateProposals(storage: any MemoryV2Storage, into report: inout MigrationReport) async {
+    private func migrateProposals(storage: MemoryStorage, into report: inout MigrationReport) async {
         let fm = FileManager.default
         let entries: [URL]
         do {
@@ -740,7 +587,7 @@ public actor MemoryV2Migrator {
 
     // MARK: tombstones
 
-    private func migrateTombstones(storage: any MemoryV2Storage, into report: inout MigrationReport) async {
+    private func migrateTombstones(storage: MemoryStorage, into report: inout MigrationReport) async {
         guard FileManager.default.fileExists(atPath: tombstoneFile.path) else { return }
         guard let data = try? Data(contentsOf: tombstoneFile),
               let text = String(data: data, encoding: .utf8) else {
@@ -755,8 +602,8 @@ public actor MemoryV2Migrator {
             let key = raw.trimmingCharacters(in: .whitespaces)
             if key.isEmpty || key.hasPrefix("#") { continue }
             do {
-                if try await storage.tombstoneExists(key) { continue }
-                try await storage.insertTombstone(key)
+                if try await storage.isTombstoned(content: key) { continue }
+                try await storage.addTombstone(content: key, reason: nil)
                 report.tombstonesImported += 1
             } catch {
                 report.errors.append("tombstone: \(error)")

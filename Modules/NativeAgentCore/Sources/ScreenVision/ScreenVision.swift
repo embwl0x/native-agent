@@ -72,7 +72,7 @@ public actor SwiftNativeScreenVision {
         // CURRENT state on subsequent calls (it only triggers the prompt
         // the first time), so it's safe to call here unconditionally if
         // preflight is false.
-        guard ScreenVisionPermissions.requestAccess() else {
+        guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
             throw ScreenVisionError.permissionDenied
         }
 
@@ -134,24 +134,139 @@ public actor SwiftNativeScreenVision {
         }
         return png
     }
+}
 
-    /// Returns one of: `"granted"`, `"denied"`, or `"not_determined"`.
-    ///
-    /// macOS Screen Recording is a single boolean in TCC (granted / not),
-    /// not a tri-state like camera/mic. We map preflight true → `"granted"`
-    /// and preflight false → `"denied"`. The `"not_determined"` arm is kept
-    /// in the API shape for future cross-platform parity but is never
-    /// returned on the current Mac runtime.
-    nonisolated public func permissionStatus() -> String {
-        return ScreenVisionPermissions.isAuthorized() ? "granted" : "denied"
+public enum NativeScreenCapture {
+    public enum CaptureError: LocalizedError {
+        case permissionRequired
+        case noDisplay
+        case encodingFailed
+        case tooLarge
+        // ScreenVision v1 (2026-06-06): carries the underlying
+        // ScreenCaptureKit reason when SwiftNativeScreenVision throws
+        // .captureFailed(_). The reason goes to the log; the toast says it
+        // plainly.
+        case captureFailed(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .permissionRequired:
+                return "Screen Recording permission is required for NativeAgent. Enable it in System Settings, then restart NativeAgent if macOS asks."
+            case .noDisplay:
+                return "NativeAgent could not find a display to capture."
+            case .encodingFailed:
+                return "NativeAgent captured the screen but could not encode it as an image."
+            case .tooLarge:
+                return "NativeAgent captured the screen, but the image was too large to send."
+            case .captureFailed:
+                return "NativeAgent couldn't capture the screen. Try again in a moment."
+            }
+        }
     }
 
-    /// Trigger the OS Screen Recording prompt if needed. Returns true iff
-    /// permission is granted after the call returns.
-    ///
-    /// `CGRequestScreenCaptureAccess` fires the system prompt on first call
-    /// and returns the current decision on subsequent calls.
-    public func requestPermission() async -> Bool {
-        return ScreenVisionPermissions.requestAccess()
+    public static let maxCaptureDimension = 1600
+    public static let maxCaptureBytes = 6 * 1024 * 1024
+
+    public static func captureImageBase64() async throws -> (base64: String, mime: String, name: String, byteSize: Int) {
+        // v1 vision pipeline (2026-06-06): the capture itself is delegated to
+        // the Swift-native ScreenVision module. The size-cap / re-encode path
+        // below stays here because ScreenVision returns raw PNG bytes; the
+        // chat surface still wants a JPEG-with-quality-ladder fallback for
+        // anything that would exceed `maxCaptureBytes`.
+        //
+        // ScreenVision v1 captures the primary display only. There is no
+        // display-selection argument here because accepting one we cannot
+        // honor would silently send the wrong screen on a multi-display Mac.
+
+        let png: Data
+        do {
+            png = try await SwiftNativeScreenVision().captureScreen()
+        } catch let e as ScreenVisionError {
+            // Map the ScreenVision error surface back onto the existing
+            // CaptureError cases. The underlying ScreenCaptureKit reason is
+            // logged here rather than shown in the toast.
+            switch e {
+            case .permissionDenied:
+                throw CaptureError.permissionRequired
+            case .noDisplay:
+                throw CaptureError.noDisplay
+            case .captureFailed(let reason):
+                ModuleLog.app("%@", "[screen-capture] failed: \(reason)")
+                throw CaptureError.captureFailed(reason)
+            }
+        }
+
+        // Decode the PNG back into a CGImage so the existing encodeForChat
+        // ladder (JPEG quality fallbacks, then PNG, then tooLarge) can run
+        // unchanged.
+        guard let provider = CGDataProvider(data: png as CFData),
+              let cg = CGImage(
+                pngDataProviderSource: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            throw CaptureError.encodingFailed
+        }
+        let encoded = try encodeForChat(cg)
+        return (
+            encoded.data.base64EncodedString(),
+            encoded.mime,
+            encoded.name,
+            encoded.data.count
+        )
     }
+
+    public static func encodeForChat(_ source: CGImage) throws -> (data: Data, mime: String, name: String) {
+        let image = resizedForChat(source)
+        let bitmap = NSBitmapImageRep(cgImage: image)
+        return try fittingEncodedPayload(
+            maxBytes: maxCaptureBytes,
+            jpegData: { quality in
+                bitmap.representation(using: .jpeg, properties: [.compressionFactor: quality])
+            },
+            pngData: { bitmap.representation(using: .png, properties: [:]) }
+        )
+    }
+
+    public static func fittingEncodedPayload(
+        maxBytes: Int,
+        jpegData: (Double) -> Data?,
+        pngData: () -> Data?
+    ) throws -> (data: Data, mime: String, name: String) {
+        for quality in [0.78, 0.65, 0.52, 0.40] {
+            if let jpeg = jpegData(quality), jpeg.count <= maxBytes {
+                return (jpeg, "image/jpeg", "screen.jpg")
+            }
+        }
+        if let png = pngData(), png.count <= maxBytes {
+            return (png, "image/png", "screen.png")
+        }
+        throw CaptureError.tooLarge
+    }
+
+    public static func resizedForChat(_ source: CGImage) -> CGImage {
+        let width = source.width
+        let height = source.height
+        let largest = max(width, height)
+        guard largest > maxCaptureDimension else { return source }
+        let scale = CGFloat(maxCaptureDimension) / CGFloat(largest)
+        let targetWidth = max(1, Int(CGFloat(width) * scale))
+        let targetHeight = max(1, Int(CGFloat(height) * scale))
+        guard let context = CGContext(
+            data: nil,
+            width: targetWidth,
+            height: targetHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return source
+        }
+        context.interpolationQuality = .high
+        context.draw(source, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        return context.makeImage() ?? source
+    }
+
 }

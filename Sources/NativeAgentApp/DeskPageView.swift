@@ -1,3 +1,4 @@
+import StandingBots
 // DeskPageView.swift
 // The primary Desk: canonical work in plain words, with item actions in place.
 // Store, execution, GitHub and schedule lanes retain their own failure states.
@@ -16,61 +17,6 @@ import NativeAgentShared
 import ApprovalInbox
 import NotificationInbox
 
-// MARK: - Words
-
-/// Counts on this page are spelled, the way Today spells them. `TodayWords`
-/// stops at ten (its lists are never longer); a desk is, so the same rule is
-/// carried up to nine hundred and ninety-nine and falls back to numerals past
-/// that rather than inventing a mouthful.
-enum DeskPageWords {
-    private static let ones = [
-        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
-        "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
-        "sixteen", "seventeen", "eighteen", "nineteen",
-    ]
-    private static let tens = [
-        "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
-        "eighty", "ninety",
-    ]
-
-    /// Mid-sentence: "twenty-one", "a hundred and twenty-one".
-    static func spelledLower(_ count: Int) -> String {
-        guard count >= 0 else { return String(count) }
-        if (1...10).contains(count) { return TodayWords.spelledLower(count) }
-        return lower(count)
-    }
-
-    /// Sentence-leading: "Twenty-one".
-    static func spelled(_ count: Int) -> String {
-        if (1...10).contains(count) { return TodayWords.spelled(count) }
-        return TodayWords.capitalizedFirst(spelledLower(count))
-    }
-
-    private static func lower(_ count: Int) -> String {
-        if count < 20 { return ones[count] }
-        if count < 100 {
-            let tensWord = tens[count / 10]
-            return count % 10 == 0 ? tensWord : "\(tensWord)-\(ones[count % 10])"
-        }
-        if count < 1_000 {
-            let hundreds = count / 100
-            let head = hundreds == 1 ? "a hundred" : "\(ones[hundreds]) hundred"
-            return count % 100 == 0 ? head : "\(head) and \(lower(count % 100))"
-        }
-        return String(count)
-    }
-
-    static func plural(_ count: Int, _ singular: String, _ plural: String) -> String {
-        count == 1 ? singular : plural
-    }
-
-    /// "a hundred and five" is right after "I'm watching" and wrong after "the
-    /// other". The article goes when a determiner already leads the phrase.
-    static func withoutArticle(_ words: String) -> String {
-        words.hasPrefix("a ") ? String(words.dropFirst(2)) : words
-    }
-}
-
 // MARK: - Metrics
 
 enum DeskPageMetrics {
@@ -86,299 +32,12 @@ enum DeskPageMetrics {
     static let finishedRowCap = 5
 }
 
-// MARK: - The snapshot
-
-/// One read of every store this page renders, taken off the main actor. Each
-/// lane keeps its own honesty: a lane that could not be read contributes zero
-/// rows AND a reason, never silent calm.
-struct DeskPageSnapshot: Sendable {
-    var loaded = false
-    var items: [DeskItem] = []
-    var deskUnavailable: String?
-    var generatedTs: String?
-    var executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord> = .rows([])
-    var github: DeskLaneState<GitHubCommandItem> = .rows([])
-    /// The same derived sequencing the projection renders (blockers, held
-    /// rows, subtree rollups). Computed ONCE per read, off the main actor,
-    /// because the projects lane asks it a question per row and `body` runs
-    /// far more often than the board changes.
-    var plan = DeskSequencing.Plan()
-    var overview: WorkOverview?
-
-    static let empty = DeskPageSnapshot()
-
-    /// One canonical board read, with sequencing derived from those same items.
-    static func load(desk: DeskFacade) async -> DeskPageSnapshot {
-        let read = await desk.loadBoard(includeOverview: true)
-        var snapshot = DeskPageSnapshot()
-        snapshot.loaded = true
-        // Her MY QUEUE is hers, not a row on his board.
-        snapshot.items = read.items.filter { $0.project != MyQueue.project }
-        snapshot.deskUnavailable = read.deskError
-        snapshot.generatedTs = read.deskState?.generatedTs
-        snapshot.executions = read.executions
-        snapshot.overview = read.overview
-        snapshot.github = read.github
-        snapshot.plan = DeskSequencing.compute(
-            DeskState(items: snapshot.items, generatedTs: ""))
-        return snapshot
-    }
-}
-
-// MARK: - What the page says about that snapshot
-
-/// Pure projections over the canonical board.
-enum DeskPageContent {
-    static func active(_ items: [DeskItem]) -> [DeskItem] {
-        DeskBoardLayout.activeItems(items)
-    }
-
-    /// His to clear: a live row that names the owner as the party it waits on.
-    static func waitingOnOwner(_ items: [DeskItem]) -> [DeskItem] {
-        DeskAttentionStrip.sortedDeskItems(active(items).filter(OwnerAttentionPolicy.waitsOnOwner))
-    }
-
-    /// Visible blocks that do not wait on the owner.
-    static func blocked(_ items: [DeskItem]) -> [DeskItem] {
-        DeskAttentionStrip.sortedDeskItems(
-            active(items)
-                .filter(DeskItemPresentation.needsEyes)
-                .filter { !OwnerAttentionPolicy.waitsOnOwner($0) })
-    }
-
-    // MARK: projects
-
-    /// The ordinary projects — the ones he handed over and nobody is running
-    /// this second. They had no lane on this page at all: a project with a
-    /// plan under it appeared only once a delegation family or a Workshop
-    /// execution existed, so "the conference" was invisible between the day he
-    /// asked for it and the day something started executing.
-    ///
-    /// Everything already shown elsewhere is subtracted, so no row is said
-    /// twice: the waiting card owns his questions, the blocked fold owns the
-    /// stuck ones, and "what I'm working on" owns the families.
-    static func projects(_ items: [DeskItem], excluding shown: Set<String>) -> [DeskItem] {
-        active(items)
-            .filter { $0.parent == nil }
-            .filter { $0.kind == .project || $0.kind == .plan }
-            .filter { [.now, .next, .todo].contains($0.status) }
-            .filter { !OwnerAttentionPolicy.waitsOnOwner($0) }
-            .filter { !DeskItemPresentation.needsEyes($0) }
-            .filter { !shown.contains($0.handle) }
-    }
-
-    /// One sentence about where a project actually stands: what is holding it,
-    /// or what comes next, or — when the board says nothing — that nothing is
-    /// named. Derived from the same sequencing plan the projection renders, so
-    /// this line and the desk text cannot disagree.
-    static func projectLine(_ item: DeskItem, in state: DeskState, plan: DeskSequencing.Plan) -> String {
-        let itemPlan = plan.byHandle[item.handle]
-        if let blockers = itemPlan?.effectiveBlockers, !blockers.isEmpty {
-            let named = blockers.compactMap { handle in
-                state.items.first { $0.handle == handle }?.title
-            }
-            if let first = named.first {
-                let more = named.count - 1
-                return "Held by \(TodayWords.line(first, limit: 70))"
-                    + (more > 0 ? " and \(DeskPageWords.spelledLower(more)) more." : ".")
-            }
-        }
-        if let next = nextStep(item, in: state, plan: plan) {
-            return "Next: \(TodayWords.line(next.title, limit: 80))."
-        }
-        if let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !summary.isEmpty {
-            return TodayWords.line(summary, limit: 96)
-        }
-        return "No next step written down yet."
-    }
-
-    /// The first child that could actually be started: `now` over `next` over
-    /// `todo`, and never one the plan says is held. A held child is not a next
-    /// step — advertising it is how a board lies about being ready.
-    static func nextStep(
-        _ item: DeskItem,
-        in state: DeskState,
-        plan: DeskSequencing.Plan
-    ) -> DeskItem? {
-        let kids = state.children(of: item.handle)
-            .filter { !$0.status.isTerminal }
-            .filter { plan.byHandle[$0.handle]?.isReady ?? true }
-        for status in [DeskStatus.now, .next, .todo] {
-            if let hit = kids.first(where: { $0.status == status }) { return hit }
-        }
-        return nil
-    }
-
-    static func watches(_ items: [DeskItem]) -> [DeskItem] {
-        DeskBoardLayout.watches(active(items))
-    }
-
-    /// The watches still worth his eye: everything that has moved inside the
-    /// week. A stale one recedes into the fold below on its own, and one update
-    /// brings it straight back here — no housekeeping, nothing lost.
-    static func freshWatches(_ items: [DeskItem], now: Date) -> [DeskItem] {
-        let quiet = Set(staleWatches(items, now: now).map(\.handle))
-        return watches(items).filter { !quiet.contains($0.handle) }
-    }
-
-    /// Watch rows untouched past the freshness threshold
-    /// that are not already counted as blocked or flagged.
-    static func staleWatches(_ items: [DeskItem], now: Date) -> [DeskItem] {
-        watches(items).filter { item in
-            guard item.status != .blocked, item.status != .flag else { return false }
-            guard let at = UserDisplayFormatters.parseISOTimestamp(item.updatedAt) else { return false }
-            return Int(now.timeIntervalSince(at) / 86_400) >= DeskItemPresentation.staleThresholdDays
-        }
-    }
-
-    /// One plain sentence for why a row is stuck. The inspector keeps the
-    /// whole stamped reason on every row, which is how twenty-one items became
-    /// a wall of the same paragraph; this cuts at a word boundary and never
-    /// carries markdown. Without a written reason, the open items it waits on
-    /// or its latest note say why before "no reason" does.
-    static func stuckReason(_ item: DeskItem, in items: [DeskItem]) -> String {
-        if let raw = item.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !raw.isEmpty {
-            return TodayWords.line(raw, limit: 96)
-        }
-        if let waiting = item.waitingOn?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !waiting.isEmpty {
-            return "Waiting on \(TodayWords.line(waiting, limit: 60))."
-        }
-        let blockers = items.filter { item.blockedOn.contains($0.handle) && !$0.status.isTerminal }
-        if !blockers.isEmpty {
-            return "Blocked on " + blockers.map { "desk.\($0.alias)" }.joined(separator: ", ") + "."
-        }
-        if let note = item.notes.last?.text.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty {
-            return "Last note: \(TodayWords.line(note, limit: 96))"
-        }
-        return "Blocked, with no reason written down."
-    }
-
-    static func itemDetail(_ item: DeskItem, in items: [DeskItem]) -> String {
-        if item.status == .blocked { return stuckReason(item, in: items) }
-        if let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !summary.isEmpty {
-            return TodayWords.line(summary, limit: 96)
-        }
-        if item.status == .flag { return "Flagged for a second look." }
-        return item.status.displayLabel.capitalized
-    }
-
-    static func title(_ item: DeskItem) -> String {
-        let named = TodayWords.line(item.title, limit: 110)
-        return named.isEmpty ? item.handle : named
-    }
-
-    // MARK: GitHub
-
-    static func githubNeedingAHand(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        DeskAttentionStrip.sortedGitHubItems(
-            items.filter { DeskGitHubBucket.bucket(for: $0.state) == .actionNeeded })
-    }
-
-    static func githubNeedsOwner(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        DeskAttentionStrip.sortedGitHubItems(
-            items.filter { DeskGitHubBucket.bucket(for: $0.state) == .needsOwner })
-    }
-
-    static func githubAttention(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        DeskAttentionStrip.sortedGitHubItems(
-            items.filter { DeskGitHubBucket.bucket(for: $0.state) == .attention })
-    }
-
-    static func githubRest(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
-        let claimed = Set(
-            (githubNeedingAHand(items) + githubNeedsOwner(items) + githubAttention(items)).map(\.itemId))
-        return DeskAttentionStrip.sortedGitHubItems(items.filter { !claimed.contains($0.itemId) })
-    }
-
-    /// The remainder fold holds everything the three attention groups did not
-    /// claim: work in progress, work waiting upstream, and work already closed.
-    /// Closed work is finished, not moving, and waiting is not movement either,
-    /// so the title counts what the fold actually holds.
-    static func githubRestTitle(_ rest: [GitHubCommandItem]) -> String {
-        let closed = rest.filter { DeskGitHubBucket.bucket(for: $0.state) == .resolved }.count
-        let open = rest.count - closed
-        let others = rest.count == 1
-            ? "The other one"
-            : "The other \(DeskPageWords.withoutArticle(DeskPageWords.spelledLower(rest.count)))"
-        let verb = rest.count == 1 ? "is" : "are"
-        if open == 0 { return "\(others) \(verb) closed" }
-        if closed == 0 { return "\(others) \(verb) open, none needing a hand" }
-        return "\(others): \(DeskPageWords.spelledLower(open)) still open, "
-            + "\(DeskPageWords.spelledLower(closed)) closed"
-    }
-
-    /// "a hundred and twenty-one pull requests, sixteen need a hand". The noun
-    /// tells the truth about the mix: the watcher tracks issues too.
-    static func githubHeadline(_ items: [GitHubCommandItem]) -> String {
-        let total = items.count
-        let hands = githubNeedingAHand(items).count + githubNeedsOwner(items).count
-            + githubAttention(items).count
-        let allPRs = items.allSatisfy { $0.kind == .pullRequest }
-        let noun: String
-        if allPRs {
-            noun = DeskPageWords.plural(total, "pull request", "pull requests")
-        } else {
-            noun = "pull requests and issues"
-        }
-        let head = "I'm watching \(DeskPageWords.spelledLower(total)) \(noun)"
-        guard hands > 0 else { return head + ", none of them need a hand" }
-        return "\(head), \(DeskPageWords.spelledLower(hands)) need\(hands == 1 ? "s" : "") a hand"
-    }
-
-    static func githubTitle(_ item: GitHubCommandItem) -> String {
-        let named = TodayWords.line(item.title, limit: 110)
-        return named.isEmpty ? "\(item.repository) #\(item.number)" : named
-    }
-
-    /// repo · number · state-as-a-word · when. No pill, no colour.
+extension DeskPageContent {
     static func githubMeta(_ item: GitHubCommandItem, now: Date) -> String {
         let state = DeskGitHubStatePillPresentation.pill(for: item).label.lowercased()
         let when = DeskRelativeTimePresentation.text(
             forISO: item.motorUpdatedAt ?? item.updatedAt, now: now)
         return "\(item.repository) · #\(item.number) · \(state) · \(when)"
-    }
-
-    // MARK: Schedule
-
-    /// Only enabled jobs run. The rows beneath this headline already say
-    /// "Paused." for the rest, so counting every saved record made the fold
-    /// contradict its own contents.
-    /// A missed occurrence is neither running nor paused, so it is counted on
-    /// its own: nothing ran, and the page says so instead of staying silent.
-    /// `bots` is the unpaused bots on a schedule; each one runs on a timer too.
-    static func scheduleHeadline(_ jobs: [ScheduledJob], missed: Int = 0, bots: Int = 0) -> String {
-        let paused = jobs.count - jobs.filter(\.enabled).count
-        let running = jobs.count - paused + bots
-        var tail = paused > 0 ? ", \(DeskPageWords.spelledLower(paused)) paused" : ""
-        if missed > 0 { tail += ", \(DeskPageWords.spelledLower(missed)) missed" }
-        if running == 0 {
-            guard paused > 0 || missed > 0 else { return "Nothing runs on a timer" }
-            return "Nothing runs on a timer" + tail
-        }
-        return "\(DeskPageWords.spelled(running)) "
-            + "\(DeskPageWords.plural(running, "thing runs", "things run")) on a timer" + tail
-    }
-
-    static func scheduleLine(_ job: ScheduledJob) -> String {
-        if let once = job.onceScheduleDescription {
-            return job.enabled ? once : "\(once) Paused."
-        }
-        guard job.enabled else { return "Paused." }
-        guard let seconds = job.intervalSeconds, seconds > 0 else { return "On its own schedule." }
-        if seconds % 86_400 == 0 {
-            let days = seconds / 86_400
-            return days == 1 ? "Once a day." : "Every \(DeskPageWords.spelledLower(days)) days."
-        }
-        if seconds % 3_600 == 0 {
-            let hours = seconds / 3_600
-            return hours == 1 ? "Every hour." : "Every \(DeskPageWords.spelledLower(hours)) hours."
-        }
-        let minutes = max(1, seconds / 60)
-        return minutes == 1 ? "Every minute." : "Every \(DeskPageWords.spelledLower(minutes)) minutes."
     }
 }
 
@@ -403,7 +62,7 @@ struct DeskPageView: View {
     @State private var readCount = 0
     @State private var now = Date()
     @State private var openFolds: Set<String> = []
-    @State private var projectRows: [ProjectRow] = []
+    @State private var projectRows: [DeskPageContent.ProjectRow] = []
     @State private var sheet: DeskPageSheet?
     @State private var actionNotice: DeskActionNotice?
     @State private var actionInFlight: String?
@@ -418,6 +77,7 @@ struct DeskPageView: View {
     @State private var liveUpdateError: String?
     @State private var liveSubscriberID = UUID()
     @State private var liveUpdatesMounted = false
+    @State private var watchGeneration: UInt64 = 0
     @State private var vetoHandler = WorkshopObservatoryVetoHandler(
         dataRoot: PersistenceCore.defaultDataRoot())
     /// Only the NEWEST read may publish. `reload()` is called from racing
@@ -513,7 +173,7 @@ struct DeskPageView: View {
                         AliveEyebrow("Projects")
                         let parked = projectRows.filter(\.parked)
                         let parkedOpen = openFolds.contains(Fold.parked)
-                        AliveGroupCard {
+                        AliveGroupCard(lazy: true) {
                             ForEach(projectRows.filter { !$0.parked }) { row in projectRow(row) }
                             if !parked.isEmpty {
                                 Button { toggleFold(Fold.parked) } label: {
@@ -617,11 +277,12 @@ struct DeskPageView: View {
             guard !quietOffscreenRead else { return }
             liveUpdatesMounted = true
             appModel.deskHoldsCommandPalette = true
-            bindLiveUpdates()
+            await bindLiveUpdates()
         }
         .onDisappear {
             guard !quietOffscreenRead else { return }
             liveUpdatesMounted = false
+            watchGeneration &+= 1
             appModel.deskHoldsCommandPalette = false
             DeskLiveReloader.shared.deactivate(subscriber: liveSubscriberID)
         }
@@ -679,7 +340,7 @@ struct DeskPageView: View {
 
     // MARK: waiting on you
 
-    private var ownerItems: [DeskItem] { DeskPageContent.waitingOnOwner(items) }
+    @State private var ownerItems: [DeskItem] = []
 
     private var headerLine: String? { snapshot.overview?.headline }
 
@@ -724,7 +385,7 @@ struct DeskPageView: View {
                     .contextMenu {
                         if row.reference.kind == .desk,
                            let item = items.first(where: { $0.handle == row.reference.id }), item.requiresOwnerInput {
-                            Button("Reply") { askAbout(Self.draft(about: item)) }
+                            Button("Reply") { askAbout(DeskPageContent.draft(about: item)) }
                             Button("Already handled") { close(item) }
                         }
                     }
@@ -733,35 +394,9 @@ struct DeskPageView: View {
         }
     }
 
-    /// "Running, step two of five." + "3m ago" → "Running, step two of five · 3m ago".
-    private static func detail(_ parts: String...) -> String {
-        parts
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .map { $0.hasSuffix(".") ? String($0.dropLast()) : $0 }
-            .filter { !$0.isEmpty }
-            .joined(separator: " · ")
-    }
-
     // MARK: projects
 
-    private struct ProjectRow: Identifiable {
-        let id: String
-        let title: String
-        let line: String
-        let meta: String
-        /// The plan's "x of y done", when the board has one; the row then
-        /// shows a bar instead of `meta`.
-        var done: Int? = nil
-        var total: Int? = nil
-        let draft: String
-        /// Untouched for two weeks, or a 0-of-N plan nobody has moved in a
-        /// week: it sits in the folded "Parked" group, not with the live work.
-        var parked = false
-    }
-
-    private var deskState: DeskState { DeskState(items: items, generatedTs: "") }
-
-    private func projectRow(_ row: ProjectRow) -> some View {
+    private func projectRow(_ row: DeskPageContent.ProjectRow) -> some View {
         DeskProjectRow(
             title: row.title,
             line: row.line,
@@ -780,48 +415,6 @@ struct DeskPageView: View {
     /// they read as one piece of work again.
     /// Derived once per load: `body` asked for it several times per redraw,
     /// and each ask rebuilt every row and parsed every timestamp.
-    private func computeProjectRows() -> [ProjectRow] {
-        guard snapshot.deskUnavailable == nil else { return [] }
-        let state = deskState
-        let plan = snapshot.plan
-        let evidence = DeskMovementPresentation.evidence(snapshot.executions.items)
-        let familyParents = Set(DeskProgramFamilyPresentation.families(from: laneOfItems, executions: snapshot.executions, now: now).map(\.id))
-        let rows = DeskPageContent.projects(items, excluding: familyParents)
-        return rows.map { item in
-            let handles = DeskParking.subtreeHandles(item.handle, in: state)
-            let live = snapshot.executions.items
-                .filter { $0.deskHandle.map(handles.contains) ?? false }
-                .filter { DeskParking.executionIsLive(status: $0.status) }
-                .sorted { $0.updatedAt > $1.updatedAt }
-                .first
-            let activity = DeskMovementPresentation.activity(item, evidence: evidence[item.handle], now: now).label
-            var meta = Self.detail(activity, DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
-            var counts: (done: Int, total: Int)?
-            if let live {
-                let label = DeskActivityState.execution(.init(deskHandle: live.deskHandle, status: live.status, updatedAt: live.updatedAt, lastMovementAt: live.lastMovementAt), now: now).label
-                let step = DeskExecutionPresentation.progress(
-                    status: live.status,
-                    planCount: live.plan.count,
-                    completedCount: live.stepsCompleted.count)
-                meta = step.map { "\(label), \($0)" } ?? label
-            } else if let itemPlan = plan.byHandle[item.handle], itemPlan.totalCount > 0 {
-                meta = Self.detail(activity, "\(itemPlan.doneCount) of \(itemPlan.totalCount) done")
-                counts = (itemPlan.doneCount, itemPlan.totalCount)
-            }
-            // One Parked rule, shared with the agent's home (DeskParking).
-            let parked = DeskParking.isParked(item, in: state, plan: plan, live: live != nil, now: now)
-            return ProjectRow(
-                id: item.handle,
-                title: DeskPageContent.title(item),
-                line: DeskPageContent.projectLine(item, in: state, plan: plan),
-                meta: meta,
-                done: counts?.done,
-                total: counts?.total,
-                draft: Self.draft(about: item),
-                parked: parked)
-        }
-    }
-
     /// The families projection wants the lane state, not the bare array, so a
     /// failed desk read contributes no families rather than a false calm.
     private var laneOfItems: DeskLaneState<DeskItem> {
@@ -844,23 +437,12 @@ struct DeskPageView: View {
         static let history = "history"
     }
 
-    private var blockedItems: [DeskItem] { DeskPageContent.blocked(items) }
-    /// Only the watches that have moved this week. The quiet ones are named
-    /// once, in the grey line at the foot of the page.
-    private var watchItems: [DeskItem] { DeskPageContent.freshWatches(items, now: now) }
-    private var staleItems: [DeskItem] { DeskPageContent.staleWatches(items, now: now) }
-    private var otherItems: [DeskItem] {
-        let shown = Set(ownerItems.map(\.handle) + blockedItems.map(\.handle)
-                        + watchItems.map(\.handle) + staleItems.map(\.handle) + projectRows.map(\.id))
-        return DeskAttentionStrip.sortedDeskItems(DeskPageContent.active(items).filter { !shown.contains($0.handle) })
-    }
-    private var historyItems: [DeskItem] {
-        DeskAttentionStrip.sortedDeskItems(items.filter { $0.status.isTerminal })
-    }
-    private var historyExecutions: [WorkshopExecution.WorkshopExecutionRecord] {
-        snapshot.executions.items.filter { ["completed", "failed", "cancelled"].contains($0.status) }
-            .sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
-    }
+    @State private var blockedItems: [DeskItem] = []
+    @State private var watchItems: [DeskItem] = []
+    @State private var staleItems: [DeskItem] = []
+    @State private var otherItems: [DeskItem] = []
+    @State private var historyItems: [DeskItem] = []
+    @State private var historyExecutions: [WorkshopExecution.WorkshopExecutionRecord] = []
 
     private var boardIsEmpty: Bool {
         blockedItems.isEmpty && watchItems.isEmpty && otherItems.isEmpty
@@ -1235,9 +817,9 @@ struct DeskPageView: View {
         switch liveActivity {
         case .quiet:
             EmptyView()
-        case .unavailable(let notice):
+        case .unavailable(let reason):
             if snapshot.loaded {
-                Text("\(notice.title): \(notice.detail)").font(.caption).foregroundStyle(.orange)
+                Text("Live Activity unavailable: \(reason)").font(.caption).foregroundStyle(.orange)
             }
         case .rows(let content):
             VStack(alignment: .leading, spacing: 8) {
@@ -1303,7 +885,7 @@ struct DeskPageView: View {
         actionNotice = nil
         let router = DeskToolDispatchRouter(dataRoot: PersistenceCore.defaultDataRoot())
         Task { @MainActor in
-            let outcome = await DeskActionRunner.perform(action, via: router)
+            let outcome = await router.perform(action)
             actionNotice = DeskActionNotice(text: outcome.message, isError: !outcome.ok)
             await reload()
             actionInFlight = nil
@@ -1318,20 +900,9 @@ struct DeskPageView: View {
         Task { @MainActor in
             let outcome = await handler.veto(handle)
             actionNotice = DeskPursuitVetoNotice.receipt(for: outcome)
-            if WorkshopObservatoryVetoPresentation.shouldRefresh(after: outcome) { await reload() }
+            if outcome.shouldRefresh { await reload() }
             actionInFlight = nil
         }
-    }
-
-    private static func readHerHour(dataRoot: URL, now: Date) async -> (state: DeskHerHourPresentation.State, nextRefreshAt: Date?) {
-        guard await NativeCognitionRuntime.studioWanderIsInstalled(dataRoot: dataRoot) else { return (.absent, nil) }
-        let state: StudioWanderLane.State
-        do { state = try await StudioWanderLane.loadState(dataRoot: dataRoot) }
-        catch { return (.line(text: "Her hour’s saved state is unavailable.", symbol: "exclamationmark.triangle"), nil) }
-        let presentation = DeskHerHourPresentation.state(installed: true, entry: state.trace.last, now: now)
-        let deadline = state.trace.last.flatMap { UserDisplayFormatters.parseISOTimestamp($0.at) }
-            .map { DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: now) }
-        return (presentation, deadline)
     }
 
     /// The canonical mutation seam — one
@@ -1349,17 +920,6 @@ struct DeskPageView: View {
     @MainActor
     private func askAbout(_ draft: String) {
         NotificationCenter.default.post(name: .openChatDraftRequest, object: draft)
-    }
-
-    /// What a row says when it reaches Chat: the item by handle, and the reason
-    /// she stored — whole, not the row's shortened line.
-    private static func draft(about item: DeskItem) -> String {
-        let reason = [item.blockedReason, item.waitingOn]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
-        var draft = "Desk item \(item.handle): \(item.title)"
-        if let reason { draft += "\n\nWhat you wrote: \(reason)" }
-        return draft
     }
 
     /// A click on a Desk reminder banner names an item; bringing THAT item into
@@ -1398,50 +958,24 @@ struct DeskPageView: View {
         DeskLiveReloader.shared.sourceDidChange(subscriber: liveSubscriberID)
     }
 
-    private func bindLiveUpdates() {
+    private func bindLiveUpdates() async {
         guard !quietOffscreenRead, liveUpdatesMounted else { return }
+        watchGeneration &+= 1
+        let generation = watchGeneration
         do {
-            liveUpdateError = DeskLiveReloader.shared.activate(
+            let paths = try await Task.detached(priority: .utility) {
+                try await DeskFacade(dataRoot: PersistenceCore.defaultDataRoot()).liveUpdatePaths()
+            }.value
+            guard !Task.isCancelled, liveUpdatesMounted, generation == watchGeneration else { return }
+            liveUpdateError = nil
+            DeskLiveReloader.shared.activate(
                 subscriber: liveSubscriberID,
-                paths: try Self.liveUpdatePaths(dataRoot: PersistenceCore.defaultDataRoot()),
+                paths: paths,
                 reload: { _ = await reload() })
         } catch {
+            guard !Task.isCancelled, liveUpdatesMounted, generation == watchGeneration else { return }
             liveUpdateError = UserFacingError.message(error, action: "turn on Desk live updates")
         }
-    }
-
-    /// Exact sources formerly covered by the page's poll. Watching the record
-    /// names in every existing directory also catches a first write after a
-    /// reservation, and repairs to a record that could not yet be decoded.
-    private static func liveUpdatePaths(dataRoot: URL) throws -> [URL] {
-        let executions = dataRoot.appendingPathComponent("workshop/executions", isDirectory: true)
-        var paths = [
-            SwiftNativeDeskStore(dataRoot: dataRoot).opsPath,
-            SwiftNativeDeskStore(dataRoot: dataRoot).basePath,
-            SwiftNativeApprovalInbox(root: dataRoot).approvalsPath,
-            LiveNotificationInbox.livePath(dataRoot: dataRoot),
-            GitHubCommandStore(dataRoot: dataRoot).opsPath,
-            GitHubCommandStore(dataRoot: dataRoot).basePath,
-            executions,
-            DeskFacade(dataRoot: dataRoot).jobsPath,
-            dataRoot.appendingPathComponent("bots/definitions", isDirectory: true),
-            dataRoot.appendingPathComponent("bots/runner-jobs.json"),
-            DeskNagConfigStore(dataRoot: dataRoot).configPath,
-            StudioWanderLane.statePath(dataRoot: dataRoot),
-            dataRoot.appendingPathComponent("trust/policy.json"),
-        ]
-        let directories: [URL]
-        do {
-            directories = try FileManager.default.contentsOfDirectory(
-                at: executions, includingPropertiesForKeys: [.isDirectoryKey])
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return paths
-        }
-        for directory in directories where try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
-            paths.append(ExecutionRecordFile.canonicalPath(in: directory))
-            paths.append(ExecutionRecordFile.legacyPath(in: directory))
-        }
-        return paths
     }
 
     /// Returns true only when this read published its snapshot: a cancelled
@@ -1458,74 +992,26 @@ struct DeskPageView: View {
         _ = await appModel.refreshSchedulerJobs()
         // The page's own root, the one its actions and bot reads use.
         let desk = DeskFacade(dataRoot: PersistenceCore.defaultDataRoot())
-        let loaded = await Task.detached(priority: .userInitiated) {
-            await DeskPageSnapshot.load(desk: desk)
+        let (loaded, missed, timed, presentationNow, loadedNags, hour, hourUnavailable) = await desk.loadPage()
+        let loadedHour = hourUnavailable
+            ? DeskHerHourPresentation.State.line(text: "Her hour’s saved state is unavailable.", symbol: "exclamationmark.triangle")
+            : DeskHerHourPresentation.state(installed: true, entry: hour, now: presentationNow)
+        let hourExpiry = hour.flatMap { UserDisplayFormatters.parseISOTimestamp($0.at) }
+            .map { DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: presentationNow) }
+        let jobStamps = appModel.engine.desk.jobs.compactMap(\.nextRunAt)
+        let projection = await Task.detached(priority: .userInitiated) {
+            DeskPageContent.project(snapshot: loaded, now: presentationNow, nags: loadedNags,
+                                    timedBots: timed, jobStamps: jobStamps, hourExpiry: hourExpiry)
         }.value
-        let missed = await Task.detached(priority: .userInitiated) {
-            DeskMissedBot.load(root: PersistenceCore.defaultDataRoot())
-        }.value
-        // Unattended work off: no bot runs on its own, so none is on a timer.
-        var timed: [DeskTimedBot] = []
-        if await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: PersistenceCore.defaultDataRoot()) {
-            timed = await Task.detached(priority: .userInitiated) {
-                DeskTimedBot.load(root: PersistenceCore.defaultDataRoot())
-            }.value
-        }
-        let presentationNow = Date()
-        let loadedNags = await DeskNagConfigStore(dataRoot: PersistenceCore.defaultDataRoot()).load()
-        let loadedHour = await Self.readHerHour(dataRoot: PersistenceCore.defaultDataRoot(), now: presentationNow)
+        await bindLiveUpdates()
         guard !Task.isCancelled, loadGate.accepts(token) else { return false }
         now = presentationNow
         snapshot = loaded
-        projectRows = computeProjectRows()
+        (projectRows, ownerItems, blockedItems, watchItems, staleItems, otherItems, historyItems, historyExecutions, _) = projection
         nagConfig = loadedNags
-        herHour = loadedHour.state
+        herHour = loadedHour
         if !quietOffscreenRead, liveUpdatesMounted {
-            bindLiveUpdates()
-            let movementExpiry = snapshot.executions.items.filter { $0.status == "running" }.compactMap {
-                DeskActivityState.movementDate($0.lastMovementAt)?.addingTimeInterval(DeskActivityState.movementWindow)
-            }.filter { $0 > presentationNow }.min()
-            let watchExpiry = DeskPageContent.watches(items).compactMap {
-                UserDisplayFormatters.parseISOTimestamp($0.updatedAt)?.addingTimeInterval(
-                    Double(DeskItemPresentation.staleThresholdDays) * 86_400)
-            }.filter { $0 > presentationNow }.min()
-            let deferExpiry = items.compactMap { $0.deferUntil.flatMap(DeskSequencing.parseDeferStamp) }
-                .filter { $0 > presentationNow }.min()
-            let muteExpiry = nagConfig.mutedUntil == DeskNagConfig.indefiniteMuteSentinel
-                ? nil : nagConfig.mutedUntil.flatMap(DeskSequencing.parseDeferStamp)
-            let nowExpiry = items.filter { $0.status == .now }.compactMap {
-                DeskActivityState.movementDate($0.updatedAt)?.addingTimeInterval(DeskActivityState.movementWindow)
-            }.filter { $0 > presentationNow }.min()
-            let state = deskState
-            let familyParents = Set(DeskProgramFamilyPresentation.families(
-                from: laneOfItems, executions: snapshot.executions, now: now).map(\.id))
-            let parkingExpiry = DeskPageContent.projects(items, excluding: familyParents).compactMap { item -> Date? in
-                let handles = DeskParking.subtreeHandles(item.handle, in: state)
-                guard !snapshot.executions.items.contains(where: {
-                    $0.deskHandle.map(handles.contains) == true && DeskParking.executionIsLive(status: $0.status)
-                }), let touched = DeskParking.lastTouch(item, in: state) else { return nil }
-                let plan = snapshot.plan.byHandle[item.handle]
-                let days = plan.map { $0.totalCount > 0 && $0.doneCount == 0 } == true
-                    ? DeskParking.untouchedPlanDays : DeskParking.quietDays
-                return touched.addingTimeInterval(Double(days) * 86_400)
-            }.filter { $0 > presentationNow }.min()
-            let relativeStamps = items.map(\.updatedAt)
-                + items.compactMap { $0.pursuit?.lastWorkedAt }
-                + snapshot.executions.items.map(\.updatedAt)
-                + snapshot.executions.items.compactMap(\.lastMovementAt)
-                + githubItems.map { $0.motorUpdatedAt ?? $0.updatedAt }
-                + appModel.engine.desk.jobs.compactMap(\.nextRunAt)
-                + [snapshot.generatedTs].compactMap { $0 }
-            let relativeDates = relativeStamps.compactMap(UserDisplayFormatters.parseISOTimestamp)
-                + timed.compactMap(\.nextRun)
-            let relativeExpiry = relativeDates.map {
-                DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: presentationNow)
-            }.min()
-            DeskLiveReloader.shared.scheduleRefresh(
-                subscriber: liveSubscriberID,
-                at: [liveActivity.nextRefreshAt, movementExpiry, watchExpiry, deferExpiry, muteExpiry,
-                     nowExpiry, parkingExpiry, relativeExpiry, loadedHour.nextRefreshAt]
-                    .compactMap { $0 }.filter { $0 > presentationNow }.min())
+            DeskLiveReloader.shared.scheduleRefresh(subscriber: liveSubscriberID, at: projection.8)
         }
         missedBots = missed
         timedBots = timed
@@ -1684,5 +1170,178 @@ struct DeskPageDetailRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("desk.detail-row")
+    }
+}
+
+struct DeskActionNotice: Equatable {
+    let text: String
+    let isError: Bool
+}
+
+/// What the Desk says after a veto settles. Every outcome gets a line — a
+/// refused write must never look like a completed one.
+enum DeskPursuitVetoNotice {
+    static func receipt(for outcome: WorkshopObservatoryVetoHandler.Outcome) -> DeskActionNotice {
+        switch outcome {
+        case .completed:
+            return DeskActionNotice(text: "Pursuit vetoed and closed.", isError: false)
+        case .alreadyVetoed:
+            return DeskActionNotice(text: "Pursuit was already vetoed.", isError: false)
+        case .inFlight:
+            return DeskActionNotice(text: "That veto is still being written.", isError: false)
+        case .failed(let detail):
+            return DeskActionNotice(text: "Veto failed: \(detail)", isError: true)
+        }
+    }
+}
+
+extension DeskExecutionPresentation {
+    struct Pill: Sendable, Equatable {
+        let label: String
+        let tone: DeskPresentationTone
+    }
+
+    static func pill(for status: String) -> Pill {
+        switch status {
+        case "running": return Pill(label: "running", tone: .info)
+        case "queued": return Pill(label: "queued", tone: .neutral)
+        case "blocked_on_approval": return Pill(label: "needs approval", tone: .warning)
+        case "completed": return Pill(label: "done", tone: .success)
+        case "failed": return Pill(label: "failed", tone: .danger)
+        case "cancelled": return Pill(label: "cancelled", tone: .neutral)
+        default:
+            let human = status.replacingOccurrences(of: "_", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return Pill(label: human.isEmpty ? "unknown status" : "unknown: \(human)", tone: .neutral)
+        }
+    }
+
+    static func verificationLabel(_ verification: WorkshopVerificationRecord) -> String {
+        switch verification.status {
+        case .satisfied:
+            let methods = verification.methods.map { method in
+                switch method {
+                case "exact_output": return "exact output"
+                case "file_bytes": return "file bytes"
+                default: return method.replacingOccurrences(of: "_", with: " ")
+                }
+            }.filter { !$0.isEmpty }.joined(separator: " + ")
+            return methods.isEmpty ? "verified" : "verified: \(methods)"
+        case .failed:
+            return "verification failed"
+        case .unverified:
+            return "completed; outcome not independently verified"
+        }
+    }
+}
+
+
+/// HER HOUR, on the Desk — personality-depth item 9.
+///
+/// One line, at the bottom, saying what she did with the hour that was hers. It
+/// is a TRACE, not a task: it has no action, no count, no badge, and it never
+/// becomes a row User has to clear. The lane writes no desk ops (Agent's veto —
+/// her aesthetic life is not board work), so this reads the lane's own bounded
+/// file directly and renders its newest entry.
+///
+/// ABSENT when the lane is not installed. Not "off", not a placeholder, not a
+/// zero — absent, exactly the way the lane itself is absent when the switch is
+/// off. A Desk that shows "Her hour: disabled" would be advertising a feature at
+/// a man who turned it off.
+enum DeskHerHourPresentation {
+    enum State: Sendable, Equatable {
+        case absent
+        /// Her own closing line, plus how long ago. Nothing else: no verdict,
+        /// no outcome adjective we chose, no progress.
+        case line(text: String, symbol: String)
+    }
+
+    /// The whole rule. Pure, so the Desk's claim about her hour is testable
+    /// without a running app or an installed lane.
+    static func state(
+        installed: Bool,
+        entry: StudioWanderLane.TraceEntry?,
+        now: Date
+    ) -> State {
+        guard installed, let entry else { return .absent }
+        let words = entry.line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty else { return .absent }
+        let when = DeskRelativeTimePresentation.text(forISO: entry.at, now: now)
+        return .line(text: "\(bounded(words)) · \(when)", symbol: symbol(entry.outcome))
+    }
+
+    /// Icons, not labels. The three endings are equal in standing — a decline is
+    /// not a lesser outcome — so none of them gets a word here that ranks it.
+    static func symbol(_ outcome: StudioWanderLane.Outcome) -> String {
+        switch outcome {
+        case .chose: return "eye"
+        case .declined: return "moon.zzz"
+        case .noArtifact: return "eye.slash"
+        }
+    }
+
+    static let maximumCharacters = 160
+
+    private static func bounded(_ value: String) -> String {
+        value.truncated(to: maximumCharacters, keeping: maximumCharacters - 1)
+    }
+}
+
+enum DeskGitHubCallbackFailurePresentation {
+    struct Detail: Equatable, Sendable {
+        let message: String
+        let noWorkObserved: Bool?
+    }
+
+    private static let failedStatuses: Set<String> = [
+        "failed", "failure", "error", "stalled", "timeout", "timed_out",
+        "canceled", "cancelled", "completed_without_reply",
+    ]
+    private static let successfulStatuses: Set<String> = ["completed", "ok", "success"]
+
+    static func detail(for item: GitHubCommandItem) -> Detail? {
+        let status = (item.lastCallbackStatus ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let error = nonEmpty(item.lastCallbackErrorMessage)
+        let noWorkObserved = item.lastCallbackNoWorkObserved
+
+        if failedStatuses.contains(status) {
+            return Detail(
+                message: error ?? fallbackMessage(for: status),
+                noWorkObserved: noWorkObserved
+            )
+        }
+
+        // A non-success status paired with an error/resend-safety field is
+        // conflicting callback evidence. Surface it rather than silently
+        // treating an unknown producer spelling as a healthy completion.
+        guard !successfulStatuses.contains(status), error != nil || noWorkObserved != nil else {
+            return nil
+        }
+        let statusText = status.isEmpty ? "no usable status" : "status \(status)"
+        return Detail(
+            message: error ?? "Codex callback returned \(statusText) without an error detail.",
+            noWorkObserved: noWorkObserved
+        )
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func fallbackMessage(for status: String) -> String {
+        switch status {
+        case "completed_without_reply":
+            return "Codex callback ended without a final result."
+        case "stalled":
+            return "Codex callback stalled without an error detail."
+        case "timeout", "timed_out":
+            return "Codex callback timed out without an error detail."
+        default:
+            return "Codex callback failed without an error detail."
+        }
     }
 }

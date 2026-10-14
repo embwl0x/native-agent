@@ -81,18 +81,6 @@ public struct OrganismEdge: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
-public struct OrganismFieldLimits: Sendable, Equatable {
-    public var maximumNodes: Int
-    public var maximumEdges: Int
-
-    public init(maximumNodes: Int = 96, maximumEdges: Int = 192) {
-        self.maximumNodes = max(0, maximumNodes)
-        self.maximumEdges = max(0, maximumEdges)
-    }
-
-    public static let defaults = OrganismFieldLimits()
-}
-
 public struct OrganismFieldSummary: Codable, Sendable, Equatable {
     public var nodeCount: Int
     public var edgeCount: Int
@@ -180,12 +168,14 @@ public struct OrganismField: Codable, Sendable, Equatable {
 }
 
 public enum OrganismPlasticity {
+    private static let maximumNodes = 96
+    private static let maximumEdges = 192
+
     public static func applying(
         signal: SomaticSignal,
         chemicalState: ChemicalState,
         bodySchema: BodySchema,
-        to field: OrganismField,
-        limits: OrganismFieldLimits = .defaults
+        to field: OrganismField
     ) -> OrganismField {
         // 2026-07-21 audit fix: NO wall-clock decay here. The kernel's
         // settleElapsedTime (anchored at lastSettledAt) is now the SINGLE
@@ -210,7 +200,7 @@ public enum OrganismPlasticity {
         let activeNodes = nodes(for: signal, bodySchema: bodySchema)
         guard !activeNodes.isEmpty else {
             next.lastUpdatedAt = signal.occurredAt
-            return enforcingCapacity(next, limits: limits)
+            return enforcingCapacity(next)
         }
 
         let activationImpulse = activationImpulse(for: signal)
@@ -242,7 +232,7 @@ public enum OrganismPlasticity {
             next = softened(next, intensity: signal.intensity * 0.5)
         }
         next.lastUpdatedAt = signal.occurredAt
-        return enforcingCapacity(next, limits: limits)
+        return enforcingCapacity(next)
     }
 
     private static func softened(_ field: OrganismField, intensity: Double) -> OrganismField {
@@ -313,7 +303,7 @@ public enum OrganismPlasticity {
              .approvalRequested, .resourcePressureChanged:
             return .uncertain(0.35)
         case .userSpoke, .toolStarted, .toolCancelled, .providerStarted, .providerCancelled,
-             .phoneDeliveryStarted, .deskItemCreated, .appWake, .appSleep:
+             .phoneDeliveryStarted, .deskItemCreated, .deskItemCancelled, .appWake, .appSleep:
             return .strengthen(0.7)
         case .horizonRefresh:
             // Unreachable by construction — `associations` returns [] for this
@@ -416,7 +406,7 @@ public enum OrganismPlasticity {
             return ["body:mac:\(bodySchema.macAwake ? "awake" : "sleeping")"]
         case .resourcePressureChanged:
             return ["body:resource:\(resourcePressure(from: metadata)?.rawValue ?? bodySchema.resourcePressure.rawValue)"]
-        case .userSpoke, .assistantSpoke, .correctionReceived, .deskItemCreated, .deskItemBlocked, .deskItemClosed:
+        case .userSpoke, .assistantSpoke, .correctionReceived, .deskItemCreated, .deskItemBlocked, .deskItemClosed, .deskItemCancelled:
             return []
         case .horizonRefresh:
             // Item 5: NO association, deliberately. `.appWake` — the kind this
@@ -457,18 +447,15 @@ public enum OrganismPlasticity {
         return pairs
     }
 
-    private static func enforcingCapacity(
-        _ field: OrganismField,
-        limits: OrganismFieldLimits
-    ) -> OrganismField {
+    private static func enforcingCapacity(_ field: OrganismField) -> OrganismField {
         var next = field
-        if next.nodes.count > limits.maximumNodes {
-            let keep = Set(next.nodes.values.sorted(by: nodeSort).prefix(limits.maximumNodes).map(\.id))
+        if next.nodes.count > maximumNodes {
+            let keep = Set(next.nodes.values.sorted(by: nodeSort).prefix(maximumNodes).map(\.id))
             next.nodes = next.nodes.filter { keep.contains($0.key) }
             next.edges = next.edges.filter { keep.contains($0.value.sourceID) && keep.contains($0.value.targetID) }
         }
-        if next.edges.count > limits.maximumEdges {
-            let keep = Set(next.edges.values.sorted(by: edgeSort).prefix(limits.maximumEdges).map(\.id))
+        if next.edges.count > maximumEdges {
+            let keep = Set(next.edges.values.sorted(by: edgeSort).prefix(maximumEdges).map(\.id))
             next.edges = next.edges.filter { keep.contains($0.key) }
         }
         return next

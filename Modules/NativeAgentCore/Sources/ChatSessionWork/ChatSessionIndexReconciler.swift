@@ -620,18 +620,11 @@ public actor ChatSessionIndexReconciler {
 
     private nonisolated static func date(_ raw: String?) -> Date? {
         guard let raw, !raw.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let parsed = fractional.date(from: raw) { return parsed }
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return standard.date(from: raw)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     private nonisolated static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        return NativeTimestampFormat.fractionalZulu(date)
     }
 
     private nonisolated static func bounded(_ raw: String, to limit: Int) -> String {

@@ -68,23 +68,6 @@ public struct MemoryCuration: Sendable {
         return b
     }
 
-    /// Retired but recoverable: archived by a merge or a newer fact, demoted
-    /// by a correction, or graduated into GROWTH (the GROWTH line stays hers
-    /// to retire). Contradicted and deleted rows are not offered.
-    static func isRecoverable(_ record: MemoryRecord) -> Bool {
-        let lifecycle = MemoryLifecycle.normalized(record.lifecycle)
-        return lifecycle == MemoryLifecycle.corrected || lifecycle == MemoryLifecycle.graduated
-            || (record.status == "archived" && MemoryLifecycle.isRecallEligible(lifecycle))
-    }
-
-    /// Every row in the store, archived and corrected included. The owner's
-    /// listMemory hides corrected rows, which a restore must reach.
-    func everyMemoryRow() async throws -> [MemoryRecord] {
-        try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            .listMemories(persona: nil, status: nil, limit: nil)
-            .map(MemoryRecord.init(stored:))
-    }
-
     func curationRefusal(_ reason: String) -> JSONValue {
         .object(["status": .string("refused"), "reason": .string(reason)])
     }
@@ -114,57 +97,16 @@ public struct MemoryCuration: Sendable {
                 return curationRefusal("after_id was issued with sort \(cursor.sort). Retry with sort \(cursor.sort), or restart without after_id and with offset 0 to change direction.")
             }
         }
-        let newestFirst = sort == "newest_first"
-        let kind = curationString(input, "kind")
-        let all: [MemoryRecord]
+        let listing: (records: [MemoryRecord], total: Int, nextOffset: Int)
         do {
-            all = status == "archived"
-                ? try await everyMemoryRow().filter { Self.isRecoverable($0) && (kind == nil || $0.memoryKind == kind) }
-                : try await memoryV2.listMemory(kind: kind).filter { ($0.status ?? "active") == "active" }
+            listing = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot).curationPage(
+                archived: status == "archived", kind: curationString(input, "kind"), surface: surface, persona: persona,
+                newestFirst: sort == "newest_first", afterKey: cursor?.key, afterID: afterID, offset: offset, limit: limit
+            )
         } catch {
             return .object(["status": .string("failed"), "reason": .string("\(error)")])
         }
-        // "Every active memory": the owner's list includes archived rows, so
-        // filter here (reviewer, 2026-09-05). status archived walks the
-        // recoverable rows instead.
-        // (created_at, id) is the ordering key: created_at alone is not
-        // unique, and the cursor below compares against it.
-        let ordered = all
-            .filter { record in
-                // Recovery changes eligibility, never the row's privacy scope.
-                MemoryRecordDisclosurePolicy.classify(
-                    personaID: record.personaId, status: status == "archived" ? "active" : record.status,
-                    lifecycle: status == "archived" ? nil : record.lifecycle,
-                    tags: record.tags, metadata: record.extras
-                )?.permits(surface: surface, personaID: persona) == true
-            }
-            .sorted {
-                newestFirst ? ($0.createdAt, $0.id) > ($1.createdAt, $1.id)
-                    : ($0.createdAt, $0.id) < ($1.createdAt, $1.id)
-            }
-        // A cursor is safer than an offset while the agent forgets rows as it
-        // walks: rows shift under an offset, never behind an id (Codex review
-        // 2026-09-05). `after_id` wins when both are given.
-        //
-        // 2026-09-06: the cursor is a POSITION, not a row that must still be
-        // there. Resolving it by presence meant forgetting the last row of a
-        // page silently dropped back to `offset` (0), so a walk that curated as
-        // it went restarted at the top forever. `next_after_id` now hands back
-        // the ordering key, and a page resumes after the position that key
-        // occupies whether or not its row survives.
-        let start: Int = {
-            guard let afterID else { return offset }
-            if let key = cursor?.key {
-                return ordered.prefix(while: {
-                    newestFirst ? ($0.createdAt, $0.id) >= key : ($0.createdAt, $0.id) <= key
-                }).count
-            }
-            // A bare id (from recall_memory, or a cursor minted before this
-            // change) still resumes while its row is there.
-            if let idx = ordered.firstIndex(where: { $0.id == afterID }) { return idx + 1 }
-            return offset
-        }()
-        let page = ordered.dropFirst(start).prefix(limit)
+        let page = listing.records
         let rows: [JSONValue] = page.map { record in
             MemoryDataProvenance.consume(record.extras, dataRoot: dataRoot)
             var row: [String: JSONValue] = [
@@ -199,15 +141,15 @@ public struct MemoryCuration: Sendable {
             }
             return .object(row)
         }
-        let next = start + rows.count
+        let next = listing.nextOffset
         var out: [String: JSONValue] = [
             "status": .string("ok"),
             "sort": .string(sort),
             "memories": .array(rows),
             "count": .int(Int64(rows.count)),
-            "total": .int(Int64(ordered.count)),
+            "total": .int(Int64(listing.total)),
             "next_offset": .int(Int64(next)),
-            "remaining": .int(Int64(max(0, ordered.count - next))),
+            "remaining": .int(Int64(max(0, listing.total - next))),
         ]
         if let last = page.last {
             out["next_after_id"] = .string(Self.curationCursor(sort: sort, createdAt: last.createdAt, id: last.id))
@@ -228,13 +170,13 @@ public struct MemoryCuration: Sendable {
         let row = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
             .memory(id: id).map(MemoryRecord.init(stored:))
         guard let row, MemoryRecordDisclosurePolicy.classify(
-            personaID: row.personaId, status: Self.isRecoverable(row) ? "active" : row.status,
-            lifecycle: Self.isRecoverable(row) ? nil : row.lifecycle,
+            personaID: row.personaId, status: MemoryStorage.isRecoverable(row) ? "active" : row.status,
+            lifecycle: MemoryStorage.isRecoverable(row) ? nil : row.lifecycle,
             tags: row.tags, metadata: row.extras
         )?.permits(surface: surface, personaID: persona) == true else {
             throw ToolFailureError("No memory with that id is available on this surface; nothing changed.", effects: .none)
         }
-        if restore, !Self.isRecoverable(row) {
+        if restore, !MemoryStorage.isRecoverable(row) {
             throw ToolFailureError("No archived, corrected or graduated memory with that id, so there is nothing to restore. memory.list status archived shows the ones that can come back.", effects: .none)
         }
         // The pin writer refuses the same way; asking first lets a preview say so.

@@ -27,6 +27,31 @@ public struct MacChatRetrySnapshot: Equatable, Sendable {
     public let userRowPersisted: Bool
     public let inputHadAttachments: Bool
 
+    public static func preservingSyntheticNotice<Message: MacChatRetryMessage>(
+        disk: [Message], local: [Message]?, sessionId: String, syntheticErrorIDPrefix: String,
+        isCompletedAssistant: (Message?) -> Bool
+    ) -> [Message] {
+        var loaded = disk
+        if let local, let tail = local.last,
+           tail.id.hasPrefix(syntheticErrorIDPrefix),
+           !disk.contains(where: { $0.id == tail.id }) {
+            if tail.retryUserRowPersisted == false {
+                // Canonical predecessor IDs distinguish an unsent request from
+                // an older completed answer or a newer remote turn.
+                if let snapshot = capture(
+                    target: tail, messages: local, sessionId: sessionId, isSyntheticNotice: true
+                ), snapshot.matchesCanonical(disk),
+                   let user = local.first(where: { $0.id == snapshot.priorUserMessageId }) {
+                    loaded.append(user)
+                    loaded.append(tail)
+                }
+            } else if !isCompletedAssistant(disk.last) {
+                loaded.append(tail)
+            }
+        }
+        return loaded
+    }
+
     public static func capture<Message: MacChatRetryMessage>(
         target: Message,
         messages: [Message],

@@ -101,6 +101,29 @@ public actor TurnFirstRenderRegistry {
         }
     }
 
+    /// The mounted surface reports visibility; correlation and publication
+    /// remain with the registry that owns the turn's single render claim.
+    public func observeFirstRender(
+        role: String,
+        content: String,
+        isLastAssistant: Bool,
+        messageSessionID: String?,
+        messageTurnID: String?,
+        activeSessionID: String,
+        observedBy: String
+    ) {
+        guard role == "assistant", isLastAssistant,
+              content.contains(where: { !$0.isWhitespace }) else { return }
+        // A present-but-blank message session must not claim the active tab.
+        let sessionID = (messageSessionID ?? activeSessionID)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sessionID.isEmpty, let turnID = messageTurnID, !turnID.isEmpty,
+              let event = claimFirstRenderEvent(
+                sessionId: sessionID, turnId: turnID, observedBy: observedBy
+              ) else { return }
+        TurnTraceBus.fire(event)
+    }
+
     public func claimFirstRenderEvent(
         sessionId: String,
         turnId: String,
@@ -243,8 +266,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
         threadId: String? = nil
     ) -> JSONValue {
         let leafBound = boundLeaves(value)
-        guard let serialized = try? leafBound.serializedData(pretty: false),
-              persistedRowBytes(
+        guard persistedRowBytes(
                 payload: leafBound,
                 turnId: turnId,
                 ts: ts,
@@ -253,7 +275,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 surface: surface,
                 destinationId: destinationId,
                 threadId: threadId
-              ).map({ $0 > maxPayloadBytes }) == true else {
+              ).map({ $0 > maxPayloadBytes }) == true,
+              let serialized = try? leafBound.serializedData(pretty: false) else {
             return leafBound
         }
 
@@ -549,10 +572,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
     }
 
     /// Parse a persisted ts: fractional-seconds ISO8601 (the current write
-    /// format) with a plain-seconds fallback for rows persisted before the
-    /// sub-second fix. Per-call formatters — ISO8601DateFormatter is not
-    /// thread-safe.
-    static func parseISO8601(_ s: String) -> Date? {
+    /// format) and plain seconds for rows persisted before the sub-second fix.
+    public static func parseISO8601(_ s: String) -> Date? {
         if let d = try? fractionalISO8601.parse(s) { return d }
         return try? Date.ISO8601FormatStyle().parse(s)
     }
@@ -592,11 +613,6 @@ public struct TurnTraceEvent: Sendable, Equatable {
 /// subscriber's buffer is full the event is DROPPED for that subscriber and the
 /// drop is counted — a slow observer (the Inspector tab on a busy turn) can
 /// never apply backpressure to Agent's turn.
-///
-/// The bus is an `actor` so the subscriber table mutates safely under
-/// concurrency, but `emit` hands off to the actor on a detached task and the
-/// caller does NOT await it — the hot path pays only the cost of spawning the
-/// hand-off (and the synchronous persist-lane enqueue, also detached).
 public actor TurnTraceBus {
     public static let shared = TurnTraceBus()
 
@@ -618,14 +634,6 @@ public actor TurnTraceBus {
         }
     }
 
-    /// A subscription's drop counter is meaningful only while that exact sink
-    /// still exists. Keep retirement distinct from a measured zero so runtime
-    /// diagnostics never present an unavailable live feed as loss-free.
-    public enum DropCountRead: Sendable, Equatable {
-        case available(Int)
-        case unavailable
-    }
-
     private struct Sink {
         let continuation: AsyncStream<TurnTraceEvent>.Continuation
         let dropContinuation: AsyncStream<Int>.Continuation
@@ -639,21 +647,9 @@ public actor TurnTraceBus {
     /// for a flock'd disk append here let one diagnostic burst delay terminal
     /// traces for unrelated live turns by seconds.
     private nonisolated let persistPump: _PersistPump
-    private let deliveryGate: (@Sendable () async -> Void)?
 
     public init(persistLane: TurnTracePersistLane = TurnTracePersistLane()) {
         self.persistPump = _PersistPump(lane: persistLane, capacity: 4096)
-        self.deliveryGate = nil
-    }
-
-    /// Internal fault-injection seam used to prove that the public fire gate
-    /// stays bounded when actor delivery is stalled. Production has no gate.
-    init(
-        persistLane: TurnTracePersistLane,
-        deliveryGate: @escaping @Sendable () async -> Void
-    ) {
-        self.persistPump = _PersistPump(lane: persistLane, capacity: 4096)
-        self.deliveryGate = deliveryGate
     }
 
     // MARK: Subscribe / unsubscribe
@@ -696,55 +692,41 @@ public actor TurnTraceBus {
         }
     }
 
-    /// Drop count observed for a subscriber so far (test + diagnostics hook).
+    /// Drop count observed for a subscriber so far.
     public func dropCount(_ id: UUID) -> Int {
         sinks[id]?.drops ?? 0
     }
-
-    /// Availability-preserving variant of `dropCount(_:)` for live runtime
-    /// readers. The legacy integer hook retains its zero fallback for existing
-    /// callers, but Inspector must be able to tell a retired sink from a sink
-    /// that has genuinely observed no drops.
-    public func dropCountRead(_ id: UUID) -> DropCountRead {
-        guard let sink = sinks[id] else { return .unavailable }
-        return .available(sink.drops)
-    }
-
-    public var subscriberCount: Int { sinks.count }
 
     // MARK: Emit
 
     /// One bounded FIFO and at most one drain task replace the old one-detached-
     /// task-per-event handoff. Telemetry remains nonblocking and lossy under
     /// distress without allowing thousands of suspended task allocations.
-    nonisolated static let emissionPump = _EmissionPump(capacity: 4096)
+    private nonisolated static let emissionPump = _FIFO<PendingEmission>(capacity: 4096)
 
-    final class _EmissionPump: @unchecked Sendable {
-        struct Pending: Sendable {
-            let event: TurnTraceEvent
-            let bus: TurnTraceBus
-        }
+    private struct PendingEmission: Sendable {
+        let event: TurnTraceEvent
+        let bus: TurnTraceBus
+    }
+
+    private final class _FIFO<Element: Sendable>: @unchecked Sendable {
         private let lock = NSLock()
-        private var queue: [Pending] = []
+        private var queue: [Element] = []
         private var head = 0
         private var draining = false
-        private var dropped = 0
         private var idleWaiters: [CheckedContinuation<Void, Never>] = []
-        let capacity: Int
+        private let capacity: Int
         init(capacity: Int) { self.capacity = capacity }
         /// Returns true only when the caller must start the sole drain worker.
-        func enqueue(_ pending: Pending) -> Bool {
+        func enqueue(_ pending: Element) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            guard queue.count - head < capacity else {
-                dropped += 1
-                return false
-            }
+            guard queue.count - head < capacity else { return false }
             queue.append(pending)
             guard !draining else { return false }
             draining = true
             return true
         }
-        func next() -> Pending? {
+        func next() -> Element? {
             lock.lock()
             guard head < queue.count else {
                 queue.removeAll(keepingCapacity: true)
@@ -782,96 +764,34 @@ public actor TurnTraceBus {
                 lock.unlock()
             }
         }
-        var snapshot: (inFlight: Int, dropped: Int) {
-            lock.lock(); defer { lock.unlock() }
-            return (queue.count - head, dropped)
-        }
     }
 
     /// One writer task per bus, never one task per event. This preserves the
-    /// persisted order for a turn while isolating a slow/test data root from
+    /// persisted order for a turn while isolating a slow data root from
     /// every other bus using the process-wide ingress pump. Trace persistence
     /// remains explicitly lossy under sustained distress and bounded to 4096
     /// pending rows.
-    private final class _PersistPump: @unchecked Sendable {
-        private let lock = NSLock()
+    private final class _PersistPump: Sendable {
         let lane: TurnTracePersistLane
-        private let capacity: Int
-        private var queue: [TurnTraceEvent] = []
-        private var head = 0
-        private var draining = false
-        private var dropped = 0
+        private let queue: _FIFO<TurnTraceEvent>
 
         init(lane: TurnTracePersistLane, capacity: Int) {
             self.lane = lane
-            self.capacity = capacity
+            self.queue = _FIFO(capacity: capacity)
         }
 
         func submit(_ event: TurnTraceEvent) {
-            lock.lock()
-            guard queue.count - head < capacity else {
-                dropped += 1
-                lock.unlock()
-                return
-            }
-            queue.append(event)
-            let shouldStart = !draining
-            if shouldStart { draining = true }
-            lock.unlock()
-
-            guard shouldStart else { return }
+            guard queue.enqueue(event) else { return }
             Task.detached(priority: .utility) { [self] in
-                while let next = takeNext() {
+                while let next = queue.next() {
                     await lane.append(next)
                 }
             }
         }
 
-        private func takeNext() -> TurnTraceEvent? {
-            lock.lock()
-            guard head < queue.count else {
-                queue.removeAll(keepingCapacity: true)
-                head = 0
-                draining = false
-                let waiters = idleWaiters
-                idleWaiters.removeAll()
-                lock.unlock()
-                for waiter in waiters { waiter.resume() }
-                return nil
-            }
-            let value = queue[head]
-            head += 1
-            if head >= 256, head * 2 >= queue.count {
-                queue.removeFirst(head)
-                head = 0
-            }
-            lock.unlock()
-            return value
-        }
-
-        private var idleWaiters: [CheckedContinuation<Void, Never>] = []
-
-        /// Suspend until every already-submitted row has been appended to disk
-        /// (the writer pops BEFORE awaiting `lane.append`, and `draining` only
-        /// flips false on the empty-queue pop AFTER the final append returns).
-        /// Immediate resume when idle. Never called on the emit path.
         func waitUntilIdle() async {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                lock.lock()
-                guard draining || head < queue.count else {
-                    lock.unlock()
-                    continuation.resume()
-                    return
-                }
-                idleWaiters.append(continuation)
-                lock.unlock()
-            }
+            await queue.waitUntilIdle()
         }
-    }
-
-    /// Test/observability seam: current emission backlog + gate drops.
-    public nonisolated static var emissionBacklog: (inFlight: Int, dropped: Int) {
-        emissionPump.snapshot
     }
 
     /// Await full quiescence of the fire→deliver→persist pipeline for this
@@ -934,8 +854,7 @@ public actor TurnTraceBus {
     /// counted) and enqueue onto the persist lane. Subscribers are served
     /// synchronously within the actor but the per-subscriber yield is itself
     /// non-blocking (AsyncStream.yield never suspends).
-    public func deliver(_ event: TurnTraceEvent) async {
-        if let deliveryGate { await deliveryGate() }
+    public func deliver(_ event: TurnTraceEvent) {
         deliverToSubscribers(event)
         // The per-bus writer owns disk ordering and backpressure. Enqueue is a
         // short lock operation; no disk await occurs on this actor or on the
@@ -996,143 +915,23 @@ public struct TurnTracePersistLane: Sendable {
     static let maxBytes = JSONLLineCaps.turnTraceMaximumBytes
     static let trimToBytes = JSONLLineCaps.turnTraceTrimTargetBytes
 
-    // MARK: - W3 test-override seam (W2 residual fix)
-    //
-    // The shared-bus W2 tests (TurnInspectorW2EmissionTests,
-    // AnthropicStreamMessagesSSETests thinking tests) subscribe to
-    // `TurnTraceBus.shared`, whose persist lane resolves `defaultDataRoot()`
-    // and writes into the LIVE `data/turn_traces/<date>.jsonl` feed — so test
-    // fixture events polluted the replay UI. This seam lets a test point the
-    // SHARED lane (which it does not construct) at a tmp root WITHOUT touching
-    // production. Resolution order at append time mirrors `defaultDataRoot`:
-    //
-    //   1. `NATIVE_AGENT_TURN_TRACE_ROOT` env var (literal, no tilde expand) —
-    //      a hermetic-test escape hatch settable for the whole process.
-    //   2. Per-instance `dataRootOverride` injection (direct-constructed lanes)
-    //      — outranks the static so a global seam can't clobber an instance-
-    //      injected hermetic lane (see `resolveRoot`).
-    //   3. The process-wide `rootOverride` static (settable before first use) —
-    //      redirects lanes with NO instance override, chiefly `.shared`.
-    //   4. `defaultDataRoot()` (production).
-    //
-    // The static is resolved at APPEND time (not construction) so a test that
-    // sets it before driving the already-constructed `.shared` lane is honored.
-    private final class _RootOverrideBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var url: URL?
-        var value: URL? {
-            get { lock.lock(); defer { lock.unlock() }; return url }
-            set { lock.lock(); defer { lock.unlock() }; url = newValue }
-        }
-        /// Atomic set-if-nil. Returns the EFFECTIVE value after the call —
-        /// the candidate when this call installed it, or the pre-existing
-        /// value when another caller won the race.
-        func setIfNil(_ candidate: URL) -> URL {
-            lock.lock(); defer { lock.unlock() }
-            if let existing = url { return existing }
-            url = candidate
-            return candidate
-        }
-    }
-    private static let rootOverrideBox = _RootOverrideBox()
-
-    /// Process-wide turn-trace root override. Honored at append time by every
-    /// lane with no instance override, chiefly `.shared`'s. Production never
-    /// sets this. Lower priority than `NATIVE_AGENT_TURN_TRACE_ROOT` so an
-    /// env-pinned harness still wins.
-    ///
-    /// TEST DISCIPLINE (gpt-5.5 W3 review): in a test process this must be
-    /// installed ONCE and NEVER reset — persistence off the bus is
-    /// fire-and-forget, so a `defer { rootOverride = nil }` can restore nil
-    /// while an emission is still resolving its path and leak the event into
-    /// the LIVE feed. Suites use `installTestRootOverrideIfUnset(_:)`; the
-    /// raw setter exists for the seam itself and must not be used to clear
-    /// the override mid-process while shared-bus emissions may be in flight.
-    public static var rootOverride: URL? {
-        get { rootOverrideBox.value }
-        set { rootOverrideBox.value = newValue }
-    }
-
-    /// Atomically install a process-wide test root IF none is set, returning
-    /// the effective root (the pre-existing one when another suite won the
-    /// race — any non-live tmp root satisfies the seam, so suites do not need
-    /// their own). Never resets; the override lives for the process lifetime.
-    @discardableResult
-    public static func installTestRootOverrideIfUnset(_ candidate: URL) -> URL {
-        rootOverrideBox.setIfNil(candidate)
-    }
-
-    /// The data root this lane resolves to RIGHT NOW (env → instance → static →
-    /// default). Public so the W3 replay reader can read the SAME location the
-    /// live lane writes to — including any env/static override — instead of
-    /// re-deriving `defaultDataRoot()` and diverging from the live feed.
+    /// Reads and writes resolve the same root: environment, instance, default.
     public func resolvedDataRoot() -> URL {
-        Self.resolveRoot(
-            env: Self.envRootOverride(),
-            staticOverride: Self.rootOverride,
-            instanceOverride: dataRootOverride
-        )
-    }
-
-    /// Resolve the env-var override once (literal path, tilde preserved — same
-    /// `URLComponents(scheme:"file")` trick as `defaultDataRoot`).
-    static func envRootOverride(
-        _ environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> URL? {
-        guard let raw = environment["NATIVE_AGENT_TURN_TRACE_ROOT"], !raw.isEmpty else {
-            return nil
+        if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_TURN_TRACE_ROOT"], !raw.isEmpty {
+            // Preserve literal paths, including an unexpanded tilde.
+            var components = URLComponents()
+            components.scheme = "file"
+            components.path = raw
+            return components.url ?? URL(fileURLWithPath: raw)
         }
-        var components = URLComponents()
-        components.scheme = "file"
-        components.path = raw
-        return components.url ?? URL(fileURLWithPath: raw)
+        return dataRootOverride ?? defaultDataRoot()
     }
 
-    /// Test injection. Production leaves nil → resolves through
-    /// `defaultDataRoot()` at append time (env-var / stamped-repo / cwd
-    /// resolution happens in the live process, not at construction).
     let dataRootOverride: URL?
-    /// A test-only acknowledgement after a row is durably appended. Production
-    /// leaves this nil, preserving fire-and-forget telemetry behavior.
-    private let onPersist: (@Sendable (TurnTraceEvent) async -> Void)?
     private let persistence = SwiftNativePersistenceCore()
 
     public init(dataRootOverride: URL? = nil) {
-        self.init(dataRootOverride: dataRootOverride, onPersist: nil)
-    }
-
-    init(
-        dataRootOverride: URL? = nil,
-        onPersist: (@Sendable (TurnTraceEvent) async -> Void)?
-    ) {
         self.dataRootOverride = dataRootOverride
-        self.onPersist = onPersist
-    }
-
-    /// Pure resolution of the data root from the four candidate sources, in
-    /// priority order: env override → per-instance injection → process static →
-    /// `defaultDataRoot()`.
-    ///
-    /// Per-instance injection OUTRANKS the process static deliberately: a
-    /// directly-constructed hermetic lane (the W1 persist tests) that passes an
-    /// explicit `dataRootOverride` must keep writing to ITS root even if some
-    /// other test has the process-wide static set. The static only matters for
-    /// lanes with NO instance override — chiefly `TurnTraceBus.shared`'s lane,
-    /// which is exactly the one the W2 shared-bus tests need to redirect away
-    /// from the live feed. So the static still does its job (redirect `.shared`)
-    /// without clobbering instance-injected test lanes.
-    ///
-    /// Extracted as a pure function so the priority order is unit-testable
-    /// WITHOUT mutating the process-wide static (which would race parallel
-    /// tests). `defaultRoot` is an autoclosure so it is only evaluated when all
-    /// three overrides are nil (the production path) — never eagerly.
-    static func resolveRoot(
-        env: URL?,
-        staticOverride: URL?,
-        instanceOverride: URL?,
-        defaultRoot: @autoclosure () -> URL = defaultDataRoot()
-    ) -> URL {
-        env ?? instanceOverride ?? staticOverride ?? defaultRoot()
     }
 
     /// `<dataRoot>/turn_traces/<yyyy-MM-dd>.jsonl`. NOTE: `defaultDataRoot()`
@@ -1140,15 +939,10 @@ public struct TurnTracePersistLane: Sendable {
     /// not the repo root — see PersistenceCore.defaultDataRoot), so the file
     /// lands at `data/turn_traces/<date>.jsonl` as the brief specifies.
     public func path(for date: Date) -> URL {
-        // Resolution order: env override → per-instance injection → process
-        // static → defaultDataRoot (see resolveRoot for why instance outranks
-        // the static). The static redirects the SHARED lane (no instance
-        // override) away from the live feed for the W2 shared-bus tests.
-        let root = Self.resolveRoot(
-            env: Self.envRootOverride(),
-            staticOverride: Self.rootOverride,
-            instanceOverride: dataRootOverride
-        )
+        Self.fileURL(for: date, root: resolvedDataRoot())
+    }
+
+    static func fileURL(for date: Date, root: URL) -> URL {
         return root
             .appendingPathComponent("turn_traces", isDirectory: true)
             .appendingPathComponent("\(Self.dayString(from: date)).jsonl")
@@ -1237,7 +1031,6 @@ public struct TurnTracePersistLane: Sendable {
                 // review, 2026-09-11). Non-terminal trace rows stay non-durable.
                 durable: Self.terminalKinds.contains(event.kind)
             )
-            await onPersist?(event)
             Self.postTerminalIfNeeded(event)
         } catch {
             FileHandle.standardError.write(
@@ -1322,7 +1115,6 @@ public struct TurnTracePersistLane: Sendable {
                 capCheckStride: 4096,
                 durable: true
             )
-            await onPersist?(event)
             Self.postTerminalIfNeeded(event)
             return true
         }
@@ -1451,10 +1243,8 @@ public struct TurnTraceRecentReader: Sendable {
                     if rows.count < lines.count { truncated = true }
                 }
                 for row in rows {
-                    guard case .object(let object) = row, case .string(let ts)? = object["ts"],
-                          let stamp = TurnTraceEvent.parseISO8601(ts),
-                          let event = TurnTraceEvent(jsonRow: row) else { truncated = true; continue }
-                    guard stamp >= since, stamp <= now else { continue }
+                    guard let event = TurnTraceEvent(jsonRow: row) else { truncated = true; continue }
+                    guard event.ts >= since, event.ts <= now else { continue }
                     events.append(event)
                 }
                 continue

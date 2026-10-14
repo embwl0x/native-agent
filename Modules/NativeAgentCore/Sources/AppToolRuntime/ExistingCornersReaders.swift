@@ -40,11 +40,11 @@ extension ExistingCornersSourceProvider {
                 guard let path = ExistingCornersReaders.string(input["path"]) else {
                     throw SenseFailure(code: "source_unavailable", message: "A file sense needs a path.")
                 }
-                try SenseSandboxProfile.requirePublicPath(path, dataRoot: dataRoot,
-                    personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
                 // A document address explicitly requests today's MacDocumentRead
                 // extract; the ordinary file source is path + byte count.
                 if input["document"] == .bool(true) {
+                    try SenseSandboxProfile.requirePublicPath(path, dataRoot: dataRoot,
+                        personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
                     let result = try await rawRead("read", readerInput)
                     return .text(try ExistingCornersReaders.documentText(result))
                 }
@@ -303,10 +303,9 @@ actor NativeChromeNews {
     }
 
     private static func version(_ snapshot: JSONValue) -> String? {
-        guard let text = ChromePageText.render(snapshot),
-              case .object(let receipt)? = try? ChromePageText.envelope(snapshot, rendered: text),
-              case .string(let version)? = receipt["version"] else { return nil }
-        let document = if case .object(let fields) = snapshot { ExistingCornersReaders.string(fields["documentId"]) ?? "" } else { "" }
+        guard case .object(let fields) = snapshot, case .string? = fields["snapshotId"],
+              case .array? = fields["nodes"], let version = try? ChromePageText.contentVersion(fields) else { return nil }
+        let document = ExistingCornersReaders.string(fields["documentId"]) ?? ""
         return document + ":" + version
     }
 

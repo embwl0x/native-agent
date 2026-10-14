@@ -112,17 +112,67 @@ public final class MacAXEffectCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var received: [MacAXEffectNotification] = []
     private var dropped = 0
+    private var pending = false
+    private var waiter: AsyncStream<Void>.Continuation?
 
     public init() {}
 
     public func record(_ notification: MacAXEffectNotification) {
         lock.lock()
         defer { lock.unlock() }
-        guard received.count < Self.hardCap else {
+        if received.count < Self.hardCap {
+            received.append(notification)
+        } else {
             dropped += 1
-            return
         }
-        received.append(notification)
+        pending = true
+        waiter?.yield(())
+    }
+
+    /// Activation wakes the same consumer without fabricating an AX event.
+    func signal() {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = true
+        waiter?.yield(())
+    }
+
+    func consumeSignal() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let fired = pending
+        pending = false
+        return fired
+    }
+
+    /// One consumer per collector. Register before checking the latch so a
+    /// notification between the caller's read and its suspension is retained.
+    func waitForSignal(seconds: Double) async -> Bool {
+        let (events, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        lock.withLock {
+            waiter = continuation
+            if pending { continuation.yield(()) }
+        }
+        defer { finishWaiting() }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for await _ in events { break }
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(max(0, seconds)))
+            }
+            await group.next()
+            group.cancelAll()
+        }
+        return consumeSignal()
+    }
+
+    func finishWaiting() {
+        lock.lock()
+        let live = waiter
+        waiter = nil
+        lock.unlock()
+        live?.finish()
     }
 
     public func snapshot() -> [MacAXEffectNotification] {
@@ -257,10 +307,6 @@ public enum MacActClosedLoop {
     /// change fires a burst (Calculator: AXValueChanged then AXTitleChanged),
     /// and a diff built from the first one alone describes half the effect.
     public static let quietWindowMs = 80
-    /// Poll granularity while waiting. The notifications land on the MAIN run
-    /// loop; the act runs off it, so polling a lock-guarded collector is what
-    /// keeps the main loop free to deliver them.
-    public static let pollMs = 5
     /// Notification kinds reported in the result.
     public static let maxReportedNotifications = 12
     /// Affordance rows per diff bucket.
@@ -754,24 +800,13 @@ public enum MacActClosedLoop {
         until: Set<String> = []
     ) async -> EffectWait {
         let deadline = startedAt.addingTimeInterval(Double(waitMs) / 1000.0)
-        var first = collector.first()
-        while !Task.isCancelled, first == nil, clock() < deadline {
-            do {
-                try await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
-            } catch { break }
-            first = collector.first()
+        while !Task.isCancelled, clock() < deadline {
+            let notifications = collector.snapshot()
+            if !notifications.isEmpty,
+               until.isEmpty || notifications.contains(where: { until.contains($0.kind) }) { break }
+            _ = await collector.waitForSignal(seconds: deadline.timeIntervalSince(clock()))
         }
-        if !until.isEmpty, first != nil {
-            // Something fired, but not necessarily the thing this verb means.
-            // Keep watching for the verb's own signal until the deadline.
-            while !Task.isCancelled, clock() < deadline,
-                  !collector.snapshot().contains(where: { until.contains($0.kind) }) {
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
-                } catch { break }
-            }
-        }
-        guard let first else {
+        guard let first = collector.first() else {
             return EffectWait(
                 observed: false,
                 firstNotificationMs: nil,

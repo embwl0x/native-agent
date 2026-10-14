@@ -13,15 +13,7 @@ public struct MailReadLocator {
     public static let fields: Set<String> = ["message_id", "expected_message_id", "expected_account", "expected_account_id", "position", "scope"]
 
     public static func parse(_ input: [String: JSONValue], allowMissingMessageID: Bool = false) -> Self? {
-        func text(_ value: JSONValue?) -> String? {
-            switch value {
-            case .string(let value): value
-            case .int(let value): String(value)
-            case .double(let value): String(value)
-            case .bool(let value): value ? "true" : "false"
-            default: nil
-            }
-        }
+        let text = MacAppleScriptBridge.inputString
         guard let id = text(input["message_id"]).flatMap({ Int64($0.trimmingCharacters(in: .whitespaces)) }), id > 0,
               let messageID = text(input["expected_message_id"]), messageID.count < 4096 else { return nil }
         let account = text(input["expected_account"]).flatMap { $0.isEmpty || $0.count > 512 ? nil : $0 }

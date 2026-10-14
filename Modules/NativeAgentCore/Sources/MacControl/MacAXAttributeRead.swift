@@ -4,6 +4,17 @@ import ApplicationServices
 
 /// Nil-tolerant AX attribute copies shared by perception and actuation.
 enum MacAXAttributeRead {
+    static func copyWindowIdentity(_ window: AXUIElement, pid: Int32, index: Int) -> MacAXWindowIdentity {
+        MacAXWindowIdentity(
+            pid: pid,
+            index: index,
+            role: copyString(window, kAXRoleAttribute) ?? "AXWindow",
+            subrole: copyString(window, kAXSubroleAttribute),
+            title: copyString(window, kAXTitleAttribute),
+            frame: copyFrame(window)
+        )
+    }
+
     static func prepare(_ element: AXUIElement) -> Bool {
         guard !Task.isCancelled else { return false }
         if let deadline = MacAXLimits.readDeadline {

@@ -1,33 +1,10 @@
-// NativeCognitionRuntime+Rumination.swift
-// PERSONALITY DEPTH · item 6, second half (2026-09-02)
-//
-// Live on the first build, Agent pulled `inner_state` and reported the `-
-// Thread:` line empty while a real open thing — a tool audit she had opened on
-// the Desk and not finished — should have been itching. She was right, and the
-// reason was structural: rumination candidates came only from thought seeds,
-// and a seed is something the microcycle or reflection minted. A commitment she
-// opened herself lives in the Desk, and the Desk had no way into the lane.
-//
-// THIS IS THE READER, and it is deliberately thin. The substrate owns the
-// weight law, the slot budget, the label bound and the healing; this file owns
-// exactly one thing — which Desk rows count, and getting them across the seam
-// payload-free.
-//
-// ADMISSION (canonical Desk facts, never re-litigated from a title string):
-//   • `origin == .agent` — she opened it. An owner-filed item is User's, and her
-//     nagging about his list is not the feature.
-//   • `!status.isTerminal` — open/blocked/watch/flag/now/next/todo. `done` and
-//     `canceled` are the heal, not the nag.
-//   • not deferred — an item parked on purpose is not an open loop
-//     (`deferUntil` exists precisely because half her "stale" items are parked).
-//
-// TURNS NEVER TOUCH THE DESK. `+Pursuit.swift` states that invariant in its own
-// words ("a user turn can never initiate Desk I/O") and this obeys it: the
-// staleness question is asked of the substrate (a clock, no disk), the window is
-// claimed before the read, and the read itself runs detached off the turn path.
-// A five-minute-stale nag is not a defect; a turn that blocks on a file is.
+// Desk commitments cross into the existing rumination law, payload-free.
+// Carried work shares one external slot; pursuits and hard moments keep the
+// other. Canonical Desk events own the replay, never a user turn.
 
 import Foundation
+import ChatOrchestration
+import BackgroundLoops
 import CognitiveSubstrate
 import MemoryV2
 import NativeAgentCore
@@ -61,16 +38,12 @@ extension NativeCognitionRuntime {
         // Claimed BEFORE the load so a burst of turns starts one read, not one
         // each. A failed read simply waits out the window.
         await substrate.noteExternalRuminationRefreshStarted(at: now)
-        let loader = pursuitStateLoader
-        Task.detached(priority: .utility) { [weak self] in
-            guard let state = try? await loader() else { return }
-            await self?.applyDeskRuminations(from: state)
-        }
+        await startPursuitRefresh(waitForCompletion: false)
     }
 
     /// Map canonical Desk rows to the payload-free shape the lane consumes, and
     /// push, with canonical terminal handles as confirmed closures.
-    func applyDeskRuminations(from state: DeskState) async {
+    func applyDeskRuminations(from state: DeskState, context: MyQueue.Context, revision: UInt64, generation: UInt64) async {
         guard !isFlushedForTermination else { return }
         let now = self.now()
         let items: [CognitiveSubstrate.CognitiveExternalRumination] = state.items
@@ -82,14 +55,7 @@ extension NativeCognitionRuntime {
             .compactMap { item in
                 let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !title.isEmpty else { return nil }
-                // `updatedAt` is when the owner last touched it; the weight ages
-                // from there, so an item worked on this morning is not a nag.
-                // An unparsable stamp falls back to `openedAt`, then to now —
-                // never to `.distantPast`, which would mint a full-weight nag
-                // out of a formatting bug.
-                let touched = Self.deskDate(item.updatedAt)
-                    ?? Self.deskDate(item.openedAt)
-                    ?? now
+                let touched = Self.deskDate(item.updatedAt) ?? Self.deskDate(item.openedAt) ?? now
                 return CognitiveSubstrate.CognitiveExternalRumination(
                     // The handle is stable and opaque; it is never rendered.
                     id: item.handle,
@@ -100,20 +66,91 @@ extension NativeCognitionRuntime {
             // Oldest touch first: heaviest first, so the crossing cap takes the
             // ones that would have won the slots anyway.
             .sorted { $0.lastTouchedAt < $1.lastTouchedAt }
-            .prefix(Self.maximumDeskRuminations)
+            .prefix(Self.maximumDeskRuminations - 1)
             .map { $0 }
+
+        let ready = Set(MyQueueReady.ready(items: state.items, context: context).map(\.handle))
+        let carried = state.items.filter {
+            Self.carries($0) && !$0.isPursuit && !$0.status.isTerminal
+        }.map {
+            CognitiveSubstrate.CognitiveExternalRumination(id: $0.handle, label: $0.title,
+                lastTouchedAt: Self.carriedTouch($0, at: now), isCarried: true,
+                isReady: ready.contains($0.handle))
+        }
 
         let priorIDs = await substrate.externalRuminationIDs()
         let moments = await momentRuminations(at: now, priorIDs: priorIDs)
-        let closedIDs = Set(state.items.filter { $0.status.isTerminal }.map(\.handle))
-            .union(moments.closedIDs)
+        let closures = Dictionary(uniqueKeysWithValues: state.items.filter { $0.status.isTerminal }.compactMap { item in
+            item.closedAt.flatMap(Self.deskDate).map { (item.handle, $0) }
+        }).merging(Dictionary(uniqueKeysWithValues: moments.closedIDs.map { ($0, now) })) { desk, _ in desk }
+        guard generation == pursuitProjectionGeneration, revision == SwiftNativeDeskStore.currentRevision,
+              !isFlushedForTermination else { return }
         await substrate.setExternalRuminations(
-            (items + moments.items).sorted {
+            (Array((items + moments.items).sorted { $0.lastTouchedAt < $1.lastTouchedAt }
+                .prefix(Self.maximumDeskRuminations - 1)) + carried).sorted {
                 if $0.lastTouchedAt != $1.lastTouchedAt { return $0.lastTouchedAt < $1.lastTouchedAt }
                 return $0.id < $1.id
-            }, confirmedClosedIDs: closedIDs, at: now)
+            }, confirmedClosures: closures, at: now)
         // The heal rides the same drain the seed lane uses.
         await drainRuminationReleasesIntoSubstrate()
+    }
+
+    static func carries(_ item: DeskItem) -> Bool {
+        item.project == MyQueue.project || item.assignee == "agent"
+    }
+
+    static func carriedTouch(_ item: DeskItem, at now: Date) -> Date {
+        max(Self.deskDate(item.openedAt) ?? now,
+            item.notes.filter { $0.author == "agent" }.compactMap { Self.deskDate($0.ts) }.max() ?? .distantPast)
+    }
+
+    /// One salience law, one exact-deadline owner and one existing wake door.
+    func considerCarried() async -> Date? {
+        guard !isFlushedForTermination, !pursuitRefreshInFlight, !pursuitRefreshQueued,
+              let revision = pursuitReadRevision, let candidates = queueTurnCandidates().candidates,
+              var context = pursuitCarriedContext else { return nil }
+        let at = now(), root = dataRoot
+        let generation = residualDeadline.generation
+        guard candidates.contains(where: { Self.carries($0) && !$0.isPursuit }) else { return nil }
+        guard !liveTurnInFlight else { return nil }
+        let lastTurnActivityAt = await ChatTurnSteering.shared.turnActivityOrSeed(for: root, at: at)
+        let quietAt = lastTurnActivityAt.addingTimeInterval(StudioWanderLane.quietInterval)
+        guard revision == SwiftNativeDeskStore.currentRevision else { return nil }
+        let opportunities = ResidentWake.carriedOpportunities(dataRoot: root,
+            handles: candidates.filter { Self.carries($0) && !$0.isPursuit }.map(\.handle), at: at)
+        var next: Date?, best: DeskItem?
+        var readyByTime: [Date: Set<String>] = [:]
+        for item in candidates {
+            guard let wakeAt = opportunities[item.handle] else { continue }
+            var crossing = Self.carriedTouch(item, at: at).addingTimeInterval(CognitiveSubstrate.ruminationMinimumAge)
+            if let entry = MyQueue.entry(item), case .at(let due) = MyQueue.when(entry) {
+                crossing = max(Self.carriedTouch(item, at: at), due)
+            }
+            if let deferred = item.deferUntil.flatMap(DeskSequencing.parseDeferStamp) { crossing = max(crossing, deferred) }
+            crossing = max(crossing, quietAt)
+            crossing = max(crossing, wakeAt)
+            context.now = max(at, crossing)
+            let ready = readyByTime[context.now] ?? Set(MyQueueReady.ready(items: candidates, context: context).map(\.handle))
+            readyByTime[context.now] = ready
+            guard ready.contains(item.handle) else { continue }
+            if crossing > at { next = min(next ?? crossing, crossing); continue }
+            if let current = best {
+                if Self.carriedTouch(item, at: at) < Self.carriedTouch(current, at: at) { best = item }
+            } else { best = item }
+        }
+        guard let best else { return next }
+        let freedom = StudioWanderLane.decide(now: at, turnInFlight: liveTurnInFlight,
+            lastTurnActivityAt: lastTurnActivityAt, lastWanderAt: nil)
+        guard freedom == .wander else {
+            guard freedom == .notQuiet else { return next }
+            let freeAt = Date(timeIntervalSinceReferenceDate: quietAt.timeIntervalSinceReferenceDate.nextUp)
+            return min(next ?? freeAt, freeAt)
+        }
+        guard revision == SwiftNativeDeskStore.currentRevision else { return nil }
+        guard !liveTurnInFlight,
+              generation == residualDeadline.generation, !isFlushedForTermination else { return next }
+        ResidentWake.shared.request(dataRoot: root, reason: "what you carry", items: [ResidentWake.carriedArrival(best, crossing: at)])
+        return next
     }
 
     /// The moments half. `MemoryMoments.ruminationCandidates` owns the whole

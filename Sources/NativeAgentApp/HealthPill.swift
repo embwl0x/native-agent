@@ -1,34 +1,5 @@
 import SwiftUI
 
-public enum SystemHealthSummary: Sendable, Equatable {
-    case unknown
-    case ok
-    case warn(count: Int)
-    case error(count: Int)
-}
-
-extension AppModel {
-    var systemHealthSummary: SystemHealthSummary {
-        // Prefer an explicit Doctor run. Otherwise reuse the health card that
-        // Chat already keeps current instead of launching a second full Doctor
-        // pass from this always-mounted toolbar control.
-        func summarize(_ statuses: [String]) -> SystemHealthSummary {
-            let buckets = statuses.map { DoctorPlainCopy.bucket(for: $0) }
-            let failCount = buckets.filter { $0 == "failing" }.count
-            let warnCount = buckets.filter { $0 == "warning" }.count
-            if failCount > 0 { return .error(count: failCount) }
-            if warnCount > 0 { return .warn(count: warnCount) }
-            if buckets.isEmpty || buckets.contains("unclear") { return .unknown }
-            return .ok
-        }
-        if let checks = engine.doctor.report?.checks {
-            return summarize(checks.map(\.status))
-        }
-        guard let subsystems = engine.doctor.healthCard?.subsystems else { return .unknown }
-        return summarize(subsystems.map(\.status))
-    }
-}
-
 /// The health pill has one navigation responsibility: take the person to the
 /// mounted Doctor diagnostics surface. A queued request is useful, but it is
 /// not the same as Doctor having already rendered.
@@ -123,7 +94,7 @@ public struct HealthPill: View {
     public init() {}
 
     public var body: some View {
-        let summary = appModel.systemHealthSummary
+        let summary = appModel.engine.doctor.systemHealthSummary
         let label = label(for: summary)
         let statusColor = color(for: summary)
 

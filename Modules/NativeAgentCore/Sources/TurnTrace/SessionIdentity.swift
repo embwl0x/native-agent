@@ -3,32 +3,6 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 
-// MARK: - One Thread, Many Surfaces — Phase 0 (fences and honest instrumentation)
-//
-// docs/build_plans/one-thread-many-surfaces-plan.md §7 Phase 0.
-//
-// There is no session-resolution owner today: six independent sites mint chat
-// identity, each with its own key space and its own on-disk map. Phase 0 does
-// NOT change any of them. It makes them SAY what they did, so the phase order
-// that follows is validated by production data rather than by archaeology.
-//
-// Two artifacts, both additive:
-//
-//   1. `SessionIdentityTrace` — one `session.identity` turn-trace row per
-//      resolution, carrying {threadKey, sessionId, surface, mintSite,
-//      resolvedBy}. `mintSite` is the smoking gun: it tells us which of the
-//      six actually fires in production.
-//   2. `SessionIdentityCheck` (DoctorChecks) — hot session count, rows minted
-//      in the last 24h BY MINT SITE, and the §1.3 source-flapping detector.
-//
-// LIVES IN PersistenceCore because every mint site must be able to see it and
-// they do not share a higher module: `TelegramSessionStore` is in TelegramBot
-// (which cannot see ChatOrchestration), the Slack loop / iCloud forwarding /
-// Claude bridge live in the app target, and `syncSessionIndex` lives in
-// ChatOrchestration. PersistenceCore is the one module below all of them, and
-// it already owns `TurnTraceEvent`, `ChatSessionIndexFile` and the sessions
-// lock discipline the resolver must respect.
-
 // MARK: - ChatThreadKind
 
 /// What KIND of conversation a chat session row is — recorded on the session
@@ -45,8 +19,7 @@ import PersistenceCore
 /// is a role a session HOLDS for a while (see `ChatAnchorPin`), not a kind it
 /// is born with — which is why there is no `resident` case here.
 ///
-/// `legacy` is not a placeholder — it is the honest label for a row minted by
-/// one of the six sites in plan §1, which by construction carries no thread
+/// `legacy` is the honest label for a row minted without a thread
 /// classification. Rows keep it until something classifies them.
 public enum ChatThreadKind: String, Sendable, Equatable, CaseIterable, Codable {
     /// A private conversation between User and her, on any surface.
@@ -88,8 +61,8 @@ public enum ChatThreadKind: String, Sendable, Equatable, CaseIterable, Codable {
 ///
 /// UNLIKE `fireFromContext`, this emits even when no turnId is bound. Session
 /// resolution happens in the TRANSPORT, strictly before the turn engine binds
-/// `TurnTraceContext.turnId` — guarding on a bound turn would silence exactly
-/// the six sites this row exists to observe. Unbound resolutions are stamped
+/// `TurnTraceContext.turnId` — guarding on a bound turn would silence these
+/// resolutions. Unbound resolutions are stamped
 /// with `unboundTurnId` so a reader can tell "no turn was in flight" from
 /// "this belongs to turn X".
 public enum SessionIdentityTrace {
@@ -101,22 +74,10 @@ public enum SessionIdentityTrace {
     /// Envelope turnId used when resolution happens outside a bound turn.
     public static let unboundTurnId = "unbound"
 
-    /// WHICH of the six minting sites (plus the resolver) produced this
-    /// identity. The plan's §1 table, one case each.
+    /// Which minting site produced this identity.
     public enum MintSite: String, Sendable, Equatable, CaseIterable {
-        /// #1 `TelegramSessionStore.activeSessionId` / `startNewSession`.
+        /// `TelegramSessionStore.activeSessionId` / `startNewSession`.
         case telegramSessionStore = "telegram_session_store"
-        /// #2 `SlackSessionStore.activeSessionId(for:)`.
-        case slackSessionStore = "slack_session_store"
-        /// #3 `AppDelegate+ICloudRuntimeForwarding` resolve-or-mint.
-        case icloudForwarding = "icloud_forwarding"
-        /// #4 iOS `ChatStore.startNewSession()` (client-owned; observed only
-        /// when the phone's id reaches the Mac).
-        case iosClient = "ios_client"
-        /// #5 `AppModel.newChatSession()` → `NativeClient.createChatSession`.
-        case macAppChatSession = "mac_app_chat_session"
-        /// #6 `ClaudeBridge.bridgeMessageSessionID`.
-        case claudeBridge = "claude_bridge"
     }
 
     /// HOW the identity was arrived at. Distinguishing `minted` from every
@@ -128,8 +89,6 @@ public enum SessionIdentityTrace {
         /// Read out of the surface's own durable map
         /// (`telegram/session_map.json`, `slack/session_map.json`).
         case mapped
-        /// Found by picking the newest live row (the bridge's active-session pick).
-        case activeRow
         /// A NEW session id was created.
         case minted
         /// A concurrent first message minted first; this turn adopted its id
@@ -229,14 +188,8 @@ public enum SessionIdentityLedger {
         now: Date = Date(),
         window: TimeInterval = 24 * 60 * 60
     ) -> MintTally {
-        let dir = dataRoot.appendingPathComponent("turn_traces", isDirectory: true)
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone.current
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        formatter.dateFormat = "yyyy-MM-dd"
+        calendar.timeZone = TurnTracePersistLane.dayTimeZone
 
         let cutoff = now.addingTimeInterval(-window)
         var minted: [String: Int] = [:]
@@ -246,7 +199,7 @@ public enum SessionIdentityLedger {
         var day = calendar.startOfDay(for: cutoff)
         let lastDay = calendar.startOfDay(for: now)
         while day <= lastDay {
-            let path = dir.appendingPathComponent("\(formatter.string(from: day)).jsonl")
+            let path = TurnTracePersistLane.fileURL(for: day, root: dataRoot)
             guard let nextDay = calendar.date(byAdding: .day, value: 1, to: day) else { break }
             day = nextDay
             guard let raw = try? String(contentsOf: path, encoding: .utf8) else { continue }
@@ -353,9 +306,7 @@ public enum SessionIdentityLedger {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
         guard let data = try? Data(contentsOf: sessionsPath),
-              (try? JSONDecoder().decode([ChatSession].self, from: data)) != nil,
-              let parsed = try? JSONValue.parse(data),
-              case .array(let rows) = parsed else {
+              let rows = try? JSONDecoder().decode([ChatSession].self, from: data) else {
             return FlappingReport(
                 hotSessionCount: 0,
                 disagreeingSessionIds: [],
@@ -375,27 +326,18 @@ public enum SessionIdentityLedger {
         var indexReadable = true
 
         for row in rows {
-            guard case .object(let object) = row,
-                  case .string(let id)? = object["id"],
-                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let id = row.id
+            guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 indexReadable = false
                 continue
             }
-            if case .bool(true)? = object["archived"] { continue }
+            if row.archived == true { continue }
             hot += 1
-            let indexSource: String = {
-                if case .string(let value)? = object["source"] { return normalizedSource(value) }
-                return ""
-            }()
+            let indexSource = row.source.map(normalizedSource) ?? ""
             // DURABLE CREATION PROVENANCE. The index row carries the session's
             // own creation instant; a transcript whose oldest surviving surface
             // row postdates it has had its creation row compacted away.
-            let indexCreatedAt: Date? = {
-                if case .string(let value)? = object["createdAt"] {
-                    return iso8601Instant(value)
-                }
-                return nil
-            }()
+            let indexCreatedAt = TurnTraceEvent.parseISO8601(row.createdAt.trimmingCharacters(in: .whitespacesAndNewlines))
             guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
                 unreadable += 1
                 continue
@@ -413,7 +355,7 @@ public enum SessionIdentityLedger {
             // unread. Unread is a transcript the index says has content
             // that cannot be scanned.
             let absent = !FileManager.default.fileExists(atPath: transcript.path)
-            if absent || size == 0, indexMessageCount(object) <= 0 { continue }
+            if absent || size == 0, (row.messageCount ?? 0) <= 0 { continue }
             guard scanned < maximumTotalScanBytes,
                   let size,
                   size > 0,
@@ -455,7 +397,7 @@ public enum SessionIdentityLedger {
                 if creationSource == nil {
                     creationSource = normalized
                     if case .string(let stamp)? = record["createdAt"] {
-                        creationRowAt = iso8601Instant(stamp)
+                        creationRowAt = TurnTraceEvent.parseISO8601(stamp.trimmingCharacters(in: .whitespacesAndNewlines))
                     }
                 }
                 tally[normalized, default: 0] += 1
@@ -508,24 +450,6 @@ public enum SessionIdentityLedger {
     /// files are written by different writers moments apart, so a few seconds
     /// of skew is normal; days are not.
     static let creationRowSkewSeconds: TimeInterval = 120
-
-    /// The index row's own message count; absent or malformed reads as 0.
-    static func indexMessageCount(_ row: [String: JSONValue]) -> Int {
-        switch row["messageCount"] {
-        case .int(let value)?: return Int(value)
-        case .double(let value)?: return Int(value)
-        default: return 0
-        }
-    }
-
-    static func iso8601Instant(_ raw: String) -> Date? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let parsed = withFraction.date(from: trimmed) { return parsed }
-        return ISO8601DateFormatter().date(from: trimmed)
-    }
 
     /// The same normalization `ChatOrchestrationClient.messageSource(for:)`
     /// applies when it writes the row, so a comparison between an index

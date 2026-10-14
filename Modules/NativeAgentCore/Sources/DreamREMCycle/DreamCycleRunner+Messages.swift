@@ -344,12 +344,7 @@ extension DreamCycleRunner {
     /// — see pass-3 review).
     public static func parseDaemonISO(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isoFrac = ISO8601DateFormatter()
-        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = isoFrac.date(from: trimmed) { return d }
-        let isoPlain = ISO8601DateFormatter()
-        isoPlain.formatOptions = [.withInternetDateTime]
-        if let d = isoPlain.date(from: trimmed) { return d }
+        if let d = NativeTimestampFormat.parseISO8601FractionalFirst(trimmed) { return d }
         // Microsecond fallback: truncate the fractional component to 3
         // digits and retry the fractional parser. Match the timezone
         // suffix (`Z` or `±HH:MM`/`±HHMM`) so we splice cleanly.
@@ -365,7 +360,7 @@ extension DreamCycleRunner {
                 let truncated = String(trimmed[..<fracStart])
                     + String(frac.prefix(3))
                     + String(trimmed[tzMatch.lowerBound...])
-                return isoFrac.date(from: truncated)
+                return NativeTimestampFormat.parseISO8601FractionalFirst(truncated)
             }
         }
         return nil

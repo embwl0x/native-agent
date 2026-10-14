@@ -5,7 +5,6 @@ import AppKit
 #endif
 import Foundation
 import TrustCenter
-import CryptoKit
 import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
@@ -20,28 +19,32 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
     public static func closeACPConnections() async { await AgentACPConnections.shared.closeAll() }
 
     public func builtInAgentLaneUsable(_ name: String) -> Bool {
+        Self.builtInAgentLaneUsable(name, dataRoot: dataRoot, configRoot: agentBridgeConfigRoot)
+    }
+
+    static func builtInAgentLaneUsable(_ name: String, dataRoot: URL, configRoot: URL?) -> Bool {
         let helper: URL?
         let cli: String
         let directory: String
         switch name {
         case "codex":
-            helper = AgentBridgeRuntime.codexHelperURL(override: codexMessageWakeupHelperOverride, dataRoot: dataRoot)
+            helper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot)
             cli = "codex"
             directory = "codex-nativeagent-bridge"
         case "claude":
             // Nothing is launched: her live session reads the inbox.
             var isDirectory: ObjCBool = false
-            let inbox = Self.bridgeConfigDirectory(named: "claude-bridge", configRootOverride: agentBridgeConfigRoot)
+            let inbox = Self.bridgeConfigDirectory(named: "claude-bridge", configRootOverride: configRoot)
             return FileManager.default.fileExists(atPath: inbox.path, isDirectory: &isDirectory) && isDirectory.boolValue
         case "omp":
-            helper = AgentBridgeRuntime.ompHelperURL(override: ompMessageWakeupHelperOverride, dataRoot: dataRoot)
+            helper = AgentBridgeRuntime.ompHelperURL(dataRoot: dataRoot)
             cli = "omp"
             directory = "omp-bridge"
         default: return false
         }
         return Self.builtInAgentLaneUsable(
-            directory: Self.bridgeConfigDirectory(named: directory, configRootOverride: agentBridgeConfigRoot),
-            readiness: AgentBridgeRuntime.readiness(helper: helper, cliName: cli, bridgeConfigRoot: agentBridgeConfigRoot)
+            directory: Self.bridgeConfigDirectory(named: directory, configRootOverride: configRoot),
+            readiness: AgentBridgeRuntime.readiness(helper: helper, cliName: cli, bridgeConfigRoot: configRoot)
         )
     }
 
@@ -56,6 +59,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         let optional: Set<String> = ["endpoint", "app_bundle_id", "conversation_label", "transport", "bearer_token", "conversation_id", "message_id", "task_id", "options", "limit", "offset", "max_chars", "details", "disconnect"]
         let args = input.filter {
             if ["session_id", "__session_id"].contains($0.key) { return false }
+            if tool == "agent_message", $0.key == "dry_run" { return false }
             if optional.contains($0.key), $0.value == .string("") { return false }
             // False means the caller is not disconnecting.
             if $0.key == "disconnect", $0.value == .bool(false) { return false }
@@ -99,14 +103,17 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             if peers.contains(where: ChatGPTDotIPCTransport.owns) { _ = await chatGPTDotReadiness() }
             let usable = Set(lanes.filter { builtInAgentLaneUsable($0) })
             var contacts = Self.agentLaneContacts(peers: allPeers, selectedPeers: peers, lanes: lanes, usable: usable)
-            let health = AgentLocalHealth.read(dataRoot)
+            let health = AgentContactHealth.read(dataRoot: dataRoot)
             contacts = contacts.map { value in
                 guard case .object(var row) = value, case .string(let agent)? = row["agent"], let observed = health[agent] else { return value }
                 row["reply_path"] = observed.projection
-                if observed.brokenSince != nil || observed.status == "unverified" {
-                    row["state"] = .string(observed.status)
-                    row["state_detail"] = .string(observed.problem ?? observed.detail)
-                    row["readiness"] = .string(observed.status)
+                if let presence = observed.presenceStatus {
+                    row["presence"] = .object(["status": .string(presence), "detail": .string(observed.presenceDetail ?? "")])
+                }
+                if observed.brokenSince != nil || observed.replyStatus == "unverified" {
+                    row["state"] = .string(observed.replyStatus)
+                    row["state_detail"] = .string(observed.problem ?? observed.replyDetail)
+                    row["readiness"] = .string(observed.replyStatus)
                 }
                 return .object(row)
             }
@@ -397,7 +404,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 ? UUID().uuidString.lowercased() : nil)
             return await hostCommandRun(row: row, contact: peer, message: text, session: session,
                                         resuming: requested != nil, store: store, surface: surface,
-                                        probe: AgentRecipeStore.dryRun || text == AgentHostDirectory.probeText(appName: Self.appDisplayName))
+                                        probe: !AgentRecipeStore.dryRun && text == AgentHostDirectory.probeText(appName: Self.appDisplayName))
         }
         if peer.transport == .desktop {
             guard args["conversation_id"] == nil, args["message_id"] == nil, args["task_id"] == nil,
@@ -478,10 +485,6 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             let checked = await AgentPeerDiscovery.a2aCheck(peer, bearerToken: token, sending: sending)
             guard let selected = checked.interface else {
                 available = [.string("passed"), .string("repaired")].contains(checked.receipt["status"] ?? .null)
-                // A dry run that proved its auth is proof of the recipe it checked, as an ACP handshake is.
-                if available, let recipe = checked.recipe {
-                    store.recordRoundTrip(peerID: peer.id, workspace: "Remote workspace (not reported)", recipe: recipe)
-                }
                 return finished(envelope.merging(checked.receipt) { $1 })
             }
             a2aInterface = selected
@@ -564,10 +567,9 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             if let interface = a2aInterface {
                 let result: AgentA2AWire.Result
                 if request.isStreaming {
-                    let receipt = try AgentA2AStream.normalize(response.events, interface: interface,
-                        requestID: request.requestID, expectedTaskID: task)
-                    envelope["interrupted"] = .bool(response.interrupted || receipt.interrupted)
-                    guard let value = receipt.result else { throw AgentCommunicationError.invalid("No answer arrived. The work may still be running; do not resend automatically.") }
+                    let receipt = try response.receipt?.get()
+                    envelope["interrupted"] = .bool(response.interrupted || receipt?.interrupted != false)
+                    guard let receipt, let value = receipt.result else { throw AgentCommunicationError.invalid("No answer arrived. The work may still be running; do not resend automatically.") }
                     result = value
                     if receipt.interrupted { envelope["detail"] = .string("The connection ended before an outcome arrived. Read this task again; do not resend the message.") }
                     else if response.interrupted { envelope["detail"] = .string("The connection was interrupted after the reported outcome arrived. Do not resend the message.") }
@@ -1047,7 +1049,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             guard await AgentACPConnections.shared.finish(acquired, peer: contact.id, conversation: dryRun ? nil : reply.sessionID) else { throw AgentACPClient.Failure.interrupted }
             lease = nil
             if dryRun {
-                // What the agent advertised now goes into its recipe, and the handshake is proof.
+                // What the agent advertised now goes into its recipe.
                 let found = await acquired.client.learned(line)
                 var host = row
                 host.acp = found
@@ -1062,7 +1064,6 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                     }
                 }
                 let now = written ?? recipe
-                store.recordRoundTrip(peerID: contact.id, executable: approved.path, version: approved.version, workspace: directory.path, recipe: now)
                 var result: [String: JSONValue] = ["status": .string(written == nil ? "passed" : "repaired"), "dry_run": .bool(true), "sent": .bool(false),
                     "agent": .string("peer:" + contact.id), "transport": .string("acp"), "recipe_version": .int(Int64(now.recipeVersion)),
                     "detail": .string("\(shown) answered its handshake with no prompt sent.")]
@@ -1248,11 +1249,11 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         }
         let name = agent == "omp" ? "OMP" : "Codex"
         if agent == "codex" {
-            let job = DelegationStatusProjector(configRoot: agentBridgeConfigRoot)
+            let job = DelegationStatusProjector(configRoot: agentBridgeConfigRoot, dataRoot: dataRoot)
                 .readSnapshot(now: Date(), limit: 1, offset: 0, agent: "codex", messageID: messageID).jobs.first
             if job?.stallBasis == .terminal { return answer("cannot_stop", "Codex already finished that turn; its answer is on the way.") }
             guard let thread = job?.recordedThreadID, let turn = job?.recordedTurnID,
-                  let helper = AgentBridgeRuntime.codexHelperURL(override: codexMessageWakeupHelperOverride, dataRoot: dataRoot),
+                  let helper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot),
                   let input = try? JSONValue.object(["interrupt": .bool(true), "threadId": .string(thread), "turnId": .string(turn)]).serializedData(pretty: false) else {
                 return answer("cannot_stop", "Codex has not started a turn for it yet (it is queued behind other Codex work), so there is no turn to interrupt.")
             }
@@ -1284,7 +1285,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
               case .string(let recorded)? = job["runnerIdentity"], !recorded.isEmpty else {
             return answer("cannot_stop", "\(name)'s run did not record its process identity, so it is not safe to interrupt from here.")
         }
-        guard Self.processStartIdentity(pid) == recorded else {
+        guard AgentBridgeRuntime.processStartIdentity(pid) == recorded else {
             return answer("cannot_stop", "\(name)'s run is no longer live on this Mac, so there is nothing to interrupt.")
         }
         // Only the run's own children (the agent CLI), never the runner: it
@@ -1296,23 +1297,6 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         }
         Self.interruptThenTerminate(children)
         return answer("stopping", "Interrupted \(name)'s run (SIGINT, then SIGTERM if it keeps going); the conversation settles when the run records its end.")
-    }
-
-    /// The same identity the wake runners record for themselves:
-    /// sha256 hex of `ps -p <pid> -o lstart=,command=`, trimmed.
-    static func processStartIdentity(_ pid: Int32) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-p", String(pid), "-o", "lstart=,command="]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard process.terminationStatus == 0, !text.isEmpty else { return nil }
-        return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// A MESSAGE GOES OUT AND A MESSAGE COMES BACK, IN THE SAME CALL.
@@ -1336,6 +1320,32 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         guard let line = row.commandLine else { return Self.hostNoCommandLine(row: row, contact: contact, peers: (try? store.list()) ?? []) }
         // The recipe this send runs on, kept for its proof.
         let recipe = AgentRecipeStore.recipe(row.id)
+        if AgentRecipeStore.dryRun {
+            var result: [String: JSONValue] = ["status": .string("failed"), "dry_run": .bool(true),
+                "agent": .string("peer:" + contact.id), "transport": .string("mcpHost"), "host": .string(row.id),
+                "sent": .bool(false), "ran": .bool(false), "completed": .bool(false),
+                "command": .string(line.executable),
+                "arguments": .array((resuming ? line.continuation : line.arguments).map(JSONValue.string)),
+                "checked": .array([.string("commandLine.executable"), .string("commandLine.arguments")])]
+            guard let executable = row.resolveExecutable(line.executable) else {
+                result["detail"] = .string("\(row.displayName)'s readiness check failed: \(line.executable) could not be resolved to a runnable file; no prompt was sent.")
+                return .object(result)
+            }
+            result["executable"] = .string(executable)
+            guard let recipe else {
+                result["detail"] = .string("\(row.displayName)'s recipe is unavailable; no prompt was sent.")
+                return .object(result)
+            }
+            do {
+                let learned = try (recipe.host == row ? recipe : AgentRecipeStore.learn(recipe, host: row))
+                result["recipe_version"] = .int(Int64(learned.recipeVersion))
+                result["status"] = .string("passed")
+                result["detail"] = .string("\(row.displayName) answered its readiness check: \(executable) is runnable; no prompt was sent.")
+            } catch {
+                result["detail"] = .string("\(row.displayName)'s readiness check could not be recorded in its recipe: \(error). No prompt was sent.")
+            }
+            return .object(result)
+        }
         let access = await fullMacToolAccess(surface: surface)
         guard access.fileOpsAllowed else {
             let refusal = builderFullMacRequired(tool: "agent_message")
@@ -1427,12 +1437,13 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 var whole = "", active = false, overflow = false
                 var retainedBytes = 0
                 for await text in lines {
-                    if line.isResultLine(text), !overflow {
+                    let parsed = line.streamEvent(line: text)
+                    if parsed.retain, !overflow {
                         retainedBytes += text.utf8.count + 1
                         if retainedBytes <= 16 * 1024 * 1024 { whole += text + "\n" }
                         else { overflow = true; whole = "" }
                     }
-                    guard let live, let event = line.streamEvent(line: text) else { continue }
+                    guard let live, let event = parsed.event else { continue }
                     if !active { await hub.activity(live); active = true }
                     switch event {
                     case .text(let chunk, whole: true): await hub.text(live, replace: chunk)
@@ -1460,7 +1471,6 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             environmentOverride: AgentHostCommandLines.scrubbedEnvironment(),
             closeStandardInput: true,
             reapDescendantsOnExit: true,
-            interruptOnCancel: true,
             onStdoutLine: onStdoutLine)
         linesIn.finish()
         let streamedStdout = await streamed?.value
@@ -1533,7 +1543,6 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             if !arrived {
                 result["detail"] = .string("No new answer arrived through the connection. The other app may need to restart before it can reply here.")
             }
-            if AgentRecipeStore.dryRun { result["status"] = .string(arrived ? "passed" : "failed"); result["dry_run"] = .bool(true) }
         }
         if envelope["status"] == .string("cancelled") {
             // agent_cancel: interrupted at her request, not a failure of the contact.
@@ -1650,7 +1659,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
     private static func compactContact(_ value: JSONValue) -> JSONValue {
         guard case .object(let row) = value else { return value }
         let keys: Set<String> = ["agent", "name", "description", "kind", "state", "state_detail", "readiness", "paused",
-            "endpoint", "card_url", "untrusted_remote_data",
+            "endpoint", "card_url", "untrusted_remote_data", "presence",
             "can_start_turn", "can_answer_back", "capabilities", "read_inputs", "workspace",
             "last_reply_in", "last_message_out", "last_exchange", "retained_exchanges", "unavailable_now_checked_at", "reply_path"]
         var compact = row.filter { keys.contains($0.key) }

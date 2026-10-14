@@ -27,11 +27,7 @@ public struct MacPointerPosition: Sendable, Equatable {
     public var json: JSONValue { .object(["x": .double(x), "y": .double(y)]) }
 }
 
-public protocol MacPointerPositionSource: Sendable {
-    func currentPosition() -> MacPointerPosition?
-}
-
-public struct SystemMacPointerPositionSource: MacPointerPositionSource {
+public struct SystemMacPointerPositionSource: Sendable {
     public init() {}
     public func currentPosition() -> MacPointerPosition? {
         #if canImport(CoreGraphics) && os(macOS)
@@ -41,15 +37,6 @@ public struct SystemMacPointerPositionSource: MacPointerPositionSource {
         return nil
         #endif
     }
-}
-
-public struct UnavailableMacPointerPositionSource: MacPointerPositionSource {
-    public init() {}
-    public func currentPosition() -> MacPointerPosition? { nil }
-}
-
-public func defaultMacPointerPositionSource() -> any MacPointerPositionSource {
-    return SystemMacPointerPositionSource()
 }
 
 /// Choose a fresh clear point in a broad region, without changing its identity

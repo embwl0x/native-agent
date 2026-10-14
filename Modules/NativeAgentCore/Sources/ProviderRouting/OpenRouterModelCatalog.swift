@@ -72,12 +72,8 @@ public enum OpenRouterModelCatalog {
     static let ttlCache = ModelCatalogTTLCache(
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
-        readCache: { readCache(dataRoot: $0) },
-        cacheUpdatedAt: { cacheUpdatedAt(dataRoot: $0) },
-        // Both doors are the same fetch; `fetchLiveComplete` is the one that
-        // carries the completeness verdict (User, 2026-09-06).
-        fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1).models },
-        fetchLiveComplete: { try await fetchLiveModels(dataRoot: $0, session: $1) }
+        readCache: { readDecodedCache(dataRoot: $0) },
+        fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1) }
     )
 
     public static func models(
@@ -98,13 +94,7 @@ public enum OpenRouterModelCatalog {
         await ttlCache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
-    /// True when the cache is missing its `updated_at` stamp or that stamp is
-    /// older than the TTL. A cache without a parseable stamp is treated as stale
-    /// so it refreshes once (writeCache always stamps `updated_at`).
-    static func cacheIsStale(dataRoot: URL, now: Date = Date()) -> Bool {
-        ttlCache.cacheIsStale(dataRoot: dataRoot, now: now)
-    }
-
+    /// Only a complete, recent catalog can establish that a model is absent.
     public static func cachedAvailability(
         of modelID: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -114,8 +104,8 @@ public enum OpenRouterModelCatalog {
         // separate reads of this file, so a refresh landing between them could
         // convict a model against a generation that never listed it. Both
         // facts now come from ONE decode of one set of bytes.
-        guard !cacheIsStale(dataRoot: dataRoot, now: now),
-              let cached = readDecodedCache(dataRoot: dataRoot),
+        guard let cached = readDecodedCache(dataRoot: dataRoot),
+              !ttlCache.cacheIsStale(fetchedAt: cached.fetchedAt, now: now),
               !cached.models.isEmpty else {
             return .unknown
         }
@@ -129,25 +119,6 @@ public enum OpenRouterModelCatalog {
         // cache carrying NO completeness stamp is unknown for the same reason —
         // absence of the stamp is not authority to convict.
         return cached.isComplete == true ? .unavailable : .unknown
-    }
-
-    private static func cacheUpdatedAt(dataRoot: URL) -> Date? {
-        let path = cachePath(dataRoot: dataRoot)
-        guard let data = try? Data(contentsOf: path),
-              let root = try? JSONValue.parse(data),
-              case .object(let obj) = root,
-              case .string(let raw)? = obj["updated_at"] else {
-            return nil
-        }
-        return ISO8601DateFormatter().date(from: raw)
-    }
-
-    public static func providerJSONModels(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        session: URLSession = .shared,
-        refresh: Bool = false
-    ) async -> [[String: JSONValue]] {
-        await models(dataRoot: dataRoot, session: session, refresh: refresh).map { $0.providerJSON() }
     }
 
     /// Read-only exact capability projection from the last live-backed cache.
@@ -350,27 +321,15 @@ public enum OpenRouterModelCatalog {
 
     /// The whole decoded cache — rows AND the completeness stamp they were
     /// written under — from a single decode of a single set of bytes.
-    private static func readDecodedCache(dataRoot: URL) -> DecodedOpenRouterCatalog? {
-        OpenRouterCacheDecodeCache.shared.read(url: cachePath(dataRoot: dataRoot)) {
+    private static let decodedCache = ModelCatalogDecodeCache()
+
+    private static func readDecodedCache(dataRoot: URL) -> DecodedModelCatalog? {
+        decodedCache.read(url: cachePath(dataRoot: dataRoot)) {
             decodeCache(data: $0)
         }
     }
 
-    /// Deterministic operation-count seam for the per-turn read regression.
-    static func _testCacheStats(dataRoot: URL) -> CacheStats {
-        OpenRouterCacheDecodeCache.shared.stats(url: cachePath(dataRoot: dataRoot))
-    }
-
-    static func _resetCacheForTesting(dataRoot: URL) {
-        OpenRouterCacheDecodeCache.shared.reset(url: cachePath(dataRoot: dataRoot))
-    }
-
-    struct CacheStats: Sendable, Equatable {
-        let decodeAttempts: Int
-        let hits: Int
-    }
-
-    private static func decodeCache(data: Data) -> DecodedOpenRouterCatalog? {
+    private static func decodeCache(data: Data) -> DecodedModelCatalog? {
         guard let root = try? JSONValue.parse(data),
               case .object(let obj) = root,
               case .array(let rows)? = obj["models"] else {
@@ -401,7 +360,13 @@ public enum OpenRouterModelCatalog {
             )
         }
         guard !models.isEmpty else { return nil }
-        return DecodedOpenRouterCatalog(models: sortModels(models), isComplete: isComplete)
+        let fetchedAt: Date?
+        if case .string(let raw)? = obj["updated_at"] {
+            fetchedAt = ISO8601DateFormatter().date(from: raw)
+        } else {
+            fetchedAt = nil
+        }
+        return DecodedModelCatalog(models: sortModels(models), isComplete: isComplete, fetchedAt: fetchedAt)
     }
 
     private static func stringSet(_ value: Any?) -> Set<String> {
@@ -457,100 +422,5 @@ public enum OpenRouterModelCatalog {
     private static func bool(_ value: JSONValue?) -> Bool? {
         guard case .bool(let value)? = value else { return nil }
         return value
-    }
-}
-
-/// One decode of the on-disk catalogue: the rows AND the completeness verdict
-/// the bytes were written under. `isComplete` is nil when the file carries no
-/// `complete` stamp — unknown, never a claim either way (User, 2026-09-06).
-private struct DecodedOpenRouterCatalog: Sendable {
-    let models: [ProviderModelDescriptor]
-    let isComplete: Bool?
-}
-
-/// Process-local decoded cache keyed by canonical path and file mtime.
-///
-/// Every read still stats the exact file, so removal and atomic replacement are
-/// visible on the next read. Missing, unreadable, empty, or undecodable bytes
-/// cache only the nil result for that observed mtime; a later mtime always
-/// retries the decode. Mirrors `REMPinsDecodedCache` in DreamREMCycle — same
-/// invariant, same retry-on-concurrent-write guard.
-private final class OpenRouterCacheDecodeCache: @unchecked Sendable {
-    static let shared = OpenRouterCacheDecodeCache()
-
-    private struct Entry {
-        let modifiedAt: Date
-        let catalog: DecodedOpenRouterCatalog?
-    }
-
-    private let lock = NSLock()
-    private var entries: [String: Entry] = [:]
-    private var decodeAttempts: [String: Int] = [:]
-    private var hits: [String: Int] = [:]
-
-    func read(
-        url: URL,
-        decode: (Data) -> DecodedOpenRouterCatalog?
-    ) -> DecodedOpenRouterCatalog? {
-        // `attributesOfItem` does NOT follow symlinks, but `Data(contentsOf:)`
-        // does. Resolve first so a symlinked cache path stats as the regular
-        // file it points at instead of silently reading as "no catalog".
-        let url = url.resolvingSymlinksInPath()
-        let key = url.path
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Retry once if a writer replaces the file between the first stat and
-        // the read. Never associate bytes with a stale mtime key.
-        for _ in 0..<2 {
-            guard let modifiedAt = modificationDate(url) else {
-                entries.removeValue(forKey: key)
-                return nil
-            }
-            if let entry = entries[key], entry.modifiedAt == modifiedAt {
-                hits[key, default: 0] += 1
-                return entry.catalog
-            }
-
-            decodeAttempts[key, default: 0] += 1
-            let decoded = (try? Data(contentsOf: url)).flatMap(decode)
-            guard modificationDate(url) == modifiedAt else { continue }
-
-            if entries[key] == nil, entries.count >= 64 {
-                entries.remove(at: entries.startIndex)
-            }
-            entries[key] = Entry(modifiedAt: modifiedAt, catalog: decoded)
-            return decoded
-        }
-
-        // A continuously changing file is not a safe source to memoize.
-        entries.removeValue(forKey: key)
-        return nil
-    }
-
-    func stats(url: URL) -> OpenRouterModelCatalog.CacheStats {
-        let key = url.resolvingSymlinksInPath().path
-        lock.lock()
-        let value = OpenRouterModelCatalog.CacheStats(
-            decodeAttempts: decodeAttempts[key, default: 0],
-            hits: hits[key, default: 0]
-        )
-        lock.unlock()
-        return value
-    }
-
-    func reset(url: URL) {
-        let key = url.resolvingSymlinksInPath().path
-        lock.lock()
-        entries.removeValue(forKey: key)
-        decodeAttempts.removeValue(forKey: key)
-        hits.removeValue(forKey: key)
-        lock.unlock()
-    }
-
-    private func modificationDate(_ url: URL) -> Date? {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        guard attributes?[.type] as? FileAttributeType == .typeRegular else { return nil }
-        return attributes?[.modificationDate] as? Date
     }
 }

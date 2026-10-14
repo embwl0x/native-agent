@@ -126,24 +126,6 @@ extension NativeOAuthFlow {
         return try NativeOAuthSupport.loadJSONObject(path)
     }
 
-    /// True when the persisted credential carries a non-empty refresh token —
-    /// the only thing that makes an expired access token recoverable without
-    /// the browser. User, 2026-09-06: the badge promised a refresh on the next
-    /// chat for every expired credential, including ones with nothing to
-    /// refresh with, so a dead sign-in looked like it would heal itself.
-    public static func hasRefreshToken(providerId: String, dataRoot: URL? = nil) -> Bool {
-        guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot),
-              let obj = try? statusCredentialObject(at: path)
-        else { return false }
-        let candidates = [
-            obj["refresh_token"] as? String,
-            (obj["tokens"] as? [String: Any])?["refresh_token"] as? String,
-        ]
-        return candidates.contains {
-            ($0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-        }
-    }
-
     private static func canRefresh(providerId: String, dataRoot: URL?) -> Bool {
         let provider = normalizedOAuthProviderId(providerId)
         guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot),
@@ -370,25 +352,6 @@ extension NativeOAuthFlow {
         return candidates.first { OpenAIOAuthDirectAdapter.hasUsableTokens(at: $0) }
     }
 
-    /// The auth path chat execution will actually use, or nil when it holds
-    /// no usable tokens. This is the ONLY source for the sign-in badge:
-    /// `preferredAuthPath` honors `CODEX_HOME`/`NATIVE_AGENT_DATA_ROOT`
-    /// overrides unconditionally, so a badge built from a first-usable
-    /// candidate scan could report "Signed in" off credentials execution
-    /// never reads (gpt-5.5 review 2026-08-06). Injectable for tests only.
-    public static func openAIActiveAuthPath(
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        userCodexHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome(),
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> URL? {
-        let path = OpenAIOAuthDirectAdapter.preferredAuthPath(
-            dataRoot: dataRoot,
-            environment: environment,
-            userCodexHome: userCodexHome
-        )
-        return OpenAIOAuthDirectAdapter.hasUsableTokens(at: path) ? path : nil
-    }
-
     public static func anthropicTokenPath(dataRoot: URL? = nil) -> URL {
         (dataRoot ?? PersistenceCore.defaultDataRoot())
             .appendingPathComponent("providers", isDirectory: true)
@@ -549,4 +512,40 @@ extension NativeOAuthFlow {
     public static func repairCodexCLISessionConsent(dataRoot: URL? = nil) throws -> URL {
         try OpenAIOAuthDirectAdapter.backupAndResetCorruptCLIAdoptionConsent(dataRoot: dataRoot)
     }
+}
+
+extension NativeOAuthFlow {
+    public struct SignInStatus: Equatable {
+        public let isSignedIn: Bool
+        public let detail: String?
+        public let error: String?
+    }
+
+    public static func signInStatus(providerID: String, dataRoot: URL) -> SignInStatus {
+        if providerID == "anthropic_oauth_direct" {
+            switch NativeOAuthFlow.anthropicOAuthCredentialState(dataRoot: dataRoot) {
+            case .missing:
+                return SignInStatus(isSignedIn: false, detail: nil, error: nil)
+            case .unavailable(let detail):
+                return SignInStatus(
+                    isSignedIn: false,
+                    detail: nil,
+                    error: "Anthropic OAuth credentials unavailable: \(detail)"
+                )
+            case .ready:
+                break
+            }
+        }
+
+        guard NativeOAuthFlow.isSignedIn(providerId: providerID, dataRoot: dataRoot) else {
+            return SignInStatus(isSignedIn: false, detail: nil, error: nil)
+        }
+        return SignInStatus(
+            isSignedIn: true,
+            detail: NativeOAuthFlow.signInStatusDetail(providerId: providerID, dataRoot: dataRoot)
+                ?? "Signed in",
+            error: nil
+        )
+    }
+
 }

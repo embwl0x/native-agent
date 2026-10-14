@@ -20,9 +20,76 @@ import Studio
 /// proved it at the dispatcher, and the substrate refuses an incomplete one
 /// again on the way in.
 extension NativeCognitionRuntime: StandingViewHolding {
+    public enum StandingViewReviewStatus: Sendable, Equatable {
+        case applied(CognitiveStandingView.Status)
+        case unavailable(String)
+        case notSaved(String)
+    }
+
+    public struct StandingViewReviewOutcome: Sendable {
+        public var status: StandingViewReviewStatus
+        public var detail: CognitiveObservatoryDetail
+    }
+
+    /// Recheck at the mutation boundary and after its checked write so a
+    /// maintenance race or unsaved in-memory change cannot appear completed.
+    public func resolveStandingViewWithOutcome(id: UUID, approved: Bool) async -> StandingViewReviewOutcome {
+        let before = await observatoryDetail()
+        guard before.standingViews.first(where: { $0.id == id })?.status == .proposed else {
+            return StandingViewReviewOutcome(
+                status: .unavailable("That standing view is no longer awaiting review."),
+                detail: before
+            )
+        }
+        let resolved = await resolveStandingViewChecked(id: id, approved: approved)
+        let detail = await observatoryDetail()
+        if let failure = resolved.persistenceFailure {
+            return StandingViewReviewOutcome(status: .notSaved(failure), detail: detail)
+        }
+        let expected: CognitiveStandingView.Status = approved ? .active : .retired
+        guard resolved.view?.status == expected,
+              detail.standingViews.first(where: { $0.id == id })?.status == expected else {
+            return StandingViewReviewOutcome(
+                status: .unavailable("The standing view changed before the review could be saved."),
+                detail: detail
+            )
+        }
+        return StandingViewReviewOutcome(status: .applied(expected), detail: detail)
+    }
+
+    public func retireStandingViewWithOutcome(id: UUID) async -> StandingViewReviewOutcome {
+        let before = await observatoryDetail()
+        guard let current = before.standingViews.first(where: { $0.id == id }),
+              current.isLeaning else {
+            return StandingViewReviewOutcome(
+                status: .unavailable("That standing view is not one you're leaning on."),
+                detail: before
+            )
+        }
+        let retired = await retireStandingViewChecked(id: id)
+        let detail = await observatoryDetail()
+        guard retired.view?.status == .retired,
+              detail.standingViews.first(where: { $0.id == id })?.status == .retired else {
+            return StandingViewReviewOutcome(
+                status: .unavailable("The standing view changed before it could be retired."),
+                detail: detail
+            )
+        }
+        if let failure = retired.persistenceFailure {
+            return StandingViewReviewOutcome(status: .notSaved(failure), detail: detail)
+        }
+        return StandingViewReviewOutcome(status: .applied(.retired), detail: detail)
+    }
+
     public func standingViewsForHolding() async -> [CognitiveStandingView] {
         await bootstrap()
         return await substrate.standingViewSnapshot().filter { $0.status != .retired }
+    }
+
+    public func proposedStandingViews() async -> [CognitiveStandingView]? {
+        await bootstrap()
+        guard await substrate.configurationSnapshot().enabled else { return nil }
+        return await substrate.standingViewSnapshot().filter { $0.status == .proposed }
     }
 
     /// 2026-09-06: carries the persistence outcome for the same reason release

@@ -87,7 +87,7 @@ extension MemoryStorage {
         return s
     }
 
-    private static func decodeMetadata(_ s: String?) throws -> JSONValue? {
+    static func decodeMetadata(_ s: String?) throws -> JSONValue? {
         guard let s else { return nil }
         return try JSONDecoder().decode(JSONValue.self, from: Data(s.utf8))
     }

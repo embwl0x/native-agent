@@ -99,3 +99,113 @@ public struct EvalRun: Identifiable, Codable, Hashable, Sendable {
         self.durationSeconds = try c.decodeIfPresent(Double.self, forKey: .durationSeconds)
     }
 }
+
+public struct HarnessBenchmarkRun: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var name: String?
+    public var status: String?
+    public var checks: [HarnessBenchmarkCheck]?
+    public var durationSeconds: Double?
+    public var schedule: String?
+    public var manualRunnable: Bool?
+    public var chatPathImpact: String?
+    public var createdAt: String?
+}
+
+public struct HarnessBenchmarkCheck: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var title: String?
+    public var passed: Bool?
+    public var detail: String?
+}
+
+extension HarnessBenchmarkRun {
+    /// Validates the local Swift surfaces — tool manifest, MCP registry,
+    /// embedding runtime, Doctor — with no model call, and appends the run to
+    /// `harness/benchmark/runs.jsonl`. A failed read is a failed check that
+    /// carries its actual error text.
+    public static func run(
+        dataRoot: URL,
+        authoredToolCount: () async throws -> Int,
+        mcpServerCount: () async throws -> Int,
+        embeddingRuntimeAvailable: () async -> Bool,
+        doctorStatuses: () async -> [String]?
+    ) async -> HarnessBenchmarkRun {
+        let start = Date()
+        var checks: [HarnessBenchmarkCheck] = []
+
+        do {
+            let tools = try await authoredToolCount()
+            checks.append(HarnessBenchmarkCheck(
+                id: "tools_manifest",
+                title: "Tool manifest loads",
+                passed: true,
+                detail: "\(tools) tool row(s)"
+            ))
+        } catch {
+            checks.append(HarnessBenchmarkCheck(
+                id: "tools_manifest",
+                title: "Tool manifest loads",
+                passed: false,
+                detail: "tools read failed: \(error.localizedDescription)"
+            ))
+        }
+
+        do {
+            let mcpServers = try await mcpServerCount()
+            checks.append(HarnessBenchmarkCheck(
+                id: "mcp_registry",
+                title: "MCP registry loads",
+                passed: true,
+                detail: "\(mcpServers) configured server(s)"
+            ))
+        } catch {
+            checks.append(HarnessBenchmarkCheck(
+                id: "mcp_registry",
+                title: "MCP registry loads",
+                passed: false,
+                detail: "MCP registry read failed: \(error.localizedDescription)"
+            ))
+        }
+
+        let memoryAvailable = await embeddingRuntimeAvailable()
+        checks.append(HarnessBenchmarkCheck(
+            id: "memory_runtime",
+            title: "Memory embedding runtime reports",
+            passed: memoryAvailable,
+            detail: !memoryAvailable ? "no embedding runtime snapshot" : "embedding runtime snapshot available"
+        ))
+
+        let doctor = await doctorStatuses()
+        let failedDoctor = doctor?.filter { $0 == "fail" }.count ?? 0
+        checks.append(HarnessBenchmarkCheck(
+            id: "doctor_snapshot",
+            title: "Doctor checks run",
+            passed: doctor != nil && failedDoctor == 0,
+            detail: doctor == nil ? "doctor unavailable" : "\(doctor?.count ?? 0) check(s), \(failedDoctor) fail"
+        ))
+
+        let passed = checks.allSatisfy { $0.passed == true }
+        let run = HarnessBenchmarkRun(
+            id: "hb-\(UUID().uuidString.lowercased())",
+            name: "Swift Native Harness Benchmark",
+            status: passed ? "passed" : "warn",
+            checks: checks,
+            durationSeconds: Date().timeIntervalSince(start),
+            schedule: "manual",
+            manualRunnable: true,
+            chatPathImpact: "No model call; validates local Swift surfaces only.",
+            createdAt: ISO8601DateFormatter().string(from: Date())
+        )
+        if let row = try? JSONValue.parse(JSONEncoder().encode(run)) {
+            let path = dataRoot
+                .appendingPathComponent("harness", isDirectory: true)
+                .appendingPathComponent("benchmark", isDirectory: true)
+                .appendingPathComponent("runs.jsonl")
+            try? await appendPathOwnedJSONL(
+                row, to: path, using: SwiftNativePersistenceCore(), logLabel: "NativeClient.harnessBenchmark"
+            )
+        }
+        return run
+    }
+}

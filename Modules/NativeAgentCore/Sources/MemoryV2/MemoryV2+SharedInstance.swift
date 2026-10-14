@@ -7,12 +7,10 @@
 // different on-disk store than everything else. This file plugs the chat
 // path into the same SQLite-backed store every other MemoryV2 caller uses.
 //
-// MemoryStorage (the SQLite actor) doesn't naturally conform to
-// MemoryStorageProtocol — the protocol uses MemoryRecord/ProposalRecord and
-// the storage uses StoredMemory/StoredProposal. MemoryStorageBridge wraps
-// MemoryStorage and translates the two schemas. The production embedder is a
+// MemoryStorageBridge translates MemoryRecord/ProposalRecord to the
+// canonical storage's StoredMemory/StoredProposal schemas. The production embedder is a
 // managed Swift runtime that lazy-loads CoreML MiniLM and honors Settings'
-// on/off + memory-mode files. When CoreML can't load and the user hasn't
+// on/off configuration. When CoreML can't load and the user hasn't
 // explicitly opted into mock (config backend=mock OR
 // NATIVE_AGENT_EMBEDDING_MOCK=1), the runtime fails closed — embed() throws
 // instead of silently producing random vectors.
@@ -25,9 +23,9 @@ import NativeAgentCore
 import PersistenceCore
 import Synchronization
 
-// MARK: - MemoryStorageBridge — MemoryStorage actor → MemoryStorageProtocol
+// MARK: - MemoryStorageBridge
 
-public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol, MemoryRecordLookupStorage, MomentProposalCountingStorage, AtomicProposalStagingStorage, AtomicSupersedingAcceptanceStorage, AtomicSupersedingMemoryStorage, AtomicMemoryAdmissionStorage {
+public actor MemoryStorageBridge {
     private let storage: MemoryStorage
     /// The SQLite file this bridge fronts; `profile.json` lives beside it.
     public var path: URL { storage.path }
@@ -42,7 +40,7 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
 
     public func underlyingStorage() -> MemoryStorage { storage }
 
-    func lookupMemoryRecord(id: String) async throws -> MemoryRecord? {
+    public func lookupMemoryRecord(id: String) async throws -> MemoryRecord? {
         guard let stored = try await storage.memory(id: id) else { return nil }
         return Self.toMemoryRecord(stored)
     }
@@ -67,18 +65,6 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
             filtered = mems
         }
         return filtered.map(Self.toMemoryRecord)
-    }
-
-    public func insert(record: MemoryRecord, embedding: [Float]?) async throws -> MemoryRecord {
-        try await insert(record: record, embedding: embedding, embeddingEpoch: nil)
-    }
-
-    public func insert(
-        record: MemoryRecord,
-        embedding: [Float]?,
-        embeddingEpoch: MemoryEmbeddingEpoch?
-    ) async throws -> MemoryRecord {
-        try await insert(record: record, embedding: embedding, embeddingEpoch: embeddingEpoch, superseding: [])
     }
 
     public func insert(
@@ -139,15 +125,6 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         )
     }
 
-    public func updateMemory(id: String, patch: JSONValue, newEmbedding: [Float]?) async throws -> MemoryRecord {
-        try await updateMemory(
-            id: id,
-            patch: patch,
-            newEmbedding: newEmbedding,
-            embeddingEpoch: nil
-        )
-    }
-
     public func updateMemory(
         id: String,
         patch: JSONValue,
@@ -186,10 +163,6 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
             // run's provenance here. Without passthrough the second run's
             // identity is dropped on production SQLite exactly the way the
             // recall_count bump was.
-            // The allowlist lives in `MemoryPatchContract` so the in-memory
-            // fixture cannot drift from it (gpt-5.5 review, 2026-08-02): the
-            // fixture used to merge EVERY untyped key, so a test could pass on
-            // behaviour this bridge does not have.
             let passthrough = obj.filter {
                 MemoryPatchContract.untypedPassthroughKeys.contains($0.key)
             }
@@ -211,95 +184,21 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         try await storage.deleteMemory(id: id)
     }
 
-    /// Bounded, two-column lane enumeration straight from SQLite — overrides
-    /// the protocol's list-and-filter default (gpt-5.5 review A4).
+    /// Bounded, two-column lane enumeration straight from SQLite.
     public func memoryHandles(sourcePrefix: String, limit: Int?) async throws -> [MemoryLaneHandle] {
         try await storage.laneHandles(sourcePrefix: sourcePrefix, limit: limit)
     }
 
-    public func recall(embedding: [Float], topK: Int, persona: String?) async throws -> [ScoredMemoryRecord] {
-        let hits = try await storage.recall(embedding: embedding, topK: topK, persona: persona)
-        return hits.map { ScoredMemoryRecord(record: Self.toMemoryRecord($0.memory), score: $0.similarity) }
-    }
-
     public func recall(
         embedding: [Float],
         embeddingEpoch: MemoryEmbeddingEpoch?,
+        queryText: String,
         topK: Int,
         persona: String?
     ) async throws -> [ScoredMemoryRecord] {
         let hits = try await storage.recall(
             embedding: embedding,
             embeddingEpoch: embeddingEpoch,
-            topK: topK,
-            persona: persona
-        )
-        return hits.map { ScoredMemoryRecord(record: Self.toMemoryRecord($0.memory), score: $0.similarity) }
-    }
-
-    public func recall(
-        embedding: [Float],
-        queryText: String,
-        topK: Int,
-        persona: String?
-    ) async throws -> [ScoredMemoryRecord] {
-        let hits = try await storage.recall(
-            embedding: embedding,
-            queryText: queryText,
-            topK: topK,
-            persona: persona
-        )
-        return hits.map { ScoredMemoryRecord(record: Self.toMemoryRecord($0.memory), score: $0.similarity) }
-    }
-
-    public func recall(
-        embedding: [Float],
-        embeddingEpoch: MemoryEmbeddingEpoch?,
-        queryText: String,
-        topK: Int,
-        persona: String?
-    ) async throws -> [ScoredMemoryRecord] {
-        try await recallReportingKeywordFallback(
-            embedding: embedding,
-            embeddingEpoch: embeddingEpoch,
-            queryText: queryText,
-            topK: topK,
-            persona: persona
-        ).hits
-    }
-
-    /// 2026-09-06: carries storage's own "this answer came from the keyword
-    /// lane" flag up to the recall wiring, which owns every downstream label.
-    public func recallReportingKeywordFallback(
-        embedding: [Float],
-        embeddingEpoch: MemoryEmbeddingEpoch?,
-        queryText: String,
-        topK: Int,
-        persona: String?
-    ) async throws -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool) {
-        let result = try await storage.recallReportingKeywordFallback(
-            embedding: embedding,
-            embeddingEpoch: embeddingEpoch,
-            queryText: queryText,
-            topK: topK,
-            persona: persona
-        )
-        return (
-            result.hits.map {
-                ScoredMemoryRecord(record: Self.toMemoryRecord($0.memory), score: $0.similarity)
-            },
-            result.usedKeywordFallback
-        )
-    }
-
-    /// Sweep R4 A5: lexical-only lane used when no usable query embedding
-    /// exists (cold embedder on the first turn after launch).
-    public func recallByKeyword(
-        queryText: String,
-        topK: Int,
-        persona: String?
-    ) async throws -> [ScoredMemoryRecord] {
-        let hits = try await storage.recallByKeyword(
             queryText: queryText,
             topK: topK,
             persona: persona
@@ -318,7 +217,6 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         try await storage.removeTombstone(content: content)
     }
 
-
     public func recordRecallHits(ids: [String]) async throws {
         try await storage.recordRecallHits(ids: ids)
     }
@@ -328,10 +226,6 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
     @discardableResult
     public func markCorrected(id: String, by newerId: String, reason: String? = nil) async throws -> Bool {
         try await storage.markCorrected(id: id, by: newerId, reason: reason)
-    }
-
-    public func matchesTombstone(embedding: [Float]) async throws -> Bool {
-        try await storage.matchesTombstone(embedding: embedding)
     }
 
     public func matchesTombstone(
@@ -344,58 +238,6 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         )
     }
 
-    /// U3 wave-2 item 4: raw-cosine top-1 NN for the shadow dedup gate —
-    /// overrides the protocol default (which would return recall's
-    /// decay-shaped score) with MemoryStorage's genuinely raw sweep.
-    /// `excluding` skips the just-inserted row (the shadow observation runs
-    /// detached AFTER the insert — fix-round finding 2).
-    public func nearestNeighbor(embedding: [Float], excluding excludedId: String?) async throws -> (record: MemoryRecord, cosine: Double)? {
-        guard let hit = try await storage.nearestActiveNeighbor(embedding: embedding, excluding: excludedId) else { return nil }
-        return (record: Self.toMemoryRecord(hit.memory), cosine: hit.cosine)
-    }
-
-    public func nearestNeighbor(
-        embedding: [Float],
-        embeddingEpoch: MemoryEmbeddingEpoch?,
-        excluding excludedId: String?
-    ) async throws -> (record: MemoryRecord, cosine: Double)? {
-        guard let hit = try await storage.nearestActiveNeighbor(
-            embedding: embedding,
-            embeddingEpoch: embeddingEpoch,
-            excluding: excludedId
-        ) else { return nil }
-        return (record: Self.toMemoryRecord(hit.memory), cosine: hit.cosine)
-    }
-
-    public func insertProposal(_ proposal: ProposalRecord, embedding: [Float]? = nil) async throws {
-        try await insertProposal(proposal, embedding: embedding, embeddingEpoch: nil)
-    }
-
-    public func insertProposal(
-        _ proposal: ProposalRecord,
-        embedding: [Float]?,
-        embeddingEpoch: MemoryEmbeddingEpoch?
-    ) async throws {
-        let stored = StoredProposal(
-            id: proposal.id,
-            content: proposal.content,
-            personaId: MemoryV2Defaults.personaID,
-            source: proposal.source,
-            stagedAt: proposal.createdAt,
-            status: proposal.status,
-            resolvedAt: nil,
-            rejectionReason: proposal.rejectionReason,
-            embedding: embedding,
-            embeddingEpoch: embeddingEpoch?.rawValue,
-            // Carry the extractor's confidence/kind through to storage so
-            // acceptProposal can stamp it on the memory (#1) — was hardcoded nil.
-            metadata: proposal.metadata
-        )
-        _ = try await storage.insertProposal(stored)
-    }
-
-    /// User, 2026-09-06: one write lock for match + merge + insert. See
-    /// `MemoryStorage.stagePendingProposal`.
     public func stagePendingProposal(
         _ proposal: ProposalRecord,
         embedding: [Float]?,
@@ -439,7 +281,7 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         return Self.toMemoryRecord(accepted)
     }
 
-    /// `AtomicSupersedingAcceptanceStorage`: accept + demote in one transaction.
+    /// Accept and demote in one transaction.
     public func acceptProposal(
         id: String,
         superseding: SupersedingAcceptance
@@ -479,10 +321,6 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
     public func listProposals(status: String?) async throws -> [ProposalRecord] {
         let list = try await storage.listProposals(status: status)
         return list.map(Self.toProposalRecord)
-    }
-
-    public func listProposals(status: String?, limit: Int) async throws -> [ProposalRecord] {
-        try await storage.listProposals(status: status, limit: limit).map(Self.toProposalRecord)
     }
 
     private static func toMemoryRecord(_ s: StoredMemory) -> MemoryRecord {
@@ -537,7 +375,7 @@ extension SwiftNativeMemoryV2 {
     }
 
     /// Resolve the concrete storage actor for operations that need canonical
-    /// administrative APIs not exposed by `MemoryV2Protocol`. Default-root
+    /// administrative APIs. Default-root
     /// callers receive the exact storage beneath ``shared``; alternate roots
     /// open an isolated store. An unavailable shared actor fails closed rather
     /// than quietly constructing a hookless second owner over live memory.
@@ -582,7 +420,7 @@ extension SwiftNativeMemoryV2 {
         userProjectionBinding = (dataRoot, personaRoot, debounceInterval)
         do { try await ensureCanonicalAttachment() }
         catch { emitDiagnostic("[MemoryV2] USER projection attachment failed: \(error)"); return nil }
-        guard let bridge = storage as? MemoryStorageBridge else { return nil }
+        guard let bridge = storage else { return nil }
         let underlying = await bridge.underlyingStorage()
         let storagePath = underlying.path
         let storageDataRoot = storagePath
@@ -608,7 +446,7 @@ extension SwiftNativeMemoryV2 {
     @discardableResult
     public func reconcileKnowledgeGraphProjection() async throws -> KnowledgeGraphMemoryRebuildReport {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage as? MemoryStorageBridge else {
+        guard let bridge = storage else {
             throw MemoryV2Error.storageUnavailable
         }
         let underlying = await bridge.underlyingStorage()
@@ -625,9 +463,7 @@ extension SwiftNativeMemoryV2 {
         root.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
-    /// R13: mark an existing memory corrected by a newer one. Routes to the
-    /// storage protocol requirement (production bridge → single-transaction
-    /// lineage write; minimal fixtures honestly report not-applied).
+    /// Mark an existing memory corrected by a newer one in one transaction.
     @discardableResult
     public func markCorrected(id: String, by newerId: String, reason: String? = nil) async throws -> Bool {
         try await ensureCanonicalAttachment()
@@ -641,14 +477,14 @@ extension SwiftNativeMemoryV2 {
     /// check in front of her association rejections. Not a recall path.
     public func authorityRecord(id: String) async throws -> MemoryRecord? {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage as? MemoryStorageBridge else { throw MemoryV2Error.storageUnavailable }
+        guard let bridge = storage else { throw MemoryV2Error.storageUnavailable }
         return try await bridge.lookupMemoryRecord(id: id)
     }
 
     /// Uses disclosure-filtered user facts until a pinned core is chosen.
     public func userPromptCore(surface: String) async throws -> [String]? {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage as? MemoryStorageBridge else { throw MemoryV2Error.storageUnavailable }
+        guard let bridge = storage else { throw MemoryV2Error.storageUnavailable }
         return try await bridge.underlyingStorage().userPromptCore(surface: surface)
     }
 
@@ -688,7 +524,7 @@ extension SwiftNativeMemoryV2 {
 
     public func repairCanonicalAttachment() async throws {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage as? MemoryStorageBridge else { throw MemoryV2Error.storageUnavailable }
+        guard let bridge = storage else { throw MemoryV2Error.storageUnavailable }
         let underlying = await bridge.underlyingStorage()
         _ = try await underlying.listMemories(persona: nil, status: nil, limit: 1)
         guard try await underlying.quickCheck() == ["ok"] else {
@@ -742,15 +578,7 @@ extension SwiftNativeMemoryV2 {
                         try await kgIndexer.reconcileProjectionIfNeeded(producing: producing)
                         graphProjectionFailureSlot.withLock { $0 = nil }
                         try await kgIndexer.indexMemory(
-                            KnowledgeGraphMemoryFact(
-                                id: stored.id,
-                                content: stored.content,
-                                source: stored.source,
-                                status: stored.status,
-                                createdAt: stored.createdAt,
-                                updatedAt: stored.updatedAt,
-                                metadata: stored.projectionMetadata
-                            ),
+                            stored.id,
                             deleted: deleted,
                             producing: producing
                         )
@@ -761,7 +589,7 @@ extension SwiftNativeMemoryV2 {
                     }
                 }
             }
-            Task {
+            await storage.enqueueKnowledgeGraphProjection {
                 // Wait for migration before checking the canonical fingerprints.
                 let migrationMarker = dataRoot
                     .appendingPathComponent("memory", isDirectory: true)
@@ -804,7 +632,7 @@ extension SwiftNativeMemoryV2 {
     public func underlyingBridge() async -> MemoryStorageBridge? {
         do { try await ensureCanonicalAttachment() }
         catch { emitDiagnostic("[MemoryV2] Canonical attachment failed: \(error)") }
-        return storage as? MemoryStorageBridge
+        return storage
     }
 }
 

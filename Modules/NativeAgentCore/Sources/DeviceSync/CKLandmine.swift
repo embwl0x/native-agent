@@ -1,3 +1,8 @@
+import MemoryV2
+import PersistenceCore
+#if canImport(CloudKit)
+import CloudKit
+#endif
 import Foundation
 import NativeAgentShared
 #if canImport(Security)
@@ -73,21 +78,35 @@ private func formatCKTimeoutSeconds(_ seconds: TimeInterval) -> String {
     return String(format: "%.1fs", seconds)
 }
 
-public actor CloudKitHealth {
-    public static let shared = CloudKitHealth()
+public func nativeAgentCloudKitAccountStatus(label: String) async -> String {
+    guard nativeAgentCloudKitAccountProbeEnabled() else { return nativeAgentCloudKitDisabledStatus }
+    #if canImport(CloudKit)
+    return await withCKTimeout(label) {
+        nativeAgentCloudKitAccountWords(try await CKContainer.default().accountStatus())
+    } ?? "iCloud didn't answer in time"
+    #else
+    return "iCloud isn't available"
+    #endif
+}
 
-    private var cachedResult: (checkedAt: Date, healthy: Bool)?
+#if canImport(CloudKit)
+private func nativeAgentCloudKitAccountWords(_ status: CKAccountStatus) -> String {
+    switch status {
+    case .available: return "Signed in to iCloud"
+    case .noAccount: return "Not signed in to iCloud"
+    case .restricted: return "iCloud is restricted on this Mac"
+    case .temporarilyUnavailable: return "iCloud needs you to confirm your account"
+    case .couldNotDetermine: return "Couldn't check iCloud"
+    @unknown default: return "Couldn't check iCloud"
+    }
+}
+#endif
 
-    public func likelyHealthy() async -> Bool {
-        if let cachedResult, Date().timeIntervalSince(cachedResult.checkedAt) < 30 {
-            return cachedResult.healthy
-        }
+extension MemoryV2NativeStackSnapshot {
+    public static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> Self {
+        var snap = await read(dataRoot: dataRoot)
+        snap.cloudKitAccountStatus = await nativeAgentCloudKitAccountStatus(label: "MemoryV2NativeStackSnapshot.cloudKitAccount")
 
-        let probe = await withCKTimeout("CloudKitHealth.KVS.synchronize", seconds: 1) {
-            NSUbiquitousKeyValueStore.default.synchronize()
-        }
-        let healthy = probe != nil
-        cachedResult = (Date(), healthy)
-        return healthy
+        return snap
     }
 }

@@ -58,13 +58,24 @@ public struct ProductionExportReceipt: Sendable, Equatable {
             return ""
         }
     }
-
-    public func toJSON() -> JSONValue { raw }
 }
 
 /// One production export as the Capabilities page shows it: the typed
 /// projection of a registry row, and the row an export appends.
 public struct ProductionExport: Identifiable, Codable, Hashable, Sendable {
+    @MainActor
+    public func verifyRegistry(dataRoot: URL) async throws -> (records: [ProductionExport], failure: String?) {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        let actualBytes = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        guard actualBytes > 0 else { return ([], "the archive was empty after it was created") }
+        guard sizeBytes == actualBytes else { return ([], "the archive size did not match its creation receipt") }
+        let records = try await Self.list(dataRoot: dataRoot)
+        guard records.contains(where: { $0.id == id && $0.path == path && $0.sizeBytes == actualBytes }) else {
+            return ([], "the export registry did not confirm the created archive")
+        }
+        return (records, nil)
+    }
+
     public var id: String
     public var kind: String?
     public var path: String
@@ -112,13 +123,9 @@ public struct ProductionExport: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-public protocol ProductionExportsClient: Sendable {
-    func listExports() async throws -> [ProductionExportReceipt]
-}
-
 // MARK: - SwiftNative — ProductionExports
 
-public struct SwiftNativeProductionExportsClient: ProductionExportsClient {
+public struct SwiftNativeProductionExportsClient: Sendable {
     private let registryPath: URL
     private let persistence: any PersistenceCoreProtocol
 

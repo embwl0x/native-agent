@@ -27,15 +27,11 @@ public struct ChatCompactionDistiller: Sendable {
     /// The LLM seam: (model, prompt) → distilled recollection text.
     let llmComplete: @Sendable (_ model: String, _ prompt: String) async throws -> String
     let now: @Sendable () -> Date
-    /// Injected agent name for the first-person post-check. nil → read from the
-    /// persona profile under `dataRoot` at check time.
-    let agentName: String?
 
     public static let distillSurface = "compaction"
     /// User 2026-09-23: every model (was 12K; 40K on verified 1M routes only).
     static let maxSummaryChars = 40_000
 
-    static func maxSummaryChars(model: String?, providerID: String?) -> Int { maxSummaryChars }
     static let timeoutSeconds = 120.0
 
     /// System prompt for the distillation call. The output is stored as the
@@ -178,15 +174,13 @@ public struct ChatCompactionDistiller: Sendable {
         persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
         summaryModelResolver: @escaping @Sendable (String) async -> String?,
         llmComplete: @escaping @Sendable (_ model: String, _ prompt: String) async throws -> String,
-        now: @escaping @Sendable () -> Date = { Date() },
-        agentName: String? = nil
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
         self.persistence = persistence
         self.summaryModelResolver = summaryModelResolver
         self.llmComplete = llmComplete
         self.now = now
-        self.agentName = agentName
     }
 
     public func distill(
@@ -195,7 +189,6 @@ public struct ChatCompactionDistiller: Sendable {
         backupPath: String,
         messagesReplaced: Int,
         turnModel: String,
-        providerID: String? = nil,
         surface: String,
         runId: String?
     ) async {
@@ -204,7 +197,7 @@ public struct ChatCompactionDistiller: Sendable {
         await performDistillation(
             sessionId: sessionId, summaryRowId: summaryRowId, backupPath: backupPath,
             messagesReplaced: messagesReplaced, turnModel: turnModel,
-            providerID: providerID, surface: surface, runId: runId
+            surface: surface, runId: runId
         )
         await PendingDistillations.shared.release(key)
     }
@@ -222,7 +215,6 @@ public struct ChatCompactionDistiller: Sendable {
         backupPath: String,
         messagesReplaced: Int,
         turnModel: String,
-        providerID: String? = nil,
         surface: String,
         runId: String?
     ) async {
@@ -270,7 +262,7 @@ public struct ChatCompactionDistiller: Sendable {
 
         guard let recollection = await prepareRecollection(
             rows: replaced, sessionId: sessionId, turnModel: turnModel,
-            providerID: providerID, surface: surface, runId: runId,
+            surface: surface, runId: runId,
             summaryRowId: summaryRowId
         ) else {
             return
@@ -339,6 +331,7 @@ public struct ChatCompactionDistiller: Sendable {
                 }
                 // Rejoining the untouched segments reproduces the original
                 // bytes exactly — blank lines and final-newline state included.
+                try Task.checkCancellation()
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(
                     Data(segments.joined(separator: "\n").utf8), to: messagesPath)
                 return "ok"
@@ -386,12 +379,11 @@ public struct ChatCompactionDistiller: Sendable {
         rows: [JSONValue],
         sessionId: String,
         turnModel: String,
-        providerID: String?,
         surface: String,
         runId: String?,
         summaryRowId: String
     ) async -> PreparedRecollection? {
-        let summaryCap = Self.maxSummaryChars(model: turnModel, providerID: providerID)
+        let summaryCap = Self.maxSummaryChars
         // 2. Resolve the model through the Providers GROUP that owns
         //    `compaction` — Memory and mind (User, 2026-09-13: every activity
         //    resolves through its group). No per-surface pin and no fallback to
@@ -491,7 +483,7 @@ public struct ChatCompactionDistiller: Sendable {
         //     wrong voice still beats the mechanical summary — but the receipt
         //     says so, which is how "she reads her morning as a briefing about
         //     someone else" becomes a number instead of a feeling.
-        let thirdPersonLines = (agentName ?? Self.configuredAgentName(dataRoot: dataRoot))
+        let thirdPersonLines = Self.configuredAgentName(dataRoot: dataRoot)
             .map { Self.thirdPersonSubjectCount(distilled, agentName: $0) } ?? 0
         let thirdPerson = thirdPersonLines > Self.thirdPersonFlagThreshold
 

@@ -32,17 +32,12 @@ public struct SessionIdentityCheck: DoctorCheck {
     public let title: String = "Chat Session Identity"
 
     private let root: URL
-    private let now: @Sendable () -> Date
     /// How many disagreeing session ids to name in `detail` before summarizing.
     /// Bounded so one badly-flapping root cannot produce an unreadable row.
     private let maximumNamedSessions = 5
 
-    public init(
-        root: URL = defaultDataRoot(),
-        now: @escaping @Sendable () -> Date = { Date() }
-    ) {
+    public init(root: URL = defaultDataRoot()) {
         self.root = root
-        self.now = now
     }
 
     public func run() async -> CheckResult {
@@ -52,7 +47,7 @@ public struct SessionIdentityCheck: DoctorCheck {
         let indexExists = FileManager.default.fileExists(atPath: sessionsPath.path)
 
         let report = SessionIdentityLedger.flappingReport(dataRoot: root)
-        let tally = SessionIdentityLedger.mintTally(dataRoot: root, now: now())
+        let tally = SessionIdentityLedger.mintTally(dataRoot: root, now: Date())
 
         // Fresh install: no index yet. Honest "ok" with an explicit zero.
         guard indexExists else {

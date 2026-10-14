@@ -375,7 +375,7 @@ public enum XConnectorActions {
         let bound = hasRefreshBinding(tokens)
         return (!access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (!hasRefresh || bound),
                 numericDouble(tokens["expires_at"]).map(Date.init(timeIntervalSince1970:)),
-                hasRefresh && bound)
+                hasRefresh && bound && resolveClientCredentials(environment: ProcessInfo.processInfo.environment, dataRoot: dataRoot) != nil)
     }
 
     public static func refreshRequiresSignIn(_ error: Error) -> Bool {
@@ -798,7 +798,7 @@ public enum XConnectorActions {
         obj["error"] = .string(short)
         obj["detail"] = .string(detail)
         if ["missing_access_token", "missing_refresh_token", "refresh_disabled", "refresh_rejected"].contains(short) {
-            obj["fix"] = .string("The owner must sign in to X in Settings > Connectors.")
+            obj["fix"] = .string("The owner can sign in to X by requesting a setup card in chat or opening Connectors in Advanced view.")
         }
         return XConnectorSecretRedactor.redactValue(.object(obj))
     }
@@ -812,9 +812,9 @@ public enum XConnectorActions {
         // Carry the code as a typed field too — consumers (the chat-side
         // OAuth1 fallback) were matching obj["statusCode"], which this
         // envelope never had, making the fallback dead code (audit 2026-06-09).
-        guard case .object(var obj) = envelope else { return XConnectorSecretRedactor.redactValue(envelope) }
+        guard case .object(var obj) = envelope else { return envelope }
         obj["statusCode"] = .int(Int64(statusCode))
-        return XConnectorSecretRedactor.redactValue(.object(obj))
+        return .object(obj)
     }
 
     static func appendQuery(_ query: [(String, String)], to url: URL) -> URL {
@@ -870,10 +870,6 @@ public enum XConnectorActions {
     /// (parallel to the Swift-owned `auth.json` written by NativeOAuthFlow).
     /// Retired runtime `config/config.json` is intentionally NOT consulted —
     /// Swift owns its own config locations.
-    static func resolveClientID(environment: [String: String], dataRoot: URL) -> String? {
-        resolveClientCredentials(environment: environment, dataRoot: dataRoot)?.id
-    }
-
     static func resolveClientCredentials(
         environment: [String: String], dataRoot: URL
     ) -> (id: String, secret: String?)? {
@@ -1037,21 +1033,14 @@ private enum XConnectorSecretRedactor {
     )
 
     static func redactValue(_ value: JSONValue) -> JSONValue {
-        switch value {
-        case .string(let raw):
+        value.mapStrings { raw in
             let range = NSRange(location: 0, length: (raw as NSString).length)
-            return .string(token.stringByReplacingMatches(
+            return token.stringByReplacingMatches(
                 in: raw,
                 options: [],
                 range: range,
                 withTemplate: "[REDACTED_CONNECTOR_SECRET]"
-            ))
-        case .array(let items):
-            return .array(items.map(redactValue))
-        case .object(let object):
-            return .object(object.mapValues(redactValue))
-        default:
-            return value
+            )
         }
     }
 }

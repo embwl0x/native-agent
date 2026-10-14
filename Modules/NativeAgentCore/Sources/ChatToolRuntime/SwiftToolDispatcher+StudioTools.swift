@@ -632,7 +632,7 @@ extension SwiftToolDispatcher {
             tag: optionalString(input, "tag"),
             relationKind: relationKind,
             relatedTo: optionalString(input, "related_to"),
-            limit: optionalInt(input, "limit") ?? StudioRecallQuery.defaultLimit
+            limit: Self.jsonInt(input["limit"]) ?? StudioRecallQuery.defaultLimit
         )
         let result = try await studioStore().recall(query)
         // Desk 903 phase 4: the "used in a REAL PRODUCTION JUDGMENT" evidence

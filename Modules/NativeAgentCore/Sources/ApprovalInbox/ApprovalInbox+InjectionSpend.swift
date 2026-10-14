@@ -82,7 +82,7 @@ extension SwiftNativeApprovalInbox: InjectionApprovalSpendingInbox {
         let trimmedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedID.isEmpty else { return .unavailable }
         let path = injectionSpendPath
-        let now = clock()
+        let now = Date()
         let persistence = self.persistence
         do {
             // The flock IS the CAS: read-check-write happens entirely inside
@@ -103,12 +103,6 @@ extension SwiftNativeApprovalInbox: InjectionApprovalSpendingInbox {
         } catch {
             return .unavailable
         }
-    }
-
-    /// Read-only probe for tests only (gpt-5.5 NIT: kept internal). Never mutates.
-    func injectionApprovalSpend(id: String) async -> JSONValue? {
-        guard let spends = try? Self.loadSpends(at: injectionSpendPath) else { return nil }
-        return spends[id.trimmingCharacters(in: .whitespacesAndNewlines)]
     }
 
     private nonisolated static func _consumeInjectionApprovalImpl(

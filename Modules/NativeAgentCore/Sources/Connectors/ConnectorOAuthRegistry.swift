@@ -1,8 +1,36 @@
 import Foundation
 import PersistenceCore
 import SlackConnector
+import ProviderRouting
+import XConnector
 
 public enum ConnectorOAuthRegistry {
+    public static func oauthConnectorTokenExists(oauthId: String, root: URL) -> Bool {
+        if oauthId == "slack" { return (try? SlackCredentials.read(.bot, dataRoot: root)) != nil }
+        if oauthId == "x" {
+            guard let state = try? XConnectorActions.credentialStatus(dataRoot: root) else { return false }
+            return state.configured && (state.canRefresh || state.expiresAt.map { $0 > Date() } != false)
+        }
+        let paths = [root.appendingPathComponent("connectors/\(oauthId)/auth.json"),
+                     root.appendingPathComponent("oauth_tokens/\(oauthId).json")]
+        return paths.contains { path in
+            if ["gmail", "email", "calendar"].contains(oauthId) {
+                guard let state = try? GoogleOAuthCredentials.credentialStatus(path: path) else { return false }
+                return state.configured && !state.requiresRefresh
+                    && (state.canRefresh || state.expiresAt.map { $0 > Date() } != false)
+            }
+            guard let data = try? ConnectorCredentialFile.read(at: path),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            if let stamp = object["expires_at"] {
+                guard let expiry = parseExpiresAt(stamp), expiry > Date() else { return false }
+            }
+            return ["access_token", "oauth_token", "token"].contains { key in
+                guard let value = object[key] as? String else { return false }
+                return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
+    }
+
     public static func migrateXCredentials(dataRoot: URL) async throws {
         let paths = ["secrets/x.json", "oauth_tokens/x.json", "connectors/x/auth.json", "connectors/x/oauth_app.json"]
         var failures: [String] = []
@@ -48,7 +76,6 @@ public enum ConnectorOAuthRegistry {
             // connector mutation can advance that registry generation.
             try SlackCredentials.recoverPendingSave(dataRoot: root)
             let current = try readRegistry(at: path)
-            _ = try checkedConnectorRows(from: current)
             switch current {
             case .array(var rows):
                 for idx in rows.indices {

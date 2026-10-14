@@ -21,7 +21,7 @@ extension SwiftToolDispatcher {
         // an error whatever the switch says.
         let openID = optionalString(input, "entity_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let query = optionalString(input, "query")
-        let limit = min(100, max(1, optionalInt(input, "limit") ?? 10))
+        let limit = min(100, max(1, Self.jsonInt(input["limit"]) ?? 10))
         // The Knowledge Graph page's filters: its type/kind menus (one
         // attribute, entity.type) and its time window on last_seen, falling
         // back to first_seen.
@@ -51,9 +51,8 @@ extension SwiftToolDispatcher {
                 "reason": .string(MemoryPolicyGate.knowledgeGraphOffMessage),
             ])
         }
-        let persona = memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID)
         let disclosedIDs = Set(try await memoryV2.listMemory(kind: nil).filter {
-            MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: persona) == true
+            MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: nil) == true
         }.map(\.id))
         let disclosedFactIDs = Set(disclosedIDs.map(SwiftNativeKnowledgeGraphIndexer.memoryFactEntityID))
         func permitsDisclosure(_ value: JSONValue) -> Bool {
@@ -82,8 +81,7 @@ extension SwiftToolDispatcher {
             return true
         }
         let reader = SwiftNativeKnowledgeGraphReader(
-            graphPath: knowledgeGraphPath,
-            flushURL: nil
+            graphPath: knowledgeGraphPath
         )
         if let openID {
             // The page's entity detail: MemoryFacade.neighborhood's read.
@@ -173,7 +171,7 @@ extension SwiftToolDispatcher {
             let response = try await memoryV2.recall(MemoryV2RecallRequest(
                 text: query,
                 topK: limit * 2,
-                persona: persona,
+                persona: nil,
                 surface: surface
             ))
             // 2026-09-06: recall degrades to the keyword lane when the query
@@ -182,13 +180,14 @@ extension SwiftToolDispatcher {
             // overstated the answer.
             let lexical = response.hits.contains { $0.source == "swift-native-keyword-fallback" }
             if lexical { meaningSearch = "keyword-fallback" }
+            var missing = Set<String>()
+            let missingIDs = response.scored.map { SwiftNativeKnowledgeGraphIndexer.memoryFactEntityID(for: $0.record.id) }
+                .filter { entities[$0] == nil && missing.insert($0).inserted }
+            let recalledEntities = (try? await reader.entitiesChecked(ids: missingIDs)) ?? [:]
             for (rank, scored) in response.scored.enumerated() {
                 let nodeID = SwiftNativeKnowledgeGraphIndexer.memoryFactEntityID(for: scored.record.id)
                 if entities[nodeID] == nil {
-                    // The read returns {entity, edges, neighbors}; a result row
-                    // is the entity, like a text hit (entity_id has the rest).
-                    guard case .found(.object(let env))? = await reader.entity(id: nodeID),
-                          let ent = env["entity"], ent != .null, passesFilters(ent) else { continue }
+                    guard let ent = recalledEntities[nodeID], passesFilters(ent) else { continue }
                     order.append(nodeID); entities[nodeID] = ent
                 }
                 fused[nodeID, default: 0] += 1.0 / (60.0 + Double(rank))

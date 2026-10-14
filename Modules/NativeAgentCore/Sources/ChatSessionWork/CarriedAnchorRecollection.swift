@@ -43,8 +43,7 @@ import Transcripts
 // single stderr line per session.
 package enum CarriedAnchorRecollection {
     /// Kill switch. Like the autocompactor's own switches: absent → on, explicit false →
-    /// off. The defaults instance is injectable solely so a test can exercise
-    /// the same reader against an isolated domain.
+    /// off.
     static let defaultsKey = "chatCarryAnchorRecollection"
 
     /// `metadata` key stamped on the synthetic row, naming the session the
@@ -56,10 +55,10 @@ package enum CarriedAnchorRecollection {
     /// unborrowed one stays `[session recollection]`.
     static let renderPrefix = "[session recollection, carried from your main conversation]"
 
-    static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: defaultsKey) == nil
+    static func isEnabled() -> Bool {
+        UserDefaults.standard.object(forKey: defaultsKey) == nil
             ? true
-            : defaults.bool(forKey: defaultsKey)
+            : UserDefaults.standard.bool(forKey: defaultsKey)
     }
 
     /// The rows the v2 prefix projection should admit: `prior` unchanged, or
@@ -72,11 +71,10 @@ package enum CarriedAnchorRecollection {
     package static func seeded(
         _ prior: [ChatMessage],
         sessionId: String,
-        dataRoot: URL,
-        defaults: UserDefaults = .standard
+        dataRoot: URL
     ) -> [ChatMessage] {
         guard let row = syntheticRow(
-            sessionId: sessionId, prior: prior, dataRoot: dataRoot, defaults: defaults
+            sessionId: sessionId, prior: prior, dataRoot: dataRoot
         ) else { return prior }
         return [row] + prior
     }
@@ -86,10 +84,9 @@ package enum CarriedAnchorRecollection {
     static func syntheticRow(
         sessionId: String,
         prior: [ChatMessage],
-        dataRoot: URL,
-        defaults: UserDefaults = .standard
+        dataRoot: URL
     ) -> ChatMessage? {
-        guard isEnabled(defaults: defaults) else { return nil }
+        guard isEnabled() else { return nil }
         // A SESSION ID IS A STORAGE KEY AND NOTHING ELSE, and this one arrives
         // from a JSON file on disk. `anchor_pin.json` is written by surface
         // adapters, so a malformed or hostile pin could name `../../…` and
@@ -161,9 +158,6 @@ package enum CarriedAnchorRecollection {
             cacheLock.unlock()
             return hit.recollection
         }
-        // Counted under the same lock that guards the cache, so the tally
-        // cannot race a concurrent miss on another thread.
-        transcriptReadCount += 1
         let old = cache.first(where: { $0.key == key })
         cacheLock.unlock()
 
@@ -236,19 +230,6 @@ package enum CarriedAnchorRecollection {
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var cache: [Entry] = []
 
-    /// How many times a transcript was actually READ, as opposed to answered
-    /// from the memo. Instrumentation for the regression suite: the memo is
-    /// otherwise invisible, and an invisible cache is one nobody can prove
-    /// still works.
-    nonisolated(unsafe) static var transcriptReadCount = 0
-
-    static func resetCache() {
-        cacheLock.lock()
-        cache.removeAll()
-        transcriptReadCount = 0
-        cacheLock.unlock()
-    }
-
     /// The synthetic row itself. Shaped like the row the autocompactor writes,
     /// because every layer below reads that shape: `renderable` routes it to
     /// the compaction-summary cap, the window cursor exempts it from the drop
@@ -263,7 +244,7 @@ package enum CarriedAnchorRecollection {
         // digest, turn after turn. `messages_replaced` is a stable fallback for
         // a legacy row with no id of its own.
         let key = recollection.rowId ?? "n\(recollection.messagesReplaced)c\(recollection.text.count)"
-        let stamp = recollection.createdAt.map(iso8601) ?? ""
+        let stamp = recollection.createdAt.map(NativeTimestampFormat.fractionalZulu) ?? ""
         return ChatMessage(
             role: "system",
             content: recollection.text,
@@ -289,12 +270,6 @@ package enum CarriedAnchorRecollection {
               case .string(let kind)? = metadata["kind"]
         else { return false }
         return kind == ChatSessionRecollections.rowKind
-    }
-
-    private static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
     }
 
     /// One stderr line per session, ever. An anchor that names a conversation

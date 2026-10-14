@@ -61,7 +61,7 @@ struct MacSnapshotFreshnessBadge: View {
     var staleGroupReason: String? = nil
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 15)) { context in
+        TimelineView(MacSnapshotFreshnessSchedule(lastSyncedAt: lastSyncedAt, fixed: staleGroupReason != nil)) { context in
             let state = MacSnapshotPageFreshness.state(lastSyncedAt: lastSyncedAt, now: context.date)
             // A named group failure outranks age: a Mac that published five
             // seconds ago can still have failed to rebuild THIS group.
@@ -77,6 +77,37 @@ struct MacSnapshotFreshnessBadge: View {
         }
         .sheet(isPresented: $showsConnection) {
             NavigationStack { SettingsViewFull(opensConnection: true) }
+        }
+    }
+}
+
+struct MacSnapshotFreshnessSchedule: TimelineSchedule {
+    let lastSyncedAt: Date?
+    var fixed = false
+    var showsFreshAge = false
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnySequence<Date> {
+        AnySequence {
+            var next: Date? = startDate
+            return AnyIterator<Date> {
+                guard let date = next else { return nil }
+                defer {
+                    if fixed || lastSyncedAt == nil { next = nil }
+                    else if let lastSyncedAt {
+                        let age = date.timeIntervalSince(lastSyncedAt)
+                        let unit: TimeInterval = showsFreshAge && age < 60 ? 15 : age < 3_600 ? 60 : age < 86_400 ? 3_600 : 86_400
+                        if age < -60 { next = lastSyncedAt.addingTimeInterval(-60) }
+                        else {
+                            let threshold = lastSyncedAt.addingTimeInterval(MacSnapshotPageFreshness.staleAfter)
+                            let stale = Date(timeIntervalSinceReferenceDate: threshold.timeIntervalSinceReferenceDate.nextUp)
+                            let changedText = lastSyncedAt.addingTimeInterval(max(unit, (floor(age / unit) + 1) * unit))
+                            next = age <= MacSnapshotPageFreshness.staleAfter
+                                ? (showsFreshAge ? min(changedText, stale) : stale) : changedText
+                        }
+                    }
+                }
+                return date
+            }
         }
     }
 }

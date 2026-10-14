@@ -7,6 +7,13 @@ extension AppToolExecutor {
     /// the action registry: the registry's fold table reads the other
     /// schemas from here, and must not reach back into its own initializer.
     public static func appToolSchemas(includeDoor: Bool = true) -> [LLMToolSchema] {
+        includeDoor ? doorSchemas + nonDoorSchemas : nonDoorSchemas
+    }
+
+    private static let nonDoorSchemas = makeAppToolSchemas(includeDoor: false)
+    private static let doorSchemas = makeAppToolSchemas(includeDoor: true)
+
+    private static func makeAppToolSchemas(includeDoor: Bool) -> [LLMToolSchema] {
         func obj(_ pairs: [(String, JSONValue)]) -> JSONValue {
             var d: [String: JSONValue] = [:]
             for (k, v) in pairs { d[k] = v }
@@ -92,7 +99,8 @@ extension AppToolExecutor {
                 )
             ),
         ]
-        return door + [
+        if includeDoor { return door }
+        return [
             LLMToolSchema(
                 name: "chat_reply",
                 description: "Reply to an exact opened human conversation's saved destination; the chat read binds its conversation/latest message. Creates no user turn or foreground-chat change. Answer your active conversation normally. Never automatically resend uncertain delivery.",

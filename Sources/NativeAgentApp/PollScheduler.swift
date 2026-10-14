@@ -1,3 +1,4 @@
+import NativeAgentCore
 import SwiftUI
 import AppKit
 import ChatOrchestration
@@ -146,7 +147,7 @@ final class PollScheduler: ObservableObject {
         }
         guard await bounded.value == nil else { return }
         work.cancel()
-        nativeLog(
+        ModuleLog.app(
             "[poll-scheduler] job %@ exceeded its %.0fs ceiling — abandoned, scheduler continuing",
             id, handlerDeadline
         )

@@ -118,8 +118,7 @@ struct CapabilityScoreParts {
 ///   • +0.3 for status ∈ {active, installed, ready, configured}
 ///   • +min(1.0, useCount/20) bonus
 /// Rounded to 3 decimals. `overlap` clamped to first 8 in the return.
-func scoreContextCapabilityParts(_ record: CapabilityScoringRecord, message: String, mode: String) -> CapabilityScoreParts {
-    let tokens = keywordTokens(message)
+func scoreContextCapabilityParts(_ record: CapabilityScoringRecord, tokens: Set<String>, lower: String, mode: String) -> CapabilityScoreParts {
     // Python builds haystack in this exact order: name, description,
     // triggers joined, endpoints joined, permissions joined. Order matters
     // only for the joined string's literal content; tokens are a set.
@@ -133,7 +132,6 @@ func scoreContextCapabilityParts(_ record: CapabilityScoringRecord, message: Str
     let haystack = haystackParts.joined(separator: " ")
     let hayTokens = keywordTokens(haystack)
     let overlap = Array(tokens.intersection(hayTokens)).sorted()
-    let lower = message.lowercased()
     var score = Double(overlap.count) * 1.2
     var reasons: [String] = []
     for trigger in record.triggers {
@@ -155,7 +153,6 @@ func scoreContextCapabilityParts(_ record: CapabilityScoringRecord, message: Str
         "ops": ["feature:trust_doctor", "feature:eval_release_ops", "feature:nextgen_runtime"],
         "personality": ["feature:personality_engine", "skill"],
         "capability": ["feature", "skill", "tool", "workflow", "mcp", "catalog"],
-        "full": ["feature", "skill", "tool", "workflow", "mcp", "catalog"],
     ]
     let biases = modeKindBias[mode] ?? []
     // Python: `record.get("sourceId") or record.get("id") or ""` — empty
@@ -180,29 +177,15 @@ func scoreContextCapabilityParts(_ record: CapabilityScoringRecord, message: Str
 }
 
 /// Byte-for-byte port of `select_context_capabilities`
-///. Limit defaults:
-///   • mode=="minimal" → 2
-///   • mode=="full"    → 18
-///   • else            → 8
-/// Drops zero-score entries except in "full" mode. Sort key matches Python
+///. Drops zero-score entries. Sort key matches Python
 /// `(score, status)` with `reverse=True` — both DESCENDING.
 func selectContextCapabilities(
     records: [CapabilityScoringRecord],
     message: String,
-    mode: String,
-    limit: Int? = nil
+    mode: String
 ) -> [JSONValue] {
-    let resolvedLimit: Int
-    if let l = limit {
-        resolvedLimit = l
-    } else if mode == "minimal" {
-        resolvedLimit = 2
-    } else if mode == "full" {
-        resolvedLimit = 18
-    } else {
-        resolvedLimit = 8
-    }
-
+    let tokens = keywordTokens(message)
+    let lower = message.lowercased()
     struct Scored {
         let score: Double
         let status: String
@@ -211,8 +194,8 @@ func selectContextCapabilities(
     }
     var scored: [Scored] = []
     for (inputIndex, record) in records.enumerated() {
-        let parts = scoreContextCapabilityParts(record, message: message, mode: mode)
-        if parts.score <= 0 && mode != "full" { continue }
+        let parts = scoreContextCapabilityParts(record, tokens: tokens, lower: lower, mode: mode)
+        if parts.score <= 0 { continue }
         let trimmedDesc = String(record.description.prefix(500))
         let trimmedTriggers = Array(record.triggers.prefix(6)).map { JSONValue.string($0) }
         let trimmedPerms = Array(record.permissions.prefix(6)).map { JSONValue.string($0) }
@@ -248,8 +231,7 @@ func selectContextCapabilities(
         if a.status != b.status { return a.status > b.status }
         return a.inputIndex < b.inputIndex
     }
-    let take = max(0, resolvedLimit)
-    return Array(scored.prefix(take)).map { $0.summary }
+    return Array(scored.prefix(8)).map { $0.summary }
 }
 
 /// Build the in-process capability-records array for the routerPlan

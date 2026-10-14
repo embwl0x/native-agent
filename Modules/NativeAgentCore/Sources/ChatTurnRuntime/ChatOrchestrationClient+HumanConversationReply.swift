@@ -26,7 +26,8 @@ extension SwiftNativeChatOrchestrationClient {
                     try await TurnTraceContext.$threadId.withValue(route.threadId) {
                         try await appendMessage(sessionId: sessionID, role: "assistant", content: text,
                                                 runId: runID, attachments: [], source: snapshot.route!.surface,
-                                                expectedLastMessageID: expectedLastMessageID)
+                                                expectedLastMessageID: expectedLastMessageID,
+                                                answerFor: runID, messageId: runID)
                     }
                 }
             }

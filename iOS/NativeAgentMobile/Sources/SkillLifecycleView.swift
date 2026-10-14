@@ -249,7 +249,7 @@ struct SkillLifecycleView: View {
     var accessory: AnyView = AnyView(EmptyView())
     @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = SkillLifecycleStore()
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
 
     @State private var filter: SkillFilter = .all
     @State private var selectedSkill: SkillManifestEntry?

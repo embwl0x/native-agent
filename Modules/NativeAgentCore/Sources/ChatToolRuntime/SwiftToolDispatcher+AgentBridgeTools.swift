@@ -17,6 +17,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+import ToolRegistry
 
 /// One finished launch of an agent NativeAgent drives: SecurityCenter's
 /// decision for this turn's real origin and, under Full Mac, the exact program
@@ -260,12 +261,27 @@ extension SwiftToolDispatcher {
         return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
     }
 
-    /// Legacy synchronous invoke cwd selection; async bridge admission has its own trust checks.
-    static func builderInvokeWorkingDirectory(input: [String: JSONValue], dataRoot: URL) -> String {
-        if case .string(let c)? = input["cwd"], !c.isEmpty { return c }
-        _ = try? NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot)
-        return builderSourceRepoRoot(dataRoot: dataRoot)?.path
-            ?? builderWorkspaceRoot(dataRoot: dataRoot).path
+    /// A relative folder belongs to the contact's workspace, never the app's process cwd.
+    static func builderInvokeWorkingDirectory(input: [String: JSONValue], dataRoot: URL) throws -> String {
+        let contact = try AgentPeerStore(dataRoot: dataRoot).list().first {
+            ["codex", "codex-cli"].contains(AgentPeerStore.hostRowID($0.endpoint) ?? "")
+        }
+        let root = contact.flatMap { $0.acpWorkingDirectory ?? $0.hostWorkspace }.map { URL(fileURLWithPath: $0) }
+            ?? builderSourceRepoRoot(dataRoot: dataRoot) ?? builderWorkspaceRoot(dataRoot: dataRoot)
+        let raw: String
+        if let value = input["cwd"], value != .null {
+            guard case .string(let value) = value else {
+                throw ToolRegistryError.invalidRequest("Pass cwd as an existing folder. Codex's workspace root is \(root.path).")
+            }
+            raw = NSString(string: value.trimmingCharacters(in: .whitespacesAndNewlines)).expandingTildeInPath
+        } else { raw = "" }
+        let folder = (raw.isEmpty ? root : raw.hasPrefix("/") ? URL(fileURLWithPath: raw) : root.appendingPathComponent(raw))
+            .standardizedFileURL.resolvingSymlinksInPath()
+        var directory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &directory), directory.boolValue else {
+            throw ToolRegistryError.invalidRequest("Codex's working folder does not exist: \(folder.path). Use its workspace root \(root.path) or an existing folder inside it.")
+        }
+        return folder.path
     }
 
     static func builderConversationSelection(
@@ -367,7 +383,7 @@ extension SwiftToolDispatcher {
 
     /// Matches `topicSlug` in both builder wake helpers: ASCII lowercase
     /// alphanumerics, collapsed dash separators, 64-character ceiling.
-    private static func builderTopicSlug(_ raw: String) -> String {
+    static func builderTopicSlug(_ raw: String) -> String {
         var output = ""
         var pendingSeparator = false
         for scalar in raw.lowercased().unicodeScalars {
@@ -384,13 +400,6 @@ extension SwiftToolDispatcher {
         let canonical = String(output.prefix(64))
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return canonical.isEmpty ? "general" : canonical
-    }
-
-    /// File-internal accessor so the replay guard slugs a topic EXACTLY the way
-    /// the conversation-reference validator above does. A second slug function
-    /// would be a cross-vocabulary seam waiting to silently mismatch.
-    static func builderTopicSlugForReplayGuard(_ raw: String) -> String {
-        builderTopicSlug(raw)
     }
 
     private static func shortStableBuilderMessageId(_ messageId: String) -> String {
@@ -845,7 +854,7 @@ extension SwiftToolDispatcher {
         if environment[variable] == nil {
             environment[variable] = AgentBridgeRuntime.executableURL(named: cli, environment: environment)?.path
         }
-        var receipt = await Self.runBuilderWakeupHelper(node: node, helper: helper, inputData: inputData,
+        var receipt = await AgentBridgeRuntime.runBuilderWakeupHelper(node: node, helper: helper, inputData: inputData,
                                                        cwd: cwd, environment: environment, timeoutSeconds: timeout,
                                                        arguments: launchArguments)
         if let launch, case .object(var fields) = receipt {
@@ -854,105 +863,6 @@ extension SwiftToolDispatcher {
         }
         return receipt
     }
-
-    static func runBuilderWakeupHelper(
-        node: URL,
-        helper: URL,
-        inputData: Data,
-        cwd: URL,
-        environment: [String: String],
-        timeoutSeconds: TimeInterval,
-        arguments: [String] = []
-    ) async -> JSONValue {
-        // The helpers address the agent and the user by their configured
-        // names (2026-09-05: the scripts used to carry the maintainer's).
-        var environment = environment
-        if environment["NATIVE_AGENT_AGENT_NAME"] == nil || environment["NATIVE_AGENT_USER_NAME"] == nil {
-            let names = AgentBridgeRuntime.configuredNames(dataRoot: PersistenceCore.defaultDataRoot())
-            environment["NATIVE_AGENT_AGENT_NAME"] = environment["NATIVE_AGENT_AGENT_NAME"] ?? names.agent
-            environment["NATIVE_AGENT_USER_NAME"] = environment["NATIVE_AGENT_USER_NAME"] ?? names.user
-        }
-        let result: ProcessRunResult
-        do {
-            result = try await SystemProcessAdapter().run(
-                executable: node.path,
-                arguments: [helper.path] + arguments,
-                currentDirectory: cwd,
-                environment: environment,
-                standardInput: inputData,
-                timeoutSeconds: timeoutSeconds,
-                outputByteLimit: 8 * 1024 * 1024
-            )
-        } catch is CancellationError {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("helper_cancelled"),
-                "helper": .string(helper.path),
-                "admissionOutcome": .string("unknown"),
-                "message": .string("The helper was cancelled after possible dispatch. Inspect the original message's delegation status before any resend."),
-            ])
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("helper_spawn_failed"),
-                "helper": .string(helper.path),
-                "error": .string(String(describing: error)),
-            ])
-        }
-
-        return builderWakeupHelperReceipt(result: result, helper: helper)
-    }
-
-    /// Pure interpretation of the shared process owner's evidence. A helper
-    /// exit code is never a substitute for its structured admission receipt.
-    static func builderWakeupHelperReceipt(result: ProcessRunResult, helper: URL) -> JSONValue {
-        let stderrText = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        func unavailable(_ reason: String) -> JSONValue {
-            var envelope: [String: JSONValue] = [
-                "status": .string("failed"),
-                "reason": .string(reason),
-                "helper": .string(helper.path),
-                "exitCode": .int(Int64(result.exitCode)),
-                "admissionOutcome": .string("unknown"),
-                "note": .string("No trustworthy helper receipt was received. Work may already have been admitted; inspect the original message's delegation status before any resend."),
-            ]
-            if !stderrText.isEmpty {
-                envelope["stderrPreview"] = .string(String(stderrText.prefix(500)))
-            }
-            return .object(envelope)
-        }
-        if result.timedOut { return unavailable("helper_timeout") }
-        if result.stdoutTruncated { return unavailable("helper_output_truncated") }
-
-        let stdoutText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lastLine = stdoutText.split(separator: "\n").last.map(String.init) ?? ""
-        let parsed = [stdoutText, lastLine]
-            .lazy
-            .filter { !$0.isEmpty }
-            .compactMap { $0.data(using: .utf8) }
-            .compactMap { try? JSONValue.parse($0) }
-            .first
-        guard let parsed else { return unavailable("helper_returned_no_json") }
-        guard case .object(var object) = parsed,
-              case .string(let status)? = object["status"],
-              !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return unavailable("helper_invalid_receipt")
-        }
-        if result.exitCode != 0 && !["failed", "skipped"].contains(status) {
-            guard case .object(var failure) = unavailable("helper_exit_conflict") else {
-                return unavailable("helper_exit_conflict")
-            }
-            failure["helperReportedReceipt"] = parsed
-            return .object(failure)
-        }
-        object["helper"] = .string(helper.path)
-        object["exitCode"] = .int(Int64(result.exitCode))
-        if !stderrText.isEmpty {
-            object["stderrPreview"] = .string(String(stderrText.prefix(500)))
-        }
-        return .object(object)
-    }
-
 
     // MARK: - Runs-ledger append for sub-agent spawns
     //
@@ -1120,7 +1030,7 @@ enum WakeupReplayGuard {
         now: Date,
         window: TimeInterval = defaultWindow
     ) -> Match? {
-        let wanted = SwiftToolDispatcher.builderTopicSlugForReplayGuard(topic ?? "")
+        let wanted = SwiftToolDispatcher.builderTopicSlug(topic ?? "")
         guard !text.isEmpty else { return nil }
         let names = (try? FileManager.default.contentsOfDirectory(atPath: jobsDirectory.path)) ?? []
         var records: [[String: JSONValue]] = []
@@ -1169,7 +1079,7 @@ enum WakeupReplayGuard {
         return payloads.compactMap { payload in
             guard let text = string(payload, "text") else { return nil }
             let slug = (store == .codex ? nil : string(record, "topicSlug"))
-                ?? SwiftToolDispatcher.builderTopicSlugForReplayGuard(string(payload, "topic") ?? "")
+                ?? SwiftToolDispatcher.builderTopicSlug(string(payload, "topic") ?? "")
             return (text, slug)
         }
     }
@@ -1190,7 +1100,7 @@ enum WakeupReplayGuard {
             guard case .object(let payload)? = record["payload"],
                   string(payload, "text") == text else { return nil }
             let slug = string(record, "topicSlug")
-                ?? SwiftToolDispatcher.builderTopicSlugForReplayGuard(string(payload, "topic") ?? "")
+                ?? SwiftToolDispatcher.builderTopicSlug(string(payload, "topic") ?? "")
             guard slug == wantedSlug else { return nil }
             let completedAt = string(record, "completedAt")
             let statusWord = (string(record, "runStatus") ?? string(record, "status"))?.lowercased()
@@ -1221,7 +1131,7 @@ enum WakeupReplayGuard {
                 guard case .object(let e) = entry,
                       case .object(let payload)? = e["payload"],
                       string(payload, "text") == text else { continue }
-                let slug = SwiftToolDispatcher.builderTopicSlugForReplayGuard(
+                let slug = SwiftToolDispatcher.builderTopicSlug(
                     string(payload, "topic") ?? "")
                 if slug == wantedSlug { matched = true; break }
             }

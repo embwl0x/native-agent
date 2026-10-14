@@ -1,12 +1,174 @@
 import Foundation
+import CryptoKit
 import PersistenceCore
+import MacControl
 import Darwin
 
-/// Deterministic discovery for the external coding organs NativeAgent may
-/// invoke. This owner discovers only local executables and bundled helper
-/// resources; it does not authenticate, install software, grant authority, or
-/// infer that a subprocess result is verified work.
+/// Discovery and helper execution for the external coding organs NativeAgent
+/// may invoke. This owner does not authenticate, install software, grant
+/// authority, or infer that a subprocess result is verified work.
 public enum AgentBridgeRuntime {
+    /// The same identity the wake runners record for themselves:
+    /// sha256 hex of `ps -p <pid> -o lstart=,command=`, trimmed.
+    public static func processStartIdentity(_ pid: Int32) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-p", String(pid), "-o", "lstart=,command="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus == 0, !text.isEmpty else { return nil }
+        return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func startOMPReplyJobRecovery() async {
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        var environment = AgentBridgeRuntime.processEnvironment()
+        let configRoot = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+        environment.merge(InstallPaths.current.bridgeEnvironment(configRoot: configRoot)) { existing, _ in existing }
+        let directory = environment["NATIVE_AGENT_OMP_BRIDGE_DIR"].map { URL(fileURLWithPath: $0) }
+            ?? configRoot.appendingPathComponent("omp-bridge")
+        let jobs = directory.appendingPathComponent("wake-jobs")
+        guard FileManager.default.fileExists(atPath: jobs.path) else { return }
+        guard let helper = AgentBridgeRuntime.ompHelperURL(dataRoot: dataRoot),
+              let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
+            nativeLog("[ClaudeBridge] OMP reply recovery requires node and %@",
+                AgentBridgeRuntime.expectedHelperPath(named: "omp_thread_wakeup.js", dataRoot: dataRoot).path)
+            return
+        }
+        do {
+            for path in try FileManager.default.contentsOfDirectory(at: jobs, includingPropertiesForKeys: nil)
+                where path.pathExtension == "json" {
+                try Task.checkCancellation()
+                do {
+                    guard case .object(let job) = try JSONValue.parse(Data(contentsOf: path)),
+                          job["state"] == .string("settled") || job["state"] == .string("delivering"),
+                          case .string(let text)? = job["completionText"], !text.isEmpty,
+                          case .object(let payload)? = job["payload"] else { continue }
+                    guard case .string(let messageID)? = job["messageId"], !messageID.isEmpty,
+                          payload["messageId"] == .string(messageID) else { throw CocoaError(.fileReadCorruptFile) }
+                    // The helper's existing topic lock and delivery identity own replay.
+                    let input = try JSONValue.object(payload).serializedData(pretty: false)
+                    let receipt = await runBuilderWakeupHelper(node: node, helper: helper, inputData: input,
+                        cwd: dataRoot.deletingLastPathComponent(), environment: environment, timeoutSeconds: nil)
+                    if case .object(let fields) = receipt {
+                        if case .int(let status)? = fields["exitCode"], status != 0 {
+                            nativeLog("[ClaudeBridge] OMP reply recovery for %@ exited %d", path.lastPathComponent, Int(status))
+                        } else if fields["status"] == .string("failed") {
+                            nativeLog("[ClaudeBridge] could not recover OMP reply %@: %@", path.lastPathComponent,
+                                try receipt.serialize(pretty: false))
+                        }
+                    }
+                } catch is CancellationError { throw CancellationError() }
+                catch {
+                    nativeLog("[ClaudeBridge] OMP reply recovery for %@ failed: %@", path.lastPathComponent, error.localizedDescription)
+                }
+            }
+        } catch { nativeLog("[ClaudeBridge] OMP reply-job scan failed: %@", error.localizedDescription) }
+    }
+
+    public static func runBuilderWakeupHelper(
+        node: URL,
+        helper: URL,
+        inputData: Data,
+        cwd: URL,
+        environment: [String: String],
+        timeoutSeconds: TimeInterval?,
+        arguments: [String] = []
+    ) async -> JSONValue {
+        // The helpers address the agent and the user by their configured
+        // names (2026-09-05: the scripts used to carry the maintainer's).
+        var environment = environment
+        if environment["NATIVE_AGENT_AGENT_NAME"] == nil || environment["NATIVE_AGENT_USER_NAME"] == nil {
+            let names = AgentBridgeRuntime.configuredNames(dataRoot: PersistenceCore.defaultDataRoot())
+            environment["NATIVE_AGENT_AGENT_NAME"] = environment["NATIVE_AGENT_AGENT_NAME"] ?? names.agent
+            environment["NATIVE_AGENT_USER_NAME"] = environment["NATIVE_AGENT_USER_NAME"] ?? names.user
+        }
+        let result: ProcessRunResult
+        do {
+            result = try await SystemProcessAdapter().run(
+                executable: node.path,
+                arguments: [helper.path] + arguments,
+                currentDirectory: cwd,
+                environment: environment,
+                standardInput: inputData,
+                timeoutSeconds: timeoutSeconds,
+                outputByteLimit: 8 * 1024 * 1024
+            )
+        } catch is CancellationError {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("helper_cancelled"),
+                "helper": .string(helper.path),
+                "admissionOutcome": .string("unknown"),
+                "message": .string("The helper was cancelled after possible dispatch. Inspect the original message's delegation status before any resend."),
+            ])
+        } catch {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("helper_spawn_failed"),
+                "helper": .string(helper.path),
+                "error": .string(String(describing: error)),
+            ])
+        }
+
+        return builderWakeupHelperReceipt(result: result, helper: helper)
+    }
+
+    /// Pure interpretation of the shared process owner's evidence. A helper
+    /// exit code is never a substitute for its structured admission receipt.
+    private static func builderWakeupHelperReceipt(result: ProcessRunResult, helper: URL) -> JSONValue {
+        let stderrText = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        func unavailable(_ reason: String) -> JSONValue {
+            var envelope: [String: JSONValue] = [
+                "status": .string("failed"),
+                "reason": .string(reason),
+                "helper": .string(helper.path),
+                "exitCode": .int(Int64(result.exitCode)),
+                "admissionOutcome": .string("unknown"),
+                "note": .string("No trustworthy helper receipt was received. Work may already have been admitted; inspect the original message's delegation status before any resend."),
+            ]
+            if !stderrText.isEmpty {
+                envelope["stderrPreview"] = .string(String(stderrText.prefix(500)))
+            }
+            return .object(envelope)
+        }
+        if result.timedOut { return unavailable("helper_timeout") }
+        if result.stdoutTruncated { return unavailable("helper_output_truncated") }
+
+        let stdoutText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lastLine = stdoutText.split(separator: "\n").last.map(String.init) ?? ""
+        let parsed = [stdoutText, lastLine]
+            .lazy
+            .filter { !$0.isEmpty }
+            .compactMap { $0.data(using: .utf8) }
+            .compactMap { try? JSONValue.parse($0) }
+            .first
+        guard let parsed else { return unavailable("helper_returned_no_json") }
+        guard case .object(var object) = parsed,
+              case .string(let status)? = object["status"],
+              !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return unavailable("helper_invalid_receipt")
+        }
+        if result.exitCode != 0 && !["failed", "skipped"].contains(status) {
+            guard case .object(var failure) = unavailable("helper_exit_conflict") else {
+                return unavailable("helper_exit_conflict")
+            }
+            failure["helperReportedReceipt"] = parsed
+            return .object(failure)
+        }
+        object["helper"] = .string(helper.path)
+        object["exitCode"] = .int(Int64(result.exitCode))
+        if !stderrText.isEmpty {
+            object["stderrPreview"] = .string(String(stderrText.prefix(500)))
+        }
+        return .object(object)
+    }
+
     public struct Readiness: Sendable, Equatable {
         public let helper: URL?
         public let runtime: URL?

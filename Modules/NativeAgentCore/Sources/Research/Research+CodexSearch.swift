@@ -101,7 +101,7 @@ public enum WebSearchRoutes {
             environment: codexEnvironment(home: home), cwd: dir, timeout: codexTimeout
         )
         try Task.checkCancellation()
-        guard let run = subprocess, run.status != 127 else { throw CodexWebSearchError.unavailable }
+        guard let run = subprocess, run.exitCode != 127 else { throw CodexWebSearchError.unavailable }
         if run.timedOut { throw CodexWebSearchError.timedOut }
 
         // --json events: web_search items carry every URL the search returned;
@@ -110,7 +110,7 @@ public enum WebSearchRoutes {
         var searches = 0
         var answer = ""
         var failure = ""
-        for line in String(decoding: run.stdout, as: UTF8.self).split(separator: "\n") {
+        for line in run.stdout.split(separator: "\n") {
             guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
             if row["type"] as? String == "turn.failed" {
                 failure = ((row["error"] as? [String: Any])?["message"] as? String) ?? "turn failed"
@@ -124,10 +124,10 @@ public enum WebSearchRoutes {
                 answer = text
             }
         }
-        guard run.status == 0, failure.isEmpty else {
-            let detail = [failure, String(decoding: run.stderr, as: UTF8.self)]
+        guard run.exitCode == 0, failure.isEmpty else {
+            let detail = [failure, run.stderr]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty } ?? "no detail"
-            throw CodexWebSearchError.classify(exitCode: run.status, detail: String(detail.suffix(400)))
+            throw CodexWebSearchError.classify(exitCode: run.exitCode, detail: String(detail.suffix(400)))
         }
         guard let parsed = try? JSONSerialization.jsonObject(with: Data(answer.utf8)) as? [String: Any],
               let rows = parsed["results"] as? [[String: Any]] else {
@@ -157,7 +157,7 @@ public enum WebSearchRoutes {
             executable: executable.path, arguments: ["login", "status", "-c", "cli_auth_credentials_store=\"file\""],
             environment: codexEnvironment(home: home), timeout: 10
         )
-        return run.map { $0.status == 0 && !$0.timedOut } ?? false
+        return run.map { $0.exitCode == 0 && !$0.timedOut } ?? false
     }
 
     static func sourceKey(_ url: String) -> String {

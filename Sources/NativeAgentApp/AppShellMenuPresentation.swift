@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 import NativeAgentShared
 
@@ -40,5 +41,17 @@ enum MenuBarStatusPresentation {
             return reachability
         }
         return "\(reachability) — \(status)"
+    }
+}
+
+extension SidebarItem {
+    /// Advanced's rail top to bottom as the layout shows it (ui/layout.json,
+    /// the rail's blocks by their page ids): a page, or nil for the line
+    /// between its groups. The Navigate menu's digits and ⌘K's pages read its
+    /// pages, so ⌘N is the Nth rail row.
+    static func rail(_ layout: SurfaceLayout) -> [SidebarItem?] {
+        layout.shown("rail", profile: SimpleViewMode.advanced).map { block in
+            QuietPages.all.first { $0.id == block.name && $0.tab == nil }?.item
+        }
     }
 }

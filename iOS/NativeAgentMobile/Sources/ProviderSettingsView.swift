@@ -129,7 +129,7 @@ enum ProviderSelectionRollbackPresentation {
 // MARK: - Main View
 
 struct ProviderSettingsView: View {
-    @StateObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
 
     // Presentation mirror of ProviderSurfaceGroups. Submit one representative
@@ -540,7 +540,7 @@ struct ProviderDetailSheet: View {
     let provider: ProviderInfo
     let onDone: () -> Void
 
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var apiKey = ""
     @State private var signInRequestID: String?
     @State private var isWorking = false

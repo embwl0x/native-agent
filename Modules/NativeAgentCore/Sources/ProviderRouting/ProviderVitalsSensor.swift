@@ -130,48 +130,6 @@ public struct ProviderVitalsTransition: Sendable, Equatable {
     }
 }
 
-/// Tunables. Defaults chosen so a single slow call never trips a band and a
-/// genuinely stable stream never transitions.
-public struct ProviderVitalsConfiguration: Sendable, Equatable {
-    /// EMA smoothing for the fast (recent) latency/error signals.
-    public var fastAlpha: Double
-    /// EMA smoothing for the slow latency baseline.
-    public var baselineAlpha: Double
-    /// Samples required before a provider may leave `nominal` (cold-start guard).
-    public var warmupSamples: Int
-    /// Provider-row cap (LRU eviction of nominal rows past this bound) —
-    /// bounds resident memory AND the telemetry snapshot.
-    public var maxTrackedProviders: Int
-
-    // Hysteresis thresholds on the composite strain scalar.
-    public var enterSluggish: Double
-    public var exitSluggish: Double
-    public var enterDegraded: Double
-    public var exitDegraded: Double
-
-    public init(
-        fastAlpha: Double = 0.4,
-        baselineAlpha: Double = 0.05,
-        warmupSamples: Int = 5,
-        maxTrackedProviders: Int = 24,
-        enterSluggish: Double = 1.0,
-        exitSluggish: Double = 0.6,
-        enterDegraded: Double = 2.0,
-        exitDegraded: Double = 1.4
-    ) {
-        self.fastAlpha = fastAlpha
-        self.baselineAlpha = baselineAlpha
-        self.warmupSamples = max(0, warmupSamples)
-        self.maxTrackedProviders = max(1, maxTrackedProviders)
-        self.enterSluggish = enterSluggish
-        self.exitSluggish = exitSluggish
-        self.enterDegraded = enterDegraded
-        self.exitDegraded = exitDegraded
-    }
-
-    public static let `default` = ProviderVitalsConfiguration()
-}
-
 // MARK: - Sensor
 
 public actor ProviderVitalsSensor {
@@ -202,7 +160,14 @@ public actor ProviderVitalsSensor {
         var lastSampleAt: Date?
     }
 
-    private let configuration: ProviderVitalsConfiguration
+    private static let fastAlpha = 0.4
+    private static let baselineAlpha = 0.05
+    private static let warmupSamples = 5
+    private static let maxTrackedProviders = 24
+    private static let enterSluggish = 1.0
+    private static let exitSluggish = 0.6
+    private static let enterDegraded = 2.0
+    private static let exitDegraded = 1.4
     private var states: [String: State] = [:]
     /// Start timestamps for in-flight calls, keyed by lifecycle id, so a
     /// terminal event can compute the call's duration. Bounded — a call whose
@@ -224,9 +189,7 @@ public actor ProviderVitalsSensor {
     /// outputs, counted beside them.
     private var noReplyCuts: [String: Int] = [:]
 
-    public init(configuration: ProviderVitalsConfiguration = .default) {
-        self.configuration = configuration
-    }
+    public init() {}
 
     // MARK: Lifecycle
 
@@ -276,23 +239,23 @@ public actor ProviderVitalsSensor {
         // Fast latency EMA. The slow baseline is deliberately NOT updated here
         // — see below, after the band for this sample is known.
         if let duration = sample.durationMs {
-            state.emaLatencyMs = ema(state.emaLatencyMs, duration, alpha: configuration.fastAlpha)
+            state.emaLatencyMs = ema(state.emaLatencyMs, duration, alpha: Self.fastAlpha)
         }
         if let ttft = sample.ttftMs {
-            state.emaTTFTMs = ema(state.emaTTFTMs, ttft, alpha: configuration.fastAlpha)
+            state.emaTTFTMs = ema(state.emaTTFTMs, ttft, alpha: Self.fastAlpha)
         }
         if let tps = sample.tokensPerSec {
-            state.emaTokensPerSec = ema(state.emaTokensPerSec, tps, alpha: configuration.fastAlpha)
+            state.emaTokensPerSec = ema(state.emaTokensPerSec, tps, alpha: Self.fastAlpha)
         }
         // Error-rate EMA + consecutive-failure run.
         let errorPoint = sample.isError ? 1.0 : 0.0
-        state.emaErrorRate = ema(state.emaErrorRate, errorPoint, alpha: configuration.fastAlpha) ?? errorPoint
+        state.emaErrorRate = ema(state.emaErrorRate, errorPoint, alpha: Self.fastAlpha) ?? errorPoint
         state.consecutiveFailures = sample.isError ? state.consecutiveFailures + 1 : 0
         state.sampleCount += 1
 
         // Band with hysteresis. Cold-start providers are pinned nominal until
         // enough samples have accumulated to trust the EMAs.
-        let strain = state.sampleCount < configuration.warmupSamples ? 0 : self.strain(for: state)
+        let strain = state.sampleCount < Self.warmupSamples ? 0 : self.strain(for: state)
         let nextBand = resolveBand(current: state.band, strain: strain)
         state.band = nextBand
 
@@ -313,7 +276,7 @@ public actor ProviderVitalsSensor {
         // nominal until `warmupSamples`.
         if previousBand == .nominal, nextBand == .nominal, let duration = sample.durationMs {
             state.baselineLatencyMs = ema(
-                state.baselineLatencyMs, duration, alpha: configuration.baselineAlpha)
+                state.baselineLatencyMs, duration, alpha: Self.baselineAlpha)
         }
 
         state.lastSampleAt = sample.occurredAt
@@ -323,11 +286,11 @@ public actor ProviderVitalsSensor {
         // live band state a transition depends on; with a real provider
         // population under 10, eviction only ever hits junk ids). Snapshot
         // serialization is bounded by the same cap for free.
-        if states.count > configuration.maxTrackedProviders {
+        if states.count > Self.maxTrackedProviders {
             let evictable = states
                 .filter { $0.value.band == .nominal && $0.key != key }
                 .sorted { ($0.value.lastSampleAt ?? .distantPast) < ($1.value.lastSampleAt ?? .distantPast) }
-            for (staleKey, _) in evictable.prefix(states.count - configuration.maxTrackedProviders) {
+            for (staleKey, _) in evictable.prefix(states.count - Self.maxTrackedProviders) {
                 states.removeValue(forKey: staleKey)
             }
         }
@@ -420,10 +383,6 @@ public actor ProviderVitalsSensor {
         return vitals(key: key, state: state)
     }
 
-    public func allVitals() -> [ProviderVitals] {
-        states.keys.sorted().compactMap { key in states[key].map { vitals(key: key, state: $0) } }
-    }
-
     private func vitals(key: String, state: State) -> ProviderVitals {
         ProviderVitals(
             providerId: key,
@@ -493,7 +452,7 @@ public actor ProviderVitalsSensor {
         }
 
         var restored: [(String, State)] = []
-        restored.reserveCapacity(min(rows.count, configuration.maxTrackedProviders))
+        restored.reserveCapacity(min(rows.count, Self.maxTrackedProviders))
         for (rawKey, value) in rows {
             let key = normalizedProviderId(rawKey)
             guard !key.isEmpty,
@@ -538,7 +497,7 @@ public actor ProviderVitalsSensor {
             return $0.0 < $1.0
         }
         states = Dictionary(
-            restored.prefix(configuration.maxTrackedProviders),
+            restored.prefix(Self.maxTrackedProviders),
             uniquingKeysWith: { first, _ in first }
         )
         openCallStarts.removeAll(keepingCapacity: true)
@@ -589,16 +548,16 @@ public actor ProviderVitalsSensor {
     private func resolveBand(current: ProviderVitalsBand, strain: Double) -> ProviderVitalsBand {
         switch current {
         case .nominal:
-            if strain >= configuration.enterDegraded { return .degraded }
-            if strain >= configuration.enterSluggish { return .sluggish }
+            if strain >= Self.enterDegraded { return .degraded }
+            if strain >= Self.enterSluggish { return .sluggish }
             return .nominal
         case .sluggish:
-            if strain >= configuration.enterDegraded { return .degraded }
-            if strain < configuration.exitSluggish { return .nominal }
+            if strain >= Self.enterDegraded { return .degraded }
+            if strain < Self.exitSluggish { return .nominal }
             return .sluggish
         case .degraded:
-            if strain < configuration.exitSluggish { return .nominal }
-            if strain < configuration.exitDegraded { return .sluggish }
+            if strain < Self.exitSluggish { return .nominal }
+            if strain < Self.exitDegraded { return .sluggish }
             return .degraded
         }
     }

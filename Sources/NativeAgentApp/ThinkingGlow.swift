@@ -15,21 +15,6 @@ import SwiftUI
 // size back, so it re-lays-out nothing. The fade animates one @State that
 // only this leaf reads, so its transaction never reaches anything else.
 
-extension AppModel {
-    /// She is working on the open conversation's turn and no reply text has
-    /// streamed yet. A retry resets the streamed length, so a retried turn
-    /// reads as thinking again until its new text arrives.
-    var isThinkingBeforeReply: Bool {
-        isThinkingBeforeReply(for: activeChatSessionId)
-    }
-
-    func isThinkingBeforeReply(for sessionId: String) -> Bool {
-        guard engine.turns.isBusy(sessionId) || engine.turns.isStreaming(sessionId) else { return false }
-        guard let lifecycle = engine.turns.lifecycle(for: sessionId) else { return true }
-        return !lifecycle.presentation.isTerminal && lifecycle.presentation.streamedTextLength == 0
-    }
-}
-
 /// One thinking effect, masked to a rounded rectangle of `cornerRadius`.
 /// Put `.shimmer` under content (a background, before `glassEffect`) and
 /// `.rim` over it (an overlay).
@@ -53,7 +38,7 @@ struct ThinkingGlow: View {
                 let sessionId = sessionId ?? model.activeChatSessionId
                 return wholeTurn
                     ? model.engine.turns.isBusy(sessionId) || model.engine.turns.isStreaming(sessionId)
-                    : model.isThinkingBeforeReply(for: sessionId)
+                    : model.engine.turns.isThinkingBeforeReply(for: sessionId)
             } ?? false
         )
     }

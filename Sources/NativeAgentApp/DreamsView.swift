@@ -1,3 +1,5 @@
+import TrustCenter
+import Foundation
 import NativeAgentCore
 // PATCH-2026-05-29: dreams-tab DreamsView — surfaces + controls the dream diary
 // and REM consolidation cycle. Backend: Swift-native DreamREMCycle runtime.
@@ -838,4 +840,85 @@ private struct DreamDateRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)
     }
+}
+
+/// The manual REM button has three distinct policy states. An unresolved
+/// authority read cannot be presented as an enabled cycle, and an explicit
+/// false remains a normal disabled state rather than an execution failure.
+enum DreamsREMRunAvailability: Equatable {
+    case checking
+    case enabled
+    case disabled
+    case unavailable
+
+    static func resolve(policy: TrustPolicy?, policyLoadFailed: Bool) -> Self {
+        if policyLoadFailed { return .unavailable }
+        guard let policy else { return .checking }
+        return policy.trainingPolicy?.rem_cycle_enabled == true ? .enabled : .disabled
+    }
+
+    var canRun: Bool { self == .enabled }
+
+    var help: String {
+        switch self {
+        case .checking:
+            return "Checking REM-cycle permission."
+        case .enabled:
+            return "I reread the last week of dreams, draft up to five growth notes from patterns that recur on two or more days, and send them to you for approval. Dreams older than two weeks move to the archive."
+        case .disabled:
+            return "Weekly dream consolidation is off. Turn it on in Settings \u{25B8} Inner life."
+        case .unavailable:
+            return "REM-cycle permission could not be read. Refresh and retry."
+        }
+    }
+}
+
+/// Bounded, user-visible completion for the same response returned by
+/// `BackgroundLoopsAssembly.runRem`. A synchronous manual run has already completed;
+/// calling it "started" hides both no-op weeks and malformed responses.
+enum DreamsREMActionFeedback: Equatable {
+    case completed(proposals: Int, archivedEntries: Int)
+    /// A root too young to recur — the pass ran and found nothing worth
+    /// consolidating. A normal outcome, reported as one line, never as a
+    /// failure.
+    case nothingToConsolidate
+    case failed(String)
+
+    static func resolve(response: [String: Any]) -> Self {
+        switch REMRunReportPayload.validatedManualCompletion(response: response) {
+        case .success(let completion):
+            return completion.nothingToConsolidate ? .nothingToConsolidate
+                : .completed(proposals: completion.proposals, archivedEntries: completion.archivedEntries)
+        case .failure(let error):
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .completed(let proposals, let archivedEntries):
+            let proposalText = proposals == 1 ? "1 proposal" : "\(proposals) proposals"
+            let archiveText = archivedEntries == 1 ? "1 diary entry archived" : "\(archivedEntries) diary entries archived"
+            return "REM consolidation completed — \(proposalText), \(archiveText)."
+        case .nothingToConsolidate:
+            return "REM consolidation completed — nothing to consolidate yet."
+        case .failed(let detail):
+            return detail
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .completed, .nothingToConsolidate: return "checkmark.circle"
+        case .failed: return "exclamationmark.triangle"
+        }
+    }
+
+    var isSuccess: Bool {
+        switch self {
+        case .completed, .nothingToConsolidate: return true
+        case .failed: return false
+        }
+    }
+
 }

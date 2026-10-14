@@ -23,18 +23,6 @@ public struct ContextCompiledProjectionResult: Sendable, Equatable {
     public var isEmpty: Bool {
         changedSources.isEmpty && removedSourceIDs.isEmpty
     }
-
-    public func generationDraft(
-        reason: String,
-        createdAt: Date = Date()
-    ) -> ContextGenerationDraft {
-        ContextGenerationDraft(
-            reason: reason,
-            changedSources: changedSources,
-            removedSourceIDs: removedSourceIDs,
-            createdAt: createdAt
-        )
-    }
 }
 
 /// A rebuildable projection whose output is already compiled for ContextStore.
@@ -101,5 +89,3 @@ public extension ContextCompiledProjectionProvider {
             == URL(fileURLWithPath: locator).standardizedFileURL
     }
 }
-
-public typealias ContextCompiledProjectionProviding = ContextCompiledProjectionProvider

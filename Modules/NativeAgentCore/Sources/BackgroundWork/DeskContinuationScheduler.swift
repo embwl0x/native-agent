@@ -27,12 +27,19 @@ public actor DeskContinuationScheduler {
         self.resume = resume
     }
 
-    private func eligible(_ item: DeskItem) -> Bool {
+    private func eligible(_ item: DeskItem, checkpoints: inout [String: Result<Set<String>, Error>]) -> Bool {
         guard !item.requiresOwnerInput, let record = item.continuation else { return false }
         if let sessionId = record.sessionID {
             do {
-                if try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
-                    .contains(where: { $0.runId == record.runID }) { return false }
+                let runs: Result<Set<String>, Error>
+                if let cached = checkpoints[sessionId] { runs = cached }
+                else {
+                    runs = Result {
+                        Set(try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId).map(\.runId))
+                    }
+                    checkpoints[sessionId] = runs
+                }
+                if try runs.get().contains(record.runID) { return false }
             } catch {
                 failure = "Repair the turn checkpoint before resuming this task: \(error.localizedDescription)"
                 return false
@@ -52,17 +59,20 @@ public actor DeskContinuationScheduler {
     /// When the task is actionable by Desk sequencing — its own and every
     /// ancestor's blockers and deferrals respected. Nil while a blocker or
     /// cycle holds it; a deferral only moves the date.
-    private func dueDate(_ item: DeskItem, in state: DeskState) -> Date? {
-        guard let record = item.continuation, eligible(item) else { return nil }
+    private func dueDate(_ item: DeskItem, in state: DeskState, now: Date,
+                         checkpoints: inout [String: Result<Set<String>, Error>],
+                         plans: inout [Date: DeskSequencing.Plan]) -> Date? {
+        guard let record = item.continuation, eligible(item, checkpoints: &checkpoints) else { return nil }
         if record.reason == "reply_ready" { return record.nextRunAt }
-        var at = Date()
+        var at = now
         var cursor: DeskItem? = item
         var seen: Set<String> = []
         while let current = cursor, seen.insert(current.handle).inserted {
             if let until = current.deferUntil.flatMap(DeskSequencing.parseDeferStamp), until > at { at = until }
             cursor = current.parent.flatMap { parent in state.items.first { $0.handle == parent } }
         }
-        guard DeskSequencing.compute(state, now: at).byHandle[item.handle]?.isReady == true else { return nil }
+        if plans[at] == nil { plans[at] = DeskSequencing.compute(state, now: at) }
+        guard plans[at]?.byHandle[item.handle]?.isReady == true else { return nil }
         return max(record.nextRunAt, at)
     }
 
@@ -71,7 +81,12 @@ public actor DeskContinuationScheduler {
         guard await isAllowed() else { return nil }
         do {
             let state = try await store.liveState()
-            return state.items.compactMap { dueDate($0, in: state) }.map { max(date, $0) }.min()
+            var checkpoints: [String: Result<Set<String>, Error>] = [:]
+            var plans: [Date: DeskSequencing.Plan] = [:]
+            let now = Date()
+            return state.items.compactMap {
+                dueDate($0, in: state, now: now, checkpoints: &checkpoints, plans: &plans)
+            }.map { max(date, $0) }.min()
         } catch { failure = error.localizedDescription; return nil }
     }
 
@@ -80,8 +95,14 @@ public actor DeskContinuationScheduler {
         guard await isAllowed() else { return [] }
         do {
             let state = try await store.liveState()
+            var checkpoints: [String: Result<Set<String>, Error>] = [:]
+            var plans: [Date: DeskSequencing.Plan] = [:]
+            let now = Date()
             guard let item = state.items.sorted(by: { $0.handle < $1.handle })
-                .first(where: { dueDate($0, in: state).map { $0 <= Date() } == true }),
+                .first(where: {
+                    dueDate($0, in: state, now: now, checkpoints: &checkpoints, plans: &plans)
+                        .map { $0 <= Date() } == true
+                }),
                   var record = item.continuation else { return [] }
             let expected = record.revision
             var unresolved: [DeskContinuation.Step] = []

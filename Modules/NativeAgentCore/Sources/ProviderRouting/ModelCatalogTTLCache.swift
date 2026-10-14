@@ -42,15 +42,66 @@ public enum ModelCatalogFreshness: String, Sendable, Equatable {
     /// the only case a caller may treat as authoritative enough to prune rows
     /// the provider no longer has.
     public var isLive: Bool { self == .live }
+}
 
-    /// True when this read reached the provider, complete or not. Rows from a
-    /// partial page are still fresh data; they may be added, never pruned on.
-    public var reachedProvider: Bool { self == .live || self == .liveIncomplete }
+/// Process-local decoded cache keyed by canonical path and file mtime.
+///
+/// Every read still stats the exact file, so removal and atomic replacement are
+/// visible on the next read. Missing, unreadable, empty, or undecodable bytes
+/// cache only the nil result for that observed mtime; a later mtime always
+/// retries the decode. Mirrors `REMPinsDecodedCache` in DreamREMCycle — same
+/// invariant, same retry-on-concurrent-write guard.
+final class ModelCatalogDecodeCache: @unchecked Sendable {
+    private struct Entry {
+        let modifiedAt: Date
+        let catalog: DecodedModelCatalog?
+    }
 
-    /// True when the list is not the provider's current answer: a refresh
-    /// failed, or no list has ever been fetched.
-    public var refreshFailed: Bool {
-        self == .staleAfterFailedRefresh || self == .unavailable
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+
+    func read(
+        url: URL,
+        decode: (Data) -> DecodedModelCatalog?
+    ) -> DecodedModelCatalog? {
+        // `attributesOfItem` does NOT follow symlinks, but `Data(contentsOf:)`
+        // does. Resolve first so a symlinked cache path stats as the regular
+        // file it points at instead of silently reading as "no catalog".
+        let url = url.resolvingSymlinksInPath()
+        let key = url.path
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Retry once if a writer replaces the file between the first stat and
+        // the read. Never associate bytes with a stale mtime key.
+        for _ in 0..<2 {
+            guard let modifiedAt = modificationDate(url) else {
+                entries.removeValue(forKey: key)
+                return nil
+            }
+            if let entry = entries[key], entry.modifiedAt == modifiedAt {
+                return entry.catalog
+            }
+
+            let decoded = (try? Data(contentsOf: url)).flatMap(decode)
+            guard modificationDate(url) == modifiedAt else { continue }
+
+            if entries[key] == nil, entries.count >= 64 {
+                entries.remove(at: entries.startIndex)
+            }
+            entries[key] = Entry(modifiedAt: modifiedAt, catalog: decoded)
+            return decoded
+        }
+
+        // A continuously changing file is not a safe source to memoize.
+        entries.removeValue(forKey: key)
+        return nil
+    }
+
+    private func modificationDate(_ url: URL) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        guard attributes?[.type] as? FileAttributeType == .typeRegular else { return nil }
+        return attributes?[.modificationDate] as? Date
     }
 }
 
@@ -99,6 +150,14 @@ public struct ModelCatalogFetch: Sendable {
     }
 }
 
+/// Rows and authority stamps from the same cached bytes. A missing
+/// completeness stamp cannot establish that an absent model is unavailable.
+struct DecodedModelCatalog: Sendable {
+    let models: [ProviderModelDescriptor]
+    let isComplete: Bool?
+    let fetchedAt: Date?
+}
+
 struct ModelCatalogTTLCache: Sendable {
     /// A cached list older than this is stale on the next read: a live refresh
     /// is attempted, but the stale copy is still served if that refresh fails.
@@ -111,17 +170,10 @@ struct ModelCatalogTTLCache: Sendable {
     var cachePath: @Sendable (URL) -> URL
     /// Source URL stamped into the written cache payload.
     var endpoint: URL
-    /// Decode the on-disk cache into descriptors (`nil` when absent/empty).
-    var readCache: @Sendable (URL) -> [ProviderModelDescriptor]?
-    /// Read the cache's `updated_at` stamp (`nil` when missing/unparseable →
-    /// treated as stale so it refreshes once).
-    var cacheUpdatedAt: @Sendable (URL) -> Date?
+    /// Decode rows and authority stamps together (`nil` when absent/empty).
+    var readCache: @Sendable (URL) -> DecodedModelCatalog?
     /// Fetch the live list; throws on any failure (network/credentials).
-    var fetchLive: @Sendable (URL, URLSession) async throws -> [ProviderModelDescriptor]
-    /// The same fetch, carrying the completeness verdict a pruning caller
-    /// needs (User, 2026-09-06). `nil` for a catalogue that arrives whole or
-    /// not at all — then a successful fetch is complete by construction.
-    var fetchLiveComplete: (@Sendable (URL, URLSession) async throws -> ModelCatalogFetch)?
+    var fetchLive: @Sendable (URL, URLSession) async throws -> ModelCatalogFetch
 
     // R-L5 (a): backoff state keyed per cache-file path. One dict serves both
     // catalogs because the cache filenames differ per provider. S12a: the
@@ -174,8 +226,8 @@ struct ModelCatalogTTLCache: Sendable {
 
     /// True when the cache is missing its `updated_at` stamp or that stamp is
     /// older than `cacheTTL`.
-    func cacheIsStale(dataRoot: URL, now: Date = Date()) -> Bool {
-        guard let updated = cacheUpdatedAt(dataRoot) else { return true }
+    func cacheIsStale(fetchedAt: Date?, now: Date = Date()) -> Bool {
+        guard let updated = fetchedAt else { return true }
         return now.timeIntervalSince(updated) >= cacheTTL
     }
 
@@ -202,8 +254,9 @@ struct ModelCatalogTTLCache: Sendable {
         session: URLSession,
         refresh: Bool
     ) async -> ModelCatalogRead {
-        let cached = readCache(dataRoot).flatMap { $0.isEmpty ? nil : $0 }
-        let fetchedAt = cacheUpdatedAt(dataRoot)
+        let decoded = readCache(dataRoot)
+        let cached = decoded.flatMap { $0.models.isEmpty ? nil : $0.models }
+        let fetchedAt = decoded?.fetchedAt
         if !refresh {
             // A passive read never reaches the network without a cache — the
             // same as before; the list arrives on Refresh or a key save.
@@ -215,12 +268,12 @@ struct ModelCatalogTTLCache: Sendable {
             // The last attempt failed (a success clears the stamp): the list is
             // last-known and says so until a fetch succeeds, fresh TTL or not.
             if let reason = lastFailureReason(dataRoot: dataRoot) {
-                guard cacheIsStale(dataRoot: dataRoot), staleRefreshAllowed(dataRoot: dataRoot) else {
+                guard cacheIsStale(fetchedAt: fetchedAt), staleRefreshAllowed(dataRoot: dataRoot) else {
                     return ModelCatalogRead(
                         models: cached, freshness: .staleAfterFailedRefresh,
                         failure: reason, fetchedAt: fetchedAt)
                 }
-            } else if !cacheIsStale(dataRoot: dataRoot) {
+            } else if !cacheIsStale(fetchedAt: fetchedAt) {
                 return ModelCatalogRead(models: cached, freshness: .cached, fetchedAt: fetchedAt)
             }
             // TTL expired: try to freshen, but never block the caller — serve the
@@ -260,13 +313,7 @@ struct ModelCatalogTTLCache: Sendable {
         session: URLSession
     ) async -> Result<ModelCatalogFetch, FetchFailure> {
         do {
-            let fetched: ModelCatalogFetch
-            if let fetchLiveComplete {
-                fetched = try await fetchLiveComplete(dataRoot, session)
-            } else {
-                fetched = ModelCatalogFetch(
-                    models: try await fetchLive(dataRoot, session), isComplete: true)
-            }
+            let fetched = try await fetchLive(dataRoot, session)
             guard !fetched.models.isEmpty else {
                 return .failure(FetchFailure("the provider returned no models"))
             }

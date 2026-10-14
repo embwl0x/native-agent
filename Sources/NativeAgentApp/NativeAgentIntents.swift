@@ -1,9 +1,8 @@
+import EngineRuntime
 import AppIntents
 import Foundation
 import PersistenceCore
 import NativeAgentCore
-import ChatOrchestration
-import MacControl
 import PersonaEngine
 import Transcripts
 
@@ -29,20 +28,26 @@ struct ResidentAgentQuery: EntityStringQuery {
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
 
     func entities(for identifiers: [String]) async throws -> [ResidentAgentEntity] {
+        try await NativeAgentAppCoordinator.shared.prepare()
         let agent = ResidentAgentEntity.current
         return identifiers.contains(agent.id) ? [agent] : []
     }
 
     func entities(matching string: String) async throws -> [ResidentAgentEntity] {
+        try await NativeAgentAppCoordinator.shared.prepare()
         let agent = ResidentAgentEntity.current
         return agent.name.localizedCaseInsensitiveContains(string) ? [agent] : []
     }
 
     func suggestedEntities() async throws -> [ResidentAgentEntity] {
-        [.current]
+        try await NativeAgentAppCoordinator.shared.prepare()
+        return [.current]
     }
 
-    func defaultResult() async -> ResidentAgentEntity? { .current }
+    func defaultResult() async -> ResidentAgentEntity? {
+        do { try await NativeAgentAppCoordinator.shared.prepare(); return .current }
+        catch { return nil }
+    }
 }
 
 /// The original Ask action stays source- and shortcut-compatible. This action
@@ -67,6 +72,7 @@ struct AskResidentAgentIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
+        try await NativeAgentAppCoordinator.shared.prepare()
         guard agent.id == ResidentAgentEntity.current.id else {
             throw $agent.needsValueError("Choose the resident agent.")
         }
@@ -91,6 +97,7 @@ struct NativeAgentStatusIntent: AppIntent {
     static let openAppWhenRun = false
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
+        try await NativeAgentAppCoordinator.shared.prepare()
         let health = NativeAgentEngine.live.doctor.readHealth()
         let state = health.ok ? "online" : "unavailable"
         if #available(macOS 27, *), systemContext.isVoiceOnly {
@@ -128,40 +135,8 @@ struct NativeAgentChatIntent: AppIntent {
     }
 
     static func reply(to message: String) async throws -> String {
-        // No pick means no pick: an empty model resolves through the chat
-        // surface's Providers group rather than a literal chosen here.
-        let model = UserDefaults.standard.string(forKey: "chatModel") ?? ""
-        let reasoningEffort = UserDefaults.standard.string(forKey: "chatReasoningEffort") ?? "high"
-        let fileAccess = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"
-        // Siri continues the conversation User is in, at whichever door he last
-        // spoke; with none yet, this ask starts one. Either way it is now the
-        // conversation he is in.
-        let sessionID = try SwiftNativeChatOrchestrationClient.resolveSessionId(
-            ConversationAnchor.currentSessionId() ?? UUID().uuidString
-        )
-        _ = try? await ConversationAnchor.publish(
-            sessionId: sessionID, source: "siri", conversationKind: .direct
-        )
-        // Where User was when he said "take over", before the session queue.
-        let takeover = await MacWorkContinuation.admit(message)
-        let reply = try await MacWorkContinuation.$current.withValue(takeover) {
-            try await TurnAdmission.shared.run(sessionID: sessionID) {
-                try await TurnRequest(
-                    message: message,
-                    sessionID: sessionID,
-                    model: model,
-                    reasoningEffort: reasoningEffort,
-                    fileAccess: fileAccess,
-                    attachments: [],
-                    persona: nil,
-                    surface: "chat",
-                    suppressUserAppend: false,
-                    replacementAssistantMessageID: nil,
-                    serviceTier: NativeChatTurnOptions.current(surface: "chat").serviceTier
-                ).chat(on: NativeAgentEngine.live.chatClient(profile: .mac))
-            }
-        }
-        return reply.output
+        try await NativeAgentAppCoordinator.shared.prepare()
+        return try await NativeAgentEngine.live.replyToIntent(message)
     }
 }
 
@@ -180,7 +155,8 @@ struct NativeAgentDoctorIntent: AppIntent {
     static let openAppWhenRun = true
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let report = try await AppDoctorPort(dataRoot: PersistenceCore.defaultDataRoot()).runDoctor()
+        try await NativeAgentAppCoordinator.shared.prepare()
+        let report = try await AppDoctorPort(dataRoot: PersistenceCore.defaultDataRoot()).runtime.runDoctor()
         return .result(dialog: "Doctor finished with status \(report.status). \(report.checks.count) checks ran.")
     }
 }
@@ -204,7 +180,8 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let task = try await BackgroundLoopsAssembly.submitDeskTask(title: title, objective: objective).execution
+        try await NativeAgentAppCoordinator.shared.prepare()
+        let task = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective).execution
         return .result(dialog: "Desk task created: \(task.title).")
     }
 }
@@ -222,6 +199,7 @@ struct NativeAgentApprovalsIntent: AppIntent {
     static let openAppWhenRun = true
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
+        try await NativeAgentAppCoordinator.shared.prepare()
         let approvals = try await NativeAgentEngine.live.approvals.list()
         let pending = approvals.filter { $0.status == "pending" }.count
         return .result(dialog: "\(pending) NativeAgent approval\(pending == 1 ? "" : "s") pending.")

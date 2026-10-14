@@ -31,25 +31,6 @@ enum KnowledgeGraphPresentation {
         return .content
     }
 
-    static func matches(
-        query: String,
-        name: String,
-        type: String,
-        summary: String?,
-        aliases: [String]?
-    ) -> Bool {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return true }
-        return name.localizedCaseInsensitiveContains(needle)
-            || type.localizedCaseInsensitiveContains(needle)
-            || (summary?.localizedCaseInsensitiveContains(needle) ?? false)
-            || (aliases?.contains { $0.localizedCaseInsensitiveContains(needle) } ?? false)
-    }
-
-    static func bounded<T>(_ values: [T], maximum: Int) -> [T] {
-        Array(values.prefix(max(0, maximum)))
-    }
-
     static func entityCountHeader(visibleCount: Int) -> String {
         let count = max(0, visibleCount)
         return count == 1 ? "1 entity" : "\(count) entities"
@@ -114,7 +95,7 @@ enum KnowledgeGraphDetailNeighborsPresentation {
 // We retain both decoders during migration. Either way we expose a normalized
 // `entities: [KGEntity]` array so
 // the SwiftUI view doesn't have to know which path was taken.
-struct KGEntityResponse: Decodable {
+struct KGEntityResponse: Decodable, Equatable, Sendable {
     var entities: [KGEntity]
     var edges: [KGEdge]
     var total: Int
@@ -173,7 +154,7 @@ struct KGEntityResponse: Decodable {
     }
 }
 
-struct KGEntity: Decodable, Identifiable {
+struct KGEntity: Decodable, Identifiable, Equatable, Sendable {
     var id: String
     var name: String
     var type: String
@@ -222,13 +203,13 @@ struct KGEntity: Decodable, Identifiable {
     }
 }
 
-private struct KGNeighborsResponse: Decodable {
+private struct KGNeighborsResponse: Sendable {
     var entity: KGEntity?
     var edges: [KGEdge]
     var neighbors: [String: KGEntity]
 }
 
-struct KGEdge: Decodable, Identifiable {
+struct KGEdge: Decodable, Identifiable, Equatable, Sendable {
     var id: String { "\(from)-\(to)-\(kind)" }
     var from: String
     var to: String
@@ -244,44 +225,28 @@ struct KGEdge: Decodable, Identifiable {
     }
 }
 
-private struct KGSearchResponse: Decodable {
-    var results: [KGEntity]
-}
-
 // MARK: - Store
 
 @MainActor
 private final class KGStore: ObservableObject {
-    @Published var entities: [KGEntity] = []
-    @Published var total: Int = 0
+    @Published private(set) var snapshot: KGEntityResponse?
+    var entities: [KGEntity] { snapshot?.entities ?? [] }
+    var total: Int { snapshot?.total ?? 0 }
     @Published var isLoading = false
     @Published var bannerError: String?
     /// This is deliberately separate from `bannerError`: a quiet initial
     /// launch has neither an error nor a Mac-published projection.
-    @Published private(set) var hasPublishedSnapshot = false
-    private var cachedSnapshot: KGEntityResponse?
-    private(set) var snapshotReadCount = 0
+    var hasPublishedSnapshot: Bool { snapshot != nil }
     static let maxSearchResults = 200
 
-    private func snapshot(forceReload: Bool) async -> KGEntityResponse? {
-        if !forceReload, let cachedSnapshot { return cachedSnapshot }
-        snapshotReadCount += 1
-        let loaded: KGEntityResponse? = await iCloudSyncEngine.shared.loadSnapshotObjectAsync(named: "knowledge_graph.json")
-        if let loaded {
-            cachedSnapshot = loaded
-            hasPublishedSnapshot = true
-        }
-        return loaded
-    }
-
-    func refresh(client: MacBridgeClient) async {
+    func refresh() async {
         isLoading = true
         defer { isLoading = false }
-        let _ = client
-        if let resp = await snapshot(forceReload: true) {
-            withAnimation(AppMotion.snappy) {
-                entities = resp.entities
-                total = resp.total
+        if let resp: KGEntityResponse = await iCloudSyncEngine.shared.loadSnapshotObjectAsync(named: "knowledge_graph.json") {
+            if snapshot != resp {
+                withAnimation(AppMotion.snappy) {
+                    snapshot = resp
+                }
             }
             bannerError = nil
         } else {
@@ -294,30 +259,21 @@ private final class KGStore: ObservableObject {
 // MARK: - KnowledgeGraphView
 
 struct KnowledgeGraphView: View {
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @ObservedObject private var syncEngine = iCloudSyncEngine.shared
+    private let syncEngine = iCloudSyncEngine.shared
     @StateObject private var store = KGStore()
     @State private var searchText = ""
+    @State private var searchIndex = MobileSearchIndex<KGEntity>()
+    @State private var searchResults: [KGEntity] = []
     @State private var selectedEntity: KGEntity?
 
     private var displayEntities: [KGEntity] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return MobileDesignSamples.rows(store.entities) }
-        return KnowledgeGraphPresentation.bounded(
-            store.entities.filter { entity in
-                KnowledgeGraphPresentation.matches(
-                    query: query,
-                    name: entity.name,
-                    type: entity.type,
-                    summary: entity.summary,
-                    aliases: entity.aliases
-                )
-            },
-            maximum: KGStore.maxSearchResults
-        )
+        return searchResults
     }
 
     var body: some View {
+        let displayEntities = displayEntities
         ZStack(alignment: .top) {
             List {
                 // E6: freshness of the Mac snapshot behind this graph, under the door.
@@ -392,10 +348,18 @@ struct KnowledgeGraphView: View {
                 }
             }
             .listStyle(.plain)
-            .refreshable { await store.refresh(client: bridgeClient) }
-            .task { await store.refresh(client: bridgeClient) }
-            .onChange(of: syncEngine.lastSyncAt) { _, _ in
-                Task { await store.refresh(client: bridgeClient) }
+            .task(id: MobileSearchInput(rows: store.entities, query: searchText)) {
+                let input = MobileSearchInput(rows: store.entities, query: searchText.trimmingCharacters(in: .whitespacesAndNewlines))
+                let result = await searchIndex.search(input, maximum: KGStore.maxSearchResults,
+                    fields: { [$0.name, $0.type, $0.summary ?? ""] + ($0.aliases ?? []) },
+                    matches: { $0.localizedCaseInsensitiveContains($1) })
+                guard !Task.isCancelled else { return }
+                searchResults = result
+            }
+            .refreshable { await store.refresh() }
+            .task { await store.refresh() }
+            .onChange(of: syncEngine.pageSnapshotVersions["knowledge_graph.json"]) { _, _ in
+                Task { await store.refresh() }
             }
 
         }
@@ -414,8 +378,7 @@ struct KnowledgeGraphView: View {
         }
         .macSyncErrorBanner()
         .sheet(item: $selectedEntity) { entity in
-            KGEntityDetailSheet(entity: entity)
-                .environmentObject(bridgeClient)
+            KGEntityDetailSheet(entity: entity, store: store)
         }
     }
 }
@@ -460,6 +423,7 @@ private struct KGEntityRowCell: View {
 
 private struct KGEntityDetailSheet: View {
     let entity: KGEntity
+    @ObservedObject var store: KGStore
     @State private var neighbors: KGNeighborsResponse?
     @State private var isLoading = false
     @State private var loadError: String?
@@ -468,7 +432,7 @@ private struct KGEntityDetailSheet: View {
 
     var body: some View {
         let meta = KGEntityMeta.presentation(for: entity.type)
-        NavigationStack {
+        return NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     // Header card
@@ -557,43 +521,40 @@ private struct KGEntityDetailSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .task { await loadNeighbors() }
+            .task(id: store.snapshot) { await loadNeighbors() }
         }
     }
 
     private func loadNeighbors() async {
         isLoading = true
-        defer { isLoading = false }
+        defer { if !Task.isCancelled { isLoading = false } }
         loadError = nil
         loadUnavailableReason = nil
-        let snapshot: KGEntityResponse? = await iCloudSyncEngine.shared
-            .loadSnapshotObjectAsync(named: "knowledge_graph.json")
-        guard let snapshot else {
+        guard let snapshot = store.snapshot else {
             let reason: KnowledgeGraphDetailNeighborsPresentation.UnavailableReason = .snapshotStillDownloading
             loadUnavailableReason = reason
             loadError = KnowledgeGraphDetailNeighborsPresentation.message(for: reason)
             return
         }
-        guard let match = snapshot.entities.first(where: { $0.id == entity.id }) else {
+        let entityID = entity.id
+        let projected = await Task.detached(priority: .userInitiated) {
+            guard let match = snapshot.entities.first(where: { $0.id == entityID }) else { return nil as KGNeighborsResponse? }
+            let incidentEdges = snapshot.edges.filter { $0.from == entityID || $0.to == entityID }
+            let neighborIDs = Set(incidentEdges.flatMap { [$0.from, $0.to] }).subtracting([entityID])
+            let neighborMap = Dictionary(snapshot.entities
+                .filter { neighborIDs.contains($0.id) }
+                .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            return KGNeighborsResponse(entity: match, edges: incidentEdges, neighbors: neighborMap)
+        }.value
+        guard !Task.isCancelled, store.snapshot == snapshot else { return }
+        guard let projected else {
             let reason: KnowledgeGraphDetailNeighborsPresentation.UnavailableReason = .entityNoLongerPublished
             loadUnavailableReason = reason
             loadError = KnowledgeGraphDetailNeighborsPresentation.message(for: reason)
             return
         }
 
-        let incidentEdges = snapshot.edges.filter {
-            $0.from == entity.id || $0.to == entity.id
-        }
-        let neighborIDs = Set(incidentEdges.flatMap { [$0.from, $0.to] })
-            .subtracting([entity.id])
-        let neighborMap = Dictionary(snapshot.entities
-            .filter { neighborIDs.contains($0.id) }
-            .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        neighbors = KGNeighborsResponse(
-            entity: match,
-            edges: incidentEdges,
-            neighbors: neighborMap
-        )
+        neighbors = projected
         loadError = nil
     }
 }
@@ -656,10 +617,6 @@ enum KGEntityMeta {
         let isKnown: Bool
     }
 
-    static let knownTypes = [
-        "person", "organization", "project", "concept", "place", "event", "tool", "fact",
-    ]
-
     static func presentation(for rawType: String) -> Presentation {
         switch rawType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "person":
@@ -683,29 +640,5 @@ enum KGEntityMeta {
             let label = cleanType.isEmpty ? "Type unavailable" : "Unrecognized type: \(cleanType)"
             return .init(label: label, icon: "questionmark.circle", color: .orange, isKnown: false)
         }
-    }
-}
-
-// MARK: - Shared banner helper (private — ApprovalsView has its own)
-
-private struct BannerRow: View {
-    enum Style { case error, warning }
-    let message: String
-    let style: Style
-
-    private var bgColor: Color { style == .error ? .red.opacity(0.85) : .orange.opacity(0.85) }
-    private var icon: String { style == .error ? "wifi.slash" : "exclamationmark.triangle" }
-
-    var body: some View {
-        MobileAdaptiveRow(spacing: 8) {
-            Image(systemName: icon).font(.caption.weight(.semibold))
-            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(bgColor)
-        .ignoresSafeArea(edges: .horizontal)
     }
 }

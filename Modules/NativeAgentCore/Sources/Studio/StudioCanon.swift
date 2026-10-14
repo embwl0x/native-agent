@@ -465,13 +465,6 @@ public enum StudioCanonSeat {
     /// calls `studio_canon_resolve` during a turn.
     public static let agent = "studio_agent"
 
-    /// Owner surfaces, named explicitly so the refusal reads as a decision
-    /// rather than a fallback. Every other seat is refused too — this list is
-    /// documentation, not the gate.
-    public static let ownerSeats: Set<String> = [
-        "mac_ui", "local_desk_click", "full_mac_yolo", "ios_signed_operator", "mac_operator",
-    ]
-
     public static func isAgent(_ decidedBy: String?) -> Bool {
         (decidedBy ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == agent
     }
@@ -640,15 +633,10 @@ public extension SwiftNativeStudioStore {
                 if case .object(let row)? = table[key], case .int(let existing)? = row["count"] {
                     count = existing
                 }
-                var row: [String: JSONValue] = [
+                let row: [String: JSONValue] = [
                     "count": .int(count + 1),
                     "last_at": .string(stamp),
-                    "title": .string(String(cleaned.prefix(200))),
                 ]
-                if let creator = entry.creator?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !creator.isEmpty {
-                    row["creator"] = .string(String(creator.prefix(160)))
-                }
                 table[key] = .object(row)
             }
             if table.count > maximumTrackedWorks {
@@ -668,7 +656,7 @@ public extension SwiftNativeStudioStore {
                 )
             }
             try await core.writeJSON(
-                .object(["updated_at": .string(stamp), "works": .object(table)]),
+                .object(["works": .object(table)]),
                 to: path
             )
         }

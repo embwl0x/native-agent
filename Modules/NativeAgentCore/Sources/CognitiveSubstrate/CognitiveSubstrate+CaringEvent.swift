@@ -125,18 +125,6 @@ extension CognitiveSubstrate {
         needMetPhrases + caredForPhrases + roomMadePhrases
     }
 
-    /// The appraisal's own warmth term for `text`. Public because the DEBUG
-    /// tenderness replay has to reconstruct the warmth series the old law
-    /// integrated, and `AffectAppraisal` itself is internal.
-    public nonisolated func conversationalAppraisalWarmth(in text: String) -> Double {
-        conversationalAppraisal(in: text).warmth
-    }
-
-    /// The relational warmth boost for `text`. Public for the same replay.
-    public nonisolated func relationalWarmthBoostValue(in text: String) -> Double {
-        relationalWarmthBoost(in: text)
-    }
-
     // MARK: - The seam
 
     /// Install the model appraiser. Without one nothing ever doses, which is the
@@ -195,7 +183,7 @@ extension CognitiveSubstrate {
     /// `ChatOrchestrationClient`), with different event ids and the same subject.
     /// Keyed on the event id instead, one caring moment would dose twice.
     func caringEventCandidate(for event: CognitiveEvent) -> CaringAppraisalRequest? {
-        guard configuration.enabled, configuration.affectEnabled else { return nil }
+        guard configuration.enabled else { return nil }
         guard Self.isUserAuthored(event.kind) else { return nil }
         guard event.turnKind.contributesToLivedState else { return nil }
         let relayed: Bool
@@ -354,7 +342,7 @@ extension CognitiveSubstrate {
                       && $0.context.generation == context.generation
               }) else { return nil }
         let deferred = deferredTurns.remove(at: index)
-        guard configuration.enabled, configuration.affectEnabled, let appraisal else { return nil }
+        guard configuration.enabled, let appraisal else { return nil }
         var weighted = appraisal
         let weight = Self.relationalSource(for: context.event).appraisalWeight
         weighted.valence *= weight

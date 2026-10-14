@@ -26,9 +26,16 @@ extension SwiftToolDispatcher {
 
     static func senseFileMaterial(_ result: JSONValue) throws -> SenseMaterial {
         guard case .object(let fields) = result, fields["ok"] == .bool(true),
-              case .string(let path)? = fields["path"], case .int(let bytes)? = fields["bytes"] else {
+              case .string(let path)? = fields["path"], case .string(let content)? = fields["content"] else {
             throw SenseFailure(code: "source_unavailable", message: "The original file reader did not admit this file.")
         }
-        return .file(path: path, bytes: Int(bytes))
+        let data: Data
+        if fields["encoding"] == .string("base64") {
+            guard let decoded = Data(base64Encoded: content) else {
+                throw SenseFailure(code: "source_unavailable", message: "The file reader returned invalid base64 material.")
+            }
+            data = decoded
+        } else { data = Data(content.utf8) }
+        return .file(path: path, bytes: data.count, data: data)
     }
 }

@@ -194,36 +194,15 @@ public struct CapabilityFoundryResult: Sendable, Equatable {
         self.createdAt = createdAt
     }
 
-    public func toJSON() -> JSONValue {
-        .object([
-            "status": .string(status),
-            "detail": .string(detail),
-            "principle": .string(principle),
-            "hotPathContract": hotPathContract.toJSON(),
-            "summary": summary.toJSON(),
-            "lanes": .array(lanes.map { $0.toJSON() }),
-            "reviewQueue": .array(reviewQueue),
-            "recentArtifacts": .array(recentArtifacts),
-            "readouts": .array(readouts.map { $0.toJSON() }),
-            "createdAt": .string(createdAt),
-        ])
-    }
-
     /// Mirrors `SystemOps.isoTimestamp` / the daemon's `now_iso()` convention.
     public static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
 }
 
-// MARK: - Client protocol
-
-public protocol CapabilityFoundryClient: Sendable {
-    func capabilityFoundrySummary() async throws -> CapabilityFoundryResult
-}
-
 // MARK: - SwiftNative impl (PARTIAL native aggregation)
 
-public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
+public struct SwiftNativeCapabilityFoundryClient: Sendable {
     private let now: @Sendable () -> Date
     private let root: URL
 
@@ -241,8 +220,7 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         // static stub claimed status "ready" with 7 zeroed lanes — an
         // all-green lie. Now: lane counts that are cheaply countable from
         // on-disk stores this module can reach are REAL —
-        //   skill    → <root>/skills/registry.json      (entry count)
-        //   tool     → <root>/tools/registry.json       (status=="active")
+        //   skill/tool → <root>/abilities/             (file scan)
         //   workflow → <root>/workflows/registry.json   (definition count)
         //   mcp      → <root>/mcp/servers.json          (entry count)
         // 2026-08-02 (E-1): lanes with no native source (panel/plugin/catalog)
@@ -253,7 +231,7 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         // a `detail` naming exactly what is and isn't wired. The review queues +
         // the side-effecting backlog tick remain unported (see file header);
         // their envelope fields stay empty and nothing renders them.
-        let skillEntries = try Self.checkedEntries(store: "skills/registry.json") {
+        let skillEntries = try Self.checkedEntries(store: "abilities") {
             try InstalledSkillInventory.entries(dataRoot: root).map { .object($0.row) }
         }
         let toolEntries = try ToolRegistryActions.entries(dataRoot: root)
@@ -307,8 +285,8 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         //     name the Swift-native store the count actually comes from;
         //     unwired lanes carry no endpoint rather than a dead route.
         let lanes: [CapabilityFoundryLane] = [
-            CapabilityFoundryLane(id: "skill", title: "Skills", status: "ready", count: skillCount, reviewCount: 0, endpoint: "native:skills/registry.json", policyGate: "skillBuilderPolicy.v2_enabled", hotPath: "manifest_only"),
-            CapabilityFoundryLane(id: "tool", title: "Tools", status: "ready", count: toolEntries.count, reviewCount: 0, endpoint: "native:tools/registry.json", policyGate: "signed_manifest_and_validation", hotPath: "summary_only_until_matched"),
+            CapabilityFoundryLane(id: "skill", title: "Skills", status: "ready", count: skillCount, reviewCount: 0, endpoint: "native:abilities", policyGate: "skillBuilderPolicy.v2_enabled", hotPath: "manifest_only"),
+            CapabilityFoundryLane(id: "tool", title: "Tools", status: "ready", count: toolEntries.count, reviewCount: 0, endpoint: "native:abilities", policyGate: "signed_manifest_and_validation", hotPath: "summary_only_until_matched"),
             CapabilityFoundryLane(id: "workflow", title: "Retained workflow definitions", status: "retained", count: workflowCount, reviewCount: 0, endpoint: "native:workflows/registry.json", policyGate: "execution_retired", hotPath: "definitions_only"),
             CapabilityFoundryLane(id: "mcp", title: "MCP Servers", status: "ready", count: mcpCount, reviewCount: 0, endpoint: "native:mcp/servers.json", policyGate: "consent_ledger", hotPath: "server_manifest_only"),
             // REMOVED 2026-08-02 (E-1): the panel / plugin / catalog lanes.
@@ -387,13 +365,4 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         }
         return nil
     }
-}
-
-// MARK: - Factory
-
-public func makeCapabilityFoundryClient(
-    now: @escaping @Sendable () -> Date = { Date() },
-    root: URL = PersistenceCore.defaultDataRoot()
-) -> any CapabilityFoundryClient {
-    return SwiftNativeCapabilityFoundryClient(now: now, root: root)
 }

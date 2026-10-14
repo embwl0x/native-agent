@@ -5,122 +5,6 @@ import TelegramBot
 import TriggerScheduler
 
 extension SchedulerDueJobRunner {
-    static func upsertDefaultCycleJob(
-        rows: inout [JSONValue],
-        id: String,
-        legacyNames: Set<String>,
-        name: String,
-        kind: String,
-        intervalSeconds: Int,
-        schedule: [String: JSONValue],
-        objective: String,
-        extraPayload: [String: JSONValue],
-        nextRunEpoch: Double,
-        now: Date,
-        reactivateCancelled: Bool = false
-    ) -> Bool {
-        let matchIndex = rows.firstIndex { row in
-            guard case .object(let obj) = row else { return false }
-            let rowID = SchedulerJobRuntime.string(obj["id"]) ?? ""
-            if rowID == id { return true }
-            let rowKind = (SchedulerJobRuntime.string(obj["kind"]) ?? "").lowercased()
-            let rowName = (SchedulerJobRuntime.string(obj["name"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return rowKind == kind && legacyNames.contains(rowName)
-        }
-
-        var existing: [String: JSONValue] = [:]
-        if let matchIndex, case .object(let obj) = rows[matchIndex] {
-            existing = obj
-        }
-
-        // 2026-07-21 audit fix: a user-cancelled default job STAYS cancelled.
-        // cancelJob() stamps enabled=false + cancelledAt; before this guard the
-        // upsert below forced enabled=true, silently resurrecting the job on
-        // the next due-job pass.
-        //
-        // 2026-07-23 audit fix (F3-M1): the PASSIVE bootstrap pass must honor
-        // that tombstone, but an EXPLICIT user re-enable action (createDreamJob
-        // → ensureDefaultCycleJobs(reactivateCancelled: true)) must be able to
-        // clear it — otherwise, once cancelled, the job could never be
-        // re-created because cancelledAt is never stripped anywhere. Only the
-        // explicit path passes reactivateCancelled; the passive due-job pass
-        // keeps it false and still no-ops on a cancelled row.
-        let isCancelledTombstone = existing["cancelledAt"] != nil
-            && existing["enabled"] == .bool(false)
-        // Pauses survive bootstrap; only setJobEnabled resumes them.
-        let isPaused = existing["pausedAt"] != nil
-            && existing["enabled"] == .bool(false)
-        if isPaused || (isCancelledTombstone && !reactivateCancelled) {
-            return false
-        }
-
-        // 2026-07-21 audit fix: preserve an EARLIER existing nextRunAt (e.g. a
-        // 15-minute retryAfterSeconds retry stamped by update(job:), or an
-        // overdue catch-up) instead of stomping it with the recomputed
-        // schedule — previously the very next ensureDefaultCycleJobs pass
-        // rewrote a pending dream retry to tomorrow 03:30 and the "retry
-        // scheduled in 15 minutes" receipt was a lie. A LATER existing stamp
-        // still yields to the freshly computed schedule.
-        //
-        // A pending retry is a floor: catch-up may never pull a job earlier
-        // than the backoff chosen by the bounded retry policy.
-        //
-        // A CHANGED schedule invalidates the stamp that was computed from the
-        // old one. The nightly dream fires on the machine's own zone, so a row
-        // written on another clock (or before the person moved) carries a
-        // nextRunAt from a schedule this job no longer keeps — and the min()
-        // below would have held it at that old firing time for one more run.
-        // The pending-retry floor above still wins: a backoff is not a
-        // schedule.
-        let scheduleChanged = existing["schedule"] != nil
-            && existing["schedule"] != .object(schedule)
-        let effectiveNextRunEpoch: Double = {
-            if let pendingRetry = SchedulerJobRuntime.epoch(from: existing["retryPendingUntilEpoch"]),
-               pendingRetry.isFinite,
-               pendingRetry > now.timeIntervalSince1970 {
-                return pendingRetry
-            }
-            guard !scheduleChanged else { return nextRunEpoch }
-            guard let existingEpoch = SchedulerJobRuntime.epoch(from: existing["nextRunAtEpoch"] ?? existing["nextRunAt"]) else {
-                return nextRunEpoch
-            }
-            return min(existingEpoch, nextRunEpoch)
-        }()
-
-        var next = existing
-        // Explicit reactivation strips the cancellation tombstone; the upsert
-        // already forces enabled=true below, so re-enable + un-cancel land
-        // together. (cancelJob stamps only enabled=false + cancelledAt.)
-        if isCancelledTombstone, reactivateCancelled {
-            next.removeValue(forKey: "cancelledAt")
-        }
-        next["id"] = .string(id)
-        next["name"] = .string(name)
-        next["kind"] = .string(kind)
-        next["intervalSeconds"] = .int(Int64(intervalSeconds))
-        next["enabled"] = .bool(true)
-        next["oneShot"] = .bool(false)
-        next["schedule"] = .object(schedule)
-        var payload = extraPayload
-        payload["objective"] = .string(objective)
-        next["payload"] = .object(payload)
-        next["createdBy"] = existing["createdBy"] ?? .string("nativeagent_bootstrap")
-        next["createdAt"] = existing["createdAt"] ?? .string(iso(now))
-        next["nextRunAt"] = .string(SchedulerJobRuntime.floatString(effectiveNextRunEpoch))
-        next["nextRunAtEpoch"] = .int(Int64(effectiveNextRunEpoch))
-        next["nextRunAtISO"] = .string(SchedulerJobRuntime.decorationISO(epoch: effectiveNextRunEpoch))
-        if existing["lastRunAt"] == nil { next["lastRunAt"] = .null }
-
-        let nextValue = JSONValue.object(next)
-        if let matchIndex {
-            if rows[matchIndex] == nextValue { return false }
-            rows[matchIndex] = nextValue
-        } else {
-            rows.append(nextValue)
-        }
-        return true
-    }
-
     /// Keep recent one-shot completion and unknown-outcome history for review.
     static let oneShotRetentionSeconds: Double = 7 * 86_400
 
@@ -183,8 +67,7 @@ extension SchedulerDueJobRunner {
 
     static func nextEpoch(
         schedule: [String: JSONValue],
-        now: Date,
-        fallbackInterval: TimeInterval
+        now: Date
     ) throws -> Double {
         let job: JSONValue = .object([
             "oneShot": .bool(false),
@@ -194,7 +77,7 @@ extension SchedulerDueJobRunner {
             for: job,
             afterEpoch: now.timeIntervalSince1970,
             now: { now }
-        ) ?? now.addingTimeInterval(fallbackInterval).timeIntervalSince1970
+        )!
     }
 
     static func containsLastRunToday(rows: [JSONValue], kind: String, dateKey: String, includingFailed: Bool = false) -> Bool {
@@ -372,37 +255,6 @@ extension SchedulerDueJobRunner {
             || text.contains("unparseable llm response")
     }
 
-    static func retryEpoch(from output: JSONValue, runDate: Date) -> Double? {
-        guard case .object(let obj) = output else { return nil }
-        if let explicit = SchedulerJobRuntime.epoch(from: obj["retryAtEpoch"] ?? obj["retry_at_epoch"]) {
-            return max(explicit, runDate.addingTimeInterval(60).timeIntervalSince1970)
-        }
-        let after = SchedulerJobRuntime.int(
-            obj["retryAfterSeconds"] ?? obj["retry_after_seconds"],
-            default: 0
-        )
-        guard after > 0 else { return nil }
-        return runDate.addingTimeInterval(Double(max(60, after))).timeIntervalSince1970
-    }
-
-    // MARK: - FIX 2 (A4.4): retry count + exponential backoff + daily cap.
-
-    /// Consecutive retryable failures a job may accrue in a single day before
-    /// it is PARKED (stops retrying, reschedules to its next natural run, and
-    /// leaves a receipt) instead of retrying forever at the 60s due-floor.
-    static let maxRetryAttemptsPerDay = 6
-
-    /// Exponential backoff carried by the retry stamp: 15m → 30m → 60m (cap).
-    /// The stamp itself is the backoff carrier — FIX 1's floor keeps the
-    /// catch-up path from collapsing it.
-    static func retryBackoffSeconds(attempt: Int) -> Int {
-        switch attempt {
-        case ..<2: return 15 * 60
-        case 2: return 30 * 60
-        default: return 60 * 60
-        }
-    }
-
     /// A default cycle job parked (retry cap reached) on `dateKey`. While
     /// parked for the day the catch-up path must stay disarmed.
     static func containsRetryParkedToday(rows: [JSONValue], kind: String, dateKey: String) -> Bool {
@@ -412,22 +264,6 @@ extension SchedulerDueJobRunner {
             guard rowKind == kind else { return false }
             return SchedulerJobRuntime.string(obj["retryParkedDateKey"]) == dateKey
         }
-    }
-
-    /// Stamp the canonical next-run trio on a job row.
-    static func stampNextRun(_ obj: inout [String: JSONValue], epoch: Double) {
-        obj["nextRunAt"] = .string(SchedulerJobRuntime.floatString(epoch))
-        obj["nextRunAtEpoch"] = .int(Int64(epoch))
-        obj["nextRunAtISO"] = .string(SchedulerJobRuntime.decorationISO(epoch: epoch))
-    }
-
-    /// Clear all retry/park bookkeeping — called on any successful or normally
-    /// rescheduled run so the backoff self-heals once the outage clears.
-    static func clearRetryState(_ obj: inout [String: JSONValue]) {
-        obj.removeValue(forKey: "retryCount")
-        obj.removeValue(forKey: "retryDayKey")
-        obj.removeValue(forKey: "retryPendingUntilEpoch")
-        obj.removeValue(forKey: "retryParkedDateKey")
     }
 
     static func remInboxMessage(
@@ -469,13 +305,7 @@ extension SchedulerDueJobRunner {
     }
 
     static func parseISODate(_ raw: String) -> Date? {
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFraction.date(from: raw) { return date }
-        let withoutFraction = ISO8601DateFormatter()
-        withoutFraction.formatOptions = [.withInternetDateTime]
-        if let date = withoutFraction.date(from: raw) { return date }
-        return nil
+        NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     static func anyInt(_ value: Any?) -> Int {

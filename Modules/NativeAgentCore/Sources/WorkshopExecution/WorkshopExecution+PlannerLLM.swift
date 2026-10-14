@@ -202,10 +202,6 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         )
     }
 
-    /// Narrow test seam for the root-confinement invariant. It exposes no
-    /// credential or prompt content.
-    public var _testRunLedgerDataRoot: URL? { runLedgerDataRoot }
-
     public func availableConnectorActions() async -> [JSONValue] {
         await connectorActionsProvider()
     }
@@ -356,7 +352,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
 public func makeWorkshopRunner(
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
-) -> any WorkshopRunnerClient {
+) -> SwiftNativeWorkshopRunner {
     return SwiftNativeWorkshopRunner(
         root: dataRoot,
         planner: SwiftNativeWorkshopPlannerLLM(

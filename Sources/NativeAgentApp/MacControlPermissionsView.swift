@@ -1,3 +1,4 @@
+import MacIntegration
 import AppToolRuntime
 // PATCH-2026-05-07: mac-control-ui-1 Mac Control Permissions panel — master toggle + category toggles + audit log
 import AppKit
@@ -236,14 +237,7 @@ enum MacControlAuditLogRead: Sendable {
 
 // MARK: - MacControlPermissionsView
 
-private enum MacIntegrationPreset: String, Identifiable {
-    case off
-    case watch
-    case assistant
-    case full
-
-    var id: String { rawValue }
-
+extension MacIntegrationPreset {
     var title: String {
         switch self {
         case .off: return "Off"
@@ -786,20 +780,7 @@ struct MacControlPermissionsView: View {
     // MARK: - Logic
 
     private var activePreset: MacIntegrationPreset {
-        activePreset(for: policy)
-    }
-
-    private func activePreset(for policy: TrustMacControlPolicy) -> MacIntegrationPreset {
-        if policy.enabled == false {
-            return .off
-        }
-        if policy.shellAllowed && policy.fileOpsAllowed && policy.accessibilityAllowed && policy.approvalRequiredFor.isEmpty {
-            return .full
-        }
-        if policy.fileOpsAllowed || policy.shellAllowed || policy.systemControlAllowed || policy.accessibilityAllowed || policy.applesScriptAllowed || policy.jxaAllowed {
-            return .assistant
-        }
-        return .watch
+        TrustAccessModeCapabilityCatalog.macIntegrationPreset(for: policy)
     }
 
     private var setupBadges: MacControlSetupStatusBadges.State {
@@ -1155,100 +1136,6 @@ private struct MacControlAuditSheet: View {
 
 // MARK: - Live Workbench
 
-enum MacControlWorkbenchAvailability: Equatable {
-    case ready
-    case disabled(String)
-    case unavailable(String)
-
-    var isEnabled: Bool {
-        if case .ready = self { return true }
-        return false
-    }
-
-    var message: String? {
-        switch self {
-        case .ready:
-            nil
-        case .disabled(let message), .unavailable(let message):
-            message
-        }
-    }
-
-    var isUnavailable: Bool {
-        if case .unavailable = self { return true }
-        return false
-    }
-}
-
-/// The only action routes the mounted workbench can invoke. Keeping route,
-/// native action name, policy gate, and user-facing label together prevents a
-/// button from quietly drifting onto an unsupported 501 action.
-enum MacControlWorkbenchAction: String, CaseIterable {
-    case shell
-    case fileRead = "file/read"
-    case fileWrite = "file/write"
-    case notify
-
-    var title: String {
-        switch self {
-        case .shell: "Run Shell"
-        case .fileRead: "Read File"
-        case .fileWrite: "Write File"
-        case .notify: "Notify"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .shell: "terminal"
-        case .fileRead: "doc.text.magnifyingglass"
-        case .fileWrite: "square.and.pencil"
-        case .notify: "bell"
-        }
-    }
-
-    var path: String { "/v1/mac_control/\(rawValue)" }
-
-    func availability(
-        policy: TrustMacControlPolicy,
-        policySaved: Bool,
-        hasRequiredInput: Bool = true
-    ) -> MacControlWorkbenchAvailability {
-        guard !macControlUnsupportedActions.contains(rawValue) else {
-            return .unavailable("This version of NativeAgent does not support this action.")
-        }
-        guard policySaved else {
-            return .disabled("Save your Mac Control permissions before trying an action.")
-        }
-        guard policy.enabled else {
-            return .disabled("Turn on Mac Control before using this action.")
-        }
-        guard categoryAllowed(by: policy) else {
-            return .disabled("Enable \(categoryName) in Mac Control categories first.")
-        }
-        guard hasRequiredInput else {
-            return .disabled("Enter the required input before running this action.")
-        }
-        return .ready
-    }
-
-    private var categoryName: String {
-        switch self {
-        case .shell: "Terminal commands"
-        case .fileRead, .fileWrite: "File Operations"
-        case .notify: "Notifications"
-        }
-    }
-
-    private func categoryAllowed(by policy: TrustMacControlPolicy) -> Bool {
-        switch self {
-        case .shell: policy.shellAllowed
-        case .fileRead, .fileWrite: policy.fileOpsAllowed
-        case .notify: policy.notificationsAllowed
-        }
-    }
-}
-
 private enum MacControlWorkbenchMode: String, CaseIterable, Identifiable {
     case shell = "Shell"
     case files = "Files"
@@ -1479,4 +1366,25 @@ struct MacControlWorkbenchView: View {
         else { return nil }
         return String(data: data, encoding: .utf8)
     }
+}
+
+extension MacControlWorkbenchAction {
+    var title: String {
+        switch self {
+        case .shell: "Run Shell"
+        case .fileRead: "Read File"
+        case .fileWrite: "Write File"
+        case .notify: "Notify"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .shell: "terminal"
+        case .fileRead: "doc.text.magnifyingglass"
+        case .fileWrite: "square.and.pencil"
+        case .notify: "bell"
+        }
+    }
+
 }

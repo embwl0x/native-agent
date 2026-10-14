@@ -597,13 +597,6 @@ struct TraitRow: View {
 /// unknown instead of making a missing default look like an intentional one.
 enum TrustPolicySummaryPresentation {
     static let unknownValue = "Not reported by the Mac"
-
-    static func textValue(_ value: String?) -> String {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return unknownValue
-        }
-        return value
-    }
 }
 
 struct TrustPolicyView: View {

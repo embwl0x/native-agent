@@ -5,25 +5,30 @@ import PersistenceCore
 public struct AgentContactIdentity: Sendable {
     public let aliases: [String: String]
     public let doors: [String: String]
+    let peers: [[String: String]]
 
     public init(dataRoot: URL) {
+        let peers = (try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [[String: Any]] } ?? []
+        self.init(peers: peers.map { $0.compactMapValues { $0 as? String } })
+    }
+
+    init(peers: [[String: String]]) {
+        self.peers = peers
         var aliases = ["claude": "claude", "codex": "codex"]
         var doors = ["claude": "Claude CLI", "codex": "Codex bridge"]
-        if let data = try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")),
-           let peers = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-            for peer in peers {
-                guard let id = peer["id"] as? String, let endpoint = peer["endpoint"] as? String,
-                      let url = URL(string: endpoint), ["mcp", "acp"].contains(url.scheme ?? "") else { continue }
-                let brain: String?
-                switch url.host {
-                case "claude-desktop", "claude-code": brain = "claude"
-                case "codex", "codex-cli": brain = "codex"
-                default: brain = nil
-                }
-                if let brain {
-                    aliases["peer:" + id] = brain
-                    doors["peer:" + id] = (peer["name"] as? String ?? url.host ?? "") + (url.scheme == "acp" ? " (ACP)" : " (MCP)")
-                }
+        for peer in peers {
+            guard let id = peer["id"], let endpoint = peer["endpoint"],
+                  let url = URL(string: endpoint), ["mcp", "acp"].contains(url.scheme ?? "") else { continue }
+            let brain: String?
+            switch url.host {
+            case "claude-desktop", "claude-code": brain = "claude"
+            case "codex", "codex-cli": brain = "codex"
+            default: brain = nil
+            }
+            if let brain {
+                aliases["peer:" + id] = brain
+                doors["peer:" + id] = (peer["name"] ?? url.host ?? "") + (url.scheme == "acp" ? " (ACP)" : " (MCP)")
             }
         }
         self.aliases = aliases; self.doors = doors
@@ -43,8 +48,30 @@ public struct AgentContactIdentity: Sendable {
 
 /// Cheap local observations, never transport authority or proof a model will answer.
 public struct AgentLocalHealth: Codable, Sendable, Equatable {
-    public var status: String
-    public var detail: String
+    private var observedStatus: String?
+    private var observedDetail: String
+    public private(set) var presenceStatus: String? = nil
+    public private(set) var presenceDetail: String? = nil
+    private var installed: Bool? = nil
+    private var authenticationRequired: Bool? = nil
+    private var availability: String {
+        guard let installed else { return "unchecked" }
+        if !installed { return "unavailable" }
+        if authenticationRequired == true, !authenticated { return "signed_out" }
+        return lastGoodAt == nil ? "installed" : "ready"
+    }
+    public var status: String {
+        get { presenceStatus ?? replyStatus }
+        set { observedStatus = newValue }
+    }
+    public var replyStatus: String { observedStatus ?? availability }
+    public var replyDetail: String {
+        observedDetail.isEmpty ? (availability == "installed" ? "Installed; no reply proven yet" : availability == "ready" ? "Ready" : "") : observedDetail
+    }
+    public var detail: String {
+        get { presenceDetail ?? replyDetail }
+        set { observedDetail = newValue }
+    }
     public var checkedAt: Date
     public var authenticated: Bool
     public var failureOperation: String?
@@ -54,8 +81,26 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     public var repairDetail: String?
     public var repairFor: String?
 
+    private enum CodingKeys: String, CodingKey {
+        case observedStatus = "status", observedDetail = "detail"
+        case installed, authenticationRequired, checkedAt, authenticated, failureOperation, brokenSince, lastGoodAt, repairAttemptedAt, repairDetail, repairFor
+    }
+
     public init(status: String, detail: String, checkedAt: Date, authenticated: Bool) {
-        self.status = status; self.detail = detail; self.checkedAt = checkedAt; self.authenticated = authenticated
+        self.observedStatus = status; self.observedDetail = detail; self.checkedAt = checkedAt; self.authenticated = authenticated
+    }
+
+    public mutating func present(_ presence: Self) {
+        presenceStatus = presence.status
+        presenceDetail = presence.detail
+    }
+
+    public mutating func retainReplyEvidence() {
+        guard !sticky, let observedStatus, observedStatus != "unknown" else { return }
+        installed = ["ready", "installed", "signed_out"].contains(observedStatus) ? true : observedStatus == "unavailable" ? false : nil
+        authenticationRequired = observedStatus == "signed_out" || authenticated
+        if !["signed_out", "unavailable"].contains(observedStatus) { observedDetail = "" }
+        self.observedStatus = nil
     }
 
     public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/local-health.json") }
@@ -64,25 +109,30 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         return (try? JSONDecoder().decode([String: Self].self, from: data)) ?? [:]
     }
     /// Said until a newer observation replaces it, not only while fresh.
-    public var sticky: Bool { brokenSince != nil || ["unverified", "interrupted"].contains(status) }
-    public var current: Bool { sticky || Date().timeIntervalSince(checkedAt) < 600 }
+    public var sticky: Bool { brokenSince != nil || ["unverified", "interrupted", "no_reply_by_deadline"].contains(observedStatus ?? "") }
+    public var current: Bool { presenceStatus != nil || sticky || Date().timeIntervalSince(checkedAt) < 600 }
     public var word: String? {
         guard current else { return nil }
         let text = status.replacingOccurrences(of: "_", with: " ")
         return text.prefix(1).uppercased() + text.dropFirst()
     }
+    public var problemWord: String? {
+        guard problem != nil else { return nil }
+        let text = (observedStatus ?? availability).replacingOccurrences(of: "_", with: " ")
+        return text.prefix(1).uppercased() + text.dropFirst()
+    }
     /// A reply path that is broken, as Doctor and the body report count it. An
     /// unverified one (its app, program or recipe changed since the proof) is
     /// not: the next send proves it again.
-    public var isBroken: Bool { problem != nil && ["broken", "signed_out", "unavailable"].contains(status) }
+    public var isBroken: Bool { problem != nil && ["broken", "signed_out", "unavailable"].contains(observedStatus ?? availability) }
     public var problem: String? {
-        current && !["ready", "installed", "live", "unchecked"].contains(status)
-            ? detail + (repairDetail.map { " " + $0 } ?? "") : nil
+        current && !["ready", "installed", "live", "recent_activity", "waiting", "unchecked"].contains(observedStatus ?? availability)
+            ? observedDetail + (repairDetail.map { " " + $0 } ?? "") : nil
     }
 
     public var projection: JSONValue {
         let iso = ISO8601DateFormatter()
-        return .object(["status": .string(status), "detail": .string(problem ?? detail),
+        return .object(["status": .string(replyStatus), "detail": .string(problem ?? replyDetail),
             "since": brokenSince.map { .string(iso.string(from: $0)) } ?? .null,
             "last_good": lastGoodAt.map { .string(iso.string(from: $0)) } ?? .null,
             "repair_at": repairAttemptedAt.map { .string(iso.string(from: $0)) } ?? .null,

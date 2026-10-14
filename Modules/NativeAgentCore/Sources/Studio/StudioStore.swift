@@ -866,14 +866,6 @@ public struct SwiftNativeStudioStore: Sendable {
             .appendingPathComponent("journal_archive_\(f.string(from: now)).jsonl")
     }
 
-    /// `<dataRoot>/studio/journal/trim_receipts.jsonl` — one row per trim event:
-    /// what was moved, where, and how big the journal was at the time.
-    public var journalTrimReceiptsPath: URL {
-        studioRoot
-            .appendingPathComponent("journal", isDirectory: true)
-            .appendingPathComponent("trim_receipts.jsonl")
-    }
-
     /// Every overflow archive on the shelf, oldest stamp first. The combined
     /// journal reader uses this inventory for recall, encounter intake and
     /// work history.
@@ -885,11 +877,6 @@ public struct SwiftNativeStudioStore: Sendable {
             .filter { $0.lastPathComponent.hasPrefix("journal_archive_") }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
-
-    /// Test seam: fires on EVERY pre-trim overflow check the production append
-    /// path performs, with the number of lines that check is about to move.
-    /// It observes; it never decides anything.
-    @TaskLocal public static var journalOverflowCheckObserver: (@Sendable (Int) -> Void)?
 
     /// `<dataRoot>/studio/consults/<id>.json`, for an id that has already been
     /// validated by `validatedIdentifier`.
@@ -1097,7 +1084,7 @@ public struct SwiftNativeStudioStore: Sendable {
     }
 
     /// Move the lines a cap trim is about to discard onto the overflow shelf,
-    /// durably, and record the event — before the append that would trigger the
+    /// durably — before the append that would trigger the
     /// trim, and before the trim itself.
     ///
     /// `incoming` is how many lines the pending append adds (1 on the live
@@ -1114,7 +1101,6 @@ public struct SwiftNativeStudioStore: Sendable {
         now: Date = Date()
     ) async throws {
         let doomed = try journalOverflowLines(maxLines: maxLines, incoming: incoming)
-        Self.journalOverflowCheckObserver?(doomed.count)
         guard !doomed.isEmpty else { return }
 
         let directory = journalPath.deletingLastPathComponent()
@@ -1128,18 +1114,6 @@ public struct SwiftNativeStudioStore: Sendable {
             payload.append(0x0A)
         }
         try SwiftNativePersistenceCore.appendOwnedBytes(payload, to: archive, durable: true)
-        // The receipt is written only after the bytes are on the platter, and a
-        // receipt failure also blocks the trim. Worst case is an archived line
-        // that was not trimmed after all — duplicated, never lost.
-        try await persistence.appendJSONLDurable(
-            .object([
-                "ts": .string(StudioClock.nowISO(now)),
-                "archive": .string(archive.lastPathComponent),
-                "archived_lines": .int(Int64(doomed.count)),
-                "cap": .int(Int64(maxLines)),
-            ]),
-            to: journalTrimReceiptsPath
-        )
         nativeLog("%@: journal cap reached — moved %d oldest line(s) to %@ before any trim",
               Self.logLabel, doomed.count, archive.lastPathComponent)
     }
@@ -1232,11 +1206,6 @@ public struct SwiftNativeStudioStore: Sendable {
                   Self.logLabel, report.malformedLineCount, rows.count - amendments.count)
         }
         return AmendmentsRead(amendments: amendments, unreadable: unreadable)
-    }
-
-    /// Corrections only, for a caller that has already accounted for damage.
-    public func readAmendments() async throws -> [StudioAmendment] {
-        try await readAmendmentsReporting().amendments
     }
 
     /// Project the corrections onto the entries they name. This is what makes

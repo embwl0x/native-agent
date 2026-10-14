@@ -68,7 +68,7 @@ public enum GoogleOAuthCredentials {
         return OAuthCredentialHealth(
             configured: string(object["access_token"]) != nil,
             expiresAt: parseExpiresAt(object["expires_at"]),
-            canRefresh: boundRefresh,
+            canRefresh: boundRefresh && (try? withClientCredentials(object, path: path)) != nil,
             requiresRefresh: hasRefresh && !boundRefresh
         )
     }
@@ -132,16 +132,8 @@ public enum GoogleOAuthCredentials {
                 refreshToken: string(object["refresh_token"])
             )
         }
-        let appPath = path.deletingLastPathComponent().appendingPathComponent("oauth_app.json")
-        if FileManager.default.fileExists(atPath: appPath.path) {
-            let app = try read(appPath)
-            for key in ["client_id", "client_secret"] where object[key] == nil {
-                object[key] = app[key]
-            }
-        }
-        guard let clientID = string(object["client_id"]) else {
-            throw RefreshError(statusCode: 401, requiresReauthentication: true)
-        }
+        object = try withClientCredentials(object, path: path)
+        let clientID = string(object["client_id"])!
         var fields = ["grant_type": "refresh_token", "refresh_token": refreshToken, "client_id": clientID]
         if let secret = string(object["client_secret"]) { fields["client_secret"] = secret }
         var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
@@ -177,6 +169,21 @@ public enum GoogleOAuthCredentials {
             originalAccessToken: originalAccessToken, accessToken: access,
             refreshToken: string(object["refresh_token"])
         )
+    }
+
+    private static func withClientCredentials(_ token: [String: Any], path: URL) throws -> [String: Any] {
+        var object = token
+        let appPath = path.deletingLastPathComponent().appendingPathComponent("oauth_app.json")
+        if FileManager.default.fileExists(atPath: appPath.path) {
+            let app = try read(appPath)
+            for key in ["client_id", "client_secret"] where object[key] == nil {
+                object[key] = app[key]
+            }
+        }
+        guard string(object["client_id"]) != nil else {
+            throw RefreshError(statusCode: 401, requiresReauthentication: true)
+        }
+        return object
     }
 
     private static func string(_ value: Any?) -> String? {

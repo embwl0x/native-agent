@@ -18,10 +18,9 @@ extension TelegramPollLoop {
     }
 
     /// 2026-09-22: the "Queued" acknowledgement is scaffolding. Once its turn
-    /// starts, delete it; edit it to `runningText` only when this loop has no
-    /// deleteMessage (or the delete fails).
+    /// starts, delete it; edit it to `runningText` if deletion fails.
     func clearQueueAcknowledgement(chatId: Int, messageId: Int, runningText: String) async {
-        if let deleteMessage, (try? await deleteMessage(token, chatId, messageId)) != nil { return }
+        if (try? await deleteMessage(token, chatId, messageId)) != nil { return }
         try? await editMessageTextWithReplyMarkup(
             token,
             chatId,
@@ -414,9 +413,16 @@ extension TelegramPollLoop {
                             update: claim.update, message: originalMessage, text: nil
                         )
                         switch await delivery.finalize(reply: retained.reply, savedDelivery: retained, resendUnknown: args == ["resend"]) {
+                        case .held: break
                         case .delivered:
+                            if let session = claim.assistantSessionId, let run = claim.assistantRunId {
+                                try settleReplyCheckpoint(sessionId: session, runId: run)
+                            }
+                            _ = try await updateInbox.transition(updateId: claim.updateId,
+                                from: [.processing, .completed, .outcomeUnknown, .sentUnconfirmed], to: .completed)
+                            await updateInbox.pruneTerminalClaims(dataRoot: dataRoot)
                             await recordReceipt(kind: "retry_reply", update: claim.update, message: originalMessage, text: text, reply: retained.reply)
-                            if let deleteMessage, let cardId = await turnCardRestartRepairer.takeInterruptedCard(chatId: message.chatId) {
+                            if let cardId = await turnCardRestartRepairer.takeInterruptedCard(chatId: message.chatId) {
                                 try await deleteMessage(token, message.chatId, cardId)
                             }
                         case .failed(let reason), .outcomeUnknown(let reason):
@@ -436,7 +442,7 @@ extension TelegramPollLoop {
             await sendCommandReply("There's no saved answer waiting to be delivered.", kind: "retry_unavailable", update: update, message: message, text: text)
             return false
         }
-        guard chatHandler != nil || progressChatHandler != nil || attachmentChatHandler != nil else {
+        guard attachmentChatHandler != nil else {
             await sendCommandReply(
                 "I can't run anything here right now — chat isn't wired up on this surface.",
                 kind: "retry_unavailable",
@@ -717,16 +723,10 @@ extension TelegramPollLoop {
             )
             var attachments: [TelegramMediaAttachment] = []
             if let retryMessage, let attachment = Self.chatAttachment(from: retryMessage) {
-                guard let photoDownloader else {
-                    throw TelegramBotError.underlying("Attachment ingestion is not configured; the original attachment could not be retried.")
-                }
                 let maxBytes = chatAttachmentMaxBytes(attachment)
-                let downloaded = try await photoDownloader.download(token: token, attachment: attachment, maxBytes: maxBytes)
+                let downloaded = try await mediaDownloader.download(token: token, attachment: attachment, maxBytes: maxBytes)
                 guard let bytes = downloaded.bytes, !bytes.isEmpty else {
                     throw TelegramMediaDownloadError.malformedResponse
-                }
-                guard bytes.count <= maxBytes else {
-                    throw TelegramMediaDownloadError.oversized(reportedBytes: bytes.count, capBytes: maxBytes)
                 }
                 let mime: String
                 if downloaded.kind == "photo" {
@@ -764,7 +764,9 @@ extension TelegramPollLoop {
             if !reply.isEmpty {
                 let deliveryOutcome = await delivery.finalize(reply: reply, imagePaths: await generatedImages.snapshot())
                 switch deliveryOutcome {
+                case .held: break
                 case .delivered:
+                    try settleReplyCheckpoint(sessionId: sessionId, runId: turnId.uuidString)
                     await recordReceipt(kind: "retry_reply", update: update, message: message, text: commandText, reply: reply)
                     await card.transition(.completed(summary: nil))
                 case .failed(let reason):

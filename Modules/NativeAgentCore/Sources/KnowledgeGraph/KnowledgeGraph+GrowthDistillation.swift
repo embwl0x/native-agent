@@ -48,12 +48,10 @@ extension SwiftNativeKnowledgeGraphIndexer {
             )
         }
 
-        let memoryDirectory = sqlitePath.deletingLastPathComponent()
-        _ = try await KnowledgeGraphStore.loadFromMemoryV2(
-            memoryDir: memoryDirectory,
+        let dbPool = try await KnowledgeGraphStore.withPreparedPool(
+            memoryDir: sqlitePath.deletingLastPathComponent(),
             jsonImportPath: legacyJSONPath
-        )
-        let dbPool = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
+        ) { $0 }
         let name = String(boundedSummary.prefix(80))
         let lineCount = max(0, sourceLines)
         try await dbPool.write { db in

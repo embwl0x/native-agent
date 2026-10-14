@@ -2,14 +2,7 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 import ActivityWatch
-
-/// Kept beside the mounted Trust Center control so its disabled state follows
-/// exactly the same persisted consent rule as the dispatcher-facing policy.
-enum ActivityCapturePresentation {
-    static func isAgentAccessControlEnabled(policy: ActivityPolicy) -> Bool {
-        policy.captureEnabled
-    }
-}
+import TrustCenter
 
 /// W8 — the Trust Center surface for the ambient activity watcher.
 ///
@@ -149,7 +142,7 @@ struct ActivityCapturePermissionsView: View {
                 "Record which apps you use",
                 isOn: Binding(
                     get: { controller.policy.captureEnabled },
-                    set: { controller.setCaptureEnabled($0) }
+                    set: { value in Task { await controller.setCaptureEnabled(value) } }
                 )
             )
             .labelsHidden()
@@ -221,7 +214,7 @@ struct ActivityCapturePermissionsView: View {
     private var modelAccessControl: some View {
         let title = "Let me answer from activity history"
         let detail = "With Full Mac I can use your recorded activity in trusted chats. In other modes a switch here decides, and it starts off. When I answer from it, the answer goes to the chat's AI provider; the database and full history stay on this Mac. Recording itself is the switch at the top."
-        if appModel.engine.trust.policy.map(AppModel.fullMacGrantIsActive) ?? false {
+        if appModel.engine.trust.policy.map(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive) ?? false {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title)
@@ -244,10 +237,10 @@ struct ActivityCapturePermissionsView: View {
                 detail: detail,
                 isOn: Binding(
                     get: { controller.policy.allowModelAccess },
-                    set: { controller.setModelAccessEnabled($0) }
+                    set: { value in Task { await controller.setModelAccessEnabled(value) } }
                 )
             )
-            .disabled(!ActivityCapturePresentation.isAgentAccessControlEnabled(policy: controller.policy))
+            .disabled(!controller.policy.captureEnabled)
         }
     }
 
@@ -256,44 +249,16 @@ struct ActivityCapturePermissionsView: View {
     /// The three saved title fields as the one choice they really are. Read
     /// the way `ActivityPolicy.allowsTitleCapture` reads them, so the picker
     /// shows what capture actually does; rendering writes nothing.
-    enum TitleCapture: Hashable, CaseIterable {
-        case appNamesOnly, windowTitles, windowAndBrowserTitles
-
-        init(policy: ActivityPolicy) {
-            if policy.appNameOnlyMode || !policy.captureTitles {
-                self = .appNamesOnly
-            } else {
-                self = policy.browserTitlesEnabled ? .windowAndBrowserTitles : .windowTitles
-            }
-        }
-
-        func applied(to policy: ActivityPolicy) -> ActivityPolicy {
-            var next = policy
-            next.appNameOnlyMode = self == .appNamesOnly
-            next.captureTitles = self != .appNamesOnly
-            next.browserTitlesEnabled = self == .windowAndBrowserTitles
-            return next
-        }
-
-        var label: String {
-            switch self {
-            case .appNamesOnly: "App names only"
-            case .windowTitles: "Window titles"
-            case .windowAndBrowserTitles: "Window and browser titles"
-            }
-        }
-    }
-
     @ViewBuilder
     private var titleControls: some View {
-        let choice = TitleCapture(policy: controller.policy)
+        let choice = ActivityPolicy.TitleCapture(policy: controller.policy)
         Picker("Window titles", selection: Binding(
             get: { choice },
             // One write through the controller's one save path, so the three
             // fields never land half-changed.
-            set: { controller.apply($0.applied(to: controller.policy)) }
+            set: { value in Task { await controller.apply { $0 = value.applied(to: $0) } } }
         )) {
-            ForEach(TitleCapture.allCases, id: \.self) { Text($0.label).tag($0) }
+            ForEach(ActivityPolicy.TitleCapture.allCases, id: \.self) { Text($0.label).tag($0) }
         }
         .pickerStyle(.segmented)
         .hazeTinted(.segments)
@@ -380,7 +345,7 @@ struct ActivityCapturePermissionsView: View {
                             .help(bundleID)
                         Spacer()
                         Button("Remove", systemImage: "xmark.circle") {
-                            controller.removeExclusion(bundleID: bundleID)
+                            Task { await controller.removeExclusion(bundleID: bundleID) }
                         }
                         .buttonStyle(.borderless)
                     }
@@ -408,7 +373,7 @@ struct ActivityCapturePermissionsView: View {
         VStack(alignment: .leading, spacing: 8) {
             Picker("Keep history for", selection: Binding(
                 get: { controller.policy.retentionDays },
-                set: { controller.setRetentionDays($0) }
+                set: { value in Task { await controller.setRetentionDays(value) } }
             )) {
                 Text("7 days").tag(7)
                 Text("14 days").tag(14)
@@ -470,5 +435,33 @@ struct ActivityCapturePermissionsView: View {
             get: { pendingExclusion != nil },
             set: { if !$0 { pendingExclusion = nil } }
         )
+    }
+}
+
+extension ActivityPolicy.TitleCapture {
+    var label: String {
+        switch self {
+        case .appNamesOnly: "App names only"
+        case .windowTitles: "Window titles"
+        case .windowAndBrowserTitles: "Window and browser titles"
+        }
+    }
+}
+
+extension ActivityCaptureIssue.Severity {
+    var title: String {
+        switch self {
+        case .notice: "Notice"
+        case .warning: "Warning"
+        case .critical: "Action needed"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .notice: "info.circle.fill"
+        case .warning: "exclamationmark.circle.fill"
+        case .critical: "exclamationmark.triangle.fill"
+        }
     }
 }

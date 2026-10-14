@@ -18,11 +18,6 @@ extension SwiftNativeSecurityCenter {
         return [:]
     }
 
-    static func object(_ value: JSONValue) -> [String: JSONValue] {
-        if case .object(let obj) = value { return obj }
-        return [:]
-    }
-
     static func string(_ value: JSONValue?) -> String? {
         switch value {
         case .string(let s): return s
@@ -31,10 +26,6 @@ extension SwiftNativeSecurityCenter {
         case .bool(let b): return b ? "true" : "false"
         default: return nil
         }
-    }
-
-    static func string(_ value: JSONValue) -> String? {
-        string(Optional(value))
     }
 
     static func bool(_ value: JSONValue?, default fallback: Bool) -> Bool {
@@ -108,6 +99,10 @@ extension SwiftNativeSecurityCenter {
     static func isSelfOrAncestor(root: URL, of candidate: URL) -> Bool {
         let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
         let candidatePath = candidate.standardizedFileURL.resolvingSymlinksInPath().path
+        return isSelfOrAncestor(rootPath: rootPath, candidatePath: candidatePath)
+    }
+
+    static func isSelfOrAncestor(rootPath: String, candidatePath: String) -> Bool {
         if candidatePath == rootPath { return true }
         let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
         return candidatePath.hasPrefix(prefix)

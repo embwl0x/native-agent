@@ -25,8 +25,7 @@ actor TurnCheckpointWriter {
     }
 
     func capture(prose: String, commentaryCharacters: Int, conversation: [LLMMessage],
-                 startingCalls: Int = 0, nextIteration: Bool = false) throws {
-        if nextIteration { record.iteration += 1 }
+                 startingCalls: Int = 0) throws {
         record.keptProse = prose
         record.workingCommentaryCharacters = commentaryCharacters
         record.workingNotes = conversation.flatMap(\.content).compactMap { block -> String? in
@@ -35,32 +34,121 @@ actor TurnCheckpointWriter {
             return text
         }.joined(separator: "\n")
         pendingCalls += startingCalls
-        record.runningStep = pendingCalls > 0 ? record.dispatchCount + 1 : nil
+        record.runningStep = pendingCalls > 0 ? 1 : nil
         record.peerSources = PeerDataTaint.current?.checkpointSources ?? record.peerSources
         try record.write(dataRoot: dataRoot)
     }
 
     func receiptWritten() throws {
-        record.dispatchCount += 1
         pendingCalls = max(0, pendingCalls - 1)
-        record.runningStep = pendingCalls > 0 ? record.dispatchCount + 1 : nil
+        record.runningStep = pendingCalls > 0 ? 1 : nil
         record.peerSources = PeerDataTaint.current?.checkpointSources ?? record.peerSources
         try record.write(dataRoot: dataRoot)
     }
 }
 
 extension SwiftNativeChatOrchestrationClient {
+    public static func retainRequestedResult(dataRoot: URL, sessionId: String, runId: String, deliveryId: String) async throws {
+        guard NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId else { throw CocoaError(.fileReadInvalidFileName) }
+        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
+        let persistence = SwiftNativePersistenceCore()
+        try await persistence.withFileLock(path) {
+            let read = try await persistence.readJSONLReporting(path)
+            guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine,
+                  read.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            var rows = read.rows
+            guard let index = rows.lastIndex(where: { row in
+                guard case .object(let fields) = row, fields["role"] == .string("assistant"),
+                      case .object(let metadata)? = fields["metadata"] else { return false }
+                return fields["runId"] == .string(runId) || metadata["answerFor"] == .string(deliveryId)
+            }), case .object(var fields) = rows[index], case .object(var metadata)? = fields["metadata"],
+                case .string(let savedRun)? = fields["runId"] else { throw CocoaError(.fileReadCorruptFile) }
+            guard metadata["resultDelivery"] == nil else { return }
+            metadata["resultDelivery"] = .object(["eventId": .string(deliveryId), "state": .string("pending"),
+                "sessionId": .string(sessionId), "runId": .string(savedRun)])
+            fields["metadata"] = .object(metadata)
+            rows[index] = .object(fields)
+            let text = try rows.map { try $0.serialize(pretty: false) }.joined(separator: "\n") + "\n"
+            try await persistence.writeDataAtomicDurable(Data(text.utf8), to: path)
+        }
+    }
+
+    public static func settleReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String) throws {
+        for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
+            where checkpoint.runId == runId && checkpoint.deliveryPending {
+            try checkpoint.remove(dataRoot: dataRoot)
+        }
+    }
+
+    public static func hasReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String) throws -> Bool {
+        try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId).contains { $0.runId == runId }
+    }
+
+    public static func removeReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String) throws {
+        for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId) where checkpoint.runId == runId {
+            try checkpoint.remove(dataRoot: dataRoot)
+        }
+    }
+
+    public static func savedReply(dataRoot: URL, sessionId: String, runId: String, turnId: String? = nil) async throws -> ChatResponse? {
+        guard NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
+        let persistence = SwiftNativePersistenceCore()
+        let read = try await persistence.withFileLock(path) { try await persistence.readJSONLReporting(path) }
+        guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine,
+              read.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let rows = read.rows
+        for row in rows.reversed() {
+            guard case .object(let fields) = row, fields["role"] == .string("assistant"),
+                  fields["runId"] == .string(runId), fields["sessionId"] == .string(sessionId),
+                  case .object(let metadata)? = fields["metadata"],
+                  case .string(let content)? = fields["content"] else { continue }
+            // Explicit authorship binds the answer to the appended row's own identity.
+            if turnId == nil, !runId.isEmpty, fields["id"] == .string(runId), metadata["answerFor"] == .string(runId) {
+                return ChatResponse(runId: runId, model: "explicit-assistant-reply", output: content, sessionId: sessionId,
+                    attachments: try CodexCompletionTranscriptEvidence.decodeAttachments(metadata["attachments"]), terminalState: .completed)
+            }
+            guard metadata["completionState"] != nil,
+                  let raw = metadata["outcomeObservation"], let outcome = ResponseOutcomeObservationV2(jsonValue: raw),
+                  outcome.sessionID == sessionId, fields["id"] == .string(outcome.messageID),
+                  metadata["turnTraceId"] == .string(outcome.turnID),
+                  turnId == nil || outcome.turnID == turnId,
+                  let model = outcome.providerModel, case .string(let status)? = metadata["terminalState"],
+                  let state = TurnEngineResult.TerminalState(rawValue: status) else { continue }
+            var response = ChatResponse(runId: runId, model: model, reasoningEffort: outcome.reasoningEffort,
+                output: content, sessionId: sessionId,
+                attachments: try CodexCompletionTranscriptEvidence.decodeAttachments(metadata["attachments"]), terminalState: state)
+            if case .int(let count)? = metadata["workingCommentaryChars"] { response.workingCommentaryCharacters = Int(count) }
+            if state != .completed {
+                response.runtimeStatus = state == .waiting ? "waiting on you" : state == .failed ? "failed" : "interrupted"
+            }
+            return response
+        }
+        return nil
+    }
+
     func settleTurnCheckpoint(_ terminal: TurnTraceEvent, sessionId: String, runId: String) async throws {
         var checkpoints = try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
             .filter { $0.runId == runId }
         for index in checkpoints.indices {
-            if TurnCheckpointScope.resuming?.runId == runId,
-               case .object(let payload) = terminal.payload, payload["status"] == .string("completed"),
+            if case .object(let payload) = terminal.payload,
+               payload["status"] == .string("completed") || payload["status"] == .string("waiting"),
                checkpoints[index].hasRedeliveryOwner {
                 // Persist ownership before the terminal so a kill at either write remains resumable.
                 checkpoints[index].deliveryPending = true
                 try checkpoints[index].write(dataRoot: dataRoot)
             } else { checkpoints[index].deliveryPending = false }
+        }
+        if case .object(let payload) = terminal.payload,
+           payload["status"] == .string("completed") || payload["status"] == .string("waiting") {
+            do { try await AbandonedTurnReconciliationHook.retainMirror(dataRoot: dataRoot, sessionId: sessionId, runId: runId) }
+            catch { nativeLog("Reply mirror remains owed: %@", error.localizedDescription) }
         }
         try await turnTraceBus.deliverDurably(terminal)
         for checkpoint in checkpoints {
@@ -78,27 +166,15 @@ extension SwiftNativeChatOrchestrationClient {
             throw ChatOrchestrationError.underlying("Repair this turn's transcript before resuming it.")
         }
         let rows = history.messages.filter { SessionHistoryPromptRenderer.renderable($0)?.runId == checkpoint.runId }
-        for answer in rows.reversed() where answer.role == "assistant" {
-            guard case .object(let fields)? = answer.extras, case .object(let metadata)? = fields["metadata"],
-                  metadata["turnTraceId"] == .string(checkpoint.turnId), metadata["completionState"] != nil,
-                  let raw = metadata["outcomeObservation"], let outcome = ResponseOutcomeObservationV2(jsonValue: raw),
-                  outcome.turnID == checkpoint.turnId, outcome.sessionID == checkpoint.sessionId,
-                  fields["id"] == .string(outcome.messageID),
-                  let model = outcome.providerModel, case .string(let status)? = metadata["terminalState"],
-                  let state = TurnEngineResult.TerminalState(rawValue: status) else { continue }
-            var response = ChatResponse(runId: checkpoint.runId, model: model, reasoningEffort: outcome.reasoningEffort,
-                output: answer.content, sessionId: checkpoint.sessionId,
-                attachments: try CodexCompletionTranscriptEvidence.decodeAttachments(metadata["attachments"]), terminalState: state)
-            if case .int(let count)? = metadata["workingCommentaryChars"] { response.workingCommentaryCharacters = Int(count) }
-            if state != .completed {
-                response.runtimeStatus = state == .waiting ? "waiting on you" : state == .failed ? "failed" : "interrupted"
-            }
+        if let response = try await Self.savedReply(dataRoot: dataRoot, sessionId: checkpoint.sessionId,
+                                                    runId: checkpoint.runId, turnId: checkpoint.turnId) {
+            let state = response.terminalState ?? .completed
             let reason: TurnEngineResult.TerminalReason = state == .completed ? .replyCompleted
                 : state == .waiting ? .interactionRequired : state == .failed ? .executionFailed : .incomplete
             try await TurnCheckpointScope.$resuming.withValue(checkpoint) {
             try await settleTurnCheckpoint(TurnTraceEvent(turnId: checkpoint.turnId, kind: "turn.terminal",
                 sessionId: checkpoint.sessionId, surface: checkpoint.surface, payload: .object([
-                    "schema": .string("metacognition.observed.v1"), "status": .string(status),
+                    "schema": .string("metacognition.observed.v1"), "status": .string(state.rawValue),
                     "terminalReason": .string(reason.rawValue), "observedBy": .string("checkpoint_recovery")])),
                 sessionId: checkpoint.sessionId, runId: checkpoint.runId)
             }
@@ -112,6 +188,9 @@ extension SwiftNativeChatOrchestrationClient {
             throw ChatOrchestrationError.underlying("The resumed turn's input metadata is missing; repair its transcript.")
         }
         if case .string(let persona)? = metadata["persona"] { request.persona = persona }
+        request.origin = try metadata["origin"].map {
+            try JSONDecoder().decode(ChatMessageOrigin.self, from: $0.serializedData(pretty: false))
+        }
         request.attachments = try CodexCompletionTranscriptEvidence.decodeAttachments(metadata["attachments"])
         for index in request.attachments.indices {
             guard let path = request.attachments[index].path else {
@@ -120,14 +199,15 @@ extension SwiftNativeChatOrchestrationClient {
             request.attachments[index].base64 = try Data(contentsOf: URL(fileURLWithPath: path)).base64EncodedString()
         }
         var record = checkpoint
-        record.dispatchCount = rows.filter { SessionHistoryPromptRenderer.renderable($0)?.isTool == true }.count
         let sources = rows.flatMap { row -> [String] in
             guard case .object(let fields)? = row.extras, case .object(let metadata)? = fields["metadata"],
                   case .array(let saved)? = metadata["untrusted_sources"] else { return [] }
             return saved.compactMap { if case .string(let source) = $0 { return source }; return nil }
         }
         let taint = PeerDataTaint(restoring: (record.peerSources ?? []) + sources
-            + (PeerDataTaint.current?.checkpointSources ?? []))
+            + (PeerDataTaint.current?.checkpointSources ?? []),
+            elevated: PeerDataTaint.current?.elevatedSources ?? [])
+        try await DeskContinuationScope.current?.resume()
         return try await PeerDataTaint.$current.withValue(taint) {
         for row in rows {
             SwiftToolDispatcher.consumePersistedHistoryEvidence(row.extras ?? .null)
@@ -172,7 +252,7 @@ extension SwiftNativeTurnEngine {
             var reply: [String: JSONValue] = ["surface": .string(route?.surface ?? surface)]
             for (key, value) in [("destinationId", route?.destinationId), ("threadId", route?.threadId),
                                  ("sourceKey", route?.sourceKey), ("replyTo", route?.replyTo),
-                                 ("correlationId", route?.correlationId)] {
+                                 ("correlationId", route?.correlationId), ("requesterUserId", route?.requesterUserId)] {
                 if let value { reply[key] = .string(value) }
             }
             saved = DeskContinuation(runID: runId, sessionID: sessionId, surface: surface,

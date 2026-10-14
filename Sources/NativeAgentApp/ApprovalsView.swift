@@ -1,5 +1,8 @@
+import Cognition
 import SwiftUI
+import EngineRuntime
 import ApprovalInbox
+import ApprovalTransactions
 import NativeAgentShared
 import Observation
 import AppKit
@@ -66,12 +69,6 @@ enum ApprovalPayloadPreviewPresentation {
         return .available(preview)
     }
 
-    static func canResolve(_ approval: ApprovalRecord) -> Bool {
-        if case .available = state(for: approval) { return true }
-        return false
-    }
-
-    static let unavailableText = "The details of this request are missing. Refresh approvals to check again. You can decide once the details are available."
 }
 
 /// Toasts describe the durable approval decision, never merely the button the
@@ -202,7 +199,7 @@ enum ApprovalRequestsLiveRefresh {
         refresh: @escaping @MainActor @Sendable () async -> Void
     ) async {
         let approvalPath = await approvals.requestsPath()
-        await ViewFileRefreshTask.run(paths: [approvalPath], refresh: refresh)
+        await EventDeadlinePhysiology.refreshOnChanges(paths: [approvalPath], refresh: refresh)
     }
 }
 
@@ -454,10 +451,10 @@ struct ApprovalsView: View {
             if toast.kind == .error { approvalLoadState.showActionFailure(toast.text) }
             await appModel.loadHealthCard()
         case .noOpInFlight(let inFlightID):
-            appModel.systemToasts.push(info: CapabilitiesApprovalInboxResolution.noOpInFlight(id: inFlightID).visibleMessage)
+            appModel.systemToasts.push(info: ApprovalsFacade.Resolution.noOpInFlight(id: inFlightID).visibleMessage)
             await refreshApprovals()
         case .noOpAlreadyResolved(let resolvedID, let status):
-            appModel.systemToasts.push(info: CapabilitiesApprovalInboxResolution.noOpAlreadyResolved(id: resolvedID, status: status).visibleMessage)
+            appModel.systemToasts.push(info: ApprovalsFacade.Resolution.noOpAlreadyResolved(id: resolvedID, status: status).visibleMessage)
             await refreshApprovals()
         case .unavailable(let detail):
             let toast = ApprovalDecisionToastPresentation.unavailable(
@@ -553,7 +550,7 @@ private struct ApprovalRequestPanel: View {
                 ApprovalPayloadPreviewView(preview: preview)
             case .unavailable:
                 Label(
-                    ApprovalPayloadPreviewPresentation.unavailableText,
+                    ApprovalChatCards.unavailableText,
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption)
@@ -568,7 +565,7 @@ private struct ApprovalRequestPanel: View {
                 .buttonStyle(.borderedProminent)
                 .hazeTinted(.button)
                 .controlSize(.small)
-                .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
+                .disabled(isDeciding || !ApprovalChatCards.canResolve(approval))
                 Button {
                     onResolve("denied")
                 } label: {
@@ -577,7 +574,7 @@ private struct ApprovalRequestPanel: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .tint(.red)
-                .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
+                .disabled(isDeciding || !ApprovalChatCards.canResolve(approval))
                 if isDeciding {
                     ProgressView()
                         .controlSize(.small)
@@ -614,5 +611,23 @@ private struct ApprovalHistoryRow: View {
             Spacer()
         }
         .padding(.vertical, 8)
+    }
+}
+/// Every place an approval is decided (the chat's inline card, Today's
+/// Approvals) is a view of one durable queue. A second tap is therefore an
+/// observed no-op, never a second request to execute the approved effect.
+extension ApprovalsFacade.Resolution {
+    var visibleMessage: String {
+        switch self {
+        case .applied(let approval):
+            let decision = approval.decision ?? approval.status
+            return "Approval recorded as \(decision)."
+        case .noOpInFlight:
+            return "This approval is already being decided on another screen."
+        case .noOpAlreadyResolved:
+            return "This approval was already decided; no second action was run."
+        case .unavailable(let detail):
+            return "Approval update failed: \(detail)"
+        }
     }
 }

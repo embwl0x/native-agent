@@ -41,9 +41,9 @@ public enum AgentRecipeStore {
 
     private static let loaded = OSAllocatedUnfairLock<Loaded?>(initialState: nil)
 
-    /// Set by `AgentContactHealth.repair`: the contact's send runs its recipe
+    /// Bound from `agent_message`'s `dry_run` input: the contact runs its recipe
     /// dry. An ACP send stops after its handshake, a desktop chat finds its
-    /// controls without typing, a command line sends its connect probe, an
+    /// controls without typing, a command line checks its executable and args, an
     /// A2A send stops after its card, auth and one task listing; nothing she
     /// wrote goes out and no other route runs.
     @TaskLocal package static var dryRun = false
@@ -119,7 +119,7 @@ public enum AgentRecipeStore {
     /// lacks, at the version it was read. The write bumps that version and
     /// keeps the replaced file as <id>.previous.json; writing that back, at
     /// whatever version it carries, undoes it.
-    public static func write(host: String, document: JSONValue) -> JSONValue {
+    public static func write(host: String, document: JSONValue, undoing receipt: JSONValue? = nil) -> JSONValue {
         let given: Recipe
         do { given = try validated(document) }
         catch { return refused("invalid_recipe", "recipe doesn't match a recipe's shape: \(error). Start from agent.recipe's recipe and change only what you mean to.") }
@@ -139,6 +139,11 @@ public enum AgentRecipeStore {
                         return refused("stale_recipe", "\(file.path) changed since this app read it; relaunch or read it again.")
                     }
                     var saved = state.recipes[index]
+                    if case .object(let receipt) = receipt,
+                       receipt["host"] != .string(id) || receipt["recipe_version"] != .int(Int64(saved.recipeVersion))
+                        || receipt["host_digest"] != .string(saved.hostDigest) {
+                        return refused("stale_recipe", "The recipe changed after that receipt. Read it again with agent.recipe.")
+                    }
                     guard given.host.id == saved.host.id else { return refused("invalid_recipe", "host.id stays \(saved.host.id).") }
                     // Undo: the version a write replaced goes back whatever version it carries.
                     let restored = (try? validated(file: previous)).flatMap { $0.host == given.host ? $0.recipeVersion : nil }
@@ -153,11 +158,12 @@ public enum AgentRecipeStore {
                     try commit(&saved, host: given.host, source: "written", file: file, previous: previous)
                     state.recipes[index] = saved
                     var receipt: [String: JSONValue] = ["status": .string("written"), "changed": .bool(true), "host": .string(id),
-                        "recipe_version": .int(Int64(saved.recipeVersion)), "fields_changed": .array(changed.map(JSONValue.string)),
+                        "recipe_version": .int(Int64(saved.recipeVersion)), "host_digest": .string(saved.hostDigest),
+                        "fields_changed": .array(changed.map(JSONValue.string)),
                         "path": .string(file.path), "previous": .string(previous.path),
                         "detail": .string((restored.map { "Restored \(saved.host.displayName)'s recipe version \($0) as version \(saved.recipeVersion). " }
                             ?? "\(saved.host.displayName)'s recipe is version \(saved.recipeVersion) now. ")
-                            + "Writing the previous one back with agent.recipe_write undoes it. A contact reached by it reads Unverified since the recipe changed until its next message proves it.")]
+                            + "One call undoes it: app {action: undo}. A contact reached by it reads Unverified since the recipe changed until its next message proves it.")]
                     if let restored { receipt["restored_version"] = .int(Int64(restored)) }
                     return .object(receipt)
                 }

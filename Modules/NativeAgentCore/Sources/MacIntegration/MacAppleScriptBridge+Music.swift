@@ -1,0 +1,521 @@
+import Foundation
+import AppKit
+import PersistenceCore
+
+extension MacAppleScriptBridge {
+    // MARK: MUSIC
+
+    /// Search Music.app library by name / artist / album. Required: "query".
+    /// Optional: "kind" (one of "track" | "artist" | "album", default
+    /// "track"), "limit" (default 20, max 100).
+    /// Returns: {status, count, results: [{name, artist, album, duration_seconds}]}.
+    public static func musicSearchLibrary(input: [String: JSONValue]) async throws -> JSONValue {
+        if let closed = musicClosed() { return closed }
+        guard let query = inputString(input["query"]), !query.isEmpty else {
+            return failedEnvelope(integration: "music", reason: "missing_query")
+        }
+        let kindRaw = inputString(input["kind"])?.lowercased() ?? "track"
+        let kind: String
+        switch kindRaw {
+        case "track", "artist", "album": kind = kindRaw
+        default: return failedEnvelope(integration: "music", reason: "unknown_kind:\(kindRaw)")
+        }
+        let limit = clampedInt(input["limit"], defaultValue: 20, min: 1, max: 100)
+        let queryAS = escapeForAppleScript(query)
+        // For all three kinds the underlying collection is `every track` —
+        // we just narrow the `whose` predicate so callers can filter to a
+        // single field. Track is the broad default (name OR artist OR album).
+        let predicate: String
+        switch kind {
+        case "artist":
+            predicate = "artist contains q"
+        case "album":
+            predicate = "album contains q"
+        default: // "track"
+            predicate = "name contains q or artist contains q or album contains q"
+        }
+        // Collection failures must reach the shared denied/failed envelopes.
+        // Only optional metadata reads may fall back to an empty field.
+        let source = """
+        with timeout of 10 seconds
+            tell application "__NativeAgentApp__"
+                set searchOutputString to ""
+                set q to "\(queryAS)"
+                set searchHitsList to (every track whose \(predicate))
+                set searchCountedNum to 0
+                repeat with trackItem in searchHitsList
+                    if searchCountedNum ≥ \(limit) then exit repeat
+                    set trackNameString to ""
+                    set trackArtistString to ""
+                    set trackAlbumString to ""
+                    set trackDurationString to ""
+                    try
+                        set trackNameString to (name of trackItem) as string
+                    end try
+                    try
+                        set trackArtistString to (artist of trackItem) as string
+                    end try
+                    try
+                        set trackAlbumString to (album of trackItem) as string
+                    end try
+                    try
+                        set trackDurationString to ((duration of trackItem) as string)
+                    end try
+                    set searchOutputString to searchOutputString & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "###"
+                    set searchCountedNum to searchCountedNum + 1
+                end repeat
+                return searchOutputString
+            end tell
+        end timeout
+        """
+        do {
+            let raw = try await runAppleScript(source, bundleID: "com.apple.Music")
+            let results = parseMusicTrackRecords(raw)
+            return .object([
+                "status": .string("completed"),
+                "count": .int(Int64(results.count)),
+                "results": .array(results),
+            ])
+        } catch let AppleScriptError.permissionDenied(app) {
+            return deniedEnvelope(integration: "music", app: app)
+        } catch {
+            return failedEnvelope(integration: "music", error: error)
+        }
+    }
+
+    public static func musicListLibrary(input: [String: JSONValue]) async throws -> JSONValue {
+        if let closed = musicClosed() { return closed }
+        let offset = clampedInt(input["offset"], defaultValue: 0, min: 0, max: 1_000_000)
+        let limit = clampedInt(input["limit"], defaultValue: 50, min: 1, max: 100)
+        let startIndex = offset + 1
+        let requestedEndIndex = offset + limit
+        let source = """
+        with timeout of 15 seconds
+            tell application "__NativeAgentApp__"
+                set totalTrackCountString to "0"
+                set libraryOutputString to ""
+                set totalTrackCountNum to count of tracks
+                set totalTrackCountString to totalTrackCountNum as string
+                set startIndexNum to \(startIndex)
+                set requestedEndIndexNum to \(requestedEndIndex)
+                if startIndexNum is less than or equal to totalTrackCountNum then
+                    set endIndexNum to requestedEndIndexNum
+                    if endIndexNum is greater than totalTrackCountNum then set endIndexNum to totalTrackCountNum
+                    repeat with trackIndexNum from startIndexNum to endIndexNum
+                        set trackItem to track trackIndexNum
+                        set trackNameString to ""
+                        set trackArtistString to ""
+                        set trackAlbumString to ""
+                        set trackDurationString to ""
+                        set trackPersistentIDString to ""
+                        try
+                            set trackNameString to (name of trackItem) as string
+                        end try
+                        try
+                            set trackArtistString to (artist of trackItem) as string
+                        end try
+                        try
+                            set trackAlbumString to (album of trackItem) as string
+                        end try
+                        try
+                            set trackDurationString to ((duration of trackItem) as string)
+                        end try
+                        try
+                            set trackPersistentIDString to (persistent ID of trackItem) as string
+                        end try
+                        set libraryOutputString to libraryOutputString & trackIndexNum & "|||" & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "|||" & trackPersistentIDString & "###"
+                    end repeat
+                end if
+                return totalTrackCountString & ":::PAGE:::" & libraryOutputString
+            end tell
+        end timeout
+        """
+        do {
+            let raw = try await runAppleScript(source, bundleID: "com.apple.Music")
+            let page = parseMusicPagedTrackRecords(raw, offset: offset, limit: limit)
+            return .object([
+                "status": .string("completed"),
+                "offset": .int(Int64(offset)),
+                "limit": .int(Int64(limit)),
+                "total": .int(Int64(page.total)),
+                "count": .int(Int64(page.tracks.count)),
+                "hasMore": .bool(offset + page.tracks.count < page.total),
+                "tracks": .array(page.tracks),
+            ])
+        } catch let AppleScriptError.permissionDenied(app) {
+            return deniedEnvelope(integration: "music", app: app)
+        } catch {
+            return failedEnvelope(integration: "music", error: error)
+        }
+    }
+
+    public static func musicListPlaylists(input: [String: JSONValue]) async throws -> JSONValue {
+        if let closed = musicClosed() { return closed }
+        let offset = clampedInt(input["offset"], defaultValue: 0, min: 0, max: 1_000_000)
+        let limit = clampedInt(input["limit"], defaultValue: 50, min: 1, max: 100)
+        let startIndex = offset + 1
+        let requestedEndIndex = offset + limit
+        let source = """
+        with timeout of 15 seconds
+            tell application "__NativeAgentApp__"
+                set totalPlaylistCountString to "0"
+                set playlistOutputString to ""
+                set totalPlaylistCountNum to count of playlists
+                set totalPlaylistCountString to totalPlaylistCountNum as string
+                set startIndexNum to \(startIndex)
+                set requestedEndIndexNum to \(requestedEndIndex)
+                if startIndexNum is less than or equal to totalPlaylistCountNum then
+                    set endIndexNum to requestedEndIndexNum
+                    if endIndexNum is greater than totalPlaylistCountNum then set endIndexNum to totalPlaylistCountNum
+                    repeat with playlistIndexNum from startIndexNum to endIndexNum
+                        set playlistItem to playlist playlistIndexNum
+                        set playlistNameString to ""
+                        set playlistTrackCountString to "unknown"
+                        set playlistPersistentIDString to ""
+                        set playlistSpecialKindString to ""
+                        try
+                            set playlistNameString to (name of playlistItem) as string
+                        end try
+                        try
+                            set playlistTrackCountString to ((count of tracks of playlistItem) as string)
+                        end try
+                        try
+                            set playlistPersistentIDString to (persistent ID of playlistItem) as string
+                        end try
+                        try
+                            set playlistSpecialKindString to (special kind of playlistItem) as string
+                        end try
+                        set playlistOutputString to playlistOutputString & playlistIndexNum & "|||" & playlistNameString & "|||" & playlistTrackCountString & "|||" & playlistPersistentIDString & "|||" & playlistSpecialKindString & "###"
+                    end repeat
+                end if
+                return totalPlaylistCountString & ":::PAGE:::" & playlistOutputString
+            end tell
+        end timeout
+        """
+        do {
+            let raw = try await runAppleScript(source, bundleID: "com.apple.Music")
+            let page = parseMusicPlaylistRecords(raw, offset: offset, limit: limit)
+            return .object([
+                "status": .string("completed"),
+                "offset": .int(Int64(offset)),
+                "limit": .int(Int64(limit)),
+                "total": .int(Int64(page.total)),
+                "count": .int(Int64(page.playlists.count)),
+                "hasMore": .bool(offset + page.playlists.count < page.total),
+                "playlists": .array(page.playlists),
+            ])
+        } catch let AppleScriptError.permissionDenied(app) {
+            return deniedEnvelope(integration: "music", app: app)
+        } catch {
+            return failedEnvelope(integration: "music", error: error)
+        }
+    }
+
+    /// Get current track + playback state. No required input.
+    /// Returns: {status, isPlaying, track: {name, artist, album, duration_seconds, position_seconds} | null}.
+    public static func musicNowPlaying(input: [String: JSONValue]) async throws -> JSONValue {
+        // Asking what plays must not launch Music.
+        if NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").isEmpty {
+            return .object(["status": .string("completed"), "isPlaying": .bool(false), "playerState": .string("not_running"),
+                            "track": .null, "reason": .string("Music isn't open.")])
+        }
+        // 2026-06-07 ITERATION 5 — Agent's theory: my state gate was too
+        // narrow. `player state` can return fast forwarding / rewinding /
+        // (queue-driven states on AirPlay or remote sessions). Comparing
+        // only to playing/paused fell through to "stopped|||" even when a
+        // track was clearly current.
+        //
+        // Better shape: just try to read `current track` properties no
+        // matter what the player state says. If the track read fails,
+        // THEN bail. Player state becomes informational, not a gate. This
+        // also handles the "as text" coercion issue for player state by
+        // simply checking each constant in turn for the label.
+        let source = """
+        with timeout of 5 seconds
+            tell application "__NativeAgentApp__"
+                set stateLabel to "unknown"
+                try
+                    set stateLabel to (player state as text)
+                end try
+                if stateLabel is "stopped" then
+                    return stateLabel & "|||NO_TRACK"
+                end if
+
+                try
+                    set currentTrackRef to current track
+                    set trackNameString to ""
+                    set trackArtistString to ""
+                    set trackAlbumString to ""
+                    set trackDurationString to "0"
+                    set playerPositionString to "0"
+
+                    try
+                        set trackNameString to (name of currentTrackRef) as text
+                    end try
+                    try
+                        set trackArtistString to (artist of currentTrackRef) as text
+                    end try
+                    try
+                        set trackAlbumString to (album of currentTrackRef) as text
+                    end try
+                    try
+                        set trackDurationString to ((duration of currentTrackRef) as text)
+                    end try
+                    try
+                        set playerPositionString to ((player position) as text)
+                    end try
+
+                    if trackNameString is "" and trackArtistString is "" and trackAlbumString is "" then
+                        return stateLabel & "|||NO_TRACK"
+                    end if
+                    return stateLabel & "|||" & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "|||" & playerPositionString
+                on error errMsg number errNum
+                    return stateLabel & "|||ERR:" & errNum & ":" & errMsg
+                end try
+            end tell
+        end timeout
+        """
+        do {
+            let raw = try await runAppleScript(source, bundleID: "com.apple.Music")
+            if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .object([
+                    "status": .string("completed"),
+                    "isPlaying": .bool(false),
+                    "playerState": .string("unknown"),
+                    "track": .null,
+                    "reason": .string("no_current_track"),
+                ])
+            }
+            let parts = raw.components(separatedBy: "|||")
+            let state = parts.first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+            let normalizedState = state.lowercased()
+            let knownStates: Set<String> = [
+                "playing", "paused", "stopped", "fast forwarding",
+                "fast_forwarding", "rewinding", "unknown",
+            ]
+            guard knownStates.contains(normalizedState) else {
+                return .object([
+                    "status": .string("failed"),
+                    "integration": .string("music"),
+                    "track": .null,
+                    "reason": .string("malformed_now_playing_response"),
+                ])
+            }
+            let isPlaying = normalizedState == "playing"
+            if parts.count == 2, parts[1] == "NO_TRACK" {
+                return .object([
+                    "status": .string("completed"),
+                    "isPlaying": .bool(false),
+                    "playerState": .string(state),
+                    "track": .null,
+                    "reason": .string("no_current_track"),
+                ])
+            }
+            if parts.count >= 6 {
+                let name = parts[1]
+                let artist = parts[2]
+                let album = parts[3]
+                let duration = Double(parts[4].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+                let position = Double(parts[5].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+                let track: JSONValue = .object([
+                    "name": .string(name),
+                    "artist": .string(artist),
+                    "album": .string(album),
+                    "duration_seconds": .double(duration),
+                    "position_seconds": .double(position),
+                ])
+                return .object([
+                    "status": .string("completed"),
+                    "isPlaying": .bool(isPlaying),
+                    "playerState": .string(state),
+                    "track": track,
+                ])
+            }
+            // 2026-06-07 diagnostic: surface the AppleScript error that
+            // caused the track read to fail so Agent can see WHY in chat
+            // instead of just a null track. parts.count == 2 means the
+            // script returned "<state>|||ERR:<errMsg>" — extract the
+            // error and surface it. The track stays null but at least
+            // we name what blocked us.
+            if parts.count == 2, parts[1].hasPrefix("ERR:") {
+                let msg = String(parts[1].dropFirst("ERR:".count))
+                if isMusicNoCurrentTrackError(msg) {
+                    return .object([
+                        "status": .string("completed"),
+                        "isPlaying": .bool(isPlaying),
+                        "playerState": .string(state),
+                        "track": .null,
+                        "reason": .string("no_current_track"),
+                    ])
+                }
+                return .object([
+                    "status": .string("failed"),
+                    "integration": .string("music"),
+                    "reason": .string("now_playing_applescript_error"),
+                    "applescript_error": .string(msg),
+                ])
+            }
+            return .object([
+                "status": .string("failed"),
+                "integration": .string("music"),
+                "isPlaying": .bool(isPlaying),
+                "playerState": .string(state),
+                "track": .null,
+                "reason": .string("malformed_now_playing_response"),
+            ])
+        } catch let AppleScriptError.permissionDenied(app) {
+            return deniedEnvelope(integration: "music", app: app)
+        } catch {
+            let ns = error as NSError
+            if ns.domain == "NativeAgentAppleScript", ns.code == -1751 {
+                return .object([
+                    "status": .string("completed"),
+                    "isPlaying": .bool(false),
+                    "playerState": .string("unknown"),
+                    "track": .null,
+                    "reason": .string("no_current_track"),
+                ])
+            }
+            return failedEnvelope(integration: "music", error: error)
+        }
+    }
+
+    /// Control playback: "action" (play, pause, toggle, next, previous and
+    /// their plain synonyms), or "playlist" / "track" to play one by name.
+    /// Returns: {status, action_performed, now_playing}.
+    public static func musicControl(input: [String: JSONValue]) async throws -> JSONValue {
+        func named(_ value: JSONValue?) -> String? {
+            guard let text = inputString(value)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+            return text
+        }
+        let playlist = named(input["playlist"]), track = named(input["track"] ?? input["song"] ?? input["query"])
+        let artist = named(input["artist"])
+        // Nothing asked: say what plays and what can be done; change nothing.
+        guard let action = named(input["action"])?.lowercased() ?? (playlist != nil || track != nil ? "play" : nil) else {
+            return .object(["status": .string("completed"), "action_performed": .string("none"),
+                            "now_playing": (try? await musicNowPlaying(input: [:])) ?? .null,
+                            "actions": .string("action play/pause/toggle/next/previous, or playlist or track (with artist) to play one by name")])
+        }
+        let command: String
+        switch action {
+        case "play", "resume", "start":
+            if let playlist {
+                command = """
+                set matchingPlaylists to (every playlist whose name is "\(escapeForAppleScript(playlist))")
+                if (count of matchingPlaylists) is 0 then
+                    set suggestions to ""
+                    set namesList to name of every playlist
+                    repeat with i from 1 to (count of namesList)
+                        if i > 6 then exit repeat
+                        set suggestions to suggestions & (item i of namesList) & "|||"
+                    end repeat
+                    return "missing_playlist|||" & suggestions
+                end if
+                if (count of matchingPlaylists) > 1 then return "ambiguous_playlist|||"
+                play item 1 of matchingPlaylists
+                """
+            }
+            else if let track {
+                // Exactly one track with exactly that name (and artist, when
+                // given); several or none play nothing and list candidates.
+                let pick: (id: String?, refusal: JSONValue?)
+                do { pick = try await pickTrack(track, artist: artist) }
+                catch let AppleScriptError.permissionDenied(app) { return deniedEnvelope(integration: "music", app: app) }
+                catch { return failedEnvelope(integration: "music", error: error) }
+                if let refusal = pick.refusal { return refusal }
+                command = "play (first track of library playlist 1 whose persistent ID is \"\(escapeForAppleScript(pick.id ?? ""))\")"
+            } else { command = "play" }
+        case "pause", "stop": command = "pause"
+        case "toggle", "playpause", "play_pause": command = "playpause"
+        case "next", "next_track", "skip", "forward": command = "next track"
+        case "previous", "prev", "previous_track", "back", "restart": command = "previous track"
+        default:
+            return .object(["status": .string("failed"), "effects": .string("none"), "integration": .string("music"), "reason": .string("unknown_action"),
+                            "fix": .string("Say play, pause, toggle, next or previous, or give playlist or track to play one by name.")])
+        }
+        let source = """
+        tell application "__NativeAgentApp__"
+            \(command)
+            return "ok"
+        end tell
+        """
+        do {
+            let raw = try await runAppleScript(source, bundleID: "com.apple.Music")
+            if raw.hasPrefix("missing_playlist|||") || raw.hasPrefix("ambiguous_playlist|||") {
+                let missing = raw.hasPrefix("missing_playlist|||")
+                let names = raw.components(separatedBy: "|||").dropFirst().filter { !$0.isEmpty }
+                return .object(["status": .string("failed"), "effects": .string("none"), "integration": .string("music"),
+                    "reason": .string(missing ? "playlist_not_found" : "ambiguous_playlist"),
+                    "playlists": .array(names.map(JSONValue.string)),
+                    "fix": .string(missing
+                        ? "No playlist is named \"\(playlist ?? "")\"." + (names.isEmpty ? " The library has no playlists." : " Available: " + names.joined(separator: ", ") + ".")
+                        : "More than one playlist is named \"\(playlist ?? "")\". Rename one in Music to select it exactly.")])
+            }
+        } catch let AppleScriptError.permissionDenied(app) {
+            return deniedEnvelope(integration: "music", app: app)
+        } catch {
+            // Music's "can't get" on a name that matched nothing.
+            if (error as NSError).code == -1728, let name = playlist ?? track {
+                return .object(["status": .string("failed"), "integration": .string("music"), "reason": .string("not_found"),
+                                "fix": .string("Nothing in the library matches \"\(name)\". music_list_playlists or music_search_library shows the exact names. Search the Apple Music catalog in Music if available, or play it in an existing Chrome tab using browser actions.")])
+            }
+            return failedEnvelope(integration: "music", error: error)
+        }
+        let nowPlaying = try await musicNowPlaying(input: [:])
+        guard case .object(let playback) = nowPlaying, playback["status"] == .string("completed") else { return nowPlaying }
+        let startsPlayback = ["play", "resume", "start"].contains(action)
+        let started = playback["isPlaying"] == .bool(true) && playback["track"] != nil && playback["track"] != .null
+        var result: [String: JSONValue] = ["status": .string(startsPlayback && !started ? "failed" : "completed"),
+                                         "action_performed": .string(action), "now_playing": nowPlaying]
+        if startsPlayback && !started {
+            result["reason"] = .string("playback_not_started")
+            result["fix"] = .string("Music has not started a track. Open Music and check that the selection is playable.")
+        }
+        if let playlist { result["playlist"] = .string(playlist) }
+        if let track { result["track"] = .string(track) }
+        return .object(result)
+    }
+
+    /// The one library track named exactly `name` (case aside), narrowed by
+    /// `artist` when given; otherwise a refusal naming the candidates.
+    private static func pickTrack(_ name: String, artist: String?) async throws -> (id: String?, refusal: JSONValue?) {
+        let q = escapeForAppleScript(name)
+        let source = """
+        with timeout of 10 seconds
+            tell application "__NativeAgentApp__"
+                set out to ""
+                set hits to (every track of library playlist 1 whose name is "\(q)")
+                if (count of hits) is 0 then set hits to (every track of library playlist 1 whose name contains "\(q)")
+                set n to 0
+                repeat with t in hits
+                    if n ≥ 12 then exit repeat
+                    set out to out & (persistent ID of t) & "|||" & (name of t) & "|||" & (artist of t) & "###"
+                    set n to n + 1
+                end repeat
+                return out
+            end tell
+        end timeout
+        """
+        let raw = try await runAppleScript(source, bundleID: "com.apple.Music")
+        let rows = raw.components(separatedBy: "###").compactMap { entry -> (id: String, name: String, artist: String)? in
+            let parts = entry.components(separatedBy: "|||")
+            guard parts.count >= 3 else { return nil }
+            return (parts[0].trimmingCharacters(in: .whitespacesAndNewlines), parts[1], parts[2])
+        }
+        var exact = rows.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        if let artist { exact = exact.filter { $0.artist.caseInsensitiveCompare(artist) == .orderedSame } }
+        if exact.count == 1 { return (exact[0].id, nil) }
+        let shown = (exact.isEmpty ? rows : exact).prefix(6).map { "\"\($0.name)\" by \($0.artist)" }.joined(separator: ", ")
+        let fix = exact.isEmpty
+            ? "No song is named exactly \"\(name)\"." + (shown.isEmpty ? " Search the Apple Music catalog in Music if available, or play it in an existing Chrome tab using browser actions." : " Close: \(shown). Give one exactly.")
+            : "\(exact.count) songs are named \"\(name)\": \(shown). Add artist to pick one."
+        return (nil, .object(["status": .string("failed"), "integration": .string("music"),
+                              "reason": .string(exact.isEmpty ? "not_found" : "ambiguous"), "fix": .string(fix)]))
+    }
+
+    /// A library read would launch Music; say it's closed instead.
+    static func musicClosed() -> JSONValue? {
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").isEmpty else { return nil }
+        return .object(["status": .string("completed"), "count": .int(0), "reason": .string("Music isn't open; music_control play opens it.")])
+    }
+}

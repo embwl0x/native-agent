@@ -343,31 +343,11 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     private func mutate<T: Sendable>(
         _ body: @Sendable (inout Snapshot) throws -> T
     ) async throws -> T {
-        try await persistence.withFileLock(path) { [path, persistence] in
-            var snapshot: Snapshot
-            if FileManager.default.fileExists(atPath: path.path) {
-                do {
-                    let data = try Data(contentsOf: path)
-                    snapshot = try JSONDecoder.nativeAgent.decode(Snapshot.self, from: data)
-                    guard snapshot.schemaVersion == 1,
-                          snapshot.operations.allSatisfy({
-                              Self.validOperationId($0.operationId)
-                                  && ($0.requestDigest == nil || Self.validRequestDigest($0.requestDigest))
-                          }) else {
-                        throw MacControlOperationStoreError.corruptStore
-                    }
-                } catch let error as MacControlOperationStoreError {
-                    throw error
-                } catch {
-                    throw MacControlOperationStoreError.corruptStore
-                }
-            } else {
-                snapshot = Snapshot(schemaVersion: 1, operations: [])
-            }
+        try await persistence.withFileLock(path) { [path] in
+            var snapshot = try await self.load()
             let result = try body(&snapshot)
             let encoded = try JSONEncoder.nativeAgent.encode(snapshot)
-            let json = try JSONValue.parse(encoded)
-            try await persistence.writeJSON(json, to: path)
+            try SwiftNativePersistenceCore.atomicWrite(encoded, to: path)
             return result
         }
     }

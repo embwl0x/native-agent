@@ -191,7 +191,7 @@ public enum LLMError: Error, Equatable, LocalizedError {
 /// An admitted turn's model takes precedence over the literal `model` argument.
 /// With neither, the model comes from the same snapshot's surface preferences,
 /// using Chat preferences when the surface has no entry.
-public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
+public final class SwiftNativeLLMClient: LLMClient {
     private let router: any ProviderRoutingProtocol
     private let codex: any LLMAdapter
     private let anthropic: any LLMAdapter
@@ -646,84 +646,13 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         guard wall > 0 else {
             return try await ProviderStreamContext.$stallOnly.withValue(true) { try await work() }
         }
-        // User, 2026-09-06: this used to race the call against a sleep inside a
-        // task group. Leaving a group WAITS for its cancelled children, so a
-        // provider that ignores cancellation never let the timeout return and
-        // the wall could not release the turn — exactly the hang it was added
-        // for. Both sides now run unstructured behind a resume-once gate, the
-        // shape `IntraTurnContextCompaction.withDeadline` uses (that type lives
-        // in ChatOrchestration, which ProviderRouting deliberately cannot see).
-        let child = Task { try await work() }
-        let sleeper = Task {
-            try? await Task.sleep(nanoseconds: UInt64(wall * 1_000_000_000))
-        }
-        let once = CompletionWallOnce<T>()
-        let outcome: Result<T, Error> = await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Result<T, Error>, Never>) in
-                once.install(continuation)
-                Task {
-                    let value = await child.result
-                    sleeper.cancel()
-                    once.resume(value)
-                }
-                Task {
-                    await sleeper.value
-                    guard !sleeper.isCancelled else { return }
-                    // User, 2026-09-06: CLAIM FIRST, THEN CANCEL. Cancelling the
-                    // child first let a cooperative provider throw
-                    // CancellationError and win the once-gate, so a wall
-                    // timeout surfaced as a user Stop — the turn persisted
-                    // "cancelled" for a stop nobody pressed, and the recovery
-                    // ladder skipped a retry it was entitled to.
-                    once.resume(.failure(ProviderFailure.Diagnostic(
-                        cause: .network, detail: "\(label) completion wall timeout after \(Int(wall))s",
-                        deadlineExpired: true
-                    )))
-                    child.cancel()
-                }
-            }
-        } onCancel: {
-            // A Stop returns NOW, even if the provider ignores cancellation.
-            child.cancel()
-            sleeper.cancel()
-            once.resume(.failure(CancellationError()))
-        }
-        return try outcome.get()
-    }
-
-    /// Resume-once gate for `withCompletionWall`'s two racers. Resuming before
-    /// the continuation is installed is remembered and applied on install, so a
-    /// cancellation that lands first still resolves the wait.
-    private final class CompletionWallOnce<T: Sendable>: @unchecked Sendable {
-        private let lock = NSLock()
-        private var continuation: CheckedContinuation<Result<T, Error>, Never>?
-        private var pending: Result<T, Error>?
-        private var resolved = false
-
-        func install(_ continuation: CheckedContinuation<Result<T, Error>, Never>) {
-            lock.lock()
-            if let pending {
-                self.pending = nil
-                lock.unlock()
-                continuation.resume(returning: pending)
-                return
-            }
-            self.continuation = continuation
-            lock.unlock()
-        }
-
-        func resume(_ value: Result<T, Error>) {
-            lock.lock()
-            guard !resolved else { lock.unlock(); return }
-            resolved = true
-            if let continuation {
-                self.continuation = nil
-                lock.unlock()
-                continuation.resume(returning: value)
-                return
-            }
-            pending = value
-            lock.unlock()
+        do {
+            return try await TurnDeadline.withThrowingDeadline(seconds: wall, work)
+        } catch is TurnDeadline.DeadlineExceeded {
+            throw ProviderFailure.Diagnostic(
+                cause: .network, detail: "\(label) completion wall timeout after \(Int(wall))s",
+                deadlineExpired: true
+            )
         }
     }
 
@@ -762,50 +691,8 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             return try await completeMessages(messages: [LLMMessage(role: .user, content: [.text(prompt)])],
                 system: system, model: model, surface: surface, tools: tools)
         }
-        let routingSnapshot = try await checkedRoutingSnapshot()
-        let resolvedModel = try resolveRequestedModel(
-            model,
-            surface: surface,
-            routingSnapshot: routingSnapshot
-        )
-        let resolution = await resolveAdapterAndModel(
-            model: resolvedModel,
-            surface: surface,
-            routingSnapshot: routingSnapshot
-        )
-        try validateCatalogAvailability(resolution)
-        ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
-        let effectiveModel = resolution.model
-        let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
-        let attemptStartedAt = ProcessInfo.processInfo.systemUptime
-        let lifecycle = await providerLifecycleStart(
-            resolution: resolution,
-            surface: surface,
-            streaming: false,
-            reasoningEffort: controls.effort
-        )
-        // U1 step 1: bind the calling surface task-locally so the adapters'
-        // llm.call telemetry rows can carry it (no signature changes).
-        let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
-        do {
-            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) { try await LLMCallContext.$surface.withValue(surface) {
-                try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
-                    try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
-                return try await adapter(for: resolution, tools: tools).adapter.complete(
-                    prompt: prompt, system: system, model: effectiveModel, tools: tools
-                )
-                    }
-                }
-            } } } }
-            await providerLifecycleFinish(lifecycle, phase: .succeeded)
-            return result
-        } catch is CancellationError {
-            await providerLifecycleFinish(lifecycle, phase: .cancelled)
-            throw CancellationError()
-        } catch {
-            await providerLifecycleFinish(lifecycle, phase: .failed)
-            await recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
-            throw ProviderFailure.normalize(error)
+        return try await executeCompletion(model: model, surface: surface, tools: tools) { adapter, effectiveModel in
+            try await adapter.complete(prompt: prompt, system: system, model: effectiveModel, tools: tools)
         }
     }
 
@@ -835,6 +722,17 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             }
             return result
         }
+        return try await executeCompletion(model: model, surface: surface, tools: tools) { adapter, effectiveModel in
+            try await adapter.completeMessages(messages: messages, system: system, model: effectiveModel, tools: tools)
+        }
+    }
+
+    private func executeCompletion(
+        model: String?,
+        surface: String,
+        tools: [LLMToolSchema]?,
+        operation: @escaping @Sendable (any LLMAdapter, String) async throws -> String
+    ) async throws -> String {
         let routingSnapshot = try await checkedRoutingSnapshot()
         let resolvedModel = try resolveRequestedModel(
             model,
@@ -848,7 +746,6 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         )
         try validateCatalogAvailability(resolution)
         ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
-        let effectiveModel = resolution.model
         let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
         let attemptStartedAt = ProcessInfo.processInfo.systemUptime
         let lifecycle = await providerLifecycleStart(
@@ -857,18 +754,21 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             streaming: false,
             reasoningEffort: controls.effort
         )
-        // U1 step 1: bind the calling surface task-locally for telemetry.
         let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
         do {
-            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) { try await LLMCallContext.$surface.withValue(surface) {
-                try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
-                    try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
-                return try await adapter(for: resolution, tools: tools).adapter.completeMessages(
-                    messages: messages, system: system, model: effectiveModel, tools: tools
-                )
+            let result = try await ProviderRecoveryPolicy.retryOverload {
+                try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in
+                    try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
+                        try await LLMCallContext.$surface.withValue(surface) {
+                            try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
+                                try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
+                                    try await operation(adapter(for: resolution, tools: tools).adapter, resolution.model)
+                                }
+                            }
+                        }
                     }
                 }
-            } } } }
+            }
             await providerLifecycleFinish(lifecycle, phase: .succeeded)
             return result
         } catch is CancellationError {
@@ -1014,7 +914,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         }
     }
 
-    // MARK: StreamingLLMClient
+    // MARK: Streaming
 
     /// Mirror of `complete(...)`'s dispatch: by-prefix routing to the right
     /// adapter's `stream(...)`. Same router fallback when `model` is nil/empty.

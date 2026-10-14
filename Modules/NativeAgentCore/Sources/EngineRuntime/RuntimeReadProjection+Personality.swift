@@ -5,7 +5,7 @@ import Cognition
 
 extension RuntimeReadProjection {
     public static func swiftPersonalityGrowth(
-        growthWeekProvider: @escaping @Sendable () async throws -> [String]
+        runtime: NativeCognitionRuntime
     ) async throws -> PersonalityGrowthSummary {
         let compiler = PersonaCompiler()
         let feedbackProvider: @Sendable () async throws -> Int = {
@@ -21,7 +21,7 @@ extension RuntimeReadProjection {
         // the rows are injected here exactly as the feedback count is.
         let summary = try await compiler.growthSummary(
             feedbackMemoryProvider: feedbackProvider,
-            growthWeekProvider: growthWeekProvider,
+            growthWeekProvider: { await runtime.substrate.growthWeekLines() },
             now: Date.init
         )
         return PersonalityGrowthSummary(

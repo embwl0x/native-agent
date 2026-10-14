@@ -65,13 +65,13 @@ extension SwiftNativeResearchClient {
 
         // Receipt write: {id, query, url, results, createdAt} →
         // data/research/<id>.json. Matches the retired daemon.
-        let receiptID = receiptIDFactory()
+        let receiptID = UUID().uuidString.lowercased()
         let receiptObj: JSONValue = .object([
             "id": .string(receiptID),
             "query": .string(query),
             "url": .string(url.absoluteString),
             "results": .array(results.map { $0.toJSON() }),
-            "createdAt": .string(Self.isoTimestamp(now())),
+            "createdAt": .string(Self.isoTimestamp(Date())),
         ])
         let receiptPath = receiptsDir.appendingPathComponent("\(receiptID).json")
         try await persistence.writeJSON(receiptObj, to: receiptPath)
@@ -103,10 +103,11 @@ extension SwiftNativeResearchClient {
               scheme == "http" || scheme == "https" else {
             throw ResearchClientError.malformedResponse("Only http/https URLs are allowed")
         }
-        func get(_ target: URL, maxBytes: Int) async throws -> ResearchHTTPResponse {
+        func get(_ target: URL) async throws -> ResearchHTTPResponse {
             let response: ResearchHTTPResponse
             do {
-                response = try await http.getBounded(url: target, timeout: 30, maxBytes: maxBytes)
+                response = try await http.getBounded(url: target, timeout: 30, maxBytes: 1_000_000,
+                                                     pdfMaxBytes: MacDocumentRead.maxFileBytes)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -126,24 +127,19 @@ extension SwiftNativeResearchClient {
             response.contentType?.split(separator: ";").first?
                 .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         }
-        var byteLimit = 1_000_000
-        var response = try await get(parsed, maxBytes: byteLimit)
+        var response = try await get(parsed)
         var finalURL = response.finalURL
         // A <meta http-equiv=refresh> page ("Redirecting…") is a redirect a
         // browser follows; follow one hop, as an HTTP redirect is followed.
         if mimeOf(response).contains("html"),
            let next = Self.metaRefreshTarget(String(decoding: response.body, as: UTF8.self), base: finalURL ?? parsed),
            next.absoluteString != (finalURL ?? parsed).absoluteString {
-            response = try await get(next, maxBytes: byteLimit)
+            response = try await get(next)
             finalURL = response.finalURL ?? next
         }
         // A PDF is read by the app's PDF reader, under its own size bound.
         let looksLikePDF = mimeOf(response) == "application/pdf" || response.body.starts(with: Data("%PDF-".utf8))
-        if looksLikePDF, response.truncated {
-            byteLimit = MacDocumentRead.maxFileBytes
-            response = try await get(finalURL ?? parsed, maxBytes: byteLimit)
-            finalURL = response.finalURL ?? finalURL
-        }
+        let byteLimit = looksLikePDF ? MacDocumentRead.maxFileBytes : 1_000_000
         let mime = mimeOf(response)
         let supported = mime.isEmpty || mime.hasPrefix("text/") || mime == "application/json"
             || mime.hasSuffix("+json") || mime == "application/xml" || mime.hasSuffix("+xml")
@@ -221,7 +217,7 @@ extension SwiftNativeResearchClient {
                 ? "Text covers the retained response body. Tool-output paging may expose it in sections. Body truncation means the source was not fully read."
                 : "No readable text was extracted. Discover an appropriate reader for this content type or encoding; this is not an empty-page finding."),
         ])
-        let sourceID = receiptIDFactory()
+        let sourceID = UUID().uuidString.lowercased()
         // The locator names the receipt this call actually writes. It is not
         // an access grant, a permanent archive, or a promise of future presence.
         let receiptPath = receiptsDir.appendingPathComponent("source-\(sourceID).json")
@@ -238,7 +234,7 @@ extension SwiftNativeResearchClient {
             "access": .string("Normal file permissions apply. This locator does not grant access."),
         ])
         let record = ResearchFetchRecord(
-            id: sourceID, url: url, text: text, createdAt: Self.isoTimestamp(now()), coverage: coverage,
+            id: sourceID, url: url, text: text, createdAt: Self.isoTimestamp(Date()), coverage: coverage,
             sourceReceipt: sourceReceipt
         )
         try Task.checkCancellation()
@@ -269,10 +265,6 @@ extension SwiftNativeResearchClient {
         guard !raw.isEmpty, let target = URL(string: decodeHTMLEntities(raw), relativeTo: base)?.absoluteURL,
               ["http", "https"].contains(target.scheme?.lowercased() ?? "") else { return nil }
         return target
-    }
-
-    static func extractText(fromHTML html: String) -> String {
-        extractHTML(html).text
     }
 
     private static func extractHTML(_ html: String)

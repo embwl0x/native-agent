@@ -130,7 +130,7 @@ extension SwiftToolDispatcher {
             let needle = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
             let limit = max(1, min(
                 Self.dreamDiaryQueryMaximumLimit,
-                optionalInt(input, "limit") ?? Self.dreamDiaryQueryDefaultLimit))
+                Self.jsonInt(input["limit"]) ?? Self.dreamDiaryQueryDefaultLimit))
             let matched = entries.filter {
                 ($0.content ?? "").range(of: needle, options: .caseInsensitive) != nil
             }
@@ -152,7 +152,7 @@ extension SwiftToolDispatcher {
         // The INDEX, grouped the way the Dreams page groups it.
         let weeksAsked = max(1, min(
             Self.dreamDiaryMaximumWeeks,
-            optionalInt(input, "weeks") ?? Self.dreamDiaryDefaultWeeks))
+            Self.jsonInt(input["weeks"]) ?? Self.dreamDiaryDefaultWeeks))
         let allWeeks = Self.dreamDiaryWeeks(entries, dataRoot: dataRoot)
         let shown = Array(allWeeks.prefix(weeksAsked))
         let listed = shown.reduce(0) { $0 + $1.count }

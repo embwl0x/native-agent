@@ -6,16 +6,7 @@ import Observation
 import UIKit
 import Speech
 import AVFoundation
-
-struct VoiceInputLifecycleSnapshot: Equatable {
-    let isListening: Bool
-    let isStarting: Bool
-    let tapInstalled: Bool
-    let hasRecognitionTask: Bool
-    let desiredListening: Bool
-    let waitingForFinalAfterStop: Bool
-    let generation: Int
-}
+import os
 
 enum VoiceInputAuthorizationPresentation {
     static func speechFailureMessage(
@@ -36,14 +27,6 @@ enum VoiceInputAuthorizationPresentation {
     }
 }
 
-// PERF-2026-08-05: was `ObservableObject` with 8 `@Published` properties, injected
-// at the app root via `.environmentObject` and subscribed by the 1454-line ChatView.
-// `objectWillChange` is whole-object, so the ~45Hz `audioLevel` write from the
-// installTap audio callback invalidated the ENTIRE chat screen while the mic was
-// live — driven by a property no view reads. `@Observable` is field-granular: a
-// view only re-renders for the exact properties its body touched. This matches the
-// Mac controller (Sources/NativeAgentApp/VoiceInputController.swift), which has
-// always been `@Observable`.
 @MainActor
 @Observable
 final class VoiceInputController {
@@ -53,19 +36,10 @@ final class VoiceInputController {
     var lastFinalTranscript = "" // populated when user releases
     var error: String?
     var statusText: String?
-    /// Written ~45Hz from the audio tap. No view reads it today (no level meter /
-    /// waveform exists on iOS). Left observation-tracked deliberately: under
-    /// `@Observable` an unread property costs nothing, and if a meter is ever
-    /// added only that leaf view will re-render. Do NOT read this from a
-    /// container view — read it from the smallest possible leaf.
-    var audioLevel: Double = 0
     var hasReceivedAudio = false
 
-    @ObservationIgnored private var recognizer: SFSpeechRecognizer?
-    @ObservationIgnored private var audioEngine = AVAudioEngine()
-    @ObservationIgnored private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    @ObservationIgnored private var recognitionTask: SFSpeechRecognitionTask?
-    @ObservationIgnored private var tapInstalled = false
+    @ObservationIgnored private var audioToken: UUID?
+    @ObservationIgnored private var hasRecognitionTask = false
     @ObservationIgnored private var desiredListening = false
     @ObservationIgnored private var startGeneration = 0
     @ObservationIgnored private var waitingForFinalAfterStop = false
@@ -74,25 +48,12 @@ final class VoiceInputController {
     @ObservationIgnored private let requestSpeechAuthorization: () async -> SFSpeechRecognizerAuthorizationStatus
     @ObservationIgnored private let requestMicrophoneAuthorization: () async -> Bool
 
-    var lifecycleSnapshot: VoiceInputLifecycleSnapshot {
-        .init(
-            isListening: isListening,
-            isStarting: isStarting,
-            tapInstalled: tapInstalled,
-            hasRecognitionTask: recognitionTask != nil,
-            desiredListening: desiredListening,
-            waitingForFinalAfterStop: waitingForFinalAfterStop,
-            generation: startGeneration
-        )
-    }
-
     init(
         requestSpeechAuthorization: @escaping () async -> SFSpeechRecognizerAuthorizationStatus = { await VoiceInputController.requestSpeechAuthorization() },
         requestMicrophoneAuthorization: @escaping () async -> Bool = { await VoiceInputController.requestMicrophonePermission() }
     ) {
         self.requestSpeechAuthorization = requestSpeechAuthorization
         self.requestMicrophoneAuthorization = requestMicrophoneAuthorization
-        recognizer = SFSpeechRecognizer(locale: Locale.current)
 
         // Stop cleanly when the app backgrounds (e.g. home-button press mid-hold)
         NotificationCenter.default.addObserver(
@@ -114,7 +75,7 @@ final class VoiceInputController {
         // leak the audio engine across multiple rapid presses.
         finalResultTimeout?.cancel()
         finalResultTimeout = nil
-        if recognitionTask != nil { teardownAudio(cancelTask: true) }
+        if hasRecognitionTask { teardownAudio(cancelTask: true) }
         startGeneration += 1
         let generation = startGeneration
         isStarting = true
@@ -125,7 +86,6 @@ final class VoiceInputController {
         statusText = "Requesting speech recognition permission..."
         transcript = ""
         lastFinalTranscript = ""
-        audioLevel = 0
         hasReceivedAudio = false
         defer {
             if generation == startGeneration, !isListening {
@@ -154,127 +114,53 @@ final class VoiceInputController {
             return
         }
 
-        guard let recognizer, recognizer.isAvailable else {
-            desiredListening = false
-            error = "Speech recognition unavailable on this device or locale."
-            statusText = nil
-            return
-        }
-
-        // 3. Configure AVAudioSession
-        let session = AVAudioSession.sharedInstance()
+        let token = UUID()
+        audioToken = token
         do {
-            try session.setCategory(
-                .playAndRecord,
-                mode: .measurement,
-                options: [.allowBluetoothHFP, .defaultToSpeaker, .duckOthers]
-            )
-            try? session.setPreferredSampleRate(16_000)
-            try? session.setPreferredIOBufferDuration(0.02)
-            try session.setActive(true, options: .notifyOthersOnDeactivation)
+            let preparationError = try await MobileAudioService.shared.prepareInput(token: token, onAudio: { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.startGeneration == generation
+                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
+                    self.hasReceivedAudio = true
+                    if self.transcript.isEmpty { self.statusText = "Hearing you..." }
+                }
+            }, onResult: { [weak self, generation] text, isFinal in
+                Task { @MainActor in
+                    guard let self, self.startGeneration == generation
+                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
+                    self.transcript = text
+                    if self.waitingForFinalAfterStop && isFinal { self.publishStoppedTranscript() }
+                }
+            }, onError: { [weak self, generation] detail in
+                Task { @MainActor in
+                    guard let self, self.startGeneration == generation
+                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
+                    if let detail { self.error = detail }
+                    if self.waitingForFinalAfterStop { self.publishStoppedTranscript() }
+                    else if detail != nil { self.teardownAudio(cancelTask: true) }
+                }
+            })
+            guard desiredListening, generation == startGeneration else {
+                teardownAudio(cancelTask: true); return
+            }
+            if let preparationError {
+                desiredListening = false
+                teardownAudio(cancelTask: true)
+                self.error = preparationError
+                statusText = nil
+                return
+            }
         } catch {
-            desiredListening = false
+            teardownAudio(cancelTask: true)
             self.error = "Microphone could not start: \(error.localizedDescription)"
             statusText = nil
             return
         }
-        guard desiredListening, generation == startGeneration else {
-            try? session.setActive(false, options: .notifyOthersOnDeactivation)
-            return
-        }
-
-        // 4. Build recognition request
-        audioEngine = AVAudioEngine()
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = false
-        if #available(iOS 16.0, *) {
-            request.addsPunctuation = true
-        }
-        request.taskHint = .dictation
-        recognitionRequest = request
-
-        // 5. Install tap on input node
-        let inputNode = audioEngine.inputNode
-        let format = inputNode.inputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            teardownAudio(cancelTask: true)
-            self.error = "No usable microphone input route was found."
-            statusText = nil
-            return
-        }
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self, request] buffer, _ in
-            request.append(buffer)
-            guard let channelData = buffer.floatChannelData?.pointee else { return }
-            let frameCount = Int(buffer.frameLength)
-            guard frameCount > 0 else { return }
-            var sum: Float = 0
-            for index in 0..<frameCount {
-                let sample = channelData[index]
-                sum += sample * sample
-            }
-            let rms = sqrt(sum / Float(frameCount))
-            let normalized = min(1.0, max(0.0, Double(rms) * 35.0))
-            Task { @MainActor [weak self] in
-                guard let self, self.desiredListening || self.waitingForFinalAfterStop else { return }
-                self.audioLevel = normalized
-                if rms > 0.002 {
-                    // PERF-2026-08-05: `@Observable` setters fire a mutation
-                    // unconditionally, including for same-value writes. These two
-                    // used to be re-assigned every buffer (~45Hz); `statusText` IS
-                    // read by ChatView, so the redundant writes would have kept a
-                    // slice of the storm alive. Same final values, one write each.
-                    if !self.hasReceivedAudio {
-                        self.hasReceivedAudio = true
-                    }
-                    if self.transcript.isEmpty, self.statusText != "Hearing you..." {
-                        self.statusText = "Hearing you..."
-                    }
-                }
-            }
-        }
-        tapInstalled = true
-
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self, generation] result, err in
-            guard let self else { return }
-            if let result {
-                let isFinal = result.isFinal
-                Task { @MainActor in
-                    guard self.startGeneration == generation
-                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1)
-                    else { return }
-                    let text = result.bestTranscription.formattedString
-                    self.transcript = text
-                    if self.waitingForFinalAfterStop && isFinal {
-                        self.publishStoppedTranscript()
-                    }
-                }
-            }
-            if let err {
-                let nsErr = err as NSError
-                // Code 216 / 203 = cancelled/no-speech — suppress; they're normal on stop.
-                let suppressed = nsErr.domain == "kAFAssistantErrorDomain"
-                    && (nsErr.code == 216 || nsErr.code == 203 || nsErr.code == 1110)
-                Task { @MainActor in
-                    guard self.startGeneration == generation
-                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1)
-                    else { return }
-                    if !suppressed {
-                        self.error = err.localizedDescription
-                    }
-                    if self.waitingForFinalAfterStop {
-                        self.publishStoppedTranscript()
-                    } else if !suppressed {
-                        self.teardownAudio(cancelTask: true)
-                    }
-                }
-            }
-        }
+        hasRecognitionTask = true
 
         // 6. Start engine after the recognition task is ready to consume buffers.
-        audioEngine.prepare()
         do {
-            try audioEngine.start()
+            try await MobileAudioService.shared.startInput(token: token)
             hasStartedAudioSession = true
         } catch {
             teardownAudio(cancelTask: true)
@@ -290,7 +176,7 @@ final class VoiceInputController {
         isListening = true
         isStarting = false
         error = nil
-        statusText = "Listening..."
+        statusText = hasReceivedAudio && transcript.isEmpty ? "Hearing you..." : "Listening..."
     }
 
     /// End audio on touch-up, then allow recognition to finalize before publishing.
@@ -337,29 +223,18 @@ final class VoiceInputController {
     // MARK: - Private
 
     private func teardownAudio(cancelTask: Bool) {
-        recognitionRequest?.endAudio()
-        if cancelTask {
-            recognitionTask?.cancel()
-            recognitionTask = nil
-        } else {
-            recognitionTask?.finish()
+        if cancelTask { hasRecognitionTask = false }
+        if let token = audioToken {
+            Task {
+                do { try await MobileAudioService.shared.stopInput(token: token, cancelTask: cancelTask) }
+                catch { NSLog("[VoiceInputController] audio session deactivate failed: %@", error.localizedDescription) }
+            }
+            if cancelTask { audioToken = nil }
         }
-        recognitionRequest = nil
-
-        if tapInstalled {
-            audioEngine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
-        if audioEngine.isRunning {
-            audioEngine.stop()
-        }
-
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         isListening = false
         isStarting = false
         hasStartedAudioSession = false
         statusText = nil
-        audioLevel = 0
     }
 
     func openSettings() {
@@ -384,5 +259,102 @@ final class VoiceInputController {
                 cont.resume(returning: granted)
             }
         }
+    }
+}
+
+actor MobileAudioService {
+    static let shared = MobileAudioService()
+    private var engine: AVAudioEngine?
+    private var recognizer: SFSpeechRecognizer?
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var inputToken: UUID?
+    private var routeToken: UUID?
+    private var tapInstalled = false
+
+    func prepareInput(token: UUID, onAudio: @escaping @Sendable () -> Void,
+                      onResult: @escaping @Sendable (String, Bool) -> Void,
+                      onError: @escaping @Sendable (String?) -> Void) throws -> String? {
+        if let inputToken { try stopInput(token: inputToken, cancelTask: true) }
+        let recognizer = SFSpeechRecognizer(locale: Locale.current)
+        guard let recognizer, recognizer.isAvailable else { return "Speech recognition unavailable on this device or locale." }
+        self.recognizer = recognizer
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.requiresOnDeviceRecognition = false
+        request.addsPunctuation = true
+        request.taskHint = .dictation
+        self.request = request
+        inputToken = token
+        routeToken = token
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, mode: .measurement,
+            options: [.allowBluetoothHFP, .defaultToSpeaker, .duckOthers])
+        try? session.setPreferredSampleRate(16_000)
+        try? session.setPreferredIOBufferDuration(0.02)
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
+        let engine = AVAudioEngine()
+        self.engine = engine
+        let input = engine.inputNode
+        let format = input.inputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { return "No usable microphone input route was found." }
+        let hasReceivedAudio = OSAllocatedUnfairLock(initialState: false)
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+            request.append(buffer)
+            let firstAudibleBuffer = hasReceivedAudio.withLockUnchecked { received in
+                guard !received, let data = buffer.floatChannelData?.pointee, buffer.frameLength > 0 else { return false }
+                var sum: Float = 0
+                for index in 0..<Int(buffer.frameLength) { sum += data[index] * data[index] }
+                guard sqrt(sum / Float(buffer.frameLength)) > 0.002 else { return false }
+                received = true
+                return true
+            }
+            if firstAudibleBuffer { onAudio() }
+        }
+        tapInstalled = true
+        recognitionTask = recognizer.recognitionTask(with: request) { result, error in
+            if let result { onResult(result.bestTranscription.formattedString, result.isFinal) }
+            if let error {
+                let failure = error as NSError
+                let suppressed = failure.domain == "kAFAssistantErrorDomain"
+                    && (failure.code == 216 || failure.code == 203 || failure.code == 1110)
+                onError(suppressed ? nil : error.localizedDescription)
+            }
+        }
+        return nil
+    }
+
+    func startInput(token: UUID) throws {
+        guard inputToken == token, let engine else { throw CancellationError() }
+        engine.prepare()
+        try engine.start()
+    }
+
+    func stopInput(token: UUID, cancelTask: Bool) throws {
+        guard inputToken == token else { return }
+        request?.endAudio()
+        if cancelTask { recognitionTask?.cancel(); recognitionTask = nil; inputToken = nil; recognizer = nil }
+        else { recognitionTask?.finish() }
+        request = nil
+        if tapInstalled { engine?.inputNode.removeTap(onBus: 0) }
+        tapInstalled = false
+        engine?.stop()
+        engine = nil
+        guard routeToken == token else { return }
+        try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        routeToken = nil
+    }
+
+    func prepareOutput(token: UUID, configure: @Sendable () throws -> Void,
+                       activate: @Sendable () throws -> Void) throws {
+        try configure()
+        try activate()
+        routeToken = token
+    }
+
+    func releaseOutput(token: UUID, deactivate: @Sendable () throws -> Void) throws {
+        guard routeToken == token else { return }
+        try deactivate()
+        routeToken = nil
     }
 }

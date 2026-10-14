@@ -35,10 +35,6 @@ import PersistenceCore
 // not an index: indices shift under the tail limit every turn, identities do
 // not. A boundary that no longer appears in the admitted set drops nothing —
 // fail-open is a bigger prompt, never a lost row.
-//
-// File shape, actor discipline, per-file lock, and the hourly orphan sweep all
-// mirror `ChatSessionActiveTools` / `ActiveToolsStore` deliberately: same
-// failure modes, same recovery, one pattern to reason about.
 
 public struct HistoryWindowCursor: Codable, Sendable, Equatable {
     public var sessionId: String
@@ -76,25 +72,9 @@ public actor HistoryWindowCursorStore {
     /// Post-advance target. Trimming well under the ceiling is what makes the
     /// next several turns cache-stable.
     static let advanceTargetRatio = 0.70
-    /// Orphan-sweep horizon and cadence — identical contract to
-    /// `ActiveToolsStore`: this reaps `<id>.json` / `<id>.json.lock` left by
-    /// sessions that ended or crashed, and is NOT a decay rule for live state.
-    private static let ttlSeconds: TimeInterval = 24 * 60 * 60
-    private static let sweepIntervalSeconds: TimeInterval = 60 * 60
-
-    private static func makeISO8601() -> ISO8601DateFormatter {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }
-
-    nonisolated private static func iso8601Now() -> String {
-        makeISO8601().string(from: Date())
-    }
 
     private let persistence = SwiftNativePersistenceCore()
     private let dataRootOverride: URL?
-    private var lastSweepAt: Date?
 
     public init(dataRoot: URL? = nil) {
         self.dataRootOverride = dataRoot
@@ -111,24 +91,6 @@ public actor HistoryWindowCursorStore {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("prefix_window", isDirectory: true)
             .appendingPathComponent("\(safe).json")
-    }
-
-    // MARK: - Reads
-
-    public func load(sessionId: String) async throws -> HistoryWindowCursor {
-        await sweepOrphansIfDue()
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard NativeAgentChatSessionID.isSafePathComponent(trimmed) else {
-            return HistoryWindowCursor(sessionId: sessionId)
-        }
-        let path = pathFor(sessionId: trimmed)
-        do {
-            return try await persistence.withFileLock(path) {
-                try await self.loadLocked(path: path, sessionId: trimmed)
-            }
-        } catch {
-            throw error
-        }
     }
 
     // MARK: - The one advance boundary
@@ -157,36 +119,20 @@ public actor HistoryWindowCursorStore {
         do {
             return try await persistence.withFileLock(path) {
                 let state = try await self.loadLocked(path: path, sessionId: trimmed)
-                // PERSIST ON EVERY PATH. The file used to be written ONLY on a
-                // successful advance, so a session that never crossed the
-                // pressure threshold left no file at all — live CD041E66 had
-                // only the `.lock` sidecar (created by `withFileLock`
-                // regardless) and no `.json`. That made the one piece of state
-                // that pins the prefix head invisible: "no advance yet" and
-                // "the write path is broken" looked identical from outside.
-                // Writing the CURRENT boundary every turn costs one small
-                // locked write, keeps the file's mtime fresh for the orphan
-                // sweep, and makes the cursor observable.
-                func persistingCurrentState() async -> (HistoryWindowCursor, Bool) {
-                    var refreshed = state
-                    refreshed.updatedAt = Self.iso8601Now()
-                    try? await self.saveLocked(refreshed, path: path)
-                    return (state, false)
-                }
                 // NEVER twice within one turn: a tool loop's later iterations
                 // must read the same prefix iteration 1 wrote.
                 if let turnId, !turnId.isEmpty, state.lastAdvanceTurnId == turnId {
                     return (state, false)
                 }
                 // Compaction already owns this turn's rewrite.
-                guard !compactionRanThisTurn else { return await persistingCurrentState() }
+                guard !compactionRanThisTurn else { return (state, false) }
                 guard let boundary = Self.nextBoundary(
                     admitted: admitted,
                     currentBoundary: state.dropBoundaryIdentity,
                     budgetChars: budgetChars,
                     rowCap: rowCap
                 ) else {
-                    return await persistingCurrentState()
+                    return (state, false)
                 }
                 // THE WRITE IS THE DECISION. A swallowed save failure used to
                 // return `didAdvance: true` against an in-memory cursor that
@@ -200,7 +146,7 @@ public actor HistoryWindowCursorStore {
                 advanced.dropBoundaryIdentity = boundary
                 advanced.advanceCount += 1
                 advanced.lastAdvanceTurnId = turnId
-                advanced.updatedAt = Self.iso8601Now()
+                advanced.updatedAt = NativeTimestampFormat.fractionalZulu(Date())
                 do {
                     try await self.saveLocked(advanced, path: path)
                 } catch {
@@ -349,39 +295,6 @@ public actor HistoryWindowCursorStore {
         ))
     }
 
-    // MARK: - Orphan sweep (identical contract to ActiveToolsStore)
-
-    private func sweepOrphansIfDue() async {
-        let now = Date()
-        if let last = lastSweepAt, now.timeIntervalSince(last) < Self.sweepIntervalSeconds {
-            return
-        }
-        lastSweepAt = now
-        let dir = dataRoot()
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("prefix_window", isDirectory: true)
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-        for url in entries where url.pathExtension == "json" {
-            try? await persistence.withFileLock(url) {
-                guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
-                      let mtime = vals.contentModificationDate,
-                      now.timeIntervalSince(mtime) > Self.ttlSeconds else { return }
-                try? FileManager.default.removeItem(at: url)
-            }
-        }
-        // Lock sidecars, same three conditions as ActiveToolsStore: the
-        // sibling .json is gone, the lock is older than the TTL, and the
-        // unlink happens while holding that lock.
-        await reapOrphanedChatSessionLockSidecars(
-            entries: entries, now: now, ttlSeconds: Self.ttlSeconds, persistence: persistence
-        )
-    }
-
     // MARK: - Helpers (must be called while holding the file lock)
 
     private func loadLocked(path: URL, sessionId: String) async throws -> HistoryWindowCursor {
@@ -461,25 +374,6 @@ public struct HistoryWindowRow: Sendable, Equatable {
         self.length = length
         self.isAnchor = isAnchor
         self.isCompactionSummary = isCompactionSummary
-    }
-}
-
-/// Per-data-root store registry.
-///
-/// The store carries the hourly orphan-sweep throttle as instance state, so a
-/// fresh instance per turn would re-run the directory sweep on every turn.
-/// One store per root, reused, keeps the sweep at its intended cadence while
-/// leaving tests free to point at a tmp root.
-public actor HistoryWindowCursorStoreRegistry {
-    public static let shared = HistoryWindowCursorStoreRegistry()
-    private var stores: [String: HistoryWindowCursorStore] = [:]
-
-    public func store(dataRoot: URL?) -> HistoryWindowCursorStore {
-        let key = dataRoot?.standardizedFileURL.path ?? ""
-        if let existing = stores[key] { return existing }
-        let created = HistoryWindowCursorStore(dataRoot: dataRoot)
-        stores[key] = created
-        return created
     }
 }
 

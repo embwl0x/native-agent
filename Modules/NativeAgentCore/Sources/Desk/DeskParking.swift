@@ -48,3 +48,35 @@ public enum DeskParking {
         return formatter.date(from: text)
     }
 }
+
+public enum DeskDeferPreset: String, CaseIterable, Identifiable, Sendable {
+    case tomorrow
+    case nextWeek
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .tomorrow: return "Tomorrow"
+        case .nextWeek: return "Next week"
+        }
+    }
+
+    public var days: Int {
+        switch self {
+        case .tomorrow: return 1
+        case .nextWeek: return 7
+        }
+    }
+
+    /// `now` and `calendar` are injected so the boundary cases (a park chosen at
+    /// 23:59, a non-local time zone) are testable instead of clock-dependent.
+    public func day(from now: Date, calendar: Calendar = .current) -> String {
+        let target = calendar.date(byAdding: .day, value: days, to: now) ?? now
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: target)
+    }
+}

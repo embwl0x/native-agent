@@ -6,6 +6,29 @@ import PersistenceCore
 import ProviderRouting
 
 extension BuiltInToolSchemaFactory {
+    private static let canonicalContextExpandSchema = LLMToolSchema(
+        name: "context_expand",
+        description: "Read deeper context by its offered atom id or a history: id from a replayed receipt. Context atoms are pinned to this turn's generation; history receipts are read from the current conversation.",
+        parametersJSON: (try? JSONValue.object([
+            "type": .string("object"),
+            "properties": .object([
+                "atom_id": .object([
+                    "type": .string("string"),
+                    "description": .string("Offered context atom id or history: id from a replayed receipt."),
+                ]),
+                "max_characters": .object([
+                    "type": .string("integer"),
+                    "description": .string("Optional bounded character limit."),
+                ]),
+                "offset": .object([
+                    "type": .string("integer"),
+                    "description": .string("Optional character offset, default 0. Continue with next_offset until null."),
+                ]),
+            ]),
+            "required": .array([.string("atom_id")]),
+        ]).serializedData(pretty: false)) ?? Data("{}".utf8)
+    )
+
     func coreSchemas() -> [LLMToolSchema?] {
         let mailReplyFields: [(String, JSONValue)] = [
             ("subject", strSchema("Subject for legacy matching; omit when using the exact message locator.")),
@@ -95,7 +118,7 @@ extension BuiltInToolSchemaFactory {
                 )
             ),
             requestedNames?.contains("context_expand") != false
-                ? TurnToolSchemaCatalogSeed.canonicalContextExpandSchema
+                ? Self.canonicalContextExpandSchema
                 : nil,
             requestedSchema(
                 name: "list_dir",
@@ -229,6 +252,7 @@ extension BuiltInToolSchemaFactory {
                         ("offset", intSchema("result offset for a follow-up page; omit on the first search")),
                         ("before", strSchema("Optional exclusive ISO8601 upper bound; omitted/null/empty is unbounded. Unknown-timestamp matches are excluded and reported.")),
                         ("after", strSchema("Optional exclusive ISO8601 lower bound; omitted/null/empty is unbounded. Unknown-timestamp matches are excluded and reported.")),
+                        ("since", strSchema("Optional lower bound: ISO8601 or a positive relative duration such as 1d, 7d or 2h. Combined with after, the later bound applies.")),
                         ("sort", .object([
                             "type": .string("string"),
                             "enum": .array(["relevance", "oldest", "newest"].map(JSONValue.string)),
@@ -253,6 +277,7 @@ extension BuiltInToolSchemaFactory {
                         ("offset", intSchema("result offset for a follow-up page; omit on the first search")),
                         ("before", strSchema("Optional exclusive ISO8601 upper bound; omitted/null/empty is unbounded. Unknown-timestamp matches are excluded and reported.")),
                         ("after", strSchema("Optional exclusive ISO8601 lower bound; omitted/null/empty is unbounded. Unknown-timestamp matches are excluded and reported.")),
+                        ("since", strSchema("Optional lower bound: ISO8601 or a positive relative duration such as 1d, 7d or 2h. Combined with after, the later bound applies.")),
                         ("sort", .object([
                             "type": .string("string"),
                             "enum": .array(["relevance", "oldest", "newest"].map(JSONValue.string)),
@@ -288,15 +313,18 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "persona_read",
-                description: "Read a canonical persona document by kind: growth=GROWTH.md, user=USER.md, soul=SOUL.md, voice=VOICE.md, agents=AGENTS.md; skill requires skill_name.",
+                description: "Read a canonical persona document by kind: growth=GROWTH.md, user=USER.md, soul=SOUL.md, voice=VOICE.md, agents=AGENTS.md.",
                 parametersJSON: params(
                     properties: [
                         // The reader canonicalizes kind; keep those string forms accepted.
-                        ("kind", obj([("description", .string("One of: soul, user, voice, growth, agents, skill.")), ("anyOf", .array([
-                            enumStringSchema(["soul", "user", "voice", "growth", "agents", "skill"]),
+                        ("kind", obj([("description", .string("One of: soul, user, voice, growth, agents.")), ("anyOf", .array([
+                            enumStringSchema(["soul", "user", "voice", "growth", "agents"]),
                             strSchema(),
                         ]))])),
-                        ("skill_name", strSchema("Required only when kind='skill'.")),
+                        // Still accepted and ignored for ordinary documents; the skill alias is retired.
+                        ("skill_name", strSchema("Retired skill alias argument; ignored for ordinary persona documents.")),
+                        ("source", boolSchema("Retired skill alias argument; ignored for ordinary persona documents.")),
+                        ("content", boolSchema("Retired skill alias argument; ignored for ordinary persona documents.")),
                     ],
                     required: ["kind"]
                 )
@@ -306,9 +334,8 @@ extension BuiltInToolSchemaFactory {
                 description: "Replace your own persona document. USER.md is read-only, generated from Memories; use commit_memory for durable user facts.",
                 parametersJSON: params(
                     properties: [
-                        ("kind", strSchema("One of: soul, voice, growth, agents, skill. Do not use user; USER.md is generated from Memories.")),
+                        ("kind", strSchema("One of: soul, voice, growth, agents. Do not use user; USER.md is generated from Memories.")),
                         ("content", strSchema("Full replacement document content.")),
-                        ("skill_name", strSchema("Required only when kind='skill'.")),
                         ("retire", obj([
                             ("type", .string("object")),
                             ("description", .string("growth only: each REM-approved line this rewrite drops, exactly as written, mapped to why it goes. A retired line is not offered again.")),
@@ -376,7 +403,7 @@ extension BuiltInToolSchemaFactory {
                             ["connector", "permission", "model_choice", "api_key", "capability", "choose"],
                             "What is needed."
                         )),
-                        ("target", strSchema("Canonical id. connector: github, notion, slack, telegram, gmail, gcal, x, mail (Apple Mail), chrome (Chrome extension), iphone (pair iPhone/iPad). permission: calendar, reminders, contacts, mail, messages, notes, music, notify_mac, notify_mobile, spotlight, scheduler; Mac control: shell, file_ops, applescript, jxa, accessibility, system. api_key: openai, anthropic, openrouter, moonshot; sign-in: openai_oauth_direct (ChatGPT), anthropic_oauth_direct (Claude), xai (Grok). capability: image_generation, screen_capture, vision_api_calls, tts. model_choice: a Providers group id. Omit for choose.")),
+                        ("target", strSchema("Canonical id. connector: github, notion, slack, telegram, gmail, gcal, x, mail (Apple Mail), chrome (Chrome extension), iphone (pair iPhone/iPad). permission: calendar, reminders, contacts, mail, messages, notes, music, notify_mac, notify_mobile, spotlight, scheduler; Mac control: shell, file_ops, applescript:<bundle_id> (macOS Automation for one app), jxa, accessibility, system. api_key: openai, anthropic, openrouter, moonshot; sign-in: openai_oauth_direct (ChatGPT), anthropic_oauth_direct (Claude), xai (Grok). capability: image_generation, screen_capture, vision_api_calls, tts. model_choice: a Providers group id. Omit for choose.")),
                         ("why", strSchema("One sentence: why this is needed, here, now.")),
                         ("decline_consequence", strSchema("What happens if they say no. Required for choose; a sensible default is used otherwise.")),
                         ("also_needed", stringArraySchema("For permission: other Mac capabilities this same request needs, so they grant once instead of twice.")),
@@ -423,40 +450,45 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "list_skills",
-                description: "List only skill names, triggers, descriptions and status. Bodies load lazily; never read all skills or inspect private registry files.",
+                description: "List skill descriptions, signatures, status and run calls. Never inspect private registry files.",
                 parametersJSON: params(properties: [], required: [])
             ),
             requestedSchema(
                 name: "read_skill",
-                description: "Load one skill body by manifest name only when its triggers match this work; never preload all bodies.",
+                description: "Read one skill's metadata: description, signature, status, digest, admission and versions. Request source:true only for authoring or review; content:true explicitly reads legacy guidance until conversion.",
                 parametersJSON: params(
-                    properties: [("name", strSchema())],
+                    properties: [("name", strSchema()), ("source", boolSchema("Explicit code authoring or review request.")),
+                                 ("content", boolSchema("Explicit legacy guidance read during conversion."))],
                     required: ["name"]
                 )
             ),
             requestedSchema(
                 name: "save_skill",
-                description: "Create/update a reusable Capabilities skill only on explicit user request or for a proven repeatable procedure. Facts belong in commit_memory. Never inspect/write skills/registry.json or body paths yourself. Skills guide; they grant no tools, permissions, approval bypasses or safety authority.",
+                description: "Save a reusable JavaScript run(input) routine and one-line description for requested or proven repeatable work. Reuse the same name to replace a draft. app.step labels progress; app.decide(question,data) hands a bounded judgment back. Validate with skill.validate, then enable the exact code. A revision leaves the working version selected. Every app/tool call takes the ordinary turn's gates; a skill grants no authority.",
                 parametersJSON: params(
                     properties: [
                         ("name", strSchema("Short stable display name.")),
                         ("description", strSchema("One concise sentence describing when and why this skill helps.")),
                         ("triggers", stringArraySchema("Specific phrases or situations that make this skill relevant.")),
-                        ("content", strSchema("Markdown body beginning with a heading and containing the reusable procedure. Maximum 65536 UTF-8 bytes.")),
+                        ("converts", stringArraySchema("Optional original source SHA-256 digests from Tools census; binds historical conversion counterparts to this exact candidate.")),
+                        ("overrides", enumStringSchema(["built_in"], "For a converted persona procedure, preserve built-in identity with built_in as required by the census; this protection cannot be removed by a later save.")),
                         ("script", obj([
                             ("type", .string("object")),
-                            ("description", .string("Optional; makes it repeatable. A save that adds or changes a script lands drafted: it runs only once skill.enable turns it on.")),
+                            ("description", .string("Executable routine; a candidate runs only after validation and exact-code enable.")),
                             ("properties", obj([
-                                ("source", strSchema("The JavaScript, run against app.*; at most 8192 bytes. Params arrive frozen as `input` (e.g. input.name; `args` is the same object).")),
-                                ("params", looseObjectSchema("Each input name to its type: string, int, number, bool, list or object; a trailing ? marks it optional. Params arrive frozen as `input` (e.g. input.name).")),
-                                ("actions", stringArraySchema("The app action ids it may call.", minItems: 1, maxItems: 50)),
+                                ("source", strSchema("Sync-only: define function run(input) using synchronous app.* calls and return plain JSON; async functions and Promises are unsupported. At most 8192 bytes. input is frozen JSON. Execution never loads an instruction body.")),
+                                ("params", looseObjectSchema("Each input name to its type or {type, description}: string, int, number, bool, list or object; a trailing ? marks it optional. Include descriptions explaining the inputs. Params arrive frozen as `input` (e.g. input.name).")),
+                                ("actions", stringArraySchema("Only app action IDs, e.g. memory.recall for app.memory.recall(). app.read, app.find, app.log, app.expect, app.expect_fail, app.decide and app.step are built in; use [] for helpers alone. Grants no permissions.", minItems: 0, maxItems: 50)),
                                 ("steps", stringArraySchema("Optional label for each step.", maxItems: 50, maxItemLength: 160)),
                                 ("of", intSchema("How many steps it has; leave it out when steps labels them.", minimum: 1, maximum: 50)),
                             ])),
                             ("required", .array([.string("source"), .string("actions")])),
                         ])),
+                        ("fixtures", obj([("type", .string("array")),
+                            ("description", .string("Omit fixtures to record one safe run during skill.validate, supplying input there when params require it; capture:true also requests recording. Every app call and app.decide return visible placeholders. Later validation replays the sealed capture. Or supply input, calls:[{operation,args,result}], answers:[] and expected returned JSON; operation is app.<action>, read or find, decision replies go in answers, and expected matches the full return.")),
+                            ("items", looseObjectSchema("Exact captured input, replies, bounded decision answers and expected result."))])),
                     ],
-                    required: ["name", "description", "content"]
+                    required: ["name", "description", "script"]
                 )
             ),
             requestedSchema(
@@ -1205,11 +1237,12 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "mail_list_recent",
-                description: "List Apple Mail's inbox or sent metadata and exact mailbox totals; inbox_unread_by_category counts Primary, Transactions, Updates, Promotions and unclassified across the whole inbox. Primary is not proof of a human sender. Filtered or explicitly sorted lists cover all categories. Pass scope + message_id + expected_message_id + expected_account_id from one row to read a body and attachments (filename, content_type, size in bytes, 1-based index). Read-only; requires Mail → Read permission.",
+                description: "List Apple Mail's inbox, sent or drafts metadata and exact mailbox totals; inbox_unread_by_category counts Primary, Transactions, Updates, Promotions and unclassified across the whole inbox. Primary is not proof of a human sender. Filtered or explicitly sorted lists cover all categories. Pass scope + message_id + expected_message_id + expected_account_id from one row to read a body and attachments (filename, content_type, size in bytes, 1-based index). Read-only; requires Mail → Read permission.",
                 parametersJSON: params(
                     properties: [
                         ("limit", intSchema("Maximum messages to return (1-50, default 10).")),
-                        ("scope", strSchema("Mailbox scope: inbox (default) or sent. Keep the same scope for continuation and message-body reads.")),
+                        ("scope", strSchema("Mailbox scope: inbox (default), sent or drafts. Keep the same scope for continuation and message-body reads.")),
+                        ("mailbox", enumStringSchema(["inbox", "sent", "drafts"], "Alias for scope; both must agree when supplied together.")),
                         ("all_categories", boolSchema("Inbox lists show Mail's Primary and Transactions categories; true lists Updates and Promotions too.")),
                         ("unread", boolSchema("true selects unread messages, false selects read messages; omit for both.")),
                         ("sort", enumStringSchema(["newest", "oldest"], "Date order; default newest. Keep unchanged for continuation.")),
@@ -1252,7 +1285,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "mail_search",
-                description: "Search or list Apple Mail's whole inbox or sent mailbox, all categories, with optional query, from, since, unread, category, attachment; default newest. Returns matching_total, has_more, next_offset and metadata, plus up to five attachment_names per message when filtering attachments. Search results can be passed to mail.mark_read in one call. Bodies are not searched. Requires Mail → Read permission.",
+                description: "Search or list Apple Mail's whole inbox, sent or drafts mailbox, all categories, with optional query, from, since, unread, category, attachment; default newest. Returns matching_total, has_more, next_offset and metadata, plus up to five attachment_names per message when filtering attachments. Inbox search results can be passed to mail.mark_read in one call. Bodies are not searched. Requires Mail → Read permission.",
                 parametersJSON: params(
                     properties: [
                         ("query", stringOrStringArraySchema("One search term or an array of terms matched with OR against mailbox subject and sender metadata. Example: [\"receipt\", \"order confirmation\"]. Keep the same terms for continuation.")),
@@ -1265,7 +1298,8 @@ extension BuiltInToolSchemaFactory {
                         ("category", strSchema("Mail categories: primary, transactions, updates, promotions; comma-separated categories combine. A category is not a guarantee of a human sender.")),
                         ("unread", boolSchema("true selects unread messages, false selects read messages; omit for both.")),
                         ("sort", enumStringSchema(["newest", "oldest"], "Date order; default newest. Keep unchanged for continuation.")),
-                        ("scope", strSchema("Mailbox scope: inbox (default) or sent. Keep the same scope for continuation and message-body reads.")),
+                        ("scope", strSchema("Mailbox scope: inbox (default), sent or drafts. Keep the same scope for continuation and message-body reads.")),
+                        ("mailbox", enumStringSchema(["inbox", "sent", "drafts"], "Alias for scope; both must agree when supplied together.")),
                         ("limit", intSchema("Maximum messages to return (1-50, default 10).")),
                         ("offset", mailOffsetSchema),
                     ],
@@ -1690,7 +1724,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "mail_draft",
-                description: "Saves an unsent email in Apple Mail → Drafts, without sending or opening a window. Use for draft, don't send, just draft, save as draft or not yet requests. For a reply, use an exact inbox message_id plus expected_message_id, or a uniquely matching subject (and optional sender); ambiguous or changed targets are refused. For a new email, supply to, subject and body instead. Requires Mail Write permission. Returns saved_in and draft_id.",
+                description: "Saves an unsent email in Apple Mail → Drafts, without sending or opening a window. Use for draft, don't send, just draft, save as draft or not yet requests. For a reply, use an exact inbox message_id plus expected_message_id, or a uniquely matching subject (and optional sender); ambiguous or changed targets are refused. For a new email, supply to, subject and body instead. Requires Mail Write permission. Confirms a new Drafts message by subject, recipients and content after saving; returns created, saved_in and the saved message's draft_id. Inspect drafts with mail.recent or mail.search using mailbox:\"drafts\"; never repeat an unconfirmed save before checking.",
                 parametersJSON: params(properties: mailReplyFields + [
                     ("to", stringOrStringArraySchema("Recipient address(es) for a new draft. Omit for a reply draft.")),
                     ("cc", stringOrStringArraySchema("Optional CC recipient(s) for a new draft.")),

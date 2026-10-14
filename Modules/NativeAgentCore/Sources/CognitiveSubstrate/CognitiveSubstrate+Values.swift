@@ -227,8 +227,4 @@ extension CognitiveSubstrate {
         return true
     }
 
-    func clamp(_ value: Double) -> Double {
-        (value).clamped01()
-    }
-
 }

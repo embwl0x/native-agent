@@ -415,13 +415,6 @@ func chatCompletionsToolUseMarker(_ call: ChatCompletionsToolCall) -> String {
     "<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(call.arguments)</tool_use>"
 }
 
-/// Truncate an error-response body for inclusion in a thrown message. Plain
-/// (non-redacting) — the OAuth-direct adapters keep their own redacting
-/// `boundedBodyString` because their bodies can echo bearer tokens.
-func boundedBody(_ data: Data, maxBytes: Int = 2_048) -> String {
-    String(decoding: data.prefix(maxBytes), as: UTF8.self)
-}
-
 /// Apply the three streaming Chat-Completions content headers shared by every
 /// chat-completions adapter's SSE request. `Authorization` is provider-specific
 /// (api key vs. OAuth access token) and stays with the caller.

@@ -73,13 +73,6 @@ enum TurnInspectorPresentation {
         return "\(value) ms"
     }
 
-    static func kindsText(_ kinds: [String: Int]) -> String {
-        let ordered = kinds
-            .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
-        let visible = ordered.prefix(6).map { "\($0.key) ×\($0.value)" }.joined(separator: " · ")
-        return ordered.count > 6 ? "\(visible) · +\(ordered.count - 6) more" : visible
-    }
-
     static func metrics(for summary: TurnSummaryRecord) -> [(value: String, label: String)] {
         var result: [(value: String, label: String)] = [
             (value: nonnegativeText(summary.eventCount), label: "events"),
@@ -95,7 +88,7 @@ enum TurnInspectorPresentation {
 
 struct TurnInspectorView: View {
     @StateObject private var store = TurnInspectorStore()
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
 
     var body: some View {
         AlivePage(title: "Turns", line: "How my recent replies went.", freshnessGroup: "turn_summaries") {

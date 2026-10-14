@@ -1,42 +1,10 @@
+import ApprovalTransactions
+import EngineRuntime
+import EngineRuntime
 import SwiftUI
 import ApprovalInbox
 import PersistenceCore
 import NativeAgentShared
-
-/// The inline approval card is a safety control, so it has an explicit state
-/// for missing authority rather than presenting disabled actions as though the
-/// card were merely busy. This also keeps an absent/stale approvals refresh
-/// from turning a still-pending request into a resolved-looking card.
-enum InlineApprovalPresentation {
-    enum State: Equatable {
-        case unavailable
-        case pending
-        case resolved(decision: String)
-    }
-
-    static func state(
-        approvalID: String,
-        locallyResolved: Bool,
-        localDecision: String,
-        externalStatus: String?,
-        externalDecision: String?
-    ) -> State {
-        guard !approvalID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .unavailable
-        }
-        let status = externalStatus?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if locallyResolved {
-            return .resolved(decision: localDecision)
-        }
-        guard let status, !status.isEmpty, status != "pending" else {
-            return .pending
-        }
-        return .resolved(decision: externalDecision?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
-    }
-}
 
 // PATCH-2026-05-08: wave2-chat-ux — inline approval card for kind=approval_pending
 struct InlineApprovalCard: View {
@@ -71,16 +39,6 @@ struct InlineApprovalCard: View {
             externalStatus: externalApproval?.status,
             externalDecision: externalApproval?.decision
         )
-    }
-
-    /// An inbox approval as the card's message, for surfaces that hold the
-    /// record rather than a transcript row (the inbox strip, the Work pane).
-    static func message(for approval: ApprovalRecord) -> ChatMessage {
-        var metadata = ChatMessageMetadata()
-        metadata.kind = ChatMessageMetadata.approvalPendingKind
-        metadata.approvalId = approval.id
-        return ChatMessage(id: approval.id, role: "tool",
-            content: "\(approval.title)\n\(approval.reason)\n\(approval.payloadPreview)", metadata: metadata)
     }
 
     var body: some View {
@@ -176,23 +134,142 @@ struct InlineApprovalCard: View {
         resolveError = nil
         defer { resolving = false }
         do {
-            // B.3: call the typed endpoint so we catch daemon errors
-            _ = try await appModel.resolveApproval(id: approvalId, decision: decision)
-            resolvedDecision = decision
-            resolved = true
-            // S.4: refresh the global approvals list so other inline cards
-            // for the same approval ID reflect the new state immediately.
-            await appModel.loadHealthCard()
-        } catch ApprovalInboxError.alreadyResolved {
-            // A stale card: the request was already answered. Settle to the
-            // decision the inbox holds instead of showing an error.
-            appModel.engine.approvals.records = (try? await appModel.engine.approvals.list())
-                ?? appModel.engine.approvals.records
-            resolvedDecision = externalApproval?.decision ?? ""
-            resolved = true
+            try await appModel.engine.approvals.settleInlineCard(
+                id: approvalId, decision: decision,
+                coordinator: .app(dataRootOverride: appModel.dataRootOverride),
+                resolutionChanged: { id, active in
+                    if active { appModel.approvalResolutionInFlightIDs.insert(id) }
+                    else { appModel.approvalResolutionInFlightIDs.remove(id) }
+                },
+                didResolve: { decision in
+                    resolvedDecision = decision
+                    resolved = true
+                },
+                refreshHealth: { await appModel.loadHealthCard() }
+            )
         } catch {
             // B.3: daemon returned an error — keep card actionable
             resolveError = UserFacingError.message(error, action: "record that decision")
         }
+    }
+}
+
+/// The approval card's words.
+///
+/// The mockup's card is an email, and its primary button reads "Send it". A
+/// button that says "Send it" over an approval to DELETE something would be a
+/// lie the person acts on, so the verb is chosen from the request rather than
+/// hard-coded: send-shaped requests get "Send it", everything else gets the
+/// neutral "Go ahead". "Not now" is constant; the fold reads "Show me the
+/// draft" over a send and "Details" over everything else.
+enum ChatShellApprovalCopy {
+    static let decline = "Not now"
+    static let showDraft = "Show me the draft"
+
+    static func approve(for content: String) -> String {
+        // The verb is read from the request's opening word only. A delete
+        // that mentions an email in passing must never be labelled "Send it".
+        let firstLine = content.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+            .first.map(String.init) ?? ""
+        let firstWord = firstLine.lowercased()
+            .split(whereSeparator: { !$0.isLetter && $0 != "-" }).first.map(String.init) ?? ""
+        let sendVerbs: Set<String> = ["send", "email", "e-mail", "mail", "message", "reply", "post", "text"]
+        let destructive = ["delete", "remove", "erase", "wipe", "drop", "overwrite"]
+        let lowered = content.lowercased()
+        // The primary names the OUTCOME. "Connect" is the one the universal
+        // agent bridge's setup card asks for by name, and it is read from the
+        // opening word like every other verb here, so a request that merely
+        // mentions connecting cannot claim it.
+        if firstWord == "connect" { return "Connect" }
+        if destructive.contains(where: lowered.contains) { return "Go ahead" }
+        return sendVerbs.contains(firstWord) ? "Send it" : "Go ahead"
+    }
+
+    /// What taking the quiet option costs, in the request's own terms. Every
+    /// card says this (Agent): a decline that does not state its consequence
+    /// makes the person guess what they just refused. "→" is used here and
+    /// nowhere else in the card grammar.
+    static func consequence(for content: String) -> String {
+        let lowered = content.lowercased()
+        let destructive = ["delete", "remove", "erase", "wipe", "drop", "overwrite"]
+        if destructive.contains(where: lowered.contains) {
+            return "\(decline) → nothing is changed or removed."
+        }
+        let sendVerbs = ["send", "email", "e-mail", "mail", "message", "reply", "post", "text"]
+        if sendVerbs.contains(where: { lowered.hasPrefix($0) }) {
+            return "\(decline) → nothing leaves this Mac; I'll keep the draft."
+        }
+        return "\(decline) → I'll leave it alone and carry on without it."
+    }
+
+    /// The card's plain title: the first line of the request, no decoration.
+    static func title(_ content: String) -> String {
+        let first = content.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init) ?? content
+        let trimmed = first.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "\(AgentVoice.live.Subject) \(AgentVoice.live.verb("need")) a decision" : String(trimmed.prefix(120))
+    }
+
+    /// The why, for the person: the reason's opening sentence or two (the
+    /// line under the title). Ids, timestamps, counters and " · "-joined
+    /// metadata stay off the face — they fold into `details`.
+    static func why(_ content: String) -> String {
+        // The first line that reads as a sentence: a lone tag ("recurring") is a label, not the why.
+        let all = lines(content)
+        guard let reason = all.first(where: { $0.components(separatedBy: " · ")[0].split(separator: " ").count >= 3 }) ?? all.first,
+              !reason.hasPrefix("{"), !reason.hasPrefix("[") else { return "" }
+        var why = ""
+        for sentence in sentences(reason.components(separatedBy: " · ")[0]) {
+            guard why.isEmpty || why.count + sentence.count < 140 else { break }
+            why += (why.isEmpty ? "" : " ") + sentence
+        }
+        return why
+    }
+
+    /// Everything after the title and the why, each sentence once, one piece
+    /// per line; nil when nothing is left. What was filed stays intact.
+    static func details(_ content: String) -> String? {
+        var seen = Set(sentences(why(content)) + [recipient(content)].compactMap { $0 })
+        let rest = lines(content).flatMap { $0.components(separatedBy: " · ") }.compactMap { piece -> String? in
+            let kept = piece.hasPrefix("{") || piece.hasPrefix("[")
+                ? (seen.insert(piece).inserted ? [piece] : [])
+                : sentences(piece).filter { seen.insert($0).inserted }
+            return kept.isEmpty ? nil : kept.joined(separator: " ")
+        }
+        return rest.isEmpty ? nil : rest.joined(separator: "\n")
+    }
+
+    /// Who a send goes to, on the face: a filed "To:" line, else the first
+    /// `to` / `recipient(s)` / `expected_participants` / `chat_id` / `channel` value in the filed
+    /// arguments (read as text, so a clipped preview still yields it).
+    static func recipient(_ content: String) -> String? {
+        if let line = lines(content).first(where: { $0.lowercased().hasPrefix("to: ") }) {
+            return String(line.prefix(160))
+        }
+        let pattern = #""(?:to|recipients?|expected_participants|chat_id|channel)"\s*:\s*(\[[^\]]*\]|"[^"]*"|-?\d+)"#
+        guard let regex = try? Regex(pattern), let match = content.firstMatch(of: regex),
+              let value = match.output[1].substring else { return nil }
+        let who = value.filter { !"[]\"".contains($0) }.trimmingCharacters(in: .whitespaces)
+        return who.isEmpty ? nil : "To: " + who.prefix(160)
+    }
+
+    private static func lines(_ content: String) -> [String] {
+        content.split(separator: "\n").dropFirst()
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    /// Split after ". ", "! " or "? ".
+    private static func sentences(_ text: String) -> [String] {
+        var out: [String] = [], current = ""
+        for char in text {
+            if char == " ", let last = current.last, ".!?".contains(last) {
+                out.append(current)
+                current = ""
+            } else {
+                current.append(char)
+            }
+        }
+        out.append(current)
+        return out.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 }

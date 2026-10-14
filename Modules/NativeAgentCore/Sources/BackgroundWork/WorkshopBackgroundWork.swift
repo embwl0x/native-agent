@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentCore
 import ChatOrchestration
 import PersistenceCore
-import ProviderRouting
 import ApprovalInbox
 import Cognition
 import WorkshopExecution
@@ -19,24 +18,12 @@ public enum WorkshopBackgroundWork {
     public static func makeWorkshopExecutor(
         dataRoot: URL,
         cognition: NativeCognitionRuntime,
-        planner: SwiftNativeWorkshopPlannerLLM,
         chatClient: @escaping @Sendable (any ToolDispatchClient) -> SwiftNativeChatOrchestrationClient,
         gatedTools: any ToolDispatchClient,
         approvedTools: @escaping @Sendable (ApprovedChatToolReplay) -> any ToolDispatchClient,
         notify: @escaping WorkshopInboxNotification
     ) -> WorkshopExecutorLoop {
         let usesLiveAppBody = dataRoot == PersistenceCore.defaultDataRoot()
-        let measuredLLMStep: WorkshopStepMeasuredLLM = { prompt in
-            let (model, output) = try await planner.runCodex(
-                prompt: prompt, surface: WorkshopSurfaceVocabulary.canonical,
-                timeoutSeconds: 120)
-            return WorkshopStepLLMCompletion(
-                model: model,
-                text: output,
-                providerCallCount: 1,
-                removableOrchestrationProviderCallCount: 0
-            )
-        }
         // TOOL-CAPABLE synthesize turn (synthesize-quality fix, 2026-06-11).
         // Found live by Agent on execution 752636c5: a bare completion has no
         // tool access, so the synthesize model refused ("I can't access your
@@ -59,8 +46,6 @@ public enum WorkshopBackgroundWork {
                     allowProcessGlobalTools: usesLiveAppBody,
                     agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
                 ))
-            // A test-root executor gets its own bodiless engine, as its planner
-            // gets the unavailable LLM above.
             let client = chatClient(restricted)
             let response = try await LLMCallContext.$purpose.withValue("workshop") {
             try await client.runEphemeralToolTurn(
@@ -112,7 +97,6 @@ public enum WorkshopBackgroundWork {
         }
         return WorkshopExecutorLoop(
             root: dataRoot,
-            measuredLLMStep: measuredLLMStep,
             measuredTooledLLMStep: measuredTooledLLMStep,
             toolDispatch: toolStep,
             approvedToolDispatch: { tool, args, approvalId in
@@ -179,6 +163,12 @@ public enum WorkshopBackgroundWork {
         if case .bool(true) = policy["enableAutonomy"] ?? .null { return true }
         if isFullMacPolicy(policy) { return true }
         return await isWideOpenTrust(dataRoot: dataRoot)
+    }
+
+    public static func unattendedWorkForced(policy: TrustPolicy?, dataRoot: URL) async -> Bool {
+        let fullMac = policy.map(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive) ?? false
+        let yolo = await isWideOpenTrust(dataRoot: dataRoot)
+        return fullMac || yolo
     }
 
     /// The isFullMac rule from `SwiftNativeTrustCenter.normalizedTrustPolicy`,
@@ -379,6 +369,33 @@ public enum WorkshopBackgroundWork {
                 "actionable"
             )
         }
+    }
+
+}
+
+/// Process-wide handle to the assembled WorkshopExecutorLoop. Approval
+/// continuations reuse the executor configured by the app's background loop.
+/// Synchronous NSLock instead of an actor so the boot-path factory
+/// (makeWorkshopExecutorLoopRunner, a sync function) can configure it
+/// race-free without spawning a Task.
+public final class WorkshopExecutorRef: @unchecked Sendable {
+    public static let shared = WorkshopExecutorRef()
+
+    private let lock = NSLock()
+    private var executor: WorkshopExecutorLoop?
+
+    public func configure(_ executor: WorkshopExecutorLoop) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.executor = executor
+    }
+
+    /// The assembled executor, or nil when no background-loop assembly has
+    /// run in this process yet.
+    public func current() -> WorkshopExecutorLoop? {
+        lock.lock()
+        defer { lock.unlock() }
+        return executor
     }
 
 }

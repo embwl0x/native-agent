@@ -47,10 +47,9 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
     /// The graph lives inside memory.sqlite and is written on memory writes, so
     /// it invalidates on exactly the signal the memory projection uses.
     var invalidationNamespaces: Set<String> { ["memory-v2"] }
-    let invalidationSourceURL: URL?
+    var invalidationSourceURL: URL? { sqlite }
+    private let sqlite: URL
 
-    private let loadRelations: @Sendable () async throws -> [KnowledgeGraphContextRelation]
-    private let diagnostics: @Sendable (String) -> Void
     private let dataRoot: URL
 
     var excludedSourceOwners: Set<String> {
@@ -58,26 +57,10 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
     }
 
     init(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        maximumRelations: Int = NativeKnowledgeGraphContextProjection.maximumRelations,
-        maximumRelationsPerEntity: Int =
-            NativeKnowledgeGraphContextProjection.maximumRelationsPerEntity,
-        loadRelations: (@Sendable () async throws -> [KnowledgeGraphContextRelation])? = nil,
-        diagnostics: @escaping @Sendable (String) -> Void = { nativeLog("%@", $0) }
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
-        let sqlite = dataRoot.appendingPathComponent("memory/memory.sqlite").standardizedFileURL
-        self.invalidationSourceURL = sqlite
+        self.sqlite = dataRoot.appendingPathComponent("memory/memory.sqlite").standardizedFileURL
         self.dataRoot = dataRoot
-        self.diagnostics = diagnostics
-        let total = max(0, maximumRelations)
-        let perEntity = max(1, maximumRelationsPerEntity)
-        self.loadRelations = loadRelations ?? {
-            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlite)
-            return try await indexer.contextRelations(
-                perSubjectLimit: perEntity,
-                maximumRelations: total
-            )
-        }
     }
 
     func compiledProjection(
@@ -93,12 +76,16 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
         }
         let relations: [KnowledgeGraphContextRelation]
         do {
-            relations = try await loadRelations()
+            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlite)
+            relations = try await indexer.contextRelations(
+                perSubjectLimit: Self.maximumRelationsPerEntity,
+                maximumRelations: Self.maximumRelations
+            )
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             // Last known good: publish nothing, retire nothing.
-            diagnostics("[context-kg] relation read failed: \(String(describing: error))")
+            nativeLog("%@", "[context-kg] relation read failed: \(String(describing: error))")
             return ContextCompiledProjectionResult(changedSources: [], removedSourceIDs: [])
         }
 

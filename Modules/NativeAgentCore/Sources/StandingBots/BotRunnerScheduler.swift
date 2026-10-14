@@ -53,28 +53,29 @@ public actor BotRunnerScheduler {
 
     private var path: URL { disk.root.appendingPathComponent("runner-jobs.json") }
 
-    /// Read the scheduler's saved projection without reconciling or moving a deadline.
-    public static func scheduledDates(dataRoot: URL) throws -> [UUID: Date] {
+    /// Read both saved projections without reconciling or moving a deadline.
+    public static func scheduleSnapshot(dataRoot: URL) throws -> (dates: [UUID: Date], missed: [UUID: BotMissedRun]) {
         let disk = StandingBotsDisk(dataRoot: dataRoot)
         return try disk.locked {
             let jobs = try disk.read([String: Job].self, at: disk.root.appendingPathComponent("runner-jobs.json")) ?? [:]
-            return Dictionary(jobs.compactMap { key, job in
+            let dates = Dictionary(jobs.compactMap { key, job -> (UUID, Date)? in
                 guard let id = UUID(uuidString: key), job.reason == nil, job.next != .distantFuture else { return nil }
                 return (id, job.next)
             }, uniquingKeysWith: { first, _ in first })
-        }
-    }
-
-    /// The last missed occurrence per definition, for the Bots page and the Desk.
-    public static func missedRuns(dataRoot: URL) throws -> [UUID: BotMissedRun] {
-        let disk = StandingBotsDisk(dataRoot: dataRoot)
-        return try disk.locked {
-            let jobs = try disk.read([String: Job].self, at: disk.root.appendingPathComponent("runner-jobs.json")) ?? [:]
-            return Dictionary(jobs.compactMap { key, job in
+            let missed = Dictionary(jobs.compactMap { key, job -> (UUID, BotMissedRun)? in
                 guard let id = UUID(uuidString: key), let missed = job.missed else { return nil }
                 return (id, missed)
             }, uniquingKeysWith: { first, _ in first })
+            return (dates, missed)
         }
+    }
+
+    public static func scheduledDates(dataRoot: URL) throws -> [UUID: Date] {
+        try scheduleSnapshot(dataRoot: dataRoot).dates
+    }
+
+    public static func missedRuns(dataRoot: URL) throws -> [UUID: BotMissedRun] {
+        try scheduleSnapshot(dataRoot: dataRoot).missed
     }
 
     /// How late an occurrence may be and still just run late. Being later than
@@ -278,6 +279,10 @@ public actor BotRunnerScheduler {
             for (id, request) in requests {
                 guard inFlight[id] == nil else { continue }
                 let requestID = request.runID
+                guard bots.contains(where: { $0.id == id }) else {
+                    try queue.rejectPending(bot: id, requestID: requestID)
+                    continue
+                }
                 try Task.checkCancellation()
                 guard reconciledJobs[id.uuidString]?.reason == nil else {
                     try queue.rejectPending(bot: id, requestID: requestID)
@@ -326,7 +331,8 @@ public actor BotRunnerScheduler {
             noteMissed(scheduledBots, autonomyEnabled: autonomyEnabled)
             // Unattended admission boundary: scheduled occurrences only.
             guard autonomyEnabled else { return completed }
-            for bot in scheduledBots where !bot.paused {
+            let now = Date()
+            for bot in scheduledBots where !bot.paused && scheduledJobs[bot.id.uuidString].map({ $0.next <= now }) == true {
                 guard inFlight[bot.id] == nil else { continue }
                 try Task.checkCancellation()
                 guard scheduledJobs[bot.id.uuidString]?.reason == nil else { continue }
@@ -398,7 +404,7 @@ public actor BotRunnerScheduler {
         do {
             switch error {
             case let admission as BotRunAdmissionError:
-                try recordMissed(id, due: due, reason: admission == .overBudget ? .overBudget : .queueBusy)
+                try recordMissed(id, due: due, reason: .queueBusy)
                 failure = "Bot request rejected: \(admission.rawValue)"
             case BotRunnerError.cannotRun(let problem):
                 try recordMissed(id, due: due, reason: .blocked, detail: problem)

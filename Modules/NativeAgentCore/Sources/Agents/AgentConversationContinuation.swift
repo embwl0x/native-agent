@@ -1,6 +1,8 @@
 import BackgroundLoops
 import ChatOrchestration
+import Cognition
 import CryptoKit
+import Desk
 import Foundation
 import ToolRegistry
 import NativeAgentCore
@@ -59,6 +61,7 @@ public struct AgentConversationContinuation: Sendable {
     /// refused and the message is held with the reason.
     private func resumeQueues() {
         guard queuesResumed.set() else { return }
+        ResidentWake.shared.turnEnded(dataRoot: dataRoot)
         // Every agent row below reads its recipe: seeded and loaded first.
         AgentRecipeStore.load(dataRoot: dataRoot)
         grok.resumeHandOvers(dataRoot: dataRoot)
@@ -75,7 +78,7 @@ public struct AgentConversationContinuation: Sendable {
         for row in AgentConversationQueues.orphaned(dataRoot: dataRoot) {
             if dotAgents.contains(row.agent) { continue } // Retired queued Dot sends are never replayed.
             let session = row.scopeSessionID, surface = row.sourceSurface
-            let tools = clients.toolDispatchClient(denyExternalMcp: false, enforceAppAutonomy: false)
+            let tools = clients.toolDispatchClient(enforceAppAutonomy: false)
             let chain = makeGatedToolDispatchClient(tools: tools, fileAccess: "auto", dataRoot: dataRoot, verifiedSessionId: session)
             AgentConversationQueues.resume(row, dataRoot: dataRoot) { tool, input in
                 try await ChatToolSessionContext.$verifiedSessionId.withValue(session) {
@@ -155,24 +158,33 @@ public struct AgentConversationContinuation: Sendable {
         if complete { try? await SwiftNativePersistenceCore().writeJSON(.string(iso.string(from: Date())), to: marker) }
     }
 
+    public func reconcileReplies() async throws {
+        let configRoot = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+        let lifecycle = CodexCompletionLifecycle(receiptURL: configRoot.appendingPathComponent("claude-bridge/message-replies.jsonl"), dataRoot: dataRoot)
+        _ = try await lifecycle.reconcileInterruptedClaims()
+        try await ClaudeBridgeMessageRuntime.recoverMessageReplies(lifecycle: lifecycle,
+            logURL: configRoot.appendingPathComponent("claude-bridge/message-replies.jsonl"))
+        try await lifecycle.reconcileSavedDeliveries(configRoot: configRoot, sender: completionSender, client: clients.bridgeChatClient())
+        let human = CodexCompletionLifecycle(receiptURL: dataRoot.appendingPathComponent("chat/human-reply-delivery/receipts.jsonl"), dataRoot: dataRoot)
+        _ = try await human.reconcileInterruptedClaims()
+        try await human.reconcileSavedDeliveries(configRoot: configRoot, sender: completionSender,
+            client: clients.bridgeChatClient(), notifyRequestedResult: false)
+        _ = try await self.lifecycle.reconcileInterruptedClaims()
+        try await self.lifecycle.reconcileSavedDeliveries(configRoot: configRoot, sender: completionSender, client: clients.bridgeChatClient())
+        let owed = Set(try await self.lifecycle.reconciliationRows().filter { $0.status == "owed" || $0.status == "sent_unconfirmed" }.map(\.id))
+        for row in try store.records() where row.phase == "attention" && row.receipt != nil
+            && owed.contains("agent-conversation:" + row.operationID) {
+            _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
+                $0.deliveryState = "delivering"; $0.automaticRead = true; $0.nextReadAt = Date()
+            }
+        }
+    }
+
     public func tick() async throws {
         resumeQueues()
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         // Discovery at launch and after an install: no scan unless one is due.
         Task.detached(priority: .utility) { await AgentDiscoverySession.shared.refreshIfInstallsChanged(dataRoot: dataRoot) }
-        // MY QUEUE steps whose condition is met become one arrival each, once
-        // a day: her own turn works them (Agent, 10-02: "a queue I can't
-        // reach is a list"). A step a peer steered carries that peer.
-        let ready = await MyQueueReady.ready(dataRoot: dataRoot, ownTurn: true)
-        if !ready.isEmpty {
-            ResidentWake.shared.request(dataRoot: dataRoot, reason: "my queue", items: ready.prefix(5).map { entry in
-                ResidentWake.Item(id: "queue:\(entry.item.handle):\(entry.step.when)",
-                                  line: "\(entry.name) is ready in MY QUEUE: \"\(entry.step.words.prefix(140))\"",
-                                  key: "queue:\(entry.item.handle)", thread: "queue:\(entry.item.handle)",
-                                  agent: entry.peerBorn ? (entry.step.peers.first ?? entry.step.elevated.first) : nil,
-                                  session: entry.step.session)
-            })
-        }
         // Her wake is this tick's one full turn; the reads wait a second.
         if try await wakeHer() { return }
         let now = Date()
@@ -268,7 +280,7 @@ public struct AgentConversationContinuation: Sendable {
                 }
                 if settled, row.personInitiated == true {
                     // The person's own send: its answer settles in the thread, no agent turn.
-                    try finish(row, delivered: true, runID: nil)
+                    try finish(row, delivered: true, runID: nil, sessionID: row.scopeSessionID)
                     continue
                 }
                 if settled {
@@ -294,25 +306,158 @@ public struct AgentConversationContinuation: Sendable {
     }
 
     /// Her one wake for what resolved (ResidentWake): only while no turn of
-    /// hers runs, in her own conversation, never a chat of the person's. It
-    /// quotes an agent's words only with that agent's authority; otherwise it
+    /// hers runs, in her own conversation. A promise's reply returns to the
+    /// conversation it was made in. It quotes an agent's words only with
+    /// that agent's authority; otherwise it
     /// is hers. At most once: a turn that fails is not rerun.
     private func wakeHer() async throws -> Bool {
-        let busy = await ChatTurnSteering.shared.hasOpenTurn(excludingPrefix: "bot-")
-        guard let wake = ResidentWake.shared.claim(dataRoot: dataRoot, busy: busy) else { return false }
+        let now = Date()
+        guard ResidentWake.shared.arrivalsDue(dataRoot: dataRoot).map({ $0 <= now }) == true else { return false }
+        // The person's quiet hours hold what reaches him, not her work (User 10-12).
+        let nextFreeAt: @Sendable (Date, Date) -> Date? = { now, activity in
+            let due = activity.addingTimeInterval(StudioWanderLane.quietInterval)
+            return due > now ? due : nil
+        }
+        guard await ChatTurnSteering.shared.residentWakeIsFree(dataRoot: dataRoot, nextFreeAt: nextFreeAt) else { return false }
+        var items = ResidentWake.pendingItems(dataRoot: dataRoot, now: now)
+        let pending = items.filter { $0.key?.hasPrefix("carry.") == true }
+        var carriedItems: [String: DeskItem] = [:]
+        let deskRevision = SwiftNativeDeskStore.currentRevision
+        if !pending.isEmpty {
+            let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
+            let context = HerScreen.queueContext(dataRoot: dataRoot, now: now, ownTurn: true)
+            let ready = MyQueueReady.ready(items: state.items, context: context)
+            for arrival in pending {
+                guard let key = arrival.key else { continue }
+                let handle = String(key.dropFirst(6))
+                guard let item = ready.first(where: { $0.handle == handle }),
+                      item.step?.session == arrival.session,
+                      arrival.filedAt == nil || arrival.filedAt == (item.step?.filedAt ?? item.openedAt) else {
+                    ResidentWake.shared.withdraw(dataRoot: dataRoot, key: key)
+                    items.removeAll { $0.id == arrival.id }
+                    continue
+                }
+                carriedItems[handle] = item
+                if let index = items.firstIndex(where: { $0.id == arrival.id }) {
+                    items[index].line = ResidentWake.carriedArrival(item, crossing: arrival.at).line
+                }
+            }
+        }
+        guard !items.isEmpty else { return false }
         let session = ResidentWake.session
-        let (text, agents) = await Self.wakeMessage(wake.text, agents: wake.agents, items: wake.items, dataRoot: dataRoot)
-        let agent = agents.first ?? "self"
-        let request = TurnRequest(message: text, sessionID: session, surface: "chat",
-            envelope: TurnEnvelope(surface: "chat", agent: agent, declaredRemote: false), verifiedSessionID: session,
-            origin: ChatMessageOrigin(surface: agents.first.map(BridgeLane.bridgeSurfaceName) ?? session, agent: agent, authored: .agent))
+        let carried = items.first { $0.key?.hasPrefix("carry.") == true }
+        // Carried work has one external slot; other arrivals may share its wake.
+        items.removeAll { $0.key?.hasPrefix("carry.") == true && $0.id != carried?.id }
+        var route: AgentBridgeCompletionRoute?
+        if let key = carried?.key, let item = carriedItems[String(key.dropFirst(6))], item.step?.owedToPerson == true {
+            let revision = (try? ResidentWake.routeRevision(dataRoot: dataRoot, session: item.step?.session)) ?? .null
+            do {
+                guard let id = item.step?.session, NativeAgentChatSessionID.normalizedPathComponent(id) == id else {
+                    throw StandingBotsError.invalidValue("The promise has no recorded conversation to reply to.")
+                }
+                if item.step?.replyRoute == nil, let ref = item.refs.last(where: {
+                    if case .step = $0.kind { return true }; return false
+                }) {
+                    var originating: TurnEnvelope?
+                    // Creation predates condition refreshes; a later message cannot move the promise's door.
+                    if let before = DeskClock.parseISO(item.openedAt) {
+                        do { originating = try await HumanConversationReader.read(sessionID: id, dataRoot: dataRoot, replyBefore: before).route }
+                        catch is CancellationError { throw CancellationError() }
+                        catch { nativeLog("Legacy promise route could not be proven: %@", error.localizedDescription) }
+                    }
+                    let repaired = HumanConversationReader.routeAvailable(originating) ? originating! : TurnEnvelope(surface: "chat")
+                    try await SwiftNativeDeskStore(dataRoot: dataRoot).updateRef(item.handle, refId: ref.refId,
+                        cachedFields: ["replyRoute": repaired.persistedMetadata()])
+                    // The Desk write signals another admission with fresh readiness and provenance.
+                    return false
+                }
+                guard let envelope = TurnEnvelope.fromPersistedMetadata(item.step?.replyRoute),
+                      HumanConversationReader.routeAvailable(envelope) else {
+                    throw StandingBotsError.invalidValue("The promise's recorded reply route is unavailable. Restore that route before replying.")
+                }
+                let saved = envelope.replyRoute
+                route = AgentBridgeCompletionRoute(surface: saved.surface, sessionId: id,
+                    destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
+                    replyTo: saved.replyTo, correlationId: saved.correlationId, turnSessionId: session,
+                    requesterUserId: saved.requesterUserId)
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                let reason: String
+                switch error {
+                case StandingBotsError.invalidValue(let detail): reason = detail
+                default: reason = error.localizedDescription
+                }
+                let marker = "Waiting to return this promise: "
+                try await SwiftNativeDeskStore(dataRoot: dataRoot).appendNoteIfAbsent(item.handle,
+                    marker: marker + reason, text: marker + reason)
+                try ResidentWake.shared.waitForRoute(dataRoot: dataRoot, key: key, revision: revision)
+                return false
+            }
+        }
         do {
-            // Every agent it quotes carries its authority, not only the first.
-            let response = try await PeerDataTaint.$current.withValue(PeerDataTaint(restoring: agents)) {
-                try await TurnAdmission.shared.run(sessionID: session) { try await request.chat(on: clients.bridgeChatClient()) }
+            let (context, agents) = await Self.wakeMessage("",
+                agents: Array(Set(items.compactMap(\.agent))).sorted(), items: items, dataRoot: dataRoot)
+            let execution: (response: ChatResponse, items: [ResidentWake.Item], completion: CodexCompletionTranscriptBinding?)? = try await TurnAdmission.shared.run(sessionID: session) {
+                    guard let wake = await ChatTurnSteering.shared.claimResidentWake(dataRoot: dataRoot, items: items,
+                        deskRevision: deskRevision, nextFreeAt: nextFreeAt) else { return nil }
+                    let admitted = wake.items.first { $0.key?.hasPrefix("carry.") == true }
+                    let step = admitted?.key.flatMap { carriedItems[String($0.dropFirst(6))]?.step }
+                    let taint = PeerDataTaint(restoring: step?.peers ?? [], elevated: step?.elevated ?? [])
+                    if let step { taint.keep(line: step.words) }
+                    for agent in agents { taint.mark(peer: agent) }
+                    let reply = admitted == nil ? nil : route
+                    let completion = reply.flatMap { _ in admitted }.map { arrival in
+                        let id = "carried-reply:" + arrival.id
+                        let digest = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
+                        return CodexCompletionTranscriptBinding(deliveryId: id, requestDigest: digest, model: "", reasoningEffort: nil)
+                    }
+                    let responseRunID = completion.map { CausalTransitionEvidence.opaqueIdentity($0.deliveryId) }
+                    if let completion, let responseRunID {
+                        guard try await lifecycle.claim(deliveryId: completion.deliveryId, requestDigest: completion.requestDigest,
+                            sessionId: session, responseRunId: responseRunID, route: reply, principal: "self", source: session) == .start else {
+                            throw StandingBotsError.invalidValue("This carried reply already has a recorded attempt; it was not sent again.")
+                        }
+                    }
+                    var text = wake.text + context
+                    if reply != nil { text += "\nYour reply will return to the conversation this promise was made in. Say what you did or why it waits." }
+                    let agent = "self"
+                    var origin = ChatMessageOrigin(surface: session, agent: agent, authored: .agent)
+                    origin.peerSources = taint.checkpointSources
+                    origin.elevatedPeerSources = taint.elevatedSources
+                    let request = TurnRequest(message: text, sessionID: session, surface: "chat",
+                        envelope: TurnEnvelope(surface: "chat", agent: agent, deliveryRoute: reply?.chatToolReplyRoute,
+                            declaredRemote: false, workIdentity: admitted?.key),
+                        verifiedSessionID: session, replyRoute: reply?.chatToolReplyRoute,
+                        origin: origin, pinnedRunID: responseRunID, codexCompletion: completion)
+                    do {
+                        let response = try await PeerDataTaint.$current.withValue(taint) {
+                            try await request.chat(on: clients.bridgeChatClient())
+                        }
+                        if let completion {
+                            try await lifecycle.cacheResponse(response, deliveryId: completion.deliveryId, requestDigest: completion.requestDigest)
+                        }
+                        return (response, wake.items, completion)
+                    } catch {
+                        if let completion {
+                            try await lifecycle.markOutcomeUnknown(deliveryId: completion.deliveryId, requestDigest: completion.requestDigest,
+                                detail: "Resident continuation interrupted; never rerun automatically")
+                        }
+                        throw error
+                    }
+            }
+            guard let execution else { return false }
+            let response = execution.response
+            if let route, let completion = execution.completion {
+                let answer = ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters)
+                let result = await AgentBridgeCompletionRouter.deliverAnswer(deliveryId: completion.deliveryId, requestDigest: completion.requestDigest,
+                    text: answer, attachments: response.attachments ?? [], route: route, client: clients.bridgeChatClient(),
+                    sender: completionSender, lifecycle: lifecycle)
+                if result.status != "completed" {
+                    throw StandingBotsError.invalidValue("Carried reply delivery is not confirmed: " + (result.reason ?? result.status))
+                }
             }
             // Phase 5 E1: a reach wakes alone; her answer is the message, or "pass".
-            if let reach = wake.items.first(where: \.isReach) {
+            if let reach = execution.items.first(where: \.isReach) {
                 await clients.deliverReach(
                     reply: ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters),
                     itemID: reach.id, turnID: response.runId)
@@ -325,8 +470,8 @@ public struct AgentConversationContinuation: Sendable {
     }
 
     /// The wake's words: a step another conversation is working stays theirs
-    /// (desk.3402), so the wake takes each one it was woken for or hears who
-    /// holds it; and the conversation it came from, as the chat page reads
+    /// (desk.3402), so preparation reads who holds each one; and the
+    /// conversation it came from, as the chat page reads
     /// it, its latest turns. A peer's words in that conversation carry the peer.
     static func wakeMessage(_ text: String, agents: [String], items: [ResidentWake.Item],
                             dataRoot: URL) async -> (text: String, agents: [String]) {
@@ -334,8 +479,9 @@ public struct AgentConversationContinuation: Sendable {
         var text = text, agents = agents
         func string(_ value: JSONValue?) -> String? { if case .string(let text)? = value, !text.isEmpty { text } else { nil } }
         for item in items {
-            guard let key = item.key, key.hasPrefix("queue:"),
-                  let by = await MyQueueReady.hold(String(key.dropFirst(6)), session: session, dataRoot: dataRoot) else { continue }
+            guard let key = item.key, key.hasPrefix("queue:") || key.hasPrefix("carry."),
+                  let by = try? await SwiftNativeDeskStore(dataRoot: dataRoot).heldBy(
+                    String(key.dropFirst(6)), session: session) else { continue }
             text += "\n• Held: \(item.line.prefix(80)) is held by \(by), which is working it. Leave it to that one."
         }
         var sources: [String] = []
@@ -361,7 +507,7 @@ public struct AgentConversationContinuation: Sendable {
                 + "this came from; records, not a request]\n"
                 + recent.map { $0.role + ": " + String($0.content.prefix(600)) }.joined(separator: "\n")
         }
-        // An elevated peer's words are the person's own (PeerTrust).
+        // Newly quoted context is separate from the step's restored steer.
         return (text, agents.filter { !PeerTrust.ownerTrusts($0, dataRoot: dataRoot) })
     }
 
@@ -389,6 +535,7 @@ public struct AgentConversationContinuation: Sendable {
             // lane too, so no person-only gate reads it as the person.
             turnSurface = "chat"
             turnEnvelope = TurnEnvelope(surface: turnSurface, agent: row.agent,
+                verifiedUserId: peer?.id,
                 deliveryRoute: route.chatToolReplyRoute, declaredRemote: false)
             origin = ChatMessageOrigin(surface: BridgeLane.bridgeSurfaceName(forSender: row.agent), agent: row.agent,
                 authored: BridgeLane.laneAuthorship(forSender: row.agent))
@@ -407,13 +554,17 @@ public struct AgentConversationContinuation: Sendable {
         } else { throw StandingBotsError.invalidValue("A reply must have an identified author.") }
         let isTerminalCompletion = notice?.event.hasPrefix("stalled:") != true
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        let digest = SHA256.hash(data: try encoder.encode(receipt)).map { String(format: "%02x", $0) }.joined()
+        let digest = try await lifecycle.cachedRequestDigest(deliveryId: deliveryID)
+            ?? SHA256.hash(data: try encoder.encode(receipt)).map { String(format: "%02x", $0) }.joined()
+        let responseRunID = CausalTransitionEvidence.opaqueIdentity(deliveryID)
         let response: ChatOrchestration.ChatResponse
-        switch try await lifecycle.claim(deliveryId: deliveryID, requestDigest: digest, sessionId: session) {
+        switch try await lifecycle.claim(deliveryId: deliveryID, requestDigest: digest, sessionId: session, responseRunId: responseRunID, route: route,
+                                        principal: row.agent, source: row.agent) {
         case .cached(let cached): response = cached
         case .settled(let result):
             if let notice { return try told(row, notice) }
-            try finish(row, delivered: result?.status == "completed", runID: row.deliveryRunID)
+            try finish(row, delivered: result?.status == "completed" || result?.status == "sent_unconfirmed", runID: row.deliveryRunID, sessionID: session,
+                       sentUnconfirmed: result?.status == "sent_unconfirmed")
             return
         case .inProgress, .outcomeUnknown, .conflict:
             // Never a second turn for one event; the thread itself is untouched.
@@ -430,7 +581,7 @@ public struct AgentConversationContinuation: Sendable {
                 let client = bot == nil ? clients.bridgeChatClient() : clients.backgroundChatClient()
                 let request = TurnRequest(message: incoming, sessionID: session, surface: turnSurface,
                     envelope: turnEnvelope, verifiedSessionID: session, replyRoute: route.chatToolReplyRoute,
-                    origin: origin, codexCompletion: CodexCompletionTranscriptBinding(deliveryId: deliveryID, requestDigest: digest,
+                    origin: origin, pinnedRunID: responseRunID, codexCompletion: CodexCompletionTranscriptBinding(deliveryId: deliveryID, requestDigest: digest,
                                                                                       model: "", reasoningEffort: nil,
                                                                                       isTerminalCompletion: isTerminalCompletion))
                 response = try await TurnAdmission.shared.run(sessionID: session) {
@@ -474,7 +625,8 @@ public struct AgentConversationContinuation: Sendable {
             text: response.output, attachments: response.attachments ?? [], route: route, client: clients.bridgeChatClient(),
             sender: completionSender, lifecycle: lifecycle, notifyRequestedResult: isTerminalCompletion)
         if let notice { return try told(row, notice) }
-        try finish(row, delivered: result.status == "completed", runID: response.runId)
+        try finish(row, delivered: result.status == "completed" || result.status == "sent_unconfirmed", runID: response.runId, sessionID: session,
+                   sentUnconfirmed: result.status == "sent_unconfirmed")
     }
 
     /// The event is hers now: clear it, leaving the thread's own state (a
@@ -580,13 +732,17 @@ public struct AgentConversationContinuation: Sendable {
         """
     }
 
-    private func finish(_ row: AgentConversationRecord, delivered: Bool, runID: String?) throws {
+    private func finish(_ row: AgentConversationRecord, delivered: Bool, runID: String?, sessionID: String, sentUnconfirmed: Bool = false) throws {
         // Agent can already have answered and advanced this conversation while
         // the old human-facing completion is delivered. Never overwrite it.
         _ = try? store.update(id: row.id, operationID: row.operationID) {
             $0.phase = delivered ? "ready" : "attention"
-            $0.deliveryState = delivered ? "delivered" : "attention"
+            $0.deliveryState = sentUnconfirmed ? "sent_unconfirmed" : delivered ? "delivered" : "attention"
             $0.deliveryRunID = runID; $0.automaticRead = false; $0.nextReadAt = nil
+        }
+        if delivered, let runID {
+            try SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot,
+                sessionId: sessionID, runId: runID)
         }
     }
 

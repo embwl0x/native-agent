@@ -442,17 +442,18 @@ extension CognitiveSubstrate {
         let window = min(
             CognitiveInnerStateReading.maximumWindowHours,
             max(CognitiveInnerStateReading.minimumWindowHours, windowHours))
-        guard configuration.enabled, configuration.affectEnabled else {
+        guard configuration.enabled else {
             return .unavailable(at: now, windowHours: window, detail: detail)
         }
 
-        let mood = derivedMood(at: now)
-        let currentAffect = projectedAffect(at: now)
+        let dyn = dynamics
+        let currentAffect = projectedAffect(at: now, dynamics: dyn)
+        let mood = derivedMood(at: now, dynamics: dyn, affect: currentAffect)
 
         // The hot set, read through the PURE decayed peek — the same producer
         // the shoulder tap's suggestion read uses, so the two surfaces can never
         // disagree about what she is holding, and neither one ages it.
-        let capsuleItems = pureHotSet(at: now)
+        let capsuleItems = pureHotSet(at: now, mood: mood, affect: currentAffect)
             .filter { capsuleEligibleWorkspaceNode($0.node) }
             .map { CognitiveWorkspaceItem(node: $0.node, score: $0.score, reasons: []) }
 
@@ -466,9 +467,9 @@ extension CognitiveSubstrate {
         )
         let signals = feltSignalsForCapsule(
             from: capsuleItems, request: request, at: now,
-            affect: currentAffect, mood: mood)
+            affect: currentAffect, mood: mood, dynamics: dyn)
         let fingerprint = Self.feltFingerprint(
-            signals, intensityFloor: dynamics.feltIntensityFloor)
+            signals, intensityFloor: dyn.feltIntensityFloor)
 
         // What the fingerprint is about: the leading FELT node in the same
         // capsule-eligible population the fingerprint was built from. Absent
@@ -669,8 +670,8 @@ extension CognitiveSubstrate {
             moodValence: mood.valence,
             moodBasis: mood.basis,
             moodWord: Self.innerStateMoodWord(mood.valence),
-            dispositionValence: decayedDispositionValence(at: now),
-            dispositionWord: Self.innerStateDispositionWord(decayedDispositionValence(at: now)),
+            dispositionValence: decayedDispositionValence(at: now, dynamics: dyn),
+            dispositionWord: Self.innerStateDispositionWord(decayedDispositionValence(at: now, dynamics: dyn)),
             feltNodes: Array(felt),
             chemistryWords: Self.innerStateChemistryWords(organism.projection),
             fatigue: organism.fatigue,
@@ -710,10 +711,12 @@ extension CognitiveSubstrate {
     }
 
     /// The hot set, decayed on COPIES: reading her mind never changes it.
-    func pureHotSet(at now: Date) -> [(node: CognitiveNode, score: Double)] {
-        guard configuration.enabled, configuration.workspaceEnabled else { return [] }
-        let mood = derivedMood(at: now)
-        let currentAffect = projectedAffect(at: now)
+    func pureHotSet(
+        at now: Date,
+        mood: CognitiveMoodReading,
+        affect currentAffect: CognitiveAffectState
+    ) -> [(node: CognitiveNode, score: Double)] {
+        guard configuration.enabled else { return [] }
         return field.peekDecayedNodes(at: now)
             .map { (node: $0, turnKind: field.cachedTurnKind(for: $0)) }
             .filter {
@@ -803,9 +806,7 @@ extension CognitiveSubstrate {
     /// a second, prose-shaped way out of the machine.
     func innerStateRumination(at now: Date, surface: String?) -> CognitiveInnerStateReading.RuminationCandidate? {
         guard let heaviest = ruminationCandidates(at: now).first(where: { candidate in
-            guard let id = candidate.externalId,
-                  let permitted = externalRuminations[id]?.permittedSurfaces else { return true }
-            return surface.map { permitted.contains($0) } ?? false
+            ruminationIsPermitted(candidate, on: surface)
         }) else { return nil }
         // The subject is the first LIVED source node the seed still has in the
         // field. A nag whose evidence has been evicted keeps its pointer and

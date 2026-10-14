@@ -6,23 +6,7 @@ import MemoryV2
 import ProviderRouting
 import TrustCenter
 
-/// Supplies the app-composed shared model client at the original staging boundary.
-public struct MemoryApprovalTransactionPorts: Sendable {
-    public let makeLLMClient: @Sendable () -> any LLMClient
-
-    public init(makeLLMClient: @escaping @Sendable () -> any LLMClient) {
-        self.makeLLMClient = makeLLMClient
-    }
-}
-
 public enum MemoryApprovalTransactions {
-    public static func applyResolvedMemoryRepair(
-        from rec: ApprovalRecord,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
-        await MemoryRepairOneShot.applyResolvedMemoryRepair(from: rec, dataRoot: dataRoot)
-    }
-
     /// REVIEW BLOCKER FIX (gpt-5.5, 2026-06-10): resolve→apply crash-window
     /// reconciliation for memory.repair. resolveApproval persists the
     /// approval terminal BEFORE the executor runs; a crash between the two
@@ -45,7 +29,7 @@ public enum MemoryApprovalTransactions {
             ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind(
                 action: MemoryRepairOneShot.action,
                 shouldReconcile: { _ in true },
-                execute: { await applyResolvedMemoryRepair(from: $0, dataRoot: dataRoot) })
+                execute: { await MemoryRepairOneShot.applyResolvedMemoryRepair(from: $0, dataRoot: dataRoot) })
         ])
     }
 
@@ -76,18 +60,17 @@ public enum MemoryApprovalTransactions {
                     // annotating, or the stamp dead-ends every future
                     // staging behind a card that can never apply.
                     MemoryKindBackfill.clearStamp(dataRoot: dataRoot)
-                    try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                        id: rec.id,
+                    try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                        rec.id,
                         executedAction: .object(["error": .string("payload carries no row proposals")]),
                         detail: "kind backfill FAILED: payload carries no row proposals — "
-                            + "stamp cleared; next launch re-stages whatever is still classifiable",
-                        root: dataRoot)
+                            + "stamp cleared; next launch re-stages whatever is still classifiable")
                     return
                 }
-                let storage = try await Self.kindBackfillStorage(dataRoot: dataRoot)
+                let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
                 let outcome = try await MemoryKindBackfill.apply(rows, storage: storage)
-                try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                    id: rec.id,
+                try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                    rec.id,
                     executedAction: .object([
                         "op": .string("memory_kind_backfill"),
                         "applied": .array(outcome.applied.map { .string($0) }),
@@ -96,31 +79,27 @@ public enum MemoryApprovalTransactions {
                     ]),
                     detail: "kind backfill applied: \(outcome.applied.count) rows stamped"
                         + (outcome.skippedStale.isEmpty ? "" : ", \(outcome.skippedStale.count) stale-skipped")
-                        + (outcome.failed.isEmpty ? "" : ", \(outcome.failed.count) FAILED"),
-                    root: dataRoot)
+                        + (outcome.failed.isEmpty ? "" : ", \(outcome.failed.count) FAILED"))
             } catch {
                 nativeLog("[kindBackfill] apply failed: \(String(describing: error))")
                 MemoryKindBackfill.clearStamp(dataRoot: dataRoot)
-                try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                    id: rec.id,
+                try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                    rec.id,
                     executedAction: .object(["error": .string("\(error)")]),
                     detail: "kind backfill FAILED: \(error.localizedDescription) — stamp cleared; "
-                        + "next launch re-stages whatever is still classifiable",
-                    root: dataRoot)
+                        + "next launch re-stages whatever is still classifiable")
             }
         case "denied":
-            try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                id: rec.id,
+            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                rec.id,
                 executedAction: .object(["op": .string("memory_kind_backfill_deny")]),
-                detail: "kind backfill denied — rows untouched; will not be re-proposed",
-                root: dataRoot)
+                detail: "kind backfill denied — rows untouched; will not be re-proposed")
         default: // canceled
             MemoryKindBackfill.clearStamp(dataRoot: dataRoot)
-            try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                id: rec.id,
+            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                rec.id,
                 executedAction: .object(["op": .string("memory_kind_backfill_cancel")]),
-                detail: "kind backfill canceled — stamp cleared; next launch re-stages it",
-                root: dataRoot)
+                detail: "kind backfill canceled — stamp cleared; next launch re-stages it")
         }
     }
 
@@ -139,17 +118,6 @@ public enum MemoryApprovalTransactions {
         ])
     }
 
-    /// Storage handle for the kind-backfill surface. Fix-round NIT (gpt-5.5
-    /// review, 2026-06-10): prefer the launch-attached SHARED storage —
-    /// `SwiftNativeMemoryV2.shared.underlyingBridge().underlyingStorage()` —
-    /// so USER.md regen / Spotlight / KG hooks fire on the kind stamps
-    /// (same rule as updateMemory/deleteMemory, F2). The shared resolver opens
-    /// a private store only for custom roots; an unavailable live owner fails
-    /// closed instead of silently creating a hookless default-root fallback.
-    private static func kindBackfillStorage(dataRoot: URL) async throws -> MemoryStorage {
-        try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-    }
-
     /// Stages the kind-backfill approval card if the legacy kind-less rows
     /// still exist and no card was staged before (U3 wave-2 item 5).
     /// MemoryV2 never imports ApprovalInbox (module-boundary rule), so the
@@ -157,7 +125,7 @@ public enum MemoryApprovalTransactions {
     /// SwiftNativeApprovalInbox closures.
     public static func stageKindBackfillIfNeeded(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        ports: MemoryApprovalTransactionPorts
+        makeLLMClient: @Sendable () -> any LLMClient
     ) async {
         let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .fullMacYoloAuthority(
@@ -169,16 +137,11 @@ public enum MemoryApprovalTransactions {
                 )
             )
         if yolo.state == .explicitlyBlocked {
-            writeKindBackfillFullMacOutcome(
-                dataRoot: dataRoot,
-                status: "refused",
-                detail: "memory kind backfill is explicitly blocked; no approval was staged."
-            )
             return
         }
         let storage: MemoryStorage
         do {
-            storage = try await Self.kindBackfillStorage(dataRoot: dataRoot)
+            storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         } catch {
             nativeLog("[kindBackfill] storage open failed; staging skipped: \(String(describing: error))")
             return
@@ -194,7 +157,7 @@ public enum MemoryApprovalTransactions {
         // save Anthropic tokens). Same no-fabrication contract as FM: a
         // reply outside the taxonomy throws → the row drops from the card
         // instead of carrying a made-up kind.
-        let llm = ports.makeLLMClient()
+        let llm = makeLLMClient()
         let routerForPins = SwiftNativeProviderRouting()
         let classifier: @Sendable (String, [String]) async throws -> String = { content, taxonomy in
             if AppleFoundationModelsAdapter.isAvailable {
@@ -268,11 +231,6 @@ public enum MemoryApprovalTransactions {
                         localOnly: true
                     )
                     await applyResolvedKindBackfill(from: admitted, dataRoot: dataRoot)
-                    writeKindBackfillFullMacOutcome(
-                        dataRoot: dataRoot,
-                        status: "admitted",
-                        detail: "Executed through the canonical kind-backfill executor without an approval prompt."
-                    )
                     return id
                 }
                 return try await inbox.create(body).id
@@ -283,27 +241,5 @@ public enum MemoryApprovalTransactions {
                     filter: ApprovalFilter(status: "pending", action: MemoryKindBackfill.action)
                 ).map { (id: $0.id, payload: $0.payload) }
             })
-    }
-
-    private static func writeKindBackfillFullMacOutcome(
-        dataRoot: URL,
-        status: String,
-        detail: String
-    ) {
-        let path = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("kind_backfill.full_mac_outcome.json")
-        try? FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let value: JSONValue = .object([
-            "status": .string(status),
-            "detail": .string(detail),
-            "at": .string(ISO8601DateFormatter().string(from: Date())),
-        ])
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(value) {
-            try? data.write(to: path, options: .atomic)
-        }
     }
 }

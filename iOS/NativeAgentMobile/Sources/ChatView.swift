@@ -15,16 +15,13 @@ import UniformTypeIdentifiers
 struct ChatView: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
-    // PERF-2026-08-05: `@Observable` — this view body reads only `isListening`,
-    // `isStarting`, `transcript`, `statusText`, `error` and `lastFinalTranscript`,
-    // so the ~45Hz `audioLevel` tap write no longer invalidates the chat screen.
     @Environment(VoiceInputController.self) private var voiceInput
     @EnvironmentObject private var voiceOutput: VoiceOutputController
     @Environment(\.scenePhase) private var scenePhase
     // chat-smoothness phase 6: respect Reduce Motion on the bubble entrance.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @EnvironmentObject private var store: ChatStore
-    @StateObject private var sync = iCloudSyncEngine.shared
+    @Environment(ChatStore.self) private var store
+    private let sync = iCloudSyncEngine.shared
     /// The iPhone is a member of the **Chat** group, so its model is the Mac's
     /// resolved Chat choice, delivered in the synced surface preferences
     /// (`adoptSurfaceModelPreferenceFromSync`). Empty until that snapshot
@@ -49,7 +46,7 @@ struct ChatView: View {
     @AppStorage("chatSurfaceSelectionAwaitingSync") private var surfaceSelectionAwaitingSync = false
     @AppStorage("chatFileAccess") private var selectedFileAccess = "auto"
     @AppStorage("chatProviderId") private var selectedProviderId = ""
-    @State private var inputText = ""
+    @State private var draft = MobileChatDraft()
     @State private var showsChatSetup = false
     @State private var historyLimit = ChatView.historyPage
     @State private var showsConfiguration = false
@@ -72,6 +69,8 @@ struct ChatView: View {
     @State private var pendingFiles: [MultimodalAttachment] = []
     @State private var showsFileImporter = false
     @State private var isLoadingPhotos = false
+    @State private var fileLoadTask: Task<Void, Never>?
+    @State private var fileLoadID: UUID?
     @State private var photoLoadTask: Task<Void, Never>?
     @State private var photoLoadGeneration = 0
     @State private var suppressNextEmptyPhotoSelection = false
@@ -85,12 +84,6 @@ struct ChatView: View {
     @State private var dictationSessionKey: String?
 
     private let maxPendingPhotos = 4
-    /// No model ids are named on the phone (2026-09-13). Rows and their order
-    /// come from the Mac's catalog snapshot (`sync.providers`), which is already
-    /// priority-ordered there, so an empty preference list means "take the
-    /// provider's own first row" — and a model retired on the Mac disappears
-    /// here the moment the snapshot lands, with nothing to keep in step.
-    static let preferredModelIDs: [String] = []
     // CloudKitDeviceTransport caps the complete encoded BridgeMessage at
     // 800 KiB. Base64 expands image bytes by roughly one third, so reserve
     // ample room for JSON, text, signatures, and controls and keep the
@@ -263,6 +256,7 @@ struct ChatView: View {
                                     status: "pending", localOnly: true, remoteResolvable: false)]
         }
         #endif
+        guard store.sessionCacheLoadTask == nil else { return [] }
         return MobileChatApprovalProjection.pendingApprovals(
             sessionId: store.selectedSessionID,
             approvals: sync.approvals
@@ -272,25 +266,22 @@ struct ChatView: View {
     /// Cards raised in another thread and mirrored into this conversation for
     /// User; their buttons answer the original through the signed inbox action.
     private var inlineChatCards: [InboxItemRecord] {
-        guard let session = store.selectedSessionID, !session.isEmpty else { return [] }
+        guard store.sessionCacheLoadTask == nil,
+              let session = store.selectedSessionID, !session.isEmpty else { return [] }
+        let interactions = Set(visibleMessages.compactMap { $0.interaction.map { "interaction:\($0.id)" } })
         return sync.inboxItems.filter { item in
             item.source == "interaction" && item.chat_session_id == session
                 && !["archived", "dismissed"].contains(item.status)
-                && !visibleMessages.contains(where: { message in "interaction:\(message.interaction?.id ?? "")" == item.id })
+                && !interactions.contains(item.id)
         }
-    }
-
-    private var inlineApprovalAnchorID: UUID? {
-        guard !inlineChatApprovals.isEmpty || !inlineChatCards.isEmpty else { return nil }
-        return MobileChatApprovalProjection.anchorMessageID(in: visibleMessages)
     }
 
     @ViewBuilder
-    private var inlinePendingCards: some View {
-        ForEach(inlineChatApprovals) { approval in
+    private func inlinePendingCards(approvals: [ApprovalRequest], cards: [InboxItemRecord]) -> some View {
+        ForEach(approvals) { approval in
             InlineChatApprovalCard(approval: approval)
         }
-        ForEach(inlineChatCards) { item in
+        ForEach(cards) { item in
             InboxCardRow(item: item, onAction: { action in
                 Task {
                     do {
@@ -379,6 +370,11 @@ struct ChatView: View {
                     reconcilePublishedChatSessions()
                 }
             }
+            .onChange(of: store.sessionSwitchGeneration) { _, _ in
+                fileLoadTask?.cancel()
+                fileLoadTask = nil
+                fileLoadID = nil
+            }
     }
 
     /// Every notice the chat can raise, for the one banner lane. E8: an
@@ -429,7 +425,10 @@ struct ChatView: View {
     }
 
     private var chatBody: some View {
-        NavigationStack {
+        let approvals = inlineChatApprovals
+        let cards = inlineChatCards
+        let anchor = approvals.isEmpty && cards.isEmpty ? nil : MobileChatApprovalProjection.anchorMessageID(in: visibleMessages)
+        return NavigationStack {
             VStack(spacing: 0) {
                 // One banner lane: the newest notice shows, the rest wait
                 // behind a count instead of stacking down the screen.
@@ -442,7 +441,7 @@ struct ChatView: View {
 
                 ScrollViewReader { proxy in
                     ScrollView {
-                        if visibleMessages.isEmpty && inlineChatApprovals.isEmpty && inlineChatCards.isEmpty {
+                        if visibleMessages.isEmpty && approvals.isEmpty && cards.isEmpty {
                             chatEmptyState
                                 .containerRelativeFrame(.vertical)
                         } else {
@@ -462,6 +461,7 @@ struct ChatView: View {
 	                                        onRetry: { store.retry(messageId: msg.id, client: bridgeClient) },
 	                                        isLiveTurn: store.liveTurnBubbles.values.contains(msg.id)
 	                                    )
+                                        .equatable()
                                         // The paced reveal grows the live reply
                                         // between ~1 s batches; keep following it.
                                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { _ in
@@ -505,12 +505,12 @@ struct ChatView: View {
 	                                    // this turn is waiting on renders right
 	                                    // here instead of only in the Activity
 	                                    // tab. Activity stays canonical.
-	                                    if msg.id == inlineApprovalAnchorID {
-                                            inlinePendingCards
+	                                    if msg.id == anchor {
+                                            inlinePendingCards(approvals: approvals, cards: cards)
 	                                    }
 	                                }
-                                if inlineApprovalAnchorID == nil {
-                                    inlinePendingCards
+                                if anchor == nil {
+                                    inlinePendingCards(approvals: approvals, cards: cards)
                                 }
                                 // Reaching the bottom by hand is following again:
                                 // the Latest button goes away on its own.
@@ -685,6 +685,9 @@ struct ChatView: View {
                 .presentationDetents([.medium, .large])
             }
             .task {
+                await store.restorationTask?.value
+                guard !Task.isCancelled else { return }
+                store.resumeObservingPendingExchanges(using: bridgeClient)
                 #if DEBUG
                 if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleModel") {
                     showsConfiguration = true
@@ -695,7 +698,7 @@ struct ChatView: View {
                 if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleKeyboard") {
                     if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-chatSampleDraft"),
                        ProcessInfo.processInfo.arguments.indices.contains(index + 1) {
-                        inputText = ProcessInfo.processInfo.arguments[index + 1]
+                        draft.text = ProcessInfo.processInfo.arguments[index + 1]
                     }
                     await Task.yield()
                     composerIsFocused = true
@@ -740,7 +743,7 @@ struct ChatView: View {
                 if iCloudReplyObserverID == nil {
                     iCloudReplyObserverID = bridgeClient.observeICloudReplies { msg in
                         Task { @MainActor in
-                            store.receiveICloudReply(msg)
+                            await store.receiveICloudReply(msg)
                         }
                     }
                 }
@@ -774,15 +777,20 @@ struct ChatView: View {
                     controls: runtimeControls
                 )
                 Task {
+                    await store.restorationTask?.value
+                    await iCloudBridge.shared.deviceIncomingSetupTask?.value
+                    await iCloudBridge.shared.setupTask?.value
                     await bridgeClient.pollICloudRepliesNow()
-                    await sync.refreshProviderControlsSnapshot()
-                    await sync.refreshChatSessionListSnapshot()
+                    if !sync.refreshInFlight {
+                        await sync.refreshProviderControlsSnapshot()
+                        await sync.refreshChatSessionListSnapshot()
+                    }
                     adoptMainSessionFromSnapshots()
                     reconcileExternallyRemovedPinnedSession(
                         afterPinnedIDs: visiblePinnedSessionIDs
                     )
                     adoptConversationAnchorIfNeeded()
-                    store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
+                    if !sync.refreshInFlight { store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages()) }
                     await MainActor.run { seedProviderIfNeeded() }
                 }
                 // PATCH-2026-05-11: foreground-refresh — pull latest history on appear.
@@ -851,10 +859,10 @@ struct ChatView: View {
                 // receives the words.
                 guard let origin = dictationSessionKey,
                       origin == store.queueSessionKey(store.selectedSessionID) else { return }
-                if inputText.isEmpty {
-                    inputText = newValue
+                if draft.text.isEmpty {
+                    draft.text = newValue
                 } else {
-                    inputText += " " + newValue
+                    draft.text += " " + newValue
                 }
             }
             .onChange(of: selectedPhotoItems) { previousItems, items in
@@ -897,19 +905,9 @@ struct ChatView: View {
                 : AnyLayout(HStackLayout(alignment: .bottom, spacing: 2))
             layout {
                 if !a11y { photosPickerButton }
-                TextField(composerPlaceholder, text: Binding(
-                    get: { inputText },
-                    set: { inputText = $0 }
-                ), prompt: Text(composerPlaceholder).foregroundStyle(AlivePalette.secondary), axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .focused($composerIsFocused)
-                    .mobileTypography(.body)
-                    .lineLimit(a11y ? 1...8 : 1...5)
-                    .padding(.vertical, 11)
-                    .frame(minHeight: 44)
-                    .submitLabel(.send)
-                    .onSubmit { submitMessage() }
-                    .disabled(store.isSwitchingSession)
+                MobileChatComposerField(draft: draft, placeholder: composerPlaceholder,
+                    focused: $composerIsFocused, accessibilitySize: a11y,
+                    isSwitchingSession: store.isSwitchingSession, onSubmit: submitMessage)
 
             HStack(spacing: 2) {
                 if a11y { photosPickerButton; Spacer(minLength: 8) }
@@ -972,13 +970,13 @@ struct ChatView: View {
     }
 
     private var canSend: Bool {
-        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !pendingPhotos.isEmpty || !pendingFiles.isEmpty
+        fileLoadID == nil && (draft.hasText
+            || !pendingPhotos.isEmpty || !pendingFiles.isEmpty)
     }
 
     private var hasComposerDraft: Bool {
-        !inputText.isEmpty || !pendingPhotos.isEmpty || !pendingFiles.isEmpty
-            || !selectedPhotoItems.isEmpty || isLoadingPhotos
+        !draft.isEmpty || !pendingPhotos.isEmpty || !pendingFiles.isEmpty
+            || !selectedPhotoItems.isEmpty || isLoadingPhotos || fileLoadID != nil
     }
 
     private var queuedSendStrip: some View {
@@ -1220,7 +1218,7 @@ struct ChatView: View {
                 .frame(width: 44, height: 44)
                 .contentShape(Circle())
         }
-        .disabled(store.isLoading || store.isSwitchingSession || loading || pendingPhotos.count + pendingFiles.count == maxPendingPhotos)
+        .disabled(store.isLoading || store.isSwitchingSession || loading || fileLoadID != nil || pendingPhotos.count + pendingFiles.count == maxPendingPhotos)
         .accessibilityLabel("Add photos")
         Button { showsFileImporter = true } label: {
             Image(systemName: "doc.badge.plus")
@@ -1228,7 +1226,7 @@ struct ChatView: View {
                 .foregroundStyle(AlivePalette.secondary)
                 .frame(width: 44, height: 44)
         }
-        .disabled(store.isLoading || store.isSwitchingSession || pendingFiles.count + pendingPhotos.count >= maxPendingPhotos)
+        .disabled(store.isLoading || store.isSwitchingSession || fileLoadID != nil || pendingFiles.count + pendingPhotos.count >= maxPendingPhotos)
         .accessibilityLabel("Add PDF or text files")
         }
     }
@@ -1832,11 +1830,6 @@ struct ChatView: View {
         return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Auto"
     }
 
-    private func fileAccessIcon(_ id: String) -> String {
-        let normalized = ChatRuntimeControlPresentation.normalizedFileAccessID(id)
-        return fileAccessOptions.first(where: { $0.id == normalized })?.icon ?? "wand.and.stars"
-    }
-
     // MARK: - Mic button
 
     private var micButton: some View {
@@ -1961,10 +1954,9 @@ struct ChatView: View {
     // MARK: - Send
 
     private func submitMessage() {
-        guard !isChatSample else { return }
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isChatSample, canSend, !store.isSwitchingSession else { return }
+        let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = pendingPhotos.map(\.attachment) + pendingFiles
-        guard !text.isEmpty || !attachments.isEmpty else { return }
         let sendText = text.isEmpty
             ? (attachments.count == 1 ? "Look at this attachment." : "Look at these attachments.")
             : text
@@ -1973,7 +1965,7 @@ struct ChatView: View {
         let follow = ChatFollowPresentation.followLatest()
         autoFollowChat = follow.autoFollow
         showLatestButton = follow.showsLatest
-        inputText = ""
+        draft.text = ""
         pendingPhotos = []
         pendingFiles = []
         selectedPhotoItems = []
@@ -1982,33 +1974,35 @@ struct ChatView: View {
     private func loadFileAttachments(_ result: Result<[URL], Error>) {
         do {
             let urls = try result.get()
-            var files: [MultimodalAttachment] = []
             guard urls.count + pendingFiles.count + pendingPhotos.count <= maxPendingPhotos else {
                 store.errorBanner = "Attach up to four photos or documents at a time."
                 return
             }
-            for url in urls {
-                guard let shape = ChatAttachmentTypeResolver.typeAndMime(forExtension: url.pathExtension.lowercased()),
-                      shape.type == "file" else {
-                    store.errorBanner = "Choose a PDF, TXT, or Markdown file."
-                    return
+            let generation = store.sessionSwitchGeneration
+            fileLoadTask?.cancel()
+            let loadID = UUID()
+            fileLoadID = loadID
+            fileLoadTask = Task {
+                defer {
+                    if fileLoadID == loadID { fileLoadID = nil; fileLoadTask = nil }
                 }
-                let access = url.startAccessingSecurityScopedResource()
-                defer { if access { url.stopAccessingSecurityScopedResource() } }
-                let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                guard size > 0, size <= ChatAttachmentTypeResolver.fileByteLimit else {
-                    store.errorBanner = "Documents must be nonempty and no larger than 10 MB."
-                    return
+                do {
+                    let files = try await Task.detached(priority: .userInitiated) {
+                        try urls.map { try MobileChatAttachmentPreparation.fileAttachment(from: $0) }
+                    }.value
+                    guard !Task.isCancelled, fileLoadID == loadID, generation == store.sessionSwitchGeneration else { return }
+                    guard files.count + pendingFiles.count + pendingPhotos.count <= maxPendingPhotos else {
+                        store.errorBanner = "Attach up to four photos or documents at a time."
+                        return
+                    }
+                    pendingFiles.append(contentsOf: files)
+                } catch {
+                    guard !Task.isCancelled, fileLoadID == loadID, generation == store.sessionSwitchGeneration else { return }
+                    let failure = error as NSError
+                    store.errorBanner = failure.domain == "ChatAttachment" ? failure.localizedDescription
+                        : "File could not be loaded: \(error.localizedDescription)"
                 }
-                let bytes = try Data(contentsOf: url)
-                guard bytes.count > 0, bytes.count <= ChatAttachmentTypeResolver.fileByteLimit else {
-                    store.errorBanner = "Documents must be nonempty and no larger than 10 MB."
-                    return
-                }
-                files.append(MultimodalAttachment(id: UUID().uuidString, type: shape.type,
-                    base64: bytes.base64EncodedString(), mime: shape.mime, name: url.lastPathComponent, byteSize: bytes.count))
             }
-            pendingFiles.append(contentsOf: files)
         } catch { store.errorBanner = "File could not be loaded: \(error.localizedDescription)" }
     }
 
@@ -2044,29 +2038,21 @@ struct ChatView: View {
                         remainingBytes: remainingBudget,
                         remainingCount: remainingCount
                     )
-                    guard let sourceData = try await item.loadTransferable(type: Data.self),
-                          let sourceImage = UIImage(data: sourceData),
-                          photoBudget > 0,
-                          let jpeg = Self.preparedJPEGData(
-                            from: sourceImage,
-                            maxBytes: photoBudget
-                          ),
-                          let thumbnail = UIImage(data: jpeg)
-                    else {
+                    guard let sourceData = try await item.loadTransferable(type: Data.self), photoBudget > 0,
+                          let prepared = await Task.detached(priority: .userInitiated, operation: {
+                              guard let jpeg = MobileChatAttachmentPreparation.preparedJPEGData(from: sourceData, maxBytes: photoBudget),
+                                    let thumbnail = MobileChatAttachmentPreparation.thumbnail(from: jpeg, maxDimension: 240) else { return nil as (MultimodalAttachment, UIImage)? }
+                              let attachment = MultimodalAttachment(id: UUID().uuidString, type: "image",
+                                  base64: jpeg.base64EncodedString(), mime: "image/jpeg",
+                                  name: "iphone-photo-\(index + 1).jpg", byteSize: jpeg.count)
+                              return (attachment, thumbnail)
+                          }).value else {
                         skippedCount += 1
                         continue
                     }
-                    remainingBudget -= jpeg.count
-
-                    let id = UUID().uuidString
-                    let attachment = MultimodalAttachment(
-                        id: id,
-                        type: "image",
-                        base64: jpeg.base64EncodedString(),
-                        mime: "image/jpeg",
-                        name: "iphone-photo-\(index + 1).jpg",
-                        byteSize: jpeg.count
-                    )
+                    let (attachment, thumbnail) = prepared
+                    remainingBudget -= attachment.byteSize
+                    let id = attachment.id
                     loaded.append(PendingPhotoAttachment(id: id, attachment: attachment, thumbnail: thumbnail, pickerItem: item))
                 } catch {
                     await MainActor.run {
@@ -2097,13 +2083,7 @@ struct ChatView: View {
         return remainingBytes / remainingCount
     }
 
-    static func preparedJPEGData(
-        from image: UIImage,
-        maxDimension: CGFloat = 1400,
-        maxBytes: Int = cloudKitPhotoPayloadBudgetBytes
-    ) -> Data? {
-        MobileChatAttachmentPreparation.preparedJPEGData(from: image, maxDimension: maxDimension, maxBytes: maxBytes)
-    }
+
 
     private func importSharedItems() {
         rememberShareAgentName()
@@ -2255,5 +2235,41 @@ private struct MobileChatIssueBanner: View {
         .padding(.vertical, 4)
         .background(banner.tint.opacity(0.14))
         .accessibilityElement(children: .contain)
+    }
+}
+
+@Observable
+private final class MobileChatDraft {
+    var text = "" {
+        didSet {
+            if isEmpty != text.isEmpty { isEmpty = text.isEmpty }
+            let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if self.hasText != hasText { self.hasText = hasText }
+        }
+    }
+    private(set) var isEmpty = true
+    private(set) var hasText = false
+}
+
+private struct MobileChatComposerField: View {
+    @Bindable var draft: MobileChatDraft
+    let placeholder: String
+    let focused: FocusState<Bool>.Binding
+    let accessibilitySize: Bool
+    let isSwitchingSession: Bool
+    let onSubmit: () -> Void
+
+    var body: some View {
+        TextField(placeholder, text: $draft.text,
+            prompt: Text(placeholder).foregroundStyle(AlivePalette.secondary), axis: .vertical)
+            .textFieldStyle(.plain)
+            .focused(focused)
+            .mobileTypography(.body)
+            .lineLimit(accessibilitySize ? 1...8 : 1...5)
+            .padding(.vertical, 11)
+            .frame(minHeight: 44)
+            .submitLabel(.send)
+            .onSubmit(onSubmit)
+            .disabled(isSwitchingSession)
     }
 }

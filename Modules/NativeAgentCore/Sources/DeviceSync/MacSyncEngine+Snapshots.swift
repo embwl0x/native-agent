@@ -8,6 +8,7 @@ import CommonCrypto
 import CryptoKit
 import AppKit
 import Foundation
+import TurnTrace
 import DeviceSyncState
 import NativeAgentShared
 import NativeAgentCore
@@ -513,10 +514,30 @@ extension MacSyncEngine {
             async let sessionsTask = api.getChatSessions()
             async let healthTask = api.getHealth()
             async let memProposalsTask = api.pendingMemoryProposals()
-            async let trainingTask = api.getTrainingProposals()
-            async let promotionTask = api.getPromotionPending()
             async let organismTask = self.organismLivingStatusSnapshot()
             async let overviewTask = api.workOverview()
+            async let skillsTask: DeviceSyncSnapshotRows? = {
+                guard includeHeavySnapshots else { return nil }
+                return try await api.getSkills()
+            }()
+            async let memoriesTask: [MemoryRecord]? = {
+                guard includeHeavySnapshots || includeMemories else { return nil }
+                return try await Self.retryingCancelledGroupRead("memories") {
+                    try await api.activeMemories().map(MemoryRecord.init(phoneRow:))
+                }
+            }()
+            async let connectorsTask: DeviceSyncSnapshotRows? = {
+                guard includeHeavySnapshots else { return nil }
+                return try await api.getConnectors()
+            }()
+            async let toolCatalogTask: [MobileToolCatalogRecord]? = {
+                guard includeHeavySnapshots else { return nil }
+                return try await api.mobileToolCatalog()
+            }()
+            async let providersTask: DeviceSyncSnapshotRows? = {
+                guard includeHeavySnapshots else { return nil }
+                return try await api.providers()
+            }()
 
             // fix-2026-06-10 sync-audit #1: a transient fetch failure must NOT
             // become a successfully-written EMPTY snapshot (`?? []` fabricated
@@ -567,16 +588,12 @@ extension MacSyncEngine {
             do { health = try await healthTask } catch { recordFetchFailure("health", error) }
             var memProposals: DeviceSyncSnapshotRows?
             do { memProposals = try await memProposalsTask } catch { recordFetchFailure("memory_proposals", error) }
-            var training: DeviceSyncSnapshotRows?
-            do { training = try await trainingTask } catch { recordFetchFailure("training_proposals", error) }
-            var promotion: DeviceSyncSnapshotRows?
-            do { promotion = try await promotionTask } catch { recordFetchFailure("promotion_candidates", error) }
             var organismLivingStatus = await organismTask
             // One Desk read per pass: the overview and desk.json come from the
             // same board. needsUser is the overview's Needs you, the number
             // every Mac surface shows. The needs-you push runs off the app's
             // own overview read (DeviceSync.evaluateNeedsUser), not this pass.
-            let (overview, deskItems) = await overviewTask
+            let (overview, deskItems, approvals, inbox) = await overviewTask
             if let deskItems, overview.unavailable.isEmpty {
                 organismLivingStatus.needsUser = overview.needsYouCount > 0
                 organismLivingStatus.needsAttention = (organismLivingStatus.needsAttention ?? false)
@@ -594,23 +611,19 @@ extension MacSyncEngine {
             )
             var providers: DeviceSyncSnapshotRows?
             if includeHeavySnapshots {
-                do { skills = try await api.getSkills() } catch { recordFetchFailure("skills_snapshot", error) }
+                do { skills = try await skillsTask } catch { recordFetchFailure("skills_snapshot", error) }
             }
             if includeHeavySnapshots || includeMemories {
-                do {
-                    memories = try await Self.retryingCancelledGroupRead("memories") {
-                        try await api.activeMemories().map(MemoryRecord.init(phoneRow:))
-                    }
-                } catch { recordFetchFailure("memories", error) }
+                do { memories = try await memoriesTask } catch { recordFetchFailure("memories", error) }
             }
             if includeHeavySnapshots {
-                do { connectors = try await api.getConnectors() } catch { recordFetchFailure("connectors", error) }
-                do { toolCatalog = try await api.mobileToolCatalog() } catch {
+                do { connectors = try await connectorsTask } catch { recordFetchFailure("connectors", error) }
+                do { toolCatalog = try await toolCatalogTask } catch {
                     recordFetchFailure("tools_snapshot", error)
                 }
                 // PATCH-2026-05-07: leftover-1 providers.json snapshot so iOS reads provider state.
                 // This can refresh provider catalogs, so keep it out of the idle timer.
-                do { providers = try await api.providers() } catch { recordFetchFailure("providers", error) }
+                do { providers = try await providersTask } catch { recordFetchFailure("providers", error) }
             }
 
             guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
@@ -657,9 +670,19 @@ extension MacSyncEngine {
 
             await publish(await helpersSnapshotData(), as: "helpers_agents", to: "helpers_agents.json")
             await write(overview, to: "work_overview.json")
+            var executionData: Result<Data, Error>?
             if let executions {
-                await write(executions, to: "workshop_tasks.json")
-                do { try projectWorkshopWorkActivities(try await encodeSnapshot(executions)) }
+                let prepared: Result<Data, Error>
+                do {
+                    let data = try await encodeSnapshot(executions)
+                    prepared = .success(data)
+                    await writeData(data, to: "workshop_tasks.json")
+                } catch {
+                    prepared = .failure(error)
+                    recordGroupSkip("workshop_tasks", "encoding failed: \(error.localizedDescription)")
+                }
+                executionData = prepared
+                do { try projectWorkshopWorkActivities(try prepared.get()) }
                 catch { recordFetchFailure("work_activity", error) }
                 try? FileManager.default.removeItem(
                     at: snapshotDir.appendingPathComponent("missions.json")
@@ -667,9 +690,7 @@ extension MacSyncEngine {
             }
             if let deskItems {
                 do {
-                    var executionData: Data?
-                    if let executions { executionData = try await encodeSnapshot(executions) }
-                    let projection = try await MobileSnapshotBuilder.shared.desk(deskItems, executions: executionData)
+                    let projection = try await MobileSnapshotBuilder.shared.desk(deskItems, executions: executionData?.get())
                     await writeData(projection.data, to: "desk.json")
                     // Publish what the bounds dropped instead of leaving the
                     // phone to infer it from the row count it received.
@@ -708,8 +729,8 @@ extension MacSyncEngine {
                     return nil
                 }
             }()
-            async let approvalsData: SnapshotGroupBuild = self.nativeApprovalsSnapshotData()
-            async let inboxData: SnapshotGroupBuild = self.nativeInboxSnapshotData()
+            async let approvalsData: SnapshotGroupBuild = self.nativeApprovalsSnapshotData(approvals)
+            async let inboxData: SnapshotGroupBuild = self.nativeInboxSnapshotData(inbox)
             // The command palette is unconditionally Swift-native and reads
             // its live persona, approval, and autonomy context directly from
             // canonical local owners without an HTTP round-trip.
@@ -865,8 +886,8 @@ extension MacSyncEngine {
             await publish(await telegramSnapshotData(), as: "telegram", to: "telegram.json")
             await write(organismLivingStatus, to: Self.organismLivingStatusSnapshotFilename)
             if let memProposals { await write(memProposals, to: "memory_proposals.json") }
-            if let training { await write(training, to: "training_proposals.json") }
-            if let promotion { await write(promotion, to: "promotion_candidates.json") }
+            await write([JSONValue](), to: "training_proposals.json")
+            await write([JSONValue](), to: "promotion_candidates.json")
             if let providers { await write(providers, to: "providers.json") }
             await write(api.providerSignInStates(), to: "provider_sign_ins.json")
 
@@ -895,7 +916,7 @@ extension MacSyncEngine {
             let prunedDigests = Self.digestsPrunedToExistingFiles(snapshotFileDigests, in: snapshotDir)
             if prunedDigests.count != snapshotFileDigests.count {
                 snapshotFileDigests = prunedDigests
-                saveSnapshotDigests()   // durable even on a pass that wrote nothing
+                await saveSnapshotDigests()
             }
             // Publish before recording skips: a group that did not reach the
             // phone is stale exactly like one that did not build, and is named
@@ -1076,7 +1097,7 @@ extension MacSyncEngine {
                 syncError = "iPhone updates could not be delivered. The last received data is still available. The Mac will try again on its next update; keep NativeAgent open."
             }
         }
-        saveSnapshotDigests()
+        await saveSnapshotDigests()
         return failures
     }
 
@@ -1198,7 +1219,6 @@ extension MacSyncEngine {
         for filename in filenames {
             snapshotFileDigests.removeValue(forKey: filename)
         }
-        saveSnapshotDigests()
     }
 
     /// The hard ceiling on published transcripts. Each one is bounded to 80
@@ -1290,7 +1310,7 @@ extension MacSyncEngine {
         // session whose index row was removed mid-pass still shipped. Absence
         // now means "the row moved": drop it. A row that is present but has no
         // counter (an older Mac build) still publishes, exactly as before.
-        if let generationsAfter = Self.currentTranscriptGenerations() {
+        if let generationsAfter = await MobileSnapshotBuilder.shared.build({ Self.currentTranscriptGenerations() }) {
             out = out.filter { snapshot in
                 guard let after = generationsAfter[snapshot.sessionId] else { return false }
                 return after == snapshot.transcriptGeneration
@@ -1402,7 +1422,7 @@ extension MacSyncEngine {
         guard expectedLifecycleGeneration == snapshotLifecycleGeneration,
               isActive else {
             snapshotFileDigests.removeValue(forKey: filename)
-            saveSnapshotDigests()
+            await saveSnapshotDigests()
             return .unchanged
         }
         if let writeError {
@@ -1484,9 +1504,9 @@ extension MacSyncEngine {
     // approvals or an out-of-date model choice. The typed result carries the
     // REASON out so the same pass that keeps last-good also says which group
     // went stale and why.
-    private func nativeApprovalsSnapshotData() async -> SnapshotGroupBuild {
+    private func nativeApprovalsSnapshotData(_ read: Result<[ApprovalRequest], Error>) async -> SnapshotGroupBuild {
         let approvals: [ApprovalRequest]
-        do { approvals = try await sync.host.approvals() } catch {
+        do { approvals = try read.get() } catch {
             return .skipped("approval store unreadable: \(error.localizedDescription)")
         }
         do { return .built(try await MobileSnapshotBuilder.shared.encode(approvals)) } catch {
@@ -1494,9 +1514,9 @@ extension MacSyncEngine {
         }
     }
 
-    private func nativeInboxSnapshotData() async -> SnapshotGroupBuild {
+    private func nativeInboxSnapshotData(_ read: Result<[InboxItemRecord], Error>) async -> SnapshotGroupBuild {
         let items: [InboxItemRecord]
-        do { items = try await sync.host.inboxItems() } catch {
+        do { items = try read.get() } catch {
             return .skipped("inbox unreadable: \(error.localizedDescription)")
         }
         return await buildInboxSnapshot(items)
@@ -1538,7 +1558,7 @@ extension MacSyncEngine {
     }
 
     func organismLivingStatusSnapshot() async -> OrganismLivingStatusFile {
-        let snapshot = await organismSnapshotProvider()
+        let snapshot = await sync.cognition.organismSnapshot()
         return await MobileSnapshotBuilder.shared.build { Self.organismLivingStatusSnapshot(from: snapshot) }
     }
 
@@ -1629,7 +1649,13 @@ extension MacSyncEngine {
         sourceRoot: URL? = nil,
         now: Date = Date()
     ) async -> Data? {
-        await sync.host.turnSummariesSnapshotData(root: sourceRoot ?? stateDataRootOverride, now: now)
+        let root = sourceRoot ?? TurnSummarySource.liveRoot()
+        return await Task.detached(priority: .utility) { () -> Data? in
+            let events = TurnSummarySource.loadEvents(root: root, now: now)
+            let encoder = TurnSummaryComputer.makeEncoder()
+            let file = TurnSummaryComputer.compute(from: events, encoder: encoder)
+            return try? encoder.encode(file)
+        }.value
     }
 
     /// 2026-06-05 picker-sync: encode the picker's resolved per-surface

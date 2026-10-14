@@ -41,19 +41,20 @@ public actor HumanConversationReplyService {
         let deliverySurface = saved.surface == "app" ? "chat" : saved.surface
         let route = AgentBridgeCompletionRoute(surface: deliverySurface, sessionId: id,
             destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
-            replyTo: saved.replyTo, correlationId: saved.correlationId)
+            replyTo: saved.replyTo, correlationId: saved.correlationId, requesterUserId: saved.requesterUserId)
         let deliveryID = "human-reply:" + digest(id + "\u{1f}" + expected)
         let requestDigest = digest(id + "\u{1f}" + expected + "\u{1f}" + text)
         // Known setup failures happen before a claim or transcript mutation.
         do {
             let artifacts = try AgentBridgeCompletionRouter.artifacts(deliveryId: deliveryID,
-                surface: deliverySurface, text: text, attachments: [], notifyRequestedResult: false)
+                surface: deliverySurface, text: text, attachments: [])
             try await sender.preflight(surface: deliverySurface, route: route, artifacts: artifacts)
         } catch {
             return failure("unavailable", "This conversation's delivery connection is unavailable. Nothing was saved or sent.")
         }
         // Claim first. An interrupted or ambiguous attempt is never automatically replayed.
-        let claim = try await lifecycle.claim(deliveryId: deliveryID, requestDigest: requestDigest, sessionId: id)
+        let claim = try await lifecycle.claim(deliveryId: deliveryID, requestDigest: requestDigest, sessionId: id,
+                                             responseRunId: deliveryID, route: route)
         switch claim {
         case .start: break
         case .cached, .settled:

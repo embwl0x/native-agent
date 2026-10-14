@@ -7,28 +7,12 @@ import PersistenceCore
 final class _MCPWarnedServerSet: @unchecked Sendable {
     private let lock = NSLock()
     private var seen: Set<String> = []
-    private var order: [String] = []
 
     /// Returns true when this is the FIRST time we've seen `serverId`.
     func insert(_ serverId: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard seen.insert(serverId).inserted else { return false }
-        order.append(serverId)
-        return true
-    }
-
-    var recorded: [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return order
-    }
-
-    func reset() {
-        lock.lock()
-        seen.removeAll()
-        order.removeAll()
-        lock.unlock()
+        return seen.insert(serverId).inserted
     }
 }
 
@@ -118,18 +102,19 @@ public enum MCPToolBridge {
                 warnEmptyServer(serverId: serverId, reason: "server ID contains the reserved '__' tool-name delimiter; rename the server ID")
                 continue
             }
-            guard let tools = toolsCache[serverId], !tools.isEmpty else {
+            let cached = cachedTools(toolsCache[serverId])
+            guard let tools = cached, !tools.isEmpty else {
                 // FAIL LOUD (NORTHSTAR clause 2). A server that servers.json
                 // says is usable but that contributes ZERO descriptors is a
                 // silent capability loss — the model is told it has no such
                 // tools and reports "I don't have access". Before F-B3 this
                 // was the state of EVERY stdio server, because nothing wrote
                 // `mcp/cache/tools.json` after the daemon was retired. The
-                // cure is `SwiftNativeMCPDispatcher.refreshAllToolsCaches()`;
+                // live catalog warmer refreshes each server's tools cache;
                 // this line makes the disease visible either way.
                 warnEmptyServer(
                     serverId: serverId,
-                    reason: toolsCache[serverId] == nil
+                    reason: cached == nil
                         ? "no entry in mcp/cache/tools.json (never handshaked, or the cache was never stamped)"
                         : "its cache entry lists zero tools"
                 )
@@ -181,27 +166,26 @@ public enum MCPToolBridge {
         return out.sorted { $0.bridgedName < $1.bridgedName }
     }
 
-    /// Convenience wrapper returning just the bridged names — what
-    /// `ToolDispatchClient.listAvailableTools()` ultimately needs.
-    public static func listMCPToolNames(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> [String] {
-        listMCPTools(dataRoot: dataRoot).map(\.bridgedName)
-    }
-
     public static func effectiveRiskClass(
         serverId: String,
         toolName: String,
         serverRiskClass: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> String {
-        let descriptor = listMCPTools(dataRoot: dataRoot).first {
-            $0.serverId == serverId && $0.toolName == toolName
+        let mcpRoot = dataRoot.appendingPathComponent("mcp", isDirectory: true)
+        var toolRisk: String?
+        if !serverId.contains("__"), !(serverId == "searxng-local" && toolName == "fetch"),
+           readServers(at: mcpRoot.appendingPathComponent("servers.json")).contains(where: { $0.id == serverId }) {
+            let cache = readToolsCache(at: mcpRoot.appendingPathComponent("cache/tools.json"))
+            if let entry = cache[serverId] as? [String: Any], let tools = entry["tools"] as? [[String: Any]],
+               let tool = tools.first(where: { ($0["name"] as? String) == toolName && !toolName.isEmpty }) {
+                toolRisk = (tool["risk_class"] as? String) ?? (tool["riskClass"] as? String)
+            }
         }
         return effectiveRiskClass(
             serverId: serverId,
             serverRiskClass: serverRiskClass,
-            toolRiskClass: descriptor?.toolRiskClass
+            toolRiskClass: toolRisk
         )
     }
 
@@ -263,18 +247,11 @@ public enum MCPToolBridge {
     /// once per server rather than on every chat turn.
     private static let warnedServers = _MCPWarnedServerSet()
 
-    /// Server ids warned about this process, in first-seen order. The
-    /// observable half of the loud failure — stderr is the human half.
-    public static var emptyServerWarnings: [String] { warnedServers.recorded }
-
-    /// Test seam — forget the warned set so a test can observe the warning.
-    public static func _resetEmptyServerWarnings() { warnedServers.reset() }
-
     private static func warnEmptyServer(serverId: String, reason: String) {
         guard warnedServers.insert(serverId) else { return }
         let message = "MCPToolBridge: server '\(serverId)' is configured but contributes ZERO tool "
             + "descriptors — \(reason). The model will not see any mcp__\(serverId)__* tools. Run "
-            + "SwiftNativeMCPDispatcher.refreshAllToolsCaches() to stamp the cache from a live handshake.\n"
+            + "a tools refresh from the MCP page to stamp the cache from a live handshake.\n"
         FileHandle.standardError.write(Data(message.utf8))
     }
 
@@ -350,35 +327,25 @@ public enum MCPToolBridge {
         let inputSchema: JSONValue?
     }
 
-    private static func readToolsCache(at url: URL) -> [String: [CachedTool]] {
+    private static func readToolsCache(at url: URL) -> [String: Any] {
         guard let data = try? Data(contentsOf: url),
               let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
             return [:]
         }
-        var out: [String: [CachedTool]] = [:]
-        for (serverId, entryAny) in parsed {
-            guard let entry = entryAny as? [String: Any],
-                  let tools = entry["tools"] as? [[String: Any]]
-            else { continue }
-            var parsedTools: [CachedTool] = []
-            parsedTools.reserveCapacity(tools.count)
-            for t in tools {
-                guard let name = t["name"] as? String, !name.isEmpty else { continue }
-                let desc = t["description"] as? String
-                let risk = (t["risk_class"] as? String)
-                    ?? (t["riskClass"] as? String)
-                // Only object-shaped schemas count — a stray string/array
-                // here would fail provider-side tool validation.
-                let schema: JSONValue? = (t["inputSchema"] as? [String: Any])
-                    .flatMap { try? JSONSerialization.data(withJSONObject: $0) }
-                    .flatMap { try? JSONValue.parse($0) }
-                parsedTools.append(CachedTool(
-                    name: name, description: desc, riskClass: risk, inputSchema: schema
-                ))
-            }
-            out[serverId] = parsedTools.sorted { $0.name < $1.name }
+        return parsed
+    }
+
+    private static func cachedTools(_ entry: Any?) -> [CachedTool]? {
+        guard let entry = entry as? [String: Any], let tools = entry["tools"] as? [[String: Any]] else { return nil }
+        return tools.compactMap { t in
+            guard let name = t["name"] as? String, !name.isEmpty else { return nil }
+            // Only object-shaped schemas count — a stray string/array
+            // here would fail provider-side tool validation.
+            let schema = (t["inputSchema"] as? [String: Any]).map { JSONValue(fromFoundation: $0) }
+            return CachedTool(name: name, description: t["description"] as? String,
+                riskClass: (t["risk_class"] as? String) ?? (t["riskClass"] as? String), inputSchema: schema)
         }
-        return out
+        .sorted { $0.name < $1.name }
     }
 }

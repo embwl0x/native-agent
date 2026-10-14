@@ -220,7 +220,7 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "offset, max_characters, and expected_content_sha256 require memory_id.")
         }
         let query = try requireString(input, "query")
-        let k = optionalInt(input, "k") ?? optionalInt(input, "limit") ?? 5
+        let k = Self.jsonInt(input["k"]) ?? Self.jsonInt(input["limit"]) ?? 5
         // Review blocker (2026-06-10): k had no ceiling — clamp to
         // [1, maxRecallK] before it reaches the recaller.
         let cappedK = Self.cappedRecallK(k)
@@ -231,8 +231,8 @@ extension SwiftToolDispatcher {
                 text: query,
                 topK: cappedK,
                 // Slot id → MemoryV2 persona vocabulary; resident recalls
-                // unfiltered (see memoryRecallPersonaFilter).
-                persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID),
+                // unfiltered for every persona slot.
+                persona: nil,
                 surface: surface,
                 requiresRelevance: true
             ))
@@ -293,11 +293,12 @@ extension SwiftToolDispatcher {
             expectedHash = nil
         }
         guard let record = try await memoryV2.readMemoryRecord(
-            id: id, persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID), surface: surface
+            id: id, persona: nil, surface: surface
         ) else {
             // Missing, retired, tombstoned and disallowed IDs are indistinguishable.
             // Never query KG as an alternate way around this exact-record gate.
-            return .object(["status": .string("not_found")])
+            return .object(["status": .string("not_found"),
+                "detail": .string("Memory id \(id) was not found for this recall. Call memory.recall with query to find matching ids, or memory.list to list ids.")])
         }
         let text = MemoryTextClip.memoryDisplayText(record.text, kind: record.memoryKind)
         let contentHash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()

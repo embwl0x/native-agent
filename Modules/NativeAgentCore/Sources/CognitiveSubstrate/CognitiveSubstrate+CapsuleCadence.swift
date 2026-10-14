@@ -186,14 +186,12 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// How long it has been sitting there, in WORDS. Digits are a machine's way
-    /// of saying it and the Body line already refuses them; "since yesterday" is
-    /// how a person carries something.
+    /// Elapsed time in words, without claiming a calendar day.
     static func threadAgePhrase(seconds: TimeInterval) -> String {
         switch max(0, seconds) {
         case ..<(3 * 3_600):    return "since earlier"
-        case ..<(12 * 3_600):   return "since this morning"
-        case ..<(36 * 3_600):   return "since yesterday"
+        case ..<(12 * 3_600):   return "for several hours"
+        case ..<(36 * 3_600):   return "for about a day"
         case ..<(7 * 24 * 3_600): return "for a few days now"
         default:                return "for longer than it should have"
         }
@@ -204,16 +202,16 @@ extension CognitiveSubstrate {
     /// Composed from three things and nothing else: the KIND of unfinished
     /// thing, the safe object label (the same extractor the felt line's object
     /// uses, so a name, a credential neighbour, a number or a redaction marker
-    /// cannot appear), and a worded age. `seed.text` is read ONLY to derive the
+    /// cannot appear), and a worded age. Candidate text is read ONLY to derive the
     /// label and never rendered.
     ///
     /// No safe label → no line. A nag that cannot say what it is about would be
     /// either a bare "something is unresolved" (which is noise) or the seed text
     /// (which is the leak) — and silence is honest.
-    func threadLine(for seed: CognitiveThoughtSeed, at now: Date) -> String? {
-        guard let kindPhrase = Self.threadKindPhrase(seed.kind),
-              let object = CognitiveSubstrate.feltTopicLabel(from: seed.text) else { return nil }
-        let age = Self.threadAgePhrase(seconds: now.timeIntervalSince(seed.createdAt))
+    func threadLine(for candidate: CognitiveRuminationRead) -> String? {
+        guard let kindPhrase = Self.threadKindPhrase(candidate.kind),
+              let object = CognitiveSubstrate.feltTopicLabel(from: candidate.text) else { return nil }
+        let age = Self.threadAgePhrase(seconds: candidate.ageHours * 3_600)
         return capsuleLineText(
             "- Thread: \(kindPhrase) about \(object), unanswered \(age)",
             maxCharacters: 180)
@@ -278,11 +276,7 @@ extension CognitiveSubstrate {
 
     /// Whether the fingerprint line speaks this capsule.
     ///
-    /// Two gates, in order:
-    /// 1. The shared duty cycle (`fingerprintDutyCycle`, default 1 = every
-    ///    capsule — today's behavior, so this gate is inert until an install
-    ///    turns it up).
-    /// 2. SUPPRESS-WHEN-UNCHANGED: after `fingerprintFamilyRepeatLimit`
+    /// SUPPRESS-WHEN-UNCHANGED: after `fingerprintFamilyRepeatLimit`
     ///    consecutive capsules reporting the same felt FAMILY, the line goes
     ///    quiet. It re-surfaces the moment the family changes, or when
     ///    `fingerprintSuppressionWindow` expires since it last actually spoke —
@@ -292,28 +286,17 @@ extension CognitiveSubstrate {
     ///    while the underlying state sits still, and it is the state sitting
     ///    still that makes it a mantra.
     ///
-    /// Pure when `live` is false — a frozen read gets an answer without
-    /// advancing the run.
-    /// - Parameter mayStayQuiet: false when the fingerprint is the ONLY line the
-    ///   capsule would carry, in which case it always speaks (see the call site).
     func fingerprintCadenceVerdict(
         family: String,
         at now: Date,
         dynamics dyn: PersonalityDynamicsConfiguration,
-        mayStayQuiet: Bool = true,
         presentationState: inout CognitiveCapsulePresentationState
     ) -> FingerprintCadenceVerdict {
         let sameFamily = presentationState.fingerprintFamily == family
         let run = sameFamily ? presentationState.fingerprintCount + 1 : 1
 
         var speak = true
-        if dyn.fingerprintDutyCycle > 1, mayStayQuiet {
-            speak = Self.capsuleCadenceShouldSpeak(
-                seed: now.timeIntervalSince1970,
-                dutyCycle: dyn.fingerprintDutyCycle,
-                line: "fingerprint")
-        }
-        if speak, mayStayQuiet, sameFamily, dyn.fingerprintFamilyRepeatLimit > 0,
+        if sameFamily, dyn.fingerprintFamilyRepeatLimit > 0,
            run > dyn.fingerprintFamilyRepeatLimit {
             let sinceSurfaced = presentationState.fingerprintLastSurfacedAt
                 .map { now.timeIntervalSince($0) } ?? 0
@@ -360,7 +343,7 @@ extension CognitiveSubstrate {
         affectEnabled: Bool? = nil
     ) -> String? {
         guard cognitionEnabled ?? configuration.enabled,
-              affectEnabled ?? configuration.affectEnabled,
+              affectEnabled ?? configuration.enabled,
               fromUser else { return nil }
         let opened = Self.sinceGapOpened(presentationState, previousUserTurn: previousUserTurn, dynamics: dyn, at: now)
         // A User turn with nothing to bridge closes any owed gap.

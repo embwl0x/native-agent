@@ -3,23 +3,16 @@ import Foundation
 public struct CognitiveConfiguration: Sendable, Equatable {
     public var enabled: Bool
     public var persistenceEnabled: Bool
-    public var workspaceEnabled: Bool
     public var capsuleInjectionEnabled: Bool
-    /// Canary for relevance-gating the durable standing-view `Inner` line.
-    /// Turning this off restores the prior most-recent-active-view behavior
-    /// without changing any persisted view or appraisal influence.
-    public var standingViewCapsuleRelevanceEnabled: Bool
     /// Phase 5 D experiment (`personality.views_experiment`): opinions that
     /// form on independent recurrence and interests from her hour. Off leaves
     /// every opinion and interest row stored but inert — nothing forms,
     /// surfaces, or reaches a prompt.
     public var viewsExperimentEnabled: Bool
-    public var affectEnabled: Bool
-    public var thoughtSeedsEnabled: Bool
-    public var replayEnabled: Bool
+    public var affectEnabled: Bool { enabled }
     public var backgroundMicrocyclesEnabled: Bool
     public var reflectiveCallsEnabled: Bool
-    public var observatoryEnabled: Bool
+    public var observatoryEnabled: Bool { enabled }
     public var maximumActiveNodes: Int
     public var defaultDecayHalfLife: TimeInterval
     public var maximumMetadataKeys: Int
@@ -48,16 +41,10 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     public init(
         enabled: Bool = false,
         persistenceEnabled: Bool = false,
-        workspaceEnabled: Bool = false,
         capsuleInjectionEnabled: Bool = false,
-        standingViewCapsuleRelevanceEnabled: Bool = true,
         viewsExperimentEnabled: Bool = true,
-        affectEnabled: Bool = false,
-        thoughtSeedsEnabled: Bool = false,
-        replayEnabled: Bool = false,
         backgroundMicrocyclesEnabled: Bool = false,
         reflectiveCallsEnabled: Bool = false,
-        observatoryEnabled: Bool = false,
         maximumActiveNodes: Int = 256,
         defaultDecayHalfLife: TimeInterval = 60 * 60,
         maximumMetadataKeys: Int = 12,
@@ -77,16 +64,10 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     ) {
         self.enabled = enabled
         self.persistenceEnabled = persistenceEnabled
-        self.workspaceEnabled = workspaceEnabled
         self.capsuleInjectionEnabled = capsuleInjectionEnabled
-        self.standingViewCapsuleRelevanceEnabled = standingViewCapsuleRelevanceEnabled
         self.viewsExperimentEnabled = viewsExperimentEnabled
-        self.affectEnabled = affectEnabled
-        self.thoughtSeedsEnabled = thoughtSeedsEnabled
-        self.replayEnabled = replayEnabled
         self.backgroundMicrocyclesEnabled = backgroundMicrocyclesEnabled
         self.reflectiveCallsEnabled = reflectiveCallsEnabled
-        self.observatoryEnabled = observatoryEnabled
         self.maximumActiveNodes = max(1, maximumActiveNodes)
         self.defaultDecayHalfLife = max(1, defaultDecayHalfLife)
         self.maximumMetadataKeys = max(0, maximumMetadataKeys)
@@ -104,22 +85,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     }
 
     public static let disabled = CognitiveConfiguration(enabled: false)
-
-    public static let phaseOneEnabled = CognitiveConfiguration(enabled: true)
-
-    public static let allPhasesEnabled = CognitiveConfiguration(
-        enabled: true,
-        persistenceEnabled: true,
-        workspaceEnabled: true,
-        capsuleInjectionEnabled: true,
-        affectEnabled: true,
-        thoughtSeedsEnabled: true,
-        replayEnabled: true,
-        backgroundMicrocyclesEnabled: true,
-        reflectiveCallsEnabled: true,
-        observatoryEnabled: true,
-        dailyReflectionCallBudget: 2
-    )
 
     private static func cleaned(_ value: String, fallback: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)

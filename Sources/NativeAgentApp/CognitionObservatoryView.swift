@@ -1,3 +1,4 @@
+import Foundation
 import Cognition
 import TurnTrace
 import SwiftUI
@@ -20,54 +21,6 @@ enum CognitionObservatoryPanelID: String, CaseIterable, Sendable {
     case reflections
 }
 
-/// The Observatory deliberately accepts only these observational panels. Human
-/// approval remains an Activity concern, so it cannot be added to this surface
-/// by accidentally passing an ad-hoc disclosure identifier.
-enum CognitionSurfaceDispositionPresentation {
-    enum Destination: Equatable, Sendable {
-        case activityCognitionProposals
-        case diagnosticsCognition
-    }
-
-    enum StandingViewAction: String, CaseIterable, Hashable, Sendable {
-        case approve
-        case reject
-        /// The way OUT of a view she is already leaning on — active or held.
-        /// Not `reject`: rejecting is a verdict on a proposal, retiring is
-        /// ending something she has been living with, and the timeline records
-        /// them as the different facts they are.
-        case retire
-
-        var title: String {
-            switch self {
-            case .approve: "Approve"
-            case .reject: "Reject"
-            case .retire: "Retire"
-            }
-        }
-
-        var approved: Bool { self == .approve }
-
-        var systemImage: String {
-            switch self {
-            case .approve: "checkmark"
-            case .reject: "xmark"
-            case .retire: "archivebox"
-            }
-        }
-    }
-
-    static let approvalsDestination: Destination = .activityCognitionProposals
-    static let activityApprovalSection: ActivitySection = .cognitionProposals
-    static let deskDebugDestination: Destination = .diagnosticsCognition
-
-    /// Pending views get the review pair; a view she is already leaning on
-    /// (active or held) gets the one control that was missing until 2026-09-02.
-    static func standingViewActions(isPending: Bool, isLeaning: Bool = false) -> [StandingViewAction] {
-        if isPending { return [.approve, .reject] }
-        return isLeaning ? [.retire] : []
-    }
-}
 import Observation
 import CognitiveSubstrate
 import Context
@@ -136,7 +89,6 @@ struct CognitionObservatoryView: View {
         get { cognition.reflectionBudget }
         nonmutating set { cognition.reflectionBudget = newValue }
     }
-    private var refreshCoordinator: CognitionObservatoryRefreshCoordinator { cognition.refreshCoordinator }
     @State private var isRunningReflection = false
     @State private var isRunningEvaluationSamplers = false
     @State private var evaluationSamplerOutcome: CognitiveEvaluationSamplerOutcome?
@@ -156,7 +108,7 @@ struct CognitionObservatoryView: View {
         self.dependencies = dependencies
     }
 
-    private var isRefreshing: Bool { refreshCoordinator.isRefreshing }
+    private var isRefreshing: Bool { cognition.isRefreshing }
 
     private var initialStateLabel: String {
         if case .receiptEvidenceUnavailable = detailEvidenceStatus { return "Unavailable" }
@@ -216,7 +168,7 @@ struct CognitionObservatoryView: View {
                             Button("Refresh", systemImage: "arrow.clockwise") {
                                 Task { await refresh() }
                             }
-                            .disabled(refreshCoordinator.isRefreshing)
+                            .disabled(isRefreshing)
                             Button("Think now", systemImage: "waveform.path.ecg") {
                                 Task {
                                     await runtime.runMicrocycle(reason: "observatory manual run")
@@ -227,10 +179,9 @@ struct CognitionObservatoryView: View {
                             Button("Reflect", systemImage: "brain.head.profile") {
                                 Task {
                                     isRunningReflection = true
-                                    let outcome = await CognitionObservatoryActions.reflectWithOutcome(
-                                        runtime: runtime
-                                    )
-                                    CognitionObservatoryControlFeedback.publish(outcome.status, to: dependencies.systemToasts)
+                                    let outcome = await runtime.runManualReflection()
+                                    _ = await runtime.observatoryDetailRead()
+                                    CognitionObservatoryControlFeedback.publish(outcome, to: dependencies.systemToasts)
                                     await refresh()
                                     isRunningReflection = false
                                 }
@@ -253,16 +204,18 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled)
                             Button("Settle body", systemImage: "leaf") {
                                 Task {
-                                    let result = await CognitionObservatoryActions.settleBodyChecked(runtime: runtime)
-                                    CognitionObservatoryControlFeedback.publish(result.outcome, action: "settle", to: dependencies.systemToasts)
+                                    let outcome = await runtime.settleOrganismContinuityChecked()
+                                    _ = await runtime.observatoryDetailRead()
+                                    CognitionObservatoryControlFeedback.publish(outcome, action: "settle", to: dependencies.systemToasts)
                                     await refresh()
                                 }
                             }
                             .disabled(!enabled || !organismEnabled)
                             Button("Reset body", systemImage: "waveform.path.ecg.rectangle") {
                                 Task {
-                                    let result = await CognitionObservatoryActions.resetBodyChecked(runtime: runtime)
-                                    CognitionObservatoryControlFeedback.publish(result.outcome, action: "reset", to: dependencies.systemToasts)
+                                    let outcome = await runtime.resetOrganismContinuityChecked()
+                                    _ = await runtime.observatoryDetailRead()
+                                    CognitionObservatoryControlFeedback.publish(outcome, action: "reset", to: dependencies.systemToasts)
                                     await refresh()
                                 }
                             }
@@ -457,7 +410,7 @@ struct CognitionObservatoryView: View {
         // Embedded as the Diagnostics ▸ Cognition segment (B2.4): Diagnostics
         // owns the navigation chrome, so no navigationTitle/toolbar here. The
         // Controls panel already carries a Refresh button.
-        .task {
+        .task(id: expandedPanels.contains(CognitionObservatoryPanelID.workshop.rawValue)) {
             let changes = await cognition.changes()
             // Subscribe before the initial read. A cognition event that lands
             // while refresh is in flight is then buffered instead of being
@@ -494,32 +447,10 @@ struct CognitionObservatoryView: View {
     }
 
     func refresh() async {
-        let refreshGeneration = refreshCoordinator.begin()
-        guard let nextRead = await cognition.observatoryRead() else {
-            _ = refreshCoordinator.settle(refreshGeneration)
-            return
-        }
-        let next = nextRead.detail
-        let nextContextFlowHealth = await dependencies.contextFlowHealth()
-        let deskRoot = dependencies.dataRoot
-        let nextWorkshop = await WorkshopObservatorySnapshot.load(
-            store: SwiftNativeDeskStore(dataRoot: deskRoot),
-            receiptsPath: deskRoot
-                .appendingPathComponent("workshop", isDirectory: true)
-                .appendingPathComponent("receipts.jsonl")
+        await cognition.refreshObservatory(
+            includeWorkshopReceipts: { expandedPanels.contains(CognitionObservatoryPanelID.workshop.rawValue) },
+            contextFlowHealthRead: dependencies.contextFlowHealth
         )
-        guard refreshCoordinator.settle(refreshGeneration) == .accepted else { return }
-        detail = next
-        detailEvidenceStatus = nextRead.evidenceStatus
-        contextFlowHealth = nextContextFlowHealth
-        workshop = nextWorkshop
-        enabled = next.configuration.enabled
-        capsuleEnabled = next.configuration.capsuleInjectionEnabled
-        backgroundEnabled = next.configuration.backgroundMicrocyclesEnabled
-        reflectionEnabled = next.configuration.reflectiveCallsEnabled
-        organismEnabled = next.organism.enabled
-        reflectionBudget = next.configuration.dailyReflectionCallBudget
-        lastRefresh = Date()
     }
 
     private func contextFlowHint(_ state: ContextFlowObservatoryHealthState) -> String {
@@ -648,5 +579,95 @@ struct CognitionObservatoryView: View {
     private func cognitionPersistenceFailure(_ health: CognitivePersistenceHealth) -> String {
         let stage = health.failureStage.map { " at \($0)" } ?? ""
         return "Cognitive persistence degraded\(stage); writes are paused to protect stored continuity."
+    }
+}
+
+/// Presentation policy for a collapsed Observatory disclosure row. The compact
+/// text is a status summary, not an unbounded diagnostic channel: preserve a
+/// real state, normalize malformed whitespace, and expose the same bounded
+/// summary to VoiceOver and the visible row.
+enum CognitionObservatoryCollapsedRowPresentation {
+    static let maximumVisibleHintCharacters = 96
+
+    struct Hint: Equatable {
+        let text: String
+        let isTruncated: Bool
+    }
+
+    static func hint(raw: String?, isExpanded: Bool) -> Hint? {
+        guard !isExpanded,
+              let raw else { return nil }
+        let normalized = raw
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !normalized.isEmpty else { return nil }
+        guard normalized.count > maximumVisibleHintCharacters else {
+            return Hint(text: normalized, isTruncated: false)
+        }
+        return Hint(
+            text: String(normalized.prefix(maximumVisibleHintCharacters)) + "…",
+            isTruncated: true
+        )
+    }
+
+    static func accessibilityLabel(
+        title: String,
+        count: Int?,
+        pending: Int,
+        hint: Hint?
+    ) -> String {
+        var parts = [title]
+        if let badge = CognitionObservatoryCountBadgePresentation.badge(for: count) {
+            let count = badge.count
+            parts.append("\(count) item\(count == 1 ? "" : "s")")
+        }
+        if pending > 0 {
+            parts.append("\(pending) pending")
+        }
+        if let hint {
+            parts.append(hint.text)
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+enum CognitionObservatoryPresentation {
+    static func receiptEvidenceUnavailableText(_ reason: CognitiveReceiptReadUnavailability) -> String {
+        switch reason {
+        case .cognitionDisabled:
+            return "The records behind this page are unavailable while cognition is off."
+        case .persistenceDisabled:
+            return "The records behind this page are unavailable because cognition is not saving anything."
+        case .storeUnavailable:
+            return "The records behind this page are unavailable because their store could not be opened."
+        case .readFailed:
+            return "The records behind this page could not be read."
+        }
+    }
+
+}
+
+@MainActor
+enum CognitionObservatoryControlFeedback {
+    static func publish(_ outcome: CognitiveBackgroundRunOutcome, to toasts: SystemToastCenter) {
+        switch outcome {
+        case .completed:
+            toasts.push(success: "Reflection recorded.")
+        case .skipped(let reason):
+            toasts.push(info: "Reflection skipped: \(reason)")
+        case .failed(let reason):
+            toasts.push(error: "Reflection failed: \(reason)")
+        }
+    }
+
+    static func publish(_ outcome: OrganismContinuityApplyOutcome, action: String, to toasts: SystemToastCenter) {
+        switch outcome.status {
+        case .applied:
+            toasts.push(success: action == "reset" ? "Body state reset and saved." : "Body state settled and saved.")
+        case .organismDisabled:
+            toasts.push(info: outcome.error ?? "Body signals are off.")
+        case .persistenceFailed:
+            toasts.push(error: outcome.error ?? "Body state was not saved.")
+        }
     }
 }

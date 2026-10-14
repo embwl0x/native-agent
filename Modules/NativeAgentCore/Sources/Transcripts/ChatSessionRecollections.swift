@@ -135,8 +135,8 @@ public enum ChatSessionRecollections {
         return actual == expected
     }
 
-    private static func continuityBinding(role: String, metadata: [String: JSONValue]?) -> JSONValue? {
-        guard let metadata, metadata["origin"] == nil else { return nil }
+    package static func continuityBinding(role: String, metadata: [String: JSONValue]?) -> JSONValue? {
+        guard let metadata else { return nil }
         if metadata["kind"] == .string(rowKind) {
             guard case .object(let recorded)? = metadata[continuityProvenanceKey],
                   let participant = continuityString(recorded["participant"]),
@@ -149,8 +149,18 @@ public enum ChatSessionRecollections {
         }
         guard role != "user" || metadata["mechanicalKind"] == nil,
               case .object(let envelope)? = metadata["envelope"],
-              envelope["agent"] == nil,
               let surface = continuityString(envelope["surface"]) else { return nil }
+        if let agent = continuityString(envelope["agent"]) {
+            guard agent != "self", !agent.hasPrefix("bot:") else { return nil }
+            let participant: String
+            if let user = continuityString(envelope["userId"]), !user.isEmpty { participant = "peer:" + user }
+            else {
+                guard !["agent", "peer", ""].contains(agent) else { return nil }
+                participant = "peer:" + agent
+            }
+            return continuityBinding(participant: participant, source: nil, scope: nil)
+        }
+        guard metadata["origin"] == nil else { return nil }
         if ["app", "chat", "mac", "default", "ios", "mobile", "iphone", "icloud"].contains(surface) {
             return continuityBinding(participant: "local_operator", source: nil, scope: nil)
         }
@@ -163,7 +173,9 @@ public enum ChatSessionRecollections {
     }
 
     private static func continuityBinding(participant: String, source: String?, scope: String?) -> JSONValue? {
-        if participant == "local_operator" { return .object(["participant": .string(participant)]) }
+        if participant == "local_operator" || (participant.hasPrefix("peer:") && participant.count > 5) {
+            return .object(["participant": .string(participant)])
+        }
         guard !participant.isEmpty, let source, !source.isEmpty, let scope, !scope.isEmpty else { return nil }
         return .object(["participant": .string(participant), "source": .string(source), "scope": .string(scope)])
     }
@@ -177,14 +189,6 @@ public enum ChatSessionRecollections {
     /// life a recollection stands for without re-reading the backup.
     public static let coversFromKey = "covers_from"
     public static let coversUntilKey = "covers_until"
-    /// `metadata` keys recording only what THIS pass newly folded in — the
-    /// first raw turn it replaced through the end of the span. `covers_from`
-    /// must stay honest about the WHOLE text (a folded-in prior recollection
-    /// carries its own `covers_from` forward), because the dream lane decides
-    /// admission from it; anyone who wants "what moved this pass" reads these.
-    public static let incorporatedFromKey = "incorporated_from"
-    public static let incorporatedUntilKey = "incorporated_until"
-
     /// Recognize a recollection row. Returns nil for every ordinary transcript
     /// row — this is the only place that knows the shape.
     public static func recollection(
@@ -285,6 +289,18 @@ public enum ChatSessionRecollections {
         return from <= mark && until > mark
     }
 
+    private static let timestampLock = NSLock()
+    nonisolated(unsafe) private static let fractionalTimestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    nonisolated(unsafe) private static let plainTimestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
     /// Live transcripts carry microsecond ISO8601 (`...T11:33:32.167835+00:00`)
     /// while `ISO8601DateFormatter.withFractionalSeconds` accepts three digits.
     /// Try fractional, then plain, then truncate to milliseconds.
@@ -292,12 +308,10 @@ public enum ChatSessionRecollections {
         guard case .string(let raw)? = value else { return nil }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: text) { return date }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        if let date = plain.date(from: text) { return date }
+        timestampLock.lock()
+        defer { timestampLock.unlock() }
+        if let date = fractionalTimestampFormatter.date(from: text) { return date }
+        if let date = plainTimestampFormatter.date(from: text) { return date }
         // Truncate an over-long fractional part to milliseconds and retry.
         if let dot = text.firstIndex(of: ".") {
             let afterDot = text.index(after: dot)
@@ -309,7 +323,7 @@ public enum ChatSessionRecollections {
             if digits.count > 3 {
                 let keep = text.index(afterDot, offsetBy: 3)
                 let rebuilt = String(text[text.startIndex..<keep]) + String(text[digitsEnd...])
-                if let date = fractional.date(from: rebuilt) { return date }
+                if let date = fractionalTimestampFormatter.date(from: rebuilt) { return date }
             }
         }
         return nil

@@ -193,7 +193,8 @@ struct ResearchView: View {
         savingSearchConfiguration = true
         Task {
             do {
-                _ = try await appModel.saveSearXNGBaseURL(url)
+                appModel.searxngBaseURL = try await SwiftNativeResearchClient(dataRoot: appModel.engine.dataRoot)
+                    .saveSearXNGBaseURL(url)
                 searchServiceStatus = .saved
             } catch {
                 searchServiceStatus = .saveFailed(UserFacingError.cause(error, action: "save the search service"))

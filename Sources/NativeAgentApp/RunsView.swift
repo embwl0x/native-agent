@@ -300,7 +300,7 @@ enum RunDetailPresentation {
 
     private static func durationText(_ duration: Double?) -> String {
         guard let duration else { return "Unknown" }
-        let displayed = UserDisplayFormatters.humanizeDuration(duration)
+        let displayed = CompactDurationFormatter.string(duration)
         return displayed.isEmpty ? "Unknown" : displayed
     }
 
@@ -338,7 +338,7 @@ private struct RunRow: View {
                     Text(UserDisplayFormatters.humanizeISOTimestamp(run.createdAt))
                     if let duration = run.durationSeconds {
                         Text("·")
-                        Text(UserDisplayFormatters.humanizeDuration(duration))
+                        Text(CompactDurationFormatter.string(duration))
                     }
                     if let model = run.model, !model.isEmpty {
                         Text("·")

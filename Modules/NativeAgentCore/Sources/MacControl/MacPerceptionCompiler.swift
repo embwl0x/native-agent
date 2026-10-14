@@ -169,6 +169,19 @@ public enum MacLookHandle {
     public static func rendered(token: String, ordinal: Int) -> String {
         ordinal <= 1 ? token : "\(token).\(ordinal)"
     }
+
+    public static func mint(tokens: [String]) -> [(handle: String, ambiguity: String?)] {
+        var totals: [String: Int] = [:]
+        for token in tokens { totals[token, default: 0] += 1 }
+        var seen: [String: Int] = [:]
+        return tokens.map { token in
+            let ordinal = (seen[token] ?? 0) + 1
+            seen[token] = ordinal
+            let total = totals[token] ?? 1
+            return (rendered(token: token, ordinal: ordinal),
+                    total > 1 ? ambiguityNote(ordinal: ordinal, total: total) : nil)
+        }
+    }
 }
 
 // MARK: - Percept value types
@@ -1097,12 +1110,8 @@ public enum MacPerceptionCompiler {
         //
         //    THIS PASS RUNS BEFORE RANKING and over document order, so the
         //    controls-first ordering below can never change a handle.
-        var seen: [String: Int] = [:]
-        var handleByPath: [String: String] = [:]
-        var ordinalByPath: [String: Int] = [:]
-        var tokenByPath: [String: String] = [:]
-        for node in ordered {
-            let token = MacLookHandle.token(
+        let tokens = ordered.map { node in
+            MacLookHandle.token(
                 fingerprint: MacLookHandle.fingerprint(
                     role: node.attributes.role,
                     subrole: node.attributes.subrole,
@@ -1115,23 +1124,17 @@ public enum MacPerceptionCompiler {
                     contentName: contentNameByPath[key(node.path)]
                 )
             )
-            let ordinal = (seen[token] ?? 0) + 1
-            seen[token] = ordinal
-            handleByPath[key(node.path)] = MacLookHandle.rendered(token: token, ordinal: ordinal)
-            ordinalByPath[key(node.path)] = ordinal
-            tokenByPath[key(node.path)] = token
+        }
+        var handleByPath: [String: String] = [:]
+        var ambiguityByPath: [String: String] = [:]
+        for (node, minted) in zip(ordered, MacLookHandle.mint(tokens: tokens)) {
+            handleByPath[key(node.path)] = minted.handle
+            ambiguityByPath[key(node.path)] = minted.ambiguity
         }
         // finding B — a token that STILL repeats after `contentName` is genuine
         // ambiguity (N identical unlabeled buttons). Every row carrying one says
         // so; the act is never refused, because refusing would make Finder
         // unusable. Announce, don't hide.
-        func ambiguity(at path: [Int]) -> String? {
-            guard let token = tokenByPath[key(path)], let total = seen[token], total > 1 else {
-                return nil
-            }
-            return MacLookHandle.ambiguityNote(ordinal: ordinalByPath[key(path)] ?? 1, total: total)
-        }
-
         // 2. Affordances, landmarks, unlabeled census — one pass.
         var affordances: [MacLookAffordance] = []
         var landmarks: [MacLookLandmark] = []
@@ -1270,7 +1273,7 @@ public enum MacPerceptionCompiler {
                 // The control's own title is the value's caption — the "CVV"
                 // box showing `123`, the "API key" field showing the key.
                 valueJSON: shownValue.map { redacted($0, of: node, under: title, isValue: true) },
-                handleAmbiguity: ambiguity(at: node.path),
+                handleAmbiguity: ambiguityByPath[key(node.path)],
                 placeholder: cleaned(attributes.placeholder),
                 placeholderJSON: cleaned(attributes.placeholder).map { redacted($0, of: node, under: nil) },
                 state: attributes.state
@@ -1416,7 +1419,7 @@ public enum MacPerceptionCompiler {
                     under: candidate.source == "value" ? candidate.node.attributes.title : nil,
                     isValue: candidate.source == "value"
                 ),
-                handleAmbiguity: ambiguity(at: candidate.node.path)
+                handleAmbiguity: ambiguityByPath[key(candidate.node.path)]
             ))
         }
         readouts = readouts
@@ -1957,9 +1960,6 @@ public actor MacLookFrameStore {
     /// everything. Same safety invalidation the view store carries.
     /// A dead frame may sit in either slot; clear both (rare path, safe side).
     public func invalidate() { latestBySource = [:] }
-
-    /// Test seam only.
-    public func reset() { latestBySource = [:] }
 }
 
 // MARK: - The Chromium / Electron live seam

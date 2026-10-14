@@ -22,7 +22,7 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
         return EventDeadlinePhysiology.storeAndFileEvents(
             paths: [
                 store.opsPath,
-                store.statePath,
+                store.basePath,
                 dataRoot.appendingPathComponent("trust/policy.json"),
                 dataRoot.appendingPathComponent("workshop/background_lease.json"),
             ],
@@ -39,10 +39,6 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
             nativeLog("[workshop] deadline projection unavailable: %@", String(error.localizedDescription.prefix(600)))
             return nil
         }
-    }
-
-    public func tick() async {
-        _ = await tickOutcome()
     }
 
     public func tickOutcome() async -> LoopTickOutcome {

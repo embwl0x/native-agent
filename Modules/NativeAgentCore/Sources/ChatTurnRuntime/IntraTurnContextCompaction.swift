@@ -56,11 +56,6 @@ public enum IntraTurnContextCompaction {
     /// to 70% means the next few rounds do not re-trigger.
     static let pressureFraction = 0.80
 
-    /// Ceiling on the mechanical fold (no distiller, or the distiller failed):
-    /// the rendered span truncated NEWEST-LAST, because the newest steps are the
-    /// ones the model is about to continue from.
-    static let mechanicalFoldChars = 12_000
-
     /// Ceiling on what the distiller is ASKED to read. The rendered span is
     /// post-stub and therefore small in the normal case; this is the guard for
     /// the case where it is not, so the working-notes call can never itself

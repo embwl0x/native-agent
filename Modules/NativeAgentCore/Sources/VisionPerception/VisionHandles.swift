@@ -99,19 +99,6 @@ public enum VisionHandles {
     public static func mint(
         fingerprints: [String]
     ) -> [(handle: String, ambiguity: String?)] {
-        let tokens = fingerprints.map { token(fingerprint: $0) }
-        var totals: [String: Int] = [:]
-        for token in tokens { totals[token, default: 0] += 1 }
-        var seen: [String: Int] = [:]
-        return tokens.map { token in
-            let ordinal = (seen[token] ?? 0) + 1
-            seen[token] = ordinal
-            let total = totals[token] ?? 1
-            let rendered = MacLookHandle.rendered(token: token, ordinal: ordinal)
-            let ambiguity = total > 1
-                ? MacLookHandle.ambiguityNote(ordinal: ordinal, total: total)
-                : nil
-            return (rendered, ambiguity)
-        }
+        MacLookHandle.mint(tokens: fingerprints.map { token(fingerprint: $0) })
     }
 }

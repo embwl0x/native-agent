@@ -5,6 +5,7 @@
 
 import SwiftUI
 import Context
+import MemoryV2
 import NativeAgentShared
 import NativeAgentCore
 
@@ -188,57 +189,6 @@ enum SoftwareUpdateRowPresentation {
 }
 
 // MARK: - Embeddings backend
-
-/// Shared state/action mapping for the embeddings controls. The SwiftUI view
-/// owns task lifetime, while this value owner keeps retry/release eligibility
-/// and the post-action truth in one place.
-struct EmbeddingsSettingsActionPresentation {
-    struct Controls: Equatable {
-        let showsRetryMemoryStatus: Bool
-        let showsRetryStatus: Bool
-        let showsReleaseNow: Bool
-    }
-
-    struct Update {
-        let status: EmbeddingsStatus?
-        let errorMessage: String?
-    }
-
-    static func controls(status: EmbeddingsStatus?, errorMessage: String?) -> Controls {
-        Controls(
-            showsRetryMemoryStatus: errorMessage != nil,
-            showsRetryStatus: status?.installState?.state == "failed",
-            showsReleaseNow: status?.modelState?.loaded == true
-        )
-    }
-
-    static func refreshed(_ status: EmbeddingsStatus) -> Update {
-        Update(status: status, errorMessage: nil)
-    }
-
-    static func refreshFailed(_ error: any Error, preserving status: EmbeddingsStatus?) -> Update {
-        Update(
-            status: status,
-            errorMessage: UserFacingError.message(error, action: "check memory status")
-        )
-    }
-
-    static func released(_ result: EmbeddingsToggleResult) -> Update {
-        Update(
-            status: result.status,
-            errorMessage: result.ok == false
-                ? (result.error ?? "Embedding memory release could not be confirmed.")
-                : result.error
-        )
-    }
-
-    static func releaseFailed(_ error: any Error, preserving status: EmbeddingsStatus?) -> Update {
-        Update(
-            status: status,
-            errorMessage: UserFacingError.message(error, action: "release memory")
-        )
-    }
-}
 
 /// Shared read-only mapping for the embeddings status panel. It receives the
 /// root-scoped run status and gives the view its selected mode and the

@@ -78,8 +78,6 @@ public final class CognitiveAttentionTraceRecorder: @unchecked Sendable {
         public let totalMilliseconds: Int64
     }
 
-    private static let permittedStages = Set(CognitiveAttentionStage.allCases)
-
     private let lock = NSLock()
     private let startedNs = DispatchTime.now().uptimeNanoseconds
     private var stagesMilliseconds: [String: Int64] = [:]
@@ -93,9 +91,7 @@ public final class CognitiveAttentionTraceRecorder: @unchecked Sendable {
     }
 
     public func recordElapsed(_ stage: String, since startNs: UInt64) {
-        guard let stage = CognitiveAttentionStage(rawValue: stage),
-              Self.permittedStages.contains(stage)
-        else { return }
+        guard let stage = CognitiveAttentionStage(rawValue: stage) else { return }
         let nowNs = DispatchTime.now().uptimeNanoseconds
         let elapsed = nowNs >= startNs ? Int64((nowNs - startNs) / 1_000_000) : 0
         lock.lock()

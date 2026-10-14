@@ -13,25 +13,37 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// Generic or unavailable values retain the role label rather than
     /// guessing a person's name from accepted-memory prose.
     static func resolvePrimaryUserName(explicit: String?, profileURL: URL) -> String {
-        let raw: String? = {
-            if let explicit { return explicit }
-            guard let data = try? Data(contentsOf: profileURL),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return nil
-            }
-            return object["userName"] as? String
-        }()
-        guard let raw else { return "the user" }
+        if let explicit {
+            return usableProfileName(explicit, rejecting: ["user", "the user"]) ?? "the user"
+        }
+        return profileNames(profileURL: profileURL).user ?? "the user"
+    }
+
+    /// Read onboarding's names together so graph extraction and memory query
+    /// expansion use the same identity and rejection vocabulary.
+    public static func profileNames(profileURL: URL) -> (agent: String?, user: String?) {
+        guard let data = try? Data(contentsOf: profileURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (nil, nil)
+        }
+        return (
+            usableProfileName(object["name"] as? String, rejecting: ["assistant", "the assistant", "agent", "the agent"]),
+            usableProfileName(object["userName"] as? String, rejecting: ["user", "the user"])
+        )
+    }
+
+    private static func usableProfileName(_ raw: String?, rejecting: Set<String>) -> String? {
+        guard let raw else { return nil }
         let trimmed = raw
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.count <= 80,
-              !["user", "the user"].contains(trimmed.lowercased()),
+              !rejecting.contains(trimmed.lowercased()),
               trimmed.unicodeScalars.allSatisfy({
                   !CharacterSet.controlCharacters.contains($0)
               }) else {
-            return "the user"
+            return nil
         }
         return trimmed
     }

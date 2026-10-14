@@ -247,7 +247,7 @@ extension iCloudSyncEngine {
                 throw SyncError.persistence("Multiple pending actions match this request; retry with the original message identity.")
             }
             if let matching { return (matching.0, matching.1, true) }
-            let data = try Self.signedActionData(requested, secret: secret)
+            let data = try await PhoneSigningIdentity.shared.signedActionData(requested, secret: secret)
             let file = directory.appendingPathComponent("\(requested.msgId).json")
             try data.write(to: file, options: .atomic)
             let handle = try FileHandle(forWritingTo: file)
@@ -501,11 +501,6 @@ extension iCloudSyncEngine {
         try beginSendAction()
         defer { finishSendAction() }
 
-        var deviceAction = action
-        let deviceKey = try PhoneSigningIdentity.key()
-        deviceAction.clientId = DeviceApprovalSignature.deviceID(publicKey: deviceKey.publicKey.rawRepresentation)
-        deviceAction.devicePublicKey = deviceKey.publicKey.rawRepresentation.base64EncodedString()
-
         guard let secret = pairingStore?.iCloudPairingSecret else {
             let msg = IOSPairingPresentation.notSignedSyncMessage
             syncError = msg
@@ -513,6 +508,13 @@ extension iCloudSyncEngine {
             throw SyncError.notSigned
         }
 
+        let lifecycle = lifecycleGeneration
+        var deviceAction = action
+        let deviceKey = try await PhoneSigningIdentity.shared.key()
+        deviceAction.clientId = DeviceApprovalSignature.deviceID(publicKey: deviceKey.publicKey.rawRepresentation)
+        deviceAction.devicePublicKey = deviceKey.publicKey.rawRepresentation.base64EncodedString()
+
+        guard lifecycle == lifecycleGeneration, secret == pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
         let usesCloudKit = iCloudBridge.shared.usesCloudKitDeviceTransport
         let prepared: (InboxAction, Data, Bool)
         if usesCloudKit {
@@ -520,8 +522,9 @@ extension iCloudSyncEngine {
                 deviceAction, secret: secret, intentionalNewRequest: intentionalNewRequest
             )
         } else {
-            prepared = (deviceAction, try Self.signedActionData(deviceAction, secret: secret), false)
+            prepared = (deviceAction, try await PhoneSigningIdentity.shared.signedActionData(deviceAction, secret: secret), false)
         }
+        guard lifecycle == lifecycleGeneration, secret == pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
         let (action, signedData, wasRetained) = prepared
         let transactionId = action.transactionId ?? action.msgId
         try await writeTransaction(id: transactionId, action: action.action, state: "queued", attempts: 1, msgId: action.msgId)
@@ -656,39 +659,6 @@ extension iCloudSyncEngine {
         return result
     }
 
-    nonisolated private static func signedActionData(
-        _ action: InboxAction,
-        secret: Data
-    ) throws -> Data {
-        var body: [String: Any] = [
-            "msgId": action.msgId,
-            "clientId": action.clientId,
-            "action": action.action,
-            "payload": action.payload,
-            "createdAt": action.createdAt,
-        ]
-        if let protocolVersion = action.protocolVersion {
-            body["protocolVersion"] = protocolVersion
-        }
-        if let transactionId = action.transactionId {
-            body["transactionId"] = transactionId
-        }
-        let deviceKey = try PhoneSigningIdentity.key()
-        guard action.clientId == DeviceApprovalSignature.deviceID(publicKey: deviceKey.publicKey.rawRepresentation) else {
-            throw DeviceApprovalSignature.Failure.invalid
-        }
-        body["devicePublicKey"] = deviceKey.publicKey.rawRepresentation.base64EncodedString()
-        let deviceBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-        body["deviceSignature"] = try deviceKey.signature(for: DeviceApprovalSignature.canonicalBody(deviceBody)).base64EncodedString()
-        let canonical = try JSONSerialization.data(
-            withJSONObject: body,
-            options: [.sortedKeys]
-        )
-        let key = SymmetricKey(data: secret)
-        let mac = HMAC<SHA256>.authenticationCode(for: canonical, using: key)
-        body["signature"] = Data(mac).map { String(format: "%02x", $0) }.joined()
-        return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-    }
 
     /// Best-effort signed acknowledgement that one exact notification event
     /// reached the iOS process (APNS) or its iCloud bridge scheduler. This does
@@ -845,7 +815,7 @@ extension iCloudSyncEngine {
         intentionalNewRequest: Bool = false,
         pollTimeoutSeconds: Double = 30,
         pollIntervalSeconds: Double = 0.5,
-        onReplacement: ((InboxAction) -> Void)? = nil
+        onReplacement: ((InboxAction) async throws -> Void)? = nil
     ) async -> [String: String]? {
         // First attempt
         let msgId: String
@@ -873,9 +843,9 @@ extension iCloudSyncEngine {
                 let retryAction = InboxAction.make(action: action.action, payload: action.payload)
                 // 2026-09-06: the submission owner must retry this replacement
                 // if signature recovery itself has an uncertain outcome.
-                onReplacement?(retryAction)
                 let retryMsgId: String
                 do {
+                    try await onReplacement?(retryAction)
                     retryMsgId = try await sendAction(retryAction)
                 } catch {
                     syncError = "Resubmit after signature recovery failed: \(error.localizedDescription)"
@@ -1043,7 +1013,7 @@ extension iCloudSyncEngine {
     func createDeskItem(
         kind: String, project: String, title: String, summary: String?,
         submission: InboxAction? = nil, intentionalNewRequest: Bool = false,
-        onReplacement: ((InboxAction) -> Void)? = nil
+        onReplacement: ((InboxAction) async throws -> Void)? = nil
     ) async throws -> [String: String]? {
         var payload = ["kind": kind, "project": project, "title": title]
         if let summary, !summary.isEmpty { payload["summary"] = summary }
@@ -1070,7 +1040,7 @@ extension iCloudSyncEngine {
         text: String,
         submission: InboxAction? = nil,
         intentionalNewRequest: Bool = false,
-        onReplacement: ((InboxAction) -> Void)? = nil
+        onReplacement: ((InboxAction) async throws -> Void)? = nil
     ) async throws -> [String: String]? {
         let action = submission
             ?? .make(action: "appendDeskItemNote", payload: ["handle": handle, "text": text])
@@ -1088,7 +1058,7 @@ extension iCloudSyncEngine {
         title: String, objective: String,
         submission: InboxAction? = nil,
         intentionalNewRequest: Bool = false,
-        onReplacement: ((InboxAction) -> Void)? = nil,
+        onReplacement: ((InboxAction) async throws -> Void)? = nil,
         onRefusal: (() -> Void)? = nil
     ) async throws -> String {
         let action = submission ?? InboxAction.make(action: "submitWorkshopTask", payload: [
@@ -1100,7 +1070,7 @@ extension iCloudSyncEngine {
             action, intentionalNewRequest: intentionalNewRequest || submission == nil,
             onReplacement: {
                 currentSubmission = $0
-                onReplacement?($0)
+                try await onReplacement?($0)
             }
         )
         // A refusal for an earlier signature attempt cannot unlock a replacement
@@ -1541,8 +1511,13 @@ extension iCloudSyncEngine {
         let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
             .make(action: "chat_history_page", payload: payload)))
         guard let raw = result["messages"] else { throw SyncError.persistence("The Mac did not return the messages.") }
-        let records = try JSONDecoder().decode([ChatMessageRecord].self, from: Data(raw.utf8))
-        return (MacBridgeClient.projectChatRecords(records), result["hasOlder"] == "true")
+        let lifecycle = lifecycleGeneration
+        let messages = try await Task.detached(priority: .userInitiated) {
+            let records = try JSONDecoder().decode([ChatMessageRecord].self, from: Data(raw.utf8))
+            return MacBridgeClient.projectChatRecords(records)
+        }.value
+        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        return (messages, result["hasOlder"] == "true")
     }
 
     /// The Mac's settings page, every row as the Mac reads it.
@@ -1591,7 +1566,11 @@ extension iCloudSyncEngine {
             .make(action: text == nil ? "get_agent_thread" : "send_agent_message", payload: payload), pollTimeoutSeconds: text == nil ? 30 : 120))
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
         guard let raw = result["thread"] else { throw SyncError.persistence("The Mac did not return the agent thread.") }
-        return try JSONDecoder().decode(MobileAgentThread.self, from: Data(raw.utf8))
+        let thread = try await Task.detached(priority: .userInitiated) {
+            try JSONDecoder().decode(MobileAgentThread.self, from: Data(raw.utf8))
+        }.value
+        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        return thread
     }
 
     @discardableResult

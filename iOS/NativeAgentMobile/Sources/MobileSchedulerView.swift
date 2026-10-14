@@ -2,7 +2,7 @@ import SwiftUI
 import NativeAgentShared
 
 struct MobileSchedulerView: View {
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var showingCreate = false
 
@@ -51,7 +51,7 @@ struct MobileSchedulerView: View {
 
 private struct MobileSchedulerJobDetail: View {
     let jobID: String
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var saving = false
     @State private var confirmingCancel = false

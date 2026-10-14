@@ -74,6 +74,15 @@ public struct ExternalSendProviderOutcome: Sendable, Equatable {
         return .providerAccepted(String(timestamp.prefix(128)))
     }
 
+    public static func classifySlackFailure(_ error: Error) -> Self {
+        let error = error as NSError
+        if error.domain == "NativeAgentSlack", [-400, -401].contains(error.code) {
+            return .preDispatchFailed("connector_preflight_failed")
+        }
+        // After preflight, transport failure cannot prove Slack never received it.
+        return .outcomeUnknown("transport_outcome_unknown")
+    }
+
     /// `AgentMailActions.sendNow` reaches `succeeded` only after a 2xx HTTP
     /// response. A nonempty provider message id is additionally required here;
     /// without both facts the result stays ambiguous.
@@ -539,11 +548,10 @@ private actor ExternalSendApprovalExecutor {
         dataRoot: URL
     ) async -> Bool {
         do {
-            try await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                id: recordID,
+            try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                recordID,
                 executedAction: summary,
-                detail: detail,
-                root: dataRoot
+                detail: detail
             )
             return true
         } catch {
@@ -983,13 +991,6 @@ private actor ExternalSendApprovalExecutor {
             deadline: nil
         )
     }
-
-    func resetReceiptCacheForTesting(dataRoot: URL) {
-        legacyReceiptIndexes.removeValue(
-            forKey: ExternalSendApprovalTransactions.externalSendReceiptsPath(dataRoot: dataRoot)
-                .standardizedFileURL.path
-        )
-    }
 }
 
 /// One payload-free motor projection over the canonical approval/execution
@@ -1047,9 +1048,5 @@ public enum ExternalSendApprovalTransactions {
             .appendingPathComponent("actions", isDirectory: true)
             .appendingPathComponent("external_send_receipts", isDirectory: true)
             .appendingPathComponent("\(canonicalID).json")
-    }
-
-    public static func resetExternalSendReceiptCacheForTesting(dataRoot: URL) async {
-        await ExternalSendApprovalExecutor.shared.resetReceiptCacheForTesting(dataRoot: dataRoot)
     }
 }

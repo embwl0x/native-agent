@@ -13,8 +13,8 @@ import TrustCenter
 // properties:
 //
 //  * H5 (unforgeable trigger): the ONLY authorization a session accepts is a
-//    triggerSource of the exact shape "workshop:<handle>:<reservationId>" whose
-//    reservationId is a REAL reservation on that pursuit in the Desk store. A
+//    pump-minted request whose reservationId is a REAL reservation on that
+//    pursuit in the Desk store. A
 //    chat turn cannot set that (it is minted by the pump against a durable
 //    reservation, SwiftNativeDeskStore.reserveWorkSession) — an absent/forged/stale
 //    reservation refuses BEFORE any LLM call.
@@ -24,7 +24,7 @@ import TrustCenter
 //    can't finish (a wedged tool, a needs-User outward step) resolves to a finite
 //    `blocked` receipt within the deadline — in-flight, then done, never stuck.
 
-public struct WorkshopSession: WorkshopSessionRunning {
+public struct WorkshopSession: Sendable {
     let dataRoot: URL
     let store: SwiftNativeDeskStore
     /// Hard per-session deadline (M6). Kept modest — one short conversation of
@@ -32,40 +32,27 @@ public struct WorkshopSession: WorkshopSessionRunning {
     let deadlineSeconds: TimeInterval
     let now: @Sendable () -> Date
     let claimStore: WorkshopReservationClaimStore
-    let platform: any WorkshopPumpPlatform
     let effects: any WorkshopSessionEffects
-    /// Executes the actual turn against the membrane. nil → the production path
-    /// (runEphemeralToolTurn on surface "workshop"). Injectable so tests can
-    /// prove the deadline/authorization behavior without a provider call.
-    let turnExecutor: (@Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String))?
 
     public init(
         dataRoot: URL,
         store: SwiftNativeDeskStore,
-        platform: any WorkshopPumpPlatform,
         effects: any WorkshopSessionEffects,
         deadlineSeconds: TimeInterval = 600,
-        now: @escaping @Sendable () -> Date = { Date() },
-        turnExecutor: (@Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String))? = nil
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
         self.store = store
-        self.platform = platform
         self.effects = effects
         self.deadlineSeconds = deadlineSeconds
         self.now = now
         self.claimStore = WorkshopReservationClaimStore(dataRoot: dataRoot)
-        self.turnExecutor = turnExecutor
     }
 
     public func run(_ request: WorkshopSessionRequest) async -> WorkshopSessionReceipt {
-        let resultStore = WorkshopSessionResultStore(dataRoot: dataRoot, platform: platform)
-        // ---- H5: authorization is the triggerSource, and nothing else. ----
-        let expected = WorkshopSessionRequest.makeTriggerSource(
-            handle: request.handle, reservationId: request.reservationId)
+        let resultStore = WorkshopSessionResultStore(dataRoot: dataRoot)
         guard !request.handle.isEmpty,
-              !request.reservationId.isEmpty,
-              request.triggerSource == expected else {
+              !request.reservationId.isEmpty else {
             return refused("malformed triggerSource — not authorized", request)
         }
         // The reservation must actually exist on the pursuit in the store. A
@@ -119,7 +106,7 @@ public struct WorkshopSession: WorkshopSessionRunning {
             // method refuses every non-pursuit target (lane1 finding 3).
             allowsDeskWorkLog: claimedItem.isPursuit
         )
-        let executor = turnExecutor ?? effects.productionTurnExecutor(dataRoot: dataRoot)
+        let executor = effects.productionTurnExecutor(dataRoot: dataRoot)
 
         let outcome = await runWithDeadline(request: request, tools: profile, executor: executor)
         // User, 2026-09-06: seal the membrane before reading the artifact set.

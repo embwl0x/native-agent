@@ -431,11 +431,6 @@ public actor MacScreenViewStore {
         return true
     }
 
-    public func record(_ snapshot: MacScreenViewSnapshot) {
-        pendingCapture = nil
-        latest = snapshot
-    }
-
     public func latestViewId() -> String? { latest?.viewId }
 
     public func snapshot(viewId: String) -> MacScreenViewSnapshot? {
@@ -464,9 +459,6 @@ public actor MacScreenViewStore {
         pendingCapture = nil
         latest = nil
     }
-
-    /// Test seam only: forget everything. Never called on a production path.
-    public func reset() { invalidate() }
 }
 
 // MARK: - Geometry (THE CRUX)
@@ -693,7 +685,7 @@ public enum MacScreenViewBuilder {
             let rhsBand = (rhs.frame.y / 8.0).rounded(.down)
             if lhsBand != rhsBand { return lhsBand < rhsBand }
             if lhs.frame.x != rhs.frame.x { return lhs.frame.x < rhs.frame.x }
-            return pathIsBefore(lhs.node.path, rhs.node.path)
+            return MacPerceptionCompiler.pathIsBefore(lhs.node.path, rhs.node.path)
         }
         let kept = candidates.prefix(cap)
         var marks: [MacScreenViewMark] = []
@@ -828,7 +820,7 @@ public enum MacScreenViewBuilder {
             guard distance >= 0, distance <= 240 else { continue }
             if let current = best,
                !(distance < current.distance
-                 || (distance == current.distance && pathIsBefore(candidate.path, current.path))) {
+                 || (distance == current.distance && MacPerceptionCompiler.pathIsBefore(candidate.path, current.path))) {
                 continue
             }
             best = (text.trimmingCharacters(in: .whitespacesAndNewlines), distance, candidate.path)
@@ -906,7 +898,7 @@ public enum MacScreenViewBuilder {
             let rhsBand = (rhs.frame.y / 8.0).rounded(.down)
             if lhsBand != rhsBand { return lhsBand < rhsBand }
             if lhs.frame.x != rhs.frame.x { return lhs.frame.x < rhs.frame.x }
-            return pathIsBefore(lhs.path, rhs.path)
+            return MacPerceptionCompiler.pathIsBefore(lhs.path, rhs.path)
         }
         // W3.5-FIX 1 — the prose channel is a SECRET CHANNEL too. Marking the
         // secure FIELD's value was only half the job: a 2FA code, a recovery
@@ -923,11 +915,6 @@ public enum MacScreenViewBuilder {
             items: Array(redacted.prefix(cap)),
             omitted: max(0, candidates.count - cap)
         )
-    }
-
-    private static func pathIsBefore(_ lhs: [Int], _ rhs: [Int]) -> Bool {
-        for (a, b) in zip(lhs, rhs) where a != b { return a < b }
-        return lhs.count < rhs.count
     }
 
     /// Fit the annotated image under a byte cap by stepping DOWN a fixed
@@ -1338,25 +1325,8 @@ public enum MacScreenViewTextRedaction {
         enclosing: EnclosingCaptionKinds = .none,
         context: NodeSecretContext
     ) -> JSONValue {
-        if let reason = standaloneSecretReason(text) {
-            return redactedText(text, reason: reason)
-        }
-        // W3.5-FIX-R4 — the enclosing group's caption, before the beside/above
-        // ones: it is the geometry a real card form actually uses.
-        if let reason = enclosingSecretReason(text, kinds: enclosing) {
-            return redactedText(text, reason: reason)
-        }
-        if let label {
-            if isCardVerificationLabel(label), isShortCodeValue(text) {
-                return redactedText(text, reason: "labeled_cvv")
-            }
-            if isSeedPhraseLabel(label), isRecoveryPhrase(text, labeled: true) {
-                return redactedText(text, reason: "labeled_recovery_phrase")
-            }
-            if looksLikeSecretLabel(label), isLabeledSecretValue(text) {
-                return redactedText(text, reason: "labeled_secret_nearby")
-            }
-        }
+        let redacted = redactedLegendString(text, valueChars: valueChars, under: label, enclosing: enclosing)
+        guard case .string = redacted else { return redacted }
         if let frame {
             func near(_ frames: [MacAXFrame]) -> Bool {
                 frames.contains { $0 != frame && isLabel($0, forValueAt: frame) }
@@ -1371,7 +1341,7 @@ public enum MacScreenViewTextRedaction {
                 return redactedText(text, reason: "labeled_secret_nearby")
             }
         }
-        return .string(MacAccessibilityReader.truncate(text, to: valueChars))
+        return redacted
     }
 
     /// Serialize one AX node with its text channels redacted and every

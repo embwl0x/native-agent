@@ -42,7 +42,7 @@ extension SomaticSignalKind {
         // neutral lifecycle marker).
         case .userSpoke, .assistantSpoke, .appSleep, .toolStarted, .toolCancelled,
              .providerStarted, .providerCancelled, .phoneDeliveryStarted,
-             .deskItemCreated, .approvalRequested,
+             .deskItemCreated, .deskItemCancelled, .approvalRequested,
              // Item 5: a horizon refresh has no intrinsic feeling at all. Note
              // that `.appWake`, three cases up, carries +0.15 — riding it would
              // have made every calendar read faintly pleasant.
@@ -60,7 +60,7 @@ extension SomaticSignalKind {
         switch self {
         case .userSpoke, .assistantSpoke, .appSleep, .resourcePressureChanged,
              .toolStarted, .toolCancelled, .providerStarted, .providerCancelled,
-             .phoneDeliveryStarted, .deskItemCreated, .approvalRequested,
+             .phoneDeliveryStarted, .deskItemCreated, .deskItemCancelled, .approvalRequested,
              .approvalResolved, .iPhoneStale, .horizonRefresh:
             return true
         default:

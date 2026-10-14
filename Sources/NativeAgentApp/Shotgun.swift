@@ -1,3 +1,4 @@
+import AttentionRouting
 // Shotgun (User, 2026-10-04): when the agent starts driving the Mac in the chat
 // on screen, the main window steps aside and this small floating glass chat
 // takes its place — she drives, User rides shotgun. User's rulings:
@@ -330,7 +331,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         )
         guard status == noErr, let ref else {
             shortcutTaken = shortcut
-            nativeLog("[Shotgun] %@ could not be registered: %d", shortcut.title, status)
+            ModuleLog.app("[Shotgun] %@ could not be registered: %d", shortcut.title, status)
             if toldTaken.insert(shortcut).inserted {
                 NativeAgentNotifications.post(
                     title: "\(shortcut.title) is taken",

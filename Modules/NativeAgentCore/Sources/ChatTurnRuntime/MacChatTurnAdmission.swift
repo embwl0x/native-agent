@@ -548,8 +548,6 @@ public extension MacChatTurnPresentationPort {
         let acceptance: MacChatTurnAcceptance
         if macChatTurns.pausedQueueSessions.contains(sessionId) {
             acceptance = .rejected(message: "The queue is paused")
-        } else if let queuedChatTurnStartOverride = macChatTurns.queuedChatTurnStartOverride {
-            acceptance = await queuedChatTurnStartOverride(next, sessionId)
         } else {
             // A queued successor keeps its own origin, not the finishing
             // turn's envelope or reply routing.

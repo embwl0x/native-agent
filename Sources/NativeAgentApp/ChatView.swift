@@ -1,6 +1,10 @@
+import EngineRuntime
 import ChatOrchestration
+import ToolRegistry
 import AppToolRuntime
+import MultimodalTTS
 import SwiftUI
+import ProviderRouting
 import AppKit
 import CoreGraphics
 import ScreenCaptureKit
@@ -286,6 +290,7 @@ final class ChatSidebarProjectionCache {
     private var pinnedRaw = ""
     private var anchorSessionId: String?
     private var search = ""
+    private var openingRevision: UInt64 = 0
     private var cached = ChatSidebarProjection(
         sections: .init(pinned: [], unpinned: []),
         pinnedTabs: []
@@ -303,22 +308,26 @@ final class ChatSidebarProjectionCache {
         sessions newSessions: [ChatSession],
         pinnedRaw newPinnedRaw: String,
         anchorSessionId newAnchorSessionId: String?,
-        search newSearch: String
+        search newSearch: String,
+        openingRevision newOpeningRevision: UInt64
     ) -> ChatSidebarProjection {
         if sessions == newSessions,
            pinnedRaw == newPinnedRaw,
            anchorSessionId == newAnchorSessionId,
-           search == newSearch {
+           search == newSearch,
+           openingRevision == newOpeningRevision {
             return cached
         }
 
         let query = newSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let visible = query.isEmpty ? newSessions : newSessions.filter {
-            $0.title.lowercased().contains(query)
+        let visible = newSessions.filter {
+            ChatShellOpeningLine.shared.isPrepared(for: $0)
+                && (query.isEmpty || $0.title.lowercased().contains(query)
                 || ($0.lastMessagePreview ?? "").lowercased().contains(query)
+                )
         }
         let pinnedIDs = ConversationAnchor.merged(
-            into: MacPinnedChatSessionStore.decode(newPinnedRaw),
+            into: ChatSessionRetention.decode(newPinnedRaw),
             anchorSessionId: newAnchorSessionId
         )
         let pinnedTabs: [ChatSession]
@@ -340,6 +349,7 @@ final class ChatSidebarProjectionCache {
         pinnedRaw = newPinnedRaw
         anchorSessionId = newAnchorSessionId
         search = newSearch
+        openingRevision = newOpeningRevision
         cached = result
         rebuildCount += 1
         return result
@@ -426,7 +436,7 @@ struct ChatTurnCardInset: View {
 /// body made every streamed delta a dependency of the WHOLE Chat screen — the
 /// session rail included. This view renders nothing and exists only to own
 /// those three dependencies; `onChanged` is `speakLatestAssistantIfReady`,
-/// whose own gate (ChatVoiceAutoReadGate) is unchanged, so the firing
+/// whose own gate (VoiceOutputModeSelection.autoReadDecision) is unchanged, so the firing
 /// CONDITIONS are identical to before the move.
 struct ChatReadAloudObserver: View {
     @Environment(AppModel.self) private var appModel
@@ -595,7 +605,7 @@ struct ChatView: View {
     @Environment(\.quietOffscreenRead) var quietOffscreenRead
 
     // Sprint 3.1 — voice input
-    @State var voiceInput = VoiceInputController()
+    @State var voiceInput = VoiceInputCapture.forChat()
     @State var voiceDraftBeforeListening = ""
     /// 2026-09-06: the conversation dictation started in. Speech kept running
     /// across a session switch and the next transcript update overwrote the
@@ -608,7 +618,7 @@ struct ChatView: View {
     /// waiting on the microphone permission prompt had nothing to cancel it.
     @State var voiceGeneration = 0
     // Sprint 3.2 — voice output
-    @State var voiceOutput = VoiceOutputController()
+    @State var voiceOutput = VoiceOutputController.forChat()
     @AppStorage("voiceAutoRead") var voiceAutoRead = false
     // Sprint 3.3 — screen capture
     @State var isCapturing = false
@@ -633,12 +643,13 @@ struct ChatView: View {
     // destructive button action cannot race into duplicate clears.
     @State var clearConfirmation = ChatClearConfirmationState()
     // Capability store supplies dynamic slash-command suggestions and dispatch metadata.
-    @State var capabilitiesStore = CapabilitiesStore.shared
+    @State var capabilitiesStore = NativeAgentEngine.live.tools
     // PATCH-Phase7b: tool dispatch sheet + in-flight plan
     @State var showToolInputForm = false
     @State var currentDispatchPlan: DispatchArgPlan? = nil
     @State var scrollCoordinator = ChatScrollCoordinator()
     @State var sidebarProjectionCache = ChatSidebarProjectionCache()
+    @State var conversationAnchor = MacConversationAnchorReading()
     /// Per-session cursor prevents a tab switch from overwriting the marker
     /// for a response that is still arriving in another conversation.
     @State var lastAutoReadMessageIds: [String: String] = [:]
@@ -651,6 +662,7 @@ struct ChatView: View {
     /// appearing, switching session, and a provider being connected. Starts
     /// TRUE so a working machine can never flash the connect prompt.
     @State var hasUsableProvider = true
+    @State private var providerReadinessTask: Task<Void, Never>?
     /// Fences overlapping "Go to" tasks. A route may need to refresh the
     /// session index before selection; an older click must not resume after a
     /// newer click and become the newest AppModel selection request.
@@ -691,8 +703,9 @@ struct ChatView: View {
         sidebarProjectionCache.project(
             sessions: appModel.engine.transcripts.sessions,
             pinnedRaw: pinnedChatSessionIdsRaw,
-            anchorSessionId: MacConversationAnchorReading.currentSessionId(),
-            search: sessionSearch
+            anchorSessionId: conversationAnchor.sessionId,
+            search: sessionSearch,
+            openingRevision: ChatShellOpeningLine.shared.revision
         )
     }
 
@@ -737,7 +750,8 @@ struct ChatView: View {
         transcriptSearchFocusRequest &+= 1
         transcriptSearch.replaceSource(
             messages: appModel.chatMessages,
-            sessionID: appModel.activeChatSessionId
+            sessionID: appModel.activeChatSessionId,
+            revision: appModel.engine.transcripts.structureVersion(for: appModel.activeChatSessionId)
         )
     }
 
@@ -762,15 +776,16 @@ struct ChatView: View {
     }
 
     private func refreshTranscriptSearchIfPresented() {
-        guard showTranscriptSearch else { return }
+        guard showTranscriptSearch, chatPageIsVisible else { return }
         transcriptSearch.replaceSource(
             messages: appModel.chatMessages,
-            sessionID: appModel.activeChatSessionId
+            sessionID: appModel.activeChatSessionId,
+            revision: appModel.engine.transcripts.structureVersion(for: appModel.activeChatSessionId)
         )
     }
 
     func refreshTranscriptSearchTailIfPresented() {
-        guard showTranscriptSearch else { return }
+        guard showTranscriptSearch, chatPageIsVisible else { return }
         transcriptSearch.replaceLastMessage(
             appModel.chatMessages.last,
             ordinal: appModel.chatMessages.count - 1,
@@ -816,12 +831,20 @@ struct ChatView: View {
             ChatReadAloudObserver(onChanged: speakLatestAssistantIfReady)
         }
         .navigationTitle("Chat")
+        .task(id: appModel.engine.transcripts.sessions) {
+            try? await ChatShellOpeningLine.shared.prepare(
+                appModel.engine.transcripts.sessions, dataRoot: appModel.engine.transcripts.dataRoot
+            )
+        }
+        .task(id: appModel.dataRootOverride) {
+            await conversationAnchor.watch(root: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        }
         // Where a card's setup opens: the connector sheet, or in Simple view
         // the floating glass panel (SimpleSetupPanel.swift).
         .inlineCardSetup(inlineCards)
         .liveOnAppear {
             prunePinnedSessions()
-            hasUsableProvider = appModel.hasAnyUsableProvider()
+            refreshProviderReadiness()
             // H5: pick up whatever draft this session already holds (a prefill
             // that landed while Chat was off-screen, or our own last commit).
             adoptDraft(for: appModel.activeChatSessionId)
@@ -891,6 +914,8 @@ struct ChatView: View {
         .onChange(of: chatPageIsVisible) { _, visible in
             if !visible { composerCardState.dismiss() }
             guard !visible else {
+                refreshProviderReadiness()
+                refreshTranscriptSearchIfPresented()
                 // Coming BACK is the "the control closed" signal for the
                 // controls that are pages rather than sheets: a card that sent
                 // the person to Providers asks its owner, now, whether the
@@ -901,9 +926,9 @@ struct ChatView: View {
             commitDraft()
             endDictation()
         }
-        // Seed CapabilitiesStore when chat view appears (TTL-gated, no-op if fresh).
+        // Seed the slash catalog when chat view appears (TTL-gated, no-op if fresh).
         .liveTask {
-            await capabilitiesStore.refresh()
+            await capabilitiesStore.refreshSlashCatalog()
             // First-run: agent greets the user once a provider is connected.
             // Idempotent + self-gating; safe to call from multiple triggers.
             await appModel.maybeSendFirstRunGreeting()
@@ -921,7 +946,7 @@ struct ChatView: View {
             endDictation()
             adoptDraft(for: newSessionId)
             Task { await inlineCards.refresh(sessionID: newSessionId) }
-            hasUsableProvider = appModel.hasAnyUsableProvider()
+            refreshProviderReadiness()
             Task { await appModel.maybeSendFirstRunGreeting() }
         }
         // The cards follow the TRANSCRIPT, because that is where they live.
@@ -940,7 +965,7 @@ struct ChatView: View {
         //
         // Coalesced: one turn bumps the version many times and each bump is a
         // whole-transcript read (2026-09-14, snappiness).
-        .onChange(of: appModel.engine.transcripts.structureVersion) {
+        .onChange(of: appModel.engine.transcripts.structureVersion(for: appModel.activeChatSessionId)) {
             inlineCards.refreshSoon(sessionID: appModel.activeChatSessionId)
         }
         // A link that names a message (a miss's history locator) lands on it
@@ -975,17 +1000,16 @@ struct ChatView: View {
         .onChange(of: appModel.chatProvider) {
             // Catches the case where the user skipped the provider step at
             // onboarding and connected an LLM later in Settings.
-            hasUsableProvider = appModel.hasAnyUsableProvider()
+            refreshProviderReadiness()
             Task { await appModel.maybeSendFirstRunGreeting() }
         }
-        // D1 review fix: readiness can change WITHOUT chatProvider changing
-        // (credentials added for the already-selected provider in Settings).
-        // Any window regaining key — e.g. returning from the Settings window —
-        // re-derives it, so the connect prompt can never sit stale while the
-        // user is looking at Chat.
+        .onChange(of: appModel.engine.providers.connections) { refreshProviderReadiness() }
+        // Account files can also change outside Settings.
         .onReceive(NotificationCenter.default.publisher(
-            for: NSWindow.didBecomeKeyNotification)) { _ in
-            hasUsableProvider = appModel.hasAnyUsableProvider()
+            for: NSWindow.didBecomeKeyNotification)) { note in
+            guard chatPageIsVisible, let window = note.object as? NSWindow,
+                  window.identifier?.rawValue.contains(NativeAgentAppCoordinator.mainSceneID) == true else { return }
+            refreshProviderReadiness()
         }
         .onChange(of: chatSessionIdsFingerprint) {
             prunePinnedSessions()
@@ -1004,6 +1028,40 @@ struct ChatView: View {
                 showToast(msg)
                 voiceOutput.errorMessage = nil
             }
+        }
+    }
+
+    private func receiveTurnNotice(_ note: Notification) {
+        guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
+        // Session-scope (audit #7/#9): a notice that names a
+        // session only toasts when that session is active, so a
+        // background/detached turn's advisory + tool notices don't
+        // bleed over the active conversation. Notices without a
+        // sessionId (legacy/other posters) are not filtered.
+        if let noticeSession = note.userInfo?["sessionId"] as? String,
+           !noticeSession.isEmpty,
+           noticeSession != appModel.activeChatSessionId {
+            return
+        }
+        let kind = (note.userInfo?["kind"] as? String) ?? ""
+        switch ChatTurnNoticePresentation.destination(for: kind) {
+        case .chatTop:
+            if chatPageIsVisible { pushChatTopNotice(text, kind: kind) }
+        case .globalWarning:
+            appModel.systemToasts.push(warn: text)
+        case .globalInfo:
+            appModel.systemToasts.push(info: text, autoDismissAfter: 6)
+        }
+    }
+
+    private func refreshProviderReadiness() {
+        providerReadinessTask?.cancel()
+        let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        providerReadinessTask = Task {
+            let ready = await Task.detached(priority: .userInitiated) {
+                SwiftNativeProviderRouting(dataRoot: root).hasUsableCredentials()
+            }.value
+            if !Task.isCancelled { hasUsableProvider = ready }
         }
     }
 
@@ -1030,7 +1088,7 @@ struct ChatView: View {
                                 // submitted (2026-09-06).
                                 let toolSessionId = plan.sessionId
                                 Task {
-                                    await runDispatchAndRenderReceiptData(
+                                    await appModel.engine.runChatSlashCommand(
                                         tool: toolName,
                                         inputData: inputData,
                                         sessionId: toolSessionId
@@ -1298,7 +1356,7 @@ struct ChatView: View {
                     }
                     .overlay(alignment: .bottomTrailing) { latestPillOverlay(proxy) }
                     .onChange(of: transcriptLatestRequest) { _, _ in
-                        guard !showTranscriptSearch else { return }
+                        guard chatPageIsVisible, !showTranscriptSearch else { return }
                         scrollToBottom(proxy, animated: false, delay: 0, force: true)
                     }
                     // User, 2026-09-13: a clearance-driven scroll is gone on
@@ -1318,10 +1376,11 @@ struct ChatView: View {
                     } action: { _, _ in
                         // Card and composer resizing must settle the anchor
                         // without waiting for the next reply token.
-                        guard scrollCoordinator.autoFollow, !showTranscriptSearch else { return }
+                        guard chatPageIsVisible, scrollCoordinator.autoFollow, !showTranscriptSearch else { return }
                         scrollToBottom(proxy, animated: false, delay: 0)
                     }
                     .onChange(of: appModel.chatMessages.count) {
+                        guard chatPageIsVisible else { return }
                         if showTranscriptSearch {
                             refreshTranscriptSearchIfPresented()
                         } else {
@@ -1333,6 +1392,7 @@ struct ChatView: View {
                         }
                     }
                     .onChange(of: appModel.isBusy) { _, isBusy in
+                        guard chatPageIsVisible else { return }
                         // PATCH-2026-06-06: chat-upgrades — smarter auto-scroll.
                         // On stream completion (isBusy true→false), if the user
                         // never scrolled up during the stream (auto-follow
@@ -1373,9 +1433,14 @@ struct ChatView: View {
                     // observe every text publication independently of layout.
                     .followsStreamingTail(
                         messageID: appModel.chatMessages.last?.id,
-                        enabled: showTranscriptSearch,
+                        enabled: showTranscriptSearch && chatPageIsVisible,
                         onChanged: { refreshTranscriptSearchTailIfPresented() }
                     )
+                    .onChange(of: chatPageIsVisible) { _, visible in
+                        guard visible else { return }
+                        if showTranscriptSearch { refreshTranscriptSearchIfPresented() }
+                        else if scrollCoordinator.autoFollow { scrollToBottom(proxy, animated: false, delay: 0) }
+                    }
                     // The structural seam still carries the end-of-turn write
                     // and any interior rewrite.
                     .onChange(of: appModel.chatMessages.last?.content) { _, _ in
@@ -1390,7 +1455,7 @@ struct ChatView: View {
                     // id, so open search kept showing results for text that is
                     // no longer there. The transcript's own mutation counter
                     // catches every such write.
-                    .onChange(of: appModel.engine.transcripts.structureVersion) { _, _ in
+                    .onChange(of: appModel.engine.transcripts.structureVersion(for: appModel.activeChatSessionId)) { _, _ in
                         refreshTranscriptSearchIfPresented()
                     }
                     .onChange(of: transcriptSearch.selectionRevision) { _, _ in
@@ -1448,26 +1513,7 @@ struct ChatView: View {
                             // hop to main before touching the toast center.
                             .receive(on: DispatchQueue.main)
                     ) { note in
-                        guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
-                        // Session-scope (audit #7/#9): a notice that names a
-                        // session only toasts when that session is active, so a
-                        // background/detached turn's advisory + tool notices don't
-                        // bleed over the active conversation. Notices without a
-                        // sessionId (legacy/other posters) are not filtered.
-                        if let noticeSession = note.userInfo?["sessionId"] as? String,
-                           !noticeSession.isEmpty,
-                           noticeSession != appModel.activeChatSessionId {
-                            return
-                        }
-                        let kind = (note.userInfo?["kind"] as? String) ?? ""
-                        switch ChatTurnNoticePresentation.destination(for: kind) {
-                        case .chatTop:
-                            pushChatTopNotice(text, kind: kind)
-                        case .globalWarning:
-                            appModel.systemToasts.push(warn: text)
-                        case .globalInfo:
-                            appModel.systemToasts.push(info: text, autoDismissAfter: 6)
-                        }
+                        receiveTurnNotice(note)
                     }
                     // `loadChatState` writes the shared session state the
                     // visible window is bound to, and the rest of this primes

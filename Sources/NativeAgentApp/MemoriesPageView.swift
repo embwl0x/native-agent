@@ -1,3 +1,5 @@
+import Cognition
+import Foundation
 // MemoriesPageView.swift
 // WHAT I'VE KEPT, IN HER WORDS. (ui-simplify 2026-09-03, lane M.)
 //
@@ -40,9 +42,8 @@
 //   delete              AppModel.deleteMemory (behind the same confirmation)
 //   read                MemoryFullTextView, the classic page's own sheet
 //   deleted             engine.memory.proposals(status: "rejected")
-//   a moment's quote    SwiftNativeMemoryV2.listProposals(status:"pending"),
-//                       metadata `quote` — the same read Today's kept-moments
-//                       fold makes, joined to the proposal by id
+//   a moment's quote    engine.memory.proposals metadata `quote`,
+//                       from the pending-proposal read already loaded above
 //
 // The classic page's consolidate / hygiene / Spotlight-reindex menu and its
 // status block (with Advanced diagnostics) are the "Upkeep and details" fold
@@ -269,39 +270,6 @@ enum MemoriesPageContent {
     }
 }
 
-// MARK: - The one read this page makes of its own
-
-/// Everything the page needs that is NOT already on `AppModel`. Two things: the
-/// quotes that make a pending moment a moment, and whether the store could be
-/// opened at all. Taken off the main actor because it touches SQLite.
-struct MemoriesPageSnapshot: Sendable, Equatable {
-    var loaded = false
-    /// Proposal id → the exact words that made the moment.
-    var momentQuotes: [String: String] = [:]
-    /// A store that would not open. Same distinction TodayView keeps: read and
-    /// empty is calm, could-not-be-read is a sentence.
-    var memoryUnreadable = false
-
-    static let empty = MemoriesPageSnapshot()
-
-    static func load() async -> MemoriesPageSnapshot {
-        var snapshot = MemoriesPageSnapshot()
-        snapshot.loaded = true
-        do {
-            let pending = try await SwiftNativeMemoryV2.shared.listProposals(status: "pending")
-            for proposal in pending where MemoryMoments.isMoment(proposal.metadata) {
-                if let quote = MemoryMoments.metadataString(proposal.metadata, "quote"),
-                   !quote.isEmpty {
-                    snapshot.momentQuotes[proposal.id] = quote
-                }
-            }
-        } catch {
-            snapshot.memoryUnreadable = true
-        }
-        return snapshot
-    }
-}
-
 // MARK: - The page
 
 struct MemoriesPageView: View {
@@ -312,7 +280,7 @@ struct MemoriesPageView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var query = ""
-    @State private var snapshot = MemoriesPageSnapshot.empty
+    @State private var loaded = false
     @State private var readCount = 0
     @State private var rejectedProposals: [ProposalRecord] = []
     @State private var rejectedShown = MemoriesPageMetrics.foldRowCap
@@ -322,6 +290,28 @@ struct MemoriesPageView: View {
     @State private var notice: String?
     @State private var fullText: MemoriesFullText?
     @State private var savingProposalIDs: Set<String> = []
+    @State private var ordered: [MemoryRow] = []
+    @State private var found: [MemoryRow] = []
+
+    private struct MemoryRow: Identifiable, Sendable {
+        let memory: MemoryV2.MemoryRecord
+        let line: String
+        let meta: String
+        var id: String { memory.id }
+    }
+
+    private struct RowInput: Equatable, Sendable {
+        let memories: [MemoryV2.MemoryRecord]
+        let results: [MemoryV2.MemoryRecord]?
+        let resultQuery: String?
+        let query: String
+        let now: Date
+    }
+
+    private var rowInput: RowInput {
+        RowInput(memories: memories, results: memory.searchResults,
+                 resultQuery: memory.searchResultQuery, query: query, now: now)
+    }
 
     private enum Fold {
         static let showAll = "show-all"
@@ -339,8 +329,8 @@ struct MemoriesPageView: View {
                 MemoriesSearchField(text: $query)
 
                 PageReadStatus(
-                    isReading: !snapshot.loaded || readCount > 0,
-                    text: !snapshot.loaded ? "Reading my memories…" : readCount > 0 ? "Refreshing my memories…" : nil
+                    isReading: !loaded || readCount > 0,
+                    text: !loaded ? "Reading my memories…" : readCount > 0 ? "Refreshing my memories…" : nil
                 )
 
                 if isSearching {
@@ -368,7 +358,7 @@ struct MemoriesPageView: View {
 
                 // The one line a quiet page must still say out loud. Same
                 // sentence as Today's, because it is the same store.
-                if snapshot.memoryUnreadable {
+                if memory.proposalsReadFailed {
                     Text("I couldn't read my memory just now.")
                         .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -401,7 +391,7 @@ struct MemoriesPageView: View {
             let database = root
                 .appendingPathComponent("memory", isDirectory: true)
                 .appendingPathComponent("memory.sqlite")
-            await ViewFileRefreshTask.run(paths: [
+            await EventDeadlinePhysiology.refreshOnChanges(paths: [
                 database,
                 URL(fileURLWithPath: database.path + "-wal"),
             ]) {
@@ -411,11 +401,29 @@ struct MemoriesPageView: View {
         // The visible page is loaded by the watcher above; the offscreen copy
         // a quiet read mounts has no watcher, so it reads once.
         .quietReadTask(live: false) { await reload() }
+        .task(id: rowInput) {
+            let input = rowInput
+            let rows = await Task.detached {
+                func row(_ record: MemoryV2.MemoryRecord) -> MemoryRow {
+                    MemoryRow(memory: record, line: MemoriesPageContent.line(record.text),
+                              meta: MemoriesPageContent.meta(record, now: input.now))
+                }
+                let ordered = MemoriesPageContent.ordered(input.memories).map(row)
+                let found = MemorySearchPresentation.displayedRecords(
+                    input.memories, query: input.query, semanticResults: input.results,
+                    resultQuery: input.resultQuery
+                ) { $0.text.lowercased().contains($1) }.map(row)
+                return (ordered, found)
+            }.value
+            guard !Task.isCancelled, input == rowInput else { return }
+            (ordered, found) = rows
+        }
         // The owner starts its generation gate before its debounce, so a new
         // keystroke invalidates old results instead of leaving a previous
         // query's rows under the current search text. Same call the classic
         // page makes, so "meaning, not words" behaves identically here.
         .onChange(of: query) { _, newValue in
+            found = []
             searchTask?.cancel()
             searchTask = Task { await memory.search(query: newValue) }
         }
@@ -431,8 +439,8 @@ struct MemoriesPageView: View {
         AlivePageHeader(
             title: "Memories",
             line: MemoriesPageContent.headerLine(
-                loaded: snapshot.loaded,
-                failed: snapshot.memoryUnreadable
+                loaded: loaded,
+                failed: memory.proposalsReadFailed
                     || appModel.panelRefreshStatus[.memories]?.failedEndpoints.contains("memories") == true,
                 kept: memories.count,
                 toLookAt: pendingProposals.count),
@@ -443,19 +451,6 @@ struct MemoriesPageView: View {
 
     private var isSearching: Bool {
         !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// The SAME projection the classic page uses: semantic results when they
-    /// name the query in the field, the cheap lexical pass otherwise.
-    private var found: [MemoryV2.MemoryRecord] {
-        MemorySearchPresentation.displayedRecords(
-            memories,
-            query: query,
-            semanticResults: memory.searchResults,
-            resultQuery: memory.searchResultQuery
-        ) { record, lower in
-            record.text.lowercased().contains(lower)
-        }
     }
 
     private var searchState: MemorySearchPresentation {
@@ -497,7 +492,7 @@ struct MemoriesPageView: View {
                         .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
                         .foregroundStyle(NativeAgentShell.secondary)
                 } else {
-                    AliveGroupCard {
+                    AliveGroupCard(lazy: true) {
                         ForEach(found, id: \.id) { memory in
                             keptRow(memory)
                         }
@@ -523,7 +518,7 @@ struct MemoriesPageView: View {
                         line: MemoriesPageContent.proposalLine(proposal),
                         meta: MemoriesPageContent.proposalMeta(
                             proposal,
-                            quote: snapshot.momentQuotes[proposal.id],
+                            quote: MemoryMoments.isMoment(proposal.metadata) ? MemoryMoments.metadataString(proposal.metadata, "quote") : nil,
                             staged: "staged \(MemoriesWhen.words(proposal.createdAt, now: now))"),
                         isSaving: savingProposalIDs.contains(proposal.id),
                         onKeep: { decide(proposal, keep: true) },
@@ -538,15 +533,11 @@ struct MemoriesPageView: View {
 
     // MARK: what I've kept
 
-    private var ordered: [MemoryV2.MemoryRecord] {
-        MemoriesPageContent.ordered(memories)
-    }
-
     @ViewBuilder
     private var keptSection: some View {
         let ordered = self.ordered
         if ordered.isEmpty {
-            if snapshot.loaded, !snapshot.memoryUnreadable,
+            if memories.isEmpty, loaded, !memory.proposalsReadFailed,
                appModel.panelRefreshStatus[.memories]?.failedEndpoints.contains("memories") == false {
                 Text("It fills up as we talk.")
                     .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
@@ -556,7 +547,7 @@ struct MemoriesPageView: View {
         } else {
             VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
                 AliveEyebrow("What I've kept")
-                AliveGroupCard {
+                AliveGroupCard(lazy: true) {
                     ForEach(Array(ordered.prefix(MemoriesPageMetrics.keptShown)), id: \.id) { memory in
                         keptRow(memory)
                     }
@@ -565,7 +556,7 @@ struct MemoriesPageView: View {
             let rest = Array(ordered.dropFirst(MemoriesPageMetrics.keptShown))
             if !rest.isEmpty {
                 MemoriesFold(title: "\(rest.count) more", isOpen: binding(Fold.showAll)) {
-                    AliveGroupCard {
+                    AliveGroupCard(lazy: true) {
                         ForEach(rest, id: \.id) { memory in
                             keptRow(memory)
                         }
@@ -576,10 +567,11 @@ struct MemoriesPageView: View {
         }
     }
 
-    private func keptRow(_ memory: MemoryV2.MemoryRecord) -> some View {
-        MemoriesRowCard(
-            line: MemoriesPageContent.line(memory.text),
-            meta: MemoriesPageContent.meta(memory, now: now),
+    private func keptRow(_ row: MemoryRow) -> some View {
+        let memory = row.memory
+        return MemoriesRowCard(
+            line: row.line,
+            meta: row.meta,
             isPinned: memory.pinned == true,
             onRead: { fullText = MemoriesFullText(id: memory.id, text: memory.text, memoryID: memory.id) },
             onTogglePin: { Task { await togglePin(memory) } },
@@ -686,12 +678,9 @@ struct MemoriesPageView: View {
         } catch {
             notice = "Could not reload rejected memory history."
         }
-        let loaded = await Task.detached(priority: .userInitiated) {
-            await MemoriesPageSnapshot.load()
-        }.value
         guard !Task.isCancelled else { return }
         now = Date()
-        snapshot = loaded
+        loaded = true
     }
 }
 
@@ -918,5 +907,62 @@ struct MemoriesRejectedHistory: View {
                 .accessibilityIdentifier("memories.deleted.show-more")
             }
         }
+    }
+}
+
+/// The mounted Memory search field distinguishes a still-running canonical
+/// search from an honest empty result and from a failed semantic reader whose
+/// keyword fallback also found nothing.
+enum MemorySearchPresentation: Equatable {
+    case allMemories
+    case searching
+    case results
+    case empty
+    case unavailable(String)
+
+    static func matchesCurrentQuery(_ query: String, resultQuery: String?) -> Bool {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.count >= 3
+            && resultQuery?.trimmingCharacters(in: .whitespacesAndNewlines) == normalized
+    }
+
+    /// Semantic results are usable only when they name the query currently in
+    /// the field. Even then, an empty semantic array is not enough evidence to
+    /// suppress the cheap lexical fallback: the embedder can be unavailable,
+    /// weak, or return an incomplete projection while the rendered memory list
+    /// still has an exact text match.
+    static func displayedRecords<Record>(
+        _ records: [Record],
+        query: String,
+        semanticResults: [Record]?,
+        resultQuery: String?,
+        lexicalMatch: (Record, String) -> Bool
+    ) -> [Record] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return records }
+        let lexical = records.filter { lexicalMatch($0, trimmed.lowercased()) }
+        guard matchesCurrentQuery(query, resultQuery: resultQuery),
+              let semanticResults,
+              !semanticResults.isEmpty else {
+            return lexical
+        }
+        return semanticResults
+    }
+
+    static func resolve(
+        query: String,
+        resultCount: Int,
+        isLoading: Bool,
+        error: String?
+    ) -> Self {
+        guard query.trimmingCharacters(in: .whitespacesAndNewlines).count >= 3 else {
+            return .allMemories
+        }
+        if isLoading { return .searching }
+        if resultCount > 0 { return .results }
+        if let error, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .unavailable(error)
+        }
+        return .empty
     }
 }

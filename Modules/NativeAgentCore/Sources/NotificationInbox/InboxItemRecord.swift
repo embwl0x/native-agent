@@ -66,7 +66,8 @@ public struct InboxItemRecord: Identifiable, Encodable, Hashable, Sendable {
             source = ""
             sourceReadState = .malformed
         }
-        severity = Self.string(o["severity"]) ?? "info"
+        severity = id.hasPrefix("delegation-outcome:") && id.hasSuffix(":adverse-rollup") && o["adverse_jobs"] == .array([])
+            ? "info" : Self.string(o["severity"]) ?? "info"
         title = Self.string(o["title"]) ?? ""
         summary = Self.string(o["summary"]) ?? ""
         detail = Self.string(o["detail"])

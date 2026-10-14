@@ -3,6 +3,8 @@ import CryptoKit
 import PersistenceCore
 
 public enum OrganismPredictiveBody {
+    private static let maximumPredictions = 96
+
     public static func predictionID(
         kind: OrganismPredictionKind,
         sourceOrgan: String,
@@ -15,8 +17,7 @@ public enum OrganismPredictiveBody {
         signal: SomaticSignal,
         to ledger: OrganismPredictionLedger,
         chemicalState: ChemicalState,
-        bodySchema: BodySchema,
-        limits: OrganismPredictionLimits = .defaults
+        bodySchema: BodySchema
     ) -> (ledger: OrganismPredictionLedger, chemicalState: ChemicalState, bodySchema: BodySchema) {
         var nextLedger = ledger
         var nextChemistry = chemicalState
@@ -44,7 +45,7 @@ public enum OrganismPredictiveBody {
         case .userSpoke, .toolSucceeded, .toolFailed,
              .providerSucceeded, .providerFailed,
              .phoneDeliveryReceived, .phoneDeliveryFailed,
-             .approvalResolved, .deskItemClosed, .deskItemBlocked:
+             .approvalResolved, .deskItemClosed, .deskItemCancelled, .deskItemBlocked:
             resolvesOwnRow = true
         default:
             resolvesOwnRow = false
@@ -110,6 +111,8 @@ public enum OrganismPredictiveBody {
             upsertPending(.workflowAdvance, signal: signal, in: &nextLedger)
         case .deskItemClosed:
             satisfy(.workflowAdvance, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
+        case .deskItemCancelled:
+            cancel(.workflowAdvance, signal: signal, ledger: &nextLedger)
         case .deskItemBlocked:
             violate(.workflowAdvance, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .memoryCommitted, .memoryCorrected, .memoryHygieneCompleted:
@@ -150,7 +153,7 @@ public enum OrganismPredictiveBody {
             nextLedger.lastUpdatedAt ?? .distantPast,
             signal.occurredAt
         )
-        nextLedger = enforcingCapacity(nextLedger, limits: limits)
+        nextLedger = enforcingCapacity(nextLedger)
         return (nextLedger, nextChemistry, nextBody)
     }
 
@@ -563,7 +566,7 @@ public enum OrganismPredictiveBody {
         case .providerSucceeded, .providerFailed: kind = .providerCompletion
         case .phoneDeliveryReceived, .phoneDeliveryFailed: kind = .phoneDelivery
         case .approvalResolved: kind = .approvalResolution
-        case .deskItemClosed, .deskItemBlocked: kind = .workflowAdvance
+        case .deskItemClosed, .deskItemCancelled, .deskItemBlocked: kind = .workflowAdvance
         case .userSpoke:
             guard OrganismSemanticExpectation.field(
                 OrganismSemanticExpectation.reactionField, in: signal.metadata,
@@ -669,14 +672,11 @@ public enum OrganismPredictiveBody {
         }
     }
 
-    private static func enforcingCapacity(
-        _ ledger: OrganismPredictionLedger,
-        limits: OrganismPredictionLimits
-    ) -> OrganismPredictionLedger {
-        guard ledger.predictions.count > limits.maximumPredictions else { return ledger }
+    private static func enforcingCapacity(_ ledger: OrganismPredictionLedger) -> OrganismPredictionLedger {
+        guard ledger.predictions.count > maximumPredictions else { return ledger }
         var next = ledger
         let keep = Set(OrganismPredictionRetention.bounded(
-            Array(ledger.predictions.values), maximum: limits.maximumPredictions
+            Array(ledger.predictions.values), maximum: maximumPredictions
         ).map(\.id))
         next.predictions = ledger.predictions.filter { keep.contains($0.key) }
         return next
@@ -779,14 +779,13 @@ enum OrganismPredictionRetention {
 
         var result = pending
         var buckets = Dictionary(grouping: predictions.filter { $0.status != .pending }, by: \.kind)
-            .mapValues { $0.sorted(by: recentFirst) }
+            .mapValues { Array($0.sorted(by: recentFirst).reversed()) }
         let kinds = OrganismPredictionKind.allCases
         while result.count < maximum {
             var appended = false
             for kind in kinds where result.count < maximum {
-                guard var bucket = buckets[kind], !bucket.isEmpty else { continue }
-                result.append(bucket.removeFirst())
-                buckets[kind] = bucket
+                guard let prediction = buckets[kind]?.popLast() else { continue }
+                result.append(prediction)
                 appended = true
             }
             if !appended { break }

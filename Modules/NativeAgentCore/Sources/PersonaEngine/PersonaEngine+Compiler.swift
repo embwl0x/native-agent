@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 
 // MARK: - PersonalityPacket
 //
@@ -94,35 +95,11 @@ public struct PersonaContextSourceSnapshot: Sendable, Equatable {
 // Mirrors the retired daemon `personality()` (L35081-35084) which reads
 // `<dataRoot>/memory/profile.json`, normalizes it via `normalize_personality`
 // (L35035-35079) seeded with `default_personality()` (L34989-35033), and
-// returns the typed profile. Shape matches the Mac-side `PersonalityProfile`
-// in NativeAgentShared/SharedModels.swift so the NativeClient adapter can
-// map field-for-field. Core-side type — PersonaEngine doesn't import
-// NativeAgentShared.
+// returns the typed profile, preserving extras beyond the shared field set.
 
-public struct CompiledPersonalityTraits: Sendable, Codable, Equatable {
-    public let warmth: Double
-    public let directness: Double
-    public let humor: Double
-    public let proactivity: Double
-    public let rigor: Double
-    public let autonomy: Double
-    public let creativity: Double
-    public let brevity: Double
+public typealias CompiledPersonalityTraits = PersonalityTraits
 
-    public init(warmth: Double, directness: Double, humor: Double, proactivity: Double,
-                rigor: Double, autonomy: Double, creativity: Double, brevity: Double) {
-        self.warmth = warmth
-        self.directness = directness
-        self.humor = humor
-        self.proactivity = proactivity
-        self.rigor = rigor
-        self.autonomy = autonomy
-        self.creativity = creativity
-        self.brevity = brevity
-    }
-}
-
-public struct CompiledPersonalityProfile: Sendable, Codable, Equatable {
+public struct CompiledPersonalityProfile: Sendable, Equatable {
     public let schemaVersion: Int
     public let personaEngineVersion: String
     public let name: String
@@ -184,59 +161,6 @@ public struct CompiledPersonalityProfile: Sendable, Codable, Equatable {
         self.surfaceOverrides = surfaceOverrides
         self.updatedAt = updatedAt
         self.extras = extras
-    }
-
-    /// Explicit `CodingKeys` that OMIT `extras` so the synthesized
-    /// `Codable` wire shape of this struct stays byte-identical to the
-    /// pre-extras layout. Nothing in the codebase Codable-encodes this
-    /// struct directly (the `/v1/personality/compiled` packet builds its
-    /// `profile` value explicitly in `PersonaEngine+CompiledPacket.swift`,
-    /// and the on-disk profile.json write is built explicitly in
-    /// `PersonaEngine+Writes.swift`), but pinning the keys keeps any future
-    /// incidental `JSONEncoder().encode(profile)` from leaking an
-    /// unsorted/duplicated `extras` blob. The lossless extras carry-over is
-    /// done EXPLICITLY at the two write boundaries, not via this `Codable`.
-    private enum CodingKeys: String, CodingKey {
-        case schemaVersion, personaEngineVersion, name, personaKind, essence
-        case voice, customDirective, traits, examples, forbiddenPatterns
-        case instincts, boundaries, surfaceOverrides, updatedAt
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
-        self.personaEngineVersion = try c.decode(String.self, forKey: .personaEngineVersion)
-        self.name = try c.decode(String.self, forKey: .name)
-        self.personaKind = try c.decode(String.self, forKey: .personaKind)
-        self.essence = try c.decode(String.self, forKey: .essence)
-        self.voice = try c.decode(String.self, forKey: .voice)
-        self.customDirective = try c.decode(String.self, forKey: .customDirective)
-        self.traits = try c.decode(CompiledPersonalityTraits.self, forKey: .traits)
-        self.examples = try c.decode([String].self, forKey: .examples)
-        self.forbiddenPatterns = try c.decode([String].self, forKey: .forbiddenPatterns)
-        self.instincts = try c.decode([String].self, forKey: .instincts)
-        self.boundaries = try c.decode([String].self, forKey: .boundaries)
-        self.surfaceOverrides = try c.decode([String: String].self, forKey: .surfaceOverrides)
-        self.updatedAt = try c.decode(String.self, forKey: .updatedAt)
-        self.extras = [:]
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(schemaVersion, forKey: .schemaVersion)
-        try c.encode(personaEngineVersion, forKey: .personaEngineVersion)
-        try c.encode(name, forKey: .name)
-        try c.encode(personaKind, forKey: .personaKind)
-        try c.encode(essence, forKey: .essence)
-        try c.encode(voice, forKey: .voice)
-        try c.encode(customDirective, forKey: .customDirective)
-        try c.encode(traits, forKey: .traits)
-        try c.encode(examples, forKey: .examples)
-        try c.encode(forbiddenPatterns, forKey: .forbiddenPatterns)
-        try c.encode(instincts, forKey: .instincts)
-        try c.encode(boundaries, forKey: .boundaries)
-        try c.encode(surfaceOverrides, forKey: .surfaceOverrides)
-        try c.encode(updatedAt, forKey: .updatedAt)
     }
 
     /// Defaults matching Python `default_personality()` at
@@ -363,31 +287,44 @@ public actor PersonaCompiler {
     ) async throws -> ResolvedCompilation {
         let root = await engine.personaRoot
 
-        let (personaKind, personaId, personaSubdir) = try Self.resolveActivePersona(
+        let persona = try Self.resolveActivePersona(
             root: root, personaOverride: personaOverride, fileManager: fileManager
         )
-
-        // Load canonical docs + apply per-doc overrides from the custom
-        // persona subdir.
-        var activeDocs: [String: String] = [:]
-        for id in Self.canonicalDocOrder {
-            if let personaSubdir,
-               let override = try readDoc(root: personaSubdir, id: id) {
-                activeDocs[id] = override
-            } else if let canonical = try readDoc(root: root, id: id) {
-                activeDocs[id] = canonical
-            }
-            // missing → omitted from activeDocs and from the prompt body.
-        }
-
-        if let surfaceBody = try readSurfaceOverride(root: root, surface: surface) {
-            activeDocs["surface:\(surface)"] = surfaceBody
-        }
+        var documents = try canonicalDocuments(root: root, personaSubdir: persona.subdir)
         // Unless a turn requires it, an unreadable profile omits the line;
         // her documents still carry her name.
         do {
-            activeDocs["IDENTITY"] = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
+            documents["IDENTITY"] = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
         } catch where !identityRequired {}
+        return try resolvedCompilation(
+            surface: surface, root: root, persona: persona,
+            documents: documents, userMemoryCore: userMemoryCore
+        )
+    }
+
+    private func canonicalDocuments(root: URL, personaSubdir: URL?) throws -> [String: String] {
+        var documents: [String: String] = [:]
+        for id in Self.canonicalDocOrder {
+            if let personaSubdir, let override = try readDoc(root: personaSubdir, id: id) {
+                documents[id] = override
+            } else if let canonical = try readDoc(root: root, id: id) {
+                documents[id] = canonical
+            }
+        }
+        return documents
+    }
+
+    private func resolvedCompilation(
+        surface: String,
+        root: URL,
+        persona: (kind: String, id: String, subdir: URL?),
+        documents: [String: String],
+        userMemoryCore: [String]? = nil
+    ) throws -> ResolvedCompilation {
+        var activeDocs = documents
+        if let surfaceBody = try readSurfaceOverride(root: root, surface: surface) {
+            activeDocs["surface:\(surface)"] = surfaceBody
+        }
         let compiledSystemPrompt = Self.renderPrompt(
             documents: activeDocs, surface: surface, userMemoryCore: userMemoryCore
         )
@@ -397,8 +334,8 @@ public actor PersonaCompiler {
 
         let packet = PersonalityPacket(
             surface: surface,
-            personaKind: personaKind,
-            personaId: personaId,
+            personaKind: persona.kind,
+            personaId: persona.id,
             fingerprint: fingerprint,
             compiledSystemPrompt: compiledSystemPrompt,
             activeDocs: activeDocs,
@@ -407,12 +344,8 @@ public actor PersonaCompiler {
         return ResolvedCompilation(
             packet: packet,
             personaRoot: root,
-            activePersonaDirectory: personaSubdir
+            activePersonaDirectory: persona.subdir
         )
-    }
-
-    public func fingerprint(surface: String) async throws -> String {
-        try await compile(surface: surface).fingerprint
     }
 
     /// 2026-09-18: one ordering for cold compilation and the resident kernel.
@@ -454,6 +387,51 @@ public actor PersonaCompiler {
             surface: surface,
             personaOverride: personaOverride
         )
+        return contextSourceSnapshot(resolved)
+    }
+
+    /// One read of common documents per selected persona, with surface guidance
+    /// applied to that same immutable input for every kernel in the refresh.
+    public func contextSourceSnapshots(
+        surfaces: [String],
+        personaOverrides: [String: String] = [:]
+    ) async throws -> [PersonaContextSourceSnapshot] {
+        let root = await engine.personaRoot
+        let selected = PersonaSelection.current() ?? ""
+        let identity = try? Self.identityPrompt(dataRoot: await engine.dataRootURL)
+        var resolvedByOverride: [String: (kind: String, id: String, subdir: URL?)] = [:]
+        var documentsByPersona: [String: [String: String]] = [:]
+        var snapshots: [PersonaContextSourceSnapshot] = []
+        for surface in surfaces {
+            let override = personaOverrides[surface] ?? selected
+            let persona: (kind: String, id: String, subdir: URL?)
+            if let cached = resolvedByOverride[override] {
+                persona = cached
+            } else {
+                persona = try Self.resolveActivePersona(
+                    root: root, personaOverride: override, fileManager: fileManager
+                )
+                resolvedByOverride[override] = persona
+            }
+            let documents: [String: String]
+            if let cached = documentsByPersona[persona.id] {
+                documents = cached
+            } else {
+                var loaded = try canonicalDocuments(root: root, personaSubdir: persona.subdir)
+                loaded["IDENTITY"] = identity
+                documentsByPersona[persona.id] = loaded
+                documents = loaded
+            }
+            let resolved = try resolvedCompilation(
+                surface: surface, root: root, persona: persona, documents: documents
+            )
+            snapshots.append(contextSourceSnapshot(resolved))
+        }
+        return snapshots
+    }
+
+    private func contextSourceSnapshot(_ resolved: ResolvedCompilation) -> PersonaContextSourceSnapshot {
+        let surface = resolved.packet.surface
         let packet = resolved.packet
         let root = resolved.personaRoot
         let activeDirectory = resolved.activePersonaDirectory
@@ -535,49 +513,12 @@ public actor PersonaCompiler {
         (try? compileProfile(dataRoot: dataRoot)) ?? .defaults
     }
 
-    // MARK: - agent_display_name() mirror
-    //
-    // Subsystem #17 wave 10 prereq #2: mirror Python `agent_display_name()`
-    // at the retired daemon. The daemon normalizes
-    // profile.name: when it's empty, whitespace, or one of the generic
-    // labels {"agent", "custom", "ai", "male", "female"} (case-insensitive),
-    // the daemon falls back to APP ("NativeAgent"). Real custom names
-    // pass through, truncated to 80 chars.
-
-    /// Generic labels the daemon treats as "no real name set" — see
-    /// the retired daemon. Case-insensitive comparison; keep this set
-    /// in sync with the Python literal.
-    nonisolated static let agentDisplayGenericNames: Set<String> = [
-        "agent", "custom", "ai", "male", "female",
-    ]
-
-    /// The daemon's APP constant (the literal string "NativeAgent"). The
-    /// Python source defines `APP = "NativeAgent"` near the top of
-    /// the retired daemon and `agent_display_name()` returns it whenever the
-    /// profile name is empty/whitespace OR one of the generic labels above.
-    nonisolated static let agentDisplayAppFallback: String = "NativeAgent"
-
-    /// Pure normalization of a profile's display name. Mirrors Python
-    /// `agent_display_name()` at the retired daemon.
-    /// Empty/whitespace OR a generic label → "NativeAgent". Otherwise the
-    /// trimmed name truncated to 80 UTF-8-character cap (matches Python's
-    /// `name[:80]` slice which counts code points).
+    /// Shared display-name normalization, including generic names and the
+    /// 80-Unicode-scalar limit.
     public nonisolated static func agentDisplayName(
         profile: CompiledPersonalityProfile
     ) -> String {
-        // Python: `name = str(profile.get("name") or "").strip()`
-        let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if name.isEmpty { return agentDisplayAppFallback }
-        if agentDisplayGenericNames.contains(name.lowercased()) {
-            return agentDisplayAppFallback
-        }
-        // Python: `return name[:80]` — slice by code points (Unicode scalars).
-        // Swift String.count + .prefix(N) operate on extended grapheme clusters,
-        // which would diverge for grapheme-cluster-rich names (compound emoji,
-        // etc.). Use unicodeScalars to mirror Python's CODE POINT slice exactly.
-        let scalars = name.unicodeScalars
-        if scalars.count <= 80 { return name }
-        return String(String.UnicodeScalarView(scalars.prefix(80)))
+        NativeAgentIdentity.displayName(profile.name)
     }
 
     /// Convenience wrapper: load the profile from disk and return its

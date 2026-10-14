@@ -13,39 +13,16 @@ public struct ActivityRetentionRunner: Sendable {
     /// enforcing it hourly buys nothing and VACUUMs the file for no reason.
     public static let defaultInterval: TimeInterval = 6 * 3600
 
-    public struct Outcome: Sendable, Equatable {
-        public let ran: Bool
-        public let deleted: Int
-        public let nextDueAt: Double
-
-        public init(ran: Bool, deleted: Int, nextDueAt: Double) {
-            self.ran = ran
-            self.deleted = deleted
-            self.nextDueAt = nextDueAt
-        }
-    }
-
     public let stateURL: URL
-    private let interval: TimeInterval
 
-    public init(dataRoot: URL, interval: TimeInterval = ActivityRetentionRunner.defaultInterval) {
+    public init(dataRoot: URL) {
         self.stateURL = ActivityWatchPaths.retentionStateURL(dataRoot: dataRoot)
-        self.interval = interval
     }
 
-    /// Constructs the durable schedule beside the exact store it will prune.
-    /// The watcher owns a store, not an app-level data-root dependency, so this
-    /// keeps retention on the capture owner's production path rather than
-    /// depending on a UI controller to remember a separate launch-time call.
-    public init(databaseURL: URL, interval: TimeInterval = ActivityRetentionRunner.defaultInterval) {
-        self.stateURL = databaseURL.deletingLastPathComponent()
-            .appendingPathComponent("activity_retention_state.json")
-        self.interval = interval
-    }
-
-    public init(stateURL: URL, interval: TimeInterval = ActivityRetentionRunner.defaultInterval) {
-        self.stateURL = stateURL
-        self.interval = interval
+    public func nextRunDelay(now: Double = Date().timeIntervalSince1970) -> TimeInterval {
+        guard let last = lastRunAt(), last <= now,
+              last + Self.defaultInterval > now else { return Self.defaultInterval }
+        return last + Self.defaultInterval - now
     }
 
     public func lastRunAt() -> Double? {
@@ -61,24 +38,19 @@ public struct ActivityRetentionRunner: Sendable {
         // it as due rather than as a licence to skip pruning until the clock
         // catches up — which, after a large backwards step, could be years.
         if last > now { return true }
-        return now - last >= interval
+        return now - last >= Self.defaultInterval
     }
 
-    /// Prune if due. Returns what happened, including when it is next due, so a
-    /// caller never has to guess whether retention is actually being enforced.
-    @discardableResult
+    /// Prune if due, then durably record the completed maintenance pass.
     public func runIfDue(
         store: ActivitySpanStore,
         policy: ActivityPolicy,
         now: Double = Date().timeIntervalSince1970
-    ) async throws -> Outcome {
-        guard isDue(now: now) else {
-            return Outcome(ran: false, deleted: 0, nextDueAt: (lastRunAt() ?? now) + interval)
-        }
+    ) async throws {
+        guard isDue(now: now) else { return }
         let retention = Double(max(1, policy.retentionDays)) * 86_400
-        let deleted = try await store.prune(olderThan: retention, now: now)
+        try await store.prune(olderThan: retention, now: now)
         try recordRun(at: now)
-        return Outcome(ran: true, deleted: deleted, nextDueAt: now + interval)
     }
 
     public func recordRun(at timestamp: Double) throws {

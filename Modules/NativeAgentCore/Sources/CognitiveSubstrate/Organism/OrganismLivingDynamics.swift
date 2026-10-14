@@ -3,8 +3,7 @@ import Foundation
 
 /// Closed-form time law used by organism tissue that should change with wall
 /// time without waking on a polling cadence. The stored value remains an
-/// anchor; reads derive the present value and, when meaningful, the one exact
-/// future threshold crossing worth scheduling.
+/// anchor; reads derive the present value.
 public struct OrganismAnalyticDecay: Sendable, Equatable {
     public var valueAtAnchor: Double
     public var equilibrium: Double
@@ -28,24 +27,6 @@ public struct OrganismAnalyticDecay: Sendable, Equatable {
         let elapsed = max(0, date.timeIntervalSince(anchoredAt))
         let factor = pow(0.5, elapsed / halfLife)
         return equilibrium + ((valueAtAnchor - equilibrium) * factor)
-    }
-
-    /// Returns the first future instant at which a monotonic decay reaches the
-    /// threshold. Nil means the threshold is behind the current direction of
-    /// travel, already crossed, or the state is constant.
-    public func crossingDate(for threshold: Double, after date: Date) -> Date? {
-        guard halfLife > 0 else { return nil }
-        let current = value(at: date)
-        let target = Self.finite(threshold)
-        let delta = current - equilibrium
-        let targetDelta = target - equilibrium
-        guard delta != 0,
-              targetDelta != 0,
-              (delta > 0) == (targetDelta > 0),
-              abs(targetDelta) < abs(delta) else { return nil }
-        let interval = halfLife * log2(abs(delta / targetDelta))
-        guard interval.isFinite, interval > 0 else { return nil }
-        return date.addingTimeInterval(interval)
     }
 
     private static func finite(_ value: Double) -> Double {
@@ -100,37 +81,6 @@ public struct OrganismSleepEvidenceReference: Codable, Sendable, Equatable, Iden
     }
 }
 
-/// Optional exact residuals supplied by an immutable generated/frozen
-/// evaluation artifact. Production runtime callers do not need this value.
-/// The values are read-only inputs and are never persisted as organism truth.
-public struct OrganismSupplementalSleepResiduals: Sendable, Equatable {
-    public var transitionSurprise: Double
-    public var contradiction: Double
-    public var calibration: Double
-    public var evidence: [OrganismSleepEvidenceReference]
-    public var nextModelReviewAt: Date?
-
-    public init(
-        transitionSurprise: Double = 0,
-        contradiction: Double = 0,
-        calibration: Double = 0,
-        evidence: [OrganismSleepEvidenceReference] = [],
-        nextModelReviewAt: Date? = nil
-    ) {
-        self.transitionSurprise = Self.clamp(transitionSurprise)
-        self.contradiction = Self.clamp(contradiction)
-        self.calibration = Self.clamp(calibration)
-        self.evidence = Array(evidence.prefix(32))
-        self.nextModelReviewAt = nextModelReviewAt
-    }
-
-    public static let empty = Self()
-
-    private static func clamp(_ value: Double) -> Double {
-        (value.isFinite ? value : 0).clamped01()
-    }
-}
-
 public struct OrganismSleepPressureComponents: Sendable, Equatable {
     public var predictionResidual: Double
     public var transitionSurprise: Double
@@ -151,34 +101,6 @@ public struct OrganismSleepPressureComponents: Sendable, Equatable {
         self.fieldChargeResidual = Self.clamp(fieldChargeResidual)
         self.calibrationResidual = Self.clamp(calibrationResidual)
     }
-
-    private static func clamp(_ value: Double) -> Double {
-        (value.isFinite ? value : 0).clamped01()
-    }
-}
-
-public struct OrganismSleepPressureWeights: Sendable, Equatable {
-    public var prediction: Double
-    public var transitionSurprise: Double
-    public var contradiction: Double
-    public var fieldCharge: Double
-    public var calibration: Double
-
-    public init(
-        prediction: Double = 0.30,
-        transitionSurprise: Double = 0.25,
-        contradiction: Double = 0.20,
-        fieldCharge: Double = 0.15,
-        calibration: Double = 0.10
-    ) {
-        self.prediction = Self.clamp(prediction)
-        self.transitionSurprise = Self.clamp(transitionSurprise)
-        self.contradiction = Self.clamp(contradiction)
-        self.fieldCharge = Self.clamp(fieldCharge)
-        self.calibration = Self.clamp(calibration)
-    }
-
-    public static let preregistered = Self()
 
     private static func clamp(_ value: Double) -> Double {
         (value.isFinite ? value : 0).clamped01()

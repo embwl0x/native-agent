@@ -163,7 +163,7 @@ public protocol LLMCallLifecycleObserving: Sendable {
     func firstOutputDeadline(provider: String, model: String, streamKind: String?) async -> FirstOutputDeadline
 }
 
-/// A provider's slowest first output (text or tool, the adapter's `ttftMs`)
+/// A provider's slowest first output (text, thinking or tool, the adapter's `ttftMs`)
 /// over its retained streamed calls. Below `callsNeeded` calls the slowest is
 /// not yet evidence and the deadline is unmeasured.
 public struct FirstOutputDeadline: Sendable, Equatable {
@@ -176,8 +176,8 @@ public struct FirstOutputDeadline: Sendable, Equatable {
         self.slowest = slowest
     }
 
-    /// The slowest, deliberately not a p99: a cut ends the turn (an admitted
-    /// request is never re-sent) while waiting longer costs seconds. On her
+    /// The slowest, deliberately not a p99: cutting a real slow start wastes
+    /// the request while waiting longer costs seconds. On her
     /// trace 10-10 a p99 deadline would have cut 13 real replies in 37 h
     /// (12 gpt-6-luna, 1 claude-opus-5-5); the slowest cut none.
     public var seconds: TimeInterval? { calls >= Self.callsNeeded ? slowest : nil }
@@ -404,16 +404,6 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         self.description = description
         self.parametersJSON = parametersJSON
         self.deferLoading = deferLoading
-    }
-
-    /// The same schema with the deferred-loading flag set (or cleared).
-    public func deferringLoad(_ deferLoading: Bool = true) -> LLMToolSchema {
-        LLMToolSchema(
-            name: name,
-            description: description,
-            parametersJSON: parametersJSON,
-            deferLoading: deferLoading
-        )
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -701,34 +691,5 @@ extension LLMClient {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
-    }
-}
-
-// Streaming sibling of LLMClient. Lives in NativeAgentCore (same reasoning as
-// LLMClient) so ProviderRouting can declare conformance without taking a
-// circular dep on ChatOrchestration.
-public protocol StreamingLLMClient: Sendable {
-    func stream(
-        prompt: String,
-        system: String?,
-        model: String?
-    ) -> AsyncThrowingStream<String, Error>
-    func stream(
-        prompt: String,
-        system: String?,
-        model: String?,
-        surface: String
-    ) -> AsyncThrowingStream<String, Error>
-}
-
-extension StreamingLLMClient {
-    /// Surface-aware streaming variant. See `LLMClient.complete(...surface:)`.
-    public func stream(
-        prompt: String,
-        system: String?,
-        model: String?,
-        surface: String
-    ) -> AsyncThrowingStream<String, Error> {
-        stream(prompt: prompt, system: system, model: model)
     }
 }

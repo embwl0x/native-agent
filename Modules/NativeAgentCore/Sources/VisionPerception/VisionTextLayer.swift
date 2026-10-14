@@ -19,64 +19,6 @@ import Vision
 // would buy ~nothing and cost latency on every look — the measurement is the
 // reason this code has a `shouldTile` predicate instead of a tiling stage.
 
-/// The seam. Real OCR is a `VisionTextLayer`; tests inject a stub so the
-/// element/fusion layers are provable without Vision in the loop (they are
-/// also exercised against REAL Vision output on rendered scenes — the stub is
-/// for pinning fusion logic exactly, not for avoiding the real engine).
-public protocol VisionTextRecognizing: Sendable {
-    /// - Parameter region: the sub-rect of `image` to recognize, in image
-    ///   pixel coordinates; nil = the whole frame. Returned rects are always
-    ///   in WHOLE-IMAGE pixel coordinates regardless.
-    func recognizeText(in image: CGImage, region: VisionRect?) throws -> [VisionTextBox]
-}
-
-extension VisionTextRecognizing {
-    public func recognizeText(in image: CGImage) throws -> [VisionTextBox] {
-        try recognizeText(in: image, region: nil)
-    }
-}
-
-public struct VisionTextLayerConfig: Sendable, Equatable {
-    /// Median text height BELOW this fraction of the frame height triggers the
-    /// conditional tiling pass. 0.9% of a 1440-tall frame ≈ 13 px — right at
-    /// the point where the v1 measurement stops being reassuring.
-    public let tinyTextHeightFraction: Double
-    /// …and an absolute floor, because a small window full of ordinary 13 px
-    /// text is not tiny text; it is a small window.
-    public let tinyTextHeightPixels: Double
-    /// Tiles per axis for the conditional pass (v1 measured 3×3 overlapped).
-    public let tileGrid: Int
-    /// Fractional overlap between adjacent tiles, so a string straddling a
-    /// tile seam is whole in at least one tile.
-    public let tileOverlap: Double
-    /// Two boxes this close (IoU) with the same text are the same string seen
-    /// twice by two tiles.
-    public let dedupeIoU: Double
-    /// Optional canvas/HUD recovery. A whole-frame pass that sees only a few
-    /// large labels can miss smaller status lines beside them while still
-    /// suppressing ordinary tiny-text tiling. Zero keeps the measured general
-    /// UI default unchanged; visual-surface perception enables a small bound.
-    public let sparseRecoveryMaxBoxes: Int
-
-    public init(
-        tinyTextHeightFraction: Double = 0.009,
-        tinyTextHeightPixels: Double = 12,
-        tileGrid: Int = 3,
-        tileOverlap: Double = 0.15,
-        dedupeIoU: Double = 0.5,
-        sparseRecoveryMaxBoxes: Int = 0
-    ) {
-        self.tinyTextHeightFraction = tinyTextHeightFraction
-        self.tinyTextHeightPixels = tinyTextHeightPixels
-        self.tileGrid = tileGrid
-        self.tileOverlap = tileOverlap
-        self.dedupeIoU = dedupeIoU
-        self.sparseRecoveryMaxBoxes = max(0, sparseRecoveryMaxBoxes)
-    }
-
-    public static let `default` = VisionTextLayerConfig()
-}
-
 /// The result of a text pass, including WHETHER tiling fired — a caller (and a
 /// latency budget) must be able to tell a 40 ms look from a 700 ms one.
 public struct VisionTextLayerResult: Sendable, Equatable {
@@ -99,6 +41,22 @@ public struct VisionTextLayerResult: Sendable, Equatable {
 }
 
 public enum VisionTextLayer {
+    /// Median text height BELOW this fraction of the frame height triggers the
+    /// conditional tiling pass. 0.9% of a 1440-tall frame ≈ 13 px — right at
+    /// the point where the v1 measurement stops being reassuring.
+    private static let tinyTextHeightFraction: Double = 0.009
+    /// …and an absolute floor, because a small window full of ordinary 13 px
+    /// text is not tiny text; it is a small window.
+    private static let tinyTextHeightPixels: Double = 12
+    /// Tiles per axis for the conditional pass (v1 measured 3×3 overlapped).
+    private static let tileGrid: Int = 3
+    /// Fractional overlap between adjacent tiles, so a string straddling a
+    /// tile seam is whole in at least one tile.
+    private static let tileOverlap: Double = 0.15
+    /// Two boxes this close (IoU) with the same text are the same string seen
+    /// twice by two tiles.
+    private static let dedupeIoU: Double = 0.5
+
     /// The conditional-tiling decision, isolated so it can be pinned without
     /// running Vision at all.
     ///
@@ -106,8 +64,7 @@ public enum VisionTextLayer {
     /// measurement is that this returns nil for typical UI.
     public static func tilingDecision(
         boxes: [VisionTextBox],
-        imageHeight: Double,
-        config: VisionTextLayerConfig = .default
+        imageHeight: Double
     ) -> (shouldTile: Bool, reason: String) {
         let heights = boxes.map(\.rect.h).filter { $0 > 0 }.sorted()
         guard !heights.isEmpty else {
@@ -118,7 +75,7 @@ public enum VisionTextLayer {
             return (false, "no text recognized — nothing to re-scan")
         }
         let median = heights[heights.count / 2]
-        let threshold = max(config.tinyTextHeightPixels, imageHeight * config.tinyTextHeightFraction)
+        let threshold = max(tinyTextHeightPixels, imageHeight * tinyTextHeightFraction)
         let rounded = (median * 10).rounded() / 10
         if median < threshold {
             return (true, "tiny text (median \(rounded)px < \((threshold * 10).rounded() / 10)px)")
@@ -128,14 +85,13 @@ public enum VisionTextLayer {
 
     /// Tile rects for the conditional pass, in image pixel coordinates.
     public static func tiles(
-        imageSize: VisionSize,
-        config: VisionTextLayerConfig = .default
+        imageSize: VisionSize
     ) -> [VisionRect] {
-        let n = max(1, config.tileGrid)
+        let n = max(1, tileGrid)
         let tileW = imageSize.width / Double(n)
         let tileH = imageSize.height / Double(n)
-        let padX = tileW * config.tileOverlap
-        let padY = tileH * config.tileOverlap
+        let padX = tileW * tileOverlap
+        let padY = tileH * tileOverlap
         var out: [VisionRect] = []
         for row in 0..<n {
             for column in 0..<n {
@@ -155,14 +111,12 @@ public enum VisionTextLayer {
     /// overlapping regions collapse to one recognition call.
     public static func sparseRecoveryRegions(
         boxes: [VisionTextBox],
-        imageSize: VisionSize,
-        config: VisionTextLayerConfig
+        imageSize: VisionSize
     ) -> [VisionRect] {
-        let cap = config.sparseRecoveryMaxBoxes
-        guard cap > 0, !boxes.isEmpty, boxes.count <= cap,
+        guard !boxes.isEmpty, boxes.count <= 3,
               imageSize.width > 0, imageSize.height > 0 else { return [] }
         var regions: [VisionRect] = []
-        for box in boxes.prefix(cap) {
+        for box in boxes {
             let padX = max(box.rect.h * 4, imageSize.width * 0.02)
             let x = max(0, box.rect.x - padX)
             let y = max(0, box.rect.y - box.rect.h * 2)
@@ -196,8 +150,7 @@ public enum VisionTextLayer {
     /// Merge a whole-frame pass with tile passes: the same string seen by two
     /// tiles is one string; the higher-confidence observation wins.
     public static func dedupe(
-        _ boxes: [VisionTextBox],
-        config: VisionTextLayerConfig = .default
+        _ boxes: [VisionTextBox]
     ) -> [VisionTextBox] {
         var kept: [VisionTextBox] = []
         for box in boxes.sorted(by: {
@@ -206,7 +159,7 @@ public enum VisionTextLayer {
                 : $0.confidence > $1.confidence
         }) {
             let duplicate = kept.contains { existing in
-                existing.text == box.text && existing.rect.iou(box.rect) >= config.dedupeIoU
+                existing.text == box.text && existing.rect.iou(box.rect) >= dedupeIoU
             }
             if !duplicate { kept.append(box) }
         }
@@ -257,10 +210,10 @@ public enum VisionTextLayer {
     /// tiny. Foreground-covered boxes do not trigger expensive refinement of
     /// another app's text. They remain in the result for whole-frame redaction
     /// context; the compiler owns exclusion from the published percept.
+    #if canImport(Vision)
     public static func recognize(
         image: CGImage,
-        using recognizer: some VisionTextRecognizing,
-        config: VisionTextLayerConfig = .default,
+        using recognizer: VisionKitTextRecognizer,
         ignoredForRefinement: [VisionRect] = []
     ) throws -> VisionTextLayerResult {
         try Task.checkCancellation()
@@ -270,23 +223,23 @@ public enum VisionTextLayer {
         let relevant = whole.filter { box in
             !ignoredForRefinement.contains { $0.intersection(box.rect).area > 0 }
         }
-        let decision = tilingDecision(boxes: relevant, imageHeight: size.height, config: config)
+        let decision = tilingDecision(boxes: relevant, imageHeight: size.height)
         let exclusionNote = relevant.count == whole.count
             ? "" : "; foreground-covered text ignored for refinement"
         let regions: [VisionRect]
         let reason: String
         if decision.shouldTile {
-            regions = tiles(imageSize: size, config: config)
+            regions = tiles(imageSize: size)
             reason = decision.reason + exclusionNote
         } else {
-            regions = sparseRecoveryRegions(boxes: relevant, imageSize: size, config: config)
+            regions = sparseRecoveryRegions(boxes: relevant, imageSize: size)
             reason = regions.isEmpty
                 ? decision.reason + exclusionNote
                 : "sparse text recovery (\(relevant.count) relevant whole-frame box(es), \(regions.count) local region(s))" + exclusionNote
         }
         guard !regions.isEmpty else {
             return VisionTextLayerResult(
-                boxes: dedupe(whole, config: config),
+                boxes: dedupe(whole),
                 tiled: false,
                 tilingReason: reason
             )
@@ -306,28 +259,21 @@ public enum VisionTextLayer {
         }
         try Task.checkCancellation()
         return VisionTextLayerResult(
-            boxes: dedupe(all, config: config),
+            boxes: dedupe(all),
             tiled: true,
             tilingReason: reason,
             tileFailures: tileFailures
         )
     }
+    #endif
 }
 
 // MARK: - The real engine
 
 #if canImport(Vision)
 /// `VNRecognizeTextRequest(.accurate)` — the measured path.
-public struct VisionKitTextRecognizer: VisionTextRecognizing {
-    public let minimumConfidence: Double
-    /// `usesLanguageCorrection` is OFF: UI strings are labels, not prose, and
-    /// language correction rewrites things like "AC" and "0x1F" into words.
-    public let usesLanguageCorrection: Bool
-
-    public init(minimumConfidence: Double = 0.3, usesLanguageCorrection: Bool = false) {
-        self.minimumConfidence = minimumConfidence
-        self.usesLanguageCorrection = usesLanguageCorrection
-    }
+public struct VisionKitTextRecognizer: Sendable {
+    public init() {}
 
     public func recognizeText(in image: CGImage, region: VisionRect?) throws -> [VisionTextBox] {
         let width = Double(image.width)
@@ -357,7 +303,8 @@ public struct VisionKitTextRecognizer: VisionTextRecognizing {
 
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = usesLanguageCorrection
+        // UI labels must not be rewritten as prose.
+        request.usesLanguageCorrection = false
         let handler = VNImageRequestHandler(cgImage: target, options: [:])
         try handler.perform([request])
 
@@ -365,7 +312,7 @@ public struct VisionKitTextRecognizer: VisionTextRecognizing {
         return (request.results ?? []).compactMap { observation -> VisionTextBox? in
             guard let candidate = observation.topCandidates(1).first else { return nil }
             let confidence = Double(candidate.confidence)
-            guard confidence >= minimumConfidence else { return nil }
+            guard confidence >= 0.3 else { return nil }
             let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
             // Vision boxes are normalized with a BOTTOM-LEFT origin; every
@@ -382,23 +329,3 @@ public struct VisionKitTextRecognizer: VisionTextRecognizing {
     }
 }
 #endif
-
-/// A deterministic recognizer for tests and for replaying a captured text
-/// layer. Region-aware so the tiling path is exercisable without Vision.
-public struct VisionStaticTextRecognizer: VisionTextRecognizing {
-    public let boxes: [VisionTextBox]
-    /// Boxes returned ONLY when a region (tile) is requested — how a test
-    /// models "tiling recovered strings the whole-frame pass missed".
-    public let tileOnlyBoxes: [VisionTextBox]
-
-    public init(boxes: [VisionTextBox], tileOnlyBoxes: [VisionTextBox] = []) {
-        self.boxes = boxes
-        self.tileOnlyBoxes = tileOnlyBoxes
-    }
-
-    public func recognizeText(in image: CGImage, region: VisionRect?) throws -> [VisionTextBox] {
-        guard let region else { return boxes }
-        return (boxes + tileOnlyBoxes).filter { $0.rect.coverage(by: region) > 0.5 }
-            .map { VisionTextBox(text: $0.text, rect: $0.rect, confidence: $0.confidence, source: "tile") }
-    }
-}

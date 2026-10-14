@@ -12,8 +12,6 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
     private let backgroundLoopsManager: BackgroundLoopsManager
     private let compactionHandler: TelegramCompactionHandler?
     let completenessDeps: TelegramBotCompletenessDeps?
-    // 2026-09-07: An address can be reused before asynchronous deinit cleanup runs.
-    nonisolated let completenessRegistryToken = UUID()
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -25,13 +23,6 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
         self.backgroundLoopsManager = backgroundLoopsManager
         self.completenessDeps = completenessDeps
         self.compactionHandler = compactionHandler
-    }
-
-    deinit {
-        let token = completenessRegistryToken
-        Task {
-            await TelegramBotCompletenessRegistry.shared.unregister(token)
-        }
     }
 
     func approvalStatusSentence(destination: TelegramDestination) async -> String {
@@ -95,17 +86,17 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
            let polledAt = await loop.lastSuccessfulPollAt {
             stateObj["lastPollAt"] = .string(ISO8601DateFormatter().string(from: polledAt))
         }
-        let receipts = (try? await persistence.tailJSONL(
+        async let receipts = (try? persistence.tailJSONL(
             telegramDir.appendingPathComponent("receipts.jsonl"),
             limit: 25,
             maxBytes: 1_048_576
         )) ?? []
-        let blocked = (try? await persistence.tailJSONL(
+        async let blocked = (try? persistence.tailJSONL(
             telegramDir.appendingPathComponent("blocked.jsonl"),
             limit: 25,
             maxBytes: 1_048_576
         )) ?? []
-        let errors = (try? await persistence.tailJSONL(
+        async let errors = (try? persistence.tailJSONL(
             telegramDir.appendingPathComponent("errors.jsonl"),
             limit: 25,
             maxBytes: 1_048_576
@@ -133,9 +124,9 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
                 "model": .string(voiceModel),
                 "maxBytes": .int(Int64(voiceMaxBytes)),
             ]),
-            "receipts": .array(receipts),
-            "blocked": .array(blocked),
-            "errors": .array(errors),
+            "receipts": .array(await receipts),
+            "blocked": .array(await blocked),
+            "errors": .array(await errors),
         ]
         return TelegramStatus(
             enabled: cfg?.enabled ?? false,
@@ -356,47 +347,6 @@ extension SwiftNativeTelegramBot {
         return TelegramPollResult(updates: updates, nextOffset: nextOffset)
     }
 
-    /// Single-string convenience wrapper. Callers that own the transport
-    /// (TelegramPollLoop) use `dispatchSwiftSlashCommandDetailed` so the
-    /// post-reply followup (/restart's terminate arm) runs AFTER the reply
-    /// send; this wrapper can't sequence that, so it runs the followup
-    /// immediately — same behavior as before the detailed split.
-    public func dispatchSwiftSlashCommand(
-        _ command: String,
-        args: [String],
-        chatId: Int,
-        fromUserId: Int? = nil,
-        chatType: String? = nil
-    ) async throws -> String? {
-        let outcome = try await dispatchSwiftSlashCommandDetailed(
-            command, args: args, chatId: chatId,
-            fromUserId: fromUserId, chatType: chatType
-        )
-        outcome.afterReplySent?()
-        return outcome.reply
-    }
-
-    /// Full dispatch: returns the reply text plus an optional followup the
-    /// transport MUST invoke after the reply send attempt completes.
-    /// `fromUserId`/`chatType` ride along for owner-gated commands
-    /// (/restart): the gate requires a PRIVATE chat and a sender id matching
-    /// the allowlisted chat id; nil (legacy callers) fails those closed.
-    public func dispatchSwiftSlashCommandDetailed(
-        _ command: String,
-        args: [String],
-        chatId: Int,
-        fromUserId: Int? = nil,
-        chatType: String? = nil
-    ) async throws -> TelegramSlashDispatchOutcome {
-        try await dispatchSwiftSlashCommandDetailed(
-            command,
-            args: args,
-            destination: .chat(chatId),
-            fromUserId: fromUserId,
-            chatType: chatType
-        )
-    }
-
     /// 2026-09-06: the topic-aware entry point. Session commands (/new,
     /// /compact, /session, /resume, /persona, /scratch) act on
     /// the conversation the command was said in, which for a forum topic is
@@ -421,7 +371,7 @@ extension SwiftNativeTelegramBot {
         // updates, but owner-gating re-checks against the on-disk allowlist
         // so a future multi-chat allowlist can't silently widen restart.
         return await dispatchCompletenessCommandDetailed(
-            lower, args: args, depsOverride: completenessDeps,
+            lower, args: args,
             chatId: destination.chatId, fromUserId: fromUserId, chatType: chatType
         )
     }

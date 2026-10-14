@@ -245,8 +245,7 @@ extension SwiftToolDispatcher {
     ///
     /// Clipboard is separately reachable through the four-verb surface.
     ///
-    /// GATE, split by half: the read rides `accessibilityReadAllowed`, the
-    /// write rides `appControlAllowed`. Both still require an ACTIVE Full Mac
+    /// GATE: both reads and writes require `accessibilityAllowed`, an ACTIVE Full Mac
     /// window and the accessibility category, enforced again inside MacControl.
     static let macClipboardReadToolNames: [String] = ["clipboard_read"]
     static let macClipboardWriteToolNames: [String] = ["clipboard_write"]
@@ -281,7 +280,7 @@ extension SwiftToolDispatcher {
     /// is a NEW organ for the four-verb surface to reach for, not a legacy
     /// `mac_*` organ being retired.
     ///
-    /// GATE: `accessibilityReadAllowed`, plus the file gate (`fileOpsAllowed`
+    /// GATE: `accessibilityAllowed`, plus the file gate (`fileOpsAllowed`
     /// and workspace file policy) for ANY filesystem route — a `path` the caller
     /// names or one inferred from `AXDocument` (see `impl_mac_read_tool`).
     static let macReadToolNames: [String] = ["read"]
@@ -329,20 +328,16 @@ extension SwiftToolDispatcher {
     /// the cutover boundary; prompt filters, same-turn loading, and stale-call
     /// rejection all consult it instead of maintaining parallel exclusion
     /// lists.
-    package static var legacyMacModelToolNames: Set<String> {
-        Set(fullMacAccessibilityReadToolNames
+    package static let legacyMacModelToolNames: Set<String> = Set(fullMacAccessibilityReadToolNames
             + fullMacAccessibilityInjectionToolNames)
             .subtracting(fourVerbToolNames)
-    }
 
     /// Names her catalog never shows: the legacy Mac organs, the tools
     /// folded into `app` or retired from it, and `workspace` (app's home).
     /// All stay callable by name for internal callers; the deleted discovery
     /// names never return from an old session's pinned row.
-    package static var modelHiddenToolNames: Set<String> {
-        legacyMacModelToolNames.union(ToolNameAliases.foldedTools.keys).union(ToolNameAliases.mergedTools)
+    package static let modelHiddenToolNames: Set<String> = legacyMacModelToolNames.union(ToolNameAliases.foldedTools.keys).union(ToolNameAliases.mergedTools)
             .union(ToolNameAliases.retiredAppTools)
-    }
 
     /// `modelHiddenToolNames`, and every MCP server's tools: each is an `app`
     /// action (`mcp.<server>.<tool>`) generated from its live list.
@@ -434,8 +429,7 @@ extension SwiftToolDispatcher {
     /// surfaces. Dynamic registry and MCP tools are catalog rows too, but are
     /// intentionally not claimed here because this static dispatcher cannot
     /// vouch for their registration lifecycle.
-    public static var catalogRegisteredToolNames: Set<String> {
-        Set(
+    public static let catalogRegisteredToolNames: Set<String> = Set(
             builtInToolNames
             + fullMacFileToolNames
             + fullMacSystemToolNames
@@ -445,7 +439,6 @@ extension SwiftToolDispatcher {
             + fullMacBuilderToolNames
             + fullMacRestartToolNames
         )
-    }
 
     /// Returns nil deliberately for a name without an explicit reviewed
     /// category. Callers must present that condition visibly instead of

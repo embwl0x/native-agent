@@ -32,7 +32,6 @@ public protocol CognitionHost: Sendable {
         userInfo: [String: String], at date: Date
     ) async throws -> String?
     /// Publishes the Mac's snapshots to the phone.
-    func writeSyncSnapshots() async
     /// The shared background LLM client; nil cognition binds the root's own owner.
     func backgroundLLMClient(dataRoot: URL, cognition: NativeCognitionRuntime?) -> any LLMClient
     /// Workshop's autonomy gate for unattended work.

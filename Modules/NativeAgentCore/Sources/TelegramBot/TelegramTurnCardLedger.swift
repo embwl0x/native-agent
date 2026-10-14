@@ -37,24 +37,21 @@ struct TelegramPersistedTurnCard: Sendable, Codable, Equatable {
     }
 }
 
-protocol TelegramTurnCardStorage: Sendable {
-    func load() async throws -> [TelegramPersistedTurnCard]
-    func save(_ records: [TelegramPersistedTurnCard]) async throws
-}
-
 enum TelegramTurnCardLedgerError: Error, Sendable, Equatable {
     case capacityExceeded(Int)
 }
 
-struct TelegramTurnCardFileStorage: TelegramTurnCardStorage {
+/// Bounded, actor-owned identity ledger. It intentionally stores no prompt,
+/// action, delegate, reply, token, or provider content.
+actor TelegramTurnCardLedger {
     private struct Envelope: Sendable, Codable {
         let schemaVersion: Int
         let cards: [TelegramPersistedTurnCard]
     }
 
-    let fileURL: URL
+    private let fileURL: URL
 
-    func load() async throws -> [TelegramPersistedTurnCard] {
+    private func load() throws -> [TelegramPersistedTurnCard] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         let data = try Data(contentsOf: fileURL)
         let envelope = try JSONDecoder().decode(Envelope.self, from: data)
@@ -64,34 +61,21 @@ struct TelegramTurnCardFileStorage: TelegramTurnCardStorage {
         return envelope.cards
     }
 
-    func save(_ records: [TelegramPersistedTurnCard]) async throws {
+    private func save(_ records: [TelegramPersistedTurnCard]) async throws {
         let envelope = Envelope(schemaVersion: 1, cards: records)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(envelope)
         try await SwiftNativePersistenceCore().writeDataAtomicDurable(data, to: fileURL)
     }
-}
 
-/// Bounded, actor-owned identity ledger. It intentionally stores no prompt,
-/// action, delegate, reply, token, or provider content.
-actor TelegramTurnCardLedger {
-    private let storage: any TelegramTurnCardStorage
     private let maximumRecords: Int
     private var loadedRecords: [TelegramPersistedTurnCard]?
     private var storageOwned = false
     private var storageWaiters: [CheckedContinuation<Void, Never>] = []
 
-    init(
-        storage: any TelegramTurnCardStorage,
-        maximumRecords: Int = 64
-    ) {
-        self.storage = storage
-        self.maximumRecords = max(1, maximumRecords)
-    }
-
     init(fileURL: URL, maximumRecords: Int = 64) {
-        self.storage = TelegramTurnCardFileStorage(fileURL: fileURL)
+        self.fileURL = fileURL
         self.maximumRecords = max(1, maximumRecords)
     }
 
@@ -103,7 +87,7 @@ actor TelegramTurnCardLedger {
         if !record.isTerminal {
             try Task.checkCancellation()
         }
-        var records = try await currentRecords()
+        var records = try currentRecords()
         let safeRecord = TelegramPersistedTurnCard(
             turnId: record.turnId,
             chatId: record.chatId,
@@ -128,7 +112,7 @@ actor TelegramTurnCardLedger {
             }
             return $0.updatedAt < $1.updatedAt
         }
-        try await storage.save(records)
+        try await save(records)
         loadedRecords = records
     }
 
@@ -136,11 +120,11 @@ actor TelegramTurnCardLedger {
         await acquireStorage()
         defer { releaseStorage() }
         try Task.checkCancellation()
-        var records = try await currentRecords()
+        var records = try currentRecords()
         let priorCount = records.count
         records.removeAll { $0.turnId == turnId }
         guard records.count != priorCount else { return }
-        try await storage.save(records)
+        try await save(records)
         loadedRecords = records
     }
 
@@ -148,7 +132,7 @@ actor TelegramTurnCardLedger {
         await acquireStorage()
         defer { releaseStorage() }
         try Task.checkCancellation()
-        return try await currentRecords()
+        return try currentRecords()
     }
 
     // Actor isolation alone does not own the transaction while storage awaits.
@@ -169,9 +153,9 @@ actor TelegramTurnCardLedger {
         }
     }
 
-    private func currentRecords() async throws -> [TelegramPersistedTurnCard] {
+    private func currentRecords() throws -> [TelegramPersistedTurnCard] {
         if let loadedRecords { return loadedRecords }
-        let records = try await storage.load()
+        let records = try load()
         loadedRecords = records
         return records
     }
@@ -240,7 +224,7 @@ actor TelegramTurnCardRestartRepairer {
     func repairOnce(
         token: String,
         editCard: @escaping EditCard,
-        deleteCard: DeleteCard? = nil,
+        deleteCard: @escaping DeleteCard,
         isActive: @Sendable (UUID) async -> Bool
     ) async -> TelegramTurnCardRepairResult {
         let records: [TelegramPersistedTurnCard]
@@ -282,7 +266,7 @@ actor TelegramTurnCardRestartRepairer {
                 do {
                     // 2026-09-22: a completed card has nothing left to say
                     // once its reply landed; delete it rather than leave "Done.".
-                    if record.phase == .completed, let deleteCard {
+                    if record.phase == .completed {
                         do {
                             try await deleteCard(token, record.chatId, record.messageId)
                         } catch let failure as TelegramAPIFailure

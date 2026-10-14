@@ -28,13 +28,6 @@ public let memoryRecallContentCap = 2000
 /// mid-word chop.
 public let memoryRecallPreviewCap = 200
 
-/// Cap for regex value-captures in the fact extractors
-/// (RuleBasedFactExtractor / FoundationModelsRuleFallback). Generous so a
-/// captured value runs to its natural sentence/clause boundary (the capture
-/// classes already exclude `.,;:!?`) instead of chopping mid-phrase at the
-/// old 40/60/80 caps; `MemoryTextClip.wordSafeCapture` then guarantees the
-/// emitted row never ends mid-word.
-public let memoryExtractionCaptureCap = 200
 
 /// Rows the persona-starvation alarm pulls unfiltered before applying the
 /// disclosure gate. Wide enough that one undisclosable top row cannot mask a
@@ -102,32 +95,6 @@ public enum MemoryTextClip {
         return clipped.isEmpty ? prefix : clipped
     }
 
-    /// Regex-capture guard for the fact extractors: returns the captured
-    /// substring, trimmed back to its last whole word when the quantifier
-    /// cap chopped the match mid-word (the source character immediately
-    /// after the capture is still alphanumeric). Returns nil when nothing
-    /// whole-word remains — the caller drops the candidate rather than
-    /// storing a chopped fragment.
-    public static func wordSafeCapture(_ source: NSString, range: NSRange) -> String? {
-        guard range.location != NSNotFound, range.length > 0 else { return nil }
-        let captured = source.substring(with: range)
-        let end = range.location + range.length
-        var choppedMidWord = false
-        if end < source.length {
-            let nextUnit = source.character(at: end)
-            if let next = Unicode.Scalar(nextUnit),
-               CharacterSet.alphanumerics.contains(next),
-               let last = captured.unicodeScalars.last,
-               CharacterSet.alphanumerics.contains(last) {
-                choppedMidWord = true
-            }
-        }
-        guard choppedMidWord else { return captured }
-        guard let lastSpace = captured.lastIndex(where: { $0.isWhitespace }) else { return nil }
-        let trimmed = String(captured[..<lastSpace])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 
     /// Index just past the last sentence terminator (and any closing
     /// quotes/brackets that follow it), at or before `limit`, whose next

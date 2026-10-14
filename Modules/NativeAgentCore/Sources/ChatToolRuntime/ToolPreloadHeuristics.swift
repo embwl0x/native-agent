@@ -2,9 +2,6 @@ import MacIntegration
 
 /// Shared tool policy tables; turn intent is not inferred from message text.
 public enum ToolPreloadHeuristics {
-    /// The built-in SearXNG server's tool (MCPDispatcher default server).
-    public static let webSearchTools: Set<String> = ["mcp__searxng-local__search"]
-
     /// Dispatch-time Mac Integration permissions, also used by the parallel write veto.
     package static let macIntegrationGates: [String: (integration: String, mode: MacIntegrationPermissionMode)] = [
         // calendar group

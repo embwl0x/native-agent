@@ -12,6 +12,9 @@ public enum ProviderStreamContext {
     /// The provider admitted the request: a validated 2xx body is being read.
     @TaskLocal public static var admitted: (@Sendable () -> Void)?
     @TaskLocal public static var stallOnly: Bool = false
+    /// A live first-output cut must not repeat the learned deadline on retry.
+    @TaskLocal public static var retryingLiveFirstOutputCut: Bool = false
+    @TaskLocal public static var diagnosticEvent: (@Sendable (SSEEvent) -> Void)?
 }
 
 /// One parsed Server-Sent Event.
@@ -160,6 +163,8 @@ public struct SSEEventParser: Sendable {
         }
         if !dataLines.isEmpty || eventName != nil { onActivity?() }
         guard !dataLines.isEmpty else { return nil }
-        return SSEEvent(event: eventName, data: dataLines.joined(separator: "\n"))
+        let event = SSEEvent(event: eventName, data: dataLines.joined(separator: "\n"))
+        ProviderStreamContext.diagnosticEvent?(event)
+        return event
     }
 }

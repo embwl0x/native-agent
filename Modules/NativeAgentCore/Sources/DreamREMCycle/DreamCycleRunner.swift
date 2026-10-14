@@ -308,7 +308,7 @@ public actor DreamCycleRunner {
         // one logical commit: if the mark cannot persist, restore/remove the
         // diary entry and report failure so the input remains retryable.
         do {
-            try advanceDreamMark(to: newestIncluded, trigger: trigger)
+            try advanceDreamMark(to: newestIncluded)
         } catch {
             report.errors.append("high-water mark write error: \(error)")
             do {
@@ -456,22 +456,15 @@ public actor DreamCycleRunner {
         return Self.parseDaemonISO(s)
     }
 
-    /// Forward-only for the MARK: never regress it, so a re-run/force can't let
-    /// already-dreamed material back into a future window. The trigger receipt
-    /// beside it is not a mark — it records which lane actually wrote the entry
-    /// this call committed (`schedule` vs `manual`), so a dream's provenance
-    /// is evidence rather than an inference from its timestamp. It lives here,
-    /// in the runner's own sidecar, and never in the diary body: nothing about
-    /// the mechanism enters her prompt (NORTHSTAR clause 6).
-    private func advanceDreamMark(to date: Date, trigger: DreamTrigger) throws {
+    /// Never regress the mark, so a re-run/force cannot return already-dreamed
+    /// material to a future window. Completion metadata carries the trigger.
+    private func advanceDreamMark(to date: Date) throws {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let existing = readDreamMark()
         let mark = (existing.map { max($0, date) }) ?? date
         let body = JSONValue.object([
             "lastDreamedAt": .string(iso.string(from: mark)),
-            "lastDreamTrigger": .string(trigger.rawValue),
-            "lastDreamAt": .string(iso.string(from: now())),
         ])
         try body.serializedData(pretty: false).write(to: dreamMarkPath(), options: [.atomic])
     }
@@ -723,41 +716,5 @@ public actor DreamCycleRunner {
                 calendar: DreamREMSchedule.localCalendar()
             )
         }
-    }
-}
-
-// MARK: - GROWTH.md episodic-line hygiene (shared with REMConsolidator)
-
-/// Read-side guard that drops `- <ts> · feedback · ...` and `- <ts> ·
-/// dream_candidate · ...` dash lines from a GROWTH.md body before it's
-/// injected into the dream / REM bypass prompts. Mirrors the same drop
-/// PersonaEngine applies for chat retrieval (see the
-/// nativeagent-rem-dream-cycle vault skill). Distilled prose bullets and
-/// `## DATE · category` headers are preserved.
-enum DreamREMGrowthHygiene {
-    /// Pattern: dash-bullet, any non-whitespace timestamp token, middle-dot
-    /// separator (U+00B7), the category word `feedback` OR `dream_candidate`,
-    /// then another middle-dot. Distilled prose bullets don't carry the
-    /// timestamp+category prefix so they survive.
-    private static let episodicLineRegex: NSRegularExpression = {
-        // swiftlint:disable:next force_try
-        try! NSRegularExpression(
-            pattern: #"^- \S+\s+·\s+(feedback|dream_candidate)\s+·"#,
-            options: []
-        )
-    }()
-
-    static func stripEpisodicLines(_ body: String) -> String {
-        let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var out: [String] = []
-        out.reserveCapacity(lines.count)
-        for line in lines {
-            let range = NSRange(line.startIndex..., in: line)
-            if episodicLineRegex.firstMatch(in: line, options: [], range: range) != nil {
-                continue
-            }
-            out.append(line)
-        }
-        return out.joined(separator: "\n")
     }
 }

@@ -153,32 +153,42 @@ private struct AliveCardSurface: ViewModifier {
 /// card's inset; the rows themselves carry no chrome.
 struct AliveGroupCard<Content: View>: View {
     var waiting: Bool
+    var lazy: Bool
     let content: Content
 
-    init(waiting: Bool = false, @ViewBuilder content: () -> Content) {
+    init(waiting: Bool = false, lazy: Bool = false, @ViewBuilder content: () -> Content) {
         self.waiting = waiting
+        self.lazy = lazy
         self.content = content()
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Group(subviews: content) { subviews in
-                ForEach(Array(subviews.enumerated()), id: \.element.id) { index, row in
-                    if index > 0 {
-                        Rectangle()
-                            .fill(AlivePalette.divider)
-                            .frame(height: 1)
-                            .padding(.horizontal, AliveMetrics.rowInsetH)
-                    }
-                    row
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, AliveMetrics.rowInsetH)
-                        .padding(.vertical, AliveMetrics.rowInsetV)
-                }
+        Group {
+            if lazy {
+                LazyVStack(alignment: .leading, spacing: 0) { rows }
+            } else {
+                VStack(alignment: .leading, spacing: 0) { rows }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .aliveCard(waiting: waiting)
+    }
+
+    private var rows: some View {
+        Group(subviews: content) { subviews in
+            ForEach(Array(subviews.enumerated()), id: \.element.id) { index, row in
+                if index > 0 {
+                    Rectangle()
+                        .fill(AlivePalette.divider)
+                        .frame(height: 1)
+                        .padding(.horizontal, AliveMetrics.rowInsetH)
+                }
+                row
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, AliveMetrics.rowInsetH)
+                    .padding(.vertical, AliveMetrics.rowInsetV)
+            }
+        }
     }
 }
 
@@ -223,36 +233,6 @@ struct AliveProgressBar: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(done) of \(total) done")
-    }
-}
-
-/// A 42pt ring. `nil` is "no progress recorded": the track, no arc.
-struct AliveProgressRing: View {
-    let fraction: Double?
-    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
-
-    var body: some View {
-        let shades = HazeShades(colorRaw)
-        let value = min(max(fraction ?? 0, 0), 1)
-        ZStack {
-            Circle().stroke(NativeAgentShell.softFill, lineWidth: 4)
-            if fraction != nil, value > 0 {
-                Circle()
-                    .trim(from: 0, to: value)
-                    .stroke(
-                        AngularGradient(colors: [shades.deep, shades.base], center: .center,
-                                        startAngle: .degrees(0), endAngle: .degrees(360 * value)),
-                        style: StrokeStyle(lineWidth: 4, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-            }
-            Text(fraction == nil ? "–" : "\(Int((value * 100).rounded()))%")
-                .font(ShellType.captionSemibold)
-                .monospacedDigit()
-                .foregroundStyle(NativeAgentShell.text)
-        }
-        .frame(width: 42, height: 42)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(fraction == nil ? "No progress recorded" : "\(Int((value * 100).rounded())) percent done")
     }
 }
 

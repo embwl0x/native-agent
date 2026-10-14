@@ -4,7 +4,7 @@ import NativeAgentShared
 /// Both phone landing pages render the Mac's projection, without reconstructing
 /// asks from unread counts or work from open-item counts.
 struct MobileWorkOverviewView: View {
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var selected: WorkOverviewRow?
 
     private var deadlines: [Date] {
@@ -65,7 +65,7 @@ private struct MobileWorkOverviewDetail: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var pairingStore: PairingStore
     @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @StateObject private var approvals = ApprovalsStore()
     @StateObject private var workshop = WorkshopStore()
     @StateObject private var inbox = InboxStore()

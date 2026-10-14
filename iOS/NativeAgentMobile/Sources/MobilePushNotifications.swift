@@ -28,7 +28,6 @@ struct NativeAgentPushTokenSyncCache {
     }
 
     static let defaultsKey = "NativeAgentMobile.lastSyncedAPNSToken"
-    static let registrationRefreshInterval: TimeInterval = 30 * 24 * 60 * 60
     static let tokenSyncRefreshInterval: TimeInterval = 10 * 60
 
     var defaults: UserDefaults = .standard
@@ -36,20 +35,6 @@ struct NativeAgentPushTokenSyncCache {
     func load() -> Record? {
         guard let data = defaults.data(forKey: Self.defaultsKey) else { return nil }
         return try? JSONDecoder().decode(Record.self, from: data)
-    }
-
-    func hasFreshSyncedRegistration(
-        pairing: PairingIdentity,
-        now: Date = Date(),
-        refreshInterval: TimeInterval = Self.registrationRefreshInterval
-    ) -> Bool {
-        guard let record = load(), record.fingerprint.pairing == pairing else { return false }
-        guard now.timeIntervalSince(record.registeredAt) >= 0,
-              now.timeIntervalSince(record.syncedAt) >= 0 else {
-            return false
-        }
-        return now.timeIntervalSince(record.registeredAt) < refreshInterval
-            && now.timeIntervalSince(record.syncedAt) < refreshInterval
     }
 
     func shouldSync(

@@ -19,12 +19,10 @@ enum IOSPairingPresentation {
     }
     static var iCloudReadySteps: [String] { ["Open \(appName) on your Mac.", "Use the same Apple Account on both.", "Wait for the pairing key, then tap Connect."] }
     static let iCloudUnavailableSteps = ["Open Settings → Apple Account.", "Sign in with your Mac’s account and turn on iCloud Drive.", "Come back here to pair."]
-    static var iCloudReadyDetail: String { numbered(iCloudReadySteps) }
     static var iCloudUnavailableDetail: String { numbered(iCloudUnavailableSteps) }
     private static func numbered(_ steps: [String]) -> String {
         steps.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
     }
-    static var manualSectionTitle: String { "Pairing key from \(appName)" }
     static var manualSectionDetail: String { "Open \(macPairingRoute), then tap Check for Mac. Keep the Mac app open and both devices connected to the internet." }
     static var missingKeyMessage: String { "The Mac’s pairing details haven’t arrived. Open \(macPairingRoute), check that both devices are online, then tap Check for Mac again." }
     static var notSignedSyncMessage: String { "iCloud sync is waiting for pairing. Open \(macPairingRoute), then open Pair with Mac on this phone and tap Check for Mac." }
@@ -205,7 +203,7 @@ struct PairingView: View {
         let repairing = pairingStore.connectionRepairPending
         let deadline = Date().addingTimeInterval(60)
         do {
-            let key = try PhoneSigningIdentity.key()
+            let key = try await PhoneSigningIdentity.shared.key()
             phoneCode = DeviceApprovalSignature.deviceID(publicKey: key.publicKey.rawRepresentation)
             let sync = iCloudSyncEngine.shared
             sync.pairingStore = pairingStore

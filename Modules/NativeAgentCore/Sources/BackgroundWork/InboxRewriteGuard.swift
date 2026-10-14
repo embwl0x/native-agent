@@ -1,7 +1,6 @@
 import Foundation
-import Darwin
 import NativeAgentCore
-import PersistenceCore
+import NotificationInbox
 
 // MARK: - Inbox whole-file rewrite guard
 //
@@ -19,42 +18,14 @@ import PersistenceCore
 // (crash residue; the flock serializes live appenders) keeps its bytes and
 // gains only a terminating newline.
 public enum InboxRewriteGuard {
-    /// One physical line of the inbox file. `row` is nil when the line does
-    /// not parse as JSON; such lines must be carried through rewrites as
-    /// `raw`, byte-identical.
-    public struct Line {
-        public let raw: Data
-        public let row: JSONValue?
-    }
+    public typealias Line = LiveNotificationInbox.Line
 
-    /// Whole-file read that loses nothing: every physical line comes back,
-    /// with its decoded row when it parses. Interior blank lines are kept
-    /// (as empty `raw`) so the rewrite preserves them too.
     public static func readLines(_ path: URL) throws -> [Line] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        let data = try Data(contentsOf: path)
-        guard !data.isEmpty else { return [] }
-        let slices: [Data] = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-        // Copy each slice: Data slices keep parent byte offsets, and parsers
-        // must see zero-based bytes.
-        var parts = slices.map { Data($0) }
-        if parts.last?.isEmpty == true { parts.removeLast() }
-        return parts.map { Line(raw: $0, row: try? JSONValue.parse($0)) }
+        try LiveNotificationInbox.readLines(path)
     }
 
-    /// Atomic whole-file replacement from physical lines. An empty array
-    /// truncates the file (matches the old serializer's behavior).
     public static func writeLines(_ lines: [Data], to path: URL) throws {
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var payload = Data()
-        payload.reserveCapacity(lines.reduce(0) { $0 + $1.count + 1 })
-        for line in lines {
-            payload.append(line)
-            payload.append(0x0A)
-        }
-        try payload.write(to: path, options: [.atomic])
-        _ = chmod(path.path, 0o600)
+        try LiveNotificationInbox.write(lines.map { Line(raw: $0, row: nil) }, to: path)
     }
 
     /// True when it is safe to rewrite `path` from `lines`. With `readLines`

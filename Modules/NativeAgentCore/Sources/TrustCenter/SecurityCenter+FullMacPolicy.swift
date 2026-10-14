@@ -16,18 +16,25 @@ extension SwiftNativeSecurityCenter {
     /// saved policy is distinguishable from an inactive grant and always fails
     /// closed. Remote trust is resolved from the concrete origin here; a caller
     /// cannot obtain YOLO authority by supplying only a surface label.
+    /// Effect owners may pass the fresh checked generation they just read.
     public func fullMacYoloAuthority(
         tool: String,
-        origin: SecurityOriginContext
+        origin: SecurityOriginContext,
+        snapshot: TrustPolicyAuthorizationSnapshot? = nil
     ) async -> FullMacYoloAuthorityAssessment {
         do {
-            let snapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
-            let originAssessment = try await assessOrigin(origin, policy: snapshot.policy)
+            let checkedSnapshot: TrustPolicyAuthorizationSnapshot
+            if let snapshot {
+                checkedSnapshot = snapshot
+            } else {
+                checkedSnapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
+            }
+            let originAssessment = try await assessOrigin(origin, policy: checkedSnapshot.policy)
             return Self.fullMacYoloAuthority(
                 tool: tool,
                 surface: origin.surface,
                 originAssessment: originAssessment,
-                snapshot: snapshot
+                snapshot: checkedSnapshot
             )
         } catch {
             return FullMacYoloAuthorityAssessment(

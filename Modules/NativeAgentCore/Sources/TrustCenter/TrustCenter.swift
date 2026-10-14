@@ -40,13 +40,6 @@ public actor SwiftNativeTrustCenter {
         return try TrustPolicy(policyObject: try await loadTrustPolicyChecked())
     }
 
-    public func updateTrust(_ update: JSONValue) async throws -> TrustPolicy {
-        guard case .object(let patch) = update else {
-            throw TrustCenterError.invalidRequest
-        }
-        return try TrustPolicy(policyObject: try await applyPolicyPatchChecked(patch))
-    }
-
     /// Canonical checked trust-policy mutation. Every patch is merged against
     /// one freshly validated raw generation under the cross-process file lock,
     /// and the returned normalized policy is derived from that exact written
@@ -101,7 +94,7 @@ public actor SwiftNativeTrustCenter {
             try await persistence.writeJSON(.object(merged), to: path)
             return merged
         }
-        return normalizedTrustPolicy(saved: merged)
+        return normalizedTrustPolicy(saved: merged, defaults: defaults)
     }
 
     /// Checked compare-and-set used by the human-approved autonomy promotion
@@ -146,50 +139,6 @@ public actor SwiftNativeTrustCenter {
         }
     }
 
-    public func getAutonomyPolicy() async throws -> AutonomyPolicy {
-        let policy = try await loadTrustPolicyChecked()
-        let permission = Self.string(policy["permissionLevel"]) ?? "balanced"
-        let fullMacActive = SwiftNativeSecurityCenter.fullMacActive(policy: policy)
-        let enableAutonomy: Bool = {
-            if case .bool(let b)? = policy["enableAutonomy"] { return b }
-            return false
-        }()
-        let gates: [JSONValue] = [
-            .object([
-                "id": .string("permissionLevel"),
-                "title": .string("Access mode"),
-                "enabled": .bool(true),
-                "value": .string(permission),
-                "status": .string(fullMacActive ? "ok" : "limited"),
-                "detail": .string(fullMacActive ? "Full Mac access active" : "Limited access policy"),
-                "source": .string("trust/policy.json"),
-            ]),
-            .object([
-                "id": .string("enableAutonomy"),
-                "title": .string("Autonomy"),
-                "enabled": .bool(enableAutonomy),
-                "value": .bool(enableAutonomy),
-                "status": .string(enableAutonomy ? "ok" : "off"),
-                "detail": .string(enableAutonomy ? "Autonomy enabled" : "Autonomy disabled"),
-                "source": .string("trust/policy.json"),
-            ]),
-        ]
-        let raw: JSONValue = .object([
-            "status": .string("ready"),
-            "permissionLevel": .string(permission),
-            "fullMacMode": .string(fullMacActive ? "active" : "off"),
-            "gates": .array(gates),
-            "policy": .object(policy),
-        ])
-        return AutonomyPolicy(
-            status: "ready",
-            permissionLevel: permission,
-            fullMacMode: fullMacActive ? "active" : "off",
-            gates: gates,
-            rawResponse: raw
-        )
-    }
-
     private var trustPolicyPath: URL {
         dataRoot
             .appendingPathComponent("trust", isDirectory: true)
@@ -210,10 +159,5 @@ public actor SwiftNativeTrustCenter {
             }
         }
         return out
-    }
-
-    private nonisolated static func string(_ value: JSONValue?) -> String? {
-        if case .string(let s)? = value { return s }
-        return nil
     }
 }

@@ -12,28 +12,25 @@ import NativeAgentShared
 // Streaming text never comes here; a reply parses once when it settles. Its
 // paragraphs do take `inline`, so the live reply is never raw markdown.
 
-enum ChatMarkdownBlock {
+enum ChatMarkdownBlock: Sendable {
     case paragraph(AttributedString)
     case heading(level: Int, text: AttributedString)
     case listItem(marker: String, indent: Int, text: AttributedString)
     case code(language: String?, code: String)
 }
 
-@MainActor
-enum MobileChatMarkdown {
-    private struct Key: Hashable {
-        let id: UUID
-        let contentHash: Int
-    }
+actor MobileChatMarkdown {
+    static let shared = MobileChatMarkdown()
+    private var entries: [UUID: (content: String, blocks: [ChatMarkdownBlock])] = [:]
+    private var recency: [UUID] = []
 
-    private static var entries: [Key: [ChatMarkdownBlock]] = [:]
-
-    static func blocks(id: UUID, content: String) -> [ChatMarkdownBlock] {
-        let key = Key(id: id, contentHash: content.hashValue)
-        if let hit = entries[key] { return hit }
-        if entries.count >= 300 { entries.removeAll(keepingCapacity: true) }
-        let parsed = parse(content)
-        entries[key] = parsed
+    func blocks(id: UUID, content: String) -> [ChatMarkdownBlock] {
+        recency.removeAll { $0 == id }
+        recency.append(id)
+        if let hit = entries[id], hit.content == content { return hit.blocks }
+        let parsed = Self.parse(content)
+        entries[id] = (content, parsed)
+        if recency.count > 300 { entries.removeValue(forKey: recency.removeFirst()) }
         return parsed
     }
 
@@ -103,6 +100,21 @@ enum MobileChatMarkdown {
         let links = out.runs.compactMap { $0.link == nil ? nil : $0.range }
         for range in links { out[range].underlineStyle = Text.LineStyle(pattern: .solid) }
         return out
+    }
+}
+
+struct PreparedChatMarkdownView: View {
+    let id: UUID
+    let content: String
+    @State private var blocks: [ChatMarkdownBlock] = []
+
+    var body: some View {
+        ChatMarkdownView(blocks: blocks)
+            .task(id: content) {
+                let prepared = await MobileChatMarkdown.shared.blocks(id: id, content: content)
+                guard !Task.isCancelled else { return }
+                blocks = prepared
+            }
     }
 }
 

@@ -4,8 +4,7 @@ import NativeAgentCore
 import OSLog
 import PersistenceCore
 
-/// Registry mutations and code publication share one cross-process sidecar lock.
-/// A corrupt existing store is never replaced with an empty one.
+/// Sense records are a projection of ability files and the bundled defaults.
 public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
     public let root: URL
     private static let logger = Logger(subsystem: "NativeAgent", category: "SenseRegistry")
@@ -27,84 +26,81 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
     }
 
     public init(dataRoot: URL) {
-        root = dataRoot.standardizedFileURL.resolvingSymlinksInPath().appendingPathComponent("senses", isDirectory: true)
+        root = CapabilityLifecycle.Store.senses.directory(in: dataRoot.standardizedFileURL.resolvingSymlinksInPath())
     }
 
-    /// A tried page and its exact program, scoped to the conversation that made it.
-    public struct Trial: Codable, Sendable {
-        public let id: String
-        public let scope: String
-        public let record: SenseRecord
-        public let code: String
-        public let page: String
+    public var programs: OwnedProgramStore { OwnedProgramStore(root: root) }
+    var abilities: AbilityStore { AbilityStore(dataRoot: root.deletingLastPathComponent()) }
 
-        public init(id: String, scope: String, record: SenseRecord, code: String, page: String) {
-            self.id = id; self.scope = scope; self.record = record; self.code = code; self.page = page
-        }
-
-        public var digest: String {
-            get throws { SHA256.hash(data: try FileSenseRegistry.encode(self)).map { String(format: "%02x", $0) }.joined() }
-        }
-    }
-
-    public func retainTrial(_ trial: Trial) async throws -> String {
-        try await withStore { _ in
-            try Self.validateID(trial.id)
-            try Self.validateCode("sense.js", bytes: Data(trial.code.utf8))
-            let bytes = try Self.encode(trial)
-            guard bytes.count <= Self.maximumBundleBytes else {
-                throw Self.failure("This trial is too large to retain. Call sense.make with the code and keep:true after reviewing its page.")
+    public func candidate(_ input: SenseRecord, codeFiles: [String: Data], scope: String = "") async throws -> OwnedProgramStore.Candidate {
+        try await withStore { store in
+            guard input.language == .javascript, let entry = input.entry,
+                  let bytes = codeFiles[entry], let code = String(data: bytes, encoding: .utf8) else {
+                throw Self.failure("Authored senses require a JavaScript entry.")
             }
-            let directory = try Self.safeURL(".trials", under: self.root)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let path = try Self.safeURL(".trials/\(trial.id).json", under: self.root)
-            guard !FileManager.default.fileExists(atPath: path.path) else { throw Self.failure("Trial id already exists. Run a fresh sense.make trial.") }
-            try bytes.write(to: path, options: .atomic)
-            // No background owner: bound drafts when another draft is retained.
-            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
-                .filter { $0.pathExtension == "json" && $0 != path }
-                .map { url -> (URL, Date) in
-                    let safe = try Self.safeURL(".trials/" + url.lastPathComponent, under: self.root)
-                    guard let date = try safe.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else {
-                        throw Self.failure("A retained trial has no storage timestamp. Repair its draft storage before running a fresh sense.make trial.")
-                    }
-                    return (safe, date)
-                }.sorted { $0.1 > $1.1 }
-            for (index, file) in files.enumerated() where index >= 15 || Date().timeIntervalSince(file.1) > 86_400 {
-                try FileManager.default.removeItem(at: file.0)
+            var record = input
+            let previous = store.senses.first { $0.id == record.id }
+            if input.origin == .shared, let previous {
+                let current = previous.versions.first { $0.record.version == previous.currentVersion }!.record
+                guard current.origin == .shared, current.corner == input.corner else { throw Self.failure("Import would replace a locally owned sense or a different corner.") }
             }
-            return (false, try trial.digest)
+            record.version = try CapabilityLifecycle.nextVersion(previous?.versions.map(\.record.version) ?? [], requested: input.version)
+            if previous?.versions.first(where: { $0.record.version == previous?.currentVersion })?.record.origin == .shared {
+                record.origin = .shared
+            }
+            record.candidateDigest = nil
+            record.uses = 0; record.corrections = 0; record.lastUsedAt = nil
+            let files = codeFiles.keys.sorted()
+            try Self.validate(Version(record: record, files: files))
+            for (name, bytes) in codeFiles { try Self.validateCode(name, bytes: bytes) }
+            guard codeFiles.values.reduce(0, { $0 + $1.count }) <= Self.maximumCodeBytes else { throw Self.failure("Sense source exceeds the size limit.") }
+            let candidate = try OwnedProgramStore.Candidate(program: OwnedProgram(kind: .sense, id: record.id,
+                version: String(record.version), source: code, entry: .sense, reach: record.reach),
+                manifest: .object(["record": try .fromEncodable(record), "scope": .string(scope),
+                                   "files": try .fromEncodable(codeFiles.filter { $0.key != entry })]),
+                fixtures: .array([]), dependencyShapes: .object([:]), prior: try Self.selection(store, corner: record.corner))
+            try self.programs.stage(candidate)
+            return (false, candidate)
         }
     }
 
-    public func retainedTrial(id: String, digest: String, scope: String) async throws -> Trial {
-        try await withStore { _ in
-            try Self.validateID(id)
-            let path = try Self.safeURL(".trials/\(id).json", under: self.root)
-            guard FileManager.default.fileExists(atPath: path.path) else {
-                throw Self.failure("That trial is unavailable. Read the place and run a fresh sense.make trial; nothing was kept.")
-            }
-            let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
-            guard attributes[.type] as? FileAttributeType == .typeRegular,
-                  let size = (attributes[.size] as? NSNumber)?.intValue, size <= Self.maximumBundleBytes else {
-                throw Self.failure("That trial's stored candidate is invalid. Run a fresh sense.make trial; nothing was kept.")
-            }
-            let trial = try JSONDecoder().decode(Trial.self, from: Data(contentsOf: path))
-            guard trial.id == id, trial.scope == scope, try trial.digest == digest,
-                  Date().timeIntervalSince(trial.record.createdAt) <= 86_400 else {
-                throw Self.failure("That trial changed, expired, or belongs to another conversation. Run a fresh sense.make trial here; nothing was kept.")
-            }
-            try Self.validateCode("sense.js", bytes: Data(trial.code.utf8))
-            return (false, trial)
+    public static func record(_ candidate: OwnedProgramStore.Candidate) throws -> SenseRecord {
+        guard case .object(let fields) = candidate.manifest, let value = fields["record"], candidate.program.kind == .sense else {
+            throw failure("Sense candidate metadata is missing.")
         }
+        var record = try JSONDecoder().decode(SenseRecord.self, from: value.serializedData(pretty: false))
+        record.candidateDigest = candidate.digest
+        return record
     }
 
-    public func removeTrial(id: String) async throws {
-        try await withStore { _ in
-            try Self.validateID(id)
-            try FileManager.default.removeItem(at: Self.safeURL(".trials/\(id).json", under: self.root))
-            return (false, ())
+    public func keep(_ candidate: OwnedProgramStore.Candidate, key: Data, scope: String) async throws -> (SenseRecord, String) {
+        guard case .object(let manifest) = candidate.manifest, manifest["scope"] == .string(scope),
+              case .object(let proof) = try programs.proof(candidate, key: key),
+              case .array(let receipts)? = proof["receipts"], case .object(let receipt)? = receipts.first,
+              let page = receipt["page"] else { throw Self.failure("Try this exact sense in this conversation before keeping it.") }
+        let shown = try JSONDecoder().decode(NativePage.self, from: page.serializedData(pretty: false))
+        var record = try Self.record(candidate)
+        record.verbs = Array(Set(shown.things.flatMap(\.verbs))).sorted()
+        record.status = .on; record.enabledAt = Date()
+        let published = record
+        try await withStore { store in
+            _ = try self.programs.proof(candidate, key: key)
+            guard try Self.selection(store, corner: published.corner) == candidate.prior else {
+                throw Self.failure("The place's sense changed or is switched off. Read it and try again after restoring it.")
+            }
+            try Self.insert(published, files: self.sourceFiles(published).keys.sorted(), into: &store)
+            return (true, ())
         }
+        return (record, SenseDoor.render(shown, provenance: SenseProvenance(record: record)))
+    }
+
+    static func selection(_ store: Store, corner: SenseCorner) throws -> JSONValue {
+        try .fromEncodable(store.senses.filter { $0.versions.contains { $0.record.corner == corner } }.map { entry in
+            let record = entry.versions.first { $0.record.version == entry.currentVersion }!.record
+            return ["id": JSONValue.string(entry.id), "version": .int(Int64(entry.currentVersion)),
+                    "status": .string(record.status.rawValue),
+                    "enabled": try JSONValue.fromEncodable(record.enabledAt), "disabledBy": try JSONValue.fromEncodable(record.disabledBy)]
+        })
     }
 
     public func sense(for corner: SenseCorner) async throws -> SenseRecord? {
@@ -121,37 +117,30 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
         }
     }
 
-    /// Compatibility with growers that already wrote the requested version folder.
-    /// Only source files are collected; notebooks and other material are excluded.
     public func upsert(_ record: SenseRecord) async throws {
-        _ = try await withStore { store in
-            try Self.validateID(record.id)
-            let source = try Self.safeURL("\(record.id)/v\(record.version)", under: self.root)
-            let files = record.language == .native ? [:] : try Self.readSourceFiles(at: source)
-            return (true, try self.insert(record, files: files, into: &store, stagedVersion: record.version))
-        }
+        let files = record.language == .native ? [:] : try sourceFiles(record)
+        _ = try await upsert(record, codeFiles: files)
     }
 
     /// Preferred growth path: publish code and metadata together, returning the assigned version.
     public func upsert(_ record: SenseRecord, codeFiles: [String: Data]) async throws -> SenseRecord {
-        try await withStore { store in
-            (true, try self.insert(record, files: codeFiles, into: &store))
-        }
-    }
-
-    /// Publication and the off-switch share the registry lock. A grower must
-    /// never turn an archived corner back on after its provider await.
-    public func publishIfNotArchived(_ record: SenseRecord, codeFiles: [String: Data]) async throws -> SenseRecord? {
-        try await withStore { store in
-            let current = store.senses.map { entry in
-                entry.versions.first { $0.record.version == entry.currentVersion }!.record
+        if record.language == .native {
+            return try await withStore { store in
+                var native = record
+                native.version = try CapabilityLifecycle.nextVersion(store.senses.first { $0.id == record.id }?.versions.map(\.record.version) ?? [], requested: record.version)
+                native = try Self.insert(native, files: [], into: &store)
+                return (true, native)
             }
-            let switchedOff = current.contains { $0.id == record.id && $0.status == .archived }
-                || (!current.contains { $0.corner.key == record.corner.key && $0.status == .on }
-                    && current.contains { $0.corner.key == record.corner.key && $0.status == .archived })
-            guard !switchedOff else { return (false, nil) }
-            return (true, try self.insert(record, files: codeFiles, into: &store, stagedVersion: record.version))
         }
+        let candidate = try await candidate(record, codeFiles: codeFiles)
+        let published = try Self.record(candidate)
+        try await withStore { store in
+            _ = try self.programs.load(id: candidate.program.id, digest: candidate.digest)
+            guard try Self.selection(store, corner: published.corner) == candidate.prior else { throw Self.failure("Sense changed before publication.") }
+            try Self.insert(published, files: codeFiles.keys.sorted(), into: &store)
+            return (true, ())
+        }
+        return published
     }
 
     public func versions(id: String) async throws -> [SenseRecord] {
@@ -161,32 +150,84 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
         }
     }
 
-    public func rollback(id: String) async throws -> SenseRecord {
+    /// Lifecycle identity excludes all read bookkeeping and captured views.
+    public func lifecycleRead(id: String) async throws -> JSONValue {
+        try await withStore { store in
+            let entry = store.senses[try Self.index(id, in: store)]
+            let versions = entry.versions.map(\.record).sorted { $0.version > $1.version }
+            let identity = JSONValue.object(["selected": .int(Int64(entry.currentVersion)), "versions": .array(versions.map {
+                .object(["version": .int(Int64($0.version)), "digest": $0.candidateDigest.map(JSONValue.string) ?? .null,
+                         "status": .string($0.status.rawValue),
+                         "disabledBy": $0.disabledBy.map(JSONValue.string) ?? .null])
+            })])
+            let digest = SHA256.hash(data: try identity.serializedData(pretty: false)).prefix(6)
+                .map { String(format: "%02x", $0) }.joined()
+            return (false, .object(["status": .string("ok"),
+                "current": try .fromEncodable(versions.first { $0.version == entry.currentVersion }!),
+                "version": .string("senses/" + id + "@" + digest), "versions": try .fromEncodable(versions)]))
+        }
+    }
+
+    public func rollback(id: String, version: Int, preview: Bool = false) async throws -> SenseRecord {
         let (restored, withdrawn) = try await withStore { store in
             let i = try Self.index(id, in: store)
             let current = store.senses[i].currentVersion
-            guard let previous = store.senses[i].versions.filter({ $0.record.version < current })
-                .max(by: { $0.record.version < $1.record.version }) else {
-                throw Self.failure("No previous version exists for this sense.")
+            let selected = store.senses[i].versions.first { $0.record.version == current }!.record
+            guard version != current,
+                  let j = store.senses[i].versions.firstIndex(where: { $0.record.version == version }) else {
+                throw Self.failure("Choose the previous version from sense.versions.")
             }
-            // CapabilityLifecycle returns a rollback drafted, so old verbs do not
-            // silently regain authority. Enabling it is an explicit next step.
-            let j = store.senses[i].versions.firstIndex { $0.record.version == previous.record.version }!
-            store.senses[i].versions[j].record.status = .draft
-            store.senses[i].currentVersion = previous.record.version
-            return (true, (store.senses[i].versions[j].record, current))
+            // An on sense keeps reading through the selected retained version;
+            // rollback cannot turn an off sense back on.
+            store.senses[i].versions[j].record.status = selected.status == .on ? .on : .off
+            store.senses[i].versions[j].record = try CapabilityLifecycle.preservingOwnerOff(store.senses[i].versions[j].record, before: selected, preview: preview)
+            store.senses[i].currentVersion = version
+            if store.senses[i].versions[j].record.language != .native { _ = try self.sourceFiles(store.senses[i].versions[j].record) }
+            if !preview { try self.abilities.swap(id: id) }
+            return (!preview, (store.senses[i].versions[j].record, current))
         }
-        SenseDoorViews.shared.forget(senseID: id)
-        try await SensesHub.shared.markVersionWrong(senseID: id, version: withdrawn)
+        if !preview {
+            SenseDoorViews.shared.forget(senseID: id)
+            if restored.version != withdrawn { try await SensesHub.shared.markVersionWrong(senseID: id, version: withdrawn) }
+        }
         return restored
     }
 
-    public func setStatus(id: String, version: Int, status: SenseStatus) async throws -> SenseRecord {
-        let record = try await withStore { store in
+    public func drop(id: String, version: Int, preview: Bool = false, ownerAuthorized: Bool = false) async throws -> SenseRecord {
+        let record = try await withStore(ownerAuthorized: ownerAuthorized) { store in
             let (i, j) = try Self.current(id, in: store)
-            guard store.senses[i].currentVersion == version,
-                  store.senses[i].versions[j].record.status != .draft else {
+            guard store.senses[i].currentVersion == version else { throw Self.failure("Sense changed; read its current version before dropping it.") }
+            if store.senses[i].versions[j].record.language != .native { _ = try self.sourceFiles(store.senses[i].versions[j].record) }
+            let record = store.senses[i].versions[j].record
+            let override = try self.abilities.read(id: id, slot: .current)
+            guard record.origin != .builtIn || override != nil else {
+                throw Self.failure("This sense is bundled with the app. Switch it off to stop using it.")
+            }
+            if !ownerAuthorized, CapabilityLifecycle.requiresOwnerToEnable(isOff: record.status == .off, disabledBy: record.disabledBy) {
+                throw SenseFailure(code: "owners_call", message: "The owner turned \(id) off; they turn it back on. Ask them.")
+            }
+            store.senses.remove(at: i)
+            return (!preview, record)
+        }
+        if !preview { SenseDoorViews.shared.forget(senseID: id) }
+        return record
+    }
+
+    public func setStatus(id: String, version: Int, status: SenseStatus, preview: Bool = false,
+                          ownerAuthorized: Bool = false) async throws -> SenseRecord {
+        let record = try await withStore(ownerAuthorized: ownerAuthorized) { store in
+            let (i, j) = try Self.current(id, in: store)
+            let current = store.senses[i].versions[j].record
+            guard status != .on || store.senses[i].versions[j].record.language != .swift else {
+                throw Self.failure("Convert the historical Swift sense to JavaScript before enabling it.")
+            }
+            guard store.senses[i].currentVersion == version else {
                 throw Self.failure("This sense changed. Refresh the page before switching it.")
+            }
+            if status == .on, store.senses[i].versions[j].record.language != .native {
+                var resumed = store.senses[i].versions[j].record
+                resumed.status = .on
+                _ = try self.sourceFiles(resumed)
             }
             store.senses[i].versions[j].record.status = status
             store.senses[i].versions[j].record.unavailableReason = nil
@@ -194,9 +235,15 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
                 store.senses[i].versions[j].record.enabledAt = Date()
                 Self.displace(corner: store.senses[i].versions[j].record.corner, except: id, in: &store)
             }
-            return (true, store.senses[i].versions[j].record)
+            do {
+                store.senses[i].versions[j].record = try CapabilityLifecycle.preservingOwnerOff(store.senses[i].versions[j].record,
+                    before: current, ownerAuthorized: ownerAuthorized, enabling: status == .on, preview: preview)
+            } catch let error as NSError where error.domain == "CapabilityLifecycle" {
+                throw SenseFailure(code: "owners_call", message: error.localizedDescription)
+            }
+            return (!preview, store.senses[i].versions[j].record)
         }
-        if status != .on { SenseDoorViews.shared.forget(senseID: id) }
+        if !preview, status != .on { SenseDoorViews.shared.forget(senseID: id) }
         return record
     }
 
@@ -205,30 +252,12 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
             let (i, j) = try Self.current(id, in: store)
             guard store.senses[i].currentVersion == version,
                   store.senses[i].versions[j].record.status == .on else { return (false, false) }
-            store.senses[i].versions[j].record.status = .unavailable
-            store.senses[i].versions[j].record.unavailableReason = reason
-            return (true, true)
+            var fields = try self.abilities.states()[id]?.objectValue ?? [:]
+            fields["unavailableReason"] = .string(reason)
+            try self.abilities.saveState(id: id, fields: fields)
+            return (false, true)
         }
         if changed { SenseDoorViews.shared.forget(senseID: id) }
-    }
-
-    public func archiveUnused(now: Date = Date()) async throws -> [SenseRecord] {
-        let records = try await withStore { store in
-            let formatter = ISO8601DateFormatter()
-            var archived: [SenseRecord] = []
-            for i in store.senses.indices {
-                let j = store.senses[i].versions.firstIndex { $0.record.version == store.senses[i].currentVersion }!
-                let record = store.senses[i].versions[j].record
-                guard record.status == .on, record.origin != .builtIn,
-                      CapabilityLifecycle.isUnused(used: formatter.string(from: record.lastUsedAt ?? record.createdAt),
-                          enabled: [record.enabledAt.map { formatter.string(from: $0) }], now: now) else { continue }
-                store.senses[i].versions[j].record.status = .archived
-                archived.append(store.senses[i].versions[j].record)
-            }
-            return (!archived.isEmpty, archived)
-        }
-        for record in records { SenseDoorViews.shared.forget(senseID: record.id) }
-        return records
     }
 
     public func recordUse(senseID: String) async {
@@ -261,92 +290,84 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
         }
     }
 
-    func withStore<T: Sendable>(_ body: @escaping @Sendable (inout Store) throws -> (Bool, T)) async throws -> T {
+    func withStore<T: Sendable>(ownerAuthorized: Bool = false, _ body: @escaping @Sendable (inout Store) throws -> (Bool, T)) async throws -> T {
         try Task.checkCancellation()
-        _ = try Self.safeURL("registry.json", under: root)
-        _ = try Self.safeURL("registry.json.lock", under: root)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let path = root.appendingPathComponent("registry.json")
-        return try await SwiftNativePersistenceCore().withFileLock(path) {
-            _ = try Self.safeURL("registry.json", under: self.root)
-            var store = Store()
-            if FileManager.default.fileExists(atPath: path.path) {
-                do {
-                    store = try JSONDecoder().decode(Store.self, from: Data(contentsOf: path))
-                    try Self.validate(store)
-                } catch {
-                    throw Self.failure("Senses registry unavailable at \(path.path): \(error.localizedDescription) The saved bytes were preserved. Repair or restore registry.json before using senses.")
-                }
+        return try AbilityStore.withLock {
+            var store = try Self.decode(self.abilities.registry(kind: .sense))
+            let defaults = try BuiltInSenses.defaults()
+            let defaultIDs = Set(defaults.map { $0.record.id.lowercased() })
+            for file in try self.abilities.files() where defaultIDs.contains(file.id.lowercased()) && file.kind != .sense {
+                throw Self.failure("Ability id collision: \(file.id) is also a bundled sense.")
             }
+            let states = try self.abilities.states()
+            for version in defaults where !store.senses.contains(where: { $0.id == version.record.id }) {
+                var fields = try JSONValue.fromEncodable(version.record).objectValue!
+                for (key, value) in states[version.record.id]?.objectValue ?? [:] { fields[key] = value }
+                if fields["status"] == .string("on"), case .string = fields["unavailableReason"] ?? .null {
+                    fields["status"] = .string("unavailable")
+                }
+                let record = try JSONDecoder().decode(SenseRecord.self, from: JSONValue.object(fields).serializedData(pretty: false))
+                store.senses.append(Entry(id: record.id, currentVersion: record.version, versions: [Version(record: record, files: version.files)]))
+            }
+            let before = store
             let (changed, result) = try body(&store)
             if changed {
-                try Self.validate(store)
-                try Self.encode(store).write(to: path, options: .atomic)
+                store = try Self.decode(CapabilityLifecycle.preservingOwnerOff(JSONValue.fromEncodable(store),
+                    before: JSONValue.fromEncodable(before), ownerAuthorized: ownerAuthorized))
+                var value = try JSONValue.fromEncodable(store).objectValue!
+                value["senses"] = .array(try store.senses.map { entry in
+                    var fields = try JSONValue.fromEncodable(entry).objectValue!
+                    fields["versions"] = .array(try entry.versions.map { version in
+                        var fields = try JSONValue.fromEncodable(version).objectValue!
+                        if let bundled = defaults.first(where: { $0.record.id == entry.id }),
+                           try Self.metadata(version.record) == Self.metadata(bundled.record) {
+                            var record = fields["record"]!.objectValue!
+                            record["bundledDefault"] = .bool(true); fields["record"] = .object(record)
+                        } else if version.record.version == entry.currentVersion,
+                                  try self.abilities.read(id: entry.id, slot: .current) == nil,
+                                  try self.abilities.read(id: entry.id, slot: .next) == nil,
+                                  defaults.contains(where: { $0.record.id == entry.id }) {
+                            let body = try version.record.entry.map { try String(contentsOf: BuiltInSenses.resourceRoot().appendingPathComponent($0), encoding: .utf8) } ?? ""
+                            try self.abilities.write(AbilityStore.File(id: entry.id, kind: .sense,
+                                metadata: ["record": try JSONValue.fromEncodable(version.record)], body: body, pathExtension: "js"))
+                        }
+                        return .object(fields)
+                    })
+                    return .object(fields)
+                })
+                try self.abilities.saveRegistry(.object(value), kind: .sense, ownerAuthorized: ownerAuthorized)
             }
             return result
         }
     }
 
-    func insert(_ input: SenseRecord, files: [String: Data], into store: inout Store, stagedVersion: Int? = nil) throws -> SenseRecord {
-        try Self.validateID(input.id)
-        guard !store.senses.contains(where: { $0.id != input.id && $0.id.lowercased() == input.id.lowercased() }) else {
-            throw Self.failure("Sense id conflicts with an existing folder's spelling.")
+    static func metadata(_ record: SenseRecord) throws -> JSONValue {
+        var fields = try JSONValue.fromEncodable(record).objectValue!
+        if record.status == .unavailable, record.disabledBy != "owner" { fields["status"] = .string("on") }
+        for key in ["uses", "corrections", "lastUsedAt", "unavailableReason"] { fields.removeValue(forKey: key) }
+        return .object(fields)
+    }
+
+    @discardableResult
+    static func insert(_ input: SenseRecord, files: [String], into store: inout Store) throws -> SenseRecord {
+        let previous = store.senses.first { $0.id == input.id }
+        let current = previous?.versions.first { $0.record.version == previous?.currentVersion }?.record
+        let record = try CapabilityLifecycle.preservingOwnerOff(input, before: current, enabling: input.status == .on)
+        guard !store.senses.contains(where: { $0.id != record.id && $0.id.lowercased() == record.id.lowercased() }) else {
+            throw failure("Sense id conflicts with an existing folder's spelling.")
         }
-        var record = input
-        record.corner = SenseCorner(key: input.corner.key) ?? input.corner
+        let version = Version(record: record, files: files)
+        try validate(version)
+        if record.status == .on { displace(corner: record.corner, except: record.id, in: &store) }
         if let i = store.senses.firstIndex(where: { $0.id == record.id }) {
-            guard store.senses[i].versions.map(\.record.version).max()! < Int.max else { throw Self.failure("Sense version overflow.") }
-            record.version = max(store.senses[i].versions.map(\.record.version).max()! + 1, stagedVersion ?? 1)
-            // Origin cannot be laundered by an upgrade of imported code.
-            let j = store.senses[i].versions.firstIndex { $0.record.version == store.senses[i].currentVersion }!
-            if store.senses[i].versions[j].record.origin == .shared { record.origin = .shared }
-        } else { record.version = max(1, stagedVersion ?? 1) }
-        record.uses = 0
-        record.corrections = 0
-        record.lastUsedAt = nil
-        if record.status == .on { record.enabledAt = Date() }
-        let version = Version(record: record, files: files.keys.sorted())
-        try Self.validate(version)
-        for (name, bytes) in files {
-            try Self.validateCode(name, bytes: bytes)
-        }
-        guard files.values.reduce(0, { $0 + $1.count }) <= Self.maximumCodeBytes else {
-            throw Self.failure("Sense source exceeds the size limit.")
-        }
-        let destination = try Self.safeURL("\(record.id)/v\(record.version)", under: root)
-        if FileManager.default.fileExists(atPath: destination.path) {
-            // A grower may have staged this exact version already. Never replace
-            // existing code, including code left by an interrupted publication.
-            guard try Self.readSourceFiles(at: destination) == files else {
-                throw Self.failure("The next sense version folder already contains different code.")
-            }
-        } else {
-            let parent = destination.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            let stage = parent.appendingPathComponent(".staging-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: false)
-            do {
-                for (name, bytes) in files {
-                    try Task.checkCancellation()
-                    let path = stage.appendingPathComponent(name)
-                    try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try bytes.write(to: path, options: .atomic)
-                }
-                try Task.checkCancellation()
-                try FileManager.default.moveItem(at: stage, to: destination)
-            } catch {
-                do { try FileManager.default.removeItem(at: stage) }
-                catch { Self.report(error) }
-                throw error
-            }
-        }
-        if record.status == .on { Self.displace(corner: record.corner, except: record.id, in: &store) }
-        if let i = store.senses.firstIndex(where: { $0.id == record.id }) {
+            guard !store.senses[i].versions.contains(where: { $0.record.version == record.version }) else { throw failure("Sense version changed before publication.") }
             store.senses[i].versions.append(version)
+            store.senses[i].versions = Array(store.senses[i].versions.suffix(2))
             store.senses[i].currentVersion = record.version
         } else {
             store.senses.append(Entry(id: record.id, currentVersion: record.version, versions: [version]))
         }
+        try validate(store)
         return record
     }
 
@@ -364,7 +385,7 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
         for i in store.senses.indices where store.senses[i].id != id {
             let j = store.senses[i].versions.firstIndex { $0.record.version == store.senses[i].currentVersion }!
             if store.senses[i].versions[j].record.corner.key == corner.key && store.senses[i].versions[j].record.status == .on {
-                store.senses[i].versions[j].record.status = .draft
+                store.senses[i].versions[j].record.status = .off
             }
         }
     }
@@ -380,4 +401,8 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
     static func report(_ error: Error) {
         logger.error("Sense registry operation failed: \(String(describing: error), privacy: .private)")
     }
+}
+
+private extension JSONValue {
+    var objectValue: [String: JSONValue]? { if case .object(let fields) = self { fields } else { nil } }
 }

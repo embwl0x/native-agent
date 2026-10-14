@@ -46,7 +46,10 @@ extension ShelfStore {
     /// pending last. Settling it on the entry means the next read needs no inbox
     /// row at all; a write failure only costs this reconciliation.
     public func reconciling(_ entries: [ShelfEntry]) -> [ShelfEntry] {
-        let pending = Self.pendingApprovalIDs(dataRoot: dataRoot)
+        reconciling(entries, pending: Self.pendingApprovalIDs(dataRoot: dataRoot))
+    }
+
+    public func reconciling(_ entries: [ShelfEntry], pending: Set<String>?) -> [ShelfEntry] {
         return entries.map { stored in
             let entry = Self.reconciled(stored, pending: pending)
             if entry != stored { try? settleApproval(stored.id, detail: entry.statusDetail ?? "") }

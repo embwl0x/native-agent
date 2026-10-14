@@ -100,7 +100,7 @@ extension CognitionObservatoryView {
                                 .font(.caption)
                                 .lineLimit(3)
                                 .textSelection(.enabled)
-                            Text(CognitionObservatoryPresentation.timelineDateLabel(event))
+                            Text(CognitionTimelinePresentation.timelineDateLabel(event))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                             Text(event.lineageId)
@@ -111,5 +111,11 @@ extension CognitionObservatoryView {
                     }
                 }
             }
+    }
+}
+
+enum CognitionTimelinePresentation {
+    static func timelineDateLabel(_ event: CognitiveDevelopmentalTimelineEvent) -> String {
+        "recorded \(event.occurredAt.formatted(date: .abbreviated, time: .shortened))"
     }
 }

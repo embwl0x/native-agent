@@ -25,17 +25,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// Monotonic timing for duration evidence. Wall time remains the semantic
     /// event clock, but NTP/manual clock corrections cannot alter latency.
     private let monotonicNowNanoseconds: @Sendable () -> UInt64
-    let microcycleSchedulingMode: CognitiveMicrocycleSchedulingMode  // internal for actor extensions (move-only Wave C)
-    public let configurationOverride: CognitiveConfiguration?  // internal for actor extensions (move-only Wave C)
-    /// The durable preference owner used by the real Observatory/Settings
-    /// control actions. Production uses `.standard`; isolated mounted tests
-    /// inject a suite without replacing the action or runtime configuration.
-    let preferenceDefaults: UserDefaults  // internal for actor extensions
+    let preferenceDefaults = UserDefaults.standard
     private let configurationEnvironment: [String: String]
-    /// Explicit test-only escape hatch for proving the same canonical reflection
-    /// route transaction on an injected root. Production defaults to false.
-    let allowsReflectionSelectionMutationForTesting: Bool
-    private let organismConfigurationOverride: OrganismConfiguration?
     private let cognitiveStore: CognitiveSQLiteStore?
     public let substrate: CognitiveSubstrate  // internal for actor extensions (move-only Wave C)
     public let organismKernel: OrganismKernel  // internal for actor extensions (move-only Wave C)
@@ -87,41 +78,23 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     private var pendingMicrocycleTask: Task<Void, Never>?
     private var microcycleTelemetry: CognitiveMicrocycleTelemetry
     static let microcycleCoalescingDelay: TimeInterval = 0.25
-    /// Test-visible, process-local proof only. This is not persisted or surfaced;
-    /// it lets accelerated tests distinguish "no replay work ran" from "replay
-    /// ran but found no evidence," which a receipt count alone cannot prove.
-    var eventDrivenReplayAttemptCount: UInt64 = 0  // internal for actor extensions (move-only Wave C)
     private var replayReconciliationPending = false
     private var replayRetryTask: Task<Void, Never>?
     static let replayFailureRetryDelay: TimeInterval = 30
     /// A4.6: reflection rides the same dream/REM somatic commit signal replay
     /// does (clause 4 — no bare-interval LLM heartbeat). Single-flight; the
     /// substrate's budget/reservation gates stay the authority inside
-    /// `runReflectionIfDue`. Proof counter mirrors the replay one above.
-    var eventDrivenReflectionAttemptCount: UInt64 = 0  // internal for actor extensions
+    /// `runReflectionIfDue`.
     var reflectionEventTask: Task<Void, Never>?  // internal for actor extensions
-    /// The event and deadline paths do the real cognition work for the
-    /// `cognition_maintenance` / `cognition_replay` / `cognition_reflection`
-    /// lanes, and used to report nothing — so those loops only ever recorded the
-    /// daily integrity sweep's `.skipped` and their completion stamps never
-    /// advanced, which Doctor's dormancy read cannot tell from a dead lane.
-    /// They report through `reportLoopOutcome` now. Injectable so a test can
-    /// observe the report without reaching into the shared loop manager.
-    var loopResultReporterOverride:  // internal for actor extensions
-        (@Sendable (String, String, Bool) async -> Void)?
     /// Studio canon tending: single-flight, throttled. See
     /// NativeCognitionRuntime+StudioCanon.swift.
     var studioCanonTask: Task<Void, Never>?  // internal for actor extensions
     var lastStudioCanonTendingAt: Date?  // internal for actor extensions
     var lastStudioRelationAuditVerdict: String?  // internal for actor extensions
-    let eventDrivenReflectionOperationOverride:  // internal for actor extensions
-        (@Sendable (String) async -> Void)?
     public static let eventDrivenReplayDeadlineSeconds: TimeInterval = 10
-    private let eventDrivenReplayTimeoutSeconds: TimeInterval
-    private let eventDrivenReplayOperationOverride:
-        (@Sendable (String) async -> CognitiveBackgroundRunOutcome)?
-    let deadlineLogger: @Sendable (String) -> Void  // internal for actor extensions (move-only Wave C)
-    private var eventDrivenReplayTimeoutCount: UInt64 = 0
+    private func deadlineLogger(_ message: String) {
+        FileHandle.standardError.write(Data("[NativeCognitionRuntime] \(message)\n".utf8))
+    }
     /// One exact quiet-window deadline derived from prediction/field residuals.
     /// New sensory evidence cancels and re-arms it; an empty/low-pressure body
     /// owns no task and therefore creates no idle heartbeat. (C6: state +
@@ -171,12 +144,14 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// bounded advisory projection off the cognition actor; the hot read only
     /// re-scores the resident candidates for the supplied time.
     var pursuitCandidates: [DeskItem] = []  // internal for actor extensions (move-only Wave C)
+    var pursuitCarriedContext: MyQueue.Context?
     var pursuitProjectionGeneration: UInt64 = 0  // internal for actor extensions (move-only Wave C)
+    var pursuitReadRevision: UInt64?
+    var pursuitCompletedRefreshRevision = SwiftNativeDeskStore.currentRevision
     var pursuitRefreshInFlight = false  // internal for actor extensions (move-only Wave C)
     var pursuitRefreshQueued = false  // internal for actor extensions (move-only Wave C)
     var pursuitObservationTask: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
     var pursuitRefreshTask: Task<Void, Never>?
-    let pursuitStateLoader: @Sendable () async throws -> DeskState  // internal for actor extensions (move-only Wave C)
     private static let bodyLineRefreshInterval: TimeInterval = 20 * 60
     var organismContinuityRestored = false  // internal for actor extensions (move-only Wave C)
     /// Audit C1: set when the organism continuity decode threw; freezes persistOrganismContinuity.
@@ -193,20 +168,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     var organismPersistenceLastResult = true  // internal for actor extensions (move-only Wave C)
     var organismPersistenceLastWriteAt: ContinuousClock.Instant?  // internal for actor extensions
     var organismPersistenceDebounceTask: Task<Void, Never>?  // internal for actor extensions
-    let organismPersistenceWriterOverride:  // internal for actor extensions (move-only Wave C)
-        (@Sendable (OrganismPersistentState, URL) async throws -> Void)?
-    var pendingDebugReplySessionIds: Set<String> = []
-    /// Sessions whose whole conversation is treated as debug traffic.
-    ///
-    /// M9 (2026-07-09): this was insert-only. Nothing ever removed a session, so
-    /// the set grew for the process lifetime AND a session that was once debug
-    /// stayed debug forever. Bounded as a FIFO ring: the oldest marking ages out.
-    /// Use `markSessionDebug(_:)` — never `insert` directly, or the order array
-    /// and the set drift apart.
-    private(set) var debugSessionIds: Set<String> = []
-    private var debugSessionIdOrder: [String] = []
-    static let maximumDebugSessionIds = 256
-
     /// Non-live user turns must carry their classification through every event
     /// in the same tool/provider run. ChatOrchestration emits user, tool, and
     /// assistant events independently; without this run-scoped inheritance a
@@ -215,16 +176,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     var nonLiveTurnKindByRunId: [String: CognitiveTurnKind] = [:]
     private var nonLiveTurnKindRunOrder: [String] = []
     static let maximumNonLiveTurnKindRuns = 256
-
-    /// Mark a session as debug, evicting the oldest marking when over capacity.
-    func markSessionDebug(_ sessionId: String) {
-        guard debugSessionIds.insert(sessionId).inserted else { return }
-        debugSessionIdOrder.append(sessionId)
-        guard debugSessionIdOrder.count > Self.maximumDebugSessionIds else { return }
-        let stale = debugSessionIdOrder.removeFirst()
-        debugSessionIds.remove(stale)
-        pendingDebugReplySessionIds.remove(stale)
-    }
 
     func rememberNonLiveTurnKind(_ turnKind: CognitiveTurnKind, runId: String) {
         guard turnKind != .live else {
@@ -304,61 +255,29 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         host: any CognitionHost,
         contextFlow: NativeContextFlowRuntime,
-        configurationOverride: CognitiveConfiguration? = nil,
-        preferenceDefaults: NativeCognitionPreferenceDefaults = .standard,
         configurationEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        allowsReflectionSelectionMutationForTesting: Bool = false,
-        organismConfigurationOverride: OrganismConfiguration? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
         monotonicNowNanoseconds: @escaping @Sendable () -> UInt64 = {
             DispatchTime.now().uptimeNanoseconds
-        },
-        microcycleSchedulingMode: CognitiveMicrocycleSchedulingMode = .automatic,
-        eventDrivenReplayTimeoutSeconds: TimeInterval = NativeCognitionRuntime.eventDrivenReplayDeadlineSeconds,
-        eventDrivenReplayOperationOverride:
-            (@Sendable (String) async -> CognitiveBackgroundRunOutcome)? = nil,
-        eventDrivenReflectionOperationOverride:
-            (@Sendable (String) async -> Void)? = nil,
-        deadlineLogger: (@Sendable (String) -> Void)? = nil,
-        pursuitStateLoaderOverride: (@Sendable () async throws -> DeskState)? = nil,
-        organismPersistenceWriterOverride:
-            (@Sendable (OrganismPersistentState, URL) async throws -> Void)? = nil
+        }
     ) {
+        let preferenceDefaults = UserDefaults.standard
         self.dataRoot = dataRoot
         self.host = host
         self.contextFlow = contextFlow
         self.now = now
         self.monotonicNowNanoseconds = monotonicNowNanoseconds
-        self.microcycleSchedulingMode = microcycleSchedulingMode
-        self.preferenceDefaults = preferenceDefaults.defaults
         self.configurationEnvironment = configurationEnvironment
         let telemetry = CognitiveMicrocycleTelemetry.fresh(now: now())
         self.microcycleTelemetry = telemetry
-        self.configurationOverride = configurationOverride
-        self.allowsReflectionSelectionMutationForTesting = allowsReflectionSelectionMutationForTesting
-        self.organismConfigurationOverride = organismConfigurationOverride
-        self.eventDrivenReplayTimeoutSeconds = eventDrivenReplayTimeoutSeconds.isFinite
-            && eventDrivenReplayTimeoutSeconds >= 0
-            ? eventDrivenReplayTimeoutSeconds
-            : Self.eventDrivenReplayDeadlineSeconds
-        self.eventDrivenReplayOperationOverride = eventDrivenReplayOperationOverride
-        self.eventDrivenReflectionOperationOverride = eventDrivenReflectionOperationOverride
-        self.organismPersistenceWriterOverride = organismPersistenceWriterOverride
-        self.pursuitStateLoader = pursuitStateLoaderOverride ?? {
-            try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
-        }
-        self.deadlineLogger = deadlineLogger ?? { message in
-            FileHandle.standardError.write(Data("[NativeCognitionRuntime] \(message)\n".utf8))
-        }
-        let configuration = configurationOverride ?? Self.loadConfiguration(
-            defaults: preferenceDefaults.defaults,
+        let configuration = Self.loadConfiguration(
+            defaults: preferenceDefaults,
             environment: configurationEnvironment
         )
-        let organismConfiguration = organismConfigurationOverride
-            ?? Self.loadOrganismConfiguration(
-                dataRoot: dataRoot,
-                defaults: preferenceDefaults.defaults
-            )
+        let organismConfiguration = Self.loadOrganismConfiguration(
+            dataRoot: dataRoot,
+            defaults: preferenceDefaults
+        )
         let store = try? CognitiveSQLiteStore(dataRoot: dataRoot)
         self.cognitiveStore = store
         let attentionProjection = CognitiveAttentionResidentProjection()
@@ -390,25 +309,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                         publishedAt: publishedAt
                     )
                 },
-                // W4/P1 fix-round (gpt-5.5 BLOCKING): without this closure the
-                // substrate always used `.default`, leaving the whole
-                // traits→dynamics derivation dead in production — the exact
-                // "eight dials nothing consumes" finding recreated one layer
-                // up. Same re-read-per-call shape as `userName` above, so a
-                // persona trait edit takes effect on the next capsule; any
-                // read failure degrades to `.default`.
+                // Resolve traits once per calculation so edits take effect on its next read.
                 dynamics: {
                     let traits = PersonaCompiler.loadProfile(dataRoot: root).traits
-                    return .derived(from: PersonalityTraitDials(
-                        warmth: traits.warmth,
-                        directness: traits.directness,
-                        humor: traits.humor,
-                        proactivity: traits.proactivity,
-                        rigor: traits.rigor,
-                        autonomy: traits.autonomy,
-                        creativity: traits.creativity,
-                        brevity: traits.brevity
-                    ))
+                    return .derived(warmth: traits.warmth, humor: traits.humor)
                 },
                 // UNBIDDEN RECALL (2026-09-02). The substrate asks with the
                 // words of its own felt line and gets back felt MOMENTS. Local
@@ -724,15 +628,14 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
     var reachEnabled: Bool {
-        let configuration = configurationOverride ?? Self.loadConfiguration(
+        let configuration = Self.loadConfiguration(
             defaults: preferenceDefaults, environment: configurationEnvironment)
         return !isFlushedForTermination && configuration.enabled && configuration.backgroundMicrocyclesEnabled
     }
 
     public func refreshConfiguration() async {
         withdrawReachIfDisabled()
-        if configurationOverride == nil,
-           NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
+        if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
            preferenceDefaults.object(forKey: Self.enabledKey) == nil {
             let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
             if let snapshot = try? await routing.checkedRoutingSnapshot(),
@@ -747,7 +650,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 }
             }
         }
-        var configuration = configurationOverride ?? Self.loadConfiguration(
+        var configuration = Self.loadConfiguration(
             defaults: preferenceDefaults,
             environment: configurationEnvironment
         )
@@ -757,21 +660,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             if let reflection = routingSnapshot.preferences[configuration.reflectionSurface] {
                 configuration.reflectionModel = reflection.model
                 configuration.reflectionReasoningEffort = reflection.reasoningEffort
-                configuration.reflectionProvider = routingSnapshot.activeProviders[configuration.reflectionSurface]
-                    ?? routing.inferProviderForModel(reflection.model)
-                    ?? configuration.reflectionProvider
-                // 2026-09-06: the routing row is the ONLY authority for the
-                // reflection mind, and this is where it is resolved — so mirror
-                // it onto the two preference keys the Setup and Settings
-                // pickers display. Changing the reflection row in Providers
-                // writes routing and calls this; without the mirror those
-                // pickers went on showing a stale provider/model forever, with
-                // no way for the person to tell which one actually runs.
-                if usesLiveAppBody {
-                    preferenceDefaults.set(configuration.reflectionModel, forKey: Self.reflectionModelKey)
-                    preferenceDefaults.set(
-                        configuration.reflectionProvider, forKey: Self.reflectionProviderKey)
-                }
+                configuration.reflectionProvider = routingSnapshot.activeProviders[configuration.reflectionSurface] ?? ""
             }
             providerRoutingFailure = nil
         } catch {
@@ -848,11 +737,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 tendernessAfter: await self.organismKernel.snapshot().chemicalState.tenderness
             )
         }
-        let organismConfiguration = organismConfigurationOverride
-            ?? Self.loadOrganismConfiguration(
-                dataRoot: dataRoot,
-                defaults: preferenceDefaults
-            )
+        let organismConfiguration = Self.loadOrganismConfiguration(
+            dataRoot: dataRoot,
+            defaults: preferenceDefaults
+        )
         await organismKernel.configure(organismConfiguration)
         await somaticSignalBus.configure(organismConfiguration)
     }
@@ -942,18 +830,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
 
-    func eventDrivenReplayAttemptCountForProof() -> UInt64 {
-        eventDrivenReplayAttemptCount
-    }
-
-    func replayReconciliationPendingForProof() -> Bool {
-        replayReconciliationPending
-    }
-
-    func deadlineBailoutCountsForProof() -> UInt64 {
-        eventDrivenReplayTimeoutCount
-    }
-
     func handleEventDrivenReplayOutcome(  // internal for +Organism extension (move-only Wave C)
         _ outcome: CognitiveBackgroundRunOutcome,
         reason: String,
@@ -998,7 +874,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             replayRetryTask = nil
             return
         }
-        eventDrivenReplayAttemptCount &+= 1
         let reason = "replay_event_retry"
         let outcome = await runEventDrivenReplayWithDeadline(reason: reason)
         await handleEventDrivenReplayOutcome(outcome, reason: reason, allowRetry: false)
@@ -1012,13 +887,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     func runEventDrivenReplayWithDeadline(  // internal for +Organism extension (move-only Wave C)
         reason: String
     ) async -> CognitiveBackgroundRunOutcome {
-        let override = eventDrivenReplayOperationOverride
-        let outcome = await raceAgainstTimeout(seconds: eventDrivenReplayTimeoutSeconds) { [weak self] in
-            if let override {
-                return await override(reason)
-            }
+        let outcome = await raceAgainstTimeout(seconds: Self.eventDrivenReplayDeadlineSeconds) { [weak self] in
             guard let self else {
-                return .failed("cognitive runtime released before event-driven replay")
+                return CognitiveBackgroundRunOutcome.failed("cognitive runtime released before event-driven replay")
             }
             return await self.runReplay(reason: reason)
         }
@@ -1028,9 +899,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         case .failure(let detail):
             return .failed("event-driven replay race failed: \(detail)")
         case .timedOut:
-            eventDrivenReplayTimeoutCount &+= 1
             let detail = "event-driven replay '\(reason)' exceeded "
-                + "\(eventDrivenReplayTimeoutSeconds)s deadline; task cancelled and reconciliation retained"
+                + "\(Self.eventDrivenReplayDeadlineSeconds)s deadline; task cancelled and reconciliation retained"
             deadlineLogger("TIMEOUT: \(detail)")
             return .failed(detail)
         case .cancelled:
@@ -1044,51 +914,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     public func substrateForIntegration() async -> CognitiveSubstrate {
         await bootstrap()
         return substrate
-    }
-
-    /// Fixed-time mutation-free read seam for provider transplantation. It
-    /// deliberately refuses to bootstrap because launch/restore/app-wake are
-    /// canonical mutations and cannot occur inside a frozen epoch.
-    func frozenMindRead(
-        at fixedAt: Date,
-        surface: String,
-        userMessage: String,
-        sessionId: String? = nil
-    ) async throws -> NativeFrozenMindRead {
-        guard let bootstrapTask else { throw NativeFrozenMindReadError.runtimeNotBootstrapped }
-        await bootstrapTask.value
-        if let bootstrapFailure { throw NativeFrozenMindReadError.bootstrapFailed(bootstrapFailure) }
-        let cognition = await substrate.frozenRead(at: fixedAt, currentSessionId: sessionId)
-        let organism = await organismKernel.frozenRead(at: fixedAt)
-        let capsule = await substrate.compileFrozenCapsule(
-            CognitiveCapsuleRequest(
-                surface: surface,
-                userMessage: userMessage,
-                sessionId: sessionId,
-                mode: .inject,
-                organismProjection: organism.projection
-            ),
-            from: cognition
-        )
-        return NativeFrozenMindRead(
-            fixedAt: fixedAt,
-            cognition: cognition,
-            organism: organism,
-            capsule: capsule
-        )
-    }
-
-    func frozenMindOwnerRevisions() async -> [FrozenMindOwnerRevision] {
-        [
-            FrozenMindOwnerRevision(
-                owner: "cognition",
-                revision: await substrate.frozenRevisionToken()
-            ),
-            FrozenMindOwnerRevision(
-                owner: "organism",
-                revision: await organismKernel.frozenRevisionFingerprint()
-            ),
-        ]
     }
 
     /// The live turn seam is an actor-free read of the projection already
@@ -1109,18 +934,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
 
-    /// One-shot prepare+commit. This COMMITS AT PREPARE TIME (consumes the
-    /// Body-line suppress window before any provider sees the capsule), so it
-    /// must never sit on a turn-executor path — those go through
-    /// `prepareTurnProjection` and commit only after the provider accepts the
-    /// turn (R-F1, 2026-07-17). No production caller uses this today; it
-    /// remains for the protocol requirement and direct-read tests.
-    public func prepareCapsule(_ request: CognitiveCapsuleRequest) async -> CognitiveCapsule? {
-        let projection = await prepareTurnProjection(request)
-        await commitTurnProjection(projection, request: request)
-        return projection.capsule
-    }
-
     /// Ordinary chat reads cognition and organism at one fixed time after one
     /// body refresh. It does not consume the surfaced-state window; the caller
     /// commits that only after the value is actually appended to provider input.
@@ -1130,8 +943,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         let bodySample = await organismBodySample(at: fixedAt)
         let canonicalAffect = await substrate.canonicalAffectProjection(at: fixedAt)
         let organism = await organismKernel.refreshBodySchemaAndFrozenRead(
-            bodySample.read,
-            integratesChemistry: bodySample.integratesChemistry,
+            bodySample,
+            integratesChemistry: false,
             canonicalAffect: canonicalAffect,
             fixedAt: fixedAt
         )
@@ -1234,7 +1047,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         pendingMicrocycleGeneration = generation
         pendingMicrocycleTask?.cancel()
         pendingMicrocycleTask = nil
-        guard microcycleSchedulingMode == .automatic else { return }
         pendingMicrocycleTask = Task { [weak self] in
             let nanos = UInt64(Self.microcycleCoalescingDelay * 1_000_000_000)
             try? await Task.sleep(nanoseconds: nanos)
@@ -1288,19 +1100,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         publishRuntimeChange(reason: "microcycle_settlement:finished")
     }
 
-    /// Deterministic proof seam for the resident coalescer. This is unavailable
-    /// to automatic production scheduling and does not synthesize elapsed
-    /// wall-clock evidence; it merely settles the currently pending generation.
-    func flushPendingMicrocycleForProof() async {
-        guard microcycleSchedulingMode == .manuallyFlushed,
-              let generation = pendingMicrocycleGeneration else { return }
-        let reason = microcycleTelemetry.lastReason ?? "accelerated_proof"
-        await runScheduledMicrocycle(generation: generation, reason: reason)
-    }
-
-
-
-
     public func microcycleTelemetrySnapshot() -> CognitiveMicrocycleTelemetry {
         microcycleTelemetry
     }
@@ -1353,7 +1152,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         await bootstrap()
         if let bootstrapFailure { return .failed(bootstrapFailure) }
         let configuration = await substrate.configurationSnapshot()
-        guard configuration.enabled, configuration.replayEnabled else {
+        guard configuration.enabled else {
             return .skipped(LoopTickOutcome.offPrefix + "cognitive replay disabled")
         }
         switch await backgroundCognitionGate(reason: reason) {
@@ -1440,12 +1239,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
 
     public func observatoryDetail() async -> CognitiveObservatoryDetail {
         await bootstrap()
-        let configuration = await substrate.configurationSnapshot()
-        let workspace = await substrate.workspaceSnapshot()
         await refreshOrganismBodySchema(reason: "observatory")
         let organism = await organismKernel.snapshot()
         // The Capsule Preview mirrors the capsule Agent ACTUALLY received in her
-        // last live chat turn (cached at injection in prepareCapsule), timestamped —
+        // last live chat turn (cached at projection commit), timestamped —
         // so the panel moves as they talk instead of recompiling a synthetic compile
         // pinned to a constant "observatory preview" message (which never changes and
         // never reflects the live conversation). Only when nothing has been injected
@@ -1455,6 +1252,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         // synthetic capsule compile — the chip reads the same signals path the fingerprint
         // does, so what it names is what she'd feel about right now, not a parallel guess.
         let inspectFixedAt = now()
+        let read = await substrate.frozenRead(at: inspectFixedAt)
+        let configuration = read.configuration
         let inspectRequest = requestWithOrganismProjection(
             CognitiveCapsuleRequest(
                 surface: "chat",
@@ -1466,9 +1265,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             toward: await towardRead(),
             at: inspectFixedAt
         )
-        // Pass the workspace already snapshotted above: feltModeReading must not
-        // re-snapshot (that advances field decay, and this panel refreshes every 5s).
-        let feltMode = await substrate.feltModeReading(for: inspectRequest, workspace: workspace)
+        // All workspace-derived fields share the same substrate read epoch.
+        let feltMode = await substrate.feltModeReading(for: inspectRequest, from: read)
 
         let capsulePreview: CognitiveCapsule?
         let capsulePreviewInfo: CapsulePreviewInfo?
@@ -1480,7 +1278,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 at: last.capsule.generatedAt
             )
         } else {
-            let synthetic = await substrate.compileCapsule(inspectRequest)
+            let synthetic = await substrate.compileFrozenCapsulePresentation(inspectRequest, from: read).capsule
             let nonEmpty = synthetic.combined.isEmpty ? nil : synthetic
             capsulePreview = nonEmpty
             capsulePreviewInfo = nonEmpty == nil ? nil : CapsulePreviewInfo(source: .synthetic, userMessage: nil, at: nil)
@@ -1488,12 +1286,12 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         let receiptRead = await substrate.receiptReadSnapshot()
         return CognitiveObservatoryDetail(
             configuration: configuration,
-            summary: await substrate.observatorySnapshot(),
-            substrate: await substrate.snapshot(),
-            workspace: workspace,
+            summary: await substrate.observatorySnapshot(from: read),
+            substrate: read.snapshot,
+            workspace: read.workspace,
             associations: await substrate.associationSnapshot(),
-            thoughtSeeds: await substrate.thoughtSeedSnapshot(),
-            thoughtSuggestions: await substrate.thoughtSuggestionSnapshot(surface: "observatory"),
+            thoughtSeeds: read.thoughtSeeds,
+            thoughtSuggestions: await substrate.thoughtSuggestionSnapshot(surface: "observatory", workspace: read.workspace),
             episodes: await substrate.episodeSnapshot(),
             schemaProposals: await substrate.schemaProposalSnapshot(),
             standingViews: await substrate.standingViewSnapshot(),
@@ -1502,7 +1300,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             reflections: await substrate.reflectionReceiptSnapshot(),
             receiptRead: receiptRead,
             receipts: receiptRead.receipts,
-            facultyMeasurements: await substrate.facultyMeasurementSnapshot(),
+            facultyMeasurements: await substrate.facultyMeasurementSnapshot(from: read),
             experiments: await substrate.researchExperimentSnapshot(),
             welfareBounds: await substrate.welfareBoundsSnapshot(),
             organism: organism,
@@ -1699,7 +1497,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
 
     /// H2 (audit, 2026-07-09): makeOrganismBodyRead does ~15 stats + JSON parses
     /// + a dream_diary directory listing — and it ran on EVERY tool result (×10
-    /// per multi-tool turn), every prepareCapsule, every Observatory 5s poll,
+    /// per multi-tool turn), every turn projection, every Observatory 5s poll,
     /// every LivingStatusPanel 60s tick, all serialized on THIS actor which the
     /// chat turn also needs. The underlying files change on the order of minutes;
     /// a 2s TTL cache removes the per-tool-result cost without dulling the body's
@@ -1732,7 +1530,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         // line is still fresh, drop it so a held mood goes quiet instead of
         // repeating for hours. Observatory/preview (.inspectOnly) always sees the
         // true line and never touches the window. The surfaced-marker is set
-        // post-build in prepareCapsule, so a preview OR a nil capsule can't consume
+        // post-build in commitTurnProjection, so a preview OR a nil capsule can't consume
         // the window. (gpt-5.5 review)
         if request.mode == .inject,
            let line = projection.bodyLine,
@@ -1798,12 +1596,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         publishRuntimeChange(reason: "proposal:schema_resolved")
     }
 
-    /// User's approval seam for Wave E standing views — a view she formed in reflection
-    /// only reaches her capsule after this says approved.
-    public func resolveStandingView(id: UUID, approved: Bool) async -> CognitiveStandingView? {
-        await resolveStandingViewChecked(id: id, approved: approved).view
-    }
-
     /// Same seam, carrying the persistence outcome (2026-09-06) so the review
     /// surfaces can tell "saved" from "changed in memory only".
     public func resolveStandingViewChecked(id: UUID, approved: Bool) async -> StandingViewTransition {
@@ -1812,15 +1604,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         scheduleDirtyMicrocycle(reason: "standing_view_resolution")
         publishRuntimeChange(reason: "proposal:standing_view_resolved")
         return resolved
-    }
-
-    /// The user's RETIREMENT seam — the way out of `.active` that
-    /// `resolveStandingView` never had (Agent, 2026-09-02: three of her five
-    /// active views were three drafts of one phrasing view and nothing could
-    /// retire them but a sixth approval pushing one off the LRU). Also the
-    /// route for letting go of a `.held` view she adopted herself.
-    func retireStandingView(id: UUID) async -> CognitiveStandingView? {
-        await retireStandingViewChecked(id: id).view
     }
 
     /// Same seam, carrying the persistence outcome (2026-09-06).
@@ -1943,17 +1726,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
 
-    /// True while a chat turn is running, or while a settlement is still
-    /// pending. Background lanes read this so none lands on top of a turn in
-    /// flight.
-    ///
-    /// The turn latch is the authority (admission → terminal settlement, counted
-    /// by runId). The coalescer generation is kept as the
-    /// second term: it still covers non-chat sensory work and any turn admitted
-    /// without a runId, and it is what this property used to mean.
+    /// True from chat-turn admission through terminal settlement, counted by
+    /// runId. Internal microcycles are not turns and do not hold her free time.
     public var liveTurnInFlight: Bool {  // internal for actor extensions
-        if liveTurnLatchCount() > 0 { return true }
-        return pendingMicrocycleGeneration != nil
+        liveTurnLatchCount() > 0
     }
 
     /// The lane a gate reason belongs to, for the conserve starvation floor.
@@ -2080,20 +1856,13 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         let storedBudget = defaults.object(forKey: reflectionBudgetKey) as? Int
         let budget = max(0, storedBudget ?? budgetDefault)
         let storedLoadThreshold = defaults.object(forKey: reflectionLoadThresholdKey) as? Double
-        let reflectionModel = configuredReflectionModel(env: env)
-        let reflectionProvider = configuredReflectionProvider(for: reflectionModel)
         return CognitiveConfiguration(
             enabled: enabled,
             persistenceEnabled: enabled,
-            workspaceEnabled: enabled,
             capsuleInjectionEnabled: capsuleEnabled,
             viewsExperimentEnabled: defaults.object(forKey: viewsExperimentKey) as? Bool ?? true,
-            affectEnabled: enabled,
-            thoughtSeedsEnabled: enabled,
-            replayEnabled: enabled,
             backgroundMicrocyclesEnabled: backgroundEnabled,
             reflectiveCallsEnabled: reflectionEnabled,
-            observatoryEnabled: enabled,
             maximumActiveNodes: 256,
             defaultDecayHalfLife: 60 * 60,
             maximumCapsuleCharacters: 4_000,
@@ -2102,8 +1871,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             dailyReflectionCallBudget: budget,
             reflectionLoadThreshold: storedLoadThreshold ?? CognitiveConfiguration().reflectionLoadThreshold,
             reflectionSurface: "cognition_reflection",
-            reflectionModel: reflectionModel,
-            reflectionProvider: reflectionProvider,
             reflectionReasoningEffort: "high"
         )
     }
@@ -2165,26 +1932,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
 
-    private static func configuredReflectionModel(env: [String: String]) -> String {
-        let stored = UserDefaults.standard.string(forKey: reflectionModelKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !stored.isEmpty { return stored }
-        let envModel = env["NATIVE_AGENT_COGNITION_REFLECTION_MODEL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return envModel.isEmpty ? defaultReflectionModel : envModel
-    }
-
-    private static func configuredReflectionProvider(for model: String) -> String {
-        let stored = UserDefaults.standard.string(forKey: reflectionProviderKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return stored.isEmpty ? inferredReflectionProvider(for: model) : stored
-    }
-
-    public static func inferredReflectionProvider(for model: String) -> String {  // internal for actor extensions (move-only Wave C)
-        SwiftNativeProviderRouting.inferredProviderID(forModel: model)
-            ?? defaultReflectionProvider
-    }
-
     private static func configurationWithoutPersistence(_ configuration: CognitiveConfiguration) -> CognitiveConfiguration {
         var copy = configuration
         copy.persistenceEnabled = false
@@ -2193,11 +1940,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
 
 
 
-    // 2026-09-13: reflection follows the Memory and mind group. Empty means
-    // "ask the router"; a model named here was a route chosen in code, and on a
-    // ChatGPT-only install it named one that account cannot serve.
-    static let defaultReflectionModel = ""  // internal for actor extensions (move-only Wave C)
-    private static let defaultReflectionProvider = ""
     private static let enabledKey = "cognitiveSubstrateEnabled"
     private static let capsuleKey = "cognitiveSubstrateCapsuleEnabled"
     private static let backgroundKey = "cognitiveSubstrateBackgroundEnabled"
@@ -2209,6 +1951,4 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// knob: the ceiling is what User steers; this is the shape's tuning seam.
     private static let reflectionLoadThresholdKey = "cognitiveSubstrateReflectionLoadThreshold"
     static let organismKernelEnabledKey = "organismKernelEnabled"  // internal for actor extensions (move-only Wave C)
-    static let reflectionModelKey = "cognitiveSubstrateReflectionModel"
-    static let reflectionProviderKey = "cognitiveSubstrateReflectionProvider"
 }

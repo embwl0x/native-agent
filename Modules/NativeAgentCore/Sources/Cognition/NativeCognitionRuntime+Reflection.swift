@@ -36,13 +36,11 @@ extension NativeCognitionRuntime {
     /// durable and the daily integrity sweep (or the next commit) catches it.
     /// Budget/enabled/reservation gating stays inside `runReflectionIfDue`;
     /// this path adds no new unattended-LLM authority. Gated to the live app
-    /// body so alternate-root test runtimes never fire provider work (the
-    /// override seam bypasses that gate for proofs, mirroring replay's).
+    /// body so alternate-root runtimes never fire provider work.
     func scheduleEventDrivenReflection(reason: String) {
         guard !isFlushedForTermination else { return }
-        guard usesLiveAppBody || eventDrivenReflectionOperationOverride != nil else { return }
+        guard usesLiveAppBody else { return }
         guard reflectionEventTask == nil else { return }
-        eventDrivenReflectionAttemptCount &+= 1
         reflectionEventTask = Task { [weak self] in
             await self?.runEventDrivenReflection(reason: reason)
         }
@@ -50,10 +48,6 @@ extension NativeCognitionRuntime {
 
     private func runEventDrivenReflection(reason: String) async {
         defer { reflectionEventTask = nil }
-        if let override = eventDrivenReflectionOperationOverride {
-            await override(reason)
-            return
-        }
         guard !isFlushedForTermination, !Task.isCancelled else { return }
         let outcome = await runReflectionIfDue(
             llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self),
@@ -74,16 +68,6 @@ extension NativeCognitionRuntime {
         let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
         return (String(text.prefix(600)), "dream_diary/\(newest.filename ?? newest.date)")
-    }
-
-    func eventDrivenReflectionAttemptCountForProof() -> UInt64 {
-        eventDrivenReflectionAttemptCount
-    }
-
-    /// Proof seam: await the in-flight event-driven reflection task so tests
-    /// can assert on its effects without wall-clock polling.
-    func drainEventDrivenReflectionForProof() async {
-        await reflectionEventTask?.value
     }
 
     /// `demand` decides what the call has to earn. `.spontaneous` (the loops and
@@ -372,83 +356,66 @@ extension NativeCognitionRuntime {
                     "error": .string(String(describing: error)),
                 ])
             )
-            guard let receipt = await substrate.recordReflectionResult(
+            if let failure = await settleReflectionResult(
                 request: request,
                 resultSummary: "reflection failed: persona load failed: \(String(describing: error))",
-                provider: request.provider
-            ) else {
-                scheduleDirtyMicrocycle(reason: "reflection_result")
-                return .failed("reflection persona failure was not accepted by the substrate")
-            }
-            do {
-                try await substrate.persistReflectionResultChecked(receipt)
-            } catch {
-                scheduleDirtyMicrocycle(reason: "reflection_result")
-                return .failed("reflection persona failure receipt persistence failed: \(error.localizedDescription)")
-            }
-            scheduleDirtyMicrocycle(reason: "reflection_result")
+                rejection: "reflection persona failure was not accepted by the substrate",
+                persistenceFailure: "reflection persona failure receipt persistence failed"
+            ) { return failure }
             return .failed("reflection persona load failed: \(error.localizedDescription)")
         } catch is CancellationError {
-            guard let receipt = await substrate.recordReflectionResult(
+            if let failure = await settleReflectionResult(
                 request: request,
                 resultSummary: "reflection cancelled",
-                provider: request.provider,
-                cancelled: true
-            ) else {
-                scheduleDirtyMicrocycle(reason: "reflection_result")
-                return .failed("reflection cancellation was not accepted by the substrate")
-            }
-            do {
-                try await substrate.persistReflectionResultChecked(receipt)
-            } catch {
-                scheduleDirtyMicrocycle(reason: "reflection_result")
-                return .failed("reflection cancellation receipt persistence failed: \(error.localizedDescription)")
-            }
-            scheduleDirtyMicrocycle(reason: "reflection_result")
+                cancelled: true,
+                rejection: "reflection cancellation was not accepted by the substrate",
+                persistenceFailure: "reflection cancellation receipt persistence failed"
+            ) { return failure }
             return .skipped("reflection cancelled")
         } catch {
-            guard let receipt = await substrate.recordReflectionResult(
+            if let failure = await settleReflectionResult(
                 request: request,
                 resultSummary: "reflection failed: \(String(describing: error))",
-                provider: request.provider
-            ) else {
-                scheduleDirtyMicrocycle(reason: "reflection_result")
-                return .failed("reflection failure was not accepted by the substrate")
-            }
-            do {
-                try await substrate.persistReflectionResultChecked(receipt)
-            } catch {
-                scheduleDirtyMicrocycle(reason: "reflection_result")
-                return .failed("reflection failure receipt persistence failed: \(error.localizedDescription)")
-            }
-            scheduleDirtyMicrocycle(reason: "reflection_result")
+                rejection: "reflection failure was not accepted by the substrate",
+                persistenceFailure: "reflection failure receipt persistence failed"
+            ) { return failure }
             return .failed("reflection failed: \(error.localizedDescription)")
         }
 
-        guard let receipt = await substrate.recordReflectionResult(
+        if let failure = await settleReflectionResult(
             request: request,
             resultSummary: result,
-            provider: request.provider
-        ) else {
-            scheduleDirtyMicrocycle(reason: "reflection_result")
-            return .failed("reflection result was not accepted by the substrate")
-        }
-        do {
-            try await substrate.persistReflectionResultChecked(receipt)
-        } catch {
-            // The result was integrated exactly once. A persistence failure is
-            // evidence failure, not a second reflection result.
-            scheduleDirtyMicrocycle(reason: "reflection_result")
-            return .failed("reflection integrated but receipt persistence failed: \(error.localizedDescription)")
-        }
-        // Reflection can create thought seeds and review-bound standing-view
-        // proposals without passing through `observe(_:)`. Keep those internal
-        // mutations on the same event-coalesced settlement path as sensory input.
-        scheduleDirtyMicrocycle(reason: "reflection_result")
+            rejection: "reflection result was not accepted by the substrate",
+            persistenceFailure: "reflection integrated but receipt persistence failed"
+        ) { return failure }
         let persistenceEnabled = await substrate.configurationSnapshot().persistenceEnabled
         return .completed(persistenceEnabled
             ? "reflection result and receipt are durable"
             : "reflection result integrated in memory-only mode")
+    }
+
+    private func settleReflectionResult(
+        request: CognitiveReflectionRequest,
+        resultSummary: String,
+        cancelled: Bool = false,
+        rejection: String,
+        persistenceFailure: String
+    ) async -> CognitiveBackgroundRunOutcome? {
+        // Internal reflection mutations use the same coalesced settlement as sensory input.
+        defer { scheduleDirtyMicrocycle(reason: "reflection_result") }
+        guard let receipt = await substrate.recordReflectionResult(
+            request: request,
+            resultSummary: resultSummary,
+            provider: request.provider,
+            cancelled: cancelled
+        ) else { return .failed(rejection) }
+        do {
+            try await substrate.persistReflectionResultChecked(receipt)
+        } catch {
+            // A persistence failure never integrates the result a second time.
+            return .failed("\(persistenceFailure): \(error.localizedDescription)")
+        }
+        return nil
     }
 
     private func cognitiveReflectionSystemPrompt(surface: String) async throws -> String {
@@ -492,7 +459,7 @@ extension NativeCognitionRuntime {
     }
 
     public func setReflectionSelection(model: String, provider: String) async throws {
-        guard usesLiveAppBody || allowsReflectionSelectionMutationForTesting else {
+        guard usesLiveAppBody else {
             throw NSError(
                 domain: "NativeCognitionRuntime",
                 code: 409,
@@ -518,8 +485,6 @@ extension NativeCognitionRuntime {
             )
         }
         try await writeReflectionSurface(model: resolvedModel, provider: resolvedProvider)
-        UserDefaults.standard.set(resolvedModel, forKey: Self.reflectionModelKey)
-        UserDefaults.standard.set(resolvedProvider, forKey: Self.reflectionProviderKey)
         await refreshConfiguration()
         publishRuntimeChange(reason: "configuration:reflection_model")
     }
@@ -538,9 +503,7 @@ extension NativeCognitionRuntime {
                     detail: "No reflection route is configured."
                 )
             }
-            let providerID = snapshot.activeProviders[surface]
-                ?? router.inferProviderForModel(preference.model)
-                ?? ""
+            let providerID = snapshot.activeProviders[surface] ?? ""
             let providers = try await router.listProviders()
             guard let provider = providers.first(where: { $0.id == providerID }) else {
                 return NativeReflectionRouteStatus(

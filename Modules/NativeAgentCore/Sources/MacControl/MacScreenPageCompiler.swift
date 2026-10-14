@@ -38,8 +38,10 @@ public enum MacScreenPageCompiler {
         })
         // Use the existing full-context redactor, before comparing or printing
         // any text. A long paragraph is not a forty-character control hint.
-        let redacted = MacScreenViewTextRedaction.redactedNodesJSON(ordered, valueChars: fullValueChars)
         let secretContext = MacScreenViewTextRedaction.nodeSecretContext(ordered)
+        let redacted = ordered.map {
+            MacScreenViewTextRedaction.redactedNodeJSON($0, valueChars: fullValueChars, context: secretContext)
+        }
         var words: [[Int]: (title: String?, value: String?)] = [:]
         for (node, json) in zip(ordered, redacted) {
             guard case .object(let fields) = json else { continue }

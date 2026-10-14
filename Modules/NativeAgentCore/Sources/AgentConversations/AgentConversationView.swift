@@ -1,5 +1,6 @@
 import AgentWorkspace
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// Agent evidence and presentation over an already-authorized read. No transcript, latest-
@@ -22,13 +23,9 @@ public enum AgentConversationView {
     }
 
     public static func claudeWorklog(input: [String: JSONValue] = [:]) -> JSONValue {
-        let iso = ISO8601DateFormatter()
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions.insert(.withFractionalSeconds)
-        func date(_ text: String) -> Date? { iso.date(from: text) ?? fractional.date(from: text) }
         var since: Date?
         if case .string(let text)? = input["since"], !text.isEmpty {
-            since = text == "today" ? Calendar.current.startOfDay(for: Date()) : date(text)
+            since = text == "today" ? Calendar.current.startOfDay(for: Date()) : NativeTimestampFormat.parseISO8601(text)
             guard since != nil else {
                 return .object(["status": .string("failed"), "detail": .string("since must be today or an ISO 8601 timestamp with timezone.")])
             }
@@ -48,7 +45,7 @@ public enum AgentConversationView {
             return .object(["status": .string("unavailable"), "detail": .string("Claude's worklog could not be read. Check its file permissions.")])
         }
         let entries = rows.compactMap { row -> (Date, JSONValue)? in
-            guard let ts = row["ts"] as? String, let at = date(ts),
+            guard let ts = row["ts"] as? String, let at = NativeTimestampFormat.parseISO8601(ts),
                   since.map({ at >= $0 }) ?? true,
                   let summary = row["summary"] as? String, let kind = row["kind"] as? String else { return nil }
             return (at, .object([

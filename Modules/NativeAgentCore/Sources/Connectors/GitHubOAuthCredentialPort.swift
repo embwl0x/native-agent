@@ -9,3 +9,5 @@ public protocol GitHubOAuthCredentialPort: Sendable {
                         persistConnection: @Sendable () async throws -> Void) async throws
     func resolveToken(dataRoot: URL) async throws -> String?
 }
+
+extension GitHubCredentialStore: GitHubOAuthCredentialPort {}

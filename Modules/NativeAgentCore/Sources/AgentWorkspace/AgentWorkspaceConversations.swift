@@ -37,7 +37,7 @@ enum AgentWorkspaceConversations {
         // Every conversation she has, whichever chat it began in: one desktop.
         // Newest per contact and thread name; bots keep one continuous row.
         var seen: Set<String> = []
-        let records = try AgentWorkspaceConversationReader(dataRoot: dataRoot).records()
+        let records = try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)
             .sorted { lhs, rhs in
                 if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
                 return lhs.id < rhs.id
@@ -95,7 +95,7 @@ enum AgentWorkspaceConversations {
                 guard let botRead else { return nil }
                 return AgentWorkspaceChanges.evaluate(location: location, result: botRead, previous: previous)
             }
-            return AgentWorkspaceConversationProjection.workspaceChangeObservation(record, location: location, previous: previous)
+            return AgentWorkspaceChanges.workspaceChangeObservation(record, location: location, previous: previous)
         }
         let candidate = evaluate(nil)
         let previous = candidate?.nextStamp.flatMap { next in observations.first { $0.identity == next.identity } }
@@ -308,7 +308,7 @@ struct AgentWorkSession {
 
     static func people(dataRoot: URL) -> [(agent: String, name: String)] {
         [("claude", "Claude"), ("codex", "Codex"), ("omp", "Omp")]
-            + ((try? AgentWorkspacePeerReader(dataRoot: dataRoot).list()) ?? []).map { ("peer:" + $0.id, $0.name) }
+            + ((try? AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot)) ?? []).map { ("peer:" + $0.id, $0.name) }
     }
 
     /// The one person this sender is, or nil when none or several match.

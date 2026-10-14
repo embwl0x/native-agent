@@ -4,16 +4,18 @@ import PersistenceCore
 
 extension iCloudBridge {
     /// The durable receipt seam for both CloudKit and Drive sends. Keeping the
-    /// row construction and capped append here lets evaluations exercise the
+    /// row construction and durable append here lets evaluations exercise the
     /// exact persisted evidence without opening a live transport.
+    @discardableResult
     nonisolated static func appendChatDeliveryReceipt(
         _ message: BridgeMessage,
         direction: String,
         transport: String,
         status: ChatDeliveryReceiptStatus,
         secret: Data,
-        dataRoot: URL
-    ) async {
+        dataRoot: URL,
+        detail: String? = nil
+    ) async -> Bool {
         var fields: [String: JSONValue] = [
             "at": .string(ISO8601DateFormatter().string(from: Date())),
             "messageId": .string(message.id),
@@ -29,14 +31,18 @@ extension iCloudBridge {
             "targetSourceKey": message.metadata?["targetSourceKey"].map { .string($0) } ?? .null,
             "textPreview": .string(String(message.text.prefix(240))),
             "attachmentCount": .int(Int64(message.attachments?.count ?? 0)),
+            "assistantRunId": message.metadata?["assistantRunId"].map(JSONValue.string) ?? message.correlationID.map(JSONValue.string) ?? .null,
         ]
         if let eventID = message.metadata?["userInfo.eventId"] ?? message.metadata?["eventId"] {
             fields["eventId"] = .string(eventID)
         }
-        _ = try? await upsertChatDeliveryReceipt(
+        if let run = message.metadata?["canonicalAnswerRunId"] { fields["canonicalAnswerRunId"] = .string(run) }
+        if let session = message.metadata?["canonicalAnswerSessionId"] { fields["canonicalAnswerSessionId"] = .string(session) }
+        if let detail { fields["outcomeDetail"] = .string(detail) }
+        return (try? await upsertChatDeliveryReceipt(
             appendRow: .object(fields),
             dataRoot: dataRoot
-        )
+        )) == true
     }
 
     static func appendActionResponseDeliveryReceipt(
@@ -148,9 +154,7 @@ extension iCloudBridge {
                 appendRow: fallback,
                 match: ChatDeliveryReceiptMatch(
                     direction: cleanDirection,
-                    eventID: cleanEventID,
-                    correlationID: nil,
-                    kind: nil
+                    eventID: cleanEventID
                 ),
                 updateFields: [
                     "direction": .string(cleanDirection),
@@ -176,16 +180,10 @@ extension iCloudBridge {
 
     private struct ChatDeliveryReceiptMatch: Sendable {
         let direction: String
-        let eventID: String?
-        let correlationID: String?
-        let kind: String?
+        let eventID: String
 
         func matches(_ fields: [String: JSONValue]) -> Bool {
-            guard stringField(fields["direction"]) == direction else { return false }
-            if let eventID, stringField(fields["eventId"]) != eventID { return false }
-            if let correlationID, stringField(fields["correlationId"]) != correlationID { return false }
-            if let kind, stringField(fields["kind"]) != kind { return false }
-            return true
+            stringField(fields["direction"]) == direction && stringField(fields["eventId"]) == eventID
         }
     }
 
@@ -202,6 +200,9 @@ extension iCloudBridge {
             let existing = try loadChatDeliveryReceiptRows(path: path)
             var rows = existing
             var matchedIndex: Int?
+            if case .object(let fields) = appendRow, let id = stringField(fields["messageId"]) {
+                matchedIndex = rows.firstIndex { stringField($0["messageId"]) == id && $0["direction"] == fields["direction"] }
+            }
             if let match {
                 for index in rows.indices.reversed() {
                     if match.matches(rows[index]) {
@@ -217,12 +218,14 @@ extension iCloudBridge {
                 }
                 rows[matchedIndex] = merged
             } else if case .object(let fields) = appendRow {
-                rows.append(fields)
+                if let matchedIndex {
+                    let accepted = ["accepted_by_transport", "confirmed_by_peer", "delivered_to_mac"]
+                    if !accepted.contains(stringField(rows[matchedIndex]["status"]) ?? "") || fields["status"] == .string("confirmed_by_peer") {
+                        rows[matchedIndex].merge(fields, uniquingKeysWith: { _, new in new })
+                    }
+                } else { rows.append(fields) }
             } else {
                 return false
-            }
-            if rows.count > 500 {
-                rows = Array(rows.suffix(500))
             }
             try saveChatDeliveryReceiptRows(rows, path: path)
             // 2026-09-07: true means "durably persisted", whether by updating a
@@ -232,100 +235,40 @@ extension iCloudBridge {
         }
     }
 
-    /// Tolerant, self-healing load. This store was appended non-atomically for
-    /// most of its life, so a torn last line can already exist on disk at
-    /// upgrade time. Throwing on it made `upsertChatDeliveryReceipt` fail
-    /// forever — every append swallows the error with `try?`, and
-    /// `confirmChatDeliveryReceipt` then answers false permanently, so the
-    /// phone's `recordNotificationReceipt` fails with
-    /// `receipt_persistence_failed` and never recovers. Skip the unparseable
-    /// lines instead, but never drop the bytes silently: the damaged original
-    /// is renamed aside as `.stale-<ts>` before the rebuilt store is written.
-    nonisolated private struct DamagedReceiptStoreNotPreserved: Error {}
-
-    nonisolated private static func loadChatDeliveryReceiptRows(path: URL) throws -> [[String: JSONValue]] {
+    /// Delivery evidence is never discarded to repair a malformed journal.
+    nonisolated static func loadChatDeliveryReceiptRows(path: URL) throws -> [[String: JSONValue]] {
         let data: Data
-        do {
-            data = try Data(contentsOf: path)
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return []
-        } catch {
-            // 2026-09-07 (Agent): a present-but-unreadable store is not an empty
-            // one; returning [] here would let the rewrite overwrite it.
-            throw error
+        do { data = try Data(contentsOf: path) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+        guard let text = String(data: data, encoding: .utf8), data.isEmpty || data.last == 0x0A else {
+            throw CocoaError(.fileReadCorruptFile)
         }
-        guard let text = String(data: data, encoding: .utf8) else {
-            // Not even UTF-8 — the whole file is unreadable. Preserve it aside
-            // rather than letting the atomic rewrite overwrite the evidence.
-            guard quarantineDamagedChatDeliveryReceipts(path: path, reason: "file is not valid UTF-8") else {
-                throw DamagedReceiptStoreNotPreserved()
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.last?.isEmpty == true { lines.removeLast() }
+        return try lines.map { line in
+            guard case .object(let fields) = try JSONValue.parse(Data(line.utf8)),
+                  case .string(let status)? = fields["status"], ChatDeliveryReceiptStatus(rawValue: status) != nil,
+                  case .string(let direction)? = fields["direction"], ["mac_to_ios", "ios_to_mac"].contains(direction),
+                  case .string? = fields["kind"] else {
+                throw CocoaError(.fileReadCorruptFile)
             }
-            return []
-        }
-        var rows: [[String: JSONValue]] = []
-        var damagedLines = 0
-        for line in text.split(whereSeparator: \.isNewline) {
-            let raw = String(line)
-            if raw.trimmingCharacters(in: .whitespaces).isEmpty { continue }
-            guard
-                let parsed = try? JSONValue.parse(Data(raw.utf8)),
-                case .object(let object) = parsed
-            else {
-                damagedLines += 1
-                continue
+            if fields["direction"] == .string("mac_to_ios"),
+               [JSONValue.string("reply"), .string("codex_completion")].contains(fields["kind"] ?? .null)
+                  || fields["kind"] == .string("rejection") && fields["canonicalAnswerRunId"] != nil {
+                guard status != "delivered_to_mac",
+                      case .string(let correlation)? = fields["correlationId"], !correlation.isEmpty,
+                      case .string(let identity) = fields["assistantRunId"] ?? fields["correlationId"] ?? .null,
+                      !identity.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
             }
-            rows.append(object)
-        }
-        if damagedLines > 0 {
-            // 2026-09-07: if the damaged bytes cannot be preserved aside, the
-            // rebuilt store must not overwrite them; the caller fails instead.
-            guard quarantineDamagedChatDeliveryReceipts(
-                path: path,
-                reason: "\(damagedLines) unparseable row(s)"
-            ) else {
-                throw DamagedReceiptStoreNotPreserved()
-            }
-        }
-        return rows
-    }
-
-    /// Rename the damaged store aside instead of deleting it. The caller
-    /// rewrites `path` from the rows it could parse, so the quarantined copy is
-    /// the only remaining record of the bytes that were dropped.
-    @discardableResult
-    nonisolated private static func quarantineDamagedChatDeliveryReceipts(path: URL, reason: String) -> Bool {
-        let fm = FileManager.default
-        var destination = path.appendingPathExtension("stale-\(Int(Date().timeIntervalSince1970))")
-        if fm.fileExists(atPath: destination.path) {
-            destination = destination.appendingPathExtension(UUID().uuidString.prefix(8).lowercased())
-        }
-        do {
-            try fm.moveItem(at: path, to: destination)
-            nativeLog(
-                "[iCloudBridge] chat delivery receipts self-healed (%@); damaged store preserved at %@",
-                reason,
-                destination.lastPathComponent
-            )
-            return true
-        } catch {
-            nativeLog(
-                "[iCloudBridge] chat delivery receipts damaged (%@) but could not be preserved aside: %@",
-                reason,
-                error.localizedDescription
-            )
-            return false
+            return fields
         }
     }
 
     nonisolated private static func saveChatDeliveryReceiptRows(_ rows: [[String: JSONValue]], path: URL) throws {
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
         let serialized = try rows.map { try JSONValue.object($0).serialize(pretty: false) }
             .joined(separator: "\n")
         let data = Data((serialized.isEmpty ? "" : serialized + "\n").utf8)
-        try data.write(to: path, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
     }
 
     nonisolated private static func stringField(_ value: JSONValue?) -> String? {

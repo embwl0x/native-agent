@@ -3,31 +3,6 @@ import NativeAgentCore
 import PersistenceCore
 
 public enum NativeActionDispatch {
-    public static func swiftNativeDispatcherActions() -> LocalConnectorActions {
-        var handlers: [String: ConnectorActionHandler] = [:]
-        var sideEffecting: Set<String> = []
-        var trivialVerify: Set<String> = []
-        func merge(_ reg: LocalConnectorActions) {
-            for name in reg.toolNames {
-                handlers[name] = { input, ctx in reg.run(name, input: input, ctx: ctx) ?? .null }
-                if reg.isSideEffecting(name) { sideEffecting.insert(name) }
-                if reg.isTrivialVerify(name) { trivialVerify.insert(name) }
-            }
-        }
-        merge(.personaReadOnly)
-        merge(.workspaceListReadOnly)
-        merge(.timeNowReadOnly)
-        merge(.personaListSkillsReadOnly)
-        merge(.readFileReadOnly)
-        merge(.fileExcerptReadOnly)
-        merge(.systemInfoReadOnly)
-        return LocalConnectorActions(
-            handlers: handlers,
-            sideEffecting: sideEffecting,
-            trivialVerify: trivialVerify
-        )
-    }
-
     public static func dispatchNativeAction(
         tool: String,
         input: [String: JSONValue],
@@ -37,7 +12,7 @@ public enum NativeActionDispatch {
         let ledger = DispatchLedger(ledgerPath: DispatchLedger.defaultLedgerPath(
             dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
         ))
-        let dispatcher = makeDispatcher(ledger: ledger, localActions: swiftNativeDispatcherActions())
+        let dispatcher = makeDispatcher(ledger: ledger, localActions: .nativeReadOnly)
         let ctx = try strictDispatchContextForTool(tool, surface: "native_actions", dataRoot: dataRoot)
         return try await dispatcher.dispatch(tool: tool, input: input, ctx: ctx, dryRun: dryRun)
     }

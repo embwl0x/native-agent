@@ -1,7 +1,6 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import Skills
 
 // Persona tool writes hold one cross-process file lock around each target's
 // read, backup and mutation. USER.md remains owned by MemoryV2.
@@ -11,8 +10,7 @@ extension SwiftNativePersonaEngine {
     // USER.md is intentionally absent from the mutation sets. MemoryV2 owns
     // USER.md and regenerates it from SQLite; persona tools may read it, but
     // direct writes would split the projection from the source of truth.
-    static let personaWriteKinds: Set<String> = ["soul", "skill", "voice", "growth", "agents"]
-    static let personaAppendKinds: Set<String> = ["soul", "voice", "growth", "agents"]
+    static let personaWriteKinds: Set<String> = ["soul", "voice", "growth", "agents"]
     static let memoryOwnedUserDocMessage =
         "USER.md is generated from MemoryV2; use app memory.commit or memory proposal tools for durable user facts."
 
@@ -28,16 +26,9 @@ extension SwiftNativePersonaEngine {
     }
 
     /// `[A-Za-z0-9_-]+`, matching the daemon `_validate_skill_name` / `_SKILL_NAME_RE`.
-    static func validateSkillName(_ name: String) -> Bool {
-        guard !name.isEmpty else { return false }
-        return name.allSatisfy { ch in
-            ch.isASCII && (ch.isLetter || ch.isNumber || ch == "_" || ch == "-")
-        }
-    }
-
     /// Resolve the on-disk persona path for a tool `kind` (post-canonicalization).
     /// SOUL/VOICE/GROWTH/AGENTS live under the persona root; USER is deliberately
-    /// absent because MemoryV2 owns that projection. Skills owns skill bodies.
+    /// absent because MemoryV2 owns that projection. Routine authoring uses the app door.
     /// Returns `nil` for an unknown kind.
     func personaToolPath(kind: String) -> URL? {
         switch kind {
@@ -59,7 +50,7 @@ extension SwiftNativePersonaEngine {
     /// `with _persona_write_lock, file_lock(target)`). `keeping` sees the
     /// document being replaced under that lock and throws to refuse the write.
     @discardableResult
-    public func personaWrite(kind: String, content: String, skillName: String?,
+    public func personaWrite(kind: String, content: String,
                              keeping: (@Sendable (_ current: String) throws -> Void)? = nil) async throws -> PersonaToolWriteResult {
         let canon = Self.canonicalizeKind(kind)
         if canon == "user" {
@@ -70,44 +61,6 @@ extension SwiftNativePersonaEngine {
                 "kind must be one of: \(Self.personaWriteKinds.sorted().joined(separator: ", "))"
             )
         }
-        // skill kind requires + validates skill_name (daemon L3630-3634).
-        if canon == "skill" {
-            guard let name = skillName, !name.isEmpty else {
-                throw PersonaWriteError.invalidInput("skill_name is required when kind=skill")
-            }
-            guard Self.validateSkillName(name) else {
-                throw PersonaWriteError.invalidInput(
-                    "skill_name '\(name)' contains invalid characters (only A-Za-z0-9_- allowed)"
-                )
-            }
-            let hygieneViolations = SkillBodyHygiene.violations(in: content)
-            if !hygieneViolations.isEmpty {
-                throw PersonaWriteError.invalidInput(
-                    "skill body hygiene failed: \(SkillBodyHygiene.failureMessage(for: hygieneViolations))"
-                )
-            }
-            let record = try await SwiftNativeSkillsClient(root: dataRootURL).createSkill(body: .object([
-                "name": .string(name),
-                "content": .string(content),
-                "autoCreated": .bool(true),
-            ]))
-            guard case .object(let fields) = record,
-                  case .string(let path)? = fields["bodyPath"] else {
-                throw PersonaWriteError.ioFailure("Skill write returned no body path")
-            }
-            let target = URL(fileURLWithPath: path)
-            await flushDerivedPersonaChange(target, reason: "persona_tool_write")
-            return PersonaToolWriteResult(
-                kind: canon, path: path, backupPath: nil,
-                bytesWritten: try Data(contentsOf: target).count, bytesAppended: nil
-            )
-        } else if let name = skillName, !name.isEmpty, !Self.validateSkillName(name) {
-            // Daemon validates a present skill_name for ANY kind (L3633).
-            throw PersonaWriteError.invalidInput(
-                "skill_name '\(name)' contains invalid characters (only A-Za-z0-9_- allowed)"
-            )
-        }
-
         guard let target = personaToolPath(kind: canon) else {
             throw PersonaWriteError.invalidInput("Could not resolve persona path")
         }
@@ -115,10 +68,17 @@ extension SwiftNativePersonaEngine {
         let contentBytes = Array(content.utf8)
         let persistence = SwiftNativePersistenceCore()
         let backupPath: String? = try await persistence.withFileLock(target) {
-            if let keeping, FileManager.default.fileExists(atPath: target.path) {
-                try keeping(try String(contentsOf: target, encoding: .utf8))
+            let original = FileManager.default.fileExists(atPath: target.path)
+                ? try Data(contentsOf: target) : nil
+            if let keeping, let original {
+                guard let current = String(data: original, encoding: .utf8) else {
+                    throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [
+                        NSFilePathErrorKey: target.path, NSStringEncodingErrorKey: String.Encoding.utf8.rawValue
+                    ])
+                }
+                try keeping(current)
             }
-            let backup = try Self.backupIfExists(target)
+            let backup = try Self.backup(target, data: original)
             try Self.atomicWriteText(content, to: target)
             return backup
         }
@@ -146,9 +106,9 @@ extension SwiftNativePersonaEngine {
         if canon == "user" {
             throw PersonaWriteError.invalidInput(Self.memoryOwnedUserDocMessage)
         }
-        guard Self.personaAppendKinds.contains(canon) else {
+        guard Self.personaWriteKinds.contains(canon) else {
             throw PersonaWriteError.invalidInput(
-                "kind must be one of: \(Self.personaAppendKinds.sorted().joined(separator: ", "))"
+                "kind must be one of: \(Self.personaWriteKinds.sorted().joined(separator: ", "))"
             )
         }
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -167,15 +127,11 @@ extension SwiftNativePersonaEngine {
 
         let persistence = SwiftNativePersistenceCore()
         let backupPath: String? = try await persistence.withFileLock(target) {
-            let existing: String
-            if FileManager.default.fileExists(atPath: target.path) {
-                existing = try Self.readPersonaTextForAppend(at: target)
-            } else {
-                existing = ""
-            }
-            let backup = try Self.backupIfExists(target)
+            let existing = FileManager.default.fileExists(atPath: target.path)
+                ? try Self.readPersonaTextForAppend(at: target) : nil
+            let backup = try Self.backup(target, data: existing?.data)
             // new_content = existing.rstrip() + new_section
-            let newContent = Self.rstrip(existing) + newSection
+            let newContent = Self.rstrip(existing?.text ?? "") + newSection
             try Self.atomicWriteText(newContent, to: target)
             return backup
         }
@@ -197,9 +153,15 @@ extension SwiftNativePersonaEngine {
     /// persona documents. An existing unreadable file is authority we cannot
     /// safely merge, never an empty document; fail before backup/write so the
     /// original bytes remain the only state until an explicit repair occurs.
-    private static func readPersonaTextForAppend(at url: URL) throws -> String {
+    private static func readPersonaTextForAppend(at url: URL) throws -> (text: String, data: Data) {
         do {
-            return try String(contentsOf: url, encoding: .utf8)
+            let data = try Data(contentsOf: url)
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [
+                    NSFilePathErrorKey: url.path, NSStringEncodingErrorKey: String.Encoding.utf8.rawValue
+                ])
+            }
+            return (text, data)
         } catch {
             throw PersonaWriteError.ioFailure(
                 "Cannot append to unreadable \(url.lastPathComponent): \(error.localizedDescription)"
@@ -208,9 +170,8 @@ extension SwiftNativePersonaEngine {
     }
 
     func flushDerivedPersonaChange(_ target: URL, reason: String) async {
-        let namespace = target.path.contains("/skills/bodies/") ? "skill" : "persona"
         await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
-            namespace: namespace,
+            namespace: "persona",
             stableID: target.lastPathComponent,
             operation: .changed,
             canonicalLocator: target.path,
@@ -235,8 +196,8 @@ extension SwiftNativePersonaEngine {
     /// `ts = strftime("%Y%m%dT%H%M%S%fZ")` (UTC, microseconds) and
     /// `uid = uuid4().hex[:8]`. Returns the backup path (or `nil` if the target
     /// did not exist -- no backup needed). Byte-for-byte copy.
-    static func backupIfExists(_ target: URL) throws -> String? {
-        guard FileManager.default.fileExists(atPath: target.path) else { return nil }
+    static func backup(_ target: URL, data: Data?) throws -> String? {
+        guard let data else { return nil }
         let ts = backupTimestamp()
         let uid = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(8))
         // Python with_suffix(suffix + ".pre-...") REPLACES the final suffix with
@@ -244,7 +205,6 @@ extension SwiftNativePersonaEngine {
         // (the old ".md" is kept because the new suffix string starts with it).
         let backupURL = target.deletingPathExtension()
             .appendingPathExtension("\(target.pathExtension).pre-\(ts)-\(uid).bak")
-        let data = try Data(contentsOf: target)
         do {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: backupURL)
         } catch {

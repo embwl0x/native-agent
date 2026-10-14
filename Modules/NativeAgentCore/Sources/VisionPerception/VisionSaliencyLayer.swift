@@ -19,40 +19,18 @@ import Vision
 // It is emphatically NOT a detector. A CoreML UI-element detector stays out of
 // v0 by design; it must earn its way in with the MEASURED misses of (a)+(b).
 
-public protocol VisionSalienceProviding: Sendable {
-    /// Salient boxes in image pixel coordinates, most salient first, each with
-    /// a 0…1 score.
-    func salientRegions(in image: CGImage) throws -> [(rect: VisionRect, score: Double)]
-}
-
-public struct VisionSaliencyConfig: Sendable, Equatable {
+public enum VisionSaliencyLayer {
     /// A candidate overlapping a salient box by at least this IoU is "seen by
     /// saliency" and gets the rank boost.
-    public let matchIoU: Double
+    private static let matchIoU: Double = 0.25
     /// A salient box smaller/larger than these fractions of frame area is not
     /// offered as a new candidate (a speck, or the whole window).
-    public let minAreaFraction: Double
-    public let maxAreaFraction: Double
+    private static let minAreaFraction: Double = 0.0004
+    private static let maxAreaFraction: Double = 0.35
     /// At most this many saliency-only candidates. Attention maps are blobby;
     /// an unbounded add would swamp the precise candidates with vague ones.
-    public let maxAdded: Int
+    private static let maxAdded: Int = 8
 
-    public init(
-        matchIoU: Double = 0.25,
-        minAreaFraction: Double = 0.0004,
-        maxAreaFraction: Double = 0.35,
-        maxAdded: Int = 8
-    ) {
-        self.matchIoU = matchIoU
-        self.minAreaFraction = minAreaFraction
-        self.maxAreaFraction = maxAreaFraction
-        self.maxAdded = maxAdded
-    }
-
-    public static let `default` = VisionSaliencyConfig()
-}
-
-public enum VisionSaliencyLayer {
     /// Attention bounds are deliberately soft. A glow, shadow, or focus halo
     /// can make the saliency box several times larger than the precise colour
     /// region at its centre, leaving their IoU below the ordinary overlap
@@ -63,8 +41,7 @@ public enum VisionSaliencyLayer {
     /// because the control happens to sit inside it.
     static func corroborates(
         _ salient: VisionRect,
-        _ candidate: VisionRect,
-        matchIoU: Double
+        _ candidate: VisionRect
     ) -> Bool {
         if salient.iou(candidate) >= matchIoU { return true }
         let smaller = salient.area <= candidate.area ? salient : candidate
@@ -82,8 +59,7 @@ public enum VisionSaliencyLayer {
     public static func fold(
         salient: [(rect: VisionRect, score: Double)],
         into candidates: [VisionCandidate],
-        imageSize: VisionSize,
-        config: VisionSaliencyConfig = .default
+        imageSize: VisionSize
     ) -> [VisionCandidate] {
         guard !salient.isEmpty else { return candidates }
         let frameArea = imageSize.width * imageSize.height
@@ -91,7 +67,7 @@ public enum VisionSaliencyLayer {
 
         var ranked = candidates.map { candidate -> VisionCandidate in
             let best = salient
-                .filter { corroborates($0.rect, candidate.rect, matchIoU: config.matchIoU) }
+                .filter { corroborates($0.rect, candidate.rect) }
                 .map(\.score)
                 .max()
             guard let best else { return candidate }
@@ -100,12 +76,12 @@ public enum VisionSaliencyLayer {
 
         var added = 0
         for region in salient.sorted(by: { $0.score > $1.score }) {
-            guard added < config.maxAdded else { break }
+            guard added < maxAdded else { break }
             let areaFraction = region.rect.area / frameArea
-            guard areaFraction >= config.minAreaFraction,
-                  areaFraction <= config.maxAreaFraction else { continue }
+            guard areaFraction >= minAreaFraction,
+                  areaFraction <= maxAreaFraction else { continue }
             let covered = ranked.contains {
-                corroborates(region.rect, $0.rect, matchIoU: config.matchIoU)
+                corroborates(region.rect, $0.rect)
             }
             if covered { continue }
             // Saliency bounds are BLOBBY — the attention map is coarse and the
@@ -125,7 +101,7 @@ public enum VisionSaliencyLayer {
 }
 
 #if canImport(Vision)
-public struct VisionKitSalienceProvider: VisionSalienceProviding {
+public struct VisionKitSalienceProvider: Sendable {
     public init() {}
 
     public func salientRegions(in image: CGImage) throws -> [(rect: VisionRect, score: Double)] {
@@ -150,16 +126,3 @@ public struct VisionKitSalienceProvider: VisionSalienceProviding {
     }
 }
 #endif
-
-/// Deterministic provider for tests / replay.
-public struct VisionStaticSalienceProvider: VisionSalienceProviding {
-    public let regions: [(rect: VisionRect, score: Double)]
-
-    public init(regions: [(rect: VisionRect, score: Double)]) {
-        self.regions = regions
-    }
-
-    public func salientRegions(in image: CGImage) throws -> [(rect: VisionRect, score: Double)] {
-        regions
-    }
-}

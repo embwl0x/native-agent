@@ -30,7 +30,7 @@ final class PhoneTurnActivity: ObservableObject {
         return SHA256.hash(data: Data(secret.base64EncodedString().utf8)).map { String(format: "%02x", $0) }.joined()
     }
     func activityError(_ message: String?) { errorMessage = message }
-    private struct Turn: Codable {
+    private struct Turn: Codable, Sendable {
         let id: String
         let startedAt: Date
         let pairing: String
@@ -42,6 +42,7 @@ final class PhoneTurnActivity: ObservableObject {
     }
     private let key = "NativeAgentMobile.localLiveTurns"
     private var turns: [String: Turn] = [:]
+    private let storage = MobileLocalStorage()
     private var expirations: [String: Task<Void, Never>] = [:]
     private let staleInterval: TimeInterval = 15 * 60
 
@@ -52,8 +53,10 @@ final class PhoneTurnActivity: ObservableObject {
         }
     }
     private func save() {
-        do { UserDefaults.standard.set(try JSONEncoder().encode(turns), forKey: key) }
-        catch { errorMessage = "Live Activity state could not be saved: \(error.localizedDescription)" }
+        let rows = turns
+        storage.save(key: key, value: { rows }) { [weak self] error in
+            Task { @MainActor in self?.errorMessage = "Live Activity state could not be saved: \(error.localizedDescription)" }
+        }
     }
 
     func sent(_ id: String) {
@@ -73,8 +76,8 @@ final class PhoneTurnActivity: ObservableObject {
             else if turn.expired == true { continue }
             else if (turn.updatedAt ?? turn.startedAt).addingTimeInterval(staleInterval) <= Date() { expire(turn.id) }
             else if turn.status != nil {
-                if !turn.replying, let at = turn.updatedAt, at > Date().addingTimeInterval(-120) { workingIDs.insert(turn.id) }
-                else { workingIDs.remove(turn.id) }
+                if !turn.replying, let at = turn.updatedAt, at > Date().addingTimeInterval(-120) { setWorking(turn.id, true) }
+                else { setWorking(turn.id, false) }
             }
             expireWhenStale(turn.id)
         }
@@ -95,7 +98,7 @@ final class PhoneTurnActivity: ObservableObject {
             if kind == "text_delta", !message.text.isEmpty { turn.replying = true }
             turn.updatedAt = message.timestamp
             turns[id] = turn
-            if turn.replying { workingIDs.remove(id) } else { workingIDs.insert(id) }
+            if turn.replying { setWorking(id, false) } else { setWorking(id, true) }
             save()
             expireWhenStale(id)
         case "final", "cancelled", "error", "rejection":
@@ -106,14 +109,17 @@ final class PhoneTurnActivity: ObservableObject {
     }
 
     private func expireWhenStale(_ id: String) {
-        expirations.removeValue(forKey: id)?.cancel()
-        guard let turn = turns[id], turn.expired != true else { return }
+        guard expirations[id] == nil, let turn = turns[id], turn.expired != true else { return }
         let staleDate = (turn.updatedAt ?? turn.startedAt).addingTimeInterval(staleInterval)
         expirations[id] = Task {
             do { try await Task.sleep(for: .seconds(max(0, staleDate.timeIntervalSinceNow))) }
             catch { return }
             guard !Task.isCancelled else { return }
-            expire(id)
+            expirations[id] = nil
+            guard let latest = turns[id], latest.expired != true else { return }
+            if (latest.updatedAt ?? latest.startedAt).addingTimeInterval(staleInterval) > Date() {
+                expireWhenStale(id)
+            } else { expire(id) }
         }
     }
 
@@ -123,7 +129,7 @@ final class PhoneTurnActivity: ObservableObject {
         turn.expired = true
         turn.requested = false
         turns[id] = turn
-        workingIDs.remove(id)
+        setWorking(id, false)
         trimExpiredTurns()
         save()
     }
@@ -141,11 +147,16 @@ final class PhoneTurnActivity: ObservableObject {
 
     func finish(_ id: String, status: String = "Turn ended") {
         expirations.removeValue(forKey: id)?.cancel()
-        workingIDs.remove(id)
+        setWorking(id, false)
         guard turns.removeValue(forKey: id) != nil else { return }
         save()
     }
 
-    func silence(_ id: String) { workingIDs.remove(id) }
+    private func setWorking(_ id: String, _ working: Bool) {
+        guard workingIDs.contains(id) != working else { return }
+        if working { workingIDs.insert(id) } else { workingIDs.remove(id) }
+    }
+
+    func silence(_ id: String) { setWorking(id, false) }
 
 }

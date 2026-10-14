@@ -76,39 +76,3 @@ public struct ActivitySpan: Sendable, Equatable, Identifiable {
         TimeZone.current.secondsFromGMT(for: date) / 60
     }
 }
-
-/// Aggregate answer for a window. `eventsPerHour` is v0's entire reason to
-/// exist — open item #2 in the build plan is an *estimated* event rate, and this
-/// number is what retires it.
-public struct ActivityStats: Sendable, Equatable {
-    public let from: Double
-    public let to: Double
-    public let totalSpans: Int
-    public let totalEvents: Int
-    public let distinctApps: Int
-    /// Summed OBSERVED span time inside the window, clamped to it (0 when
-    /// empty). Deliberately NOT first-start-to-last-end: lock, sleep and idle
-    /// gaps between spans are excluded, so `eventsPerHour` reads as "AX
-    /// callbacks per hour of ACTIVE use".
-    public let wallClockSeconds: Double
-    public let eventsPerHour: Double
-
-    public init(
-        from: Double,
-        to: Double,
-        totalSpans: Int,
-        totalEvents: Int,
-        distinctApps: Int,
-        wallClockSeconds: Double
-    ) {
-        self.from = from
-        self.to = to
-        self.totalSpans = totalSpans
-        self.totalEvents = totalEvents
-        self.distinctApps = distinctApps
-        self.wallClockSeconds = wallClockSeconds
-        self.eventsPerHour = wallClockSeconds > 0
-            ? Double(totalEvents) / (wallClockSeconds / 3600.0)
-            : 0
-    }
-}

@@ -4,7 +4,8 @@ import Foundation
 /// URLSession.data buffering the entire remote response before a later clip.
 final class BoundedResearchDownload: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
-    private let limit: Int
+    private var limit: Int
+    private let pdfLimit: Int?
     private var continuation: CheckedContinuation<ResearchHTTPResponse, Error>?
     private var session: URLSession?
     private var task: URLSessionDataTask?
@@ -14,8 +15,9 @@ final class BoundedResearchDownload: NSObject, URLSessionDataDelegate, @unchecke
     private var body = Data()
     private var observedBytes = 0
 
-    init(limit: Int) {
+    init(limit: Int, pdfLimit: Int?) {
         self.limit = limit
+        self.pdfLimit = pdfLimit
     }
 
     func start(request: URLRequest, configuration: URLSessionConfiguration,
@@ -74,6 +76,9 @@ final class BoundedResearchDownload: NSObject, URLSessionDataDelegate, @unchecke
         }
         lock.lock()
         self.response = http
+        if let pdfLimit, http.mimeType?.lowercased() == "application/pdf" {
+            limit = pdfLimit
+        }
         let stopped = finished || cancelled
         lock.unlock()
         completionHandler(stopped ? .cancel : .allow)
@@ -83,6 +88,11 @@ final class BoundedResearchDownload: NSObject, URLSessionDataDelegate, @unchecke
         lock.lock()
         guard !finished else { lock.unlock(); return }
         observedBytes += data.count
+        if let pdfLimit, body.count < 5 {
+            var signature = body
+            signature.append(contentsOf: data.prefix(5 - signature.count))
+            if signature == Data("%PDF-".utf8) { limit = pdfLimit }
+        }
         let remaining = max(0, limit - body.count)
         body.append(contentsOf: data.prefix(remaining))
         let truncated = data.count > remaining

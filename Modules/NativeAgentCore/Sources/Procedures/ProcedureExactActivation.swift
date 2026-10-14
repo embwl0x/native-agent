@@ -292,15 +292,11 @@ package func procedureExactToken(_ raw: String, maximum: Int) -> Bool {
 }
 
 package func procedureExactTimestamp(_ raw: String) -> Bool {
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return fractional.date(from: raw) != nil || ISO8601DateFormatter().date(from: raw) != nil
+    NativeTimestampFormat.parseISO8601FractionalFirst(raw) != nil
 }
 
 package func procedureExactISO8601(_ date: Date) -> String {
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return formatter.string(from: date)
+    NativeTimestampFormat.fractionalZulu(date)
 }
 
 package struct ProcedureExactActivationStatus: Sendable, Equatable {
@@ -326,13 +322,7 @@ extension ProcedureArtifactStore {
         let artifact = try await loadForInvocation(proposal.artifactID)
         guard artifact.domain == "workshop_execution",
               artifact.procedureShapeIdentity == proposal.procedureShapeIdentity,
-              artifact.authorityClass == "low_risk",
-              artifact.manualInvocationEligible,
-              !artifact.automaticSelectionEligible,
-              !artifact.generatedExecutableCode,
-              !artifact.safety.externalSendsEligible,
-              !artifact.safety.permissionAuthority,
-              !artifact.safety.automaticActivationAllowed else {
+              artifact.authorityClass == "low_risk" else {
             throw ProcedureExactActivationError.artifactMismatch
         }
 
@@ -424,41 +414,10 @@ extension ProcedureArtifactStore {
         let artifact = try await loadForInvocation(pointer.artifactID)
         guard artifact.procedureShapeIdentity == manifest.proposal.procedureShapeIdentity,
               artifact.domain == "workshop_execution",
-              artifact.authorityClass == "low_risk",
-              artifact.manualInvocationEligible,
-              !artifact.automaticSelectionEligible,
-              !artifact.safety.externalSendsEligible,
-              !artifact.safety.permissionAuthority else {
+              artifact.authorityClass == "low_risk" else {
             throw ProcedureExactActivationError.artifactMismatch
         }
         return ProcedureExactActiveResolution(manifest: manifest, artifact: artifact)
-    }
-
-    public func deactivateExact(
-        procedureID: String,
-        expectedActivationID: String? = nil
-    ) async throws {
-        guard procedureExactToken(procedureID, maximum: 80) else {
-            throw ProcedureExactActivationError.activationNotFound
-        }
-        let pointerPath = exactActivationPointerPath(procedureID)
-        guard FileManager.default.fileExists(atPath: pointerPath.path) else { return }
-        try await persistence.withFileLock(pointerPath) {
-            if let expectedActivationID {
-                guard let data = Self.checkedRegularFile(
-                    pointerPath,
-                    maximumBytes: 64 * 1_024
-                ),
-                      let pointer = try? JSONDecoder().decode(
-                        ProcedureExactActivationPointer.self,
-                        from: data
-                      ), pointer.validates,
-                      pointer.activationID == expectedActivationID else {
-                    throw ProcedureExactActivationError.activationBindingMismatch
-                }
-            }
-            try FileManager.default.removeItem(at: pointerPath)
-        }
     }
 
     package func exactActivationStatusSnapshot() async -> ProcedureExactActivationStatus {

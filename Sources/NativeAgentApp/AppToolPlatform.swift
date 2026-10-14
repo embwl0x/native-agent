@@ -1,3 +1,4 @@
+import EngineRuntime
 import Privacy
 import Foundation
 import ApprovalTransactions
@@ -24,6 +25,20 @@ import WorkshopExecution
 import Browser
 
 extension AppToolExecutor {
+    /// Read the last report, or explicitly run checks (false) or repair (true).
+    @MainActor
+    static func doctorStatus(repair: Bool?) async throws -> JSONValue {
+        guard let appModel = NativeAgentAppCoordinator.shared.appModel else {
+            return AppToolExecutor.unattachedFailure()
+        }
+        if let repair {
+            if case .unavailable(let reason) = await appModel.runDoctor(repair: repair, repairScope: .button) {
+                return AppToolExecutor.failure("doctor_unavailable", "Doctor did not run: \(reason)")
+            }
+        }
+        return try await appModel.engine.doctor.toolStatusEnvelope()
+    }
+
     convenience init(
         securityCenter: SwiftNativeSecurityCenter = SwiftNativeSecurityCenter(),
         enforceAutonomySecurity: Bool = true,
@@ -44,18 +59,21 @@ extension AppToolExecutor {
             securityCenter: securityCenter, enforceAutonomySecurity: enforceAutonomySecurity,
             browserActionRunner: browserActionRunner ?? Self.defaultBrowserActionRunner,
             chrome: { NativeAgentEngine.live.chrome },
-            macPersonAway: Self.macPersonAway,
+            macPersonAway: MacScreenLock.personAway,
             motorActionObserver: { await NativeAgentEngine.liveCognition.observeMotorActionState($0) },
             mobileNotificationSender: mobileNotificationSender,
             macNotificationSender: macNotificationSender,
             macIntegrationPermissionStore: macIntegrationPermissionStore,
-            doctorStatusProvider: doctorStatusProvider ?? { try await AppToolHealthHost.doctorStatus(repair: $0) },
-            telegramStatusProvider: telegramStatusProvider ?? AppToolHealthHost.telegramStatus,
+            doctorStatusProvider: doctorStatusProvider ?? { try await Self.doctorStatus(repair: $0) },
+            telegramStatusProvider: telegramStatusProvider ?? { try await TelegramFacade(dataRoot: PersistenceCore.defaultDataRoot()).toolStatusEnvelope() },
             humanConversationReplyHandler: humanConversationReplyHandler ?? { input in
                 try await NativeAgentEngine.live.agents.humanReplies.reply(input: input)
             },
-            workshopStepDecider: Self.decideBlockedWorkshopStep,
-            quietHost: { QuietSelfAdmin.shared.appModel.map(AppQuietToolHost.init) },
+            workshopStepDecider: { id, approve in
+                try await ApprovalTransactionCoordinator.app().decideBlockedWorkshopStep(
+                    id: id, approve: approve, runner: { NativeAgentEngine.makeWorkshopExecutionRunner() })
+            },
+            quietHost: { NativeAgentAppCoordinator.shared.appModel.map(AppQuietToolHost.init) },
             presentation: AppQuietToolPresentation(), interactions: AppToolInteractionResolver()
         )
     }
@@ -66,7 +84,7 @@ extension AppToolExecutor {
     ) async throws -> JSONValue {
         return try await defaultBrowserActionRunner(
             actionId: actionId, dryRun: dryRun, input: input,
-            chrome: { NativeAgentEngine.live.chrome }, macPersonAway: Self.macPersonAway,
+            chrome: { NativeAgentEngine.live.chrome }, macPersonAway: MacScreenLock.personAway,
             motorActionObserver: { await NativeAgentEngine.liveCognition.observeMotorActionState($0) },
             platform: BrowserToolPlatformPort(
                 setUpChrome: {
@@ -90,46 +108,5 @@ extension AppToolExecutor {
         return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
     }
 
-    /// Deny or Approve on the Desk's waiting step (MacWorkOverviewDetail), for
-    /// the agent: the same `rejectStep` / `approveStep`, decided in her name.
-    /// Only the step the task is blocked on; approving is User's below Full
-    /// Mac, and the door refuses it there.
-    static func decideBlockedWorkshopStep(id: String, approve: Bool) async throws -> JSONValue {
-        guard let execution = try await BackgroundLoopsAssembly.makeWorkshopExecutionRunner().getWorkshopExecution(id) else {
-            return .object(["status": .string("not_found"), "id": .string(id),
-                "detail": .string("No Desk task has this execution id. app workshop.status lists them.")])
-        }
-        // "manual" is the person's own: the Desk, the iPhone, Siri. His work is
-        // not hers to stop. Hers is "agent" (workshop_submit) or background.
-        guard approve || execution.triggerSource != "manual" else {
-            return .object(["status": .string("not_yours"), "id": .string(id),
-                "detail": .string("The person started this task, so denying its step is his call; nothing was denied. Tell him what is wrong with the step, or ask him to deny it on the Desk.")])
-        }
-        guard execution.status == "blocked_on_approval", !execution.currentStepId.isEmpty else {
-            return .object(["status": .string("not_blocked"), "id": .string(id), "execution_status": .string(execution.status),
-                "detail": .string("This task is \(execution.status), not waiting on a step approval, so there is nothing to \(approve ? "approve" : "deny").")])
-        }
-        let provenance = ApprovalResolutionProvenance.local(
-            decidedBy: PersonaCompiler.agentDisplayName(dataRoot: PersistenceCore.defaultDataRoot()))
-        if approve {
-            let record = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
-                executionId: id, stepId: execution.currentStepId, decision: "approve", provenance: provenance)
-            return .object(["status": .string("approved"), "id": .string(id), "step_id": .string(execution.currentStepId),
-                "execution_status": .string(record.status),
-                "detail": .string("Approved the waiting step; the task runs on from it.")])
-        }
-        let record = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
-            executionId: id, stepId: execution.currentStepId, decision: "reject", provenance: provenance)
-        return .object(["status": .string("rejected"), "id": .string(id), "step_id": .string(execution.currentStepId),
-            "execution_status": .string(record.status),
-            "detail": .string("Denied the waiting step; the task stops without running it.")])
-    }
-
-    static func macPersonAway() -> Bool {
-        if MacScreenLock.isLocked() { return true }
-        guard let any = CGEventType(rawValue: ~0) else { return false }
-        let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: any)
-        return idle.isFinite && idle >= 180
-    }
 
 }

@@ -2,6 +2,9 @@ import Foundation
 import ChatTurnContracts
 import StandingBots
 import ProviderRouting
+import PersistenceCore
+import Transcripts
+import NativeAgentShared
 
 /// Adapter only: all history, recall, compaction, tools and approvals belong to
 /// the ordinary chat client. No bot-owned conversational state is maintained.
@@ -23,31 +26,41 @@ public enum StandingBotContinuity {
         if let problem = contract.modelChoiceProblem {
             throw ChatOrchestrationError.helperModelChoice(
                 sessionID: sessionID, reason: problem,
-                message: "\(contract.name) can't run yet. \(problem) Choose its account, model and Think level on its helper card on the Mac. Nothing was started, and its unfinished work is kept.")
+                message: "\(contract.name) can't run yet. \(problem) Nothing was started, and its unfinished work is kept.")
         }
         return try await $currentContract.withValue(contract) {
             try await ProviderTurnChoice.$current.withValue(contract.choice, operation: operation)
         }
     }
 
+    /// Opens the checked helper session, retaining a row that a first turn created concurrently.
+    public static func openSession(for bot: BotDefinition, dataRoot: URL) async throws -> NativeAgentShared.ChatSession {
+        let path = dataRoot.appendingPathComponent("chat/sessions.json")
+        let row = try await SwiftNativePersistenceCore().withFileLock(path) {
+            var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
+            if let existing = rows.first(where: { row in
+                guard case .string(let id)? = row["id"] else { return false }
+                return id == bot.sessionID
+            }) {
+                return existing
+            }
+            rows.append([
+                "id": .string(bot.sessionID), "title": .string(bot.name), "source": .string("bot"),
+                "createdAt": .string(ISO8601DateFormatter().string(from: bot.createdAt)),
+                "archived": .bool(false), "messageCount": .int(0)
+            ])
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(ChatSessionIndexFile.serializedData(for: rows), to: path)
+            return rows[rows.count - 1]
+        }
+        return try NativeAgentShared.ChatSession(row: row)
+    }
+
     public static func session(client: SwiftNativeChatOrchestrationClient, dataRoot: URL) -> BotRunnerSession {
         { bot, message in
             try await $currentBot.withValue(bot) {
             try await TurnAdmission.shared.run(sessionID: bot.sessionID) {
-            // A bot runs on the tuple it was made with, never the agent's route
-            // (2026-09-13 review): building NO choice here is exactly what sent
-            // such a turn to Chat's model. The runner already refuses a bot with
-            // no usable tuple; this is the second line of the same rule, so no
-            // path into a bot turn can invent a route.
-            if let problem = bot.modelChoiceProblem {
-                throw StandingBotsError.invalidValue(
-                    "\(bot.name) has no model chosen: \(problem)"
-                )
-            }
-            let choice = ProviderTurnChoice(
-                provider: bot.provider ?? "", model: bot.model ?? "",
-                reasoningEffort: bot.reasoningEffort ?? "", fast: bot.fast ?? false
-            )
+            let choice = try await BotChatContract.choice(for: bot, dataRoot: dataRoot)
             try await client.importBotHistory(bot: bot, dataRoot: dataRoot)
             // A text-only account hears the limitation before the brief, so the
             // answer leads with it instead of dressing remembered text as fresh
@@ -58,7 +71,7 @@ public enum StandingBotContinuity {
             // This stays in the ordinary session; there is no second memory.
             var message = BotChatContract.instructions(for: bot)
                 + "\n\nMessage for this turn:\n" + message
-            if let provider = bot.provider, !ProviderToolCapability.supportsTools(providerID: provider) {
+            if !ProviderToolCapability.supportsTools(providerID: choice.provider) {
                 message = ProviderToolCapability.textOnlyTurnPreface + "\n\n" + message
             }
             // A BOT'S RUN IS NOT HER MOMENT, live as well as imported (Agent,

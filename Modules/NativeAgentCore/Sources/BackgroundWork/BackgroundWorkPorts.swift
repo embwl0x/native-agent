@@ -19,16 +19,17 @@ public protocol HeartbeatBackgroundWorkPort: BackgroundWorkEventPort, Background
 
 public protocol MaintenanceBackgroundWorkPort: BackgroundWorkNotificationPort {
     func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult]
+    func routeDoctorAsk(eventID: String, title: String, detail: String) async throws
     var unavailableSkipPrefix: String { get }
     func autoDoctorConfig(dataRoot: URL) -> (enabled: Bool?, intervalSeconds: Int?)
     func offDiskBackupParent() -> URL
     func offDiskAutomaticBackups(in parent: URL) throws -> [(url: URL, date: Date)]
     func createOffDiskBackup(reason: String, dataRoot: URL, parent: URL, now: Date) async throws -> URL
-    /// Skill, tool and sense retirement under the posture that allows it.
-    func capabilityUpkeep(dataRoot: URL) async
 }
 
 public protocol DelegationBackgroundWorkPort: BackgroundWorkEventPort, BackgroundWorkNotificationPort {
+    func letGoReplies(deliveryIDs: Set<String>, outcome: String, dataRoot: URL, configRoot: URL) async throws
+    func reconcileReplyDeliveries(dataRoot: URL) async throws
     func retryRequestedResults(dataRoot: URL) async throws
     var agentSubject: String { get }
     func observeMotorActionState(_ model: MotorActionReadModel) async

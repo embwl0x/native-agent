@@ -14,11 +14,6 @@ public enum NativeTimestampFormat {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
-    nonisolated(unsafe) private static let internetISO: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
     private static let utcDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
@@ -82,7 +77,7 @@ public enum NativeTimestampFormat {
 
     /// Fractional timestamps take priority for these stored-state readers.
     public static func parseISO8601FractionalFirst(_ text: String) -> Date? {
-        lock.withLock { fractionalISO.date(from: text) ?? internetISO.date(from: text) }
+        lock.withLock { fractionalISO.date(from: text) ?? plainISO.date(from: text) }
     }
 
     public static func fractionalUTCOffset(_ date: Date) -> String {

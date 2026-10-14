@@ -3,7 +3,6 @@ import CryptoKit
 import NativeAgentCore
 import MacControl
 import PersistenceCore
-import UniformTypeIdentifiers
 import CoreWLAN
 import SystemConfiguration
 #if canImport(Darwin)
@@ -33,14 +32,6 @@ let connectorGrepMaxResults = 50
 /// descriptor. Ordinary file reads never bind this port.
 public enum FileReadSourceMaterial {
     @TaskLocal public static var metadataOnly = false
-
-    /// Kinds whose format already belongs to the existing text/image reader.
-    /// The platform type graph supplies this identity; foreign binary kinds
-    /// still require the reader's content probe for a particular file.
-    public static func nativeReadableKind(_ kind: String) -> Bool {
-        VerifiedImageRead.isImagePath(URL(fileURLWithPath: "read." + kind))
-            || UTType(filenameExtension: kind)?.conforms(to: .text) == true
-    }
 
     /// What files.read itself returns real content for: images and text, by
     /// content. Anything else is foreign bytes to it, so a sense serves it.
@@ -184,7 +175,15 @@ enum FileSystemActions {
     /// `Path.resolve()` does.
     static func resolvePath(_ raw: String, repoRoot: String) -> URL {
         let base = repoRoot.isEmpty ? "." : repoRoot
-        let expanded = (raw as NSString).expandingTildeInPath
+        let path: String
+        if let address = URL(string: raw), address.isFileURL {
+            path = address.path
+        } else if !raw.hasPrefix("/"), let decoded = raw.removingPercentEncoding, decoded.hasPrefix("/") {
+            path = decoded
+        } else {
+            path = raw
+        }
+        let expanded = (path as NSString).expandingTildeInPath
         let p: URL
         if expanded.hasPrefix("/") {
             p = URL(fileURLWithPath: expanded)
@@ -334,10 +333,6 @@ enum FileSystemActions {
 
     // MARK: - read_file
 
-    /// Observes the actual regular-file read request in focused tests, without
-    /// exposing file paths/content or adding process-wide instrumentation.
-    @TaskLocal static var regularFileReadObserver: (@Sendable (Int) -> Void)?
-
     struct FileReadFailure: Error {
         let message: String
         let code: String
@@ -407,7 +402,6 @@ enum FileSystemActions {
             let byteLimit = limit(for: totalBytes)
             if FileReadSourceMaterial.metadataOnly { return (Data(), totalBytes, observedVersion, byteLimit) }
             try handle.seek(toOffset: UInt64(offset))
-            regularFileReadObserver?(byteLimit)
             let data = try handle.read(upToCount: byteLimit) ?? Data()
             if !preserveInvalidUTF8 && offset > 0 && (data.isEmpty || data.first.map { $0 & 0xC0 == 0x80 } == true) {
                 let prefixCount = min(offset, 3)
@@ -557,11 +551,11 @@ enum FileSystemActions {
             var refusal: [String: JSONValue] = ["ok": .bool(false), "error_code": .string("binary_file"),
                 "error": .string(document
                     ? "\(resolved.lastPathComponent) is a document, not plain text; nothing was read. Its text comes from mac.read."
-                    : "\(resolved.lastPathComponent) is binary, not text; nothing was read. Pass raw:true for its bytes as base64.")]
-            if document {
-                refusal["next_call"] = .object(["tool": .string("app"), "input": .object([
-                    "action": .string("mac.read"), "args": .object(["path": .string(resolved.path)])])])
-            }
+                    : "\(resolved.lastPathComponent) is binary, not text; nothing was read. Grow a sense with sense.make to understand this kind through ordinary files.read from then on. Pass raw:true for its bytes as base64.")]
+            refusal["next_call"] = .object(["tool": .string("app"), "input": .object([
+                "action": .string(document ? "mac.read" : "sense.make"),
+                "args": .object(document ? ["path": .string(resolved.path)]
+                    : ["place": .string(resolved.path), "show": .string("material")])])])
             return .object(refusal)
         }
         let window: (data: Data, totalBytes: Int, version: String?, byteLimit: Int)
@@ -782,7 +776,14 @@ enum FileSystemActions {
 
     // MARK: - write_file
 
-    static func mutationRefusal(_ resolved: URL, _ ctx: ConnectorActionContext) -> JSONValue? {
+    static func mutationRefusal(_ resolved: URL, _ ctx: ConnectorActionContext, write: Bool = true) -> JSONValue? {
+        if write {
+            do {
+                try CapabilityLifecycle.requireFileMutation(resolved,
+                    dataRoot: URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path),
+                    personaRoot: ctx.personaRoot.map { URL(fileURLWithPath: $0) })
+            } catch { return errResult(error.localizedDescription, code: "path_not_allowed") }
+        }
         let allowed = allowedRoots(ctx)
         if stringField(ctx.fileAccess, "sandbox") == "read-only" || stringField(ctx.fileAccess, "mode") == "read_only" {
             return errResult("Sandbox is read-only — cannot write files. Request write access for this session.", code: "path_not_allowed")
@@ -833,7 +834,7 @@ enum FileSystemActions {
         }
         let source = resolvePath(path, repoRoot: ctx.repoRoot), target = resolvePath(destination, repoRoot: ctx.repoRoot)
         for url in [source, target] {
-            if let refusal = mutationRefusal(url, ctx) { return refusal }
+            if let refusal = mutationRefusal(url, ctx, write: !copy || url == target) { return refusal }
         }
         let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path).resolvingSymlinksInPath()
         guard source != target, !isWithinRoots(target, [source]), !isWithinRoots(dataRoot, [source]) else {
@@ -927,6 +928,7 @@ enum FileSystemActions {
                 appendHandleOpened?()
                 // Retain Foundation's full-write and I/O-error handling; an
                 // append does not promise transactionality across callers.
+                if let refusal = mutationRefusal(resolved, ctx) { return refusal }
                 try handle.write(contentsOf: data)
             } else {
                 var existingMetadata = stat()
@@ -998,6 +1000,7 @@ enum FileSystemActions {
                         return errResult("The original file could not be verified. Read it again before revising; nothing was written.", code: "file_changed")
                     }
                 }
+                if let refusal = mutationRefusal(resolved, ctx) { return refusal }
                 if renameat(verified.fd, tmpName, verified.fd, verified.name) != 0 {
                     let err = String(cString: strerror(errno))
                     return errResult("atomic write failed: \(err)")
@@ -1545,10 +1548,6 @@ enum FileSystemActions {
     // `max_results` output lines are returned (joined + truncated). Timeout 30s
     // → bash_timeout, any other launch failure → generic error (no error_code).
 
-    /// A task-scoped lookup seam lets dispatch fixtures exercise both installed
-    /// search engines without changing the process-wide PATH.
-    @TaskLocal static var grepExecutableResolver: (@Sendable (String) -> String?)?
-
     static func grep(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let pattern = stringField(input, "pattern").trimmingCharacters(in: .whitespacesAndNewlines)
         if pattern.isEmpty { return errResult("pattern is required", code: "bad_input") }
@@ -1662,8 +1661,7 @@ enum FileSystemActions {
         }
         #endif
 
-        let resolveExecutable: @Sendable (String) -> String? = grepExecutableResolver ?? { which($0) }
-        let rgPath = resolveExecutable("rg")
+        let rgPath = which("rg")
         let launch: String
         let args: [String]
         // Patterns are regex data, never CLI options (e.g. searching --help
@@ -1679,7 +1677,7 @@ enum FileSystemActions {
                 "--no-config", "--null", "--with-filename", "--no-heading", "--line-number",
                 "-m", String(maxResults), "-e", pattern, "--", searchTarget,
             ]
-        } else if let grepBin = resolveExecutable("grep") {
+        } else if let grepBin = which("grep") {
             launch = grepBin
             args = ["-rHnE", "--null", "--include=*", "-m", String(maxResults), "-e", pattern, "--", searchTarget]
         } else {
@@ -1802,13 +1800,19 @@ enum FileSystemActions {
         if case .failure(let f) = run { return f }
         guard case .success(let result) = run else { return errResult("git status failed", code: "git_unavailable") }
 
+        var fields = gitStatusFields(result.stdout)
+        fields["raw"] = .string(result.stdout)
+        return .object(fields)
+    }
+
+    private static func gitStatusFields(_ output: String) -> [String: JSONValue] {
         var staged: [JSONValue] = []
         var unstaged: [JSONValue] = []
         var untracked: [JSONValue] = []
         var branch = ""
         var ahead = 0
         var behind = 0
-        for (idx, line) in splitLines(result.stdout).enumerated() {
+        for (idx, line) in splitLines(output).enumerated() {
             if idx == 0 && line.hasPrefix("## ") {
                 branch = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
                 if branch.contains("[ahead ") {
@@ -1833,7 +1837,7 @@ enum FileSystemActions {
             }
         }
         let clean = staged.isEmpty && unstaged.isEmpty && untracked.isEmpty
-        return .object([
+        return [
             "ok": .bool(true),
             "branch": .string(branch),
             "status": .string("ok"),
@@ -1843,8 +1847,7 @@ enum FileSystemActions {
             "staged": .array(staged),
             "unstaged": .array(unstaged),
             "untracked": .array(untracked),
-            "raw": .string(result.stdout),
-        ])
+        ]
     }
 
     // MARK: - git_diff
@@ -1921,7 +1924,7 @@ enum FileSystemActions {
         for record in records.prefix(since.isEmpty ? limit : records.count) {
             let lines = splitLines(record)
             guard let line = lines.first else { continue }
-            let parts = splitN(line, separator: "|", maxSplits: 3)
+            let parts = line.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
             let changed = lines.dropFirst().filter { !$0.isEmpty }
             files.formUnion(changed)
             if commits.count >= limit { continue }
@@ -1972,67 +1975,29 @@ enum FileSystemActions {
         // git_unavailable. Run status first (its non-zero is a hard error), then
         // log (best-effort: a non-zero log just yields an empty commit list).
         let statusRun = runGit(["status", "--short", "--branch"], cwd: cwd, timeout: 15,
-                               label: "git status", context: ctx, treatNotAGitRepoSpecially: false)
+                               label: "git status", context: ctx)
         switch statusRun {
         case .failure(let f): return f
         case .success(let status):
             let logRun = runGit(["log", "-n\(logLimit)", "--format=%h|%s"], cwd: cwd, timeout: 15,
-                                label: "git log", context: ctx, treatNotAGitRepoSpecially: false)
+                                label: "git log", context: ctx)
             // A FileNotFound/timeout on the log sub-command is a hard failure in
             // Python (same outer try). A non-zero exit is NOT (commits stays []).
             if case .failure(let lf) = logRun, isProcessLevelFailure(logRun) { return lf }
 
-            var staged: [JSONValue] = []
-            var unstaged: [JSONValue] = []
-            var untracked: [JSONValue] = []
-            var branch = ""
-            var ahead = 0
-            var behind = 0
-            for (idx, line) in splitLines(status.stdout).enumerated() {
-                if idx == 0 && line.hasPrefix("## ") {
-                    branch = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
-                    if branch.contains("[ahead ") {
-                        ahead = parseTrailingInt(branch, after: "[ahead ") ?? 0
-                    }
-                    if branch.contains("behind ") {
-                        behind = parseTrailingInt(branch, after: "behind ") ?? 0
-                    }
-                    continue
-                }
-                let chars = Array(line)
-                if chars.count < 2 { continue }
-                let xy = String(chars[0...1])
-                let fname = chars.count > 3 ? String(chars[3...]) : ""
-                if xy == "??" {
-                    untracked.append(.string(fname))
-                } else {
-                    if chars[0] != " " && chars[0] != "?" { staged.append(.string(fname)) }
-                    if chars[1] != " " && chars[1] != "?" { unstaged.append(.string(fname)) }
-                }
-            }
             var commits: [JSONValue] = []
             if case .success(let log) = logRun {
                 for line in splitLines(log.stdout) {
-                    let parts = splitN(line, separator: "|", maxSplits: 1)
+                    let parts = line.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
                     commits.append(.object([
                         "hash": .string(parts.count > 0 ? parts[0] : ""),
                         "subject": .string(parts.count > 1 ? parts[1] : ""),
                     ]))
                 }
             }
-            let clean = staged.isEmpty && unstaged.isEmpty && untracked.isEmpty
-            return .object([
-                "ok": .bool(true),
-                "branch": .string(branch),
-                "status": .string("ok"),
-                "ahead": .int(Int64(ahead)),
-                "behind": .int(Int64(behind)),
-                "clean": .bool(clean),
-                "staged": .array(staged),
-                "unstaged": .array(unstaged),
-                "untracked": .array(untracked),
-                "commits": .array(commits),
-            ])
+            var fields = gitStatusFields(status.stdout)
+            fields["commits"] = .array(commits)
+            return .object(fields)
         }
     }
 
@@ -2246,8 +2211,7 @@ enum FileSystemActions {
         timeout: TimeInterval,
         label: String,
         context: ConnectorActionContext,
-        okStatuses: [Int32] = [0],
-        treatNotAGitRepoSpecially: Bool = true
+        okStatuses: [Int32] = [0]
     ) -> GitRun {
         guard let git = gitExecutablePath() else {
             return .failure(errResult("git not found", code: "git_unavailable"))
@@ -2475,17 +2439,28 @@ package func runProcess(
     } catch {
         return FileSystemProcessRunResult(launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
     }
-    // Drain BOTH pipes to EOF on DEDICATED THREADS — NOT DispatchQueue.global().
-    // CONCURRENCY (deadlock fix, found empirically when 13 parallel tests hung at
-    // 0% CPU): `Process.waitUntilExit()` itself parks on a libdispatch readability
-    // source serviced by the global concurrent pool; if the two blocking
-    // `readDataToEndOfFile()` drains ALSO sit on that pool, enough concurrent
-    // runProcess() calls oversubscribe and starve the pool, so waitUntilExit()
-    // can never wake → permanent hang. Dedicated Threads cannot be starved by the
-    // pool, so the drains always make progress and the write-ends EOF when the
-    // process dies. Each drain signals its own semaphore; results land in a
-    // Sendable locked box (each setter called exactly once, read after both
-    // semaphores → happens-after, no race).
+    return captureProcessOutput(outPipe, errPipe, timeout: timeout, captureByteLimit: captureByteLimit,
+        signalChild: { signal, timedOut in
+            guard proc.isRunning else { return }
+            timedOut.set()
+            if signal == SIGTERM { proc.terminate() }
+            else { kill(proc.processIdentifier, signal) }
+        }, waitForExit: {
+            proc.waitUntilExit()
+            return proc.terminationStatus
+        })
+}
+
+private func captureProcessOutput(
+    _ outPipe: Pipe,
+    _ errPipe: Pipe,
+    timeout: TimeInterval,
+    captureByteLimit: Int?,
+    signalChild: @escaping @Sendable (Int32, ProcessTimeoutFlag) -> Void,
+    waitForExit: () -> Int32
+) -> FileSystemProcessRunResult {
+    // Dedicated readers cannot starve the global pool that services
+    // Process.waitUntilExit(). Semaphores settle both writes before readback.
     let timedOut = ProcessTimeoutFlag()
     let box = ProcessOutputBox()
     let stopCapture = ProcessTimeoutFlag()
@@ -2506,15 +2481,9 @@ package func runProcess(
     outThread.start()
     errThread.start()
 
-    // Watchdog escalation (gpt-5.5 review): SIGTERM first; if the process ignores
-    // it (or a grandchild keeps the pipes open), SIGKILL after a short grace so
-    // waitUntilExit()/the drains cannot hang forever. Mirrors
-    // subprocess.run(timeout=)'s kill-on-timeout — Python's Popen.kill() is
-    // SIGKILL — guaranteeing the read FDs close and the drains complete. The
-    // watchdog runs on its own thread (also pool-independent) and is told to
-    // stand down via a flag once the process exits normally.
+    // TERM then KILL bounds the child wait; pipe settlement separately bounds
+    // descendants retaining writers. Keep the watchdog pool-independent too.
     let watchdogDone = ProcessTimeoutFlag()
-    let pid = proc.processIdentifier
     let watchdog = Thread {
         // Sleep in small slices so a normally-exiting process cancels promptly.
         let deadline = Date().addingTimeInterval(timeout)
@@ -2525,18 +2494,18 @@ package func runProcess(
             if watchdogDone.get() { return }
             let now = Date()
             if !sentTerm && now >= deadline {
-                if proc.isRunning { timedOut.set(); proc.terminate() }
+                signalChild(SIGTERM, timedOut)
                 sentTerm = true
             }
             if now >= killDeadline {
-                if proc.isRunning { timedOut.set(); kill(pid, SIGKILL) }
+                signalChild(SIGKILL, timedOut)
                 return
             }
         }
     }
     watchdog.start()
 
-    proc.waitUntilExit()
+    let status = waitForExit()
     watchdogDone.set()
     // Descendants may retain the pipes after the child exits. Stop the
     // nonblocking readers after a shared grace; closing a descriptor from
@@ -2560,9 +2529,9 @@ package func runProcess(
     return FileSystemProcessRunResult(
         launched: true,
         timedOut: to,
-        status: proc.terminationStatus,
-        stdout: decodeUTF8ReplacingPublic(capturedOut.data),
-        stderr: decodeUTF8ReplacingPublic(capturedErr.data),
+        status: status,
+        stdout: decodeUTF8Replacing(capturedOut.data),
+        stderr: decodeUTF8Replacing(capturedErr.data),
         stdoutTruncated: capturedOut.truncated,
         stderrTruncated: capturedErr.truncated,
         captureReadFailed: capturedOut.readFailed || capturedErr.readFailed
@@ -2576,10 +2545,8 @@ package func runProcess(
 /// `Process.currentDirectoryURL` takes a path, and a path is resolved again by
 /// the child — which is the swap window `VerifiedPath` exists to close. Only
 /// `posix_spawn_file_actions_addfchdir` puts the child in the exact inode the
-/// walk verified, so this one caller spawns directly. Everything after the
-/// launch — the dedicated drain threads, the bounded capture, the
-/// SIGTERM-then-SIGKILL watchdog, the bounded drain wait — mirrors `runProcess`
-/// above, and the reasons for each are documented there.
+/// walk verified, so this caller spawns directly. Both launchers share capture
+/// and settlement in `captureProcessOutput`.
 func runProcess(
     _ launchPath: String,
     _ args: [String],
@@ -2639,87 +2606,20 @@ func runProcess(
     try? errPipe.fileHandleForWriting.close()
     guard spawned == 0 else { return failed }
 
-    let timedOut = ProcessTimeoutFlag()
-    let box = ProcessOutputBox()
-    let stopCapture = ProcessTimeoutFlag()
-    let outDone = DispatchSemaphore(value: 0)
-    let errDone = DispatchSemaphore(value: 0)
-    let outFH = outPipe.fileHandleForReading
-    let errFH = errPipe.fileHandleForReading
-    let outThread = Thread {
-        box.setStdout(captureProcessPipe(outFH, byteLimit: captureByteLimit, stop: stopCapture))
-        outDone.signal()
-    }
-    let errThread = Thread {
-        box.setStderr(captureProcessPipe(errFH, byteLimit: captureByteLimit, stop: stopCapture))
-        errDone.signal()
-    }
-    outThread.stackSize = 1 << 20
-    errThread.stackSize = 1 << 20
-    outThread.start()
-    errThread.start()
-
-    let watchdogDone = ProcessTimeoutFlag()
-    let watchdog = Thread {
-        let deadline = Date().addingTimeInterval(timeout)
-        let killDeadline = Date().addingTimeInterval(timeout + 2.0)
-        var sentTerm = false
-        while !watchdogDone.get() {
-            Thread.sleep(forTimeInterval: 0.05)
-            if watchdogDone.get() { return }
-            let now = Date()
-            if !sentTerm, now >= deadline {
-                timedOut.set()
-                kill(pid, SIGTERM)
-                sentTerm = true
-            }
-            if now >= killDeadline {
-                timedOut.set()
-                kill(pid, SIGKILL)
-                return
-            }
-        }
-    }
-    watchdog.start()
-
-    var waitStatus: Int32 = 0
-    while waitpid(pid, &waitStatus, 0) < 0 && errno == EINTR {}
-    watchdogDone.set()
-
-    let drainGrace: DispatchTime = .now() + 2.0
-    if outDone.wait(timeout: drainGrace) != .success {
-        timedOut.set()
-        stopCapture.set()
-        outDone.wait()
-    }
-    if errDone.wait(timeout: drainGrace) != .success {
-        timedOut.set()
-        stopCapture.set()
-        errDone.wait()
-    }
-
-    // WIFEXITED/WEXITSTATUS by hand — the macros are not imported into Swift.
-    // A child that died on a signal reports -1, which the grep caller reads as
-    // "not a completed search" exactly as it read Foundation's signal status.
-    let status: Int32 = (waitStatus & 0x7f) == 0 ? (waitStatus >> 8) & 0xff : -1
-    let capturedOut = box.stdout()
-    let capturedErr = box.stderr()
-    return FileSystemProcessRunResult(
-        launched: true,
-        timedOut: timedOut.get(),
-        status: status,
-        stdout: decodeUTF8ReplacingPublic(capturedOut.data),
-        stderr: decodeUTF8ReplacingPublic(capturedErr.data),
-        stdoutTruncated: capturedOut.truncated,
-        stderrTruncated: capturedErr.truncated,
-        captureReadFailed: capturedOut.readFailed || capturedErr.readFailed
-    )
+    let childPID = pid
+    return captureProcessOutput(outPipe, errPipe, timeout: timeout, captureByteLimit: captureByteLimit,
+        signalChild: { signal, timedOut in
+            timedOut.set()
+            kill(childPID, signal)
+        }, waitForExit: {
+            var waitStatus: Int32 = 0
+            while waitpid(childPID, &waitStatus, 0) < 0 && errno == EINTR {}
+            // WIFEXITED/WEXITSTATUS macros are not imported into Swift.
+            return (waitStatus & 0x7f) == 0 ? (waitStatus >> 8) & 0xff : -1
+        })
 }
 #endif
 
-/// Sendable locked box for the two concurrent pipe drains in `runProcess`.
-/// Each setter is called exactly once (from its reader task); the getters run
-/// after `group.wait()` so the reads happen-after both writes.
 private struct ProcessPipeCapture {
     var data = Data()
     var truncated = false
@@ -2763,6 +2663,7 @@ private func captureProcessPipe(_ handle: FileHandle, byteLimit: Int?, stop: Pro
     return result
 }
 
+/// Readback follows both pipe semaphores, after each reader's single write.
 private final class ProcessOutputBox: @unchecked Sendable {
     private let lock = NSLock()
     private var out = ProcessPipeCapture()
@@ -2779,43 +2680,6 @@ private final class ProcessTimeoutFlag: @unchecked Sendable {
     private var value = false
     func set() { lock.lock(); value = true; lock.unlock() }
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
-}
-
-/// Public-to-file decode mirror (the wave-30 `decodeUTF8Replacing` is private).
-func decodeUTF8ReplacingPublic(_ data: Data) -> String {
-    if let s = String(data: data, encoding: .utf8) { return s }
-    var scalars = String.UnicodeScalarView()
-    var decoder = UTF8()
-    var iter = data.makeIterator()
-    loop: while true {
-        switch decoder.decode(&iter) {
-        case .scalarValue(let s): scalars.append(s)
-        case .emptyInput: break loop
-        case .error: scalars.append(Unicode.Scalar(0xFFFD)!)
-        }
-    }
-    return String(scalars)
-}
-
-/// Mirror Python `str.split(sep, maxsplit)`: at most `maxSplits` splits, so the
-/// final element keeps any remaining separators. Used for the `%h|%an|%ai|%s`
-/// commit-line parse where the subject may itself contain `|`.
-func splitN(_ s: String, separator: Character, maxSplits: Int) -> [String] {
-    if maxSplits <= 0 { return [s] }
-    var parts: [String] = []
-    var current = ""
-    var splits = 0
-    for ch in s {
-        if ch == separator && splits < maxSplits {
-            parts.append(current)
-            current = ""
-            splits += 1
-        } else {
-            current.append(ch)
-        }
-    }
-    parts.append(current)
-    return parts
 }
 
 /// Parse the leading integer that appears immediately after `marker` in `s`.

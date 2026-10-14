@@ -64,13 +64,18 @@ extension AttentionRouter {
         // results. Restart reconstructs this bounded work from the same rows.
         let start = resultRetryOffset % total
         let count = min(3, total)
+        var acknowledgements: [(path: URL, intents: [[String: JSONValue]])] = []
         for offset in 0..<count {
             let index = (start + offset) % total
             do {
                 if index < deliveries.count {
                     let (path, row, intent) = deliveries[index]
                     if try await deliverRequestedResult(row: row, intent: intent) {
-                        try await Self.acknowledgeResult(intent, at: path)
+                        if let group = acknowledgements.firstIndex(where: { $0.path == path }) {
+                            acknowledgements[group].intents.append(intent)
+                        } else {
+                            acknowledgements.append((path, [intent]))
+                        }
                     }
                 } else {
                     let entry = helpers[index - deliveries.count]
@@ -89,6 +94,10 @@ extension AttentionRouter {
             } catch {
                 nativeLog("requested_result: delivery remains pending: %@", error.localizedDescription)
             }
+        }
+        for group in acknowledgements {
+            do { try await Self.acknowledgeResults(group.intents, at: group.path) }
+            catch { nativeLog("requested_result: delivery remains pending: %@", error.localizedDescription) }
         }
         resultRetryOffset = start + count
         if let storageFailure { throw storageFailure }
@@ -112,7 +121,7 @@ extension AttentionRouter {
                   case .object(let intent)? = metadata["resultDelivery"], intent["eventId"] == .string(eventID) else { continue }
             if intent["state"] == .string("delivered") { return true }
             guard try await deliverRequestedResult(row: row, intent: intent, opening: opening) else { return false }
-            try await Self.acknowledgeResult(intent, at: path)
+            try await Self.acknowledgeResults([intent], at: path)
             return true
         }
         return false
@@ -155,7 +164,7 @@ extension AttentionRouter {
         if case .string(let text)? = value { return text }; return ""
     }
 
-    private static func acknowledgeResult(_ intent: [String: JSONValue], at path: URL) async throws {
+    private static func acknowledgeResults(_ intents: [[String: JSONValue]], at path: URL) async throws {
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
             let raw = try String(contentsOf: path, encoding: .utf8)
@@ -166,7 +175,8 @@ extension AttentionRouter {
                       case .object(var row) = parsed,
                       case .object(var metadata)? = row["metadata"],
                       case .object(var saved)? = metadata["resultDelivery"],
-                      saved["eventId"] == intent["eventId"], saved["state"] == .string("pending") else { continue }
+                      intents.contains(where: { saved["eventId"] == $0["eventId"] }),
+                      saved["state"] == .string("pending") else { continue }
                 saved["state"] = .string("delivered")
                 metadata["resultDelivery"] = .object(saved)
                 row["metadata"] = .object(metadata)

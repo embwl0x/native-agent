@@ -4,78 +4,10 @@ import Foundation
 /// The platform event source is deliberately a tiny lifecycle owner. The
 /// runtime owns the policy and the coordinator owns trimming; this bridge only
 /// translates an OS pressure edge into the shared Context pressure value.
-public protocol NativeContextMemoryPressureObserving: AnyObject, Sendable {
-    var isRunning: Bool { get }
-    func start(
-        handler: @escaping @Sendable (ContextArenaPressure) async -> Void
-    )
-    func stop() async
-}
-
-/// Minimal Dispatch source surface. Keeping this beneath the observer lets the
-/// real bridge be driven deterministically without inventing a process-wide
-/// memory-pressure notification in an evaluator.
-protocol NativeContextMemoryPressureDispatchSource: AnyObject, Sendable {
-    var data: DispatchSource.MemoryPressureEvent { get }
-    func setEventHandler(handler: @escaping @Sendable () -> Void)
-    func resume()
-    func cancel()
-}
-
-protocol NativeContextMemoryPressureDispatchSourceFactory: Sendable {
-    func makeSource(queue: DispatchQueue) -> any NativeContextMemoryPressureDispatchSource
-}
-
-private final class SystemContextMemoryPressureDispatchSource:
-    NativeContextMemoryPressureDispatchSource,
-    @unchecked Sendable
-{
-    private let source: DispatchSourceMemoryPressure
-
-    init(queue: DispatchQueue) {
-        source = DispatchSource.makeMemoryPressureSource(
-            eventMask: [.normal, .warning, .critical],
-            queue: queue
-        )
-    }
-
-    var data: DispatchSource.MemoryPressureEvent { source.data }
-
-    func setEventHandler(handler: @escaping @Sendable () -> Void) {
-        source.setEventHandler(handler: handler)
-    }
-
-    func resume() { source.resume() }
-    func cancel() { source.cancel() }
-}
-
-struct SystemContextMemoryPressureDispatchSourceFactory:
-    NativeContextMemoryPressureDispatchSourceFactory
-{
-    func makeSource(queue: DispatchQueue) -> any NativeContextMemoryPressureDispatchSource {
-        SystemContextMemoryPressureDispatchSource(queue: queue)
-    }
-}
-
-final class DispatchContextMemoryPressureObserver:
-    NativeContextMemoryPressureObserving,
-    @unchecked Sendable
-{
+final class DispatchContextMemoryPressureObserver: @unchecked Sendable {
     private let lock = NSLock()
-    private let sourceFactory: any NativeContextMemoryPressureDispatchSourceFactory
-    private var source: (any NativeContextMemoryPressureDispatchSource)?
+    private var source: DispatchSourceMemoryPressure?
     private var pendingHandlers: [UUID: Task<Void, Never>] = [:]
-
-    init(
-        sourceFactory: any NativeContextMemoryPressureDispatchSourceFactory
-            = SystemContextMemoryPressureDispatchSourceFactory()
-    ) {
-        self.sourceFactory = sourceFactory
-    }
-
-    var isRunning: Bool {
-        lock.withLock { source != nil }
-    }
 
     func start(
         handler: @escaping @Sendable (ContextArenaPressure) async -> Void
@@ -85,7 +17,8 @@ final class DispatchContextMemoryPressureObserver:
             lock.unlock()
             return
         }
-        let source = sourceFactory.makeSource(
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.normal, .warning, .critical],
             queue: DispatchQueue(label: "NativeAgent.ContextFlow.MemoryPressure", qos: .utility)
         )
         // This queue is deliberately outside the runtime actor. The handler
@@ -113,7 +46,7 @@ final class DispatchContextMemoryPressureObserver:
 
     func stop() async {
         let state = lock.withLock { () -> (
-            source: (any NativeContextMemoryPressureDispatchSource)?,
+            source: DispatchSourceMemoryPressure?,
             handlers: [Task<Void, Never>]
         ) in
             defer {

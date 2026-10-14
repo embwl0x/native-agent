@@ -10,7 +10,7 @@ public final class FileChangeWatcher: @unchecked Sendable {
     private struct Armed { let source: DispatchSourceFileSystemObject }
     private let paths: [URL]
     private let handler: Handler
-    private let queue: DispatchQueue
+    private let queue = DispatchQueue(label: "com.nativeagent.persistence.file-watcher", qos: .utility)
     /// fix-watcher-deinit-race (2026-08-02): `sources`/`stopped` used to be
     /// bare stored properties mutated on `queue` (arm/install) but read and
     /// mutated OFF the queue by `deinit`. `deinit` runs on whatever thread drops
@@ -23,37 +23,21 @@ public final class FileChangeWatcher: @unchecked Sendable {
     private let stateLock = NSLock()
     private var sources: [URL: Armed] = [:]
     private var stopped = false
-    private let seam: TestSeam?
     private var pooledSubscription: SharedFileChangeWatcherRegistry.Subscription?
 
-    /// Internal test seam. Production builds pass `nil`; tests use it to drive
-    /// the create-then-teardown-before-resume window deterministically instead
-    /// of sleeping on a real race.
-    struct TestSeam: Sendable {
-        /// Runs on the watcher queue right after a source is created and its
-        /// handlers are set, BEFORE the source is published or resumed.
-        var afterSourceCreated: (@Sendable (FileChangeWatcher, Int32) -> Void)?
-        /// Runs from a source's cancel handler, after its descriptor is closed.
-        var afterSourceClosed: (@Sendable (Int32) -> Void)?
-    }
-
-    public convenience init(paths: [URL], handler: @escaping Handler) {
-        self.init(paths: paths, handler: handler, seam: nil)
-    }
-
-    init(paths: [URL], handler: @escaping Handler, seam: TestSeam?) {
+    public init(paths: [URL], handler: @escaping Handler) {
         self.paths = Array(Set(paths.map(\.standardizedFileURL)))
         self.handler = handler
-        self.seam = seam
-        self.queue = DispatchQueue(label: "com.nativeagent.persistence.file-watcher", qos: .utility)
-        self.pooledSubscription = nil
-        if seam == nil {
-            pooledSubscription = SharedFileChangeWatcherRegistry.shared.subscribe(
-                paths: self.paths,
-                handler: handler
-            )
-            return
-        }
+        pooledSubscription = SharedFileChangeWatcherRegistry.shared.subscribe(paths: self.paths, handler: handler)
+    }
+
+    public static func armed(paths: [URL], handler: @escaping Handler) async -> FileChangeWatcher {
+        await Task.detached(priority: .utility) { FileChangeWatcher(paths: paths, handler: handler) }.value
+    }
+
+    fileprivate init(unpooledPath: URL, handler: @escaping Handler) {
+        self.paths = [unpooledPath.standardizedFileURL]
+        self.handler = handler
         // Return only after the vnode sources are armed. An asynchronous first
         // arm leaves a startup window where a CLI can create/replace the file
         // before any source exists, and that edge would remain invisible until
@@ -61,17 +45,8 @@ public final class FileChangeWatcher: @unchecked Sendable {
         self.queue.sync { self.armAll() }
     }
 
-    /// Test-only alias for the private teardown path.
-    func tearDownForTesting() { tearDown() }
-
     public func cancel() {
-        if seam == nil {
-            tearDown()
-            return
-        }
-        queue.async { [self] in
-            self.tearDown()
-        }
+        tearDown()
     }
 
     /// Stops the watcher and cancels every armed source EXACTLY once, from
@@ -147,7 +122,9 @@ public final class FileChangeWatcher: @unchecked Sendable {
         // immediate post-arm check and move onto the target vnode ourselves.
         if missing, FileManager.default.fileExists(atPath: child.path) {
             arm(path)
-            if FileManager.default.fileExists(atPath: path.path) { handler(path) }
+            if FileManager.default.fileExists(atPath: path.path) {
+                queue.async { [self] in if !isStopped { handler(path) } }
+            }
         }
     }
 
@@ -158,10 +135,7 @@ public final class FileChangeWatcher: @unchecked Sendable {
         mask: DispatchSource.FileSystemEvent
     ) {
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: mask, queue: queue)
-        source.setCancelHandler { [seam] in
-            close(fd)
-            seam?.afterSourceClosed?(fd)
-        }
+        source.setCancelHandler { close(fd) }
         source.setEventHandler { [weak self, weak source] in
             guard let self, let source, !self.isStopped else { return }
             let event = source.data
@@ -183,7 +157,6 @@ public final class FileChangeWatcher: @unchecked Sendable {
                 self.handler(targetPath)
             }
         }
-        seam?.afterSourceCreated?(self, fd)
         // Publish under the lock, and never publish into a torn-down watcher:
         // a source installed after `tearDown` swept the table would never be
         // cancelled, leaking its O_EVTONLY fd for the process lifetime.
@@ -217,10 +190,6 @@ public final class FileChangeWatcher: @unchecked Sendable {
     private func discardUnresumed(_ source: DispatchSourceFileSystemObject) {
         source.resume()
         source.cancel()
-    }
-
-    static func pooledSourceCountForTesting(path: URL) -> Int {
-        SharedFileChangeWatcherRegistry.shared.sourceCount(path: path.standardizedFileURL)
     }
 }
 
@@ -262,9 +231,11 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
     private final class Entry {
         var handlers: [UUID: FileChangeWatcher.Handler]
         var watcher: FileChangeWatcher?
+        let armed = DispatchGroup()
 
         init(id: UUID, handler: @escaping FileChangeWatcher.Handler) {
             handlers = [id: handler]
+            armed.enter()
         }
     }
 
@@ -292,16 +263,19 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
         if let entry = entries[path] {
             entry.handlers[id] = handler
             lock.unlock()
+            entry.armed.wait()
             return
         }
         let entry = Entry(id: id, handler: handler)
         entries[path] = entry
         lock.unlock()
+        defer { entry.armed.leave() }
 
-        // A non-nil seam selects the unpooled primitive and prevents recursion.
-        let watcher = FileChangeWatcher(paths: [path], handler: { [weak self] changedPath in
+        // Every subscriber waits for the shared inode to be armed before its
+        // registration-race read, including one arriving during the first arm.
+        let watcher = FileChangeWatcher(unpooledPath: path) { [weak self] changedPath in
             self?.publish(path: changedPath)
-        }, seam: FileChangeWatcher.TestSeam())
+        }
 
         lock.lock()
         guard entries[path] === entry else {
@@ -340,11 +314,5 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
         }
         lock.unlock()
         retired.forEach { $0.cancel() }
-    }
-
-    func sourceCount(path: URL) -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return entries[path] == nil ? 0 : 1
     }
 }

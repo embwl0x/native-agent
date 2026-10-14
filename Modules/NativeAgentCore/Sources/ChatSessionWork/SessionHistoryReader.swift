@@ -375,20 +375,6 @@ public actor SessionHistoryReader {
     /// Read the first few messages plus a bounded tail. This lets the prompt
     /// renderer keep true opening anchors for continuity without loading an
     /// entire large JSONL transcript on every turn.
-    public func promptMessages(
-        forSessionId id: String,
-        anchorLimit: Int = 3,
-        tailLimit: Int,
-        excludingRunId: String? = nil
-    ) async throws -> [ChatMessage] {
-        try await promptMessagesWithStats(
-            forSessionId: id,
-            anchorLimit: anchorLimit,
-            tailLimit: tailLimit,
-            excludingRunId: excludingRunId
-        ).messages
-    }
-
     public func promptMessagesWithStats(
         forSessionId id: String,
         anchorLimit: Int = 3,

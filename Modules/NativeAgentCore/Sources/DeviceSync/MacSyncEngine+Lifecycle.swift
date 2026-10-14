@@ -23,7 +23,8 @@ extension MacSyncEngine {
     /// Mac-App-Store-only CloudDocuments entitlement. Keep producing the exact
     /// same bounded snapshot files in a local rebuildable cache; iCloudBridge
     /// publishes those bytes through NAStatus after each owner-driven write.
-    func startCloudKitSnapshotProjection() {
+    func startCloudKitSnapshotProjection() async {
+        guard !Task.isCancelled else { return }
         let docsURL = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("mobile_snapshot_cache", isDirectory: true)
         if isActive, activeDocsURL == docsURL {
@@ -33,31 +34,31 @@ extension MacSyncEngine {
             stop()
         }
         snapshotLifecycleGeneration &+= 1
+        let generation = snapshotLifecycleGeneration
         activeDocsURL = docsURL
-        loadProcessedIds()
-        loadSnapshotDigests()
+        guard await restoreState(generation: generation) else { return }
         snapshotDir = docsURL.appendingPathComponent(Folder.snapshots, isDirectory: true)
         inboxDir = nil
         responsesDir = docsURL.appendingPathComponent(Folder.responses, isDirectory: true)
         transactionDir = docsURL.appendingPathComponent(Folder.transactions, isDirectory: true)
-        for directory in [snapshotDir, responsesDir, transactionDir].compactMap({ $0 }) {
-            try? FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true
-            )
+        let directories = [snapshotDir, responsesDir, transactionDir].compactMap({ $0 })
+        await sync.storage.perform {
+            for directory in directories { try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
         }
+        guard generation == snapshotLifecycleGeneration else { return }
         isActive = true
-        startArchiveRetentionWatcher()
+        await startArchiveRetentionWatcher()
+        guard generation == snapshotLifecycleGeneration, isActive else { return }
         pruneOldArchiveFiles()
         startSnapshotIntegrityFallback()
         startPresenceBeat()
         startCognitionSnapshotObservation()
-        startSchedulerSnapshotObservation()
-        startHelpersSnapshotObservation()
+        await startSchedulerSnapshotObservation()
+        await startHelpersSnapshotObservation()
+        guard generation == snapshotLifecycleGeneration, isActive else { return }
         startWorkActivityObservation()
         startLiveTurnRelay()
         startChatTranscriptSnapshotObservation()
-        let generation = snapshotLifecycleGeneration
         Task {
             await writeSnapshots(forceHeavy: true)
             guard generation == snapshotLifecycleGeneration, isActive else { return }
@@ -73,27 +74,34 @@ extension MacSyncEngine {
         }
     }
 
-    func start(docsURL: URL) {
+    func start(docsURL: URL) async {
+        guard !Task.isCancelled else { return }
         if isActive, activeDocsURL == docsURL {
-            return
-        }
-        let secret: Data
-        do { secret = try pairingSecret() }
-        catch {
-            syncError = "Snapshot pairing unavailable: \(error.localizedDescription)"
             return
         }
         if isActive {
             stop()
         }
         snapshotLifecycleGeneration &+= 1
+        let generation = snapshotLifecycleGeneration
         activeDocsURL = docsURL
-        // PATCH-2026-05-08: fix-A.3 Load persisted processed IDs before any inbox processing.
-        loadProcessedIds()
-        // fix-snapshot-digest-persist: reload digests so a reconnect skips
-        // re-writing unchanged snapshots instead of triggering an iOS read-storm.
-        loadSnapshotDigests()
-        let fm = FileManager.default
+        inboxDir = docsURL.appendingPathComponent(Folder.inbox)
+        // Replay state must be restored before either inbox admits work.
+        guard await restoreState(generation: generation) else { return }
+        let secret: Data
+        do {
+            if pairingSecretRotationInProgress { _ = try pairingSecret() }
+            let cached = _pairingSecret
+            let loaded = try await sync.storage.perform { try cached ?? PairingSecretManager.loadOrGenerateSecret() }
+            guard generation == snapshotLifecycleGeneration else { return }
+            if pairingSecretRotationInProgress { _ = try pairingSecret() }
+            secret = _pairingSecret ?? loaded
+            _pairingSecret = secret
+        } catch {
+            guard generation == snapshotLifecycleGeneration else { return }
+            syncError = "Snapshot pairing unavailable: \(error.localizedDescription)"
+            return
+        }
         // Same pairing fingerprint/path as the phone's cachedSnapshotDirectory.
         // Unscoped legacy snapshots are never copied into a new pairing.
         let fingerprint = SHA256.hash(data: secret).prefix(8)
@@ -101,14 +109,15 @@ extension MacSyncEngine {
         snapshotDir = docsURL.appendingPathComponent(Folder.snapshots)
             .appendingPathComponent("pairings", isDirectory: true)
             .appendingPathComponent(fingerprint, isDirectory: true)
-        inboxDir = docsURL.appendingPathComponent(Folder.inbox)
         responsesDir = docsURL.appendingPathComponent(Folder.responses)
         transactionDir = docsURL.appendingPathComponent(Folder.transactions)
         let inboxRejectedDir = docsURL.appendingPathComponent(Folder.inboxRejected)
 
-        for dir in [snapshotDir, inboxDir, inboxRejectedDir, responsesDir, transactionDir].compactMap({ $0 }) {
-            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let directories = [snapshotDir, inboxDir, inboxRejectedDir, responsesDir, transactionDir].compactMap({ $0 })
+        await sync.storage.perform {
+            for dir in directories { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
         }
+        guard generation == snapshotLifecycleGeneration else { return }
 
         isActive = true
 
@@ -131,8 +140,9 @@ extension MacSyncEngine {
         startSnapshotIntegrityFallback()
         startPresenceBeat()
         startCognitionSnapshotObservation()
-        startSchedulerSnapshotObservation()
-        startHelpersSnapshotObservation()
+        await startSchedulerSnapshotObservation()
+        await startHelpersSnapshotObservation()
+        guard generation == snapshotLifecycleGeneration, isActive else { return }
         startWorkActivityObservation()
         startLiveTurnRelay()
         startChatTranscriptSnapshotObservation()
@@ -148,7 +158,8 @@ extension MacSyncEngine {
 
         // R11-N30: prune at startup, then schedule the exact earliest 7-day
         // retention crossing instead of waking every ten minutes.
-        startArchiveRetentionWatcher()
+        await startArchiveRetentionWatcher()
+        guard generation == snapshotLifecycleGeneration, isActive else { return }
         pruneOldArchiveFiles()
     }
 
@@ -174,11 +185,11 @@ extension MacSyncEngine {
         helpersSnapshotWatcher?.cancel()
         helpersSnapshotWatcher = nil
         if let chatTurnCompletedObserver {
-            chatTurnCompletedNotificationCenter.removeObserver(chatTurnCompletedObserver)
+            NotificationCenter.default.removeObserver(chatTurnCompletedObserver)
             self.chatTurnCompletedObserver = nil
         }
         if let chatTranscriptDidChangeObserver {
-            chatTurnCompletedNotificationCenter.removeObserver(chatTranscriptDidChangeObserver)
+            NotificationCenter.default.removeObserver(chatTranscriptDidChangeObserver)
             self.chatTranscriptDidChangeObserver = nil
         }
         chatTranscriptSnapshotPublicationTask?.cancel()
@@ -190,11 +201,6 @@ extension MacSyncEngine {
         snapshotWriteQueuedNeedsMemories = false
         snapshotWriteQueuedNeedsChatTranscripts = false
         snapshotWriteQueuedNeedsStandardPass = false
-        // fix-snapshot-digest-persist: do NOT clear the digest map on stop().
-        // Clearing it meant every reconnect re-wrote all snapshots (full iOS
-        // read-storm). Persist it instead, and keep it in memory so a same-process
-        // reconnect short-circuits unchanged files immediately.
-        saveSnapshotDigests()
         // A stopped lifecycle must not retain a routable old container. Late
         // work is already generation-gated; clearing these roots also makes a
         // post-stop inbox/action call fail closed instead of writing to a
@@ -250,7 +256,7 @@ extension MacSyncEngine {
         guard isActive, let snapshotDir else { return }
         let lifecycleGeneration = snapshotLifecycleGeneration
         let digests = snapshotFileDigests
-        let dataRoot = stateDataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let dataRoot = PersistenceCore.defaultDataRoot()
         let (report, hasSkippedGroups) = await Task.detached(priority: .utility) {
             let report = MacSyncSnapshotIntegrity.reconcile(digests: digests, in: snapshotDir)
             let skipsURL = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
@@ -271,7 +277,7 @@ extension MacSyncEngine {
 
         if report.retainedDigests != snapshotFileDigests {
             snapshotFileDigests = report.retainedDigests
-            saveSnapshotDigests()
+            await saveSnapshotDigests()
         }
         let found = report.integrityFailures + (hasSkippedGroups ? ["skipped groups to republish"] : [])
         OrganPulse.record("snapshot_integrity", found: found.count, note: found.joined(separator: "; "),
@@ -304,14 +310,12 @@ extension MacSyncEngine {
         }
     }
 
-    /// Install the exact completion-edge observer that feeds the bounded chat
-    /// snapshot coalescer. Kept internal so its notification-to-write contract
-    /// can be exercised with an isolated notification center.
+    /// Install the completion-edge observer that feeds the bounded chat snapshot coalescer.
     func startChatTranscriptSnapshotObservation() {
         if let chatTurnCompletedObserver {
-            chatTurnCompletedNotificationCenter.removeObserver(chatTurnCompletedObserver)
+            NotificationCenter.default.removeObserver(chatTurnCompletedObserver)
         }
-        chatTurnCompletedObserver = chatTurnCompletedNotificationCenter.addObserver(
+        chatTurnCompletedObserver = NotificationCenter.default.addObserver(
             forName: .chatTurnCompleted,
             object: nil,
             queue: .main
@@ -325,9 +329,9 @@ extension MacSyncEngine {
         // version, so without a publication the phone keeps the mechanical
         // summary and every later publish looks no newer than what it holds.
         if let chatTranscriptDidChangeObserver {
-            chatTurnCompletedNotificationCenter.removeObserver(chatTranscriptDidChangeObserver)
+            NotificationCenter.default.removeObserver(chatTranscriptDidChangeObserver)
         }
-        chatTranscriptDidChangeObserver = chatTurnCompletedNotificationCenter.addObserver(
+        chatTranscriptDidChangeObserver = NotificationCenter.default.addObserver(
             forName: .nativeAgentChatTranscriptDidChange,
             object: nil,
             queue: .main
@@ -355,10 +359,9 @@ extension MacSyncEngine {
             includeTranscripts: includeTranscripts,
             generation: generation
         ) else { return }
-        let coalescingDelay = chatSnapshotCoalescingDelay
         chatTranscriptSnapshotPublicationTask = Task { @MainActor [weak self] in
             do {
-                try await coalescingDelay(.milliseconds(180))
+                try await Task.sleep(for: .milliseconds(180))
             } catch {
                 return
             }
@@ -369,14 +372,10 @@ extension MacSyncEngine {
                 isActive: self.isActive
             ) else { return }
             self.chatTranscriptSnapshotPublicationTask = nil
-            if let chatTranscriptSnapshotWriter = self.chatTranscriptSnapshotWriter {
-                await chatTranscriptSnapshotWriter(includeTranscripts)
-            } else {
-                await self.writeSnapshots(
-                    includeChatTranscripts: includeTranscripts,
-                    scope: .chatSessions
-                )
-            }
+            await self.writeSnapshots(
+                includeChatTranscripts: includeTranscripts,
+                scope: .chatSessions
+            )
         }
     }
 
@@ -391,22 +390,26 @@ extension MacSyncEngine {
     }
 
     /// Observe the active transport's archive and transaction directories.
-    func startArchiveRetentionWatcher() {
+    func startArchiveRetentionWatcher() async {
         archiveRetentionWatcher?.cancel()
+        let generation = snapshotLifecycleGeneration
         let paths = MacSyncArchiveRetentionWatchPaths.resolve(
             inboxDirectory: inboxDir,
             responsesDirectory: responsesDir,
             transactionDirectory: transactionDir,
-            dataRoot: stateDataRootOverride ?? PersistenceCore.defaultDataRoot()
+            dataRoot: PersistenceCore.defaultDataRoot()
         )
         guard paths.count == (inboxDir == nil ? 4 : 6) else {
             syncError = "Archive retention unavailable: sync directories could not be opened."
             return
         }
-        archiveRetentionWatcher = FileChangeWatcher(paths: paths) { [weak self] _ in
+        let watcher = await FileChangeWatcher.armed(paths: paths) { [weak self] _ in
             Task { @MainActor in
-                self?.rescheduleArchiveRetentionDeadline()
+                guard let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
+                self.rescheduleArchiveRetentionDeadline()
             }
         }
+        guard isActive, generation == snapshotLifecycleGeneration else { watcher.cancel(); return }
+        archiveRetentionWatcher = watcher
     }
 }

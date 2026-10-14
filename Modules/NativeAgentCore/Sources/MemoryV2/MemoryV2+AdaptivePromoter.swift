@@ -59,10 +59,6 @@ public struct AdaptiveExtractionReport: Sendable {
 public struct AdaptiveMemoryObservation: Sendable {
     public let proposals: [ProposalRecord]
     public let extraction: AdaptiveExtractionReport
-    /// How many candidates this turn's TOOL EVIDENCE contributed, separate
-    /// from the fact lane's own report. `extraction` keeps describing the
-    /// memory manager and nothing else, so its `semanticStatus` stays honest.
-    public let toolEvidenceCandidateCount: Int
     /// What the moment pass did this turn, one word, for the turn trace:
     /// disabled / noExtractor / capped / abstained / extractionFailed /
     /// extractorUnavailable / cancelled / belowSalience / noQuote /
@@ -85,7 +81,6 @@ public struct AdaptiveMemoryObservation: Sendable {
     init(
         proposals: [ProposalRecord],
         extraction: AdaptiveExtractionReport,
-        toolEvidenceCandidateCount: Int = 0,
         momentOutcome: String = "unreported",
         hygieneRejectedCount: Int = 0,
         savedCorrectionCount: Int = 0,
@@ -94,7 +89,6 @@ public struct AdaptiveMemoryObservation: Sendable {
     ) {
         self.proposals = proposals
         self.extraction = extraction
-        self.toolEvidenceCandidateCount = max(0, toolEvidenceCandidateCount)
         self.momentOutcome = momentOutcome
         self.hygieneRejectedCount = max(0, hygieneRejectedCount)
         self.savedCorrectionCount = savedCorrectionCount
@@ -236,30 +230,9 @@ public actor AdaptiveMemoryPromoter {
         }
     }
 
-    /// Observe one (user, assistant) turn. Extract candidates, drop any
-    /// below threshold or matching the tombstone denylist, and stage the
-    /// survivors via `SwiftNativeMemoryV2.propose(...)`. Returns the
-    /// proposals that were actually staged — empty if nothing crossed the
-    /// gate (the common case).
-    @discardableResult
-    public func observeTurn(
-        userMessage: String,
-        assistantMessage: String,
-        toolEvidence: [String] = [],
-        sessionId: String,
-        surface: String = "chat",
-        standingAgentName: String? = nil,
-        turnId: String? = nil
-    ) async -> [ProposalRecord] {
-        await observeTurnWithReport(userMessage: userMessage, assistantMessage: assistantMessage,
-                                    toolEvidence: toolEvidence, sessionId: sessionId,
-                                    surface: surface, standingAgentName: standingAgentName, turnId: turnId).proposals
-    }
-
     public func observeTurnWithReport(
         userMessage: String,
         assistantMessage: String,
-        toolEvidence: [String] = [],
         sessionId: String,
         surface: String = "chat",
         standingAgentName: String? = nil,
@@ -327,7 +300,7 @@ public actor AdaptiveMemoryPromoter {
             speaker: peerSpeaker, memory: memory, userMessage: userMessage,
             assistantMessage: assistantMessage, sessionId: sessionId, surface: surface,
             momentsAllowed: reservedMoment, origin: origin, turnId: turnId, standingAgent: standingAgent, factsAllowed: requestedFacts)
-        let momentAuthor = standingAgent || managerResult.peerAuthority ? "peer" : "user"
+        let momentAuthor = MemoryMoments.author(surface: surface, peer: standingAgent || managerResult.peerAuthority)
         let momentProposal = await stageMomentIfAny(
             memory: memory,
             userMessage: userMessage,
@@ -520,7 +493,7 @@ public actor AdaptiveMemoryPromoter {
                         proposal = await stageMomentIfAny(
                             memory: memory, userMessage: turn.user, assistantMessage: turn.assistant,
                             sessionId: turn.sessionId, surface: turn.surface,
-                            author: isStandingAgent || result.peerAuthority ? "peer" : "user",
+                            author: MemoryMoments.author(surface: turn.surface, peer: isStandingAgent || result.peerAuthority),
                             outcome: result.moment, reserved: reserved,
                             friction: AfterTurnNoveltyGate.frictionSignal(userMessage: turn.user, assistantMessage: turn.assistant),
                             origin: turn.origin, turnId: turn.turnId)
@@ -530,7 +503,7 @@ public actor AdaptiveMemoryPromoter {
                 }
                 }
             }
-            let author = isStandingAgent || result.peerAuthority ? "peer" : "user"
+            let author = MemoryMoments.author(surface: turn.surface, peer: isStandingAgent || result.peerAuthority)
             if let failure = result.report.failure {
                 if reserved { releaseMomentSlot() }
                 turn.failure = failure
@@ -626,7 +599,9 @@ public actor AdaptiveMemoryPromoter {
         if !recovery, let origin, origin.sessionId == sessionId {
             context = await prepareInterpretation?(origin)
         } else { context = nil }
-        let isPeer = peerAuthority ?? (speaker != nil || context?.event.sourceClass == .imported)
+        let author = MemoryMoments.author(surface: surface,
+            peer: peerAuthority ?? (speaker != nil || context?.event.sourceClass == .imported))
+        let isPeer = author != "user"
         let originalHumanName = humanName ?? personName?()
         guard factsEnabled || keepsMoments || context != nil else { return empty(.skipped) }
         // Phase 5A: nothing new worth keeping → no model call. The deferred
@@ -688,7 +663,8 @@ public actor AdaptiveMemoryPromoter {
                 assistantMessage: assistant,
                 existing: existing,
                 pending: pendingPrompt,
-                personName: speaker ?? originalHumanName, standingAgent: standingAgent
+                personName: author == "app" ? "NativeAgent" : speaker ?? originalHumanName,
+                standingAgent: standingAgent, appAuthored: author == "app"
             ), context: context, factsEnabled: factsEnabled, momentsEnabled: keepsMoments)
             }
         } catch {

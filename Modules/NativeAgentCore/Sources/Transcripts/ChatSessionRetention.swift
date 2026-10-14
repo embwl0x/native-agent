@@ -55,23 +55,95 @@ public struct ChatSessionRetentionReport: Sendable, Equatable {
 /// `chat/messages/<session>.jsonl.lock`. Transcript writers take only the
 /// transcript lock while appending, release it, and only then take the sessions
 /// lock to update the index. No writer may hold those locks in the reverse
-/// order. If retention cannot acquire a transcript lock within its bounded
-/// wait, that session stays hot for a later pass.
+/// order. If the nonblocking transcript lock is contended, that session stays
+/// hot for a later pass.
 public enum ChatSessionRetention {
     public static let macPinnedSessionIdsDefaultsKey = "NativeAgent.pinnedChatSessionIds"
 
-    /// TRY ONCE. This wait is spent in `Thread.sleep` — a genuinely blocked
-    /// cooperative-pool thread — and it is spent INSIDE the process-global
-    /// `chat/sessions.json` lock, on every message append by every surface. A
-    /// handful of concurrent appenders each burning 2 s of a pool thread while
-    /// holding the global index lock is how ordinary contention became a
-    /// process-wide stall on 2026-09-13. Uncontended, `flock(LOCK_NB)` still
-    /// succeeds on the first try and nothing changes; contended, this pass
-    /// defers — which is exactly what the header above already promises
-    /// ("that session stays hot for a later pass") and it gets another chance
-    /// on the very next append.
-    private static let transcriptLockWaitSeconds: TimeInterval = 0
-    private static let transcriptLockRetrySeconds: TimeInterval = 0.02
+    /// The concrete outcome of a pinned-tab close request. Keeping refusal
+    /// separate from success lets the mounted control show an honest outcome
+    /// when another surface has already removed a pin.
+    public enum CloseResult: Equatable {
+        case closed(encoded: String)
+        case refusedInvalidSessionID
+        case refusedAlreadyUnpinned
+    }
+
+    public nonisolated static func decode(_ raw: String) -> [String] {
+        let cleanRaw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ids: [String]
+        if let data = cleanRaw.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            ids = decoded
+        } else {
+            ids = cleanRaw.split(separator: "|").map(String.init)
+        }
+        return cleanedSessionIds(ids)
+    }
+
+    @MainActor
+    public static func load(defaults: UserDefaults = .standard) -> [String] {
+        decode(defaults.string(forKey: macPinnedSessionIdsDefaultsKey) ?? "")
+    }
+
+    /// Persists the retention mirror before publishing the reactive defaults
+    /// value. A failed disk write therefore cannot make the UI claim a pin
+    /// state that retention did not record.
+    @discardableResult
+    @MainActor
+    public static func save(
+        _ ids: [String],
+        defaults: UserDefaults = .standard,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws -> String {
+        let clean = cleanedSessionIds(ids)
+        try ChatSessionRetention.saveMacPinnedChatSessionIds(clean, dataRoot: dataRoot)
+        let data = try JSONEncoder().encode(clean)
+        let encoded = String(decoding: data, as: UTF8.self)
+        defaults.set(encoded, forKey: macPinnedSessionIdsDefaultsKey)
+        return encoded
+    }
+
+    /// Removes one pin through the same mirror-first transaction used by every
+    /// pinned-session mutation. If the retention mirror cannot be written,
+    /// `save` throws before it changes `UserDefaults`, leaving the visible tab
+    /// pinned now and after the next reload.
+    @MainActor
+    public static func closePinnedTab(
+        sessionID: String,
+        defaults: UserDefaults = .standard,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws -> CloseResult {
+        let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanSessionID.isEmpty else {
+            return .refusedInvalidSessionID
+        }
+
+        let current = load(defaults: defaults)
+        guard current.contains(cleanSessionID) else {
+            return .refusedAlreadyUnpinned
+        }
+
+        return .closed(encoded: try save(
+            current.filter { $0 != cleanSessionID },
+            defaults: defaults,
+            dataRoot: dataRoot
+        ))
+    }
+
+    @discardableResult
+    @MainActor
+    public static func request(
+        encodedPinnedIDs: String,
+        defaults: UserDefaults = .standard,
+        publish: ([String]) -> Void
+    ) -> Bool {
+        let requested = decode(encodedPinnedIDs)
+        let persisted = load(defaults: defaults)
+        guard requested == persisted else { return false }
+        publish(persisted)
+        return true
+    }
 
     // Archived transcripts and their locator rows are durable history. Only
     // explicit deletion may remove them; the active index remains bounded.
@@ -97,9 +169,6 @@ public enum ChatSessionRetention {
         now: Date = Date(),
         policy: ChatSessionRetentionPolicy = .default
     ) throws -> ChatSessionRetentionReport {
-        // Retire derived session state independently of the hot index.
-        pruneArchive(dataRoot: dataRoot, now: now)
-
         let sessionsPath = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
@@ -107,6 +176,8 @@ public enum ChatSessionRetention {
             return ChatSessionRetentionReport()
         }
         let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+        // Pruning and enforcement share the caller's locked index snapshot.
+        pruneArchive(dataRoot: dataRoot, now: now, rows: rows)
         guard !rows.isEmpty else {
             return ChatSessionRetentionReport()
         }
@@ -217,29 +288,39 @@ public enum ChatSessionRetention {
         }
     }
 
-    public static func archivedTranscripts(dataRoot: URL) throws -> [String: [URL]] {
+    private static func archiveIndexRows(dataRoot: URL) throws -> [[String: JSONValue]] {
         let index = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
         let bytes: Data
         do { bytes = try Data(contentsOf: index) }
-        catch CocoaError.fileReadNoSuchFile { bytes = Data() }
-        func entries(_ directory: URL) throws -> [URL] {
-            do { return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) }
-            catch CocoaError.fileReadNoSuchFile { return [] }
-        }
+        catch CocoaError.fileReadNoSuchFile { return [] }
         let directory = dataRoot.appendingPathComponent("chat/archive/messages", isDirectory: true)
             .resolvingSymlinksInPath().standardizedFileURL
-        var files: [String: [URL]] = [:]
-        for line in bytes.split(separator: 10).reversed() {
+        return try bytes.split(separator: 10).map { line in
             guard case .object(let row) = try JSONValue.parse(Data(line)),
                   case .string(let id)? = row["id"],
                   NativeAgentChatSessionID.normalizedPathComponent(id) != nil else {
                 throw CocoaError(.fileReadCorruptFile)
             }
-            guard case .string(let relative)? = row["messagesArchivePath"] else { continue }
-            let file = dataRoot.appendingPathComponent(relative).standardizedFileURL
-            guard file.resolvingSymlinksInPath().deletingLastPathComponent() == directory else {
-                throw CocoaError(.fileReadCorruptFile)
+            if case .string(let relative)? = row["messagesArchivePath"] {
+                let file = dataRoot.appendingPathComponent(relative).standardizedFileURL
+                guard file.resolvingSymlinksInPath().deletingLastPathComponent() == directory else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
             }
+            return row
+        }
+    }
+
+    public static func archivedTranscripts(dataRoot: URL) throws -> [String: [URL]] {
+        func entries(_ directory: URL) throws -> [URL] {
+            do { return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) }
+            catch CocoaError.fileReadNoSuchFile { return [] }
+        }
+        var files: [String: [URL]] = [:]
+        for row in try archiveIndexRows(dataRoot: dataRoot).reversed() {
+            guard case .string(let id)? = row["id"],
+                  case .string(let relative)? = row["messagesArchivePath"] else { continue }
+            let file = dataRoot.appendingPathComponent(relative).standardizedFileURL
             if !files[id, default: []].contains(file) { files[id, default: []].append(file) }
         }
         let sessions = dataRoot.appendingPathComponent("chat/sessions", isDirectory: true).resolvingSymlinksInPath()
@@ -314,17 +395,7 @@ public enum ChatSessionRetention {
             return nil
         }
         let chat = dataRoot.appendingPathComponent("chat", isDirectory: true)
-        let archiveIndex = chat
-            .appendingPathComponent("archive", isDirectory: true)
-            .appendingPathComponent("sessions.jsonl")
-        guard let data = try? Data(contentsOf: archiveIndex) else { return nil }
-        var archived: [String: JSONValue]?
-        for line in data.split(separator: 10) {
-            guard case .object(let row)? = try? JSONValue.parse(Data(line)),
-                  row["id"] == .string(sessionId) else { continue }
-            archived = row
-        }
-        guard var row = archived,
+        guard var row = try archiveIndexRows(dataRoot: dataRoot).last(where: { $0["id"] == .string(sessionId) }),
               case .string(let relative)? = row["messagesArchivePath"] else { return nil }
         let archivedBytes: Data
         do { archivedBytes = try Data(contentsOf: dataRoot.appendingPathComponent(relative)) }
@@ -479,17 +550,7 @@ public enum ChatSessionRetention {
 
     private static func macPinnedChatSessionIds(dataRoot: URL) throws -> Set<String> {
         var protected = try sharedMacPinnedChatSessionIds(dataRoot: dataRoot)
-        let raw = (UserDefaults.standard.string(forKey: macPinnedSessionIdsDefaultsKey) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return protected }
-        let ids: [String]
-        if let data = raw.data(using: .utf8),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            ids = decoded
-        } else {
-            ids = raw.split(separator: "|").map(String.init)
-        }
-        protected.formUnion(cleanedSessionIds(ids))
+        protected.formUnion(decode(UserDefaults.standard.string(forKey: macPinnedSessionIdsDefaultsKey) ?? ""))
         return protected
     }
 
@@ -560,9 +621,8 @@ public enum ChatSessionRetention {
         baseArchivedRow["archivedBy"] = .string("chat_session_retention")
         baseArchivedRow["retentionArchivedAt"] = .string(iso8601(now))
         baseArchivedRow["retentionReason"] = .string(reason.rawValue)
-        baseArchivedRow["originalMessagesArchivePath"] = .string("chat/archive/originals/\(safeSessionId).jsonl")
 
-        let archived = try withBoundedTranscriptLock(messagesPath) { () throws -> Bool in
+        let archived = try withNonblockingTranscriptLock(messagesPath) { () throws -> Bool in
             if reason == .activeCap, ChatSessionIndexFile.hasPendingTranscriptIndexSync(at: messagesPath) {
                 return false
             }
@@ -582,19 +642,12 @@ public enum ChatSessionRetention {
             // then synchronizes `sessions.json`; archiving in that gap deletes
             // the hot transcript, and the writer's index sync then recreates an
             // ACTIVE row for the session with none of its history behind it.
-            if reason == .activeCap, let modified = transcriptModifiedDate(messagesPath) {
+            if reason == .activeCap, transcriptModifiedDate(messagesPath) != nil {
                 // A pending writer changes the exact transcript version before
                 // synchronizing the index. Legacy rows stay hot until bounded
                 // reconciliation acknowledges their bytes.
                 guard let version = ChatSessionIndexFile.transcriptVersion(at: messagesPath),
                       row[ChatSessionIndexFile.acknowledgedTranscriptKey] == version else {
-                    return false
-                }
-                // Second line: anything written since this pass began. Two
-                // seconds of slack in the transcript's favour — the mtime comes
-                // off the filesystem and `now` off an in-memory clock, and the
-                // two need not agree to the millisecond.
-                if modified >= now.addingTimeInterval(-transcriptModifiedSlackSeconds) {
                     return false
                 }
             }
@@ -626,11 +679,11 @@ public enum ChatSessionRetention {
             // and drop a freshly appended row. Lock ordering is one-way
             // (transcript → index); the prune takes only the index lock.
             //
-            // Round 3: a lock TIMEOUT (nil return) must not count as archived —
+            // Lock contention (nil return) must not count as archived —
             // deleting the hot transcript with no index row written would
-            // orphan the session. On timeout, undo the transcript copy and
+            // orphan the session. On contention, undo the transcript copy and
             // report not-archived; retention simply retries on its next pass.
-            let indexRowWritten = try withBoundedTranscriptLock(archiveIndex) {
+            let indexRowWritten = try withNonblockingTranscriptLock(archiveIndex) {
                 try appendJSONL(.object(archivedRow), to: archiveIndex)
                 return true
             }
@@ -666,23 +719,16 @@ public enum ChatSessionRetention {
         }
     }
 
-    /// Slack applied when comparing a filesystem mtime against an in-memory
-    /// clock. Always in the transcript's favour: the cost of an unnecessary
-    /// skip is one more retention pass, the cost of a wrong archive is a lost
-    /// transcript.
-    private static let transcriptModifiedSlackSeconds: TimeInterval = 2
-
     /// The transcript's last-write time, or nil when there is no transcript.
     private static func transcriptModifiedDate(_ path: URL) -> Date? {
         (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
     }
 
-    /// Synchronous, bounded counterpart to `PersistenceCoreProtocol.withFileLock`.
+    /// Synchronous, nonblocking counterpart to `PersistenceCoreProtocol.withFileLock`.
     /// `enforce` is intentionally synchronous because production callers invoke
-    /// it while already inside the async sessions-file lock. This mirrors that
-    /// helper's exact sidecar path, open mode, nonblocking flock, and retry
-    /// cadence without parking the caller indefinitely.
-    private static func withBoundedTranscriptLock<T>(
+    /// it while already inside the async sessions-file lock. Contention defers
+    /// the session without parking a cooperative-pool thread under that lock.
+    private static func withNonblockingTranscriptLock<T>(
         _ targetPath: URL,
         _ body: () throws -> T
     ) throws -> T? {
@@ -698,18 +744,8 @@ public enum ChatSessionRetention {
                 userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"]
             )
         }
-        var acquired = false
-        defer {
-            if acquired { _ = flock(fd, LOCK_UN) }
-            Darwin.close(fd)
-        }
-
-        let deadline = ProcessInfo.processInfo.systemUptime + transcriptLockWaitSeconds
-        while true {
-            if flock(fd, LOCK_EX | LOCK_NB) == 0 {
-                acquired = true
-                break
-            }
+        defer { Darwin.close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             let lockError = errno
             if lockError != EWOULDBLOCK && lockError != EINTR {
                 throw NSError(
@@ -721,17 +757,15 @@ public enum ChatSessionRetention {
                     ]
                 )
             }
-
-            let remaining = deadline - ProcessInfo.processInfo.systemUptime
-            guard remaining > 0 else { return nil }
-            Thread.sleep(forTimeInterval: min(transcriptLockRetrySeconds, remaining))
+            return nil
         }
+        defer { _ = flock(fd, LOCK_UN) }
         return try body()
     }
 
     /// Archive changes trigger cleanup of disposable session state. Canonical
     /// transcript bytes and locator rows never expire automatically.
-    private static func pruneArchive(dataRoot: URL, now: Date) {
+    private static func pruneArchive(dataRoot: URL, now: Date, rows: [[String: JSONValue]]) {
         let archiveDir = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("archive", isDirectory: true)
@@ -750,7 +784,7 @@ public enum ChatSessionRetention {
         // throttle: an archival changes the tier stamp, so the sweep runs on
         // the pass after a session leaves the hot index, and otherwise at most
         // once per interval.
-        pruneSessionState(dataRoot: dataRoot, now: now)
+        pruneSessionState(dataRoot: dataRoot, now: now, rows: rows)
     }
 
     /// Remove `chat/session_state/<id>/` dirs whose session is no longer in
@@ -759,20 +793,12 @@ public enum ChatSessionRetention {
     /// proxy for "archived (or abandoned) that long ago": nothing writes to an
     /// archived session's state dir, and anything touched recently is kept.
     /// Best-effort and bounded; deletes only derived state, never transcripts.
-    private static func pruneSessionState(dataRoot: URL, now: Date) {
+    private static func pruneSessionState(dataRoot: URL, now: Date, rows: [[String: JSONValue]]) {
         let fm = FileManager.default
         let chatDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
         let stateDir = chatDir.appendingPathComponent("session_state", isDirectory: true)
         guard fm.fileExists(atPath: stateDir.path) else { return }
 
-        // Fail closed: prune only against a present, strictly parsed live
-        // index. A missing or malformed `sessions.json` must never read as
-        // "every state dir is an orphan".
-        let sessionsPath = chatDir.appendingPathComponent("sessions.json")
-        guard fm.fileExists(atPath: sessionsPath.path),
-              let rows = try? ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath) else {
-            return
-        }
         var liveDirNames = Set<String>()
         for row in rows {
             guard case .string(let id)? = row["id"],
@@ -840,11 +866,6 @@ public enum ChatSessionRetention {
     private struct PruneMark {
         let at: Date
         let stamp: ArchiveTierStamp
-        /// How many passes have actually scanned this root. Lives inside the
-        /// mark so the count is per-root — a process-global counter made the
-        /// throttle tests racy under parallel suite execution, because every
-        /// suite's temp-root prunes incremented one shared number.
-        let runCount: Int
     }
 
     private static let pruneStateLock = NSLock()
@@ -888,22 +909,8 @@ public enum ChatSessionRetention {
             return false
         }
         evictStalestMarkIfAtCapLocked(insertingKey: key)
-        let priorRuns = pruneMarks[key]?.runCount ?? 0
-        pruneMarks[key] = PruneMark(at: now, stamp: stamp, runCount: priorRuns + 1)
+        pruneMarks[key] = PruneMark(at: now, stamp: stamp)
         return true
-    }
-
-    /// Test seam: how many passes actually scanned THIS root's tier. Per-root
-    /// so parallel suites pruning their own temp roots cannot perturb each
-    /// other's readings.
-    public static func _archivePruneRunCountForTesting(dataRoot: URL) -> Int {
-        let key = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("archive", isDirectory: true)
-            .resolvingSymlinksInPath().path
-        pruneStateLock.lock()
-        defer { pruneStateLock.unlock() }
-        return pruneMarks[key]?.runCount ?? 0
     }
 
     /// Stamp with the tier as it stood BEFORE the scan (caller captures it).
@@ -913,13 +920,8 @@ public enum ChatSessionRetention {
     private static func notePruneCompleted(archiveDir: URL, now: Date, stamp: ArchiveTierStamp) {
         let key = archiveDir.resolvingSymlinksInPath().path
         pruneStateLock.lock()
-        // If the key was evicted while the pass ran, the reinsert restarts the
-        // run count at this pass — the history is gone with the mark. Accepted:
-        // the count is a test seam, and product behaviour (when to prune) never
-        // reads it.
         evictStalestMarkIfAtCapLocked(insertingKey: key)
-        let priorRuns = pruneMarks[key]?.runCount ?? 1
-        pruneMarks[key] = PruneMark(at: now, stamp: stamp, runCount: priorRuns)
+        pruneMarks[key] = PruneMark(at: now, stamp: stamp)
         pruneStateLock.unlock()
     }
 

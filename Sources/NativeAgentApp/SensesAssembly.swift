@@ -6,6 +6,8 @@ import NativeAgentCore
 import EngineRuntime
 import ChatOrchestration
 import MemoryV2
+import MacControl
+import TrustCenter
 
 /// Launch composition only. Runtime callers go through the shared hub.
 enum SensesAssembly {
@@ -23,8 +25,21 @@ enum SensesAssembly {
                 sandboxProfile: { record, _, scratch in
                     try SenseSandboxProfile.build(reach: record.reach,
                         helperURL: SenseHostLocator.helperURL, scratch: scratch,
-                        dataRoot: dataRoot, personaRoot: defaultPersonaRoot(dataRoot: dataRoot),
-                        language: record.language)
+                        dataRoot: dataRoot, personaRoot: defaultPersonaRoot(dataRoot: dataRoot))
+                }, apps: { arguments, targets in
+                    guard case .object(let args) = arguments, AuthoredToolEffects.appReadOnly(args),
+                          case .string(let bundleID)? = args["bundle_id"], targets[bundleID] == "read" else {
+                        throw SenseFailure(code: "read_only", message: "A sense reads only its declared apps using dictionary or standard core read events.")
+                    }
+                    let admission = try await AuthoredToolEffects.$admissionOnly.withValue(true) {
+                        try await rawRead(tool: "read", input: ["__authored_primitive": .object([
+                            "operation": .string("apps.call"), "arguments": arguments
+                        ])], dataRoot: dataRoot)
+                    }
+                    guard case .object(let fields) = admission, fields["status"] == .string("ok") else {
+                        throw SenseFailure(code: "trust_refused", message: "App read refused by Trust: \(try admission.serialize(pretty: false))")
+                    }
+                    return try await SystemAppleScriptAdapter().callApp(arguments, targets: targets)
                 })
             let source = ExistingCornersSourceProvider(rawRead: { tool, input in
                 try await rawRead(tool: tool, input: input, dataRoot: dataRoot)
@@ -39,7 +54,7 @@ enum SensesAssembly {
                     SensesHub.shared.installMemoryProvenanceSink(memory)
                     try await BuiltInSenses.registerAll(dataRoot: dataRoot)
                 } catch {
-                    nativeLog("[senses] Registration failed: %@", error.localizedDescription)
+                    ModuleLog.app("[senses] Registration failed: %@", error.localizedDescription)
                     throw error
                 }
             }
@@ -69,15 +84,13 @@ enum SensesAssembly {
         let surface = ChatToolSessionContext.envelope?.surface ?? ChatTurnRuntimeContext.current?.surface ?? "chat"
         let profile = surface == "chat" ? NativeAgentAppChatSurfaceProfile.mac
             : NativeAgentAppChatSurfaceProfile(rawValue: surface)
-        guard let profile else {
-            throw SenseFailure(code: "source_unavailable", message: "Sense source has an unknown turn surface.")
-        }
+        // Construction policy does not determine whether a turn can read.
         let sessionID = ChatToolSessionContext.verifiedSessionId
-        let filer = sessionID != nil && profile.filesApprovalsByDefault
+        let filer = sessionID != nil && profile != .background
             ? NativeAgentChatApprovalFiler(dataRoot: dataRoot) : nil
         let dispatcher = makeGatedToolDispatchClient(
             tools: NativeAgentEngine.live.toolDispatchClient(
-                denyExternalMcp: profile.deniesExternalMCP, enforceAppAutonomy: false,
+                enforceAppAutonomy: false,
                 swarmApprovalFiler: filer),
             fileAccess: ChatToolSessionContext.fileAccess ?? "read_only", approvalFiler: filer,
             dataRoot: dataRoot, verifiedSessionId: sessionID)

@@ -21,11 +21,11 @@ import UserNotifications
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var phoneRequests = PhoneRequestCoordinator.shared
-    @EnvironmentObject private var chatStore: ChatStore
+    @Environment(ChatStore.self) private var chatStore
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
     @EnvironmentObject private var pairingStore: PairingStore
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
 
     // Shared stores so the tab badges stay in sync with the views' stores
     @StateObject private var approvalsStore = ApprovalsStore()
@@ -82,9 +82,11 @@ struct ContentView: View {
     }
 
     private func openSharedChatIfNeeded() {
-        do {
-            if try !SharedChatInbox.pendingFiles().isEmpty { selection = .chat }
-        } catch { chatStore.errorBanner = "Sharing is unavailable: \(error.localizedDescription)" }
+        Task {
+            do {
+                if try await !chatStore.readSharedInbox().items.isEmpty { selection = .chat }
+            } catch { chatStore.errorBanner = "Sharing is unavailable: \(error.localizedDescription)" }
+        }
     }
 
     var body: some View {
@@ -93,6 +95,20 @@ struct ContentView: View {
                 PhoneRequestSheet(request: request)
             }
             .task { await phoneRequests.resume() }
+            .onChange(of: selection, initial: true) { before, after in
+                sync.foregroundSnapshotGroup = switch after {
+                case .chat: .chat
+                case .activity, .memories: .activity
+                case .desk: .desk
+                case .more: .advanced
+                }
+                if before != after, after == .more {
+                    Task {
+                        _ = await sync.refreshCatalogSnapshot()
+                        await sync.refreshSnapshotGroup(.advanced)
+                    }
+                }
+            }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { Task { await phoneRequests.resume() } }
             }

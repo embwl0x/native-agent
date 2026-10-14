@@ -34,7 +34,6 @@ extension HerScreen {
         "mail": [("mail.N.draft", "saves an unsent reply in Mail → Drafts (text)", "mail_draft"), ("mail.N.reply", "sends a reply now (text)", "mail_reply"), ("mail.N.archive", "archive it", "mail_archive"), ("mail.N.mark-read", "mark it read", "mail_mark_read")],
         "notes": [("notes.N.append", "add to it (text)", "notes_update")],
     ]
-    static var commsRooms: Set<String> { Set(commsFamily.values) }
     /// Rooms whose numbers stay with each item (by its message or contact
     /// identity), never its row: a `mail.3.reply` kept from an older look
     /// still reaches the same email, not whatever is third now. So a gap
@@ -44,32 +43,32 @@ extension HerScreen {
 
     /// A warning for each shown contact whose last send went wrong and
     /// nothing newer came from them since, by agent id (walk 4: omp's 403s
-    /// showed nothing in connections). The people room's rule, worked out
-    /// once per record state: the records by file stamp, each verdict by
-    /// the record's id and time, the bridge chats only on a miss.
+    /// showed nothing in connections). New inbound evidence is checked at render.
     static func sendTrouble(agents: [String], dataRoot: URL, now: Date) -> [String: String] {
         guard !agents.isEmpty else { return [:] }
         let root = dataRoot.standardizedFileURL.path + "\u{0}sendTrouble."
         let records: [AgentConversationRecord] = HerMemo.shared.cached(root + "records", stamp: [stamp(dataRoot.appendingPathComponent("agents/conversations.json"))]) {
-            ((try? AgentWorkspaceConversationReader(dataRoot: dataRoot).records()) ?? []).filter { !$0.agent.hasPrefix("bot") }
+            ((try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)) ?? []).filter { !$0.agent.hasPrefix("bot") }
         }
-        var chats: [BridgeChat]?
+        let chats = bridgeChats(dataRoot: dataRoot)
+        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let contacts = contacts(dataRoot: dataRoot, identity: identity)
         var out: [String: String] = [:]
-        let health = AgentLocalHealth.read(dataRoot)
+        let health = AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
         for agent in Set(agents.map { $0.lowercased() }) {
             if let problem = health[agent]?.problem { out[agent] = problem; continue }
-            guard let record = records.filter({ $0.agent.lowercased() == agent }).max(by: { $0.updatedAt < $1.updatedAt }),
+            guard let contact = contacts.first(where: { $0.id == agent || $0.agents.contains(agent) }),
+                  let record = latest(contact, records: records),
                   record.phase == "attention" else { continue }
             if health[agent]?.resolves(record) == true { continue }
-            let what: String? = HerMemo.shared.cached(root + record.id, stamp: [String(record.updatedAt.timeIntervalSince1970)]) {
-                let receipt = unwrap(record.receipt)
-                if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true) { return nil }
-                if chats == nil { chats = bridgeChats(dataRoot: dataRoot) }
-                let name = record.name.lowercased()
-                if let heard = chats?.first(where: { $0.who == agent || $0.who == name })?.heard, heard > record.updatedAt { return nil }
-                return receipt["status"] == .string("outcome_unknown") ? "unconfirmed" : "failed"
-            }
-            if let what { out[agent] = "⚠ last send \(what) \(age(now.timeIntervalSince(record.updatedAt)))" }
+            let receipt = unwrap(record.receipt)
+            if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true) { continue }
+            let heard = thread(contact, dataRoot: dataRoot, identity: identity, scope: nil)?.heard
+            let inbound = chats.filter { $0.who == contact.id || contact.agents.contains($0.who) || $0.who == record.name.lowercased() }
+                .compactMap(\.heard).max()
+            if max(heard ?? .distantPast, inbound ?? .distantPast) > record.updatedAt { continue }
+            let what = receipt["status"] == .string("outcome_unknown") ? "unconfirmed" : "failed"
+            out[agent] = "⚠ last send \(what) \(age(now.timeIntervalSince(record.updatedAt)))"
         }
         return out
     }
@@ -93,7 +92,7 @@ extension HerScreen {
         return parts
     }
 
-    static let notConnectedLine = "Not connected. The owner must sign in in Settings > Connectors."
+    static let notConnectedLine = "Not connected. The owner can sign in by requesting a setup card in chat or opening Connectors in Advanced view."
 
     /// A service that is not connected reads the same everywhere, whatever
     /// its owner called it (a connect card, "failed", "not set up").

@@ -12,30 +12,15 @@ public protocol ContextMarkdownEmbeddingProvider: Sendable {
     func embed(_ texts: [String]) async throws -> [[Float]]
 }
 
-public struct ContextMarkdownCompilerLimits: Equatable, Sendable {
-    public let maxSourceUTF8Bytes: Int
-    public let maxAtomUTF8Bytes: Int
-    public let maxSummaryUTF8Bytes: Int
-    public let maxTriggerUTF8Bytes: Int
-    public let maxTriggersPerAtom: Int
-
-    public init(
-        maxSourceUTF8Bytes: Int = 2 * 1_024 * 1_024,
-        maxAtomUTF8Bytes: Int = 64 * 1_024,
-        maxSummaryUTF8Bytes: Int = 320,
-        maxTriggerUTF8Bytes: Int = 64,
-        maxTriggersPerAtom: Int = 12
-    ) {
-        self.maxSourceUTF8Bytes = maxSourceUTF8Bytes
-        self.maxAtomUTF8Bytes = maxAtomUTF8Bytes
-        self.maxSummaryUTF8Bytes = maxSummaryUTF8Bytes
-        self.maxTriggerUTF8Bytes = maxTriggerUTF8Bytes
-        self.maxTriggersPerAtom = maxTriggersPerAtom
-    }
+private enum ContextMarkdownCompilerLimits {
+    static let maxSourceUTF8Bytes = 2 * 1_024 * 1_024
+    static let maxAtomUTF8Bytes = 64 * 1_024
+    static let maxSummaryUTF8Bytes = 320
+    static let maxTriggerUTF8Bytes = 64
+    static let maxTriggersPerAtom = 12
 }
 
 public enum ContextMarkdownCompilerError: Error, Equatable, Sendable, CustomStringConvertible {
-    case invalidLimits
     case malformedUTF8
     case emptySource
     case sourceTooLarge(actualBytes: Int, maximumBytes: Int)
@@ -48,8 +33,6 @@ public enum ContextMarkdownCompilerError: Error, Equatable, Sendable, CustomStri
 
     public var description: String {
         switch self {
-        case .invalidLimits:
-            "context Markdown compiler limits must all be positive"
         case .malformedUTF8:
             "context source is not valid UTF-8"
         case .emptySource:
@@ -98,14 +81,9 @@ public struct ContextMarkdownCompiler: Sendable {
             || trimmed == UserMDAutogenMarkers.preambleEnd
     }
     private let embeddingProvider: any ContextMarkdownEmbeddingProvider
-    public let limits: ContextMarkdownCompilerLimits
 
-    public init(
-        embeddingProvider: any ContextMarkdownEmbeddingProvider,
-        limits: ContextMarkdownCompilerLimits = ContextMarkdownCompilerLimits()
-    ) {
+    public init(embeddingProvider: any ContextMarkdownEmbeddingProvider) {
         self.embeddingProvider = embeddingProvider
-        self.limits = limits
     }
 
     public func compile(
@@ -114,11 +92,10 @@ public struct ContextMarkdownCompiler: Sendable {
         previous: ContextCompiledSource? = nil,
         updatedAt: Date
     ) async throws -> ContextCompiledSource {
-        try validateLimits()
-        guard sourceData.count <= limits.maxSourceUTF8Bytes else {
+        guard sourceData.count <= ContextMarkdownCompilerLimits.maxSourceUTF8Bytes else {
             throw ContextMarkdownCompilerError.sourceTooLarge(
                 actualBytes: sourceData.count,
-                maximumBytes: limits.maxSourceUTF8Bytes
+                maximumBytes: ContextMarkdownCompilerLimits.maxSourceUTF8Bytes
             )
         }
         guard let rawSource = String(data: sourceData, encoding: .utf8) else {
@@ -159,6 +136,15 @@ public struct ContextMarkdownCompiler: Sendable {
         let sourceHash = Self.sha256(
             Data("\(Self.compilerFormatVersion)\u{0}".utf8) + contextData
         )
+        if let previous, previous.descriptor == descriptor,
+           previous.sourceHash == sourceHash,
+           Set(previous.atoms.map(\.id)).count == previous.atoms.count,
+           previous.atoms.allSatisfy({
+               $0.freshness == ContextFreshness(updatedAt: updatedAt)
+                   && $0.embedding?.modelFingerprint == fingerprint
+           }) {
+            return previous
+        }
         let documentName = Self.documentName(for: descriptor.canonicalLocator)
         let parsed = try parse(
             contextData,
@@ -318,16 +304,6 @@ public struct ContextMarkdownCompiler: Sendable {
             updatedAt: updatedAt
         )
     }
-
-    private func validateLimits() throws {
-        guard limits.maxSourceUTF8Bytes > 0,
-              limits.maxAtomUTF8Bytes > 0,
-              limits.maxSummaryUTF8Bytes > 0,
-              limits.maxTriggerUTF8Bytes > 0,
-              limits.maxTriggersPerAtom > 0 else {
-            throw ContextMarkdownCompilerError.invalidLimits
-        }
-    }
 }
 
 // MARK: - Markdown structure
@@ -475,11 +451,11 @@ private extension ContextMarkdownCompiler {
                 // as atoms they carried near-top static priors (tiny body →
                 // ~zero cost penalty) while saying nothing. Never emit them.
                 if Self.isAutogenMarkerBlock(body) { continue }
-                guard bodyData.count <= limits.maxAtomUTF8Bytes else {
+                guard bodyData.count <= ContextMarkdownCompilerLimits.maxAtomUTF8Bytes else {
                     throw ContextMarkdownCompilerError.atomTooLarge(
                         index: blocks.count,
                         actualBytes: bodyData.count,
-                        maximumBytes: limits.maxAtomUTF8Bytes
+                        maximumBytes: ContextMarkdownCompilerLimits.maxAtomUTF8Bytes
                     )
                 }
                 blocks.append(ParsedBlock(
@@ -673,7 +649,7 @@ private extension ContextMarkdownCompiler {
         )
         let semantic = Self.semanticBody(block.body)
         let summarySource = Self.summaryText(for: block)
-        let summary = Self.boundedUTF8(summarySource, maximumBytes: limits.maxSummaryUTF8Bytes)
+        let summary = Self.boundedUTF8(summarySource, maximumBytes: ContextMarkdownCompilerLimits.maxSummaryUTF8Bytes)
         return Candidate(
             block: block,
             shape: block.shape,
@@ -686,8 +662,8 @@ private extension ContextMarkdownCompiler {
                 documentName: documentName,
                 headingPath: block.headingPath,
                 summary: summary,
-                maximumCount: limits.maxTriggersPerAtom,
-                maximumBytes: limits.maxTriggerUTF8Bytes
+                maximumCount: ContextMarkdownCompilerLimits.maxTriggersPerAtom,
+                maximumBytes: ContextMarkdownCompilerLimits.maxTriggerUTF8Bytes
             )
         )
     }

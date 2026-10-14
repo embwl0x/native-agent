@@ -1,7 +1,9 @@
+import Dispatcher
 import SwiftUI
+import ToolRegistry
 
 // PATCH-2026-05-08: wave2-chat-ux — slash command menu popover
-// PATCH-Phase6b: extraTools — dynamic tool entries from CapabilitiesStore appended after hardcoded ones.
+// PATCH-Phase6b: extraTools — dynamic tool entries appended after hardcoded ones.
 struct SlashCommandMenu: View {
     @State private var hoveredCommand: String?
     var filter: String
@@ -23,7 +25,16 @@ struct SlashCommandMenu: View {
         var helpLine: String { "\(displayedInvocation) — \(description)" }
     }
 
+    @MainActor private static var catalogTools: [ToolCapability]?
+    @MainActor private static var catalog: [SlashCmd] = []
+    @MainActor private static var lastFilter: String?
+    @MainActor private static var lastResult: [SlashCmd] = []
+
+    @MainActor
     static func commands(filter: String, extraTools: [ToolCapability]) -> [SlashCmd] {
+        let q = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if catalogTools == extraTools, lastFilter == q { return lastResult }
+        if catalogTools != extraTools {
         let hardcodedCommands = ChatSlashCommandRegistry.all.map {
             SlashCmd(command: $0.command, description: $0.description, placeholder: $0.placeholder)
         }
@@ -31,10 +42,12 @@ struct SlashCommandMenu: View {
         let dynamic = extraTools
             .filter { !hardcodedNames.contains($0.name) }
             .map { SlashCmd(command: $0.name, description: $0.description, placeholder: "", isToolEntry: true) }
-        let allCommands = hardcodedCommands + dynamic
-        let q = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return allCommands }
-        return allCommands.filter { $0.command.hasPrefix(q) }
+        catalog = hardcodedCommands + dynamic
+        catalogTools = extraTools
+        }
+        lastFilter = q
+        lastResult = q.isEmpty ? catalog : catalog.filter { $0.command.hasPrefix(q) }
+        return lastResult
     }
 
     private var filtered: [SlashCmd] { Self.commands(filter: filter, extraTools: extraTools) }
@@ -42,7 +55,7 @@ struct SlashCommandMenu: View {
     var body: some View {
         ScrollViewReader { proxy in
         ScrollView {
-            VStack(alignment: .leading, spacing: 2) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(filtered) { cmd in
                     Button {
                         onSelect(cmd.selection)

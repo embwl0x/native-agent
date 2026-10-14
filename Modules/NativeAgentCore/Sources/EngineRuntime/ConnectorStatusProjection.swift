@@ -145,7 +145,7 @@ public enum ConnectorStatusProjection {
             out["description"] = .string(
                 "Search and read pages shared with a validated Notion integration."
             )
-            if Self.oauthConnectorTokenExists(oauthId: "notion", root: root) {
+            if ConnectorOAuthRegistry.oauthConnectorTokenExists(oauthId: "notion", root: root) {
                 out["authState"] = .string("connected")
                 out["healthStatus"] = .string("ok")
                 markCredentialProof(&out)
@@ -168,28 +168,10 @@ public enum ConnectorStatusProjection {
         // the public wizard can collect an operator-owned OAuth app.
         if let oauth = Self.pkceOAuthConnectors[id] {
             out["description"] = .string(oauth.setupNote)
-            if Self.oauthConnectorTokenExists(oauthId: oauth.oauthId, root: root) {
+            if ConnectorOAuthRegistry.oauthConnectorTokenExists(oauthId: oauth.oauthId, root: root) {
                 out["authState"] = .string("connected")
                 out["healthStatus"] = .string("ok")
                 markCredentialProof(&out)
-                return out
-            }
-            let existingAuth = connectorString(out["authState"])?.lowercased()
-            let existingHealth = connectorString(out["healthStatus"])?.lowercased()
-            if existingAuth == "connected_unverified" || existingHealth == "needs_probe" {
-                // No usable token behind the claim: the owner has to sign in, not "check".
-                out["enabled"] = .bool(false)
-                out["healthStatus"] = .string("needs_auth")
-                return out
-            }
-            if !Self.oauthConnectorAppExists(
-                oauthId: oauth.oauthId,
-                clientIdEnv: oauth.clientIdEnv,
-                root: root
-            ) {
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_connected")
-                out["healthStatus"] = .string("needs_auth")
                 return out
             }
             out["enabled"] = .bool(false)
@@ -202,7 +184,7 @@ public enum ConnectorStatusProjection {
         if tokenBacked.contains(id) {
             let existingAuth = connectorString(out["authState"])?.lowercased()
             let existingHealth = connectorString(out["healthStatus"])?.lowercased()
-            if Self.oauthConnectorTokenExists(oauthId: id, root: root) {
+            if ConnectorOAuthRegistry.oauthConnectorTokenExists(oauthId: id, root: root) {
                 // A token on disk is hard proof of a real connection;
                 // promote regardless of a stale needs_probe / unverified flag.
                 out["authState"] = .string("connected")
@@ -291,63 +273,6 @@ public enum ConnectorStatusProjection {
         }
     }
 
-    public static func oauthConnectorTokenExists(oauthId: String, root: URL) -> Bool {
-        // Slack's token is in Keychain, not its files (SlackCredentials).
-        if oauthId == "slack" { return (try? SlackCredentials.read(.bot, dataRoot: root)) != nil }
-        let pkce = root
-            .appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent(oauthId, isDirectory: true)
-            .appendingPathComponent("auth.json")
-        let mirror = root
-            .appendingPathComponent("oauth_tokens", isDirectory: true)
-            .appendingPathComponent("\(oauthId).json")
-        return [pkce, mirror].contains { path in
-            guard let data = try? ConnectorCredentialFile.read(at: path),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return false
-            }
-            // A token past its `expires_at` is not a credential (10-10: X read
-            // "on" for 16 days on an expired token while Doctor said the owner
-            // must sign in). Epoch seconds or an ISO stamp; no stamp means no expiry.
-            if let stamp = object["expires_at"] {
-                // The token writer stores the epoch as a string ("1790287928.98"); ISO is tolerated too.
-                let expires: Date? = (stamp as? Double).map(Date.init(timeIntervalSince1970:))
-                    ?? (stamp as? String).flatMap { Double($0) }.map(Date.init(timeIntervalSince1970:))
-                    ?? (stamp as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
-                if let expires, expires <= Date() { return false }
-            }
-            return ["access_token", "oauth_token", "token"].contains { key in
-                guard let value = object[key] as? String else { return false }
-                return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-        }
-    }
-
-    public static func oauthConnectorAppExists(
-        oauthId: String,
-        clientIdEnv: String,
-        root: URL
-    ) -> Bool {
-        if let value = ProcessInfo.processInfo.environment[clientIdEnv],
-           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return true
-        }
-        let path = root
-            .appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent(oauthId, isDirectory: true)
-            .appendingPathComponent("oauth_app.json")
-        guard let data = try? ConnectorCredentialFile.read(at: path),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let clientId = object["client_id"] as? String else {
-            return false
-        }
-        return !clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    public static func connectorRows(from value: JSONValue) -> [[String: JSONValue]] {
-        ConnectorOAuthRegistry.connectorRows(from: value)
-    }
-
     public static func connectorRow(_ row: [String: JSONValue], matches providerID: String) -> Bool {
         ConnectorOAuthRegistry.connectorRow(row, matches: providerID)
     }
@@ -396,12 +321,12 @@ public enum ConnectorStatusProjection {
     }
 
     public static let pkceOAuthConnectors:
-        [String: (clientIdEnv: String, oauthId: String, setupNote: String)] = [
-        "gmail": ("NATIVE_AGENT_GMAIL_CLIENT_ID", "gmail",
+        [String: (oauthId: String, setupNote: String)] = [
+        "gmail": ("gmail",
                   "Search and read Gmail through an operator-configured Google OAuth app."),
-        "gcal": ("NATIVE_AGENT_CALENDAR_CLIENT_ID", "calendar",
+        "gcal": ("calendar",
                  "Read Google Calendar through an operator-configured Google OAuth app."),
-        "x": ("NATIVE_AGENT_X_CLIENT_ID", "x",
+        "x": ("x",
               "Use the X tools through an operator-configured X OAuth app."),
     ]
 
@@ -410,9 +335,14 @@ public enum ConnectorStatusProjection {
         await seedDefaultConnectorsIfEmpty(root: root, platform: platform)
         let path = connectorRegistryPath(root: root)
         let persistence = SwiftNativePersistenceCore()
-        let current = try await persistence.withFileLock(path) {
-            try ConnectorOAuthRegistry.readRegistry(at: path)
+        return try await persistence.withFileLock(path) {
+            try checkedConnectorRecords(root: root, platform: platform)
         }
+    }
+
+    /// A render reads the same checked owner evidence as an asynchronous door read.
+    public static func checkedConnectorRecords(root: URL, platform: any ConnectorStatusPlatform) throws -> [ConnectorRecord] {
+        let current = try ConnectorOAuthRegistry.readRegistry(at: connectorRegistryPath(root: root))
         // Fable 5.1 item 49 — health DECAYS. The overlay below derives "ok" from
         // credential PRESENCE (a token file, a saved config), which proves a
         // sign-in once completed, not that the integration works now. This
@@ -427,7 +357,7 @@ public enum ConnectorStatusProjection {
         // projection, and deliberately NOT on the mutation path's readiness
         // gate (`updateConnector`), which asks a different
         // question: may this connector be enabled at all.
-        let proof = ConnectorProofLedger.lastSuccessByConnector(root: root)
+        let proof = ConnectorProofLedger.latestByConnector(root: root)
         let decayNow = Date()
         let checkedRows = try ConnectorOAuthRegistry.checkedConnectorRows(from: current)
         // The phone's readiness and action eligibility must not conceal a
@@ -438,7 +368,10 @@ public enum ConnectorStatusProjection {
                 try TelegramBot.TelegramConfig.validateSavedConfiguration(dataRoot: root)
             }
             if id == "searxng" {
-                let config = try await persistence.readJSON(root.appendingPathComponent("research/config.json"), ifMissing: .object([:]))
+                let path = root.appendingPathComponent("research/config.json")
+                let config: JSONValue
+                do { config = try JSONValue.parse(Data(contentsOf: path)) }
+                catch CocoaError.fileReadNoSuchFile { config = .object([:]) }
                 guard case .object(let fields) = config,
                       fields["searxng_base_url"] == nil || connectorString(fields["searxng_base_url"]) != nil else {
                     throw PersistenceCoreError.ioFailure("Saved SearXNG settings must contain a string URL")
@@ -461,7 +394,7 @@ public enum ConnectorStatusProjection {
                 let family = ConnectorProofLedger.canonicalID(connectorString(row["id"]) ?? "")
                 return ConnectorHealthDecay.apply(
                     to: row,
-                    lastSuccessAt: proof[family],
+                    outcome: proof[family],
                     now: decayNow
                 )
             }
@@ -480,6 +413,15 @@ public enum ConnectorStatusProjection {
             )
         )
         return try JSONDecoder().decode(ConnectorRecord.self, from: row.serializedData(pretty: false))
+    }
+
+    public static func updateConnectorAndVerify(
+        id: String, enabled: Bool, root: URL, platform: any ConnectorStatusPlatform
+    ) async throws -> (confirmed: ConnectorRecord?, refreshed: [ConnectorRecord]) {
+        let updated = try await updateConnector(id: id, enabled: enabled, root: root, platform: platform)
+        let refreshed = try await readConnectorRecords(root: root, platform: platform)
+        let confirmed = refreshed.first { $0.id == updated.id }
+        return (confirmed?.enabled == enabled ? confirmed : nil, refreshed)
     }
 
     /// Blank-slate connector catalog seeded into an EMPTY registry so a fresh

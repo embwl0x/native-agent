@@ -45,103 +45,35 @@ import DeviceSync
 
 @MainActor
 extension AppModel {
-    /// The one intake for the live computer pane, fenced on the same exact
-    /// identity the lifecycle reducer uses: a frame from a previous turn's
-    /// trailing verb can never land in the turn that replaced it.
-    func receiveMacScreenPreview(
-        _ update: MacScreenPreviewUpdate,
-        identity: MacChatTurnIdentity
-    ) {
-        guard engine.turns.activeTurnIDsBySession[identity.sessionId] == identity.turnId else { return }
-        guard let merged = MacChatScreenPreview.merged(
-            engine.turns.screenPreviewBySession[identity.sessionId],
-            update: update
-        ) else { return }
-        engine.turns.screenPreviewBySession[identity.sessionId] = merged
-    }
-
-    /// Reload the resident mind after a profile repair, but never underneath a
-    /// running turn (User, 2026-09-06). The refresh stops and restarts Context
-    /// Flow and reloads cognition; doing that mid-turn changes the ground the
-    /// answer in flight is standing on. `activeChatTurnLifecycleIDsBySession`
-    /// is the app's existing record of which sessions own a live turn, so it
-    /// is the gate, and the turn's own close drains the deferral.
     func refreshResidentMindAfterProfileRepair() async {
-        guard engine.turns.activeTurnIDsBySession.isEmpty else {
-            residentRefreshPendingAfterActiveTurns = true
-            return
-        }
-        residentRefreshPendingAfterActiveTurns = false
-        await applyProfileRepairToResidentMind()
+        await engine.refreshResidentMindAfterProfileRepair(
+            publishProfile: { await self.reloadPersonality() },
+            refreshMind: { await NativeAgentEngine.live.refreshResidentMindAfterOnboardingTransition() }
+        )
     }
 
-    /// Runs a deferred resident refresh once the last live turn has closed.
     func drainPendingResidentRefreshIfTurnsIdle() {
-        guard residentRefreshPendingAfterActiveTurns,
-              engine.turns.activeTurnIDsBySession.isEmpty else { return }
-        residentRefreshPendingAfterActiveTurns = false
-        Task { await self.applyProfileRepairToResidentMind() }
+        engine.drainPendingResidentRefreshIfTurnsIdle(
+            publishProfile: { await self.reloadPersonality() },
+            refreshMind: { await NativeAgentEngine.live.refreshResidentMindAfterOnboardingTransition() }
+        )
     }
 
-    /// Everything a completed profile repair changes about the live agent, in
-    /// one place so the gate above covers all of it (User, 2026-09-06: the
-    /// personality reload ran ahead of the gate and re-taught the name mid-turn
-    /// while the refresh it belongs with was still deferred).
-    ///
-    /// The repair rewrote the profile but left `personality` holding the
-    /// pre-repair one, and Chat reloads it only when it is nil — so
-    /// `agentDisplayName` (and AgentVoice) kept showing the fallback name until
-    /// a screen that loads the profile was visited. A failed read leaves the
-    /// previous value rather than blanking the header.
-    /// User, 2026-09-25: the agent's name is read from THIS root's profile, at
-    /// launch in every view and again once onboarding writes it. Simple view
-    /// never loaded it, so after a relaunch the header fell back to the
-    /// defaults cache — which is shared by every root this bundle runs against
-    /// and, when the profile had been read before onboarding, held the seed's
-    /// fallback "NativeAgent". A failed read keeps the current value.
+    /// Publish the profile from this root after launch or repair; a failed
+    /// read keeps the visible name rather than clearing the header.
     func reloadPersonality() async {
-        guard let profile = try? await Self.readPersonality(dataRoot: engine.dataRoot) else { return }
+        guard let profile = try? await SwiftNativePersonaEngine.readPersonality(dataRoot: engine.dataRoot) else { return }
         personality = profile
         teachMemoryHygieneName()
-    }
-
-    private func applyProfileRepairToResidentMind() async {
-        if let repaired = try? await Self.readPersonality(dataRoot: engine.dataRoot) {
-            personality = repaired
-            teachMemoryHygieneName()
-        }
-        await refreshResidentMindAfterOnboardingTransition()
     }
 
     /// Drop a session's cached messages. Called when a session is
     /// deleted from the sidebar. The dict would otherwise grow unbounded as
     /// the user creates and discards sessions across a long-running app.
     func pruneSessionChatState(_ sessionId: String) {
-        let activeLifecycleTurnId = engine.turns.activeTurnIDsBySession[sessionId]
-        let lifecycleTurnId = activeLifecycleTurnId == nil
-            ? engine.turns.lifecycleBySession[sessionId]?.identity.turnId
-            : nil
         engine.transcripts.messagesBySession.removeValue(forKey: sessionId)
         detachedChatRefreshStatus.removeValue(forKey: sessionId)
-        Task { await engine.turns.runtime.updateQueuedTurns { $0.removeValue(forKey: sessionId) } }
-        engine.turns.pausedQueueSessions.remove(sessionId)
-        engine.turns.queuePauseReasons.removeValue(forKey: sessionId)
-        // A Stop/Archive can reach pruning before its joined producer has
-        // persisted terminal proof. Preserve that one exact authority until
-        // normal task cleanup closes it; stale-session pruning will remove the
-        // terminal projection on a later bounded session-index refresh.
-        if activeLifecycleTurnId == nil {
-            engine.turns.lifecycleBySession.removeValue(forKey: sessionId)
-            engine.turns.activeTurnIDsBySession.removeValue(forKey: sessionId)
-        }
-        if let lifecycleTurnId {
-            Task { [lifecycleStore = engine.turns.lifecycleStore] in
-                try? await lifecycleStore.remove(
-                    sessionId: sessionId,
-                    turnId: lifecycleTurnId
-                )
-            }
-        }
+        engine.turns.runtime.pruneSessionState(sessionId)
     }
 
     /// 2026-07-21 audit fix: pruneSessionChatState had zero callers, so the
@@ -154,17 +86,10 @@ extension AppModel {
     func pruneStaleSessionChatState(knownSessionIds: Set<String>) {
         let cached = Set(engine.transcripts.messagesBySession.keys)
             .union(detachedChatRefreshStatus.keys)
-            .union(engine.turns.queuedBySession.keys)
-            .union(engine.turns.pausedQueueSessions)
-            .union(engine.turns.lifecycleBySession.keys)
-            .union(engine.turns.activeTurnIDsBySession.keys)
-        for sessionId in cached {
-            guard !knownSessionIds.contains(sessionId),
-                  sessionId != activeChatSessionId,
-                  !engine.turns.streamingSessions.contains(sessionId),
-                  !engine.turns.busySessions.contains(sessionId),
-                  !DetachedChatWindowController.shared.isDetached(sessionId)
-            else { continue }
+        for sessionId in engine.turns.runtime.staleSessionIDs(
+            cached: cached, known: knownSessionIds,
+            keepVisible: { $0 == activeChatSessionId || DetachedChatWindowController.shared.isDetached($0) }
+        ) {
             pruneSessionChatState(sessionId)
         }
     }
@@ -176,59 +101,13 @@ extension AppModel {
     // to `chatMessages(for:)` for its fixed sessionId and stream into it
     // without disturbing the main window's active session.
 
-    /// Load a detached session's messages from disk into the
-    /// per-session slot. Called when a panel first opens so it shows history
-    /// immediately even if the session was never the active one. Does NOT
-    /// touch `activeChatSessionId` — the main window stays where it is.
-    @MainActor
     func loadDetachedSessionMessages(_ sessionId: String) async {
-        await loadDetachedSessionMessages(
-            sessionId,
-            loadMessages: { [transcripts = engine.transcripts] in try await transcripts.loadMessages(sessionId: $0, cached: true) })
-    }
-
-    @MainActor
-    func loadDetachedSessionMessages(
-        _ sessionId: String,
-        loadMessages: (String) async throws -> [ChatMessage]
-    ) async {
-        guard !sessionId.isEmpty else { return }
-        // Skip if a stream is already populating this slot — overwriting
-        // would clobber live deltas (mirrors selectChatSession's guard).
-        if engine.turns.streamingSessions.contains(sessionId),
-           !(engine.transcripts.messagesBySession[sessionId] ?? []).isEmpty {
-            return
+        await engine.loadDetachedSessionMessages(sessionId) { failures in
+            detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
+                previous: detachedChatRefreshStatus[sessionId],
+                failedEndpoints: failures, at: Date()
+            )
         }
-        let lifecycleAtLoadStart = engine.turns.lifecycle(for: sessionId)
-        var messageFailures: [String] = []
-        let fetched: [ChatMessage]?
-        do {
-            fetched = try await loadMessages(sessionId)
-        } catch {
-            fetched = nil
-            messageFailures.append("messages")
-        }
-        // 2026-06-08 W1.2 review fix (MEDIUM): re-check the streaming guard
-        // AFTER the network await. A stream may have STARTED for this
-        // session during the fetch (e.g. the user typed + sent in the
-        // detached panel while history was loading). Writing the stale
-        // disk snapshot now would drop the live optimistic + streaming
-        // bubbles and the by-id delta updates would then miss. Only seed
-        // the slot when no stream has taken ownership of it.
-        let streamTookOver = engine.turns.streamingSessions.contains(sessionId)
-            && !(engine.transcripts.messagesBySession[sessionId] ?? []).isEmpty
-        let lifecycleAfterMessages = engine.turns.lifecycle(for: sessionId)
-        guard !streamTookOver,
-              lifecycleAfterMessages == nil || lifecycleAfterMessages == lifecycleAtLoadStart
-        else { return }
-        if let fetched {
-            applyLoadedChatMessages(fetched, for: sessionId)
-        }
-        detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
-            previous: detachedChatRefreshStatus[sessionId],
-            failedEndpoints: messageFailures,
-            at: Date()
-        )
     }
 
     /// Add a session to the pinned-chat strip from outside ChatView (the
@@ -238,12 +117,12 @@ extension AppModel {
     @MainActor
     func pinChatSessionForDetachedWindow(_ sessionId: String) {
         guard !sessionId.isEmpty else { return }
-        var ids = MacPinnedChatSessionStore.load()
+        var ids = ChatSessionRetention.load()
         let added = !ids.contains(sessionId)
         if added {
             ids.append(sessionId)
         }
-        guard (try? MacPinnedChatSessionStore.save(ids)) != nil else { return }
+        guard (try? ChatSessionRetention.save(ids)) != nil else { return }
         // 2026-09-06: a pin that ADDS a session asks for transcripts — the
         // published transcript set is chosen from the pins as they were before
         // this save, so publishing the new tab without them put an empty
@@ -273,36 +152,11 @@ extension AppModel {
         }
     }
 
-    func removeChatMessage(id messageId: String, from sessionId: String) {
-        guard var arr = engine.transcripts.messagesBySession[sessionId] else { return }
-        arr.removeAll { $0.id == messageId }
-        engine.transcripts.messagesBySession[sessionId] = arr
-    }
-
     /// chat-smoothness phase 1 (the user, 2026-06-12): word-by-word flow, coalesced.
     /// ONE tunable knob for the Mac streaming cadence — raise for calmer
     /// ripple, lower for snappier. 70ms ≈ word-arrival rhythm at typical
     /// model token rates without hammering the renderer.
     static let chatStreamCoalesceSeconds = ChatStreamAccumulator.publishInterval
-
-    func updateChatMessageContent(id messageId: String, in sessionId: String, content: String) {
-        // THE STREAMING CASE FIRST (2026-09-13): the row being rewritten is the
-        // last one on all but a handful of calls, and that case needs neither
-        // the linear id search nor a mutated copy of the whole transcript.
-        if engine.transcripts.setTailMessageContent(content, id: messageId, in: sessionId) { return }
-        guard var arr = engine.transcripts.messagesBySession[sessionId],
-              let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
-        arr[idx].content = content
-        // 2026-09-06: only a rewrite of the FINAL row may keep the message
-        // list's cached grouping (it patches that one row in place). An
-        // interior row — a streaming reply with a slash command's system
-        // message appended behind it — must invalidate the whole cache.
-        if idx == arr.count - 1 {
-            engine.transcripts.setMessagesTailOnly(arr, for: sessionId)
-        } else {
-            engine.transcripts.messagesBySession[sessionId] = arr
-        }
-    }
 
     /// Fluid glass A1: the streamed reply learns where its working notes end
     /// as soon as the core's final result says, so a reply that has already

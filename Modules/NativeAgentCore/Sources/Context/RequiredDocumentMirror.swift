@@ -86,14 +86,6 @@ public enum RequiredPersonaDocumentKind: String, CaseIterable, Sendable, Codable
     public var canonicalOrder: Int {
         Self.allCases.firstIndex(of: self) ?? 0
     }
-
-    public var isOptional: Bool {
-        self == .memory
-    }
-
-    public static func defaultOrder(includeMemory: Bool) -> [Self] {
-        includeMemory ? allCases : allCases.filter { !$0.isOptional }
-    }
 }
 
 public enum RequiredDocumentMirrorError: Error, Equatable, Sendable {

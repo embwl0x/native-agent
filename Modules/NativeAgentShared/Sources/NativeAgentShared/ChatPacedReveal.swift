@@ -4,31 +4,9 @@ import SwiftUI
 // reply's paced reveal, its edge fade and the settle crossfade, so both
 // platforms stream with one feel.
 
-/// The streaming reply, one `Text` per paragraph.
-///
-/// User, 2026-09-23: one `Text` holding the whole growing reply was re-typeset
-/// from its first word on every published chunk (~1 ms at the start of a
-/// 1,500-word reply, ~70 ms at the end), so a long reply pinned the main
-/// thread at 14 chunks a second and starved its own stream. Split at blank
-/// lines, finished paragraphs are unchanged `Text`s that keep their cached
-/// layout and only the last one re-lays out (~2 ms at the end).
-///
-/// Wave 3 (Grok's rhythm): a paragraph break is the line gap plus
-/// `paragraphGap`, not a whole blank line; the Mac's settled reply splits at
-/// the same breaks (`paragraphs`) with the same gap, so the settle does not
-/// move a line. Its inline parse comes through here too (below).
-///
-/// Fluid glass A1: the last paragraph carries the paced reveal's edge fade.
-/// Finished paragraphs get a constant renderer, so a frame redraws one `Text`.
-///
-/// User, 2026-10-07: her replies streamed with literal `**` and snapped to
-/// bold when they settled (half her replies carry bold). Each paragraph now
-/// goes through `inline`, the platform's own settled-reply inline parse, so
-/// the words look the same before and after. A finished paragraph is an
-/// equatable leaf that parses once and is skipped after; only the last one
-/// parses per frame. A marker she has opened but not closed yet is closed at
-/// the edge (or hidden, with nothing after it). Paragraphs in or around a
-/// code fence stay raw, as the settled reply keeps code literal.
+/// One Text per paragraph, with the same gap and inline styling as settled
+/// replies. The pacer retains paragraph offsets and the styled edge; fade-only
+/// frames change the edge's renderer without splitting or parsing the source.
 @available(macOS 15, iOS 18, *)
 public struct StreamingParagraphText: View {
     let text: Substring
@@ -37,6 +15,9 @@ public struct StreamingParagraphText: View {
     var now: TimeInterval = 0
     /// The settled reply's inline markdown parse; nil streams raw text.
     var inline: ChatInlineMarkdown?
+    fileprivate var projectedParagraphs: [Substring]?
+    fileprivate var projectedStyles: [Bool]?
+    fileprivate var preparedEdge: Text?
     @Environment(\.lineSpacing) private var lineSpacing
 
     public init(
@@ -55,16 +36,16 @@ public struct StreamingParagraphText: View {
     public static let paragraphGap: CGFloat = 10
 
     public var body: some View {
-        let paragraphs = Self.paragraphs(text)
+        let paragraphs = projectedParagraphs ?? Self.paragraphs(text)
         let last = paragraphs.count - 1
-        let styled = Self.styledParagraphs(paragraphs, enabled: inline != nil)
+        let styled = projectedStyles ?? Self.styledParagraphs(paragraphs, enabled: inline != nil)
         VStack(alignment: .leading, spacing: lineSpacing + Self.paragraphGap) {
             // Positional ids: paragraphs only append while a reply streams,
             // so a finished one keeps its id and its layout.
             ForEach(paragraphs.indices, id: \.self) { index in
                 let parse = styled[index] ? inline : nil
                 if index == last {
-                    Self.paragraph(paragraphs[index], fades: fades, inline: parse, atEdge: true)
+                    (preparedEdge ?? Self.paragraph(paragraphs[index], fades: fades, inline: parse, atEdge: true))
                         .textRenderer(ChatEdgeFadeRenderer(now: now))
                 } else {
                     FinishedParagraph(text: paragraphs[index], inline: parse).equatable()
@@ -240,20 +221,9 @@ public struct ChatInlineMarkdown: Sendable {
     }
 }
 
-/// The live reply, revealed at a steady pace instead of in chunks
-/// (fluid glass A1).
-///
-/// The Mac stream publishes every 70 ms, the iPhone's every ~1 s; this leaf
-/// turns either into about 80 words a second, a word or two a frame. Only it
-/// runs per frame: the bubble re-renders per publish as before, the list and
-/// the chat view never. The display link is a `TimelineView(.animation)` that
-/// pauses once the text has caught up and the last words have faded in.
-///
-/// Agent: no artificial suspense. A mount shows what is already there (a
-/// swapped row, a reopened chat, a session switch); a hidden window and a
-/// backlog past `maxLagBytes` jump; and the settled reply replaces this view
-/// the moment the turn settles, so nothing dribbles out after the answer is
-/// done. Reduce Motion shows the text as published, with no fade.
+/// The live reply reveals words smoothly and pauses when caught up or hidden.
+/// Mounts, hidden-window returns and excessive backlog show current words;
+/// Reduce Motion bypasses pacing and fades.
 @available(macOS 15, iOS 18, *)
 public struct PacedStreamingText: View {
     let text: String
@@ -261,29 +231,43 @@ public struct PacedStreamingText: View {
     /// ~1,200 bytes, so it passes a larger lag than the Mac's 70 ms publishes.
     var maxLagBytes: Int
     var inline: ChatInlineMarkdown?
+    var isVisible: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var pacer = ChatStreamPacer()
     /// The text length the pacer last came to rest at; paused only while
     /// that is still the whole text, so a jump to the end also pauses.
     @State private var restedAt = -1
 
-    public init(text: String, maxLagBytes: Int = ChatStreamPacer.maxLagBytes, inline: ChatInlineMarkdown? = nil) {
+    public init(text: String, maxLagBytes: Int = ChatStreamPacer.maxLagBytes, inline: ChatInlineMarkdown? = nil, isVisible: Bool = true) {
         self.text = text
         self.maxLagBytes = maxLagBytes
         self.inline = inline
+        self.isVisible = isVisible
     }
 
     public var body: some View {
-        if reduceMotion {
-            visible(text[...])
-        } else {
-            TimelineView(.animation(minimumInterval: nil, paused: restedAt == text.utf8.count)) { context in
-                let now = context.date.timeIntervalSinceReferenceDate
-                let shown = pacer.advance(text, now: now, maxLagBytes: maxLagBytes)
-                let restMark = pacer.isResting(text) ? text.utf8.count : -1
-                visible(text[..<text.utf8.index(text.utf8.startIndex, offsetBy: shown)], now: now)
-                    .onChange(of: restMark, initial: true) { _, mark in restedAt = mark }
+        let _ = pacer.setSource(text)
+        Group {
+            if !isVisible {
+                if let prepared = pacer.preparedView { prepared }
+            } else if reduceMotion {
+                visible(text[...])
+            } else {
+                TimelineView(.animation(minimumInterval: 1.0 / 60, paused: restedAt == text.utf8.count)) { context in
+                    let now = context.date.timeIntervalSinceReferenceDate
+                    let shown = pacer.advance(text, now: now, maxLagBytes: maxLagBytes)
+                    let restMark = pacer.isResting(text) ? text.utf8.count : -1
+                    visible(text[..<text.utf8.index(text.utf8.startIndex, offsetBy: shown)], now: now)
+                        .onChange(of: restMark, initial: true) { _, mark in restedAt = mark }
+                }
             }
+        }
+        .onChange(of: isVisible) { _, visible in
+            if visible { pacer.resetReveal(); restedAt = -1 }
+        }
+        .onChange(of: reduceMotion) {
+            pacer.resetReveal()
+            restedAt = -1
         }
     }
 
@@ -291,7 +275,11 @@ public struct PacedStreamingText: View {
     @ViewBuilder
     private func visible(_ revealed: Substring, now: TimeInterval = 0) -> some View {
         if revealed.contains(where: { !$0.isWhitespace }) {
-            StreamingParagraphText(text: revealed, fades: reduceMotion ? [] : pacer.fades, now: now, inline: inline)
+            if reduceMotion {
+                StreamingParagraphText(text: revealed, inline: inline)
+            } else {
+                pacer.paragraphText(revealed, inline: inline, now: now)
+            }
         } else {
             StreamingParagraphText(text: " ")
         }
@@ -328,8 +316,75 @@ public final class ChatStreamPacer {
     private var budget = 0.0
     private var lastTick: TimeInterval?
     private var waitingAtLastTick = false
+    private var source = ""
+    private var completedParagraphs: [Range<Int>] = []
+    private var completedStyles: [Bool] = []
+    private var paragraphStart = 0
+    private var inFence = false
+    fileprivate var preparedView: StreamingParagraphText?
+    private var preparedBytes = -1
 
     public init() {}
+
+    fileprivate func setSource(_ text: String) {
+        guard source != text else { return }
+        if !text.hasPrefix(source) {
+            completedParagraphs = []
+            completedStyles = []
+            paragraphStart = 0
+            inFence = false
+            preparedView = nil
+            preparedBytes = -1
+            resetReveal()
+        }
+        source = text
+    }
+
+    fileprivate func resetReveal() {
+        shown = -1
+        lastTick = nil
+        fades = []
+        budget = 0
+        preparedBytes = -1
+    }
+
+    fileprivate func paragraphText(_ revealed: Substring, inline: ChatInlineMarkdown?, now: TimeInterval) -> StreamingParagraphText {
+        let bytes = revealed.utf8.count
+        if bytes != preparedBytes || (preparedView?.inline == nil) != (inline == nil) {
+            let start = revealed.utf8.index(revealed.utf8.startIndex, offsetBy: paragraphStart)
+            let tail = StreamingParagraphText.paragraphs(revealed[start...])
+            var styles: [Bool] = []
+            var fenced = inFence
+            for (index, paragraph) in tail.enumerated() {
+                let fences = paragraph.contains("```") ? paragraph.components(separatedBy: "```").count - 1 : 0
+                styles.append(inline != nil && !fenced && fences == 0)
+                if fences % 2 == 1 { fenced.toggle() }
+                if index < tail.count - 1 { inFence = fenced }
+            }
+            var view = StreamingParagraphText(text: revealed, fades: fades, inline: inline)
+            let utf8 = revealed.utf8
+            view.projectedParagraphs = completedParagraphs.map {
+                revealed[utf8.index(utf8.startIndex, offsetBy: $0.lowerBound)..<utf8.index(utf8.startIndex, offsetBy: $0.upperBound)]
+            } + tail
+            view.projectedStyles = completedStyles + styles
+            if let edge = tail.last {
+                view.preparedEdge = StreamingParagraphText.paragraph(edge, fades: fades,
+                    inline: styles.last == true ? inline : nil, atEdge: true)
+                if tail.count > 1 {
+                    completedParagraphs.append(contentsOf: tail.dropLast().map {
+                        utf8.distance(from: utf8.startIndex, to: $0.startIndex)..<utf8.distance(from: utf8.startIndex, to: $0.endIndex)
+                    })
+                    completedStyles.append(contentsOf: styles.dropLast())
+                    paragraphStart = revealed.utf8.distance(from: revealed.utf8.startIndex, to: edge.startIndex)
+                }
+            }
+            preparedView = view
+            preparedBytes = bytes
+        }
+        var view = preparedView ?? StreamingParagraphText(text: revealed, inline: inline)
+        view.now = now
+        return view
+    }
 
     static func multiplier(backlog: Int) -> Double {
         let buffered = Double(backlog)

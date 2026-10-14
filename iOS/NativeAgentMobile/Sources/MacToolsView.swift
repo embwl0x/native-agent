@@ -502,8 +502,6 @@ enum RemoteActionState: String, Equatable {
         return .failed
     }
 
-    var offersRetry: Bool { self == .failed }
-
     var color: Color {
         switch self {
         case .waiting, .running: return .orange
@@ -607,12 +605,17 @@ final class RemoteActionLedger: ObservableObject {
 
     @Published private(set) var actions: [RemoteActionCard] = []
     private let maximumOrdinaryActions: Int
-    private var approvalsObserver: AnyCancellable?
 
     init(maximumOrdinaryActions: Int = 12) {
         self.maximumOrdinaryActions = max(0, maximumOrdinaryActions)
-        approvalsObserver = iCloudSyncEngine.shared.$approvals.sink { [weak self] approvals in
-            self?.reconcileApprovals(approvals)
+        observeApprovals()
+    }
+
+    private func observeApprovals() {
+        withObservationTracking {
+            reconcileApprovals(iCloudSyncEngine.shared.approvals)
+        } onChange: { [weak self] in
+            Task { @MainActor in self?.observeApprovals() }
         }
     }
 

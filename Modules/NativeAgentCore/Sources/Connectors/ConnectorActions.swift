@@ -228,7 +228,7 @@ public struct ConnectorActions: Sendable {
                 output = try await GitHubConnectorActions.setRepoVisibility(input: input, dataRoot: dataRoot)
                 receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "slack.status":
-                output = try await SlackConnectorActions.status(input: input)
+                output = try await SlackConnectorActions.status(input: input, dataRoot: dataRoot)
                 receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "slack.list_channels":
                 output = try await SlackConnectorActions.listChannels(input: input)
@@ -761,12 +761,17 @@ public struct ConnectorActions: Sendable {
         ])
         let path = ExternalSendApprovalTransactions.externalSendReceiptsPath(dataRoot: dataRoot)
         let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            try await appendJSONLCapped(
-                record, to: path, using: persistence,
-                maxLines: JSONLLineCaps.actionReceipts,
-                logLabel: "NativeClient.connectorAction", takeLock: false
-            )
+        do {
+            try await persistence.withFileLock(path) {
+                try await appendJSONLCapped(
+                    record, to: path, using: persistence,
+                    maxLines: JSONLLineCaps.actionReceipts,
+                    logLabel: "NativeClient.connectorAction", takeLock: false
+                )
+            }
+        } catch {
+            guard descriptor.connectorId == "github", !dryRun, status == "completed" else { throw error }
+            ModuleLog(category: "Connectors")("GitHub.connection: could not record completed action: %@", error.localizedDescription)
         }
         return receipt
     }

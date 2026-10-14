@@ -14,9 +14,8 @@ public enum MoonshotModelCatalog {
     static let ttlCache = ModelCatalogTTLCache(
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
-        readCache: { readCache(dataRoot: $0) },
-        cacheUpdatedAt: { cacheUpdatedAt(dataRoot: $0) },
-        fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1) }
+        readCache: { readDecodedCache(dataRoot: $0) },
+        fetchLive: { ModelCatalogFetch(models: try await fetchLiveModels(dataRoot: $0, session: $1), isComplete: true) }
     )
 
     public static func models(
@@ -36,63 +35,17 @@ public enum MoonshotModelCatalog {
         await ttlCache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
-    /// True when the cache is missing its `updated_at` stamp or that stamp is
-    /// older than the TTL. A cache without a parseable stamp is treated as stale
-    /// so it refreshes once (writeCache always stamps `updated_at`).
-    static func cacheIsStale(dataRoot: URL, now: Date = Date()) -> Bool {
-        ttlCache.cacheIsStale(dataRoot: dataRoot, now: now)
-    }
-
-    private static func cacheUpdatedAt(dataRoot: URL) -> Date? {
-        guard let data = try? Data(contentsOf: cachePath(dataRoot: dataRoot)),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let raw = root["updated_at"] as? String else { return nil }
-        return ISO8601DateFormatter().date(from: raw)
-    }
-
-    public static func providerJSONModels(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        session: URLSession = .shared,
-        refresh: Bool = false
-    ) async -> [[String: JSONValue]] {
-        await models(dataRoot: dataRoot, session: session, refresh: refresh).map { model in
-            var object = model.providerJSON()
-            object["default_reasoning_effort"] = .string(defaultReasoningEffort(for: model.id))
-            object["supported_reasoning_efforts"] = .array(
-                supportedReasoningEfforts(for: model.id).map(JSONValue.string)
-            )
-            object["supports_fast"] = .bool(false)
-            return object
-        }
-    }
-
-    /// M-F3 (review round 2): synchronous catalog-membership check for the
-    /// routing guard. The live authenticated `/v1/models` response can carry
-    /// account-visible ids with NO `kimi-`/`moonshot-` prefix; routing must
-    /// recognize those from the same disk cache `models()` maintains — without
-    /// going async or touching the network. Memoized on the cache file's
-    /// mtime so the per-provider-call cost is a stat(), not a JSON parse.
+    /// The routing guard recognizes account-visible IDs from the same decoded
+    /// disk cache `models()` maintains, without touching the network.
     /// Only the provider's own fetched rows count here; the shipped rows are
     /// `FirstPartyModelCatalog.moonshotModels`, which routing checks first.
-    private static let knownIDsLock = NSLock()
-    nonisolated(unsafe) private static var knownIDsMemo: (path: String, mtime: Date?, ids: Set<String>)?
-
     public static func isKnownCatalogModelID(
         _ id: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> Bool {
         let needle = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !needle.isEmpty else { return false }
-        let path = cachePath(dataRoot: dataRoot)
-        let mtime = (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
-        knownIDsLock.lock()
-        defer { knownIDsLock.unlock() }
-        if let memo = knownIDsMemo, memo.path == path.path, memo.mtime == mtime {
-            return memo.ids.contains(needle)
-        }
-        let ids = Set((readCache(dataRoot: dataRoot) ?? []).map { $0.id.lowercased() })
-        knownIDsMemo = (path.path, mtime, ids)
-        return ids.contains(needle)
+        return readCache(dataRoot: dataRoot)?.contains { $0.id.lowercased() == needle } ?? false
     }
 
     static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
@@ -162,10 +115,19 @@ public enum MoonshotModelCatalog {
     }
 
     static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
-        guard let data = try? Data(contentsOf: cachePath(dataRoot: dataRoot)),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        readDecodedCache(dataRoot: dataRoot)?.models
+    }
+
+    private static let decodedCache = ModelCatalogDecodeCache()
+
+    private static func readDecodedCache(dataRoot: URL) -> DecodedModelCatalog? {
+        decodedCache.read(url: cachePath(dataRoot: dataRoot), decode: decodeCache)
+    }
+
+    private static func decodeCache(_ data: Data) -> DecodedModelCatalog? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = root["models"] as? [[String: Any]] else { return nil }
-        return rows.compactMap { row in
+        let models = rows.compactMap { row -> ProviderModelDescriptor? in
             guard let id = row["id"] as? String, !id.isEmpty else { return nil }
             return ProviderModelDescriptor(
                 id: id,
@@ -177,6 +139,8 @@ public enum MoonshotModelCatalog {
                 supportsJSONMode: (row["supports_json_mode"] as? Bool) ?? true
             )
         }
+        let fetchedAt = (root["updated_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+        return DecodedModelCatalog(models: models, isComplete: root["complete"] as? Bool, fetchedAt: fetchedAt)
     }
 
     private static func displayName(for id: String) -> String {

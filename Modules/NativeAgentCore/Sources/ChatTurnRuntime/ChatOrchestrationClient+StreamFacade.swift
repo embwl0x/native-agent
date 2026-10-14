@@ -436,7 +436,6 @@ extension SwiftNativeChatOrchestrationClient {
                 persona: persona,
                 surface: surface,
                 suppressUserAppend: suppressUserAppend,
-                persistToolMessages: true,
                 progress: { event in
                     continuation.yield(event)
                 },

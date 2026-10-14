@@ -1,3 +1,4 @@
+import AttentionRouting
 import Foundation
 import MemoryV2
 import PersistenceCore
@@ -45,7 +46,7 @@ struct AppMemoryRepairPresentation: MemoryRepairPresentationPort {
         let inserted = try await LiveNotificationInbox(path: inboxPath)
             .appendUnique(card, id: approvalId)
         if inserted {
-            await InboxPushNotifier.notifyIfAttentionWorthy(
+            await AttentionRouter.shared.notifyIfAttentionWorthy(
                 dataRoot: dataRoot,
                 itemId: approvalId,
                 title: title,

@@ -132,35 +132,6 @@ extension MemoryStorage {
     }
 
     @discardableResult
-    public func insertProposal(_ proposal: StoredProposal) async throws -> StoredProposal {
-        var stamped = proposal
-        stamped.metadata = Self.normalizingPeerMomentOrigin(stamped.metadata, source: stamped.source)
-        stamped.metadata = MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(stamped.metadata))
-        let proposal = stamped
-        try await dbPool.write { db in
-            try Self.requireWritableEpoch(
-                in: db,
-                vector: proposal.embedding,
-                epoch: proposal.embeddingEpoch
-            )
-            try db.execute(sql: """
-                INSERT INTO proposals
-                  (id, content, persona_id, source, staged_at, status,
-                   resolved_at, rejection_reason, embedding, metadata_json, embedding_epoch)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, arguments: [
-                proposal.id, proposal.content, proposal.personaId, proposal.source,
-                proposal.stagedAt, proposal.status,
-                proposal.resolvedAt, proposal.rejectionReason,
-                Self.encodeEmbedding(proposal.embedding),
-                Self.encodeMetadata(proposal.metadata),
-                proposal.embeddingEpoch
-            ])
-            try Self.pruneTerminalProposals(in: db)
-        }
-        return proposal
-    }
-
     /// User, 2026-09-06: the pending-proposal dedup as ONE transaction.
     /// `SwiftNativeMemoryV2.propose` used to list pending proposals, merge the
     /// new evidence in Swift, then call `updateProposalMetadata`, which

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore   // SwiftNativePersistenceCore + readJSONL (timeline scan)
 
 // MARK: - Execution outcome scoreboard (MEASURE leg of the north-star, 2026-06-15)
@@ -225,15 +226,9 @@ public enum WorkshopOutcomeScoreboard {
     /// module dependency from WorkshopExecution.
     static func parseTimestamp(_ s: String) -> Date? {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        let frac = ISO8601DateFormatter()
-        frac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = frac.date(from: trimmed) { return d }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        if let d = plain.date(from: trimmed) { return d }
+        if let d = NativeTimestampFormat.parseISO8601FractionalFirst(trimmed) { return d }
         if let ms = truncateFractionToMillis(trimmed) {
-            if let d = frac.date(from: ms) { return d }
-            if let d = plain.date(from: ms) { return d }
+            return NativeTimestampFormat.parseISO8601FractionalFirst(ms)
         }
         return nil
     }

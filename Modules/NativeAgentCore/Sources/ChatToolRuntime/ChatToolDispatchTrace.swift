@@ -144,7 +144,7 @@ extension ChatToolOutcome {
         if let connector = error.missingConnectorID {
             object["effects"] = .string("none")
             object["outcome"] = .string("unmet")
-            object["fix"] = .string("The owner must sign in to \(connector) in Settings > Connectors.")
+            object["fix"] = .string("The owner can sign in to \(connector) by requesting a setup card in chat or opening Connectors in Advanced view.")
         }
         if let chrome = error as? ChromeControlRuntimeError {
             if let effects = chrome.failureEffects { object["effects"] = .string(effects.rawValue) }
@@ -187,6 +187,7 @@ extension ChatToolOutcome {
             return false
         }
         guard case .object(let obj) = output else { return true }
+        if [.timeout, .cancelled, .refused].contains(exactResultClass(output)) { return false }
         // A PRESENT key holding JSON `null` is "no error", not an error.
         // `MacControlResult.toJSON()` always emits `"error": null` on success,
         // and `obj["error"] != nil` is true for `.some(.null)` — so every
@@ -239,46 +240,6 @@ extension ChatToolOutcome {
         return status == "waiting_approval"
             || status == "awaiting_approval"
             || status == "pending_approval"
-    }
-
-    /// The same truth for an inline interaction: a boundary that raised a need
-    /// DID NOT RUN. It is waiting on a person, so it is neither progress nor a
-    /// failure — the tool loop stops here and the turn suspends, exactly as it
-    /// does for an approval, and the no-progress guard must not read a card as
-    /// a round that achieved something.
-    public static func isWaitingInteraction(_ output: JSONValue) -> Bool {
-        guard case .object(let object) = output,
-              case .string(let raw)? = object["status"] else { return false }
-        guard raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            == "needs_input" else { return false }
-        // A canonical typed need and nothing else. An envelope that says
-        // `needs_input` while carrying an error, `ok: false`, or
-        // `isError: true` is a call that FAILED wearing a waiting label, and
-        // reading it as a question hid the failure on every surface: the pill
-        // drew "needs you", the fold counted it as open, and the trace filed
-        // it without an error class. Explicit failure evidence outranks
-        // waiting.
-        return !carriesFailureEvidence(output)
-    }
-
-    /// Explicit evidence, in the envelope itself, that the call did not
-    /// succeed. Never prose: only the wire fields the dispatch boundary
-    /// actually writes. The single predicate the pill, the chat fold, and the
-    /// trace all ask, so the three can never disagree about one row.
-    public static func carriesFailureEvidence(_ output: JSONValue) -> Bool {
-        guard case .object(let object) = output else { return false }
-        if let error = object["error"], error != .null {
-            if case .string(let text) = error {
-                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
-            } else {
-                return true
-            }
-        }
-        if object["ok"] == .bool(false) { return true }
-        if object["isError"] == .bool(true) { return true }
-        if object["is_error"] == .bool(true) { return true }
-        if object["success"] == .bool(false) { return true }
-        return false
     }
 
     /// Either kind of wait: the turn is parked on a person, not on a model.

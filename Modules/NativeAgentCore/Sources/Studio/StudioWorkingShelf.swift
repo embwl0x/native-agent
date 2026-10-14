@@ -112,9 +112,8 @@ public struct StudioWorkingShelf: Sendable {
     /// way `responseAsCorrected` and the amend write path resolve them.
     ///
     /// Only `response` is amendable, so a `stance.reason` quote never matches.
-    private func supersession(_ slot: Slot, entry: StudioJournalEntry, source: QuoteSource) -> Supersession? {
-        guard case .original = source,
-              slot.quoteField == "response",
+    private func supersession(_ slot: Slot, entry: StudioJournalEntry) -> Supersession? {
+        guard slot.quoteField == "response",
               let response = entry.response,
               let sentence = response.range(of: slot.sentence) else { return nil }
         var applied: [(range: Range<String.Index>, amendment: StudioAmendment)] = []
@@ -146,7 +145,7 @@ public struct StudioWorkingShelf: Sendable {
     }
 
     private enum QuoteSource {
-        case original
+        case original(Supersession?)
         case amendment(StudioAmendment)
     }
 
@@ -155,10 +154,11 @@ public struct StudioWorkingShelf: Sendable {
     private func quoteSource(_ slot: Slot, entry: StudioJournalEntry) -> QuoteSource? {
         let source = slot.quoteField == "response" ? entry.response : entry.stance.reason
         let matchesOriginal = source.map { containsSentence(slot.sentence, in: $0) } ?? false
-        if matchesOriginal, supersession(slot, entry: entry, source: .original) == nil { return .original }
+        let superseded = matchesOriginal ? supersession(slot, entry: entry) : nil
+        if matchesOriginal, superseded == nil { return .original(nil) }
         guard slot.quoteField == "response",
               let amendment = entry.amendments.first(where: { containsSentence(slot.sentence, in: $0.correction) }) else {
-            return matchesOriginal ? .original : nil
+            return matchesOriginal ? .original(superseded) : nil
         }
         return .amendment(amendment)
     }
@@ -186,7 +186,7 @@ public struct StudioWorkingShelf: Sendable {
                 throw Refusal(message: "Entry \(slot.entryID) is unavailable or selected_sentence is not one complete sentence verbatim in \(slot.quoteField). Fragments and multiple sentences are not accepted. Choose a shorter existing sentence rather than clipping or rewriting it. The shelf is unchanged.")
             }
             // The journal line still says it; she no longer does.
-            if let superseded = supersession(slot, entry: entry, source: source) {
+            if case .original(let superseded?) = source {
                 let amendment = superseded.first
                 throw Refusal(message: "Entry \(slot.entryID): that sentence was corrected on \(amendment.amendedOn) (\(amendment.reason)) and now reads \"\(amendment.correction)\". Shelve the corrected sentence instead. The shelf is unchanged.")
             }
@@ -249,7 +249,7 @@ public struct StudioWorkingShelf: Sendable {
             // since has to travel with it — struck through, with the correction,
             // its date and its reason — or the shelf keeps a retracted claim in
             // circulation with none of that attached.
-            if let superseded = supersession(slot, entry: entry, source: source) {
+            if case .original(let superseded?) = source {
                 let amendment = superseded.first
                 card["selected_sentence_status"] = .string("superseded")
                 // The correction shown at the passage it actually covers, not

@@ -1,3 +1,4 @@
+import DoctorChecks
 import Foundation
 import CognitiveSubstrate
 import Cognition
@@ -9,13 +10,11 @@ import DreamREMCycle
 
 public enum CognitionProposalsFeed: Sendable {
     public struct Pending: Sendable, Equatable {
-        public init(standingViews: [CognitiveStandingView] = [], schemaProposals: [CognitiveSchemaProposal] = []) {
+        public init(standingViews: [CognitiveStandingView] = []) {
             self.standingViews = standingViews
-            self.schemaProposals = schemaProposals
         }
         public var standingViews: [CognitiveStandingView] = []
-        public var schemaProposals: [CognitiveSchemaProposal] = []
-        public var count: Int { standingViews.count + schemaProposals.count }
+        public var count: Int { standingViews.count }
     }
 
     public enum Read: Sendable, Equatable {
@@ -251,4 +250,30 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         self.showsOrganismDetails = showsOrganismDetails
     }
 
+}
+
+extension DreamRunResult {
+    public static func completionFailure(_ result: [String: Any]) -> String? {
+        let errors = result["errors"] as? [String] ?? []
+        guard DoctorStatusProjection.boolValue(result["ok"]) == true, errors.isEmpty else {
+            return errors.isEmpty ? "The dream run did not complete successfully." : errors.joined(separator: "; ")
+        }
+        return nil
+    }
+
+    public static func statusText(_ result: [String: Any]) -> String {
+        let entries = DoctorStatusProjection.intValue(result["entriesWritten"]) ?? 0
+        let disabled = DoctorStatusProjection.boolValue(result["disabled"]) ?? false
+        if disabled { return "Dream cycle disabled" }
+        if let reason = result["skipReason"] as? String {
+            switch reason {
+            case "already_dreamt": return "Dream already ran for the target night"
+            case "already_running": return "A dream cycle is already running"
+            case "no_new_material": return "No new material to dream about"
+            default: return "Dream cycle skipped: \(reason)"
+            }
+        }
+        if entries <= 0 { return "Dream cycle wrote no entries" }
+        return entries == 1 ? "Dream cycle wrote 1 entry" : "Dream cycle wrote \(entries) entries"
+    }
 }

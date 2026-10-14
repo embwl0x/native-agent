@@ -1,8 +1,34 @@
 import Foundation
+import Observation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
+
+/// Settings sends an explicit replay edge to the main-content tour mount.
+@MainActor
+@Observable
+public final class OnboardingTourReplayCoordinator {
+    public static let shared = OnboardingTourReplayCoordinator()
+
+    public private(set) var requestID = 0
+    private var deliveredRequestID = 0
+
+    @discardableResult
+    public func requestReplay() -> Int {
+        requestID += 1
+        return requestID
+    }
+
+    /// The persisted showTour preference still covers a later scene mount.
+    public func claim(_ requestID: Int) -> Bool {
+        guard requestID == self.requestID,
+              requestID > deliveredRequestID,
+              requestID > 0 else { return false }
+        deliveredRequestID = requestID
+        return true
+    }
+}
 
 // MARK: - Onboarding
 //
@@ -24,9 +50,6 @@ import PersonaEngine
 //   • `complete` is file-authoritative: SOUL/VOICE/USER/GROWTH + profile.json
 //     must all verify before `.onboarded` is durably published.
 //
-//   • There is no HTTP fallback. `makeOnboardingClient()` always returns the
-//     Swift-native implementation.
-//
 //   • `repairProfile` (User, 2026-09-06) covers the one state `complete` and
 //     `reset` between them cannot: an anchored install whose profile.json is
 //     simply absent. It rewrites that file and NOTHING else — no persona doc,
@@ -37,49 +60,6 @@ import PersonaEngine
 //     profile already exists.
 
 // MARK: - Result types — start
-
-public struct PersonaTypeOption: Sendable, Equatable {
-    public let id: String
-    public let label: String
-    public let description: String
-    public let sampleAnchor: String
-    public let pronouns: String
-
-    public init(id: String, label: String, description: String, sampleAnchor: String, pronouns: String) {
-        self.id = id
-        self.label = label
-        self.description = description
-        self.sampleAnchor = sampleAnchor
-        self.pronouns = pronouns
-    }
-
-    public func toJSON() -> JSONValue {
-        .object([
-            "id": .string(id),
-            "label": .string(label),
-            "description": .string(description),
-            "sample_anchor": .string(sampleAnchor),
-            "pronouns": .string(pronouns),
-        ])
-    }
-
-    public init(from json: JSONValue) throws {
-        guard case .object(let obj) = json else {
-            throw OnboardingError.malformedResponse("PersonaTypeOption: not an object")
-        }
-        func str(_ k: String) throws -> String {
-            if case .string(let s) = obj[k] ?? .null { return s }
-            throw OnboardingError.malformedResponse("PersonaTypeOption: missing string '\(k)'")
-        }
-        self.init(
-            id: try str("id"),
-            label: try str("label"),
-            description: try str("description"),
-            sampleAnchor: try str("sample_anchor"),
-            pronouns: try str("pronouns")
-        )
-    }
-}
 
 public struct AbilityOverviewEntry: Sendable, Equatable {
     public let id: String
@@ -93,42 +73,27 @@ public struct AbilityOverviewEntry: Sendable, Equatable {
         self.detail = detail
         self.systemImage = systemImage
     }
-
-    public func toJSON() -> JSONValue {
-        .object([
-            "id": .string(id),
-            "title": .string(title),
-            "detail": .string(detail),
-            "system_image": .string(systemImage),
-        ])
-    }
-
-    public init(from json: JSONValue) throws {
-        guard case .object(let obj) = json else {
-            throw OnboardingError.malformedResponse("AbilityOverviewEntry: not an object")
-        }
-        func str(_ k: String) throws -> String {
-            if case .string(let s) = obj[k] ?? .null { return s }
-            throw OnboardingError.malformedResponse("AbilityOverviewEntry: missing string '\(k)'")
-        }
-        self.init(
-            id: try str("id"),
-            title: try str("title"),
-            detail: try str("detail"),
-            systemImage: try str("system_image")
-        )
-    }
 }
 
 public struct OnboardingStartResult: Sendable, Equatable {
-    public let ready: Bool
+    public enum Disposition: Sendable, Equatable {
+        case resume, repairProfile, reset, alreadyOnboarded, blockedNeedsReset, fresh
+    }
+
+    public func disposition(buildFailed: Bool) -> Disposition {
+        if pendingRecovery { return .resume }
+        if profileRepairRequired { return .repairProfile }
+        if resetRequired { return .reset }
+        if hasExisting { return buildFailed ? .blockedNeedsReset : .alreadyOnboarded }
+        return .fresh
+    }
+
     public let hasExisting: Bool
     /// Mirrors Python's `current_name if has_existing else None` — when no
     /// persona exists yet this is nil; when a persona exists the field is the
     /// raw name from `profile.json` (may be empty string if `name` is missing
     /// or empty, matching `str(profile.get('name') or '')`).
     public let currentPersonaName: String?
-    public let personaTypeOptions: [PersonaTypeOption]
     public let abilityOverview: [AbilityOverviewEntry]
     /// True when a durable completion transaction exists and can only be
     /// resumed by the exact identity that created it. This additive wire field
@@ -158,73 +123,24 @@ public struct OnboardingStartResult: Sendable, Equatable {
     /// carries bytes that must not be destroyed, and Doctor still names it.
     public let profileRepairRequired: Bool
 
+    public var requiresPresentation: Bool {
+        pendingRecovery || resetRequired || profileRepairRequired || !hasExisting
+    }
+
     public init(
-        ready: Bool,
         hasExisting: Bool,
         currentPersonaName: String?,
-        personaTypeOptions: [PersonaTypeOption],
         abilityOverview: [AbilityOverviewEntry],
         pendingRecovery: Bool = false,
         resetRequired: Bool = false,
         profileRepairRequired: Bool = false
     ) {
-        self.ready = ready
         self.hasExisting = hasExisting
         self.currentPersonaName = currentPersonaName
-        self.personaTypeOptions = personaTypeOptions
         self.abilityOverview = abilityOverview
         self.pendingRecovery = pendingRecovery
         self.resetRequired = resetRequired
         self.profileRepairRequired = profileRepairRequired
-    }
-
-    public func toJSON() -> JSONValue {
-        .object([
-            "ready": .bool(ready),
-            "has_existing": .bool(hasExisting),
-            "current_persona_name": currentPersonaName.map { .string($0) } ?? .null,
-            "persona_type_options": .array(personaTypeOptions.map { $0.toJSON() }),
-            "ability_overview": .array(abilityOverview.map { $0.toJSON() }),
-            "pending_recovery": .bool(pendingRecovery),
-            "reset_required": .bool(resetRequired),
-            "profile_repair_required": .bool(profileRepairRequired),
-        ])
-    }
-
-    public init(from json: JSONValue) throws {
-        guard case .object(let obj) = json else {
-            throw OnboardingError.malformedResponse("OnboardingStartResult: not an object")
-        }
-        var ready = false
-        if case .bool(let b) = obj["ready"] ?? .null { ready = b }
-        var hasExisting = false
-        if case .bool(let b) = obj["has_existing"] ?? .null { hasExisting = b }
-        var name: String? = nil
-        if case .string(let s) = obj["current_persona_name"] ?? .null { name = s }
-        var options: [PersonaTypeOption] = []
-        if case .array(let arr) = obj["persona_type_options"] ?? .null {
-            options = try arr.map { try PersonaTypeOption(from: $0) }
-        }
-        var overview: [AbilityOverviewEntry] = []
-        if case .array(let arr) = obj["ability_overview"] ?? .null {
-            overview = try arr.map { try AbilityOverviewEntry(from: $0) }
-        }
-        var pendingRecovery = false
-        if case .bool(let b) = obj["pending_recovery"] ?? .null { pendingRecovery = b }
-        var resetRequired = false
-        if case .bool(let b) = obj["reset_required"] ?? .null { resetRequired = b }
-        var profileRepairRequired = false
-        if case .bool(let b) = obj["profile_repair_required"] ?? .null { profileRepairRequired = b }
-        self.init(
-            ready: ready,
-            hasExisting: hasExisting,
-            currentPersonaName: name,
-            personaTypeOptions: options,
-            abilityOverview: overview,
-            pendingRecovery: pendingRecovery,
-            resetRequired: resetRequired,
-            profileRepairRequired: profileRepairRequired
-        )
     }
 }
 
@@ -247,16 +163,19 @@ public struct OnboardingCompleteResult: Sendable, Equatable {
     public let agentName: String?
     public let personaType: String?
     public let userName: String?
-    public let docsWritten: [String]
     public let error: String?
     public let detail: String?
+
+    public var requiresPersonaReset: Bool { error == "persona_already_exists" }
+    public var requiresProfileRepairRecheck: Bool {
+        error == "profile_already_present" || error == "onboarding_in_progress"
+    }
 
     public init(
         ok: Bool,
         agentName: String? = nil,
         personaType: String? = nil,
         userName: String? = nil,
-        docsWritten: [String] = [],
         error: String? = nil,
         detail: String? = nil
     ) {
@@ -264,59 +183,8 @@ public struct OnboardingCompleteResult: Sendable, Equatable {
         self.agentName = agentName
         self.personaType = personaType
         self.userName = userName
-        self.docsWritten = docsWritten
         self.error = error
         self.detail = detail
-    }
-
-    public func toJSON() -> JSONValue {
-        if ok {
-            var obj: [String: JSONValue] = [
-                "ok": .bool(true),
-                "docs_written": .array(docsWritten.map { .string($0) }),
-            ]
-            if let v = agentName { obj["agent_name"] = .string(v) }
-            if let v = personaType { obj["persona_type"] = .string(v) }
-            if let v = userName { obj["user_name"] = .string(v) }
-            return .object(obj)
-        } else {
-            var obj: [String: JSONValue] = [:]
-            if let v = error { obj["error"] = .string(v) }
-            if let v = detail { obj["detail"] = .string(v) }
-            return .object(obj)
-        }
-    }
-
-    public init(from json: JSONValue) throws {
-        guard case .object(let obj) = json else {
-            throw OnboardingError.malformedResponse("OnboardingCompleteResult: not an object")
-        }
-        // Success path: object has "ok": true. Error path: object has "error".
-        if case .bool(let b) = obj["ok"] ?? .null, b {
-            var agentName: String? = nil
-            if case .string(let s) = obj["agent_name"] ?? .null { agentName = s }
-            var personaType: String? = nil
-            if case .string(let s) = obj["persona_type"] ?? .null { personaType = s }
-            var userName: String? = nil
-            if case .string(let s) = obj["user_name"] ?? .null { userName = s }
-            var docsWritten: [String] = []
-            if case .array(let arr) = obj["docs_written"] ?? .null {
-                docsWritten = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-            }
-            self.init(
-                ok: true,
-                agentName: agentName,
-                personaType: personaType,
-                userName: userName,
-                docsWritten: docsWritten
-            )
-            return
-        }
-        var error: String? = nil
-        if case .string(let s) = obj["error"] ?? .null { error = s }
-        var detail: String? = nil
-        if case .string(let s) = obj["detail"] ?? .null { detail = s }
-        self.init(ok: false, error: error, detail: detail)
     }
 }
 
@@ -325,105 +193,37 @@ public struct OnboardingCompleteResult: Sendable, Equatable {
 public struct OnboardingResetResult: Sendable, Equatable {
     public let ok: Bool
     public let backedUp: [String]
-    public let readyForOnboarding: Bool
     public let error: String?
 
     public init(
         ok: Bool,
         backedUp: [String] = [],
-        readyForOnboarding: Bool = false,
         error: String? = nil
     ) {
         self.ok = ok
         self.backedUp = backedUp
-        self.readyForOnboarding = readyForOnboarding
         self.error = error
-    }
-
-    public func toJSON() -> JSONValue {
-        if ok {
-            return .object([
-                "ok": .bool(true),
-                "backed_up": .array(backedUp.map { .string($0) }),
-                "ready_for_onboarding": .bool(readyForOnboarding),
-            ])
-        }
-        var obj: [String: JSONValue] = [:]
-        if let v = error { obj["error"] = .string(v) }
-        return .object(obj)
-    }
-
-    public init(from json: JSONValue) throws {
-        guard case .object(let obj) = json else {
-            throw OnboardingError.malformedResponse("OnboardingResetResult: not an object")
-        }
-        if case .bool(let b) = obj["ok"] ?? .null, b {
-            var backedUp: [String] = []
-            if case .array(let arr) = obj["backed_up"] ?? .null {
-                backedUp = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-            }
-            var ready = false
-            if case .bool(let b2) = obj["ready_for_onboarding"] ?? .null { ready = b2 }
-            self.init(ok: true, backedUp: backedUp, readyForOnboarding: ready)
-            return
-        }
-        var error: String? = nil
-        if case .string(let s) = obj["error"] ?? .null { error = s }
-        self.init(ok: false, error: error)
     }
 }
 
 // MARK: - Errors
 
 public enum OnboardingError: Error, Sendable, Equatable, LocalizedError {
-    case malformedResponse(String)
-    case transport(String)
     case ioFailure(String)
 
     public var errorDescription: String? {
         switch self {
-        case .malformedResponse(let s): return "malformed response: \(s)"
-        case .transport(let s): return "transport error: \(s)"
         case .ioFailure(let s): return "io failure: \(s)"
         }
     }
 }
 
-// MARK: - Protocol
-
-public protocol OnboardingClient: Sendable {
-    func startOnboarding() async throws -> OnboardingStartResult
-    func completeOnboarding(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult
-    func resumePendingOnboarding() async throws -> OnboardingCompleteResult
-    /// Rewrite ONLY `profile.json` for the `profileRepairRequired` state.
-    /// Never touches SOUL/VOICE/USER/GROWTH or the sentinel.
-    func repairProfile(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult
-    func resetOnboarding(confirm: Bool) async throws -> OnboardingResetResult
-}
-
 // MARK: - SwiftNative
 
-public struct SwiftNativeOnboardingClient: OnboardingClient {
+public struct SwiftNativeOnboardingClient: Sendable {
     private let personaRoot: URL
     private let dataRoot: URL
     private let profileJSONPath: URL
-    private let failureInjector: (@Sendable (OnboardingCommitStep) throws -> Void)?
-
-    enum OnboardingCommitStep: Sendable, Equatable {
-        case manifestPrepared
-        case soulCommitted
-        case voiceCommitted
-        case userCommitted
-        case growthCommitted
-        case profileCommitted
-        case sentinelCommitted
-        case resetManifestPrepared
-        case resetBackupCommitted(String)
-        case resetBackupsCommitted
-        case resetSourceRemoved(String)
-        case resetSourcesRemoved
-        case resetMarkersCleared
-    }
 
     private struct OnboardingTargetIntent: Codable, Sendable {
         let role: String
@@ -474,21 +274,6 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         let sentinelSHA256: String?
         let phase: OnboardingResetPhase
         let targets: [OnboardingResetTargetIntent]
-
-        func advancing(to phase: OnboardingResetPhase) -> Self {
-            .init(
-                schemaVersion: schemaVersion,
-                transactionID: transactionID,
-                createdAt: createdAt,
-                backupStamp: backupStamp,
-                personaRoot: personaRoot,
-                dataRoot: dataRoot,
-                completionManifestSHA256: completionManifestSHA256,
-                sentinelSHA256: sentinelSHA256,
-                phase: phase,
-                targets: targets
-            )
-        }
     }
 
     static let pendingTransactionRelativePath = "onboarding/pending-completion.json"
@@ -501,34 +286,6 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         self.profileJSONPath = resolvedDataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("profile.json")
-        self.failureInjector = nil
-    }
-
-    /// Test-only escape hatch: caller supplies the exact profile.json path so a
-    /// test can assert personaRoot-vs-profilePath divergence without modelling
-    /// the dataRoot/memory join. Production callers use the two-URL init above.
-    public init(personaRoot: URL, profileJSONPath: URL) {
-        self.personaRoot = personaRoot
-        self.dataRoot = profileJSONPath
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        self.profileJSONPath = profileJSONPath
-        self.failureInjector = nil
-    }
-
-    /// Narrow failure seam used by restart/partial-commit regression tests.
-    /// Production initializers never install one.
-    init(
-        personaRoot: URL,
-        dataRoot: URL,
-        failureInjector: @escaping @Sendable (OnboardingCommitStep) throws -> Void
-    ) {
-        self.personaRoot = personaRoot
-        self.dataRoot = dataRoot
-        self.profileJSONPath = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("profile.json")
-        self.failureInjector = failureInjector
     }
 
     /// Resolve the persona root by delegating to `PersonaRootResolver.resolve()`
@@ -627,10 +384,8 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             let rawName = pending?.agentName ?? Self.readPersonaName(at: profileJSONPath)
             let currentName: String? = hasExisting ? rawName : nil
             return OnboardingStartResult(
-                ready: true,
                 hasExisting: hasExisting,
                 currentPersonaName: currentName,
-                personaTypeOptions: Self.personaTypeOptions,
                 abilityOverview: Self.abilityOverview,
                 pendingRecovery: pending != nil,
                 resetRequired: pending == nil && hasPartialPersonaState,
@@ -760,7 +515,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                 manifest = OnboardingTransactionManifest(
                     schemaVersion: 1,
                     transactionID: UUID().uuidString.lowercased(),
-                    createdAt: Self.nowISO(),
+                    createdAt: NativeTimestampFormat.fractionalZulu(Date()),
                     personaRoot: Self.canonicalPath(personaRoot),
                     profilePath: Self.canonicalPath(profileJSONPath),
                     identityHash: requestedIdentityHash,
@@ -772,7 +527,6 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                     }
                 )
                 try Self.writeTransaction(manifest, to: manifestPath)
-                try failureInjector?(.manifestPrepared)
             }
 
             return try await commitPreparedTransaction(
@@ -900,8 +654,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                     ok: true,
                     agentName: agentName,
                     personaType: personaType,
-                    userName: userName,
-                    docsWritten: ["profile.json"]
+                    userName: userName
                 )
             }
         }
@@ -954,22 +707,14 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             profilePath: profileJSONPath,
             dataRoot: dataRoot
         )
-        let commitOrder: [(String, OnboardingCommitStep)] = [
-            ("soul", .soulCommitted),
-            ("voice", .voiceCommitted),
-            ("user", .userCommitted),
-            ("growth", .growthCommitted),
-            ("profile", .profileCommitted),
-        ]
         let intents = Dictionary(uniqueKeysWithValues: manifest.targets.map { ($0.role, $0) })
-        for (role, step) in commitOrder {
+        for role in ["soul", "voice", "user", "growth", "profile"] {
             guard let intent = intents[role], let target = targetURLs[role] else {
                 throw OnboardingError.ioFailure("onboarding transaction missing required target '\(role)'")
             }
             try await persistence.withFileLock(target) {
                 try Self.ensureCommitted(intent, to: target)
             }
-            try failureInjector?(step)
         }
 
         // The completion marker is deliberately last. A successful result is
@@ -980,7 +725,6 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         try await persistence.withFileLock(sentinelURL) {
             try Self.ensureCommitted(sentinelIntent, to: sentinelURL)
         }
-        try failureInjector?(.sentinelCommitted)
 
         do {
             try FileManager.default.removeItem(at: manifestPath)
@@ -993,8 +737,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             ok: true,
             agentName: manifest.agentName,
             personaType: manifest.personaType,
-            userName: manifest.userName,
-            docsWritten: ["SOUL.md", "VOICE.md", "USER.md", "GROWTH.md"]
+            userName: manifest.userName
         )
     }
 
@@ -1089,7 +832,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         let manifest = OnboardingResetTransactionManifest(
             schemaVersion: 1,
             transactionID: transactionID,
-            createdAt: Self.nowISO(),
+            createdAt: NativeTimestampFormat.fractionalZulu(Date()),
             backupStamp: backupStamp,
             personaRoot: Self.canonicalPath(personaRoot),
             dataRoot: Self.canonicalPath(dataRoot),
@@ -1099,7 +842,6 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             targets: targets
         )
         try Self.writeResetTransaction(manifest, to: resetTransactionManifestPath)
-        try failureInjector?(.resetManifestPrepared)
         return manifest
     }
 
@@ -1107,25 +849,13 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         _ manifest: OnboardingResetTransactionManifest,
         persistence: SwiftNativePersistenceCore
     ) async throws -> OnboardingResetResult {
-        var current = manifest
-        let injectBackupSteps = current.phase == .prepared
-        for target in current.targets {
+        for target in manifest.targets {
             let backup = personaRoot.appendingPathComponent(target.backupFileName)
             try await persistence.withFileLock(backup) {
                 try Self.ensureResetBackup(target, at: backup)
             }
-            if injectBackupSteps {
-                try failureInjector?(.resetBackupCommitted(target.role))
-            }
         }
-        if current.phase == .prepared {
-            current = current.advancing(to: .backupsCommitted)
-            try Self.writeResetTransaction(current, to: resetTransactionManifestPath)
-            try failureInjector?(.resetBackupsCommitted)
-        }
-
-        let injectSourceSteps = current.phase != .sourcesRemoved
-        for target in current.targets {
+        for target in manifest.targets {
             guard let definition = Self.resetTargetDefinitions.first(where: { $0.role == target.role }) else {
                 throw OnboardingError.ioFailure("reset transaction contains unknown role '\(target.role)'")
             }
@@ -1133,33 +863,24 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             try await persistence.withFileLock(source) {
                 try Self.ensureResetSourceRemoved(target, at: source)
             }
-            if injectSourceSteps {
-                try failureInjector?(.resetSourceRemoved(target.role))
-            }
         }
-        if current.phase != .sourcesRemoved {
-            current = current.advancing(to: .sourcesRemoved)
-            try Self.writeResetTransaction(current, to: resetTransactionManifestPath)
-            try failureInjector?(.resetSourcesRemoved)
-        }
-
         // Re-verify every backup after source deletion. Only then may the two
         // completion markers be cleared. The completion manifest is removed
         // first so an older binary can fail closed on the still-present
         // sentinel, but cannot replay a completion the reset already cancelled.
-        for target in current.targets {
+        for target in manifest.targets {
             let backup = personaRoot.appendingPathComponent(target.backupFileName)
             try await persistence.withFileLock(backup) {
                 try Self.ensureResetBackup(target, at: backup)
             }
         }
         try Self.ensureResetMarkerRemoved(
-            expectedSHA256: current.completionManifestSHA256,
+            expectedSHA256: manifest.completionManifestSHA256,
             at: transactionManifestPath,
             label: "pending onboarding completion"
         )
         let sentinel = dataRoot.appendingPathComponent(".onboarded")
-        let expectedSentinelSHA256 = current.sentinelSHA256
+        let expectedSentinelSHA256 = manifest.sentinelSHA256
         try await persistence.withFileLock(sentinel) {
             try Self.ensureResetMarkerRemoved(
                 expectedSHA256: expectedSentinelSHA256,
@@ -1167,7 +888,6 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                 label: ".onboarded"
             )
         }
-        try failureInjector?(.resetMarkersCleared)
 
         do {
             try FileManager.default.removeItem(at: resetTransactionManifestPath)
@@ -1179,10 +899,9 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         }
         return OnboardingResetResult(
             ok: true,
-            backedUp: current.targets.map {
+            backedUp: manifest.targets.map {
                 personaRoot.appendingPathComponent($0.backupFileName).path
-            },
-            readyForOnboarding: true
+            }
         )
     }
 
@@ -1716,13 +1435,13 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         // in Python does {existing ∪ body} → normalize → write. We constructed
         // `current` from normalize(raw) so it already matches the
         // first-normalize step; now apply body overrides and normalize once more.
-        var merged: [String: Any] = profileToDict(current)
+        var merged = SwiftNativePersonaEngine.profileToRawDict(current)
         merged["name"] = agentName
         merged["personaKind"] = newKind
         merged["voice"] = newVoice
-        merged["updatedAt"] = nowISO()
+        merged["updatedAt"] = NativeTimestampFormat.fractionalZulu(Date())
         let renormalized = PersonaCompiler.normalize(raw: merged, defaults: .defaults)
-        var finalDict = profileToDict(renormalized)
+        var finalDict = SwiftNativePersonaEngine.profileToRawDict(renormalized)
         // The USER's name (not the agent's `name`). Injected AFTER normalize so
         // it survives regardless of the compiler's known-key set — the substrate
         // reads this to address the user in her inner voice (never hardcode a
@@ -1732,51 +1451,10 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             finalDict["userName"] = trimmedUserName
         }
 
-        let json = try JSONValue.fromObject(finalDict)
+        let json = JSONValue(fromFoundation: finalDict)
         let bytes = try json.serializedData(pretty: false)
         let text = String(decoding: bytes, as: UTF8.self)
         return ProfileUpdatePlan(content: text, baseSHA256: baseSHA256)
-    }
-
-    private static func nowISO() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        f.timeZone = TimeZone(identifier: "UTC")
-        return f.string(from: Date())
-    }
-
-    /// CompiledPersonalityProfile → JSONValue-friendly dict.
-    private static func profileToDict(_ p: CompiledPersonalityProfile) -> [String: Any] {
-        let traits: [String: Any] = [
-            "warmth": p.traits.warmth,
-            "directness": p.traits.directness,
-            "humor": p.traits.humor,
-            "proactivity": p.traits.proactivity,
-            "rigor": p.traits.rigor,
-            "autonomy": p.traits.autonomy,
-            "creativity": p.traits.creativity,
-            "brevity": p.traits.brevity,
-        ]
-        var out: [String: Any] = [
-            "schemaVersion": p.schemaVersion,
-            "personaEngineVersion": p.personaEngineVersion,
-            "name": p.name,
-            "personaKind": p.personaKind,
-            "essence": p.essence,
-            "voice": p.voice,
-            "customDirective": p.customDirective,
-            "traits": traits,
-            "examples": p.examples,
-            "forbiddenPatterns": p.forbiddenPatterns,
-            "instincts": p.instincts,
-            "boundaries": p.boundaries,
-            "surfaceOverrides": p.surfaceOverrides,
-            "updatedAt": p.updatedAt,
-        ]
-        for (key, value) in p.extras where out[key] == nil {
-            out[key] = value.foundationValue
-        }
-        return out
     }
 
     /// Best-effort read of `<dataRoot>/memory/profile.json` → `name` field.
@@ -1791,32 +1469,6 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         if let s = obj["name"] as? String { return s }
         return ""
     }
-
-    /// Byte-for-byte port of persona_templates.persona_type_descriptions
-    ///.
-    public static let personaTypeOptions: [PersonaTypeOption] = [
-        PersonaTypeOption(
-            id: "female",
-            label: "Female-presenting",
-            description: "Warm, observational, judgment-forward.",
-            sampleAnchor: "Here's what I actually see.",
-            pronouns: "she/her"
-        ),
-        PersonaTypeOption(
-            id: "male",
-            label: "Male-presenting",
-            description: "Direct, dry, holds ground.",
-            sampleAnchor: "That's a real one. Worth pausing on.",
-            pronouns: "he/him"
-        ),
-        PersonaTypeOption(
-            id: "ai",
-            label: "AI",
-            description: "Gender-neutral, precise, character without performance.",
-            sampleAnchor: "Let me be exact about this.",
-            pronouns: "they/them"
-        ),
-    ]
 
     /// Byte-for-byte port of the (now-retired, wave 37 W18) Python
     /// NativeAgentRuntime.onboarding_ability_overview. Six entries — chat,
@@ -1862,45 +1514,51 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
     ]
 }
 
-// MARK: - JSONValue helpers
-
-extension JSONValue {
-    /// Convert a `[String: Any]` (with Any values restricted to JSON-safe types
-    /// — Int/Int64/Double/Bool/String/Array/Dictionary) to JSONValue.
-    static func fromObject(_ obj: [String: Any]) throws -> JSONValue {
-        var out: [String: JSONValue] = [:]
-        for (k, v) in obj {
-            out[k] = try fromAny(v)
-        }
-        return .object(out)
+extension SwiftNativeOnboardingClient {
+    public enum StarterOutcome: Equatable {
+        case created
+        case notesUnsaved(documentID: String, draft: String)
+        case failed(String)
     }
 
-    private static func fromAny(_ value: Any) throws -> JSONValue {
-        if value is NSNull { return .null }
-        if let n = value as? NSNumber {
-            // Disambiguate Bool from numeric NSNumber.
-            if CFGetTypeID(n) == CFBooleanGetTypeID() { return .bool(n.boolValue) }
-            let cType = CFNumberGetType(n as CFNumber)
-            switch cType {
-            case .float32Type, .float64Type, .cgFloatType, .doubleType, .floatType:
-                return .double(n.doubleValue)
-            default:
-                return .int(n.int64Value)
+    @MainActor
+    public static func createStarterPersona(
+        agentName: String,
+        userName: String,
+        notes: String,
+        complete: (String, String) async throws -> OnboardingCompleteResult,
+        reload: () async -> [PersonaDocSpec]?,
+        save: (String, String) async -> Bool,
+        failureMessage: (Error) -> String
+    ) async -> StarterOutcome {
+        do {
+            let response = try await complete(
+                agentName.trimmingCharacters(in: .whitespacesAndNewlines),
+                userName.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            guard response.ok else {
+                return .failed(response.detail ?? response.error ?? "Could not create the persona.")
             }
+            guard let documents = await reload() else {
+                return .failed(
+                    "The persona was created, but its documents could not be reloaded to save your setup notes. Retry from the Personality page before editing anything else."
+                )
+            }
+
+            let trimmedNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedNotes.isEmpty,
+                  let soul = documents.first(where: { $0.id.uppercased() == "SOUL" })
+            else {
+                return .created
+            }
+
+            let draft = soul.content + "\n\n## From setup\n" + trimmedNotes + "\n"
+            guard await save(soul.id, draft) else {
+                return .notesUnsaved(documentID: soul.id, draft: draft)
+            }
+            return .created
+        } catch {
+            return .failed(failureMessage(error))
         }
-        if let s = value as? String { return .string(s) }
-        if let arr = value as? [Any] { return .array(try arr.map(fromAny)) }
-        if let dict = value as? [String: Any] {
-            var out: [String: JSONValue] = [:]
-            for (k, v) in dict { out[k] = try fromAny(v) }
-            return .object(out)
-        }
-        throw OnboardingError.ioFailure("fromAny: unsupported value type \(type(of: value))")
     }
-}
-
-// MARK: - Factory
-
-public func makeOnboardingClient() -> any OnboardingClient {
-    return SwiftNativeOnboardingClient()
 }

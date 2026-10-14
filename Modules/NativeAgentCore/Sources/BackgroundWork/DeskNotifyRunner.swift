@@ -25,21 +25,18 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
     private let postNagNotification: @Sendable (String, String, String?) async -> Bool
     public init(interval: TimeInterval, dataRoot: URL,
                 attention: AttentionRouter,
-                postMacNotification: @escaping @Sendable (String, String) async -> Bool,
-                postPairedDeviceNotification: (@Sendable (String, String) async -> Bool)?,
+                postMacNotification: @escaping @Sendable (String, String, [String: String], String?) async -> Bool,
                 postNagNotification: @escaping @Sendable (String, String, String?) async -> Bool) {
         self.interval = interval
         self.dataRoot = dataRoot
         self.attention = attention
         self.postMacNotification = postMacNotification
-        self.postPairedDeviceNotification = postPairedDeviceNotification
         self.postNagNotification = postNagNotification
     }
 
     public let interval: TimeInterval
     let dataRoot: URL
-    let postMacNotification: @Sendable (String, String) async -> Bool
-    let postPairedDeviceNotification: (@Sendable (String, String) async -> Bool)?
+    let postMacNotification: @Sendable (String, String, [String: String], String?) async -> Bool
 
     public var loopId: String { "desk_notify" }
     public var tickTimeoutOverride: TimeInterval? { 30 }
@@ -48,9 +45,10 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         // The inbox too: a knock held for quiet hours books their end.
         return EventDeadlinePhysiology.storeAndFileEvents(
-            paths: [store.opsPath, store.statePath, DeskNagConfigStore(dataRoot: dataRoot).configPath,
-                    LiveNotificationInbox.livePath(dataRoot: dataRoot)],
+            paths: [store.opsPath, store.basePath, DeskNagConfigStore(dataRoot: dataRoot).configPath,
+                    LiveNotificationInbox.livePath(dataRoot: dataRoot), dataRoot.appendingPathComponent("user_prefs.json")],
             stores: [.desk],
+            notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange],
             loopId: loopId
         )
     }
@@ -66,10 +64,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             guard held || nagConfig.enabled || DeskNotifyEvaluator.decisions(state, now: now).contains(where: { $0.level != .urgent }),
                   AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot, at: now),
                   let window = TurnQuietHoursWindow.read(dataRoot: dataRoot) else { return nil }
-            var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = .current
-            return calendar.nextDate(after: now, matching: DateComponents(hour: window.endHour, minute: 0, second: 0),
-                                     matchingPolicy: .nextTime, repeatedTimePolicy: .first, direction: .forward)
+            return window.end(after: now)
         }()
         // Nag lane deadlines (mute end / earliest in-scope defer end) share the
         // tick — load() is the same read-only, file-creating-nothing call the
@@ -80,10 +75,6 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             after: now
         )
         return [notify, nag, quietEnd].compactMap { $0 }.min()
-    }
-
-    public func tick() async {
-        _ = await tickOutcome()
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
@@ -120,36 +111,26 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             // failure isn't silent. v1 marks after attempting; success-gated retry
             // with backoff is a noted refinement (failures here are near-always a
             // permanent notification-setup issue, where retry only spams).
-            let macOK = await postMacNotification(decision.title, decision.body)
-            let mobileOK: Bool
-            // Distinct from `mobileOK`: a router that chose no channel, or
-            // deferred for quiet hours, is not a failure to report — but it is
-            // not a delivery to count either.
-            var mobileReached = false
-            if let postPairedDeviceNotification {
-                mobileOK = await postPairedDeviceNotification(decision.title, decision.body)
-                mobileReached = mobileOK
-            } else {
-                // Derive identity from the same immutable state evaluated
-                // above, never from prose or a second read after delivery.
-                let item = state.items.first { $0.handle == decision.handle }
-                let revision = item?.status.isTerminal == true
-                    ? (item?.closedAt ?? decision.observedUpdatedAt)
-                    : decision.observedUpdatedAt
-                // A non-throwing return is not a delivery: the router can
-                // return normally having chosen no channel at all. Read its own
-                // projection instead.
-                let outcome = try? await attention.route(
-                    eventId: "desk_notify:\(decision.handle):\(revision)",
-                    importance: decision.level == .urgent ? .adverse : .ownerWaiting,
-                    title: decision.title,
-                    body: decision.body,
-                    userInfo: ["screen": "inbox", "source": "desk"]
-                )
-                let projection = outcome?.deliveryProjection ?? .failed
-                mobileOK = projection != .failed
-                mobileReached = projection.reachedAChannel
-            }
+            let macOK = await postMacNotification(decision.title, decision.body, [:], nil)
+            // Derive identity from the same immutable state evaluated
+            // above, never from prose or a second read after delivery.
+            let item = state.items.first { $0.handle == decision.handle }
+            let revision = item?.status.isTerminal == true
+                ? (item?.closedAt ?? decision.observedUpdatedAt)
+                : decision.observedUpdatedAt
+            // A non-throwing return is not a delivery: the router can
+            // return normally having chosen no channel at all. Read its own
+            // projection instead.
+            let outcome = try? await attention.route(
+                eventId: "desk_notify:\(decision.handle):\(revision)",
+                importance: decision.level == .urgent ? .adverse : .ownerWaiting,
+                title: decision.title,
+                body: decision.body,
+                userInfo: ["screen": "inbox", "source": "desk"]
+            )
+            let projection = outcome?.deliveryProjection ?? .failed
+            let mobileOK = projection != .failed
+            let mobileReached = projection.reachedAChannel
             // Log BOTH channel outcomes so no failure is silent (Agent review).
             if !macOK {
                 nativeLog("desk_notify: Mac banner failed for \(decision.handle)")

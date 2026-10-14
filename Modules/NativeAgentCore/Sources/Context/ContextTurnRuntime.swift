@@ -11,14 +11,7 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
 
     public init() {}
 
-    public var embeddingIfReady: [Float]? {
-        lock.withLock { value?.values }
-    }
-
     public var valueIfReady: ContextQueryEmbeddingValue? { lock.withLock { value } }
-
-    /// Payload-free registration count for deterministic waiter-lifecycle tests.
-    var pendingWaiterCount: Int { lock.withLock { waiters.count } }
 
     /// Sweep R4 A5: the vector, waiting up to `timeoutNanoseconds` for a cold
     /// embedder to warm. Returns nil on timeout — the caller then proceeds
@@ -437,10 +430,6 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         await feedbackHandler?(.expansion, [atomID], [receiptID])
     }
 
-    public func recordRetry() async {
-        await feedbackHandler?(.retry, packet.receipt.selectedAtomIDs, [packet.receipt.id])
-    }
-
     public func recordDelivery() async {
         let first = feedbackLock.withLock {
             let first = !deliveryRecorded
@@ -497,20 +486,5 @@ public enum ContextTurnPreparationError: Error, Equatable, Sendable, LocalizedEr
         case .personaSelectionUnavailable:
             "The selected persona could not be prepared. Try again."
         }
-    }
-}
-
-/// Mutation-free revision read used to prove that a frozen evaluation epoch
-/// stayed on one immutable Context generation. This carries identifiers only;
-/// no atom text or personal content leaves the owner.
-public struct ContextFrozenRevision: Sendable, Equatable, Codable {
-    public let generationID: Int64
-    public let sourceFingerprint: String
-    public let arenaGenerationID: Int64
-
-    public init(generationID: Int64, sourceFingerprint: String, arenaGenerationID: Int64) {
-        self.generationID = generationID
-        self.sourceFingerprint = sourceFingerprint
-        self.arenaGenerationID = arenaGenerationID
     }
 }

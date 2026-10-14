@@ -63,7 +63,7 @@ package enum AgentWorkspaceArrivals {
             // Baseline collection never consumes peer content. Actual display
             // does, using the current owner's elevation rather than cached trust.
             if preview != nil, let peer, let dataRoot,
-               (try? AgentWorkspacePeerReader(dataRoot: dataRoot).list().first { "peer:" + $0.id == peer }?.elevationAllowed) != true {
+               (try? AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot).first { "peer:" + $0.id == peer }?.elevationAllowed) != true {
                 AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
             }
             var result: [String: JSONValue] = ["title": .string(String(title.prefix(120))),
@@ -173,7 +173,7 @@ package enum AgentWorkspaceArrivals {
     }
 
     static func conversations(dataRoot: URL, scope: String) throws -> [Candidate] {
-        try AgentWorkspaceConversationReader(dataRoot: dataRoot).records().filter { $0.scopeSessionID == scope }.map { row in
+        try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true).filter { $0.scopeSessionID == scope }.map { row in
             var receipt = object(row.receipt)
             if case .array(let jobs)? = receipt["jobs"], jobs.count == 1 { receipt = object(jobs.first) }
             let status = text(receipt["run_status"] ?? receipt["status"] ?? receipt["state"]) ?? row.phase
@@ -191,7 +191,7 @@ package enum AgentWorkspaceArrivals {
                 input = exact.filter { ["agent", "message_id"].contains($0.key) }
             } else if !row.agent.hasPrefix("bot:") { input["conversation"] = .string(row.label) }
             let location = AgentWorkspaceLocation.record(tool: "agent_read", input: input, title: row.name + " — " + row.label)
-            let fingerprint = AgentWorkspaceConversationProjection.workspaceChangeObservation(row, location: location, previous: nil)?.nextStamp?.fingerprint
+            let fingerprint = AgentWorkspaceChanges.workspaceChangeObservation(row, location: location, previous: nil)?.nextStamp?.fingerprint
                 ?? hash(.object(receipt.filter { !["updated_at", "read_at", "polled_at"].contains($0.key) }))
             return .init(source: "agents:" + row.id,
                 revision: row.operationID + ":" + row.phase + ":" + fingerprint,

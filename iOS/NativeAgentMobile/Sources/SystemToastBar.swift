@@ -249,7 +249,7 @@ struct MacStatusChip: View {
     var speaksAsAgent = false
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var showDetail = false
 
     private var status: BridgeStatus { bridgeClient.bridgeStatus }
@@ -383,7 +383,7 @@ private struct MacStatusDetail: View {
 /// text, X to dismiss. A NEW error text un-dismisses itself — dismissing
 /// "snapshots downloading" must not also silence a later decode failure.
 struct MacSyncErrorBanner: View {
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var dismissedMessage: String?
     @State private var isExpanded = false
     @State private var showsConnection = false

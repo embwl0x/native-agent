@@ -36,19 +36,12 @@ extension ChatStore {
         }
     }
 
-    /// Applies a Mac-owned transcript projection to the currently visible
-    /// session. This is also the event-driven iCloud publication consumer, so
-    /// it intentionally merges when messages are already visible. The existing
-    /// pending machinery remains authoritative for local streams and inputs.
-    func applyMacTranscriptSnapshot(_ macMessages: [ChatMessage], sessionID: String?) {
-        applyMacTranscriptRead(.published(macMessages, generation: nil), sessionID: sessionID)
-    }
-
     /// 2026-09-06: same merge owner, now told whether an empty transcript is
     /// the Mac's statement about this session or merely nothing to read.
     func applyMacTranscriptRead(_ read: MacTranscriptRead, sessionID: String?) {
         let requestedSessionID = Self.cleanSessionID(sessionID)
-        guard requestedSessionID == Self.cleanSessionID(selectedSessionID ?? mainSessionID),
+        guard sessionCacheLoadTask == nil,
+              requestedSessionID == Self.cleanSessionID(selectedSessionID ?? mainSessionID),
               case .published(let macMessages, let generation) = read else { return }
         guard !macMessages.isEmpty else {
             applyAuthoritativeEmptyTranscript(generation: generation, sessionID: requestedSessionID)
@@ -85,10 +78,7 @@ extension ChatStore {
             if generationAdvanced { persistMessages() }
             return
         }
-        if merged != messages {
-            messages = merged
-        }
-        persistMessages()
+        messages = merged
     }
 
     /// 2026-09-06: the Mac says this session's transcript is empty. Acting on
@@ -117,7 +107,6 @@ extension ChatStore {
             return true
         }
         messages = kept
-        persistMessages()
         return true
     }
 
@@ -140,7 +129,7 @@ extension ChatStore {
         macPublishedMessageIDs = Set(macMessages.map(\.id))
     }
 
-    func cachedTranscriptRows(_ rows: [ChatMessage]) -> [ChatMessage] {
+    nonisolated static func cachedTranscriptRows(_ rows: [ChatMessage]) -> [ChatMessage] {
         let settled = rows.filter { !$0.isStreaming }
         let recentIDs = Set(settled.suffix(200).map(\.id))
         // The ordinary cache cap cannot discard a receipt awaiting publication.
@@ -149,19 +138,15 @@ extension ChatStore {
 
     func persistMessages() {
         guard !suppressMessagePersistence else { return }
-        let capped = cachedTranscriptRows(messages)
         let ownerSessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
-        let envelope = CachedTranscript(
-            schemaVersion: 2,
-            sessionID: ownerSessionID,
-            messages: Array(capped),
-            // 2026-09-06: the watermark is written with the rows it describes,
-            // so a relaunch still knows which published transcripts these rows
-            // have already answered for.
-            appliedTranscriptGeneration: ownerSessionID.flatMap { appliedTranscriptGenerations[$0] }
-        )
-        if let data = try? JSONEncoder().encode(envelope) {
-            defaults.set(data, forKey: transcriptStorageKey(for: ownerSessionID))
+        let rows = messages
+        let generation = ownerSessionID.flatMap { appliedTranscriptGenerations[$0] }
+        storage.save(key: transcriptStorageKey(for: ownerSessionID), value: {
+            return CachedTranscript(schemaVersion: 2, sessionID: ownerSessionID,
+                messages: Self.cachedTranscriptRows(rows),
+                appliedTranscriptGeneration: generation)
+        }) { [weak self] error in
+            Task { @MainActor in self?.errorBanner = "Chat could not be saved: \(error.localizedDescription)" }
         }
     }
 }

@@ -29,21 +29,9 @@ public actor MemoryStorage {
     private var knowledgeGraphProjectionTail: Task<Void, Never>?
 
     // MARK: - Recall candidate cache
-    // Recall and nearest-neighbor queries share decoded active embeddings and
-    // precomputed norms. Reuse requires both the in-actor mutation generation
-    // and SQLite data_version to match. The latter detects writes by other
-    // connections, including the consolidation table swap.
-    //
-    // data_version is comparable only on the SAME connection. This dedicated
-    // queue keeps the sequence stable across pool reads. Counter-only writes
-    // use this connection: SQLite does not change its own data_version, while
-    // ALL other connections' commits remain visible to the version net.
-    let versionProbe: DatabaseQueue
+    // Canonical recall_generation excludes usage and graph-only writes.
     var recallCache: RecallCache?
     var recallGeneration: Int = 0
-    /// Test-only observability (internal, reached via @testable): how many
-    /// times the candidate cache was (re)built from SQL. A cache hit does NOT bump it.
-    var recallCacheRebuildCount: Int = 0
 
     /// Attach a USER.md generator so mutations debounce-regenerate the file.
     public func attachUserMDGenerator(_ generator: UserMDGenerator) {
@@ -98,10 +86,14 @@ public actor MemoryStorage {
 
     private func pokeKnowledgeGraph(_ stored: StoredMemory, deleted: Bool) {
         guard let hook = knowledgeGraphHook else { return }
+        enqueueKnowledgeGraphProjection { await hook(stored, deleted) }
+    }
+
+    func enqueueKnowledgeGraphProjection(_ operation: @escaping @Sendable () async -> Void) {
         let prior = knowledgeGraphProjectionTail
         knowledgeGraphProjectionTail = Task {
             await prior?.value
-            await hook(stored, deleted)
+            await operation()
         }
     }
 
@@ -175,6 +167,10 @@ public actor MemoryStorage {
         // prepareDatabase so every pool connection carries it.
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
+            // Match Swift's cursor comparisons, including Unicode identifiers.
+            db.add(collation: DatabaseCollation("memory_curation_order") { lhs, rhs in
+                lhs == rhs ? .orderedSame : lhs < rhs ? .orderedAscending : .orderedDescending
+            })
         }
         let pool = try DatabasePool(path: path.path, configuration: config)
         try Self.adoptLedgerlessGraphStoreIfNeeded(pool)
@@ -191,43 +187,6 @@ public actor MemoryStorage {
         self.dbPool = pool
         self.memoryLimit = boundedLimit
         self.startupBoundEvictions = startupEvictions
-        // Dedicated single connection for the recall-cache data_version net.
-        self.versionProbe = try DatabaseQueue(path: path.path, configuration: config)
-        Self.publishStartupBoundEvictions(startupEvictions, memoryPath: path)
-    }
-
-    /// Ephemeral store for tests.
-    public init(
-        inMemoryName: String = "MemoryStorage-\(UUID().uuidString)",
-        memoryLimit: Int = memoryStoredRowCap
-    ) throws {
-        let safeName = inMemoryName
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: ":", with: "_")
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(safeName)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let path = dir.appendingPathComponent("memory.sqlite")
-        self.path = path
-        var config = Configuration()
-        config.foreignKeysEnabled = true
-        config.busyMode = .timeout(2)
-        let pool = try DatabasePool(path: path.path, configuration: config)
-        try MemoryStorage.migrator.migrate(pool)
-        try pool.read { db in
-            try Self.requireSemanticIntegrity(in: db)
-        }
-        let boundedLimit = max(1, memoryLimit)
-        let startupEvictions = try pool.write { db in
-            let evicted = try Self.pruneMemoriesToBound(in: db, limit: boundedLimit)
-            try Self.pruneTerminalProposals(in: db)
-            return evicted
-        }
-        self.dbPool = pool
-        self.memoryLimit = boundedLimit
-        self.startupBoundEvictions = startupEvictions
-        // Dedicated single connection for the recall-cache data_version net.
-        self.versionProbe = try DatabaseQueue(path: path.path, configuration: config)
         Self.publishStartupBoundEvictions(startupEvictions, memoryPath: path)
     }
 
@@ -555,6 +514,8 @@ public actor MemoryStorage {
         case refreshedEmpty
         /// The canonical row exists and holds content — the live store wins.
         case skippedExisting
+
+        public var landed: Bool { self != .skippedExisting }
     }
 
     static func normalizingPeerMomentOrigin(_ metadata: JSONValue?, source: String?) -> JSONValue? {
@@ -580,6 +541,21 @@ public actor MemoryStorage {
     /// then overwrites with legacy text. (b) A bare existence check has no
     /// repair path — a blank or half-written canonical row was never refreshed,
     /// and the one-way completion sentinel made that permanent.
+    public func importLegacyMemory(_ record: MemoryRecord, embedding: [Float]) async throws -> LegacyImportOutcome {
+        let persona: String
+        if case .object(let object)? = record.extras,
+           case .string(let legacyPersona)? = object["legacy_persona"],
+           !legacyPersona.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            persona = legacyPersona.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            persona = MemoryV2Defaults.personaID
+        }
+        return try await importLegacyMemory(MemoryStorageBridge.toStoredMemory(
+            record, embedding: embedding.isEmpty ? nil : embedding, embeddingEpoch: nil,
+            defaultPersonaID: persona
+        ))
+    }
+
     public func importLegacyMemory(_ memory: StoredMemory) async throws -> LegacyImportOutcome {
         var normalized = memory
         normalized.metadata = Self.normalizingPeerMomentOrigin(memory.metadata, source: memory.source)
@@ -792,6 +768,84 @@ public actor MemoryStorage {
         }
     }
 
+    /// Archived, corrected and graduated rows remain available for recovery.
+    public static func isRecoverable(_ record: MemoryRecord) -> Bool {
+        let lifecycle = MemoryLifecycle.normalized(record.lifecycle)
+        return lifecycle == MemoryLifecycle.corrected || lifecycle == MemoryLifecycle.graduated
+            || (record.status == "archived" && MemoryLifecycle.isRecallEligible(lifecycle))
+    }
+
+    /// Check disclosure over small ordered projections; decode full rows only
+    /// for this page, within the same SQLite read transaction.
+    public func curationPage(
+        archived: Bool, kind: String?, surface: String, persona: String?, newestFirst: Bool,
+        afterKey: (String, String)?, afterID: String?, offset: Int, limit: Int
+    ) async throws -> (records: [MemoryRecord], total: Int, nextOffset: Int) {
+        try await dbPool.read { db in
+            let direction = newestFirst ? "DESC" : "ASC"
+            let order = "created_at COLLATE memory_curation_order \(direction), id COLLATE memory_curation_order \(direction)"
+            let cursor = try Row.fetchCursor(db, sql: """
+                SELECT id, persona_id, created_at, status, lifecycle, metadata_json
+                FROM memories ORDER BY \(order)
+                """)
+            var ids: [String] = []
+            var total = 0
+            var start = afterKey == nil ? offset : 0
+            var foundAfterID = false
+            while let row = try cursor.next() {
+                let record = MemoryRecord(stored: try StoredMemory(
+                    id: row.decode(forColumn: "id"), content: "",
+                    personaId: row.decode(forColumn: "persona_id"),
+                    createdAt: row.decode(forColumn: "created_at"),
+                    status: row.decode(forColumn: "status"),
+                    lifecycle: row.decode(forColumn: "lifecycle") ?? MemoryLifecycle.confirmed,
+                    metadata: Self.decodeMetadata(row.decode(forColumn: "metadata_json"))
+                ))
+                guard archived ? Self.isRecoverable(record)
+                    : record.status == "active" && MemoryLifecycle.isRecallEligible(record.lifecycle),
+                    kind == nil || record.memoryKind == kind,
+                    MemoryRecordDisclosurePolicy.classify(
+                        personaID: record.personaId, status: archived ? "active" : record.status,
+                        lifecycle: archived ? nil : record.lifecycle, tags: record.tags, metadata: record.extras
+                    )?.permits(surface: surface, personaID: persona) == true else { continue }
+                let index = total
+                total += 1
+                if let key = afterKey,
+                   newestFirst ? (record.createdAt, record.id) >= key : (record.createdAt, record.id) <= key {
+                    start += 1
+                    continue
+                }
+                if afterKey == nil, !foundAfterID, record.id == afterID {
+                    foundAfterID = true
+                    start = total
+                    ids.removeAll()
+                    continue
+                }
+                if index >= start, ids.count < limit { ids.append(record.id) }
+            }
+            let records = try ids.isEmpty ? [] : Row.fetchAll(db,
+                sql: "SELECT * FROM memories WHERE id IN (\(ids.map { _ in "?" }.joined(separator: ","))) ORDER BY \(order)",
+                arguments: StatementArguments(ids)
+            ).map(Self.decodeMemory).map(MemoryRecord.init(stored:))
+            return (records, total, start + records.count)
+        }
+    }
+
+    /// Scalar status counts keep lifecycle and JSON boolean pin semantics.
+    public func statusCounts() async throws -> (memories: Int, active: Int, pinned: Int, pendingProposals: Int) {
+        try await dbPool.read { db in
+            let row = try Row.fetchOne(db, sql: """
+                SELECT COUNT(*) AS memories,
+                    COUNT(CASE WHEN status = 'active'
+                        AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL) THEN 1 END) AS active,
+                    COUNT(CASE WHEN json_type(metadata_json, '$.pinned') = 'true' THEN 1 END) AS pinned,
+                    (SELECT COUNT(*) FROM proposals WHERE status = 'pending') AS pending
+                FROM memories
+                """)!
+            return (row["memories"], row["active"], row["pinned"], row["pending"])
+        }
+    }
+
     /// Read pinned facts about User in chosen order, or disclosure-filtered user
     /// facts before the first pin. Both admit only `userIdentityKinds`. An
     /// empty result never restores unfiltered USER.md.
@@ -870,7 +924,7 @@ public actor MemoryStorage {
     /// corrupt recency ranking and reset the stale-age clock.
     public func recordRecallHits(ids: [String], at when: String = MemoryStorage.nowISO8601()) async throws {
         guard !ids.isEmpty else { return }
-        try await versionProbe.write { db in
+        try await dbPool.write { db in
             let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
             var args: [DatabaseValueConvertible] = [when]
             args.append(contentsOf: ids)
@@ -879,8 +933,8 @@ public actor MemoryStorage {
                 arguments: StatementArguments(args)
             )
         }
-        // Recall refreshes these two mutable columns on the same connection
-        // as its version check; decoded text/vectors remain reusable.
+        // Usage does not advance recall_generation; recall refreshes these
+        // columns without rebuilding decoded text and vectors.
     }
 
     /// Wave1 S-lane: archive an older single-valued fact superseded by a newer

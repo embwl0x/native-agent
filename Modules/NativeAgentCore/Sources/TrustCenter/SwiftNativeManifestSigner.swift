@@ -154,7 +154,10 @@ public actor SwiftNativeManifestSigner {
         if ver != "2" {
             return ["Manifest signatureVersion must be 2."]
         }
-        let keyData = try loadOrCreateSigningKey()
+        guard let keyData = try CheckedFixedSizeSecretFile.peekExisting(
+            at: dataRoot.appendingPathComponent("tools/.manifest_signing_key"), byteCount: 32) else {
+            throw ManifestSigningError.keyUnavailable("Signing authority is missing. Restore the original key or validate a new candidate; verification never creates authority.")
+        }
         let canonical = try Self.canonicalBytes(manifest)
         let mac = HMAC<SHA256>.authenticationCode(
             for: canonical, using: SymmetricKey(data: keyData)

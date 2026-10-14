@@ -51,15 +51,11 @@ import TrustCenter
 public actor WorkshopExecutorLoop {
     private let root: URL
     private let persistence: any PersistenceCoreProtocol
-    private let llmStep: WorkshopStepLLM?
-    private let tooledLLMStep: WorkshopStepTooledLLM?
-    private let measuredLLMStep: WorkshopStepMeasuredLLM?
     private let measuredTooledLLMStep: WorkshopStepMeasuredLLM?
     private let toolDispatch: WorkshopStepToolDispatch?
     private let stageApproval: WorkshopStepApprovalStager?
     private let isEnabled: @Sendable () async -> Bool
     private let maxActive: Int
-    private let cancellationReadObserver: (@Sendable () -> Void)?
     /// Per-step HARD deadline in nanoseconds (0 = disabled). A wedged tool with
     /// no internal timeout would otherwise hang an UNATTENDED step forever;
     /// this auto-fails it. See raceWithCancellationWatch.
@@ -82,26 +78,16 @@ public actor WorkshopExecutorLoop {
     private let terminalEventSink: WorkshopTerminalEventSink?
     private let now: @Sendable () -> Date
     private let approvedToolDispatch: WorkshopStepApprovedToolDispatch?
-    private var beforeApprovalTimeoutClaimForTesting: (@Sendable () async -> Void)?
-
-    func _setBeforeApprovalTimeoutClaimForTesting(_ hook: @escaping @Sendable () async -> Void) {
-        beforeApprovalTimeoutClaimForTesting = hook
-    }
     /// Every executor on a root shares this admission barrier. Failed recovery
     /// remains retryable; no process-local claim can land until all prior
     /// running records have settled, so retries cannot reclaim our own work.
-    static let orphanReclaimOnce = OnceByKey<String>(name: "workshop-orphan-reclaim")
+    static let orphanReclaimOnce = OnceByKey<String>()
     private static let logger = Logger(subsystem: "com.nativeagent.workshop", category: "executor")
 
     /// - Parameters:
     ///   - maxActive: concurrent-running cap, re-checked INSIDE the claim
     ///     lock. Defaults to the daemon's slot-gate constant
     ///     (`NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS`, default 3).
-    ///   - cancellationPollInterval: compatibility-only legacy label. The
-    ///     executor no longer polls; cancellation is driven by canonical-file
-    ///     change edges. The value is intentionally ignored.
-    ///   - cancellationReadObserver: test/diagnostic seam invoked only when an
-    ///     initial or real file-change edge causes a canonical status read.
     ///   - stepTimeoutInterval: HARD per-step deadline (seconds). nil →
     ///     `defaultStepTimeoutSeconds()` (env override, else 1500s backstop,
     ///     below the 1800s drain pass-timeout); <= 0 disables it. Backstop
@@ -110,17 +96,12 @@ public actor WorkshopExecutorLoop {
     public init(
         root: URL = PersistenceCore.defaultDataRoot(),
         persistence: (any PersistenceCoreProtocol)? = nil,
-        llmStep: WorkshopStepLLM? = nil,
-        tooledLLMStep: WorkshopStepTooledLLM? = nil,
-        measuredLLMStep: WorkshopStepMeasuredLLM? = nil,
         measuredTooledLLMStep: WorkshopStepMeasuredLLM? = nil,
         toolDispatch: WorkshopStepToolDispatch? = nil,
         approvedToolDispatch: WorkshopStepApprovedToolDispatch? = nil,
         stageApproval: WorkshopStepApprovalStager? = nil,
         isEnabled: @escaping @Sendable () async -> Bool = { true },
         maxActive: Int? = nil,
-        cancellationPollInterval: TimeInterval = 0.25,
-        cancellationReadObserver: (@Sendable () -> Void)? = nil,
         stepTimeoutInterval: TimeInterval? = nil,
         approvalTimeoutInterval: TimeInterval? = nil,
         stepApprovalEnforced: @escaping @Sendable () async -> Bool = { true },
@@ -129,16 +110,11 @@ public actor WorkshopExecutorLoop {
     ) {
         self.root = root
         self.persistence = persistence ?? SwiftNativePersistenceCore()
-        self.llmStep = llmStep
-        self.tooledLLMStep = tooledLLMStep
-        self.measuredLLMStep = measuredLLMStep
         self.measuredTooledLLMStep = measuredTooledLLMStep
         self.toolDispatch = toolDispatch
         self.stageApproval = stageApproval
         self.isEnabled = isEnabled
         self.maxActive = maxActive ?? Self.defaultMaxActive()
-        _ = cancellationPollInterval
-        self.cancellationReadObserver = cancellationReadObserver
         // Clamp before the nanos conversion: a pathological / non-finite
         // stepTimeoutInterval (or env value) would otherwise TRAP UInt64(_:)
         // (gpt-5.5 review). Non-finite or <=0 → disabled; cap at 24h, well
@@ -464,7 +440,6 @@ public actor WorkshopExecutorLoop {
             let label = deadlineSecs >= 1
                 ? "\(Int(deadlineSecs))s"
                 : "\(max(1, Int((deadlineSecs * 1000).rounded())))ms"
-            await beforeApprovalTimeoutClaimForTesting?()
             let failed = try? await casMutateWorkshopExecution(
                 execution.id, require: ["blocked_on_approval"], matching: { current in
                     // A prior approval may have resumed and reached a NEW
@@ -997,9 +972,6 @@ public actor WorkshopExecutorLoop {
         // Capture the injected closures + clock as locals: the dispatch op
         // runs as a child task of the cancellation-watch group, and Sendable
         // locals keep the closure free of cross-actor property access.
-        let llmStep = self.llmStep
-        let tooledLLMStep = self.tooledLLMStep
-        let measuredLLMStep = self.measuredLLMStep
         let measuredTooledLLMStep = self.measuredTooledLLMStep
         let toolDispatch = self.toolDispatch
         let approvedToolDispatch = self.approvedToolDispatch
@@ -1033,54 +1005,24 @@ public actor WorkshopExecutorLoop {
                 }
                 switch tool {
                 case "chat.synthesize", "llm", "report":
-                    // Synthesize-quality fix (2026-06-11): prefer the
-                    // TOOL-CAPABLE turn so the model can actually read what it
-                    // is being asked to synthesize. The bare `llmStep` is the
-                    // honest fallback when no tooled closure is wired — but the
-                    // step output is flagged `tooled:false` so dispatchStep can
-                    // emit a `synthesize_untooled` timeline note (no silent
-                    // degradation, W6).
-                    let usedTooled = measuredTooledLLMStep != nil || tooledLLMStep != nil
-                    guard measuredTooledLLMStep != nil || tooledLLMStep != nil
-                            || measuredLLMStep != nil || llmStep != nil else {
+                    guard let measuredTooledLLMStep else {
                         throw WorkshopExecutionError.invalidRequest("no LLM closure wired for step kind '\(tool)'")
                     }
                     let prompt = Self.buildLLMPrompt(execution: execution, step: step)
-                    let completion: WorkshopStepLLMCompletion
-                    let providerCallCount: Int?
-                    let removableProviderCallCount: Int?
-                    if let measuredTooledLLMStep {
-                        completion = try await measuredTooledLLMStep(prompt)
-                        providerCallCount = completion.providerCallCount
-                        removableProviderCallCount = completion.removableOrchestrationProviderCallCount
-                    } else if let tooledLLMStep {
-                        let (model, text) = try await tooledLLMStep(prompt)
-                        completion = WorkshopStepLLMCompletion(model: model, text: text, providerCallCount: 0)
-                        providerCallCount = nil
-                        removableProviderCallCount = nil
-                    } else if let measuredLLMStep {
-                        completion = try await measuredLLMStep(prompt)
-                        providerCallCount = completion.providerCallCount
-                        removableProviderCallCount = completion.removableOrchestrationProviderCallCount
-                    } else if let llmStep {
-                        let (model, text) = try await llmStep(prompt)
-                        completion = WorkshopStepLLMCompletion(model: model, text: text, providerCallCount: 0)
-                        providerCallCount = nil
-                        removableProviderCallCount = nil
-                    } else {
-                        throw WorkshopExecutionError.invalidRequest("no LLM closure wired for step kind '\(tool)'")
-                    }
+                    let completion = try await measuredTooledLLMStep(prompt)
+                    let providerCallCount = completion.providerCallCount
+                    let removableProviderCallCount = completion.removableOrchestrationProviderCallCount
                     let model = completion.model
                     let text = completion.text
-                    // OUTPUT VALIDATION before scoring (2026-06-11). A bare
-                    // completion (or even a tooled one) can return a refusal or
-                    // empty body; scoring that `succeeded` is the
+                    // OUTPUT VALIDATION before scoring (2026-06-11). A tooled
+                    // completion can return a refusal or empty body; scoring
+                    // that `succeeded` is the
                     // fabricated-success disease Agent caught on 752636c5.
                     let verdict = Self.validateSynthesizeOutput(text)
                     let baseOutput: [String: JSONValue] = [
                         "model": .string(model),
                         "text": .string(text),
-                        "tooled": .bool(usedTooled),
+                        "tooled": .bool(true),
                     ]
                     switch verdict {
                     case .ok:
@@ -1218,33 +1160,13 @@ public actor WorkshopExecutorLoop {
         return (cancelled ? "cancelled" : "failed", String(detail.prefix(2000)))
     }
 
-    /// Synthesize-step tripwire notes (2026-06-11). Two honest, user-visible
-    /// timeline events keyed off the synthesize-step output metadata:
-    ///   - `synthesize_untooled` — the step ran on the BARE llmStep because no
-    ///     tool-capable closure was wired (degraded mode, not silent).
-    ///   - `synthesize_validation_failed` — output validation rejected the
-    ///     result (model_refusal / empty_output) before scoring, so the
-    ///     receipt + status reflect the real failure instead of a fabricated
-    ///     "succeeded".
-    /// Only fires for synthesize-class steps; tool steps are untouched.
+    /// Record rejected synthesis output before it can be scored as succeeded.
     private func emitSynthesizeNotes(
         executionId: String, step: WorkshopExecutionStep, outcome: WorkshopStepOutcome
     ) async {
         let tool = step.toolOrAction
         guard tool == "chat.synthesize" || tool == "llm" || tool == "report" else { return }
         let ts = SwiftNativeWorkshopRunner.isoTimestamp(now())
-        // tooled flag lives on the synthesize output metadata.
-        if case .object(let o) = outcome.output, case .bool(false)? = o["tooled"] {
-            try? await appendTimelineLocked(
-                .object([
-                    "event": .string("synthesize_untooled"),
-                    "step_id": .string(step.id),
-                    "tool": .string(tool),
-                    "ts": .string(ts),
-                ]),
-                executionId: executionId
-            )
-        }
         if outcome.status == "failed",
            case .object(let o) = outcome.output,
            case .string(let reason)? = o["validation"],
@@ -1320,7 +1242,6 @@ public actor WorkshopExecutorLoop {
         let executionRecordJSON = executionRecordPath(executionId)
         let deadlineNanos = stepTimeoutNanos
         let persistence = self.persistence
-        let cancellationReadObserver = self.cancellationReadObserver
         let changes = FileChangeEvents(paths: [executionRecordJSON])
         return try await withThrowingTaskGroup(of: StepRaceEvent<T>.self) { group in
             group.addTask {
@@ -1335,7 +1256,6 @@ public actor WorkshopExecutorLoop {
                 do {
                     for await _ in changes.stream {
                         try Task.checkCancellation()
-                        cancellationReadObserver?()
                         let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
                         if case .object(let obj) = raw,
                            case .string(let status)? = obj["status"],
@@ -1666,15 +1586,15 @@ public actor WorkshopExecutorLoop {
 
     private func annotateApprovedStep(_ record: WorkshopExecutionRecord, stepId: String, approvalId: String?) async {
         guard let approvalId, !approvalId.isEmpty else { return }
-        try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-            id: approvalId,
+        try? await SwiftNativeApprovalInbox(root: root).annotateExecution(
+            approvalId,
             executedAction: .object([
                 "op": .string("mission_step_resume"),
                 "missionId": .string(record.id),
                 "stepId": .string(stepId),
                 "missionStatus": .string(record.status),
             ]),
-            detail: "Desk step approved — executed; Desk execution now \(record.status)", root: root)
+            detail: "Desk step approved — executed; Desk execution now \(record.status)")
     }
 
     private func getRecord(_ executionId: String) async throws -> WorkshopExecutionRecord? {
@@ -1706,30 +1626,13 @@ public actor WorkshopExecutorLoop {
     }
 
     private func scanQueueChecked() async throws -> [WorkshopExecutionRecord] {
-        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
-        let fm = FileManager.default
-        let entries: [URL]
-        do {
-            entries = try fm.contentsOfDirectory(
-                at: executionRecordsRoot, includingPropertiesForKeys: [.isDirectoryKey], options: []
-            )
-        } catch CocoaError.fileReadNoSuchFile {
-            return []
-        }
-        var out: [WorkshopExecutionRecord] = []
-        for sub in entries {
-            let isDir = try sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false
-            guard isDir else { continue }
-            let raw = await SwiftNativeWorkshopRunner.readQueueRecord(
-                ExecutionRecordFile.resolve(in: sub, fileManager: fm),
-                id: sub.lastPathComponent, persistence: persistence)
+        try await SwiftNativeWorkshopRunner.readQueueRecords(dataRoot: root, persistence: persistence).map { id, raw in
             guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == sub.lastPathComponent else {
-                throw WorkshopExecutionError.persistenceFailure("Workshop queue record \(sub.lastPathComponent) is malformed; restore its saved execution record before admitting work")
+                  case .string(let gotId)? = obj["id"], gotId == id else {
+                throw WorkshopExecutionError.persistenceFailure("Workshop queue record \(id) is malformed; restore its saved execution record before admitting work")
             }
-            out.append(SwiftNativeWorkshopRunner.recordFromJSON(obj))
+            return SwiftNativeWorkshopRunner.recordFromJSON(obj)
         }
-        return out
     }
 
     /// Compare-and-swap mission.json mutation (gpt-5.5 executor-port
@@ -1832,7 +1735,7 @@ public actor WorkshopExecutorLoop {
     /// Sanitize a PLANNER-DERIVED string for use as a single filename
     /// component (gpt-5.5 executor-port blocker #5, 2026-06-10). Step ids
     /// come from LLM planner output and are kept VERBATIM by the plan
-    /// parsers (WorkshopExecution.swift parsePlanJSON / parsePlanSteps), so a step id
+    /// parsers (WorkshopExecution+Runner.swift parsePlanJSON / parsePlanSteps), so a step id
     /// like "../execution" would escape receiptsDir. Whitelist [A-Za-z0-9._-];
     /// every other scalar becomes "_"; empty input → nil (caller must
     /// reject). Capped at 180 chars so the ".json"-suffixed name stays under

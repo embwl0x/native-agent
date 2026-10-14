@@ -57,7 +57,7 @@ extension SwiftNativeMemoryV2 {
                 for value in values where !peerSources.contains(value) { peerSources.append(value) }
             }
         }
-        if !peerSources.isEmpty { out["peer_data_sources"] = .array(Array(peerSources.prefix(8))) }
+        if !peerSources.isEmpty { out["peer_data_sources"] = .array(peerSources) }
 
         // 1. Source lineage — every distinct writer of this text, oldest first,
         //    seeded from the row's own `source` so run #1 is never implied away.
@@ -266,15 +266,10 @@ extension SwiftNativeMemoryV2 {
                 targetId: id, expectedContentHash: MemoryStorage.contentHash(row.text),
                 reason: "explicit supersession")
         }
-        if !superseding.isEmpty, !(storage is any AtomicSupersedingMemoryStorage) {
-            throw MemoryV2Error.underlying("storage does not support atomic memory supersession")
-        }
-        let admission = storage as? any AtomicMemoryAdmissionStorage
         if superseding.isEmpty {
-            guard let admission else { throw MemoryV2Error.storageUnavailable }
             // Reassert exact duplicates before paying for an embedding. The
             // final admission repeats matching under its insertion transaction.
-            if let existing = try await admission.admit(
+            if let existing = try await storage.admit(
                 record: record, embedding: nil, embeddingEpoch: nil,
                 insertIfMissing: false, preserveID: id != nil
             ) {
@@ -294,12 +289,11 @@ extension SwiftNativeMemoryV2 {
             throw MemoryV2Error.underlying("tombstoned: content is a paraphrase of a rejected claim")
         }
         let inserted: MemoryRecord
-        if !superseding.isEmpty, let atomic = storage as? any AtomicSupersedingMemoryStorage {
-            inserted = try await atomic.insert(record: record, embedding: embedded.vector,
+        if !superseding.isEmpty {
+            inserted = try await storage.insert(record: record, embedding: embedded.vector,
                                               embeddingEpoch: embedded.epoch, superseding: superseding)
         } else {
-            guard let admission,
-                  let admitted = try await admission.admit(
+            guard let admitted = try await storage.admit(
                     record: record, embedding: embedded.vector, embeddingEpoch: embedded.epoch,
                     insertIfMissing: true, preserveID: id != nil) else { throw MemoryV2Error.storageUnavailable }
             inserted = admitted

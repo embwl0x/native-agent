@@ -17,7 +17,7 @@ struct AgentWorkspaceDestination: Sendable {
 }
 
 package enum AgentWorkspaceEnvironment {
-    static var destinations: [AgentWorkspaceDestination] {
+    static let destinations: [AgentWorkspaceDestination] =
         AgentWorkspaceKnowledge.destinations + AgentWorkspaceApps.destinations + AgentWorkspaceActivity.destinations + AgentWorkspaceBuild.destinations + HerScreen.commsDestinations
             + AgentWorkspaceLife.destinations + HerScreen.coreDestinations + [
             // The app is its own door, called directly.
@@ -26,13 +26,11 @@ package enum AgentWorkspaceEnvironment {
             .init(id: "self", title: "My state", summary: "How things stand, current context and available abilities.",
                   tool: "inner_state", tools: ["agent_introspect", "context_lookup"])
         ]
-    }
 
-    package static var readTools: Set<String> {
+    package static let readTools: Set<String> =
         AgentWorkspaceKnowledge.readTools.union(AgentWorkspaceApps.readTools).union(AgentWorkspaceActivity.readTools).union(AgentWorkspaceBuild.readTools).union(HerScreen.commsReadTools)
             .union(AgentWorkspaceLife.readTools).union(HerScreen.coreReadTools)
             .union(["work_context", "artifact_find", "read_chat_message", "chat_conversations", "read_file", "agent_contacts", "agent_read", "inner_state", "agent_introspect", "context_lookup", "time_now", "search_chat_history"])
-    }
 
     /// A status check reads and changes nothing: it opens as a reading, never
     /// as a form to fill (desk walk 09-24: `gmail.status` left a form open).

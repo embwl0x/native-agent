@@ -107,7 +107,6 @@ public enum FirstPartyModelCatalog {
     public static let publicGPT56Efforts = ["none", "low", "medium", "high", "xhigh", "max"]
     public static let accountGPT56SolTerraEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
     public static let accountGPT56LunaEfforts = ["low", "medium", "high", "xhigh", "max"]
-    public static let standardOpenAIEfforts = ["low", "medium", "high", "xhigh"]
     public static let fullClaudeEfforts = ["low", "medium", "high", "xhigh", "max"]
     public static let claude46Efforts = ["low", "medium", "high", "max"]
     public static let grok45Efforts = ["low", "medium", "high"]
@@ -304,12 +303,6 @@ public enum FirstPartyModelCatalog {
         }
     }
 
-    /// True when this build ships a fixed catalog for the route, so an id
-    /// missing from it is genuinely retired rather than merely unknown to us.
-    public static func hasStaticCatalog(providerID: String) -> Bool {
-        !models(forProviderID: providerID).isEmpty
-    }
-
     /// User, 2026-09-13: "All model selections should be taken care of at the
     /// picker; how can any have to resolve to 5.5?" — so nothing anywhere maps a
     /// retired id onto a literal replacement. This is the test instead: a saved
@@ -365,14 +358,6 @@ public func supportsMidConversationSystem(forModel modelId: String) -> Bool {
 public func supportsMidConversationSystemClearAt(forModel modelId: String) -> Bool {
     FirstPartyModelCatalog.descriptor(for: modelId)?
         .supportsMidConversationSystemClearAt ?? false
-}
-
-/// Whether the model honours mid-conversation `tool_addition`/`tool_removal`.
-/// Unknown id → FALSE, so an unverified model falls back to today's
-/// changing-`tools`-array shape rather than emitting blocks it would 400 on.
-public func supportsMidConversationToolChanges(forModel modelId: String) -> Bool {
-    FirstPartyModelCatalog.descriptor(for: modelId)?
-        .supportsMidConversationToolChanges ?? false
 }
 
 /// Provider-specific request controls. A picker capability is not considered
@@ -452,6 +437,11 @@ public enum FirstPartyExecutionControls {
     }
 
     public static func applyAnthropicControls(to body: inout [String: Any], model: String) {
+        // The catalog's pinned 4.5 models predate adaptive thinking.
+        if let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: model),
+           !descriptor.id.contains("-4-5") {
+            body["thinking"] = ["type": "adaptive", "display": "summarized"]
+        }
         guard let effort = anthropicEffort(model: model, requested: LLMCallContext.reasoningEffort) else {
             return
         }

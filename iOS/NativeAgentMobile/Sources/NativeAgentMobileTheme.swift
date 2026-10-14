@@ -27,14 +27,9 @@ enum NativeAgentMobileTheme {
         static let tertiary = adaptive(dark: 0xA4AAB0, light: 0x4C5055)
         static let trouble = adaptive(dark: 0xFF9F0A, light: 0x864800)
         static let calm = adaptive(dark: 0x34C759, light: 0x136224)
-        static let accentDecoration = Color(hex: 0x65CCD2)
         static let accentText = adaptive(dark: 0x65CCD2, light: 0x006B73)
-        static let accentForeground = accentText
         static let navigationGlass = adaptive(dark: 0x292725, light: 0xFFFFFF)
-        static let onAccent = adaptive(dark: 0x1C1B1A, light: 0xFFFFFF)
         static let accent = accentText
-        /// Opaque ink for small metadata, including tags over quietFill.
-        static let metadataText = tertiary
         static let accentDeep = Color(hex: 0x0E7490)
         static let accentCool = Color(hex: 0x38BDF8)
         static let softFill = ink(dark: 0.08, light: 0.11)
@@ -65,7 +60,6 @@ enum NativeAgentMobileTheme {
         static let md: CGFloat = 12
         static let lg: CGFloat = 16
         static let xl: CGFloat = 24
-        static let xxl: CGFloat = 32
     }
 
     enum Radius {
@@ -128,25 +122,6 @@ extension View {
                 RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.card)
                     .strokeBorder(NativeAgentMobileTheme.Colors.hairline, lineWidth: NativeAgentMobileTheme.Layout.hairline)
             }
-    }
-
-    /// For custom floating navigation. Native TabView already supplies its own glass.
-    func mobileRail() -> some View {
-        mobileGlassSurface(radius: NativeAgentMobileTheme.Radius.composer)
-    }
-
-    func mobileDivider() -> some View {
-        overlay(NativeAgentMobileTheme.Colors.hairline)
-            .frame(height: NativeAgentMobileTheme.Layout.hairline)
-            .accessibilityHidden(true)
-    }
-
-    func mobileSectionHeader() -> some View {
-        mobileTypography(.label, weight: .semibold)
-            .textCase(.uppercase)
-            .foregroundStyle(NativeAgentMobileTheme.Colors.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityAddTraits(.isHeader)
     }
 
 }

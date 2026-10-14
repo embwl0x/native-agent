@@ -23,7 +23,6 @@ public struct BrowserOperationStart: Sendable {
     public let url: String
     public let domain: String
     public let initialState: BrowserOperationInitialState
-    public let visible: Bool
     public let approvalId: String?
     public let captureSource: Bool
     public let captureScreenshot: Bool
@@ -34,7 +33,6 @@ public struct BrowserOperationStart: Sendable {
         url: String,
         domain: String,
         initialState: BrowserOperationInitialState,
-        visible: Bool,
         approvalId: String? = nil,
         captureSource: Bool = false,
         captureScreenshot: Bool = false,
@@ -44,7 +42,6 @@ public struct BrowserOperationStart: Sendable {
         self.url = url
         self.domain = domain
         self.initialState = initialState
-        self.visible = visible
         self.approvalId = approvalId
         self.captureSource = captureSource
         self.captureScreenshot = captureScreenshot
@@ -97,12 +94,6 @@ public struct BrowserOperationCommandResult: Sendable {
     }
 }
 
-public protocol BrowserOperationCommanding: Sendable {
-    func executeBrowserOperation(
-        _ command: BrowserOperationCommand
-    ) async throws -> BrowserOperationCommandResult
-}
-
 public enum BrowserOperationStoreError: Error, Sendable, Equatable {
     case invalidIdentity
     case invalidURL
@@ -129,7 +120,7 @@ private struct BrowserPendingProjection: Sendable {
     let publicRun: JSONValue
 }
 
-extension SwiftNativeBrowserClient: BrowserOperationCommanding {
+extension SwiftNativeBrowserClient {
     /// Stable identity for one operation request. This binds idempotency to the
     /// requested effect without exposing URL/domain in shared motor projections.
     public static func browserRequestDigest(for start: BrowserOperationStart) -> String {
@@ -138,7 +129,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
             start.url,
             start.domain.lowercased(),
             start.initialState.rawValue,
-            start.visible ? "visible" : "hidden",
+            "visible",
             start.approvalId ?? "no-approval",
             start.captureSource ? "source" : "no-source",
             start.captureScreenshot ? "screenshot" : "no-screenshot",
@@ -215,7 +206,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
                 "domain": .string(domain),
                 "status": .string(request.initialState.rawValue),
                 "dryRun": .bool(request.initialState == .dryRun),
-                "visible": .bool(request.visible),
+                "visible": .bool(true),
                 "opened": .bool(false),
                 "approvalId": request.approvalId.map(JSONValue.string) ?? .null,
                 "sourceReceipt": request.captureSource
@@ -239,7 +230,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
             let canonical = JSONValue.object(row)
             rows.append(canonical)
             rows = try Self.prunedCanonicalRuns(rows)
-            try await self.persistenceCore.writeJSON(.array(rows), to: self.runsPath)
+            try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
             return BrowserOperationCommandResult(run: Self.externalRun(canonical), didTransition: true)
         }
     }
@@ -286,7 +277,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
             row.removeValue(forKey: "deadlineAt")
             Self.stageProjection(on: &row, status: completion.state.rawValue, at: timestamp)
             rows[index] = .object(row)
-            try await self.persistenceCore.writeJSON(.array(rows), to: self.runsPath)
+            try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
             return BrowserOperationCommandResult(run: Self.externalRun(rows[index]), didTransition: true)
         }
     }
@@ -320,7 +311,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
             row.removeValue(forKey: "deadlineAt")
             Self.stageProjection(on: &row, status: "canceled", at: timestamp)
             rows[index] = .object(row)
-            try await self.persistenceCore.writeJSON(.array(rows), to: self.runsPath)
+            try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
             return BrowserOperationCommandResult(run: Self.externalRun(rows[index]), didTransition: true)
         }
     }
@@ -353,7 +344,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
                 recovered += 1
             }
             if recovered > 0 {
-                try await self.persistenceCore.writeJSON(.array(rows), to: self.runsPath)
+                try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
             }
             return BrowserOperationCommandResult(
                 run: last.map(Self.externalRun),
@@ -438,7 +429,6 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
                         object.removeValue(forKey: "projectionOutbox")
                         object["projectionState"] = .string("projected")
                         object["projectionId"] = .string(projectionID)
-                        object["projectedAt"] = .string(Self.nowISO(self.now()))
                     } else {
                         object["projectionOutbox"] = .array(remaining)
                         object["projectionState"] = .string("pending")
@@ -453,10 +443,9 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
                     guard Self.objectString(rows[index], "projectionState") == "pending",
                           Self.objectString(rows[index], "projectionId") == projectionID else { return }
                     object["projectionState"] = .string("projected")
-                    object["projectedAt"] = .string(Self.nowISO(self.now()))
                 }
                 rows[index] = .object(object)
-                try await self.persistenceCore.writeJSON(.array(rows), to: self.runsPath)
+                try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
             }
         }
     }
@@ -470,7 +459,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
         usesPathOwnedCap: Bool = false
     ) async throws {
         let work: @Sendable () async throws -> Void = {
-            let existing = (try? await self.persistenceCore.tailJSONL(
+            let existing = (try? await self.persistence.tailJSONL(
                 path, limit: maxLines, maxBytes: nil
             )) ?? []
             guard !existing.contains(where: {
@@ -478,12 +467,12 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
             }) else { return }
             if usesPathOwnedCap {
                 try await appendPathOwnedJSONL(
-                    value, to: path, using: self.persistenceCore,
+                    value, to: path, using: self.persistence,
                     logLabel: label, takeLock: false
                 )
             } else {
                 try await appendJSONLCapped(
-                    value, to: path, using: self.persistenceCore,
+                    value, to: path, using: self.persistence,
                     maxLines: maxLines, logLabel: label, takeLock: false
                 )
             }
@@ -493,12 +482,12 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
         // every conformer already has it. The old downcast to
         // SwiftNativePersistenceCore only had the effect of running this critical
         // section UNLOCKED for any other conformer.
-        try await persistenceCore.withFileLock(path, work)
+        try await persistence.withFileLock(path, work)
     }
 
     private func readCanonicalRuns() async throws -> [JSONValue] {
         guard FileManager.default.fileExists(atPath: runsPath.path) else { return [] }
-        let raw = try await persistenceCore.readJSON(runsPath, ifMissing: .null)
+        let raw = try await persistence.readJSON(runsPath, ifMissing: .null)
         guard case .array(let rows) = raw else {
             throw BrowserOperationStoreError.corruptRunsDocument
         }
@@ -513,7 +502,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
         // every conformer already has it. The old downcast to
         // SwiftNativePersistenceCore only had the effect of running this critical
         // section UNLOCKED for any other conformer.
-        return try await persistenceCore.withFileLock(runsPath, operation)
+        return try await persistence.withFileLock(runsPath, operation)
     }
 
     private static let terminalStatuses: Set<String> = [
@@ -617,7 +606,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
         return object
     }
 
-    private static func objectString(_ value: JSONValue, _ key: String) -> String? {
+    static func objectString(_ value: JSONValue, _ key: String) -> String? {
         guard case .object(let object) = value,
               case .string(let string)? = object[key] else { return nil }
         return string

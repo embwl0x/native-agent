@@ -45,13 +45,9 @@ public enum DeskProjection {
     public static func render(
         _ state: DeskState,
         now: Date = Date(),
-        archiveGrace: TimeInterval = SwiftNativeDeskStore.defaultArchiveGrace,
-        plan injectedPlan: DeskSequencing.Plan? = nil
+        archiveGrace: TimeInterval = SwiftNativeDeskStore.defaultArchiveGrace
     ) -> String {
-        // The plan is DERIVED here so every existing call site keeps working and
-        // automatically gains the sequencing segments; it is injectable purely so
-        // tests can pin a plan without reconstructing state.
-        let plan = injectedPlan ?? DeskSequencing.compute(state, now: now)
+        let plan = DeskSequencing.compute(state, now: now)
         var lines: [String] = []
         lines.append("desk · owner · rev \(state.generatedTs) · stale ok")
         // `held` is not a status anyone can set — it is this renderer saying a
@@ -231,13 +227,12 @@ public enum DeskProjection {
 
     /// The most-actionable active child collapsed inline (`now` wins over
     /// `next`). nil when no now/next child exists.
-    static func childHighlight(_ item: DeskItem, in state: DeskState, plan: DeskSequencing.Plan? = nil) -> String? {
+    static func childHighlight(_ item: DeskItem, in state: DeskState, plan: DeskSequencing.Plan) -> String? {
         let kids = state.children(of: item.handle)
             .sorted { SwiftNativeDeskStore.aliasSeq($0.alias) < SwiftNativeDeskStore.aliasSeq($1.alias) }
         // "the most-actionable active child" — a held child is not actionable,
         // so it cannot be the one the parent line advertises (lane1 finding 5).
         func startable(_ kid: DeskItem) -> Bool {
-            guard let plan else { return true }
             return plan.byHandle[kid.handle]?.isReady ?? true
         }
         if let nowChild = kids.first(where: { $0.status == .now && startable($0) }) {
@@ -351,9 +346,6 @@ public enum DeskProjection {
 /// Tuesday": an exact read is someone opening the project folder, so this
 /// renders the contents. Pure text over the same state, nothing stored.
 public extension DeskProjection {
-    /// Notes shown on a record before the older ones are counted instead.
-    static var recordNoteCap: Int { 30 }
-
     static func renderRecord(
         _ item: DeskItem,
         in state: DeskState,
@@ -459,5 +451,370 @@ public extension DeskProjection {
                 + (step.source.map { " · inferred from \"\($0)\"" } ?? "")
                 + (step.peers + step.elevated).map { " · from \($0)'s turn" }.joined()
         }
+    }
+}
+
+public enum DeskBoardLayout {
+
+    // MARK: partition
+    //
+    // Disjoint + exhaustive over the active items: the self-authored project
+    // lane claims first, even when its optional payload could not be decoded.
+    // That malformed row must stay visible as an integrity warning rather than
+    // silently becoming ordinary board work. Watches and board both negate the
+    // same lane predicate, so pursuits ∪ watches ∪ board == activeItems.
+
+    public static func isWatchShaped(_ item: DeskItem) -> Bool {
+        item.kind == .watch || item.status == .watch
+    }
+
+    public static func activeItems(_ items: [DeskItem]) -> [DeskItem] {
+        items.filter { !$0.status.isTerminal }
+    }
+
+    public static func isPursuitLaneItem(_ item: DeskItem) -> Bool {
+        item.origin == .agent && item.kind == .project
+    }
+
+    public static func watches(_ active: [DeskItem]) -> [DeskItem] {
+        // Stalest first (desk-triage-makeover W2) — sorted HERE so rendering,
+        // arrow-key selection order, and reveal keys all share one definition
+        // (gpt-5.5 HIGH: sorting only the render path desynced ↓ from the
+        // visible list). Unparseable timestamps sort last; ties break on the
+        // raw timestamp string, then handle, so equal-date rows can't jitter
+        // between loads (gpt-5.5 MED: `sorted` is not stable).
+        active.filter { !isPursuitLaneItem($0) && isWatchShaped($0) }
+            .sorted { a, b in
+                let da = DeskProjection.parseTimestamp(a.updatedAt) ?? .distantFuture
+                let db = DeskProjection.parseTimestamp(b.updatedAt) ?? .distantFuture
+                if da != db { return da < db }
+                if a.updatedAt != b.updatedAt { return a.updatedAt < b.updatedAt }
+                return a.handle < b.handle
+            }
+    }
+
+}
+
+public struct DeskPaletteRow: Identifiable, Equatable, Sendable {
+    public let handle: String
+    public let alias: String
+    public let title: String
+    public let project: String
+    public let status: String
+    /// GitHub watcher rows are reveal-only: closing or deferring one would be
+    /// a fabricated Desk mutation instead of an action supported by its store.
+    public let isActionable: Bool
+
+    public var id: String { handle }
+
+    /// What the query matches against: the visible number, the title and the
+    /// project — everything User can actually read on the row.
+    public var haystack: String { "\(alias) \(title) \(project)" }
+
+    public init(
+        handle: String,
+        alias: String,
+        title: String,
+        project: String,
+        status: String,
+        isActionable: Bool = true
+    ) {
+        self.handle = handle
+        self.alias = alias
+        self.title = title
+        self.project = project
+        self.status = status
+        self.isActionable = isActionable
+    }
+
+    public init(item: DeskItem) {
+        self.init(
+            handle: item.handle,
+            alias: item.alias,
+            title: item.title,
+            project: item.project,
+            status: item.status.rawValue,
+            isActionable: true)
+    }
+}
+
+public enum DeskFuzzy {
+    /// Match quality, LOWER is better. nil = no match at all.
+    ///   0 exact · 1 prefix · 2 word-boundary prefix · 3 substring · 4 subsequence
+    ///
+    /// Ranked rather than boolean because a bare subsequence match ("dsk" ->
+    /// "desk") is genuinely weaker than a prefix, and an unranked filter puts
+    /// the accidental match above the obvious one.
+    public static func rank(query: String, candidate: String) -> Int? {
+        let q = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let c = candidate.lowercased()
+        guard !q.isEmpty else { return 0 }
+        if c == q { return 0 }
+        if c.hasPrefix(q) { return 1 }
+        if c.split(separator: " ").contains(where: { $0.hasPrefix(q) }) { return 2 }
+        if c.contains(q) { return 3 }
+        return isSubsequence(q, of: c) ? 4 : nil
+    }
+
+    public static func isSubsequence(_ needle: String, of haystack: String) -> Bool {
+        var it = haystack.makeIterator()
+        for ch in needle {
+            var found = false
+            while let next = it.next() {
+                if next == ch { found = true; break }
+            }
+            if !found { return false }
+        }
+        return true
+    }
+
+    /// Best matches first. Ties break on title length then handle, so the list
+    /// is a TOTAL order — `sorted(by:)` is not stable in Swift, and a palette
+    /// whose rows swap under an unchanged query is unusable.
+    public static func filter(_ rows: [DeskPaletteRow], query: String, limit: Int = 12) -> [DeskPaletteRow] {
+        let scored: [(row: DeskPaletteRow, rank: Int)] = rows.compactMap { row in
+            guard let r = rank(query: query, candidate: row.haystack) else { return nil }
+            return (row, r)
+        }
+        let sorted = scored.sorted { l, r in
+            if l.rank != r.rank { return l.rank < r.rank }
+            if l.row.title.count != r.row.title.count { return l.row.title.count < r.row.title.count }
+            return l.row.handle < r.row.handle
+        }
+        return Array(sorted.prefix(limit).map(\.row))
+    }
+}
+
+public struct DeskPaletteQuery: Equatable, Sendable {
+    public enum Verb: String, CaseIterable, Sendable {
+        case close
+        case deferItem = "defer"
+        case note
+
+        public var actionLabel: String {
+            switch self {
+            case .close: return "Close"
+            case .deferItem: return "Defer"
+            case .note: return "Add note"
+            }
+        }
+    }
+
+    public var verb: Verb?
+    public var query: String
+
+    public static func parse(_ raw: String) -> DeskPaletteQuery {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return DeskPaletteQuery(verb: nil, query: "") }
+        let parts = trimmed.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        let head = String(parts[0]).lowercased()
+        guard let verb = Verb(rawValue: head) else {
+            return DeskPaletteQuery(verb: nil, query: trimmed)
+        }
+        let rest = parts.count > 1
+            ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+        return DeskPaletteQuery(verb: verb, query: rest)
+    }
+}
+
+public enum DeskPaletteCommandApplication {
+    public enum Resolution: Equatable, Sendable {
+        case dispatch(DeskQuickAction)
+        case beginDefer(handle: String)
+        case beginNote(handle: String)
+        case refused(String)
+    }
+
+    public static let actionInFlightMessage = "Another Desk action is still in progress."
+
+    public static func resolve(
+        verb: DeskPaletteQuery.Verb,
+        handle rawHandle: String,
+        activeItems: [DeskItem]
+    ) -> Resolution {
+        let handle = rawHandle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !handle.isEmpty else {
+            return .refused("Palette command was not applied: no Desk item was selected.")
+        }
+        guard let item = activeItems.first(where: { $0.handle == handle }) else {
+            return .refused("Palette command was not applied: that item is no longer active.")
+        }
+        switch verb {
+        case .close:
+            let expectedUpdatedAt = item.updatedAt.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !expectedUpdatedAt.isEmpty else {
+                return .refused(
+                    "Palette command was not applied: the item's current version is unavailable."
+                )
+            }
+            return .dispatch(.closeIfCurrent(
+                handle: handle,
+                outcome: DeskQuickAction.deskCloseOutcome,
+                expectedUpdatedAt: expectedUpdatedAt
+            ))
+        case .deferItem:
+            // Choosing Defer only opens its date choices. It has not changed
+            // the store yet, so calling it successful here would be a lie.
+            return .beginDefer(handle: handle)
+        case .note:
+            // Likewise, the note is not an effect until non-empty text is
+            // submitted through DeskQuickAction.note.
+            return .beginNote(handle: handle)
+        }
+    }
+}
+
+public enum DeskRefAction: Equatable, Sendable {
+    case open(url: String, label: String)
+    case copy(text: String, label: String)
+
+    public var label: String {
+        switch self {
+        case .open(_, let label): return label
+        case .copy(_, let label): return label
+        }
+    }
+
+    public var opensExternally: Bool {
+        if case .open = self { return true }
+        return false
+    }
+}
+
+public enum DeskRefAffordance {
+    public static func action(for ref: DeskRef) -> DeskRefAction {
+        switch ref.kind {
+        case let .ghPr(repo, number, title, _, _):
+            return .open(
+                url: "https://github.com/\(repo)/pull/\(number)",
+                label: title?.isEmpty == false ? title! : "\(repo) #\(number)")
+        case let .ghIssue(repo, number, title, _):
+            return .open(
+                url: "https://github.com/\(repo)/issues/\(number)",
+                label: title?.isEmpty == false ? title! : "\(repo) #\(number)")
+        case let .url(url, title):
+            return .open(url: url, label: title?.isEmpty == false ? title! : url)
+        case let .commit(sha, repo, label, _):
+            if let repo, !repo.isEmpty {
+                return .open(
+                    url: "https://github.com/\(repo)/commit/\(sha)",
+                    label: label?.isEmpty == false ? label! : String(sha.prefix(8)))
+            }
+            return .copy(text: sha, label: label?.isEmpty == false ? label! : String(sha.prefix(8)))
+        case let .file(path, line, label):
+            let text = line.map { "\(path):\($0)" } ?? path
+            return .copy(text: text, label: label?.isEmpty == false ? label! : text)
+        case let .agent(name, handoffId, sessionId):
+            return .copy(text: handoffId ?? sessionId ?? name, label: name)
+        case let .approval(id, _):
+            return .copy(text: id, label: "approval \(id.prefix(8))")
+        case let .trace(id, kind):
+            return .copy(text: id, label: kind.map { "\($0) \(id.prefix(8))" } ?? "trace \(id.prefix(8))")
+        case let .note(text):
+            return .copy(text: text, label: text)
+        case let .step(step):
+            return .copy(text: step.words, label: "queued " + step.when)
+        }
+    }
+}
+
+extension DeskProjection {
+    public static func parseTimestamp(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        return (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(trimmed))
+            ?? (try? Date.ISO8601FormatStyle().parse(trimmed))
+    }
+}
+
+public enum DeskQuickAction: Equatable, Sendable {
+    case close(handle: String, outcome: String)
+    /// Palette closes bind to the row version observed while resolving the
+    /// palette result. A later change must refuse at the store boundary rather
+    /// than let Enter acknowledge a different row state as this close.
+    case closeIfCurrent(handle: String, outcome: String, expectedUpdatedAt: String)
+    case setStatus(handle: String, status: DeskStatus)
+    case defer_(handle: String, until: String?)
+    case note(handle: String, text: String)
+    case nagGlobal(on: Bool)
+    case nagProject(project: String, on: Bool)
+    case nagItem(handle: String, on: Bool)
+    case nagMute(until: String?)
+    case nagUnmute
+
+    /// The default outcome summary for a one-keystroke close. `desk_close`
+    /// REFUSES an empty `outcome_summary`, and the honest thing to record is
+    /// where the close came from — not an invented outcome.
+    public static let deskCloseOutcome = "Closed from the desk."
+
+    public var tool: String {
+        switch self {
+        case .close, .closeIfCurrent: return "desk_close"
+        case .setStatus: return "desk_set_status"
+        case .defer_: return "desk_defer"
+        case .note: return "desk_note"
+        case .nagGlobal, .nagProject, .nagItem, .nagMute, .nagUnmute: return "desk_nag_control"
+        }
+    }
+
+    public var input: [String: JSONValue] {
+        switch self {
+        case let .close(handle, outcome):
+            return ["handle": .string(handle), "outcome_summary": .string(outcome)]
+        case let .closeIfCurrent(handle, outcome, expectedUpdatedAt):
+            return [
+                "handle": .string(handle),
+                "outcome_summary": .string(outcome),
+                "expected_updated_at": .string(expectedUpdatedAt),
+            ]
+        case let .setStatus(handle, status):
+            return ["handle": .string(handle), "status": .string(status.rawValue)]
+        case let .defer_(handle, until):
+            // An EMPTY `until` is how desk_defer clears a park — the same
+            // encoding the chat tool documents, not a second convention.
+            return ["handle": .string(handle), "until": .string(until ?? "")]
+        case let .note(handle, text):
+            return ["handle": .string(handle), "text": .string(text)]
+        case let .nagGlobal(on):
+            return ["action": .string(on ? "enable" : "disable"), "scope_kind": .string("global")]
+        case let .nagProject(project, on):
+            return [
+                "action": .string(on ? "enable" : "disable"),
+                "scope_kind": .string("project"),
+                "scope_id": .string(project),
+            ]
+        case let .nagItem(handle, on):
+            return [
+                "action": .string(on ? "enable" : "disable"),
+                "scope_kind": .string("item"),
+                "scope_id": .string(handle),
+            ]
+        case let .nagMute(until):
+            var input: [String: JSONValue] = ["action": .string("mute")]
+            if let until, !until.isEmpty { input["until"] = .string(until) }
+            return input
+        case .nagUnmute:
+            return ["action": .string("unmute")]
+        }
+    }
+
+}
+
+extension DeskProjection {
+    public static func needsEyes(_ item: DeskItem) -> Bool {
+        item.status == .blocked || item.status == .flag || (item.waitingOn?.isEmpty == false)
+    }
+}
+
+extension DeskProjection {
+    public static let staleThresholdDays = 7
+
+    public static func freshness(_ item: DeskItem, now: Date) -> (date: Date?, days: Int, isStale: Bool) {
+        guard let date = parseTimestamp(item.updatedAt) else { return (nil, 0, false) }
+        let days = Int(max(0, now.timeIntervalSince(date)) / 86_400)
+        let stale = days >= staleThresholdDays
+            && item.status != .blocked && item.status != .flag && !item.status.isTerminal
+        return (date, days, stale)
     }
 }

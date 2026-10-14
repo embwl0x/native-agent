@@ -65,11 +65,7 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public var requiresWorkspace: Bool = false
     public var settingsSupported: Bool = true
     public var declaredRoute: Route? = nil
-    public var outboundRoute: String { route == .dotIPC ? "chatgpt-dot-ipc" : route == .desktopChat ? "desktop-chat" : route == .grokBot ? "grok-webhook" : acpLaunch == nil ? (commandLine == nil ? "none" : "command") : "acp" }
-    /// Compatibility projection of the transport's single launch declaration.
-    public var acpLaunch: (executable: String, arguments: [String], version: String)? {
-        acp.map { ($0.executable, $0.arguments, $0.referenceVersion) }
-    }
+    public var outboundRoute: String { route == .dotIPC ? "chatgpt-dot-ipc" : route == .desktopChat ? "desktop-chat" : route == .grokBot ? "grok-webhook" : acp == nil ? (commandLine == nil ? "none" : "command") : "acp" }
     /// Launch Services finds applications outside the usual Applications folders too.
     public var bundleIDs: [String] = []
     /// Only documented A2A listening ports belong here; neither current CLI
@@ -174,7 +170,6 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
 }
 
 public enum AgentHostDirectory {
-    @TaskLocal static var homeForTests: String?
     /// The name this app's entry carries in another agent's configuration. One
     /// fixed product name, never a persona name, so a person reading their own
     /// settings file can tell which app put it there.
@@ -497,7 +492,6 @@ public enum AgentHostDirectory {
 
     static func expand(_ path: String) -> String {
         guard path.hasPrefix("~") else { return path }
-        if let homeForTests, path.hasPrefix("~/") { return homeForTests + String(path.dropFirst()) }
         return NSString(string: path).expandingTildeInPath
     }
 

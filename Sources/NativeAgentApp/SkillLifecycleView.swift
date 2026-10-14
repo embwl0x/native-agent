@@ -1,23 +1,15 @@
 import Connectors
+import Skills
 import ProviderRouting
 import SwiftUI
+import Skills
 import AppKit
 import PersistenceCore
 import PersonaEngine
 
 // MARK: - SkillLifecycleView (redesigned 2026-07-03, User's direction)
 //
-// The old tab wrapped a drafted→installed→active→dormant lifecycle wall
-// around what reality actually holds: markdown playbooks in
-// persona/skills/bodies (+ data/skills/bodies) and an EMPTY registry.
-// Since the skills-recall rework, skills surface themselves — each body has
-// a pointer row in the memory store that per-turn recall surfaces
-// in-territory, and the agent pulls the full body with read_skill. This tab
-// now shows exactly that: the playbooks, the pointer-sync receipt, and a
-// reader. The Review sheet survives for the one live lifecycle moment (a
-// chat-built DRAFT awaiting approval); the filter chips, settings sheet,
-// and per-card lifecycle furniture are gone.
-
+// Routines are reached through recall; this page reviews their code and lifecycle.
 enum SkillLifecycleSearchPresentation {
     struct Results {
         let displayed: [SkillInfo]
@@ -95,24 +87,14 @@ enum SkillReviewInstallPresentation {
         let refusal: String?
     }
 
-    static func preflight(for info: SkillInfo) -> String? {
-        let state = info.registry.state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard state == "drafted" else {
-            let shownState = state.isEmpty ? "missing" : state
-            return "Only a drafted skill can be installed from this review sheet. This skill is currently \(shownState)."
-        }
-        let name = info.registry.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
-            return "This draft has no id, so it cannot be installed safely."
-        }
-        return nil
-    }
-
     /// The review sheet's install affordance and the writer share this exact
     /// eligibility decision. A visible disabled control must name the same
     /// reason that `installReviewedSkill` will return if invoked directly.
     static func installControl(for info: SkillInfo, isInstalling: Bool) -> InstallControl {
-        let refusal = preflight(for: info)
+        let refusal = InstalledSkillInventory.reviewInstallRefusal(
+            version: info.registry.version, state: info.registry.state, name: info.registry.name,
+            hasCandidate: info.candidateDigest != nil && info.readme != nil,
+            validationStatus: info.validationStatus)
         return InstallControl(
             isEnabled: !isInstalling && refusal == nil,
             refusal: refusal
@@ -123,30 +105,9 @@ enum SkillReviewInstallPresentation {
         info.manifest.type == "connector" && info.manifest.oauth?.deviceFlow == true
     }
 
-    static func connectorID(for provider: String) -> String? {
-        switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "x", "twitter": return "x"
-        case "gmail", "email": return "gmail"
-        case "calendar", "google_calendar": return "calendar"
-        default: return nil
-        }
-    }
-
-    /// OAuth is an admission step, not a partial registry mutation. A cancel
-    /// or failed callback cannot reach the draft-install action.
-    static func installAfterAuthorizedOAuth(
-        oauthSucceeded: Bool,
-        wasCancelled: Bool,
-        install: @MainActor () async -> Bool
-    ) async -> Bool {
-        guard oauthSucceeded, !wasCancelled else { return false }
-        return await install()
-    }
-
     static func successMessage(for receipt: SkillReviewInstallReceipt) -> String {
         let verb = receipt.confirmedState == "active" ? "is now active" : "is installed"
-        // This receipt proves the registry state, not that a manifest-only
-        // package has a canonical body or a discoverable memory pointer.
+        // Package metadata and routine publication retain their own verification.
         return "‘\(receipt.confirmedName)’ \(verb)."
     }
 }
@@ -328,18 +289,7 @@ struct SkillLifecycleView: View {
             .environment(appModel)
         }
         .sheet(item: $readerTarget) { info in
-            let dataRoot = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let personaRoot = appModel.dataRootOverride.map { override in
-                // A preview opened from an injected data root is a sandboxed
-                // read: never let an environment or stamped-repository
-                // persona redirect it outside that root.
-                return PersonaRootResolver.resolveIsolated(dataRoot: override)
-            } ?? PersonaRootResolver.resolve()
-            SkillBodySheet(
-                info: info,
-                dataRoot: dataRoot,
-                personaRoot: personaRoot
-            ) { readerTarget = nil }
+            SkillSourceSheet(info: info, onDismiss: { readerTarget = nil })
         }
     }
 }
@@ -351,7 +301,7 @@ private struct SkillRow: View {
     let onRead: () -> Void
     let onReview: () -> Void
 
-    private var isDraft: Bool { info.registry.state == "drafted" }
+    private var isDraft: Bool { info.registry.state == "drafted" || info.validationStatus == "valid" }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -390,157 +340,30 @@ private struct SkillRow: View {
     }
 }
 
-// MARK: - Read-only body sheet
+// MARK: - Source review
 
-enum SkillBodyPresentation {
-    static let maximumDisplayBytes = 128 * 1024
-
-    enum State: Equatable, Sendable {
-        case loading
-        case content(String, truncated: Bool)
-        case empty
-        case unavailable(String)
-    }
-
-    static func bodyRoots(dataRoot: URL, personaRoot: URL) -> [URL] {
-        [
-            dataRoot.appendingPathComponent("skills/bodies", isDirectory: true),
-            personaRoot.appendingPathComponent("skills/bodies", isDirectory: true),
-        ].map { $0.standardizedFileURL.resolvingSymlinksInPath() }
-    }
-
-    /// Component comparison is intentional: a textual prefix would accept
-    /// `bodies-backup/` as though it were nested inside `bodies/`.
-    private static func isDescendant(_ child: URL, of root: URL) -> Bool {
-        let childComponents = child.pathComponents
-        let rootComponents = root.pathComponents
-        return childComponents.count > rootComponents.count
-            && childComponents.starts(with: rootComponents)
-    }
-
-    static func read(
-        path: String,
-        dataRoot: URL,
-        personaRoot: URL,
-        fileManager: FileManager = .default
-    ) -> State {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return .unavailable("This skill has no body file recorded.")
-        }
-
-        let raw = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-        let allowed = bodyRoots(dataRoot: dataRoot, personaRoot: personaRoot)
-        guard allowed.contains(where: { isDescendant(raw, of: $0) }) else {
-            return .unavailable("The recorded body path is outside this skill store.")
-        }
-
-        guard raw.pathExtension.lowercased() == "md" else {
-            return .unavailable("The recorded body is not a Markdown skill file.")
-        }
-
-        var isDirectory = ObjCBool(false)
-        guard fileManager.fileExists(atPath: raw.path, isDirectory: &isDirectory),
-              !isDirectory.boolValue else {
-            return .unavailable("The recorded body file is missing.")
-        }
-
-        do {
-            let attributes = try fileManager.attributesOfItem(atPath: raw.path)
-            guard attributes[.type] as? FileAttributeType == .typeRegular else {
-                return .unavailable("The recorded body is not a regular file.")
-            }
-            let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-            guard byteCount > 0 else { return .empty }
-            let handle = try FileHandle(forReadingFrom: raw)
-            defer { try? handle.close() }
-            let data = try handle.read(upToCount: maximumDisplayBytes) ?? Data()
-            return .content(
-                String(decoding: data, as: UTF8.self),
-                truncated: byteCount > Int64(maximumDisplayBytes)
-            )
-        } catch {
-            return .unavailable(UserFacingError.message(error, action: "read the skill's body file"))
-        }
-    }
-}
-
-struct SkillBodySheet: View {
+struct SkillSourceSheet: View {
     let info: SkillInfo
-    let dataRoot: URL
-    let personaRoot: URL
     let onDismiss: () -> Void
-    @State private var state: SkillBodyPresentation.State = .loading
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Text(info.manifest.name.isEmpty ? info.id : info.manifest.name)
-                    .font(ShellType.title)
-                    .foregroundStyle(NativeAgentShell.text)
-                Spacer(minLength: 8)
-                Button("Done") { onDismiss() }
-                    .keyboardShortcut(.defaultAction)
+            HStack {
+                Text(info.manifest.name).font(ShellType.title)
+                Spacer()
+                Button("Done") { onDismiss() }.keyboardShortcut(.defaultAction)
             }
-            switch state {
-            case .loading:
-                ProgressView("Loading skill body…")
-                    .font(ShellType.label)
-                    .accessibilityIdentifier("skills.lifecycle.body.loading")
-            case .content(let body, let truncated):
-                ScrollView {
-                    Text(body)
-                        .font(ShellType.code)
-                        .foregroundStyle(NativeAgentShell.text)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+            ScrollView {
+                if let source = info.readme {
+                    BoundedSkillText(text: source, limit: 4_000)
+                } else {
+                    Text("No JS routine source is available. Read Tools census for its conversion status.")
                 }
-                .accessibilityIdentifier("skills.lifecycle.body.content")
-                if truncated {
-                    Text("Showing the first \(SkillBodyPresentation.maximumDisplayBytes.formatted()) bytes of this skill body.")
-                        .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                }
-            case .empty:
-                Text("This skill has no body text yet.")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .accessibilityIdentifier("skills.lifecycle.body.empty")
-            case .unavailable(let detail):
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Skill body unavailable")
-                        .font(ShellType.labelSemibold)
-                    Text(detail)
-                        .font(ShellType.label)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .foregroundStyle(NativeAgentShell.trouble)
-                .accessibilityIdentifier("skills.lifecycle.body.unavailable")
             }
-            Text(UserDisplayFormatters.tildifyPath(info.registry.path))
-                .font(ShellType.code)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
         }
         .padding(20)
         .frame(minWidth: 620, minHeight: 480)
         .houseSheet()
-        .task(id: info.registry.path) {
-            let path = info.registry.path
-            let dataRoot = dataRoot
-            let personaRoot = personaRoot
-            state = await Task.detached(priority: .utility) {
-                SkillBodyPresentation.read(
-                    path: path,
-                    dataRoot: dataRoot,
-                    personaRoot: personaRoot
-                )
-            }.value
-        }
     }
 }
 
@@ -751,11 +574,7 @@ struct SkillReviewSheet: View {
                         onSuccess: { _ in
                             showOAuthFlow = false
                             Task {
-                                _ = await SkillReviewInstallPresentation.installAfterAuthorizedOAuth(
-                                    oauthSucceeded: true,
-                                    wasCancelled: false,
-                                    install: { await installSkill() }
-                                )
+                                _ = await installSkill()
                             }
                         },
                         onCancel: {
@@ -953,7 +772,7 @@ struct OAuthFlowSheet: View {
     private func startFlow() async {
         isLoading = true
         error = nil
-        guard let connectorId = SkillReviewInstallPresentation.connectorID(for: provider) else {
+        guard let connectorId = ConnectorWizardSetupRoute.skillOAuthConnectorID(for: provider) else {
             self.error = "Sign-in is not set up for \(provider)."
             isLoading = false
             return
@@ -992,4 +811,54 @@ struct OAuthFlowSheet: View {
 
 extension Notification.Name {
     static let skillBuildRequest = Notification.Name("NativeAgent.skillBuildRequest")
+}
+/// The latest user-visible outcome of a skill lifecycle operation. Identity is
+/// part of the contract: a repeated failure is a new event even when its text
+/// is byte-for-byte identical to the prior one.
+struct SkillLifecycleFeedback: Identifiable, Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        case success
+        case failure
+    }
+
+    let id: UUID
+    let kind: Kind
+    let message: String
+
+    init(kind: Kind, message: String) {
+        self.id = UUID()
+        self.kind = kind
+        self.message = message
+    }
+}
+
+extension AppModel {
+    @MainActor
+    func recordSkillManifestFailure(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        skillManifestError = trimmed
+        skillLifecycleFeedback = SkillLifecycleFeedback(kind: .failure, message: trimmed)
+    }
+
+    @MainActor
+    func recordSkillManifestSuccess(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        skillManifestError = nil
+        skillLifecycleFeedback = SkillLifecycleFeedback(kind: .success, message: trimmed)
+    }
+
+    @MainActor
+    func dismissSkillManifestFeedback() {
+        skillManifestError = nil
+        skillLifecycleFeedback = nil
+    }
+
+    @MainActor
+    func dismissSkillManifestSuccess(id: UUID) {
+        guard skillLifecycleFeedback?.id == id,
+              skillLifecycleFeedback?.kind == .success else { return }
+        skillLifecycleFeedback = nil
+    }
 }

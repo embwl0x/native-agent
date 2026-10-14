@@ -344,9 +344,7 @@ public enum ProcedureTrajectoryExtractor {
     }
 
     private static func parseDate(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        NativeTimestampFormat.parseISO8601FractionalFirst(value)
     }
 }
 
@@ -460,34 +458,6 @@ public enum ProcedureCandidateBlockReason: String, Codable, Sendable, Equatable,
     case productionDistinctDays = "production_distinct_days"
     case timeSeparatedHoldoutMissing = "time_separated_holdout_missing"
     case notLowRiskWorkshopTarget = "not_low_risk_workshop_target"
-}
-
-public struct ProcedureCandidateConfiguration: Sendable, Equatable {
-    public let minimumRepeatedTrajectories: Int
-    public let minimumDistinctInputs: Int
-    public let minimumVerifiedSuccessRate: Double
-    public let minimumProductionTrajectories: Int
-    public let minimumProductionDays: Int
-    public let minimumProductionVerifiedSuccessRate: Double
-    public let minimumRemovableProviderCallsPerTrajectory: Int
-
-    public init(
-        minimumRepeatedTrajectories: Int = 2,
-        minimumDistinctInputs: Int = 2,
-        minimumVerifiedSuccessRate: Double = 0.90,
-        minimumProductionTrajectories: Int = 12,
-        minimumProductionDays: Int = 3,
-        minimumProductionVerifiedSuccessRate: Double = 0.95,
-        minimumRemovableProviderCallsPerTrajectory: Int = 1
-    ) {
-        self.minimumRepeatedTrajectories = max(2, minimumRepeatedTrajectories)
-        self.minimumDistinctInputs = max(2, minimumDistinctInputs)
-        self.minimumVerifiedSuccessRate = min(1, max(0, minimumVerifiedSuccessRate))
-        self.minimumProductionTrajectories = max(12, minimumProductionTrajectories)
-        self.minimumProductionDays = max(3, minimumProductionDays)
-        self.minimumProductionVerifiedSuccessRate = min(1, max(0.95, minimumProductionVerifiedSuccessRate))
-        self.minimumRemovableProviderCallsPerTrajectory = max(1, minimumRemovableProviderCallsPerTrajectory)
-    }
 }
 
 public struct ProcedureCandidate: Sendable, Equatable, Identifiable {
@@ -610,8 +580,7 @@ public enum ProcedureCandidateCompiler {
 
     public static func evaluate(
         trajectories: [ProcedureTrajectory],
-        reviewerDecisions: [ProcedureReviewerDecision] = [],
-        configuration: ProcedureCandidateConfiguration = .init()
+        reviewerDecisions: [ProcedureReviewerDecision] = []
     ) -> [ProcedureCandidate] {
         // Once a compiled procedure is running, its canonical zero-provider
         // trajectories are effectiveness evidence for that implementation;
@@ -631,8 +600,7 @@ public enum ProcedureCandidateCompiler {
             return evaluateOne(
                 shapeIdentity: shapeIdentity,
                 trajectories: group.sorted { $0.id < $1.id },
-                review: decisions[shapeIdentity],
-                configuration: configuration
+                review: decisions[shapeIdentity]
             )
         }
     }
@@ -650,8 +618,7 @@ public enum ProcedureCandidateCompiler {
     private static func evaluateOne(
         shapeIdentity: String,
         trajectories: [ProcedureTrajectory],
-        review: ProcedureReviewerDecision?,
-        configuration: ProcedureCandidateConfiguration
+        review: ProcedureReviewerDecision?
     ) -> ProcedureCandidate {
         let successful = trajectories.filter { $0.terminalClass == .verifiedSuccess }
         let signatureGroups = Dictionary(grouping: successful, by: transitionSignature)
@@ -676,13 +643,13 @@ public enum ProcedureCandidateCompiler {
         let holdoutRate = Double(holdout.filter { $0.terminalClass == .verifiedSuccess }.count)
             / Double(max(1, holdout.count))
         let holdoutPassed = !prior.isEmpty && !holdout.isEmpty
-            && holdoutRate >= configuration.minimumProductionVerifiedSuccessRate
+            && holdoutRate >= 0.95
         let removableValues = trajectories.map(\.removableOrchestrationProviderCallCount)
         let removableCalls: Int? = removableValues.allSatisfy { $0 != nil }
             ? removableValues.compactMap { $0 }.reduce(0, +)
             : nil
         let savingsPassed = removableCalls.map {
-            $0 >= trajectories.count * configuration.minimumRemovableProviderCallsPerTrajectory
+            $0 >= trajectories.count
         } ?? false
         let productRole: ProcedureCandidateProductRole = {
             if canonical.domain == "github_command" { return .githubReducerOracle }
@@ -708,13 +675,13 @@ public enum ProcedureCandidateCompiler {
         )
 
         var manualReasons: [ProcedureCandidateBlockReason] = []
-        if canonicalGroup.count < configuration.minimumRepeatedTrajectories {
+        if canonicalGroup.count < 2 {
             manualReasons.append(.repeatedShapeInsufficient)
         }
-        if Set(trajectories.map(\.inputInstanceIdentity)).count < configuration.minimumDistinctInputs {
+        if Set(trajectories.map(\.inputInstanceIdentity)).count < 2 {
             manualReasons.append(.distinctInputsInsufficient)
         }
-        if successRate < configuration.minimumVerifiedSuccessRate {
+        if successRate < 0.90 {
             manualReasons.append(.verifiedSuccessInsufficient)
         }
         if authorities.count != 1 { manualReasons.append(.trustDivergence) }
@@ -740,13 +707,13 @@ public enum ProcedureCandidateCompiler {
         }
 
         var canaryReasons = manualReasons
-        if trajectories.count < configuration.minimumProductionTrajectories {
+        if trajectories.count < 12 {
             canaryReasons.append(.productionTrajectoryCount)
         }
-        if days.count < configuration.minimumProductionDays {
+        if days.count < 3 {
             canaryReasons.append(.productionDistinctDays)
         }
-        if successRate < configuration.minimumProductionVerifiedSuccessRate {
+        if successRate < 0.95 {
             canaryReasons.append(.verifiedSuccessInsufficient)
         }
         if !holdoutPassed { canaryReasons.append(.timeSeparatedHoldoutMissing) }
@@ -811,10 +778,7 @@ public enum ProcedureCandidateCompiler {
               ProcedureTrajectoryExtractor.isOpaqueIdentity(review.reviewerIdentity),
               ProcedureTrajectoryExtractor.isOpaqueIdentity(review.approvalReceiptIdentity),
               ProcedureTrajectoryExtractor.isOpaqueIdentity(review.candidateEvidenceDigest) else { return false }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: review.decidedAt) != nil
-            || ISO8601DateFormatter().date(from: review.decidedAt) != nil
+        return NativeTimestampFormat.parseISO8601FractionalFirst(review.decidedAt) != nil
     }
 }
 

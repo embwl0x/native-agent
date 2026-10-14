@@ -88,3 +88,41 @@ public enum GrokBotConnection {
         .object(["status": .string(state), "detail": .string(detail), "completed": .bool(false), "automatic_resend": .bool(false)])
     }
 }
+
+extension GrokBotConnection {
+    public static func selectBot(peer: String, name: String, dataRoot: URL) throws {
+        try AgentPeerStore(dataRoot: dataRoot).updateGrok(peer) { current in
+            guard current.grokConversation == nil else { throw GrokLinkCredential.Failure.invalid }
+            current.conversationLabel = name
+        }
+    }
+
+    public static func saveSecureCredentials(peer: String, paste: String, dataRoot: URL) throws -> Bool {
+        guard paste.utf8.count <= 16_384, let data = paste.data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: String],
+              Set(object.keys) == ["url", "key"], let url = object["url"], let key = object["key"] else { return false }
+        let store = AgentPeerStore(dataRoot: dataRoot)
+        try store.updateGrok(peer) { current in
+            guard ["creating", "secure-paste"].contains(current.grokSetup ?? "") else { throw GrokLinkCredential.Failure.invalid }
+            var credential = try GrokLinkCredential.read(peer: peer)
+            try credential.importWebhook(url: url, key: key)
+            try credential.write(peer: peer)
+            current.grokSetup = "set up"
+            current.grokBootstrapConfirmed = true
+        }
+        return true
+    }
+
+    public static func importSecureCredentials(peer: String, dataRoot: URL,
+                                                desktop: DesktopAgentConversationRoute) async throws -> Bool {
+        do {
+            guard let current = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peer }),
+                  ["creating", "secure-paste"].contains(current.grokSetup ?? "") else { return false }
+            try await desktop.importGrokRoutine(peer: peer, dataRoot: dataRoot, waitForCreation: true)
+            return true
+        } catch {
+            try? AgentPeerStore(dataRoot: dataRoot).updateGrok(peer) { $0.grokSetup = "secure-paste" }
+            throw error
+        }
+    }
+}

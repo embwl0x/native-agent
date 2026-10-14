@@ -184,8 +184,8 @@ struct MacSyncActionRouter {
             || ["create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job", "cancel_scheduler_job"].contains(action.action)
             || ["cancelApproval", "inboxAction", "app_settings", "app_setting_set", "chat_history_page", "set_trust_policy", "pairDevice", "disconnect_telegram", "set_telegram_settings", "set_mac_integration_permission"].contains(action.action)
             || ["get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread", "send_agent_message"].contains(action.action)
-            || ["configure_provider_secret", "start_provider_sign_in", "interaction_action"].contains(action.action)
-        if let message = sync.pairedPhones.authorize(action, requiresPairing: requiresDevice) {
+            || ["configure_provider_secret", "start_provider_sign_in", "interaction_action", "registerPushToken"].contains(action.action)
+        if let message = await sync.pairedPhones.authorize(action, requiresPairing: requiresDevice) {
             sync.engine.syncError = message
             return ["status": "error", "ok": "false", "code": "device_not_verified", "message": message]
         }
@@ -511,9 +511,11 @@ struct MacSyncActionRouter {
                 let bundleId = payload["bundleId"] ?? payload["bundle_id"] ?? ""
                 try await MacSyncMobileNotificationRelay.storePushToken(
                     deviceId: deviceId,
+                    pairedDeviceID: action.clientId,
                     token: token,
                     environment: environment,
-                    bundleId: bundleId
+                    bundleId: bundleId,
+                    dataRoot: sync.dataRoot
                 )
                 return [
                     "status": "ok",

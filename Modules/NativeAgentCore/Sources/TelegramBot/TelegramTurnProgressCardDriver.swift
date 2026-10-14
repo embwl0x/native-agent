@@ -6,21 +6,12 @@ import TurnTrace
 struct TelegramTurnProgressCardDriverSnapshot: Sendable, Equatable {
     let state: TelegramTurnPresentationState
     let messageId: Int?
-    let initialSendAttempted: Bool
-    let transportFailed: Bool
-    let heartbeatRunning: Bool
-    let detailsVisible: Bool
 }
 
 /// Owns the single ordinary Telegram message used to present one accepted
 /// turn's lifecycle. Its heartbeat coalesces transient misses while active;
 /// the ledger owns terminal delivery repair.
 actor TelegramTurnProgressCardDriver {
-    static let defaultMinimumEditInterval: TimeInterval = 5
-    static let defaultHeartbeatNanoseconds: UInt64 = 7_000_000_000
-
-    typealias Clock = @Sendable () -> Date
-    typealias Sleeper = @Sendable (_ nanoseconds: UInt64) async throws -> Void
     typealias SendCard = @Sendable (
         _ token: String,
         _ destination: TelegramDestination,
@@ -42,14 +33,12 @@ actor TelegramTurnProgressCardDriver {
     private let token: String
     private let destination: TelegramDestination
     private let turnId: UUID
-    private let minimumEditInterval: TimeInterval
-    private let heartbeatNanoseconds: UInt64
-    private let stalledAfter: TimeInterval
-    private let clock: Clock
-    private let sleeper: Sleeper
+    private let minimumEditInterval: TimeInterval = 5
+    private let heartbeatNanoseconds: UInt64 = 7_000_000_000
+    private let stalledAfter = TelegramTurnPresentationRenderer.defaultStalledAfter
     private let sendCard: SendCard
     private let editCard: EditCard
-    private let deleteCard: DeleteCard?
+    private let deleteCard: DeleteCard
     private let recordFailure: FailureRecorder
     private let persistCard: PersistCard
     private let removePersistedCard: RemovePersistedCard
@@ -79,14 +68,9 @@ actor TelegramTurnProgressCardDriver {
         token: String,
         destination: TelegramDestination,
         turnId: UUID,
-        minimumEditInterval: TimeInterval = defaultMinimumEditInterval,
-        heartbeatNanoseconds: UInt64 = defaultHeartbeatNanoseconds,
-        stalledAfter: TimeInterval = TelegramTurnPresentationRenderer.defaultStalledAfter,
-        clock: @escaping Clock = Date.init,
-        sleeper: @escaping Sleeper,
         sendCard: @escaping SendCard,
         editCard: @escaping EditCard,
-        deleteCard: DeleteCard? = nil,
+        deleteCard: @escaping DeleteCard,
         recordFailure: @escaping FailureRecorder = { _ in },
         persistCard: @escaping PersistCard = { _ in },
         removePersistedCard: @escaping RemovePersistedCard = { _ in }
@@ -94,18 +78,13 @@ actor TelegramTurnProgressCardDriver {
         self.token = token
         self.destination = destination
         self.turnId = turnId
-        self.minimumEditInterval = max(0, minimumEditInterval)
-        self.heartbeatNanoseconds = heartbeatNanoseconds
-        self.stalledAfter = max(0, stalledAfter)
-        self.clock = clock
-        self.sleeper = sleeper
         self.sendCard = sendCard
         self.editCard = editCard
         self.deleteCard = deleteCard
         self.recordFailure = recordFailure
         self.persistCard = persistCard
         self.removePersistedCard = removePersistedCard
-        self.state = TelegramTurnPresentationReducer.initialState(at: clock())
+        self.state = TelegramTurnPresentationReducer.initialState(at: Date())
     }
 
     /// Sends the acknowledged card exactly once. A failed first send is final
@@ -113,7 +92,7 @@ actor TelegramTurnProgressCardDriver {
     func start() async {
         guard !initialSendAttempted else { return }
         initialSendAttempted = true
-        let now = clock()
+        let now = Date()
         let rendered = renderedText(at: now)
         do {
             let sentMessageId = try await sendCard(
@@ -144,7 +123,7 @@ actor TelegramTurnProgressCardDriver {
             replyTextSettled = settled
             if !settled {
                 state = TelegramTurnPresentationReducer.reduce(
-                    state, lifecycle: .working(action: nil), at: clock()
+                    state, lifecycle: .working(action: nil), at: Date()
                 )
             }
             scheduleProgressFlush(force: true, bypassThrottle: true)
@@ -154,7 +133,7 @@ actor TelegramTurnProgressCardDriver {
         let next = TelegramTurnPresentationReducer.reduce(
             state,
             progress: event,
-            at: clock()
+            at: Date()
         )
         guard next != state else { return }
         state = next
@@ -179,7 +158,7 @@ actor TelegramTurnProgressCardDriver {
             progressFlushRequested = false
             progressForcedFlush = false
             progressBypassThrottle = false
-            _ = await persistIdentity(at: clock(), terminalText: nil)
+            _ = await persistIdentity(at: Date(), terminalText: nil)
             guard !state.isTerminal else { break }
             await flushIfDue(force: force, bypassThrottle: bypassThrottle)
         }
@@ -192,7 +171,7 @@ actor TelegramTurnProgressCardDriver {
         let next = TelegramTurnPresentationReducer.reduce(
             state,
             lifecycle: event,
-            at: clock()
+            at: Date()
         )
         guard next != state else { return }
         state = next
@@ -202,7 +181,7 @@ actor TelegramTurnProgressCardDriver {
             // to the ledger after this turn releases its driver.
             heartbeatTask = nil
             resolveTerminalWaiters(state.phase)
-            let now = clock()
+            let now = Date()
             let terminalText = renderedText(at: now)
             guard await persistIdentity(at: now, terminalText: terminalText) else {
                 // Without durable terminal evidence a restart must be allowed
@@ -221,7 +200,7 @@ actor TelegramTurnProgressCardDriver {
             await flushIfDue(force: true, bypassThrottle: true)
         } else {
             guard !transportFailed else { return }
-            _ = await persistIdentity(at: clock(), terminalText: nil)
+            _ = await persistIdentity(at: Date(), terminalText: nil)
             await flushIfDue(force: false)
         }
     }
@@ -239,11 +218,7 @@ actor TelegramTurnProgressCardDriver {
     func snapshot() -> TelegramTurnProgressCardDriverSnapshot {
         TelegramTurnProgressCardDriverSnapshot(
             state: state,
-            messageId: messageId,
-            initialSendAttempted: initialSendAttempted,
-            transportFailed: transportFailed,
-            heartbeatRunning: heartbeatTask != nil,
-            detailsVisible: detailsVisible
+            messageId: messageId
         )
     }
 
@@ -274,15 +249,14 @@ actor TelegramTurnProgressCardDriver {
     }
 
     private func startHeartbeatIfNeeded() {
-        guard heartbeatNanoseconds > 0, heartbeatTask == nil, !state.isTerminal else {
+        guard heartbeatTask == nil, !state.isTerminal else {
             return
         }
         let delay = heartbeatNanoseconds
-        let sleeper = self.sleeper
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
-                    try await sleeper(delay)
+                    try await Task.sleep(nanoseconds: delay)
                 } catch {
                     return
                 }
@@ -304,7 +278,7 @@ actor TelegramTurnProgressCardDriver {
             pendingForcedFlush = pendingForcedFlush || force
             return
         }
-        var now = clock()
+        var now = Date()
         if !force, let lastEditAt,
            now.timeIntervalSince(lastEditAt) < minimumEditInterval {
             return
@@ -319,8 +293,8 @@ actor TelegramTurnProgressCardDriver {
                 let nanoseconds = UInt64(
                     min(remaining, minimumEditInterval) * 1_000_000_000
                 )
-                try? await sleeper(nanoseconds)
-                now = clock()
+                try? await Task.sleep(nanoseconds: nanoseconds)
+                now = Date()
             }
         }
         let rendered = renderedText(at: now)
@@ -329,7 +303,7 @@ actor TelegramTurnProgressCardDriver {
         // and that edit's text is not the terminal one.
         let renderedIsTerminal = state.isTerminal
         guard rendered != lastRenderedText
-                || (renderedIsTerminal && state.phase == .completed && deleteCard != nil) else {
+                || (renderedIsTerminal && state.phase == .completed) else {
             editInFlight = false
             pendingFlush = false
             pendingForcedFlush = false
@@ -342,11 +316,11 @@ actor TelegramTurnProgressCardDriver {
             ? TelegramTurnControlCallback.clearedReplyMarkup
             : TelegramTurnControlCallback.replyMarkup(turnId: turnId)
 
-        let deleting = renderedIsTerminal && state.phase == .completed && deleteCard != nil
+        let deleting = renderedIsTerminal && state.phase == .completed
         // Cadence bounds attempts as well as successful edits during an outage.
         lastEditAt = now
         do {
-            if deleting, let deleteCard {
+            if deleting {
                 do {
                     try await deleteCard(token, destination.chatId, messageId)
                 } catch let failure as TelegramAPIFailure
@@ -473,45 +447,9 @@ actor TelegramTurnProgressCardDriver {
                 TelegramTurnControlCallback.clearedReplyMarkup
             )
             lastRenderedText = notice
-            lastEditAt = clock()
+            lastEditAt = Date()
         } catch {
             await reportFailure(step: "persistence fallback edit", error: error)
         }
-    }
-}
-
-enum TelegramTurnReplyDeliveryFailure {
-    static func lifecycleEvent(for error: Error) -> TelegramTurnPresentationLifecycleEvent {
-        let safe = TelegramTurnPresentationReducer.sanitized(String(describing: error))
-            ?? "delivery failed"
-        if isAmbiguous(error) {
-            return .outcomeUnknown(reason: "Reply delivery could not be confirmed: \(safe)")
-        }
-        return .failed(reason: "Reply delivery failed: \(safe)")
-    }
-
-    static func isAmbiguous(_ error: Error) -> Bool {
-        // 2026-09-06: Telegram answered 2xx and this side could not read the
-        // body. The send was accepted — the message very likely exists — so a
-        // create that fails this way is ambiguous, not a clean failure. Only
-        // transport timeouts were treated as ambiguous before, and a garbled
-        // 200 therefore led to a second, duplicate send.
-        if let failure = error as? TelegramAPIFailure {
-            switch failure.kind {
-            case .malformedResponse, .malformedResult:
-                if let status = failure.httpStatus { return (200..<300).contains(status) }
-            case .httpStatus, .rejected:
-                break
-            }
-        }
-        let nsError = error as NSError
-        if nsError.domain == NSURLErrorDomain {
-            return nsError.code == URLError.timedOut.rawValue
-                || nsError.code == URLError.networkConnectionLost.rawValue
-        }
-        let lower = String(describing: error).lowercased()
-        return lower.contains("timed out")
-            || lower.contains("network connection was lost")
-            || lower.contains("connection reset")
     }
 }

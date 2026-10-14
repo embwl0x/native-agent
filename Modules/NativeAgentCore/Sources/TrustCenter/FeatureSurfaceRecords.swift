@@ -140,18 +140,18 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
         FeatureSurfaceRecord(
             id: "feature:skills",
             sourceId: "skills",
-            name: "Lazy-Loaded Skills",
+            name: "Skill routines",
             kind: "feature",
             status: "ready",
-            description: "Reusable instruction skills are indexed by trigger and only full-loaded when relevant.",
-            triggers: ["skill", "procedure", "learn this workflow", "repeatable instruction"],
+            description: "JavaScript routines arrive by trigger with descriptions and signatures; run with skill.run, and request source only for review.",
+            triggers: ["skill", "procedure", "run a skill", "repeatable workflow"],
             permissions: [],
-            riskClass: "instruction",
+            riskClass: "routine",
             autoload: false,
             useCount: 0,
             lastUsedAt: nil,
             updatedAt: nowISO,
-            endpoints: ["/v1/skills", "/v1/skills/update", "/v1/skills/delete"]
+            endpoints: ["app skill.list", "app skill.read", "app skill.run", "app skill.save", "app skill.validate", "app skill.enable"]
         ),
         FeatureSurfaceRecord(
             id: "feature:runnable_tools",

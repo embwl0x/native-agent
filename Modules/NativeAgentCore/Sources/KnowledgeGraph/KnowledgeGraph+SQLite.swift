@@ -11,8 +11,8 @@
 // U5 W-C (2026-06-11):
 //   - The pool is no longer constructed fresh per query — it resolves through
 //     KnowledgeGraphPoolCache to the owning MemoryStorage's pool.
-//   - `loadFromMemoryV2` now THROWS instead of returning an empty store on
-//     failure. Empty-vs-error: a MISSING database is `.databaseMissing` (the
+//   - SQLite reads THROW instead of returning an empty store on failure.
+//     Empty-vs-error: a MISSING database is `.databaseMissing` (the
 //     reader legitimately falls back to the JSON file); an EXISTING database
 //     that cannot be opened or read is `.unreadable` — an ERROR that must
 //     surface to the user, never render as an empty-but-healthy graph and
@@ -63,36 +63,6 @@ extension KnowledgeGraphStore {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: date)
-    }
-
-    /// Load from `<memoryDir>/memory.sqlite` (kg_entities + kg_relationships).
-    /// If the tables are empty AND `jsonImportPath` exists AND the sentinel
-    /// `<memoryDir>/.kg_migrated_to_sqlite_v1` is missing, ingest the JSON
-    /// file once and stamp the sentinel.
-    ///
-    /// Throws `KnowledgeGraphSQLiteLoadError.databaseMissing` when the DB file
-    /// does not exist, and `.unreadable` on any open/read failure. It NEVER
-    /// returns a fabricated empty store on failure (U5 W-C empty-vs-error).
-    public static func loadFromMemoryV2(
-        memoryDir: URL,
-        jsonImportPath: URL?
-    ) async throws -> KnowledgeGraphStore {
-        do {
-            let pool = try await preparedPool(
-                memoryDir: memoryDir,
-                jsonImportPath: jsonImportPath
-            )
-            return try await readFromPool(pool)
-        } catch KnowledgeGraphPoolCache.PoolError.databaseMissing(let path) {
-            throw KnowledgeGraphSQLiteLoadError.databaseMissing(path)
-        } catch let error as KnowledgeGraphSQLiteLoadError {
-            throw error
-        } catch {
-            throw KnowledgeGraphSQLiteLoadError.unreadable(
-                path: memoryDir.appendingPathComponent("memory.sqlite").path,
-                detail: String(describing: error)
-            )
-        }
     }
 
     /// Read one bounded page directly from SQLite. The entity count, page rows,
@@ -289,60 +259,81 @@ extension KnowledgeGraphStore {
             jsonImportPath: jsonImportPath
         ) { pool in
             try await pool.read { db in
-                guard let row = try Row.fetchOne(db, sql: """
-                    SELECT id, name, type, summary, aliases_json, mention_count,
-                           first_seen, last_seen, provenance, metadata_json
-                    FROM kg_entities WHERE id = ?
-                    """, arguments: [id]),
-                    let entity = entityValue(row) else {
-                    return .notFound
-                }
-                let edgeRows = try Row.fetchAll(db, sql: """
-                    SELECT r.from_id, r.to_id, r.type, r.weight,
-                           r.mention_count, r.provenance, r.metadata_json
-                    FROM kg_relationships r
-                    JOIN kg_entities source ON source.id = r.from_id
-                    JOIN kg_entities target ON target.id = r.to_id
-                    WHERE r.from_id = ? OR r.to_id = ?
-                    ORDER BY r.from_id, r.to_id, r.type
-                    LIMIT ?
-                    """, arguments: [id, id, sqliteIncidentEdgeLimit + 1])
-                guard edgeRows.count <= sqliteIncidentEdgeLimit else {
-                    throw KnowledgeGraphReadError.relationshipLimitExceeded(sqliteIncidentEdgeLimit)
-                }
-                let edges = edgeRows.compactMap(edgeValue)
-                let neighborRows = try Row.fetchAll(db, sql: """
-                    SELECT id, name, type, summary, aliases_json, mention_count,
-                           first_seen, last_seen, provenance, metadata_json
-                    FROM kg_entities
-                    WHERE id IN (
-                        SELECT CASE WHEN r.from_id = ? THEN r.to_id ELSE r.from_id END
-                        FROM kg_relationships r
-                        JOIN kg_entities source ON source.id = r.from_id
-                        JOIN kg_entities target ON target.id = r.to_id
-                        WHERE r.from_id = ? OR r.to_id = ?
-                        ORDER BY r.from_id, r.to_id, r.type
-                        LIMIT ?
-                    )
-                    ORDER BY id
-                    LIMIT ?
-                    """, arguments: [
-                        id, id, id,
-                        sqliteIncidentEdgeLimit, sqliteIncidentEdgeLimit,
-                    ])
-                var neighbors: [String: JSONValue] = [:]
-                for value in neighborRows.compactMap(entityValue) {
-                    guard case .object(let object) = value,
-                          case .string(let neighborID)? = object["id"] else { continue }
-                    neighbors[neighborID] = value
-                }
-                return .found(.object([
-                    "entity": entity,
-                    "edges": .array(edges),
-                    "neighbors": .object(neighbors),
-                ]))
+                try entityFromSQLite(db, id: id)
             }
         }
+    }
+
+    /// Per-entity failures stay local to the recalled row, as in single reads.
+    public static func entitiesFromMemoryV2(
+        memoryDir: URL, jsonImportPath: URL?, ids: [String]
+    ) async throws -> [String: JSONValue] {
+        try await withPreparedPool(memoryDir: memoryDir, jsonImportPath: jsonImportPath) { pool in
+            try await pool.read { db in
+                var entities: [String: JSONValue] = [:]
+                for id in ids {
+                    guard case .found(.object(let envelope))? = try? entityFromSQLite(db, id: id),
+                          let entity = envelope["entity"], entity != .null else { continue }
+                    entities[id] = entity
+                }
+                return entities
+            }
+        }
+    }
+
+    private static func entityFromSQLite(_ db: Database, id: String) throws -> KnowledgeGraphEntityResult {
+        guard let row = try Row.fetchOne(db, sql: """
+            SELECT id, name, type, summary, aliases_json, mention_count,
+                   first_seen, last_seen, provenance, metadata_json
+            FROM kg_entities WHERE id = ?
+            """, arguments: [id]),
+            let entity = entityValue(row) else {
+            return .notFound
+        }
+        let edgeRows = try Row.fetchAll(db, sql: """
+            SELECT r.from_id, r.to_id, r.type, r.weight,
+                   r.mention_count, r.provenance, r.metadata_json
+            FROM kg_relationships r
+            JOIN kg_entities source ON source.id = r.from_id
+            JOIN kg_entities target ON target.id = r.to_id
+            WHERE r.from_id = ? OR r.to_id = ?
+            ORDER BY r.from_id, r.to_id, r.type
+            LIMIT ?
+            """, arguments: [id, id, sqliteIncidentEdgeLimit + 1])
+        guard edgeRows.count <= sqliteIncidentEdgeLimit else {
+            throw KnowledgeGraphReadError.relationshipLimitExceeded(sqliteIncidentEdgeLimit)
+        }
+        let edges = edgeRows.compactMap(edgeValue)
+        let neighborRows = try Row.fetchAll(db, sql: """
+            SELECT id, name, type, summary, aliases_json, mention_count,
+                   first_seen, last_seen, provenance, metadata_json
+            FROM kg_entities
+            WHERE id IN (
+                SELECT CASE WHEN r.from_id = ? THEN r.to_id ELSE r.from_id END
+                FROM kg_relationships r
+                JOIN kg_entities source ON source.id = r.from_id
+                JOIN kg_entities target ON target.id = r.to_id
+                WHERE r.from_id = ? OR r.to_id = ?
+                ORDER BY r.from_id, r.to_id, r.type
+                LIMIT ?
+            )
+            ORDER BY id
+            LIMIT ?
+            """, arguments: [
+                id, id, id,
+                sqliteIncidentEdgeLimit, sqliteIncidentEdgeLimit,
+            ])
+        var neighbors: [String: JSONValue] = [:]
+        for value in neighborRows.compactMap(entityValue) {
+            guard case .object(let object) = value,
+                  case .string(let neighborID)? = object["id"] else { continue }
+            neighbors[neighborID] = value
+        }
+        return .found(.object([
+            "entity": entity,
+            "edges": .array(edges),
+            "neighbors": .object(neighbors),
+        ]))
     }
 
     /// Materialize the canonical export/iCloud projection in exactly one GRDB
@@ -381,7 +372,7 @@ extension KnowledgeGraphStore {
         }
     }
 
-    private static func withPreparedPool<T: Sendable>(
+    static func withPreparedPool<T: Sendable>(
         memoryDir: URL,
         jsonImportPath: URL?,
         operation: @Sendable (DatabasePool) async throws -> T
@@ -424,75 +415,35 @@ extension KnowledgeGraphStore {
         return pool
     }
 
-    private static func readFromPool(_ pool: DatabasePool) async throws -> KnowledgeGraphStore {
-        try await pool.read { db in
-            try storeFromDatabase(db)
-        }
-    }
-
     private static func storeFromDatabase(_ db: Database) throws -> KnowledgeGraphStore {
-            // Entities — fetch in stable id order (PRIMARY KEY) for deterministic
-            // pagination. Daemon's JSON-derived ordering was insertion-order; the
-            // SQLite cutover trades that for lexicographic id order, which
-            // matches the no-import-yet fallback path KnowledgeGraphStore.normalize
-            // uses when entityKeyOrder is nil.
-            let entityRows = try Row.fetchAll(db, sql: """
-                SELECT id, name, type, summary, aliases_json, mention_count,
-                       first_seen, last_seen, provenance, metadata_json
-                FROM kg_entities ORDER BY id
-                """)
-            var entities: [String: JSONValue] = [:]
-            var entityOrder: [String] = []
-            for r in entityRows {
-                let id: String = r["id"] ?? ""
-                guard !id.isEmpty else { continue }
-                var obj: [String: JSONValue] = [:]
-                obj["id"] = .string(id)
-                if let name: String = r["name"] { obj["name"] = .string(name) }
-                if let type: String = r["type"] { obj["type"] = .string(type) }
-                if let s: String = r["summary"] { obj["summary"] = .string(s) }
-                if let aliasesStr: String = r["aliases_json"],
-                   let aliasesData = aliasesStr.data(using: .utf8),
-                   let aliases = try? JSONValue.parse(aliasesData) {
-                    obj["aliases"] = aliases
-                }
-                if let mc: Int64 = r["mention_count"] { obj["mention_count"] = .int(mc) }
-                if let fs: String = r["first_seen"] { obj["first_seen"] = .string(fs) }
-                if let ls: String = r["last_seen"] { obj["last_seen"] = .string(ls) }
-                if let prov: String = r["provenance"] { obj["provenance"] = .string(prov) }
-                mergeMetadata(r["metadata_json"], into: &obj)
-                entities[id] = .object(obj)
-                entityOrder.append(id)
-            }
-            let edgeRows = try Row.fetchAll(db, sql: """
-                SELECT from_id, to_id, type, weight, mention_count, provenance, metadata_json
-                FROM kg_relationships
-                ORDER BY from_id, to_id, type
-                """)
-            let entityIds = Set(entities.keys)
-            var edges: [JSONValue] = []
-            for r in edgeRows {
-                let fromId: String = r["from_id"] ?? ""
-                let toId: String = r["to_id"] ?? ""
-                let type: String = r["type"] ?? ""
-                guard !fromId.isEmpty, !toId.isEmpty, !type.isEmpty else { continue }
-                guard entityIds.contains(fromId), entityIds.contains(toId) else { continue }
-                var obj: [String: JSONValue] = [
-                    "from": .string(fromId),
-                    "to": .string(toId),
-                    "type": .string(type),
-                ]
-                if let w: Double = r["weight"] { obj["weight"] = .double(w) }
-                if let mc: Int64 = r["mention_count"] { obj["mention_count"] = .int(mc) }
-                if let prov: String = r["provenance"] { obj["provenance"] = .string(prov) }
-                mergeMetadata(r["metadata_json"], into: &obj)
-                edges.append(.object(obj))
-            }
+        // SQLite pages use stable id order; legacy JSON retains insertion order.
+        let entityRows = try Row.fetchAll(db, sql: """
+            SELECT id, name, type, summary, aliases_json, mention_count,
+                   first_seen, last_seen, provenance, metadata_json
+            FROM kg_entities ORDER BY id
+            """)
+        var entities: [String: JSONValue] = [:]
+        var entityOrder: [String] = []
+        for row in entityRows {
+            guard let entity = entityValue(row), let id: String = row["id"] else { continue }
+            entities[id] = entity
+            entityOrder.append(id)
+        }
+        let edgeRows = try Row.fetchAll(db, sql: """
+            SELECT from_id, to_id, type, weight, mention_count, provenance, metadata_json
+            FROM kg_relationships
+            ORDER BY from_id, to_id, type
+            """)
+        let entityIds = Set(entities.keys)
+        let edges = edgeRows.compactMap { row -> JSONValue? in
+            guard let from: String = row["from_id"], let to: String = row["to_id"],
+                  entityIds.contains(from), entityIds.contains(to) else { return nil }
+            return edgeValue(row)
+        }
         return KnowledgeGraphStore(
             entities: entities,
             entityOrder: entityOrder,
-            edges: edges,
-            commitSeq: 0
+            edges: edges
         )
     }
 

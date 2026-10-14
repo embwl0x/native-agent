@@ -12,7 +12,7 @@ import NativeAgentShared
 struct WorkshopView: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @StateObject private var store = WorkshopStore()
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var showNewWorkshopTask = false
     @State private var selectedWorkshopTask: WorkshopTaskRecord?
     @State private var notifiedTaskUnavailable = false

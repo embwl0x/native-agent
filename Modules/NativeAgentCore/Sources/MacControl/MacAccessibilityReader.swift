@@ -1034,7 +1034,7 @@ public enum MacAccessibilityReader {
             let lhsLength = lhs.node.attributes.title?.count ?? Int.max
             let rhsLength = rhs.node.attributes.title?.count ?? Int.max
             if lhsLength != rhsLength { return lhsLength < rhsLength }
-            return pathIsBefore(lhs.node.path, rhs.node.path)
+            return MacPerceptionCompiler.pathIsBefore(lhs.node.path, rhs.node.path)
         }
         return Array(matches.prefix(limits.maxMatches))
     }
@@ -1058,10 +1058,6 @@ public enum MacAccessibilityReader {
         return nil
     }
 
-    private static func pathIsBefore(_ lhs: [Int], _ rhs: [Int]) -> Bool {
-        for (a, b) in zip(lhs, rhs) where a != b { return a < b }
-        return lhs.count < rhs.count
-    }
 }
 
 // MARK: - Production element source
@@ -1425,7 +1421,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return windows.enumerated().map { index, window in
             MacAXWindowHandle(
                 ref: mint(window),
-                identity: MacAXWindowIdentityRead.copy(window, pid: pid, index: index)
+                identity: MacAXAttributeRead.copyWindowIdentity(window, pid: pid, index: index)
             )
         }
         #else

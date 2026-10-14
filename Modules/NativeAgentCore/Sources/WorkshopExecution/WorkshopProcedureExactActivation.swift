@@ -72,8 +72,7 @@ public enum WorkshopProcedureExactActivationQualifier {
             }
             let replay = ProcedureReplayEngine.replay(
                 artifact,
-                against: trajectory,
-                mode: .historicalExact
+                against: trajectory
             )
             guard replay.status == .matched,
                   replay.matchedStepCount == artifact.transitionTable.count else { return nil }
@@ -180,8 +179,7 @@ public enum WorkshopProcedureExactActivationQualifier {
                       let trajectory = extraction.trajectories.first else { return false }
                 let replay = ProcedureReplayEngine.replay(
                     artifact,
-                    against: trajectory,
-                    mode: .historicalExact
+                    against: trajectory
                 )
                 guard
                       trajectory.terminalClass == .verifiedSuccess,

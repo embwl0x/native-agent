@@ -326,6 +326,6 @@ extension CognitiveSubstrate {
     /// push past it.
     static let landingReactionScale = 0.24
     static func landingScore(fromReactionValence valence: Double) -> Double {
-        clampSigned(valence / landingReactionScale)
+        (valence / landingReactionScale).clampedSigned()
     }
 }

@@ -3,7 +3,6 @@ import UIKit
 import NativeAgentShared
 
 extension ChatStore {
-    typealias SessionHistoryLoader = (String?) async throws -> [ChatMessage]?
     /// 2026-09-06: a session load reads the same two-state transcript the
     /// refresh lane does — no row published, or a row that may legitimately be
     /// empty because the chat was cleared on the Mac.
@@ -50,27 +49,6 @@ extension ChatStore {
                 let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: sessionID)
                 if page.hasOlder { self?.pagedSessionsWithOlder.insert(sessionID) }
                 return .published(page.messages, generation: nil)
-            },
-            fallbackMessages: fallbackMessages
-        )
-    }
-
-    /// The loader stays at the session boundary so all terminal outcomes can
-    /// release the composer lock. Production supplies MacBridgeClient; the
-    /// hermetic path also proves a failed/cancelled read cannot leave the field
-    /// permanently disabled.
-    func switchSessionForEvaluation(
-        to sessionID: String,
-        loadHistory: @escaping SessionHistoryLoader,
-        fallbackMessages: [ChatMessage]?
-    ) {
-        guard !isSwitchingSession, let clean = Self.cleanSessionID(sessionID) else { return }
-        guard clean != selectedSessionID else { return }
-        setSelectedSessionID(clean)
-        loadSelectedSession(
-            loadTranscript: { sessionID in
-                guard let messages = try await loadHistory(sessionID) else { return .unavailable }
-                return .published(messages, generation: nil)
             },
             fallbackMessages: fallbackMessages
         )
@@ -163,6 +141,8 @@ extension ChatStore {
         sessionSwitchGeneration &+= 1
         sessionSwitchTask?.cancel()
         sessionSwitchTask = nil
+        sessionCacheLoadTask?.cancel()
+        sessionCacheLoadTask = nil
         isSwitchingSession = false
     }
 
@@ -214,22 +194,33 @@ extension ChatStore {
         isLoading = false
         errorBanner = nil
         let loadingSessionID = selectedSessionID
-        let cachedMessages = loadCachedMessages(for: loadingSessionID, fallback: fallbackMessages)
-        suppressMessagePersistence = true
-        messages = cachedMessages
-        suppressMessagePersistence = false
-        // Cache-loaded rows are NOT recent arrivals: without this, switching
-        // back to a session could resurrect rows the Mac removed/aged out for
-        // a full preserve window. Live in-session arrivals keep real stamps.
-        for id in cachedMessages.map(\.id) { localArrivalDates[id] = .distantPast }
-        // 2026-09-13: opening another conversation never erased the durable
-        // record of this one's unfinished exchange — so coming back re-attaches
-        // it: the same bubble, the same partial answer, still being observed.
-        restorePendingExchanges(for: loadingSessionID)
-        lastRefreshAt = .distantPast
+        let cacheLoad = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if self.sessionSwitchGeneration == switchGeneration { self.sessionCacheLoadTask = nil } }
+            await self.restorationTask?.value
+            let cachedMessages = await loadCachedMessages(for: loadingSessionID, fallback: fallbackMessages)
+            guard !Task.isCancelled, self.selectedSessionID == loadingSessionID,
+                  self.sessionSwitchGeneration == switchGeneration else { return }
+            suppressMessagePersistence = true
+            messages = cachedMessages
+            suppressMessagePersistence = false
+            // Cache-loaded rows are NOT recent arrivals: without this, switching
+            // back to a session could resurrect rows the Mac removed/aged out for
+            // a full preserve window. Live in-session arrivals keep real stamps.
+            for id in cachedMessages.map(\.id) { localArrivalDates[id] = .distantPast }
+            // 2026-09-13: opening another conversation never erased the durable
+            // record of this one's unfinished exchange — so coming back re-attaches
+            // it: the same bubble, the same partial answer, still being observed.
+            restorePendingExchanges(for: loadingSessionID)
+            lastRefreshAt = .distantPast
+        }
+        sessionCacheLoadTask = cacheLoad
         sessionSwitchTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.finishSessionSwitch(generation: switchGeneration) }
+            await cacheLoad.value
+            guard !Task.isCancelled, self.selectedSessionID == loadingSessionID,
+                  self.sessionSwitchGeneration == switchGeneration else { return }
             do {
                 let read = try await loadTranscript(loadingSessionID)
                 guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
@@ -238,7 +229,6 @@ extension ChatStore {
                     if let generation, let loadingSessionID,
                        let applied = self.appliedTranscriptGenerations[loadingSessionID],
                        generation < applied {
-                        self.messages = self.loadCachedMessages(for: loadingSessionID)
                         return
                     }
                     self.noteAppliedTranscriptGeneration(

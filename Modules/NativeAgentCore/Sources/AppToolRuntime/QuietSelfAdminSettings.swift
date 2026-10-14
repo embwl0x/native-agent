@@ -1,3 +1,4 @@
+import MultimodalTTS
 import ChatOrchestration
 import Cognition
 import Context
@@ -612,10 +613,12 @@ public enum QuietSettings {
         model: String?, reasoningEffort: String?, serviceTier: String?, clearOverride: Bool
     ) async throws -> ProviderGroupWriteResult {
         do {
-            return try await appModel.saveProviderGroupSelection(
+            let result = try await appModel.saveProviderGroupSelection(
                 group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
                 serviceTier: serviceTier, clearOverride: clearOverride
             )
+            QuietWriteDetail.record("undo_unavailable", .string("This receipt's old value does not contain the group's previous model choices; set those choices explicitly to restore them."))
+            return result
         } catch let failure as ProviderGroupWriteFailure {
             QuietWriteDetail.record("surfaces_changed", failure.surfacesPendingRecovery.isEmpty ? .array([]) : .null)
             QuietWriteDetail.record("surfaces_rolled_back", .array(failure.surfacesRolledBack.map { .string($0) }))
@@ -1048,7 +1051,7 @@ public enum QuietSettings {
     /// deleted simply has no rows, which is the honest answer to "can I change
     /// its schedule".
     @MainActor
-    private static func botRows(_ appModel: (any QuietSettingsHost)?) -> [QuietSetting] {
+    private static func botRows(_ appModel: (any QuietSettingsHost)?, snapshot: Bool = false) -> [QuietSetting] {
         guard let appModel,
               let bots = try? botStore(appModel).list() else { return [] }
         return bots.flatMap { bot -> [QuietSetting] in
@@ -1064,6 +1067,7 @@ public enum QuietSettings {
                         + "may be no closer together than the bot floor "
                         + "(bots.minimum_interval_minutes), which the store enforces.",
                     read: { appModel in
+                        if snapshot { return .string(cadenceText(bot.cadence)) }
                         guard let current = try? botStore(appModel).get(bot.id) else { return .string("") }
                         return .string(cadenceText(current.cadence))
                     },
@@ -1085,6 +1089,7 @@ public enum QuietSettings {
                     kind: .boolean,
                     note: "Paused stops scheduled turns. Follow-ups and run-once still work.",
                     read: { appModel in
+                        if snapshot { return .bool(bot.paused) }
                         guard let current = try? botStore(appModel).get(bot.id) else { return .bool(false) }
                         return .bool(current.paused)
                     },
@@ -1764,24 +1769,6 @@ public enum QuietSettings {
             }
         ))
 
-        rows.append(QuietSetting(
-            id: "settings.display_timezone", page: "settings",
-            label: "The clock the app speaks in", kind: .text,
-            note: "An IANA zone (Europe/London). Empty means this Mac's own zone, which is what "
-                + "shipped. Display only: it changes the times shown on the bots card, Today and "
-                + "the morning brief's date line, and never when anything runs.",
-            read: { _ in .string(DisplayTimeZone.identifier()) },
-            write: { _, value in
-                let raw = try stringValue(value, "The clock the app speaks in")
-                    .trimmingCharacters(in: .whitespaces)
-                guard raw.isEmpty || TimeZone(identifier: raw) != nil else {
-                    throw QuietSettingError.badValue(
-                        "\(raw) is not an IANA time zone. Empty follows this Mac.")
-                }
-                UserDefaults.standard.set(raw, forKey: DisplayTimeZone.key)
-            }
-        ))
-
         // ── Desk ────────────────────────────────────────────────────────────
         rows.append(QuietSetting(
             id: "desk.timeline", page: "trust", label: "Show the Desk timeline",
@@ -1949,22 +1936,49 @@ public enum QuietSettings {
         return rows
     }()
 
-    /// The compile-time rows, the rows that exist only because a bot does, and
-    /// the lower-only switches whose state only the app can reach.
     @MainActor
-    public static func all(host: (any QuietSettingsHost)?) -> [QuietSetting] {
-        staticRows + botRows(host) + (host?.lowerOnlyRows ?? [])
+    private static var fixedRows: [QuietSetting] {
+        staticRows + [QuietSetting(
+            id: "settings.display_timezone", page: "settings",
+            label: "The clock the app speaks in", kind: .text,
+            note: "An IANA zone (Europe/London); empty = the Mac's zone. Current zone: \(DisplayTimeZone.current.identifier). "
+                + "This changes what is displayed. Wall-clock schedules follow the Mac's own zone; explicitly zoned schedules keep their zone.",
+            read: { _ in .string(DisplayTimeZone.identifier()) },
+            write: { _, value in
+                let raw = try stringValue(value, "The clock the app speaks in").trimmingCharacters(in: .whitespaces)
+                guard raw.isEmpty || TimeZone(identifier: raw) != nil else {
+                    throw QuietSettingError.badValue("\(raw) is not an IANA time zone. Empty follows this Mac.")
+                }
+                UserDefaults.standard.set(raw, forKey: DisplayTimeZone.key)
+                NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+            }
+        )]
+    }
+
+    /// Snapshot bot values only for a read; mutations keep fresh store readers.
+    @MainActor
+    public static func all(host: (any QuietSettingsHost)?, snapshotBots: Bool = false) -> [QuietSetting] {
+        fixedRows + botRows(host, snapshot: snapshotBots) + (host?.lowerOnlyRows ?? [])
     }
 
     @MainActor
     public static func settings(forPage page: String, host: (any QuietSettingsHost)?) -> [QuietSetting] {
-        all(host: host).filter { $0.page == page }
+        fixedRows.filter { $0.page == page }
+            + (page == "bots" ? botRows(host, snapshot: true) : [])
+            + (host?.lowerOnlyRows ?? []).filter { $0.page == page }
     }
 
     @MainActor
     public static func setting(id: String, host: (any QuietSettingsHost)?) -> QuietSetting? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let rows = all(host: host)
+        let fixed = fixedRows
+        if let setting = fixed.first(where: { $0.id.lowercased() == key }) { return setting }
+        let lower = host?.lowerOnlyRows ?? []
+        if !key.hasPrefix("bots.") {
+            if let setting = lower.first(where: { $0.id.lowercased() == key }) { return setting }
+            if let setting = fixed.first(where: { $0.label.lowercased() == key }) { return setting }
+        }
+        let rows = fixed + botRows(host) + lower
         return rows.first { $0.id.lowercased() == key }
             ?? rows.first { $0.label.lowercased() == key }
     }

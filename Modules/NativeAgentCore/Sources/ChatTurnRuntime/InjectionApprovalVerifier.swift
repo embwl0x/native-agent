@@ -39,24 +39,6 @@ public enum InjectionApprovalVerification: String, Sendable, Equatable {
     /// cannot be persisted is an injection nothing would stop replaying after
     /// a restart, so it does not run.
     case spendUnavailable = "approval_spend_unrecordable"
-    /// No verifier wired at all. Fail-closed: an injection tool with no way to
-    /// check its approval does not run.
-    case noVerifier = "approval_verifier_unavailable"
-}
-
-/// The seam the dispatcher checks injection approvals through. Production wires
-/// `ApprovalInboxInjectionApprovalVerifier`; tests wire the same type against a
-/// temp data root (there is no "always yes" implementation in the source tree —
-/// see `macInjection_noAlwaysApproveVerifierExistsInSource`).
-public protocol InjectionApprovalVerifying: Sendable {
-    /// Consumes the approval on success: verification is the single-use gate,
-    /// so a verdict of `.verified` is returned at most once per record.
-    func verifyInjectionApproval(
-        approvalID: String,
-        tool: String,
-        surface: String,
-        input: [String: JSONValue]
-    ) async -> InjectionApprovalVerification
 }
 
 /// Process-global single-use ledger for injection APPROVAL RECORDS.
@@ -104,7 +86,7 @@ public actor MacInjectionApprovalConsumptionLedger {
 ///   3. the process-global ledger — a second mint inside one process.
 /// (2) is the addition; it is the first line of the spend, not a replacement
 /// for (1) or (3).
-public struct ApprovalInboxInjectionApprovalVerifier: InjectionApprovalVerifying {
+public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
     /// Typed as the SPENDING inbox, not the plain one: the durable spend is
     /// part of what makes verification single-use, so an inbox that cannot
     /// record a spend cannot be wired here at all. Fail-closed by type,

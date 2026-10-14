@@ -1,4 +1,5 @@
 import Foundation
+import MultimodalTTS
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers

@@ -59,15 +59,6 @@ public struct VisionRect: Sendable, Equatable, Hashable {
         return VisionRect(x: left, y: top, w: right - left, h: bottom - top)
     }
 
-    /// The SAFE ACTION POINT Agent asked for: not "button-like near here" but
-    /// a specific point. The centre, because a synthesized click at a region's
-    /// edge lands on whatever is next to it.
-    public var actionPoint: (x: Double, y: Double) { (centerX, centerY) }
-
-    /// The shared `MacAXFrame` shape, so a vision affordance's `frame` is the
-    /// same field the AX lane's is and no consumer needs a second branch.
-    public var axFrame: MacAXFrame { MacAXFrame(x: x, y: y, w: w, h: h) }
-
     public func toJSON() -> JSONValue {
         .object([
             "x": .double(x.rounded()),

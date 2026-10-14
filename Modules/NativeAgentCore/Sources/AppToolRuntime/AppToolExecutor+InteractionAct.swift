@@ -2,6 +2,7 @@ import ChatOrchestration
 import Dispatcher
 import Foundation
 import MacIntegration
+import MacControl
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -602,6 +603,8 @@ extension AppToolExecutor {
         let mode = interaction.mode
         var categories: [String] = []
         for capability in interaction.allTargets {
+            // An agent answer cannot raise a macOS consent dialog; only the owner's tap can.
+            if SystemAppleScriptAdapter.automationTarget(capability) != nil { continue }
             if InlineInteractionRegistry.isMacControlCategory(capability) {
                 categories.append(capability)
                 continue

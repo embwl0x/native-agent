@@ -306,6 +306,23 @@ public struct TrustMacControlPolicy: Sendable, Codable, Hashable {
     public var approvalRequiredFor: [String] = ["shell", "file_ops", "applescript", "jxa", "accessibility"]
     public var remoteFromIosAllowed: Bool = false
 
+    var wireValue: [String: Any] {
+        [
+            "enabled": enabled,
+            "applescript_allowed": applesScriptAllowed,
+            "jxa_allowed": jxaAllowed,
+            "shortcuts_allowed": shortcutsAllowed,
+            "accessibility_allowed": accessibilityAllowed,
+            "system_control_allowed": systemControlAllowed,
+            "file_ops_allowed": fileOpsAllowed,
+            "shell_allowed": shellAllowed,
+            "notifications_allowed": notificationsAllowed,
+            "spotlight_allowed": spotlightAllowed,
+            "approval_required_for": approvalRequiredFor,
+            "remote_from_ios_allowed": remoteFromIosAllowed,
+        ]
+    }
+
     enum CodingKeys: String, CodingKey {
         case enabled
         case applesScriptAllowed = "applescript_allowed"

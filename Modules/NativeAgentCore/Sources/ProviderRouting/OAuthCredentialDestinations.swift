@@ -24,10 +24,4 @@ public enum OAuthCredentialDestinations {
             .appendingPathComponent("oauth_tokens", isDirectory: true)
             .appendingPathComponent("x.json")
     }
-
-    public static func areDisjoint(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Bool {
-        let provider = xAIProvider(dataRoot: dataRoot).standardizedFileURL
-        return provider != xConnector(dataRoot: dataRoot).standardizedFileURL
-            && provider != xConnectorRuntimeMirror(dataRoot: dataRoot).standardizedFileURL
-    }
 }

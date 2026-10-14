@@ -27,6 +27,7 @@ public struct MobileHelperEdit: Codable, Sendable {
     public var brief = ""
     public var provider = ""
     public var model = ""
+    public var modelPinned: Bool? = false
     public var think = ""
     public var fast = false
     public var timing = "manual"

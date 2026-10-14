@@ -207,3 +207,121 @@ struct DeskItemInspector: View {
         }
     }
 }
+
+
+enum DeskSelection {
+
+    /// Arrow-key movement over the visible order. CLAMPS rather than wraps:
+    /// wrapping from the last row back to the first reads as a jump on a
+    /// surface this long, and User holding ↓ should come to rest at the bottom.
+    ///
+    /// With no current selection, ↓ takes the first row and ↑ the last — the
+    /// standard "enter the list from the edge you came from" behavior.
+    static func move(from current: String?, by delta: Int, in order: [String]) -> String? {
+        guard !order.isEmpty else { return nil }
+        guard let current, let idx = order.firstIndex(of: current) else {
+            return delta >= 0 ? order.first : order.last
+        }
+        let next = idx + delta
+        guard next >= 0, next < order.count else { return current }
+        return order[next]
+    }
+
+}
+
+enum DeskPursuitSectionPresentation {
+    static let unreadablePayloadLabel = "Project details unavailable"
+    static let unreadablePayloadDetail = "The saved details of this project could not be read. They need to be repaired before you can act on it."
+
+}
+
+enum DeskPursuitVetoControl {
+    static let help = "Close this pursuit (canceled) with a user-vetoed note."
+}
+
+/// The ordered status-critical facts rendered above a Desk row's free-text
+/// detail. The board and pursuits share this exact projection, so a blocker
+/// never becomes navigable in one lane but inert or absent in the other.
+enum DeskSequencingPillPresentation {
+    enum Kind: String, Sendable, Equatable {
+        case rollup
+        case blocked
+        case cycle
+        case deferred
+        case nextUp
+    }
+
+    struct Pill: Identifiable, Sendable, Equatable {
+        let kind: Kind
+        let text: String
+        let targetHandle: String?
+
+        var id: String { kind.rawValue }
+    }
+
+    static func pills(
+        item: DeskItem,
+        itemPlan: DeskSequencing.ItemPlan,
+        isNextUp: Bool,
+        aliases: [String: String],
+        blockerAliasCap: Int = 3
+    ) -> [Pill] {
+        var result: [Pill] = []
+        if itemPlan.totalCount > 0 {
+            result.append(Pill(
+                kind: .rollup,
+                text: "\(itemPlan.doneCount)/\(itemPlan.totalCount) closed",
+                targetHandle: nil
+            ))
+        }
+        if let blocked = DeskItemPresentation.blockedPill(
+            plan: itemPlan,
+            aliases: aliases,
+            cap: blockerAliasCap
+        ) {
+            result.append(Pill(
+                kind: .blocked,
+                text: blocked.text,
+                targetHandle: blocked.targetHandle
+            ))
+        }
+        if itemPlan.blockedByCycle {
+            result.append(Pill(
+                kind: .cycle,
+                text: "⚠ these block each other",
+                targetHandle: nil
+            ))
+        }
+        if itemPlan.isDeferred {
+            let day = item.deferUntil.flatMap(DeskSequencing.deferDisplayDay)
+            result.append(Pill(
+                kind: .deferred,
+                text: day.map { "until \($0)" } ?? "deferred; date unavailable",
+                targetHandle: nil
+            ))
+        }
+        if isNextUp {
+            result.append(Pill(kind: .nextUp, text: "start here", targetHandle: nil))
+        }
+        return result
+    }
+}
+
+extension DeskPursuitVetoRationale {
+
+    /// "score 1.83" — nil when the pursuit payload gave no score, so the row
+    /// says nothing rather than showing a misleading 0.
+    static func scoreLabel(_ score: WorkshopScoreView?) -> String? {
+        guard let score else { return nil }
+        return "score \(String(format: "%.2f", score.total))"
+    }
+
+    /// "2/3 sessions · 1/2 today" — the two hard caps the pursuit lives under.
+    static func budgetLabel(_ budget: WorkshopBudget?) -> String? {
+        guard let budget else { return nil }
+        return "\(budget.sessionsUsed)/\(budget.maxSessions) sessions · "
+            + "\(budget.todayCount)/\(budget.perDayCap) today"
+    }
+
+    /// Her most recent recorded "chose: …" rationale, stripped of the marker.
+}

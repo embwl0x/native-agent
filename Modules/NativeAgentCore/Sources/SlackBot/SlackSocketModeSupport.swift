@@ -1,6 +1,4 @@
 import Foundation
-import PersistenceCore
-import SlackConnector
 
 struct SlackConversationRef: Sendable, Equatable {
     let id: String
@@ -51,60 +49,6 @@ actor SlackHistoryPollState {
     }
 }
 
-actor SlackEventDeduper {
-    private var seen: [String] = []
-    private var seenSet: Set<String> = []
-    private var deliveredSet: Set<String> = []
-    private let cap: Int
-
-    init(cap: Int = 500) {
-        self.cap = max(1, cap)
-    }
-
-    func markIfNew(_ id: String) -> Bool {
-        guard !id.isEmpty else { return true }
-        guard !seenSet.contains(id) else { return false }
-        seen.append(id)
-        seenSet.insert(id)
-        while seen.count > cap {
-            let removed = seen.removeFirst()
-            seenSet.remove(removed)
-            deliveredSet.remove(removed)
-        }
-        return true
-    }
-
-    /// A mark alone means "delivery in flight — or failed and about to be
-    /// unmarked." Only a confirmed delivery may let the history poller advance
-    /// its watermark past the message: a dedupe hit on an IN-FLIGHT mark can
-    /// still fail and unmark afterwards, and a watermark that already moved
-    /// past it would skip the message forever (gpt-5.5 review BLOCKING).
-    func confirmDelivered(_ id: String) {
-        guard !id.isEmpty, seenSet.contains(id) else { return }
-        deliveredSet.insert(id)
-    }
-
-    /// LOOPS-2: release a mark whose delivery failed. Without this the mark is
-    /// a permanent tombstone — the message counts as "seen" forever while
-    /// never having been delivered, so no retry path can ever reach it.
-    func unmark(_ id: String) {
-        guard !id.isEmpty, seenSet.contains(id) else { return }
-        seenSet.remove(id)
-        deliveredSet.remove(id)
-        if let index = seen.lastIndex(of: id) {
-            seen.remove(at: index)
-        }
-    }
-
-    func hasSeen(_ id: String) -> Bool {
-        seenSet.contains(id)
-    }
-
-    func isDelivered(_ id: String) -> Bool {
-        deliveredSet.contains(id)
-    }
-}
-
 /// LOOPS-5: which condition released the history poll. Persisted to state.json
 /// so an operator can tell a gap-fill from the safety backstop.
 enum SlackHistoryPollTrigger: String, Sendable, Equatable {
@@ -152,9 +96,6 @@ actor SlackInFlightHandlers {
     private var finished: Set<UUID> = []
     private var completionWaiters: [UUID: AsyncStream<Void>.Continuation] = [:]
     private var draining = false
-
-    var count: Int { tasks.count }
-    var completionWaiterCount: Int { completionWaiters.count }
 
     func register(_ task: Task<Void, Never>, id: UUID) {
         // The task may already have completed before we got here; don't
@@ -243,42 +184,6 @@ actor SlackHandlingCompletion {
         Task.detached {
             for operation in pending { await operation() }
         }
-    }
-}
-
-/// Thin transport seam: ownership, receive dispatch, ACKs, and cancellation
-/// remain in the loop. Tests can hold real receive-loop work without a socket.
-struct SlackSocketConnection: Sendable {
-    var resume: @Sendable () -> Void
-    var cancel: @Sendable () -> Void
-    var receive: @Sendable () async throws -> URLSessionWebSocketTask.Message
-    var send: @Sendable (URLSessionWebSocketTask.Message) async throws -> Void
-    var sendPing: @Sendable (@escaping @Sendable (Error?) -> Void) -> Void
-
-    static func live(_ socket: URLSessionWebSocketTask) -> Self {
-        Self(
-            resume: { socket.resume() },
-            cancel: { socket.cancel(with: .goingAway, reason: nil) },
-            receive: { try await socket.receive() },
-            send: { try await socket.send($0) },
-            sendPing: { socket.sendPing(pongReceiveHandler: $0) }
-        )
-    }
-}
-
-/// Injection seam for the two Slack write calls the loop makes. Production uses
-/// `.live`; tests substitute a recorder so no test can post to a real workspace.
-struct SlackSocketModeOutbound: Sendable {
-    var postMessage: @Sendable (_ input: [String: JSONValue]) async throws -> JSONValue
-    var uploadFile: @Sendable (_ input: [String: JSONValue]) async throws -> JSONValue
-
-    static func live(dataRoot: URL, botToken: String) -> SlackSocketModeOutbound {
-        // Inbound, reply, and reconciliation must use one credential snapshot;
-        // the two persisted token stores can legitimately differ during repair.
-        SlackSocketModeOutbound(
-            postMessage: { try await SlackConnectorActions.postMessage(input: $0, dataRoot: dataRoot, tokenOverride: botToken) },
-            uploadFile: { try await SlackConnectorActions.uploadFile(input: $0, dataRoot: dataRoot, tokenOverride: botToken) }
-        )
     }
 }
 

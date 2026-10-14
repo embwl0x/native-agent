@@ -10,6 +10,19 @@ import Research
 /// Chrome's ordered prose and action rows, with the same receipt on raw and
 /// sense-served reads. Continuations name structural elements on this URL.
 enum ChromePageText {
+    struct Projection {
+        let text: String?
+        let rows: [ChromePageMirror.Row]
+        let hasVisibleRows: Bool
+    }
+
+    static func project(_ snapshot: JSONValue) -> Projection {
+        let nodes: [JSONValue] = if case .object(let page) = snapshot, case .array(let nodes)? = page["nodes"] { nodes } else { [] }
+        let visible = renderedRows(nodes)
+        let rows = rows(nodes, visible: visible)
+        return Projection(text: render(snapshot, visible: visible, rows: rows), rows: rows, hasVisibleRows: !visible.isEmpty)
+    }
+
     /// An independent HTTP read retains its own coverage; it cannot prove
     /// which PDF Chrome displayed with its cookies and authentication.
     static func readDocument(_ snapshot: JSONValue) async throws -> JSONValue {
@@ -57,7 +70,7 @@ enum ChromePageText {
         return .object(page)
     }
 
-    static func render(_ snapshot: JSONValue) -> String? {
+    private static func render(_ snapshot: JSONValue, visible: [Line], rows mirrorRows: [ChromePageMirror.Row]) -> String? {
         guard case .object(let page) = snapshot, text(page["snapshotId"]) != nil,
               case .array(let nodes)? = page["nodes"] else { return nil }
         if case .object(let document)? = page["document"], document["kind"] == .string("pdf") {
@@ -72,10 +85,11 @@ enum ChromePageText {
         let title = safe(text(page["title"]) ?? "")
         let url = safe(text(page["url"]) ?? "")
         let fromViewport: Bool = if case .object(let reading)? = page["reading"] { reading["fromViewport"] == .bool(true) } else { false }
+        let byNode = Dictionary(mirrorRows.map { ($0.node, $0) }, uniquingKeysWith: { first, _ in first })
         var head = [(title.isEmpty ? "" : title + " — ") + url]
         var where_: [String] = []
         if case .object(let reading)? = page["reading"], case .array(let sections)? = reading["sections"] {
-            let headings = renderedRows(nodes).filter(\.heading)
+            let headings = visible.filter(\.heading)
             let topLevel = headings.map(\.level).filter { $0 > 1 }.min() ?? 1
             let visibleHeadings = Set(headings.filter { $0.level <= topLevel }.map { safe($0.original) })
             let capturedHeadings = Set(nodes.compactMap { value -> String? in
@@ -93,10 +107,7 @@ enum ChromePageText {
         }
         head.append(where_.joined(separator: " · "))
 
-        var rows: [String] = []
-        for line in lines(nodes) {
-            rows.append(line)
-        }
+        var rows = lines(visible)
         var foot: [String] = []
         if rows.isEmpty, case .object(let summary)? = page["summary"], let prose = text(summary["text"]) {
             rows.append(safe(prose))
@@ -122,7 +133,7 @@ enum ChromePageText {
                 continue
             }
             let id = text(node["nodeId"]) ?? ""
-            let row = Self.rows(.object(page)).first { $0.node == id }?.number ?? safe(text(node["name"]) ?? "control")
+            let row = byNode[id]?.number ?? safe(text(node["name"]) ?? "control")
             foot.append("Folded: remaining content of row " + row)
             foot.append("More for row " + row + ": " + address + " · app {page: \"site:\(URL(string: url)?.host ?? "")\", item: \"" + address + "\"}")
         }
@@ -144,14 +155,16 @@ enum ChromePageText {
         return next
     }
 
-    static func envelope(_ snapshot: JSONValue, rendered: String) throws -> JSONValue {
+    static func envelope(_ snapshot: JSONValue, rendered: String, projection: Projection) throws -> JSONValue {
         guard case .object(let page) = snapshot else { return .string(rendered) }
-        let elementMore: [JSONValue] = if case .array(let nodes)? = page["nodes"] { nodes.compactMap { value in
+        let nodes: [JSONValue] = if case .array(let nodes)? = page["nodes"] { nodes } else { [] }
+        let byNode = Dictionary(projection.rows.map { ($0.node, $0) }, uniquingKeysWith: { first, _ in first })
+        let elementMore: [JSONValue] = nodes.compactMap { value in
             guard case .object(let node) = value, let cursor = node["more"],
                   let args = next(page, cursor: cursor) else { return nil }
-            let row = rows(snapshot).first { $0.node == text(node["nodeId"]) }
+            let row = text(node["nodeId"]).flatMap { byNode[$0] }
             return .object(["node_id": row?.number.map(JSONValue.string) ?? row.map { .string($0.label) } ?? .null, "next": .object(args)])
-        } } else { [] }
+        }
         var fields: [String: JSONValue] = ["ok": .bool(true), "text": .string(rendered),
             "url": page["url"] ?? .null, "title": page["title"] ?? .null,
             "snapshot_id": page["snapshotId"] ?? .null, "captured_at": page["capturedAt"] ?? .null,
@@ -166,9 +179,9 @@ enum ChromePageText {
             fields["captured_at"] = document["read_at"] ?? .null
             fields["url"] = document["final_url"] ?? .null
             fields["document"] = .object(document.filter { $0.key != "text" })
-        } else if case .array(let nodes)? = page["nodes"] {
+        } else if case .array? = page["nodes"] {
             let summary: [String: JSONValue] = if case .object(let summary)? = page["summary"] { summary } else { [:] }
-            let hasContent = !lines(nodes).isEmpty || !(text(summary["text"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasContent = projection.hasVisibleRows || !(text(summary["text"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             fields["ok"] = .bool(hasContent)
             fields["status"] = .string(hasContent ? (summary["truncated"] == .bool(true) ? "partial" : "completed")
                 : (next(page) != nil ? "partial" : "failed"))
@@ -177,6 +190,12 @@ enum ChromePageText {
             fields["truncation_reasons"] = summary["truncationReasons"] ?? .array([])
         }
         if !elementMore.isEmpty { fields["element_more"] = .array(elementMore) }
+        fields["version"] = .string(try contentVersion(page))
+        if let next = next(page) { fields["next"] = .object(next) }
+        return .object(fields)
+    }
+
+    static func contentVersion(_ page: [String: JSONValue]) throws -> String {
         // The version describes captured content, not a newly minted receipt.
         let contentNodes: JSONValue
         if case .array(let nodes)? = page["nodes"] {
@@ -188,15 +207,16 @@ enum ChromePageText {
         let encoded = try JSONValue.object(["url": page["url"] ?? .null, "title": page["title"] ?? .null,
             "nodes": contentNodes, "readMore": page["readMore"] ?? .null,
             "document": page["document"] ?? .null]).serialize(pretty: false)
-        fields["version"] = .string(SHA256.hash(data: Data(encoded.utf8)).map { String(format: "%02x", $0) }.joined())
-        if let next = next(page) { fields["next"] = .object(next) }
-        return .object(fields)
+        return SHA256.hash(data: Data(encoded.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// The page's rows as the mirror keeps them, so a row can be named by its label.
     static func rows(_ snapshot: JSONValue) -> [ChromePageMirror.Row] {
         guard case .object(let page) = snapshot, case .array(let nodes)? = page["nodes"] else { return [] }
-        let visible = renderedRows(nodes)
+        return rows(nodes, visible: renderedRows(nodes))
+    }
+
+    private static func rows(_ nodes: [JSONValue], visible: [Line]) -> [ChromePageMirror.Row] {
         let numbers = Set(visible.map(\.number) + visible.flatMap { $0.references })
         return nodes.compactMap { value -> ChromePageMirror.Row? in
             guard case .object(let node) = value, let id = text(node["nodeId"]) else { return nil }
@@ -243,8 +263,8 @@ enum ChromePageText {
     /// whose text is exactly its parent's (four levels up) or the row just
     /// kept ("York" under "New York" stays). Consecutive short text rows join
     /// one line under the first number.
-    private static func lines(_ nodes: [JSONValue]) -> [String] {
-        renderedRows(nodes).map { line in
+    private static func lines(_ visible: [Line]) -> [String] {
+        visible.map { line in
             if line.role == "code" {
                 let fence = codeFence(line.label)
                 return line.number + "  code\n" + fence + "\n" + line.label
@@ -261,7 +281,13 @@ enum ChromePageText {
         var labels: [String: String] = [:], parents: [String: String] = [:], items: [Line] = []
         var pathIDs: [String: String] = [:]
         var byID: [String: [String: JSONValue]] = [:]
+        var linkChildren: [String: [[String: JSONValue]]] = [:]
         for case .object(let node) in nodes {
+            if let path = text(node["contentLinkPath"]),
+               node["inline"] != .bool(true) || text(node["role"]) == "heading",
+               !safe(text(node["text"]) ?? "").isEmpty {
+                linkChildren[path, default: []].append(node)
+            }
             guard let id = text(node["nodeId"]) else { continue }
             byID[id] = node
             if let path = text(node["elementPath"]) { pathIDs[path] = id }
@@ -272,12 +298,7 @@ enum ChromePageText {
         var contentLinks: [String: String] = [:]
         for case .object(let link) in nodes where link["childTextName"] == .bool(true) {
             guard let id = text(link["nodeId"]), let path = text(link["elementPath"]) else { continue }
-            let children = nodes.compactMap { value -> [String: JSONValue]? in
-                guard case .object(let child) = value, text(child["contentLinkPath"]) == path,
-                      child["inline"] != .bool(true) || text(child["role"]) == "heading",
-                      !safe(text(child["text"]) ?? "").isEmpty else { return nil }
-                return child
-            }
+            let children = linkChildren[path] ?? []
             let childIDs = Set(children.compactMap { text($0["nodeId"]) })
             let blocks = children.filter { child in
                 var parent = text(child["parentNodeId"])

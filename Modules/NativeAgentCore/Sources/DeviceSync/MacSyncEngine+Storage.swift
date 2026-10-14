@@ -34,10 +34,9 @@ extension MacSyncEngine {
     // restarts so an iCloud reconnect / bridge teardown→setup doesn't re-write
     // every snapshot file (digest map starts empty → every write looks "changed"
     // → full read-storm on iOS). Stored alongside processed_ids.json.
-    private var snapshotDigestsURL: URL? {
-        let dir = (stateDataRootOverride ?? PersistenceCore.defaultDataRoot())
+    nonisolated private static func snapshotDigestsURL(dataRoot: URL) -> URL {
+        let dir = dataRoot
             .appendingPathComponent("icloud", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("snapshot_digests.json")
     }
 
@@ -52,11 +51,12 @@ extension MacSyncEngine {
     // executed remote Mac action. On unreadable we keep whatever the in-memory
     // set holds, refuse to trust the empty read, raise syncError, and preserve
     // the bytes so the next save can't quietly destroy the evidence.
-    func loadProcessedIds() {
-        let restored = Self.restoreProcessedIds(
-            dataRoot: PersistenceCore.defaultDataRoot(),
-            inMemory: processedMsgIdsOrdered
-        )
+    func restoreState(generation: UInt64) async -> Bool {
+        let dataRoot = sync.dataRoot
+        let inMemory = processedMsgIdsOrdered
+        let inMemoryDigests = snapshotFileDigests
+        let retiringWriter = snapshotWriteInFlight || workActivityPublicationTask != nil
+        let cap = processedIdsCap
         // Re-apply the cap here, not just in recordProcessed: merging markers
         // into a full stored window can push the list past it, and an
         // uncapped window grows without bound across restarts. ACTIVE MARKER
@@ -66,14 +66,30 @@ extension MacSyncEngine {
         // front-eviction would drop them first — gpt-5.5 review 2026-08-06,
         // blocking #1). Markers are bounded by the 30-day prune, so the
         // exemption cannot grow without bound.
-        let ids = Self.cappedPreservingMarkers(
-            restored.ids,
-            cap: processedIdsCap,
-            dataRoot: PersistenceCore.defaultDataRoot())
-        processedMsgIdsOrdered = ids
-        processedMsgIds = Set(ids)
-        processedIdsUnreadable = restored.unreadable
-        if let message = restored.message { syncError = message }
+        let restored = await sync.storage.perform {
+            let processed = Self.restoreProcessedIds(dataRoot: dataRoot, inMemory: inMemory)
+            let digests: [String: String]
+            do {
+                let data = try Data(contentsOf: Self.snapshotDigestsURL(dataRoot: dataRoot))
+                digests = try JSONDecoder().decode([String: String].self, from: data)
+            } catch {
+                // Derived state is reseeded by the first snapshot pass.
+                digests = [:]
+            }
+            return (processed, digests)
+        }
+        guard generation == snapshotLifecycleGeneration, !Task.isCancelled else { return false }
+        // Retiring writes and command completions can settle while disk reads run.
+        let completed = processedMsgIdsOrdered.filter { !inMemory.contains($0) }
+        var ids = restored.0.ids
+        ids.append(contentsOf: completed.filter { !ids.contains($0) })
+        processedMsgIdsOrdered = Self.cappedPreservingMarkers(
+            ids, cap: cap, markerIds: restored.0.markerIds.union(completed))
+        processedMsgIds = Set(processedMsgIdsOrdered)
+        processedIdsUnreadable = restored.0.unreadable
+        if let message = restored.0.message { syncError = message }
+        if !retiringWriter, snapshotFileDigests == inMemoryDigests { snapshotFileDigests = restored.1 }
+        return true
     }
 
     /// What a restart should believe about already-processed commands, computed
@@ -91,13 +107,11 @@ extension MacSyncEngine {
     /// completed-unarchived marker id — a trimmed marker id whose pending
     /// file still exists re-dispatches an already-executed remote action on
     /// restart (gpt-5.5 review 2026-08-06, blocking #1). Markers are bounded
-    /// by the 30-day prune, so the exemption cannot grow unbounded. Static +
-    /// dataRoot-injected so the hermetic tests can prove the exemption.
+    /// by the 30-day prune; completions settling during restoration are also protected.
     nonisolated static func cappedPreservingMarkers(
-        _ ids: [String], cap: Int, dataRoot: URL
+        _ ids: [String], cap: Int, markerIds: Set<String>
     ) -> [String] {
         guard ids.count > cap else { return ids }
-        let markerIds = Set(ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot))
         var overflow = ids.count - cap
         var trimmed: [String] = []
         trimmed.reserveCapacity(cap)
@@ -111,10 +125,12 @@ extension MacSyncEngine {
         return trimmed
     }
 
+    /// Missing means genesis; unreadable bytes stay preserved. Completion
+    /// markers count as processed even when filing the response failed.
     nonisolated static func restoreProcessedIds(
         dataRoot: URL,
         inMemory: [String] = []
-    ) -> (ids: [String], unreadable: Bool, message: String?) {
+    ) -> (ids: [String], unreadable: Bool, message: String?, markerIds: Set<String>) {
         var ids = inMemory
         var messages: [String] = []
         func add(_ id: String) { if !ids.contains(id) { ids.append(id) } }
@@ -132,7 +148,7 @@ extension MacSyncEngine {
         let url = ICloudSyncStatePaths.processedIds(dataRoot: dataRoot)
         guard FileManager.default.fileExists(atPath: url.path) else {
             // Genesis: no file has ever been written. Nothing to distrust.
-            return (ids, false, messages.isEmpty ? nil : messages.joined(separator: " "))
+            return (ids, false, messages.isEmpty ? nil : messages.joined(separator: " "), Set(markers))
         }
         do {
             let data = try Data(contentsOf: url)
@@ -141,7 +157,7 @@ extension MacSyncEngine {
             // preserved; marker ids append after the stored window.
             var merged = stored
             for id in ids where !stored.contains(id) { merged.append(id) }
-            return (merged, false, messages.isEmpty ? nil : messages.joined(separator: " "))
+            return (merged, false, messages.isEmpty ? nil : messages.joined(separator: " "), Set(markers))
         } catch {
             nativeLog("[MacSyncEngine] processed_ids.json UNREADABLE (%@) — keeping %d in-memory id(s); not trusting the empty read",
                   error.localizedDescription, ids.count)
@@ -155,7 +171,7 @@ extension MacSyncEngine {
                 "Could not read the processed-command list (\(error.localizedDescription)); "
                 + "iPhone commands may be re-run. The unreadable file was kept as processed_ids.corrupt.json."
             )
-            return (ids, true, messages.joined(separator: " "))
+            return (ids, true, messages.joined(separator: " "), Set(markers))
         }
     }
 
@@ -163,8 +179,10 @@ extension MacSyncEngine {
     /// treat that as "this completion is not durable yet" and leave a marker —
     /// the swallowed `try?` this replaced is half of the replay window.
     @discardableResult
-    func saveProcessedIds() -> Bool {
-        let saved = Self.persistProcessedIds(processedMsgIdsOrdered, dataRoot: PersistenceCore.defaultDataRoot())
+    func saveProcessedIds() async -> Bool {
+        let ids = processedMsgIdsOrdered
+        let root = sync.dataRoot
+        let saved = await sync.storage.perform { Self.persistProcessedIds(ids, dataRoot: root) }
         if saved { processedIdsUnreadable = false }
         return saved
     }
@@ -190,15 +208,6 @@ extension MacSyncEngine {
     /// not. Returns false when even the marker could not be written — the only
     /// case in which a replay is still possible, and one the caller surfaces
     /// rather than swallows.
-    @discardableResult
-    func writeCompletedUnarchivedMarker(msgId: String, reason: String) -> Bool {
-        Self.writeCompletedUnarchivedMarker(
-            dataRoot: PersistenceCore.defaultDataRoot(),
-            msgId: msgId,
-            reason: reason
-        )
-    }
-
     @discardableResult
     nonisolated static func writeCompletedUnarchivedMarker(
         dataRoot: URL,
@@ -273,32 +282,20 @@ extension MacSyncEngine {
     }
 
     /// Drops the marker once the completion is durable through the normal path.
-    func clearCompletedUnarchivedMarker(msgId: String) {
-        Self.clearCompletedUnarchivedMarker(dataRoot: PersistenceCore.defaultDataRoot(), msgId: msgId)
-    }
-
     nonisolated static func clearCompletedUnarchivedMarker(dataRoot: URL, msgId: String) {
         let url = ICloudSyncStatePaths.completedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         try? FileManager.default.removeItem(at: url)
     }
 
-    func loadSnapshotDigests() {
-        guard let url = snapshotDigestsURL else { return }
-        do {
-            let data = try Data(contentsOf: url)
-            snapshotFileDigests = try JSONDecoder().decode([String: String].self, from: data)
-        } catch {
-            // Missing or corrupt — start empty; first pass re-writes snapshots
-            // and re-seeds the map. Not fatal.
-            snapshotFileDigests = [:]
-        }
-    }
-
-    func saveSnapshotDigests() {
-        guard let url = snapshotDigestsURL else { return }
-        if let data = try? JSONEncoder().encode(snapshotFileDigests) {
-            try? data.write(to: url, options: .atomic)
+    func saveSnapshotDigests() async {
+        let url = Self.snapshotDigestsURL(dataRoot: sync.dataRoot)
+        let digests = snapshotFileDigests
+        await sync.storage.perform {
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(digests).write(to: url, options: .atomic)
+            } catch { nativeLog("[MacSyncEngine] could not save snapshot digests: %@", error.localizedDescription) }
         }
     }
 
@@ -666,11 +663,11 @@ extension MacSyncEngine {
 
     // R11-N30: Delete archive/response files older than 7 days; cap directory at 50 MB.
     private var incomingRejectedDirectory: URL {
-        (stateDataRootOverride ?? PersistenceCore.defaultDataRoot()).appendingPathComponent("icloud/_rejected", isDirectory: true)
+        PersistenceCore.defaultDataRoot().appendingPathComponent("icloud/_rejected", isDirectory: true)
     }
 
     private var retainedTransactionDirectories: [URL] {
-        [transactionDir, (stateDataRootOverride ?? PersistenceCore.defaultDataRoot())
+        [transactionDir, PersistenceCore.defaultDataRoot()
             .appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
     }
 

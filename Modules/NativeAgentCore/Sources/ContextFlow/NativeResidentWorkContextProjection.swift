@@ -55,31 +55,22 @@ struct NativeResidentWorkContextProjection: ContextCompiledProjectionProvider, S
     var projectionIdentifier: String { Self.owner }
     var invalidationNamespaces: Set<String> { ["resident-work"] }
 
-    private let loadDesk: @Sendable () async throws -> DeskState
-    private let loadExecutions: @Sendable () async -> [WorkshopExecution.WorkshopExecutionRecord]
-    private let maximumItems: Int
+    private let desk: SwiftNativeDeskStore
+    private let runner: SwiftNativeWorkshopRunner
 
     init(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        maximumItems: Int = Self.maximumItems,
-        loadDesk: (@Sendable () async throws -> DeskState)? = nil,
-        loadExecutions: (@Sendable () async -> [WorkshopExecution.WorkshopExecutionRecord])? = nil
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         let root = dataRoot.standardizedFileURL
-        self.maximumItems = max(1, maximumItems)
-        self.loadDesk = loadDesk ?? {
-            try await SwiftNativeDeskStore(dataRoot: root).liveState()
-        }
-        self.loadExecutions = loadExecutions ?? {
-            await SwiftNativeWorkshopRunner(root: root).listAll()
-        }
+        self.desk = SwiftNativeDeskStore(dataRoot: root)
+        self.runner = SwiftNativeWorkshopRunner(root: root)
     }
 
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
-        async let deskLoad = loadDesk()
-        async let executionLoad = loadExecutions()
+        async let deskLoad = desk.liveState()
+        async let executionLoad = runner.listAll()
         let state = try await deskLoad
         let executions = await executionLoad
 
@@ -99,7 +90,7 @@ struct NativeResidentWorkContextProjection: ContextCompiledProjectionProvider, S
             if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
             return lhs.handle < rhs.handle
         }
-        let prepared = Array(orderedItems.prefix(maximumItems)).compactMap { item in
+        let prepared = Array(orderedItems.prefix(Self.maximumItems)).compactMap { item in
             Self.prepare(item: item, execution: latestExecutionByHandle[item.handle])
         }
         let selectedIDs = Set(prepared.map { $0.sourceID })

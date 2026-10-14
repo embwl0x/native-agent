@@ -27,17 +27,6 @@ struct SemanticAppraisal: Sendable, Equatable {
     // concern touches the event (the sparse-views norm): byte-identical compat.
     var worldviewStance = 0.0        // −1…1 — event confirms (+) or violates (−) a held view
     var worldviewConflict = 0.0      // 0…1  — max(0, −stance): a view was trampled
-    /// −1…1 — the user's reaction to the event. Structurally ALWAYS 0 on this
-    /// current-turn path and that is now by design, not an unfinished stub: at the
-    /// moment a turn completes, the reaction to it has not happened yet. U1
-    /// (2026-07-09) supersedes it with a retrospective mechanism — the completion's
-    /// node is remembered in `pendingCompletion` and the next user-authored turn
-    /// re-stamps it through the asymmetric reconsolidation blend
-    /// (`reconsolidatePendingCompletion`). The dimension is kept so the appraisal
-    /// stays a complete description of the theory, and because a future non-live
-    /// caller (dream/REM replay, where the following turn IS already known) can
-    /// fill it in honestly. Live ingest never can.
-    var userReactionEvidence = 0.0
 
     static let neutral = SemanticAppraisal()
 }
@@ -202,8 +191,8 @@ extension CognitiveSubstrate {
             in: event.summary,
             concerns: precomputedStandingViewConcerns
         ) ? 1.0 : 0.0
-        a.goalRelevance = clamp(0.45 * event.importance + 0.30 * kindBase
-            + 0.20 * continuity + 0.10 * activeViewHit)
+        a.goalRelevance = (0.45 * event.importance + 0.30 * kindBase
+            + 0.20 * continuity + 0.10 * activeViewHit).clamped01()
 
         // -- goalCongruence -----------------------------------------------------
         let relief = (event.kind == .toolSucceeded && unresolvedRecentFailure == 0 && repairEvidence > 0) ? 1.0 : 0.0
@@ -217,9 +206,9 @@ extension CognitiveSubstrate {
             concerns: precomputedStandingViewConcerns
         )
         a.worldviewConflict = max(0, -a.worldviewStance)
-        a.goalCongruence = Self.clampSigned(0.45 * outcomeSign + 0.75 * text.valence
+        a.goalCongruence = (0.45 * outcomeSign + 0.75 * text.valence
             + 0.25 * relief - 0.25 * unresolvedRecentFailure
-            + Self.appraisalWorldviewStanceCongruenceGain * a.worldviewStance)
+            + Self.appraisalWorldviewStanceCongruenceGain * a.worldviewStance).clampedSigned()
 
         // -- selfAgency ---------------------------------------------------------
         switch event.kind {
@@ -242,23 +231,23 @@ extension CognitiveSubstrate {
             let age = max(0, now.timeIntervalSince(node.lastActivatedAt))
             similarity = max(similarity, pow(0.5, age / (15 * 60)) * (sameSubject ? 1.0 : 0.6))
         }
-        a.novelty = clamp(1 - similarity)
+        a.novelty = (1 - similarity).clamped01()
 
         // -- copingPotential ----------------------------------------------------
         let capacity = 1 - 0.6 * post.uncertainty - 0.4 * post.taskPressure   // 0…1
-        a.copingPotential = Self.clampSigned((capacity * 2 - 1) * 0.7 + repairEvidence * 0.3)
+        a.copingPotential = ((capacity * 2 - 1) * 0.7 + repairEvidence * 0.3).clampedSigned()
 
         // -- relationship -------------------------------------------------------
         let isLiveChat = event.kind == .userMessageReceived || event.kind == .userCorrection
         let userRecent = lastUserPresenceAt.map { now.timeIntervalSince($0) < 30 * 60 } ?? false
         let warmthBoost = precomputedWarmthBoost ?? relationalWarmthBoost(in: event.summary)
         let lexicalRelational = text.warmth != 0 || warmthBoost > 0
-        a.relationshipStake = clamp((isLiveChat ? 0.6 : 0)
+        a.relationshipStake = ((isLiveChat ? 0.6 : 0)
             + (lexicalRelational ? 0.3 : 0)
             + (userRecent && event.kind == .assistantTurnCompleted ? 0.1 : 0)
-            + 0.2 * post.socialWarmth)
-        a.relationshipCongruence = Self.clampSigned(text.valence + 0.5 * text.warmth
-            - (event.kind == .userCorrection ? 0.15 : 0))
+            + 0.2 * post.socialWarmth).clamped01()
+        a.relationshipCongruence = (text.valence + 0.5 * text.warmth
+            - (event.kind == .userCorrection ? 0.15 : 0)).clampedSigned()
 
         return a
     }
@@ -280,7 +269,6 @@ extension CognitiveSubstrate {
             // unresolved failure weighs the completion DOWN.
             let unresolvedDrag = a.goalCongruence < 0 ? 0.08 : 0.0
             let raw = 0.10 * a.resolutionEvidence
-                + 0.05 * max(0, a.userReactionEvidence)
                 - 0.06 * a.effortEvidence * (1 - a.resolutionEvidence)
                 - unresolvedDrag
             return min(Self.appraisalCompletionBaseCeiling, max(Self.appraisalCompletionBaseFloor, raw))
@@ -420,7 +408,7 @@ extension CognitiveSubstrate {
             // user actually settled. Applied to conviction rather than to the
             // aggregate so a mixed set of signed and held views averages
             // honestly instead of scaling the whole read.
-            let stake = view.status == .held ? dynamics.heldStandingViewWeightFactor : 1.0
+            let stake = view.status == .held ? PersonalityDynamicsConfiguration.heldStandingViewWeightFactor : 1.0
             let conviction = min(
                 1.0,
                 (0.5 + 0.1 * Double(view.evidenceNodeIds.count))
@@ -430,7 +418,7 @@ extension CognitiveSubstrate {
             matched += 1
         }
         guard matched > 0 else { return 0 }
-        return Self.clampSigned(aggregate / Double(matched))
+        return (aggregate / Double(matched)).clampedSigned()
     }
 
 }

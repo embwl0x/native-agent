@@ -256,11 +256,6 @@ extension CognitiveSubstrate {
         return (roomWarmth + nudge).clamped01()
     }
 
-    /// - Parameter ignoringCadence: bypasses the duty-cycle gate so the SHAPE of
-    ///   the echo can be asserted independently of how often it speaks. Cadence
-    ///   is covered directly via `soundEchoShouldSpeak(seed:)`. Production never
-    ///   passes this — an echo that always speaks is the defect this gate fixes.
-    ///
     /// - Parameter mode: W4/P11. The felt MODE steers WHICH exemplar is chosen —
     ///   never what is said. See `soundEchoRegisterTarget`.
     ///
@@ -294,37 +289,8 @@ extension CognitiveSubstrate {
         static let silent = SoundEchoSelection(line: nil, leadingWasNegative: nil, wornSignature: nil)
     }
 
-    /// Direct diagnostic/test wrapper. Production capsule rendering uses the
-    /// pure selector below and carries its proposed brake update in the turn's
-    /// `CognitiveCapsulePresentationCommit`.
-    func soundEchoLine(
-        at now: Date,
-        ignoringCadence: Bool = false,
-        mode: FeltMode? = nil,
-        roomValence: Double? = nil,
-        live: Bool = false
-    ) -> String? {
-        let selection = soundEchoSelection(
-            at: now,
-            ignoringCadence: ignoringCadence,
-            mode: mode,
-            roomValence: roomValence,
-            negativeRun: negativeSoundEchoRun
-        )
-        if live, let leadingWasNegative = selection.leadingWasNegative {
-            negativeSoundEchoRun = leadingWasNegative ? negativeSoundEchoRun + 1 : 0
-        }
-        // Diagnostic/test wrapper: assembles the line the SHAPE tests assert,
-        // with the rut nudge always allowed. The production capsule runs the
-        // nudge through `soundRutAwarenessShouldSpeak`, whose cadence is
-        // asserted directly against that function.
-        guard let line = selection.line else { return selection.rutLine }
-        return selection.rutLine.map { line + "\n" + $0 } ?? line
-    }
-
     func soundEchoSelection(
         at now: Date,
-        ignoringCadence: Bool = false,
         mode: FeltMode? = nil,
         roomValence: Double? = nil,
         currentSessionId: String? = nil,
@@ -339,7 +305,7 @@ extension CognitiveSubstrate {
         affectEnabled: Bool? = nil
     ) -> SoundEchoSelection {
         guard cognitionEnabled ?? configuration.enabled,
-              affectEnabled ?? configuration.affectEnabled else { return .silent }
+              affectEnabled ?? configuration.enabled else { return .silent }
         let dyn = frozenDynamics ?? dynamics
         let fieldNodes = frozenFieldNodes ?? field.peekNodes()
         // Her OWN live conversation turns only — never User's words as her voice,
@@ -440,8 +406,7 @@ extension CognitiveSubstrate {
             .map(\.lastActivatedAt)
             .max()?
             .timeIntervalSince1970 ?? now.timeIntervalSince1970
-        let shouldEcho = ignoringCadence
-            || Self.soundEchoShouldSpeak(seed: latestActivity, dutyCycle: dyn.soundEchoDutyCycle)
+        let shouldEcho = Self.soundEchoShouldSpeak(seed: latestActivity, dutyCycle: dyn.soundEchoDutyCycle)
         if !shouldEcho {
             return quiet()
         }
@@ -710,14 +675,6 @@ extension CognitiveSubstrate {
         return (0...(hay.count - needle.count)).contains {
             Array(hay[$0..<($0 + needle.count)]) == needle
         }
-    }
-
-    /// Stable identity of a worn-token set. Sorted so the signature depends on
-    /// WHICH words are worn, never on hash order — a set that has not changed
-    /// must compare equal across processes and across a frozen re-render.
-    static func wornTokenSignature(_ tokens: Set<String>) -> String? {
-        guard !tokens.isEmpty else { return nil }
-        return tokens.sorted().joined(separator: "|")
     }
 
     /// THE RUT NUDGE'S CADENCE (2026-09-01). Measured on 777 live turns the

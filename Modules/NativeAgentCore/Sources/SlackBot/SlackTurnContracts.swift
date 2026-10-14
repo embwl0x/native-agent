@@ -105,12 +105,6 @@ typealias SlackChatProgressSink = @Sendable (_ kind: String, _ text: String) asy
 /// owns the bot router and the autonomy switch it admits runs under.
 public typealias SlackBotEventIntake = @Sendable (_ channelId: String, _ text: String, _ userId: String) async -> Void
 
-typealias SlackSocketModeChatHandler = @Sendable (SlackInboundMessage) async throws -> SlackSocketModeReply
-
-/// 2026-09-06: the sink rides a SECOND handler, not a second parameter on the
-/// existing one. A Swift closure type cannot give a parameter a default, so
-/// widening `SlackSocketModeChatHandler` broke every one-argument caller. This
-/// one defaults to nil and the plain handler stays exactly as it was.
 typealias SlackSocketModeProgressChatHandler = @Sendable (
     _ message: SlackInboundMessage,
     _ progress: @escaping SlackChatProgressSink

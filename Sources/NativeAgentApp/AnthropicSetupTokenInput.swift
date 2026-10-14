@@ -78,7 +78,7 @@ struct AnthropicSetupTokenInput: View {
         lastError = nil
         lastSuccess = nil
         status = .submitting
-        let error = Self.save(token)
+        let error = NativeOAuthFlow.saveAnthropicSetupToken(token)
         status = .idle
         if let error {
             lastError = error
@@ -86,38 +86,6 @@ struct AnthropicSetupTokenInput: View {
             token = ""
             lastSuccess = "Setup token saved."
             onSuccess?()
-        }
-    }
-
-    /// Save a pasted setup token; nil on success, else the reason. Shared with
-    /// the inline provider card, so both write the one shape.
-    static func save(_ raw: String) -> String? {
-        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: " ", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-            .replacingOccurrences(of: "\t", with: "")
-        guard t.hasPrefix("sk-ant-oat") else {
-            return "That isn't a setup token. Setup tokens start with sk-ant-oat."
-        }
-        // DAEMON KILLED 2026-06-02. Write the setup_token directly to
-        // <dataRoot>/providers/anthropic_oauth_direct.json with the shape
-        // AnthropicOAuthDirectAdapter expects:
-        //   {"access_token": "...", "auth_mode": "setup_token", "saved_at": "..."}
-        do {
-            let dataRoot = PersistenceCore.defaultDataRoot()
-            let providersDir = dataRoot.appendingPathComponent("providers", isDirectory: true)
-            let path = providersDir.appendingPathComponent("anthropic_oauth_direct.json")
-            try FileManager.default.createDirectory(at: providersDir, withIntermediateDirectories: true)
-            let now = ISO8601DateFormatter().string(from: Date())
-            let payload: [String: Any] = [
-                "access_token": t,
-                "auth_mode": "setup_token",
-                "saved_at": now,
-            ]
-            try NativeOAuthSupport.writeJSONObject(payload, to: path)
-            return nil
-        } catch {
-            return "Failed to save setup-token: \(error.localizedDescription)"
         }
     }
 

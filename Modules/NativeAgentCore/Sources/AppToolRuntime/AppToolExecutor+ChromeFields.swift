@@ -319,6 +319,10 @@ extension AppToolExecutor {
 
     /// Snapshot rows remain attached to their exact tab until it closes.
     public static func mirrorChromePage(_ result: JSONValue, closedBy actionId: String? = nil, input: [String: JSONValue] = [:]) {
+        mirrorChromePage(result, projection: ChromePageText.project(result), closedBy: actionId, input: input)
+    }
+
+    static func mirrorChromePage(_ result: JSONValue, projection: ChromePageText.Projection, closedBy actionId: String? = nil, input: [String: JSONValue] = [:]) {
         guard case .object(let page) = result else { return }
         if actionId == "browser.chrome_close_tab" {
             guard page["tabClosed"] == .bool(true), case .int(let tab)? = page["tabId"] else { return }
@@ -328,10 +332,10 @@ extension AppToolExecutor {
         }
         if case .int(let tab)? = page["tabId"] { ChromePageMirror.tabLive(tab) }
         guard case .int(let tab)? = page["tabId"], case .string(let id)? = page["snapshotId"],
-              let text = ChromePageText.render(result) else { return }
+              let text = projection.text else { return }
         ChromePageMirror.publish(.init(tab: tab, title: ChromePageText.safe(inputString(page["title"]) ?? ""),
                                        url: ChromePageText.safe(inputString(page["url"]) ?? ""), snapshotID: id, text: text,
-                                       rows: ChromePageText.rows(result)), session: ChatToolSessionContext.verifiedSessionId)
+                                       rows: projection.rows), session: ChatToolSessionContext.verifiedSessionId)
     }
 
     /// Same address, same scroll position and height, and the same rows (as

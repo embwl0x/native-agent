@@ -1,3 +1,4 @@
+import Cognition
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -10,6 +11,7 @@ import NativeAgentShared
 import MemoryV2
 import PersistenceCore
 import TriggerScheduler
+import EngineRuntime
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -26,7 +28,7 @@ enum SchedulerJobsLiveRefresh {
         path: URL,
         refresh: @escaping @MainActor @Sendable () async -> Void
     ) async {
-        await ViewFileRefreshTask.run(
+        await EventDeadlinePhysiology.refreshOnChanges(
             paths: [path],
             debounceDelay: .milliseconds(100),
             refresh: refresh

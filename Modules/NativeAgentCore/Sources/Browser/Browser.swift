@@ -5,17 +5,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - Protocol
-
-public protocol BrowserStatusReader: Sendable {
-    /// GET /v1/browser/status — the full status envelope, or nil when native
-    /// status is unavailable.
-    func browserStatus() async throws -> JSONValue?
-}
-
-// MARK: - SwiftNative impl
-
-public struct SwiftNativeBrowserClient: BrowserStatusReader {
+public struct SwiftNativeBrowserClient: Sendable {
     /// Absolute path to `<dataRoot>/native_power/browser/runs.json`.
     public let runsPath: URL
     /// Absolute path to `<dataRoot>/native_power/browser/receipts.jsonl`.
@@ -28,10 +18,18 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
     public let screenshotsDir: URL
     /// Absolute path to `<dataRoot>/trust/policy.json` (for approvedDomains).
     public let trustPolicyPath: URL
-    // `internal` (not `private`) so the write port in Browser+Writes.swift can
-    // reuse the SAME injected core + clock (wave 34 W17).
     let persistence: any PersistenceCoreProtocol
     let now: @Sendable () -> Date
+
+    public var nativeActionsReceiptsPath: URL {
+        runsPath.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("actions/receipts.jsonl")
+    }
+
+    public var tracesPath: URL {
+        runsPath.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("traces/events.jsonl")
+    }
 
     public init(
         runsPath: URL,
@@ -81,9 +79,12 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
         )
     }
 
-    public func browserStatus() async throws -> JSONValue? {
+    public func browserStatus() async throws -> JSONValue {
         // Only a missing run feed is empty; malformed content is unavailable.
-        let runsRaw = try await persistence.readJSON(runsPath, ifMissing: .array([]))
+        async let runsRead = persistence.readJSON(runsPath, ifMissing: .array([]))
+        async let receiptsRead = persistence.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
+        async let domainsRead = approvedBrowserDomains()
+        let runsRaw = try await runsRead
         guard case .array(let runs) = runsRaw,
               runs.allSatisfy({
                   if case .object(let row) = $0, case .string? = row["status"] { return true }
@@ -101,7 +102,7 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
         }
 
         // File order is oldest first; keep the bounded tail read.
-        let receiptRead = try await persistence.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
+        let receiptRead = try await receiptsRead
         guard receiptRead.malformedJSONRowCount == 0,
               receiptRead.rows.allSatisfy({ if case .object = $0 { return true }; return false }),
               receiptRead.physicalRowsScanned > 0 || receiptRead.bytesRead == 0 else {
@@ -119,7 +120,7 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
             })
         } ?? .null
 
-        let approved = try await approvedBrowserDomains()
+        let approved = try await domainsRead
 
         // browser_status() emits createdAt = now_iso() (response timestamp).
         return .object([
@@ -204,35 +205,4 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
     static func nowISO(_ date: Date) -> String {
         NativeTimestampFormat.sixDigitUTCOffset(date)
     }
-}
-
-// MARK: - Factory
-
-/// Returns the SwiftNative reader. The client is injectable for tests;
-/// production callers omit it and get `defaultClient()`.
-public func makeBrowserClient(
-    client: SwiftNativeBrowserClient? = nil,
-    dataRoot: URL = PersistenceCore.defaultDataRoot()
-) -> any BrowserStatusReader {
-    return client ?? SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
-}
-
-/// Wave 34 W17: the WRITE-side factory. `SwiftNativeBrowserClient` conforms
-/// to both protocols, so the read factory's instance and this one are
-/// interchangeable; kept as a distinct entry point so the NativeClient write
-/// seam reads cleanly.
-public func makeBrowserWriter(
-    client: SwiftNativeBrowserClient? = nil,
-    dataRoot: URL = PersistenceCore.defaultDataRoot()
-) -> any BrowserWriter {
-    return client ?? SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
-}
-
-/// Canonical Browser lifecycle command boundary. WebKit/AppKit callers keep
-/// their effect adapters, but never write owner state or receipts themselves.
-public func makeBrowserOperationStore(
-    client: SwiftNativeBrowserClient? = nil,
-    dataRoot: URL = PersistenceCore.defaultDataRoot()
-) -> any BrowserOperationCommanding {
-    client ?? SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
 }

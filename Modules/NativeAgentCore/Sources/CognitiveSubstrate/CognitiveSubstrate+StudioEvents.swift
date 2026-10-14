@@ -81,7 +81,6 @@ public struct StudioJournalFelt: Sendable, Equatable {
 
     public static let still = StudioJournalFelt(valence: 0, arousal: 0)
 
-    public var isStill: Bool { valence == 0 }
 }
 
 public extension CognitiveSubstrate {

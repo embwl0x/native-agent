@@ -169,6 +169,29 @@ public struct AnthropicNativeToolResult: Sendable, Equatable {
 }
 
 extension AnthropicAdapter {
+    static func streamEventType(_ object: [String: Any], eventName: String?) -> String {
+        let payloadType = object["type"] as? String ?? ""
+        return payloadType.isEmpty ? (eventName ?? "") : payloadType
+    }
+
+    static func consumeStreamEvent(
+        _ object: [String: Any], event: String, usage: inout LLMUsage, stopReason: inout String?
+    ) throws {
+        switch event {
+        case "error":
+            throw ProviderFailure.wireError(object["error"] as? [String: Any] ?? [:])
+        case "message_start":
+            let message = object["message"] as? [String: Any]
+            usage.merge(LLMUsage.fromAnthropic(message?["usage"] as? [String: Any]))
+        case "message_delta":
+            usage.merge(LLMUsage.fromAnthropic(object["usage"] as? [String: Any]))
+            if let delta = object["delta"] as? [String: Any], let stop = delta["stop_reason"] as? String {
+                stopReason = stop
+            }
+        default: break
+        }
+    }
+
     /// True when THIS adapter instance may ship native tools AND the caller
     /// opted in by passing a (possibly empty) tools array.
     ///
@@ -756,6 +779,7 @@ extension AnthropicAdapter {
         // "neither text nor tool call", not on "no text".
         var yieldedSemanticOutput = false
         var lastStopReason: String?
+        var contentBlocks: [Int: String] = [:]
         // The single in-flight tool_use block. `openToolName` is the presence
         // flag: a text or thinking block leaves it nil, so content_block_stop
         // for those blocks is a no-op.
@@ -803,26 +827,18 @@ extension AnthropicAdapter {
                 if payload.isEmpty || payload == "[DONE]" { continue }
                 guard let data = payload.data(using: .utf8),
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
+                else {
+                    if yieldedSemanticOutput { throw LLMError.streamTruncated(message: "\(providerId): malformed native tools stream frame") }
+                    continue
+                }
                 // The data JSON's own `type` is authoritative per Anthropic's
                 // streaming protocol; the `event:` name is the fallback for a
                 // producer that sends data-only frames.
-                let payloadType = obj["type"] as? String ?? ""
-                let effectiveEvent = payloadType.isEmpty ? (sse.event ?? "") : payloadType
+                let effectiveEvent = AnthropicAdapter.streamEventType(obj, eventName: sse.event)
+                try AnthropicOAuthDirectAdapter.validateContentBlockEvent(obj, event: effectiveEvent, blocks: &contentBlocks)
 
+                try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
                 switch effectiveEvent {
-                case "error":
-                    let errObj = obj["error"] as? [String: Any]
-                    throw ProviderFailure.wireError(errObj ?? [:])
-                case "message_start":
-                    let msg = obj["message"] as? [String: Any]
-                    usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))
-                case "message_delta":
-                    usage.merge(LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]))
-                    if let delta = obj["delta"] as? [String: Any],
-                       let stop = delta["stop_reason"] as? String {
-                        lastStopReason = stop
-                    }
                 case "message_stop":
                     // Truncated batches never dispatch; validate the whole
                     // batch before yielding any completed call.
@@ -869,6 +885,13 @@ extension AnthropicAdapter {
                         openThinkingText = blockObj["thinking"] as? String ?? ""
                         openThinkingSignature = blockObj["signature"] as? String ?? ""
                         openThinkingData = blockObj["data"] as? String
+                        if blockType == "redacted_thinking" || !openThinkingText.isEmpty {
+                            if ttftMs == nil {
+                                ttftMs = Int(
+                                    (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                            }
+                            continuation.yield(.keepAlive)
+                        }
                         continue
                     }
                     guard blockType == "tool_use" else { continue }
@@ -918,11 +941,13 @@ extension AnthropicAdapter {
                         openToolJSON += (delta["partial_json"] as? String) ?? ""
                         continuation.yield(.keepAlive)
                     case "thinking_delta":
-                        // Real output, never reply content: liveness for the
-                        // guard, and accumulation for the replay the next
-                        // round needs. NOT yielded as text — thinking is not
-                        // the assistant reply and is never shown to the user.
-                        openThinkingText += (delta["thinking"] as? String) ?? ""
+                        guard let thinking = delta["thinking"] as? String, !thinking.isEmpty else { continue }
+                        if ttftMs == nil {
+                            ttftMs = Int(
+                                (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                        }
+                        // Preserve replay bytes; signal output without reply text.
+                        openThinkingText += thinking
                         continuation.yield(.keepAlive)
                     case "signature_delta":
                         // The attestation over the thinking text above. Only

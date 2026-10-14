@@ -1,4 +1,0 @@
-import BackgroundWork
-
-typealias HeartbeatCardAction = BackgroundWork.HeartbeatCardAction
-typealias HeartbeatCardActionError = BackgroundWork.HeartbeatCardActionError

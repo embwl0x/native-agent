@@ -28,14 +28,9 @@ public enum NativeMessagingFramingError: Error, Equatable, LocalizedError, Senda
 /// on the relay's private Unix-socket side so the relay can remain opaque and
 /// transport-only.
 public struct NativeMessagingFramer: Sendable {
-    public static let defaultMaximumMessageBytes = 1_048_576
+    private static let maximumMessageBytes = 1_048_576
 
-    public let maximumMessageBytes: Int
-
-    public init(maximumMessageBytes: Int = Self.defaultMaximumMessageBytes) {
-        precondition(maximumMessageBytes > 0 && maximumMessageBytes <= Int(UInt32.max))
-        self.maximumMessageBytes = maximumMessageBytes
-    }
+    public init() {}
 
     public func encode(_ payload: Data) throws -> Data {
         try validateSize(payload)
@@ -51,8 +46,8 @@ public struct NativeMessagingFramer: Sendable {
         }
     }
 
-    /// Closure-based seam used by tests to prove fragmented pipe reads. An
-    /// empty chunk means EOF; a short non-empty chunk is accumulated.
+    /// Authentication readers update their deadline before each fragmented
+    /// read. An empty chunk means EOF; a short non-empty chunk is accumulated.
     public func readMessage(read: (Int) throws -> Data) throws -> Data? {
         guard let header = try readExactly(4, allowCleanEOF: true, read: read) else {
             return nil
@@ -65,10 +60,10 @@ public struct NativeMessagingFramer: Sendable {
         guard length > 0 else {
             throw NativeMessagingFramingError.emptyMessage
         }
-        guard length <= UInt32(maximumMessageBytes) else {
+        guard length <= UInt32(Self.maximumMessageBytes) else {
             throw NativeMessagingFramingError.messageTooLarge(
                 actual: Int(length),
-                maximum: maximumMessageBytes
+                maximum: Self.maximumMessageBytes
             )
         }
         return try readExactly(Int(length), allowCleanEOF: false, read: read)
@@ -94,10 +89,10 @@ public struct NativeMessagingFramer: Sendable {
         guard !payload.isEmpty else {
             throw NativeMessagingFramingError.emptyMessage
         }
-        guard payload.count <= maximumMessageBytes else {
+        guard payload.count <= Self.maximumMessageBytes else {
             throw NativeMessagingFramingError.messageTooLarge(
                 actual: payload.count,
-                maximum: maximumMessageBytes
+                maximum: Self.maximumMessageBytes
             )
         }
     }

@@ -28,8 +28,7 @@ extension SwiftNativeMacControl {
                 action: "menu",
                 output: .object(output),
                 error: code,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         // Her-screen 09-25 — the app an act just brought forward, by pid: if
@@ -165,8 +164,7 @@ extension SwiftNativeMacControl {
                 action: "menu",
                 output: .object(output),
                 error: unavailable,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         return MacControlResult(
@@ -174,8 +172,7 @@ extension SwiftNativeMacControl {
             action: "menu",
             output: .object(output),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -202,8 +199,7 @@ extension SwiftNativeMacControl {
                 action: "menu_press",
                 output: .object(output),
                 error: code,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         guard let requested = body.stringValue("path")?
@@ -377,8 +373,7 @@ extension SwiftNativeMacControl {
                 "verified": .bool(false),
             ]),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -402,8 +397,7 @@ extension SwiftNativeMacControl {
                     "note": .string("There is no pasteboard on this system, so there is nothing to read."),
                 ]),
                 error: "clipboard_unavailable",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         let maxChars = MacClipboardRead.clampedMaxChars(Self.intValue(body, "max_chars"))
@@ -446,8 +440,7 @@ extension SwiftNativeMacControl {
             action: "clipboard_read",
             output: .object(output),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -463,8 +456,7 @@ extension SwiftNativeMacControl {
                 action: "clipboard_write",
                 output: .object(["written": .bool(false), "note": .string(words)]),
                 error: reason,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
         guard let text = body.stringValue("text") else {
@@ -491,8 +483,7 @@ extension SwiftNativeMacControl {
                 "change_count": readBack.map { .int(Int64($0.changeCount)) } ?? .null,
             ]),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 }

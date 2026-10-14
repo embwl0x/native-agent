@@ -1,5 +1,5 @@
 import Foundation
-import NativeAgentCore
+import PersistenceCore
 
 /// The user's declared quiet-hours window, in LOCAL wall-clock hours.
 /// `start > end` wraps midnight (19 → 3 means 7 PM through 3 AM).
@@ -8,6 +8,10 @@ import NativeAgentCore
 /// reading. The window is a FACT the turn can state instead of a guess it has
 /// to make, so it rides the same one-line dynamic clock context.
 public struct TurnQuietHoursWindow: Sendable, Equatable {
+    public static func holdsResidentWake(session: String?, dataRoot: URL, at date: Date = Date()) -> Bool {
+        session == ResidentWake.session && read(dataRoot: dataRoot)?.contains(hour: Calendar.current.component(.hour, from: date)) == true
+    }
+
     public let startHour: Int
     public let endHour: Int
 
@@ -25,6 +29,12 @@ public struct TurnQuietHoursWindow: Sendable, Equatable {
     public func contains(hour: Int) -> Bool {
         if startHour < endHour { return hour >= startHour && hour < endHour }
         return hour >= startHour || hour < endHour
+    }
+
+    public func end(after date: Date) -> Date? {
+        var components = DateComponents()
+        components.hour = endHour; components.minute = 0; components.second = 0
+        return Calendar.current.nextDate(after: date, matching: components, matchingPolicy: .nextTime)
     }
 
     /// `data/user_prefs.json` → `quiet_hours.{start,end}`. Absent file,

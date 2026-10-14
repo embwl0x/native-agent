@@ -29,20 +29,15 @@ extension SwiftNativeTurnEngine {
     /// swallowed recall failure was a legitimate zero-hit result.
     ///
     /// Production callers invoke this immediately before the initial provider
-    /// dispatch. `marksProviderDispatch` can be disabled by inspection-only
-    /// callers so `provider.requestStarted` remains an honest boundary.
+    /// dispatch, so `provider.requestStarted` remains an honest boundary.
     nonisolated static func fireContextSnapshotEvent(
         surface: String,
         context: TurnContext,
         sessionId: String? = nil,
-        runId: String? = nil,
-        systemPromptOverride: String? = nil,
-        systemSegmentsOverride: SystemPromptSegments? = nil,
-        memoryRecallOutcome: MemoryRecallTraceOutcome? = nil,
-        marksProviderDispatch: Bool = true
+        runId: String? = nil
     ) {
-        let segments = systemSegmentsOverride ?? context.systemSegments
-        let systemPrompt = systemPromptOverride ?? context.systemPrompt ?? segments?.combined ?? ""
+        let segments = context.systemSegments
+        let systemPrompt = context.systemPrompt ?? segments?.combined ?? ""
         let stable = segments?.stable ?? ""
         // v2Prefix (live turn c83a39b8): the per-turn mass — packet, recall,
         // capsule, clock — no longer lives in `segments.dynamic`; it was lifted
@@ -109,7 +104,6 @@ extension SwiftNativeTurnEngine {
             }
         }
         let resolvedMemoryRecallOutcome: MemoryRecallTraceOutcome = {
-            if let memoryRecallOutcome { return memoryRecallOutcome }
             if !context.recalled.isEmpty {
                 return .succeeded(hitCount: context.recalled.count)
             }
@@ -314,19 +308,17 @@ extension SwiftNativeTurnEngine {
             surface: surface,
             payload: .object(payload)
         )
-        if marksProviderDispatch {
-            TurnLifecycleTelemetry.emit(
-                .providerRequestStarted,
-                surface: surface,
-                sessionId: resolvedSessionId,
-                observedBy: "context.snapshot.return",
-                counts: [
-                    "systemBytes": Int64(systemBytes),
-                    "toolSchemaParameterBytes": Int64(toolSchemaParameterBytes),
-                ],
-                flags: ["initialRequest": true]
-            )
-        }
+        TurnLifecycleTelemetry.emit(
+            .providerRequestStarted,
+            surface: surface,
+            sessionId: resolvedSessionId,
+            observedBy: "context.snapshot.return",
+            counts: [
+                "systemBytes": Int64(systemBytes),
+                "toolSchemaParameterBytes": Int64(toolSchemaParameterBytes),
+            ],
+            flags: ["initialRequest": true]
+        )
     }
 
     private nonisolated static func promptFingerprint(

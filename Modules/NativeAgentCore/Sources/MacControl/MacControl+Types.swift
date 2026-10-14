@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Senses
 import TrustCenter
 #if canImport(CryptoKit)
 import CryptoKit
@@ -28,7 +29,7 @@ public struct MacControlResult: Sendable, Equatable {
     public let durationMs: Int
     /// True for Swift-handled results. Zero-daemon MacControl always returns
     /// Swift-shaped results.
-    public let viaSwift: Bool
+    public var viaSwift: Bool { true }
     /// Status code hint for refusal/unsupported results. Successful native
     /// in-process results leave this nil.
     public let httpStatus: Int?
@@ -37,6 +38,7 @@ public struct MacControlResult: Sendable, Equatable {
     public let operationId: String?
     public let operationState: MacControlOperationState?
     public let verification: MotorVerificationState?
+    public let nativePage: NativePage?
 
     public init(
         ok: Bool,
@@ -44,26 +46,26 @@ public struct MacControlResult: Sendable, Equatable {
         output: JSONValue,
         error: String?,
         durationMs: Int,
-        viaSwift: Bool,
         httpStatus: Int? = nil,
         operationId: String? = nil,
         operationState: MacControlOperationState? = nil,
-        verification: MotorVerificationState? = nil
+        verification: MotorVerificationState? = nil,
+        nativePage: NativePage? = nil
     ) {
         self.ok = ok
         self.action = action
         self.output = output
         self.error = error
         self.durationMs = durationMs
-        self.viaSwift = viaSwift
         self.httpStatus = httpStatus
         self.operationId = operationId
         self.operationState = operationState
         self.verification = verification
+        self.nativePage = nativePage
     }
 
     public func toJSON() -> JSONValue {
-        .object([
+        let fields: [String: JSONValue] = [
             "ok": .bool(ok),
             "action": .string(action),
             "output": output,
@@ -74,7 +76,11 @@ public struct MacControlResult: Sendable, Equatable {
             "operationId": operationId.map { .string($0) } ?? .null,
             "operationState": operationState.map { .string($0.rawValue) } ?? .null,
             "verification": verification.map { .string($0.rawValue) } ?? .null,
-        ])
+        ]
+        let result = JSONValue.object(fields)
+        OwnedProgramRunner.ReadContent.current?.record(result,
+            content: .object(fields.filter { !["durationMs", "operationId"].contains($0.key) }))
+        return result
     }
 }
 
@@ -102,8 +108,6 @@ public enum MacControlError: Error, Sendable, Equatable, LocalizedError {
     case appControlFailed(String)
     case applescriptFailed(String)
     case notificationFailed(String)
-    case proxyFailed(status: Int, detail: String)
-    case transport(String)
     case malformedResponse(String)
     case ioFailure(String)
     case operation(String)
@@ -117,8 +121,6 @@ public enum MacControlError: Error, Sendable, Equatable, LocalizedError {
         case .appControlFailed(let s): return "app control failed: \(s)"
         case .applescriptFailed(let s): return "applescript failed: \(s)"
         case .notificationFailed(let s): return "notification failed: \(s)"
-        case .proxyFailed(let status, let detail): return "legacy proxy disabled: HTTP \(status) \(detail)"
-        case .transport(let s): return "transport error: \(s)"
         case .malformedResponse(let s): return "malformed response: \(s)"
         case .ioFailure(let s): return "io failure: \(s)"
         case .operation(let s): return "operation error: \(s)"
@@ -140,42 +142,11 @@ public protocol MacControlClient: MotorActionReadModelProviding, Sendable {
     /// `dispatch` so that the UNPRIVILEGED signature — the one the HTTP/iOS
     /// bridge, the app's direct callers and every raw dispatcher use — has no
     /// parameter capable of carrying an authorization.
-    ///
-    /// Defaulted below to a REFUSAL, so a conformer that does not deliberately
-    /// implement injection cannot accidentally acquire it.
     func dispatchApprovedInjection(
         action: String,
         body: [String: JSONValue],
         capability: MacInjectionCapability
     ) async throws -> MacControlResult
-}
-
-extension MacControlClient {
-    /// Fail-closed default: a MacControlClient that has not implemented the
-    /// privileged path does not inject, it refuses. Adding a new conformer
-    /// therefore cannot widen the injection surface by omission.
-    public func dispatchApprovedInjection(
-        action: String,
-        body: [String: JSONValue],
-        capability: MacInjectionCapability
-    ) async throws -> MacControlResult {
-        _ = capability
-        _ = body
-        return MacControlResult(
-            ok: false,
-            action: action,
-            output: .object([
-                "ok": .bool(false),
-                "status": .string("blocked"),
-                "error": .string("injection_unsupported_client"),
-            ]),
-            error: "injection_unsupported_client: this MacControl client does not implement "
-                + "approved injection",
-            durationMs: 0,
-            viaSwift: true,
-            httpStatus: 403
-        )
-    }
 }
 
 // MARK: - Sub-action classification
@@ -662,6 +633,13 @@ public enum MacWakeGuard {
 /// windows in both cases. The bounded wake names the remaining obstruction;
 /// the session flag alone never proves a password lock.
 public enum MacScreenLock {
+    public static func personAway() -> Bool {
+        if MacScreenLock.isLocked() { return true }
+        guard let any = CGEventType(rawValue: ~0) else { return false }
+        let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: any)
+        return idle.isFinite && idle >= 180
+    }
+
     public static let reply = "The screen is still covered, so I can't see or use the apps underneath."
     public static let passiveReply = "raw view · passive observation · screen covered; observation waits"
 

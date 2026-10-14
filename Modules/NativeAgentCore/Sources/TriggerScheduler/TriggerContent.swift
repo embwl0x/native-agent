@@ -1,6 +1,4 @@
-import ActivityWatch
 import Foundation
-import os
 import NativeAgentCore
 import PersistenceCore
 import Desk
@@ -8,9 +6,7 @@ import WorkshopExecution
 
 // MARK: - TriggerContentBuilder
 //
-// Real, native, template-built content for the two proactive triggers whose
-// signals actually exist on disk today: `morning_brief` (kind `time`) and
-// `idle_checkin` (kind `idle`).
+// Real, native, template-built content for `morning_brief` (kind `time`).
 //
 // NO LLM. Every section is an independent, FAIL-OPEN read of a state source
 // that already exists under the data root (or, for the worklog, under
@@ -45,8 +41,6 @@ public struct TriggerContentBuilder: Sendable {
     let persistence: any PersistenceCoreProtocol
     let now: @Sendable () -> Date
     let worklogPath: URL
-
-    private static let logger = Logger(subsystem: "com.nativeagent.core", category: "trigger-content")
 
     /// Bounded tail read for the worklog: never map an unbounded feed into memory.
     static let worklogTailBytes: Int = 128 * 1024
@@ -137,50 +131,6 @@ public struct TriggerContentBuilder: Sendable {
 
         return TriggerContent(
             title: "Morning brief — \(label)",
-            summary: summary,
-            detail: sections.isEmpty ? .null : .string(sections.joined(separator: "\n\n"))
-        )
-    }
-
-    // MARK: - idle_checkin
-
-    /// The quiet duration comes from the cheapest honest activity signals that
-    /// are already persisted — `max(updatedAt)` over `<root>/chat/sessions.json`
-    /// and, since 2026-09-06, the human-presence stamp, whichever is later (see
-    /// `lastActivityInstant`). When no such signal resolves we SAY SO rather
-    /// than inventing a duration.
-    public func idleCheckin() async -> TriggerContent {
-        let current = now()
-        let desk = await deskSection()
-        let session = lastSessionSection()
-
-        guard let last = Self.lastActivityInstant(root: root, reference: current),
-              last <= current else {
-            return TriggerContent(
-                title: "Idle check-in",
-                summary: "You've been quiet — I can't tell how long (no recorded session activity).",
-                detail: .null
-            )
-        }
-
-        let quiet = Self.durationLabel(current.timeIntervalSince(last))
-        var summary = "Quiet for \(quiet)."
-        if desk.openCount > 0 {
-            summary += " \(desk.openCount) open desk item\(desk.openCount == 1 ? "" : "s") waiting."
-        } else if let session {
-            summary += " Last thread: \(session.title)."
-        }
-
-        var sections: [String] = []
-        if let body = desk.body, !body.isEmpty {
-            sections.append("## Desk\n\n\(body)")
-        }
-        if let session {
-            sections.append("## Last session\n\n- \(session.title) (\(Self.relativeAge(session.updatedAt, from: current)))")
-        }
-
-        return TriggerContent(
-            title: "Idle check-in",
             summary: summary,
             detail: sections.isEmpty ? .null : .string(sections.joined(separator: "\n\n"))
         )
@@ -313,37 +263,6 @@ public struct TriggerContentBuilder: Sendable {
         return SessionSection(title: trimmed, updatedAt: at)
     }
 
-    // MARK: - Activity signal (shared with the scheduler's `idle` condition)
-
-    /// THE last-user-activity timestamp the scheduler's `idle` kind waits on.
-    /// Synchronous and pure so `scheduledInstantIfDue` can call it from its
-    /// `nonisolated`, inside-the-flock recompute. nil ⇒ no signal ⇒ idle stays
-    /// dark.
-    ///
-    /// TWO signals, and it is the LATER of them (2026-09-06):
-    ///
-    ///   1. `max(updatedAt)` over `<root>/chat/sessions.json` — how long the
-    ///      CHAT has been quiet. Required: no chat signal still means dark, so
-    ///      this change can never light a trigger that used to stay dormant.
-    ///   2. `<root>/activity_watch/last_input.json` — how long the PERSON has
-    ///      been away from the Mac, published by the ActivityWatch tick (see
-    ///      `HumanPresenceStamp`). Absent, unparseable or STALE ⇒ ignored, and
-    ///      the answer is signal 1 alone, exactly as it was before.
-    ///
-    /// Taking the max is what makes "idle" mean idle: a person reading a paper
-    /// at their desk for an hour has a quiet chat, and the check-in that used
-    /// to arrive at their elbow now waits until they actually walk away.
-    public nonisolated static func lastActivityInstant(
-        root: URL,
-        reference: Date = Date()
-    ) -> Date? {
-        guard let chat = newestSession(root: root)?.updatedAt else { return nil }
-        guard let presence = HumanPresenceStamp.lastHumanInputInstant(
-            dataRoot: root, reference: reference
-        ) else { return chat }
-        return max(chat, presence)
-    }
-
     /// Newest `(title, updatedAt)` across every non-archived session row.
     /// Archived rows are excluded — an archived thread is not live activity.
     nonisolated static func newestSession(root: URL) -> (title: String, updatedAt: Date)? {
@@ -393,14 +312,10 @@ public struct TriggerContentBuilder: Sendable {
         return text
     }
 
-    /// CONTENT SELECTION, not display: this cutoff decides WHICH worklog rows
-    /// the morning brief carries. It stays on this Mac's own zone, the zone it
-    /// has always used — moving it to `DisplayTimeZone` would make changing a
-    /// formatting preference silently add or drop items from the brief.
-    /// `DisplayTimeZone` formats (see `todayLabel`); it never selects.
+    /// Select yesterday's work in the same zone as the brief's date label.
     static func startOfYesterday(_ reference: Date) -> Date? {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone.current
+        cal.timeZone = DisplayTimeZone.current
         let today = cal.startOfDay(for: reference)
         return cal.date(byAdding: .day, value: -1, to: today)
     }

@@ -10,6 +10,7 @@ import CryptoKit
 import AppIntents
 import Foundation
 import SwiftUI
+import Observation
 import NativeAgentShared
 
 // MARK: - Inbox action envelope (iOS → Mac)
@@ -93,38 +94,39 @@ enum AgentNameCache {
 }
 
 @MainActor
-final class iCloudSyncEngine: ObservableObject {
+@Observable
+final class iCloudSyncEngine {
     static let shared = iCloudSyncEngine()
 
     // MARK: - Published snapshots
 
-    @Published var workshopTasks: [WorkshopTaskRecord] = []
-    @Published var deskItems: [MobileDeskItem] = []
-    @Published var workOverview: WorkOverview?
-    @Published var schedulerSnapshot: MobileSchedulerSnapshot?
+    var workshopTasks: [WorkshopTaskRecord] = []
+    var deskItems: [MobileDeskItem] = []
+    var workOverview: WorkOverview?
+    var schedulerSnapshot: MobileSchedulerSnapshot?
     var schedulerJobReceiptTimes: [String: Double] = [:]
-    @Published var schedulerError: String?
+    var schedulerError: String?
     /// What the Mac's Desk bounds dropped, as the Mac reported it. nil means no
     /// report was delivered (an older Mac), never "nothing was dropped".
-    @Published var deskBounds: MobileDeskProjectionReport?
+    var deskBounds: MobileDeskProjectionReport?
     /// Complete reading copies of the priority Desk items, carried
     /// automatically beside the compact board so the text that matters can be
     /// read away from the Mac. Keyed by Desk handle.
-    @Published var deskReadingCopies: [String: MobileDeskItemReadingCopy] = [:]
-    @Published var skills: [SkillRecord] = []
-    @Published var memories: [MemoryRecord] = []
-    @Published var memoryProposals: [MemoryProposalRecord] = []
-    @Published var trainingProposals: [TrainingProposalSummary] = []
-    @Published var promotionCandidates: [PromotionCandidateSummary] = []
+    var deskReadingCopies: [String: MobileDeskItemReadingCopy] = [:]
+    var skills: [SkillRecord] = []
+    var memories: [MemoryRecord] = []
+    var memoryProposals: [MemoryProposalRecord] = []
+    var trainingProposals: [TrainingProposalSummary] = []
+    var promotionCandidates: [PromotionCandidateSummary] = []
     /// Set only after both self-improvement projections arrive together. Empty
     /// arrays before this point mean “not published yet”, not a measured clear
     /// queue on the iPhone.
-    @Published var selfImprovementSnapshotPublishedAt: Date?
-    @Published var trustPolicy: TrustPolicy?
+    var selfImprovementSnapshotPublishedAt: Date?
+    var trustPolicy: TrustPolicy?
     // R25 (2026-07-02): personality.json now carries the real native
     // NativeClient.getPersonality() profile (shared PersonalityProfile type,
     // typed encode) — the daemon-era raw-bytes note and the `{}` stub are gone.
-    @Published private(set) var personality: PersonalityProfile?
+    private(set) var personality: PersonalityProfile?
     private var personalityPairing: String?
     private var snapshotPairing: String?
 
@@ -182,6 +184,10 @@ final class iCloudSyncEngine: ObservableObject {
         pinnedChatSessions = []
         chatAnchor = nil
         chatTranscripts = [:]
+        pageSnapshotVersions = [:]
+        pageVersionTask?.cancel()
+        pageVersionTask = nil
+        pageVersionQueued = false
         health = nil
         organismLivingStatus = nil
         runs = []
@@ -203,22 +209,23 @@ final class iCloudSyncEngine: ObservableObject {
         memoryProposalsSnapshotLoaded = false
         NativeAgentMobileShortcuts.updateAppShortcutParameters()
     }
-    @Published var sessions: [ChatSession] = []
-    @Published var helpersSnapshot: MobileHelpersSnapshot?
+    var sessions: [ChatSession] = []
+    var helpersSnapshot: MobileHelpersSnapshot?
     /// The Mac's layout (ui/layout.json, in the core snapshot); More draws its sections from it.
-    @Published var surfaceLayout: SurfaceLayout?
-    @Published var pinnedChatSessions: [ChatSession] = []
+    var surfaceLayout: SurfaceLayout?
+    var pinnedChatSessions: [ChatSession] = []
     /// The Mac window's current chat, published beside `sessions.json`.
     /// Main follows it; explicitly opened history keeps its own destination.
-    @Published var chatAnchor: ConversationAnchorPin?
+    var chatAnchor: ConversationAnchorPin?
     /// 2026-09-06: one published transcript for a session — the rows the Mac
     /// published and the version it published them at, in ONE value. Two
     /// properties would not do: only the rows map is observed, so a republished
     /// empty transcript that differs solely by version would never be
     /// delivered, and an empty transcript is exactly the one that needs its
     /// version looked at.
-    struct PublishedTranscript: Equatable {
+    struct PublishedTranscript: Equatable, Sendable {
         var records: [ChatMessageRecord]
+        var messages: [ChatMessage]
         /// The Mac session's transcript version — a counter bumped on every
         /// clear and every transcript write. nil on pre-2026-09-06 Mac builds;
         /// an empty transcript with no version never clears anything.
@@ -226,23 +233,27 @@ final class iCloudSyncEngine: ObservableObject {
         /// The Mac holds rows older than the published window.
         var hasOlder = false
     }
-    @Published var chatTranscripts: [String: PublishedTranscript] = [:]
-    @Published var health: RuntimeHealth?
-    @Published var organismLivingStatus: OrganismLivingStatusFile?
+    var chatTranscripts: [String: PublishedTranscript] = [:]
+    var health: RuntimeHealth?
+    var organismLivingStatus: OrganismLivingStatusFile?
     // R25: worker/codex runs from runs.json (newest 50, written by the Mac's
     // heavy snapshot pass) — AdvancedView's runs list finally has a source.
-    @Published var runs: [RunRecord] = []
-    @Published var connectors: [ConnectorRecord] = []
+    var runs: [RunRecord] = []
+    var connectors: [ConnectorRecord] = []
     // PATCH-2026-05-07: leftover-1 providers snapshot — loaded from providers.json written by MacSyncEngine
-    @Published var providers: [ProviderInfo] = []
-    @Published var providerSignIns: [String: [String: String]] = [:]
-    @Published var surfaceModels: [String: SurfaceModelPref] = [:]
+    var providers: [ProviderInfo] = []
+    var providerSignIns: [String: [String: String]] = [:]
+    var surfaceModels: [String: SurfaceModelPref] = [:]
     var pendingPhoneSurfaceModels: [UUID: (surface: String, preference: SurfaceModelPref)] = [:]
-    @Published var approvals: [ApprovalRequest] = []
-    @Published var inboxItems: [InboxItemRecord] = []
+    var approvals: [ApprovalRequest] = []
+    var inboxItems: [InboxItemRecord] = []
     // Turn Inspector W4: read-only per-turn summaries from the Mac snapshot lane.
-    @Published var turnSummaries: TurnSummaryFile?
-    @Published var lastSyncAt: Date?
+    var turnSummaries: TurnSummaryFile?
+    var lastSyncAt: Date?
+    var foregroundSnapshotGroup: NAMobileSnapshotGroup = .chat
+    var pageSnapshotVersions: [String: Data] = [:]
+    @ObservationIgnored var pageVersionTask: Task<Void, Never>?
+    @ObservationIgnored var pageVersionQueued = false
     /// When each snapshot GROUP last actually arrived — keyed by
     /// `NAMobileSnapshotGroup.rawValue`. `lastSyncAt` is renewed by every local
     /// cache read (a Desk read renews it without reading Memory), so it is the
@@ -251,7 +262,7 @@ final class iCloudSyncEngine: ObservableObject {
     /// fresh. Every "Fresh" surface reads ITS OWN group through
     /// `transportDeliveryAt(screenGroup:)`. Persisted: a delivery that landed
     /// before this launch still landed.
-    @Published var groupTransportDeliveryAt: [String: Date] = [:]
+    var groupTransportDeliveryAt: [String: Date] = [:]
 
     private static let groupDeliveryDefaultsKey = "na.sync.groupTransportDeliveryAt.v1"
     private static let groupDeliveryPairingDefaultsKey = "na.sync.groupTransportDeliveryAt.pairing"
@@ -313,8 +324,8 @@ final class iCloudSyncEngine: ObservableObject {
     /// reason (sweep 2026-09-01 item 2). A screen whose group is named here is
     /// rendering rows the Mac already knows are old, however fresh the sync
     /// timestamp looks.
-    @Published var staleSnapshotGroups: [String: String] = [:]
-    @Published var syncError: String?
+    var staleSnapshotGroups: [String: String] = [:]
+    var syncError: String?
     /// Set by `sendActionWithSignatureRetry` on every nil return: the send
     /// error when the action never left the phone, nil when it was sent but
     /// unanswered. Read synchronously by `requireSuccessfulActionResponse`.

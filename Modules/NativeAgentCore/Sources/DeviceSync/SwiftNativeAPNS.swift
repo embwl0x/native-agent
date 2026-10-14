@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import TrustCenter
 
 struct WorkActivityPushRegistration: Codable, Equatable, Sendable {
     enum StartOutcome: String, Codable, Sendable {
@@ -158,6 +159,7 @@ public struct SwiftNativeAPNSReceipt: Sendable {
     public let response: String
     public let tokenSuffix: String
     public let deviceId: String
+    public let pairedDeviceID: String?
     public let tokenSource: String
     public let tokenUpdatedAt: String?
     public let tokenAgeSeconds: Int?
@@ -178,6 +180,7 @@ public struct SwiftNativeAPNSReceipt: Sendable {
             "response": .string(response),
             "tokenSuffix": .string(tokenSuffix),
             "deviceId": .string(deviceId),
+            "pairedDeviceID": pairedDeviceID.map(JSONValue.string) ?? .null,
             "tokenSource": .string(tokenSource),
             "environment": .string(environment),
             "topic": .string(topic),
@@ -244,35 +247,14 @@ public actor SwiftNativeAPNSSender {
     /// next successful mint.
     private var providerTokenHoldUntil: Date?
 
-    /// Injected clock — real path uses `Date()`; tests drive expiry directly.
-    private let now: () -> Date
-
-    /// Injected signer — real path signs the ES256 JWT off disk; tests count
-    /// mints without a live key. Throwing here fails the send loud (unchanged).
-    private let sign: (_ keyId: String, _ teamId: String, _ keyPath: String, _ iat: Date) throws -> String
-
-    public init() {
-        self.now = { Date() }
-        self.sign = { keyId, teamId, keyPath, iat in
-            try Self.makeJWT(keyId: keyId, teamId: teamId, keyPath: keyPath, now: iat)
-        }
-    }
-
-    /// Test seam: inject a controllable clock and a mint-counting signer.
-    init(
-        now: @escaping () -> Date,
-        sign: @escaping (_ keyId: String, _ teamId: String, _ keyPath: String, _ iat: Date) throws -> String
-    ) {
-        self.now = now
-        self.sign = sign
-    }
+    public init() {}
 
     /// Returns a signed provider token for the given credentials, minting only
     /// on first use, expiry, or a credential (keyId/teamId) change. A signing
     /// error propagates and leaves any prior cache untouched — no stale token is
     /// silently returned, and the failure surfaces to the caller.
     func providerToken(keyId: String, teamId: String, keyPath: String) throws -> String {
-        let current = now()
+        let current = Date()
         let storeURL = URL(fileURLWithPath: keyPath).deletingLastPathComponent()
             .appendingPathComponent("apns_provider_token.json")
         if cachedProviderToken == nil, !providerTokenRejected,
@@ -295,7 +277,7 @@ public actor SwiftNativeAPNSSender {
                 return cached.jwt
             }
         }
-        let jwt = try sign(keyId, teamId, keyPath, current)
+        let jwt = try Self.makeJWT(keyId: keyId, teamId: teamId, keyPath: keyPath, now: current)
         cachedProviderToken = CachedProviderToken(
             keyId: keyId,
             teamId: teamId,
@@ -341,7 +323,7 @@ public actor SwiftNativeAPNSSender {
             return
         }
         guard reason == "TooManyProviderTokenUpdates" else { return }
-        providerTokenHoldUntil = now().addingTimeInterval(Self.providerTokenUpdateBackoff)
+        providerTokenHoldUntil = Date().addingTimeInterval(Self.providerTokenUpdateBackoff)
     }
 
     /// Parses the `reason` field from an APNs error response body,
@@ -529,15 +511,18 @@ public actor SwiftNativeAPNSSender {
         urgency: String? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> (receipts: [SwiftNativeAPNSReceipt], errors: [String]) {
+        let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
+        var targets: [APNSTarget] = []
         do {
             let config = try APNSConfig.load(from: dataRoot)
             let tokens = try await loadTokens(dataRoot: dataRoot, config: config)
-            let targets = tokens.compactMap { config.target(for: $0) }
+            targets = tokens.compactMap { config.target(for: $0) }
             guard !targets.isEmpty else {
-                return ([], ["No APNS device tokens are registered with enough topic/environment metadata."])
+                let errors = ["No APNS device tokens are registered with enough topic/environment metadata."]
+                await recordOutcome(eventID: eventID, targets: targets, receipts: [], errors: errors, dataRoot: dataRoot)
+                return ([], errors)
             }
             let jwt = try providerToken(keyId: config.keyId, teamId: config.teamId, keyPath: config.keyPath)
-            let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
             var eventUserInfo = userInfo
             eventUserInfo["eventId"] = eventID
             let deadline = ContinuousClock.now.advanced(by: .seconds(5))
@@ -577,6 +562,7 @@ public actor SwiftNativeAPNSSender {
             await recordOutcome(eventID: eventID, targets: targets, receipts: receipts, errors: errors, dataRoot: dataRoot)
             return (receipts, errors)
         } catch {
+            await recordOutcome(eventID: eventID, targets: targets, receipts: [], errors: [error.localizedDescription], dataRoot: dataRoot)
             return ([], [error.localizedDescription])
         }
     }
@@ -638,6 +624,48 @@ public actor SwiftNativeAPNSSender {
         return try await loadTokens(dataRoot: dataRoot, config: config).compactMap { config.target(for: $0) }.count
     }
 
+    /// Pairing, current delivery targets and the newest outcome are one presentation read.
+    public func notificationReadiness(dataRoot: URL) async throws -> (supported: Bool, status: String, detail: String, paired: Int) {
+        let paired = try PairedPhoneAuthority.pairedCountChecked(at: dataRoot.appendingPathComponent("paired_phones.json"))
+        guard paired > 0 else { return (false, "not_paired", "No phone is paired.", paired) }
+        let config = try APNSConfig.load(from: dataRoot)
+        let targets = try await loadTokens(dataRoot: dataRoot, config: config)
+            .compactMap { config.target(for: $0) }
+        guard !targets.isEmpty else { return (false, "needs_token", "A phone is paired, but no push token can receive notifications.", paired) }
+        let path = dataRoot.appendingPathComponent("mobile_push/apns_outcomes.jsonl")
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return (false, "not_checked", "A phone is paired and push is configured; no delivery has been checked.", paired)
+        }
+        var unchecked = targets
+        for line in try String(contentsOf: path, encoding: .utf8).split(whereSeparator: \.isNewline).reversed() {
+            guard case .object(let outcome) = try JSONValue.parse(Data(line.utf8)),
+                  case .array(let receipts)? = outcome["receipts"] else {
+                throw PersistenceCoreError.ioFailure("The latest phone notification outcome is unreadable.")
+            }
+            for receipt in receipts {
+                guard case .object(let row) = receipt,
+                      let device = Self.string(row["deviceId"]), let suffix = Self.string(row["tokenSuffix"]),
+                      let index = unchecked.firstIndex(where: {
+                          $0.token.deviceId == device && String($0.token.token.suffix(8)) == suffix
+                              && row["tokenSource"] == .string($0.token.source)
+                              && row["environment"] == .string($0.environment) && row["topic"] == .string($0.topic)
+                      }) else { continue }
+                // Only the newest receipt for each current sender target counts.
+                unchecked.remove(at: index)
+                if row["status"] == .string("ok"), case .int(let status)? = row["httpStatus"], (200..<300).contains(status) {
+                    return (true, "ready", "The latest push was accepted for a current phone token.", paired)
+                }
+            }
+            if unchecked.isEmpty { break }
+            if case .array(let errors)? = outcome["errors"], !errors.isEmpty {
+                return (false, "not_confirmed", "The latest push was not confirmed for a current phone token.", paired)
+            }
+        }
+        return unchecked.count == targets.count
+            ? (false, "not_checked", "A phone is paired and push is configured; no delivery has been checked.", paired)
+            : (false, "not_confirmed", "The latest push was not confirmed for a current phone token.", paired)
+    }
+
     private func sendOne(
         target: APNSTarget,
         jwt: String,
@@ -653,21 +681,7 @@ public actor SwiftNativeAPNSSender {
         let now = Date()
         let createdAt = ISO8601DateFormatter().string(from: now)
         let tokenAgeSeconds = Self.tokenAgeSeconds(token.updatedAt, now: now)
-        var receipt = SwiftNativeAPNSReceipt(
-            apnsId: apnsId,
-            createdAt: createdAt,
-            status: "failed",
-            httpStatus: nil,
-            response: "",
-            tokenSuffix: String(token.token.suffix(8)),
-            deviceId: token.deviceId,
-            tokenSource: token.source,
-            tokenUpdatedAt: token.updatedAt,
-            tokenAgeSeconds: tokenAgeSeconds,
-            environment: target.environment,
-            topic: target.topic,
-            error: nil
-        )
+        let receipt: SwiftNativeAPNSReceipt
 
         do {
             try Task.checkCancellation()
@@ -708,6 +722,7 @@ public actor SwiftNativeAPNSSender {
                 response: responseText,
                 tokenSuffix: String(token.token.suffix(8)),
                 deviceId: token.deviceId,
+                pairedDeviceID: token.pairedDeviceID,
                 tokenSource: token.source,
                 tokenUpdatedAt: token.updatedAt,
                 tokenAgeSeconds: tokenAgeSeconds,
@@ -727,6 +742,7 @@ public actor SwiftNativeAPNSSender {
                 response: "",
                 tokenSuffix: String(token.token.suffix(8)),
                 deviceId: token.deviceId,
+                pairedDeviceID: token.pairedDeviceID,
                 tokenSource: token.source,
                 tokenUpdatedAt: token.updatedAt,
                 tokenAgeSeconds: tokenAgeSeconds,
@@ -744,9 +760,9 @@ public actor SwiftNativeAPNSSender {
     private func loadTokens(dataRoot: URL, config: APNSConfig) async throws -> [APNSToken] {
         let swiftTokens = filteredTokens(try await loadSwiftTokens(dataRoot: dataRoot), config: config)
         if !swiftTokens.isEmpty {
-            return dedupedTokens(swiftTokens)
+            return swiftTokens
         }
-        return dedupedTokens(filteredTokens(try await loadLegacyTokens(dataRoot: dataRoot), config: config))
+        return filteredTokens(try await loadLegacyTokens(dataRoot: dataRoot), config: config)
     }
 
     private func filteredTokens(_ tokens: [APNSToken], config: APNSConfig) -> [APNSToken] {
@@ -770,14 +786,6 @@ public actor SwiftNativeAPNSSender {
         return Array(byToken.values).sorted { $0.deviceId < $1.deviceId }
     }
 
-    private func dedupedTokens(_ tokens: [APNSToken]) -> [APNSToken] {
-        var byToken: [String: APNSToken] = [:]
-        for token in tokens {
-            byToken[token.token] = token
-        }
-        return Array(byToken.values).sorted { $0.deviceId < $1.deviceId }
-    }
-
     private func loadLegacyTokens(dataRoot: URL) async throws -> [APNSToken] {
         let path = dataRoot
             .appendingPathComponent("mobile_push", isDirectory: true)
@@ -790,6 +798,7 @@ public actor SwiftNativeAPNSSender {
                   !token.isEmpty else { return nil }
             return APNSToken(
                 deviceId: Self.string(obj["deviceId"]) ?? Self.string(obj["device_id"]) ?? "ios",
+                pairedDeviceID: Self.string(obj["pairedDeviceID"]),
                 token: token,
                 environment: Self.string(obj["environment"]) ?? Self.string(obj["sandbox"]),
                 bundleId: Self.string(obj["bundleId"]) ?? Self.string(obj["bundle_id"]),
@@ -811,6 +820,7 @@ public actor SwiftNativeAPNSSender {
                   !token.isEmpty else { return nil }
             return APNSToken(
                 deviceId: Self.string(obj["deviceId"]) ?? Self.string(obj["device_id"]) ?? key,
+                pairedDeviceID: Self.string(obj["pairedDeviceID"]),
                 token: token,
                 environment: Self.string(obj["environment"]) ?? Self.string(obj["sandbox"]),
                 bundleId: Self.string(obj["bundleId"]) ?? Self.string(obj["bundle_id"]),
@@ -1014,6 +1024,7 @@ public actor SwiftNativeAPNSSender {
 
     private struct APNSToken: Sendable {
         let deviceId: String
+        let pairedDeviceID: String?
         let token: String
         let environment: String?
         let bundleId: String?

@@ -1,4 +1,5 @@
 import SwiftUI
+import NativeAgentShared
 import Foundation
 import ProviderRouting
 import PersistenceCore
@@ -95,7 +96,7 @@ enum ProviderCredentialVerification: Equatable {
 
     /// Test Connection is the only transition that can claim the key works —
     /// and only a probe that actually RAN can claim it failed.
-    static func afterTest(_ result: ProviderTestResult, credentialReady: Bool) -> ProviderCredentialVerification {
+    static func afterTest(_ result: NativeAgentShared.ProviderTestResult, credentialReady: Bool) -> ProviderCredentialVerification {
         if result.tested {
             return result.status == "ok" ? .verified : .verificationFailed
         }
@@ -178,53 +179,6 @@ enum ProviderConfigModelPickerPresentation: Equatable {
     }
 }
 
-/// The provider catalog is the auth-mode authority for the configuration
-/// sheet. Normalize its wire values once so a stale persisted mode cannot
-/// become an untagged Picker selection or be written back as an unsupported
-/// route.
-struct ProviderAuthModePickerState: Equatable {
-    let supportedModes: [String]
-    let selectedMode: String
-    let repairedSavedMode: String?
-
-    var canSave: Bool { supportedModes.contains(selectedMode) }
-}
-
-enum ProviderAuthModePickerPresentation {
-    private static let knownModes: Set<String> = ["api_key", "oauth"]
-
-    static func resolve(
-        advertisedModes: [String],
-        savedMode: String?,
-        providerIsReady: Bool
-    ) -> ProviderAuthModePickerState {
-        var seen = Set<String>()
-        let supportedModes = advertisedModes.compactMap { raw -> String? in
-            let mode = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard knownModes.contains(mode), seen.insert(mode).inserted else { return nil }
-            return mode
-        }
-        let normalizedSavedMode = savedMode?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if let normalizedSavedMode, supportedModes.contains(normalizedSavedMode) {
-            return ProviderAuthModePickerState(
-                supportedModes: supportedModes,
-                selectedMode: normalizedSavedMode,
-                repairedSavedMode: nil
-            )
-        }
-        let fallback = providerIsReady && supportedModes.contains("oauth")
-            ? "oauth"
-            : (supportedModes.first ?? "")
-        return ProviderAuthModePickerState(
-            supportedModes: supportedModes,
-            selectedMode: fallback,
-            repairedSavedMode: normalizedSavedMode?.isEmpty == false ? normalizedSavedMode : nil
-        )
-    }
-}
-
 struct ProviderConfigSheet: View {
     let provider: ProviderInfo
     let onDone: () -> Void
@@ -233,8 +187,8 @@ struct ProviderConfigSheet: View {
     @State private var apiKey = ""
     @State private var authMode: String
     @State private var selectedModel = ""
-    @State private var availableModels: [ProviderModelInfo]
-    @State private var testResult: ProviderTestResult? = nil
+    @State private var availableModels: [NativeAgentShared.ProviderModelInfo]
+    @State private var testResult: NativeAgentShared.ProviderTestResult? = nil
     @State private var isTesting = false
     @State private var isSaving = false
     @State private var credentialRevision = 0
@@ -246,8 +200,8 @@ struct ProviderConfigSheet: View {
     /// readiness the provider row reports.
     @State private var verification: ProviderCredentialVerification = .idle
 
-    private var authModePickerState: ProviderAuthModePickerState {
-        ProviderAuthModePickerPresentation.resolve(
+    private var authModePickerState: ProvidersFacade.AuthModePickerState {
+        ProvidersFacade.authModePickerState(
             advertisedModes: provider.auth_modes,
             savedMode: provider.auth_mode,
             providerIsReady: provider.auth_status.state == "ready"
@@ -257,7 +211,7 @@ struct ProviderConfigSheet: View {
     init(provider: ProviderInfo, onDone: @escaping () -> Void) {
         self.provider = provider
         self.onDone = onDone
-        let authModeState = ProviderAuthModePickerPresentation.resolve(
+        let authModeState = ProvidersFacade.authModePickerState(
             advertisedModes: provider.auth_modes,
             savedMode: provider.auth_mode,
             providerIsReady: provider.auth_status.state == "ready"
@@ -523,27 +477,23 @@ struct ProviderConfigSheet: View {
         let savedInput = apiKey
         let savedAuthMode = authMode
         do {
-            try await appModel.configureProvider(
+            try await appModel.engine.providers.saveConnection(
                 provider.provider_id,
                 apiKey: savedAuthMode == "api_key" ? savedInput : nil,
-                authMode: savedAuthMode,
-                defaultModel: selectedModel
+                authMode: savedAuthMode, defaultModel: selectedModel,
+                didSave: {
+                    Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
+                    if savedAuthMode == "api_key", apiKey == savedInput { apiKey = "" }
+                },
+                readback: { refreshed in
+                    if let current = refreshed.first(where: { $0.provider_id == provider.provider_id }) {
+                        availableModels = current.models
+                    }
+                },
+                refreshProviders: { _ = await appModel.loadProvidersForChat() },
+                failure: { error, action in appModel.setFailureStatus(error, action: action) },
+                clearOverride: { try await appModel.clearSurfaceOverride(surface: $0) }
             )
-            // 2026-09-06: Test should use the persisted key; preserve edits made during Save.
-            if savedAuthMode == "api_key", apiKey == savedInput {
-                apiKey = ""
-            }
-            let refreshed = try await appModel.engine.providers.list()
-            if let current = refreshed.first(where: { $0.provider_id == provider.provider_id }) {
-                availableModels = current.models
-            }
-            await appModel.loadProvidersForChat()
-            // Connecting the first account HERE is the same event as connecting
-            // it in the wizard, and only the wizard was calling this — so an
-            // account added from Settings on a fresh install left Chat with no
-            // choice at all, and every group inheriting it too (2026-09-13
-            // review). Adoption itself only acts on a blank or unusable Chat.
-            await appModel.adoptProviderForBlankSurfaces(provider.provider_id)
             // FIRSTRUN-2: the key is on disk, nothing more. Any earlier
             // "verified" claim is stale now that the credential changed.
             verification = .afterSave()
@@ -581,20 +531,11 @@ struct ProviderConfigSheet: View {
         let draftKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let testsDraft = authMode == "api_key" && !draftKey.isEmpty
         do {
-            let current = try await appModel.engine.providers.list().first { $0.provider_id == provider.provider_id }
-            let credentialReady = current?.auth_status.state == "ready"
-                && (current?.auth_mode == testedAuthMode || (current?.auth_mode == nil && provider.auth_modes.count == 1))
-            let result: ProviderTestResult
-            if testedAuthMode != "api_key" {
-                result = ProviderTestResult(provider_id: provider.provider_id, status: "unknown", tested: false,
-                    response: nil, model_used: nil,
-                    detail: "No connection test is available for this sign-in method. It was not checked.", error: nil)
-            } else {
-                result = try await appModel.testProvider(
-                    provider.provider_id,
-                    apiKeyOverride: testsDraft ? draftKey : nil
-                )
-            }
+            let probe = try await appModel.engine.providers.testConfiguredProvider(
+                provider, authMode: testedAuthMode, apiKey: testedInput
+            )
+            let result = probe.result
+            let credentialReady = probe.credentialReady
             guard credentialRevision == revision, apiKey == testedInput, authMode == testedAuthMode else { return }
             testResult = result
             if testsDraft {
@@ -661,42 +602,6 @@ struct ProviderConfigSheet: View {
 }
 
 // MARK: - PATCH-2026-05-07: anthropic-mcp status panel
-
-/// A local Claude CLI presence check is the only evidence this panel has for
-/// its persistent-MCP connection claim. Do not manufacture readiness from a
-/// provider-list payload that may have been collected before the CLI moved or
-/// was removed.
-enum AnthropicMCPCLIProbe {
-    enum Availability: Equatable {
-        case checking
-        case available(path: String)
-        case unavailable(reason: String)
-    }
-
-    static func probe(
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
-    ) -> Availability {
-        guard let path = environment["PATH"], !path.isEmpty else {
-            return .unavailable(reason: "Claude CLI could not be checked because PATH is unavailable.")
-        }
-        let directories = path.split(separator: ":", omittingEmptySubsequences: true)
-            .map(String.init)
-            .filter { $0.hasPrefix("/") }
-        guard !directories.isEmpty else {
-            return .unavailable(reason: "Claude CLI could not be checked because PATH has no absolute directories.")
-        }
-        for directory in directories {
-            let candidate = URL(fileURLWithPath: directory)
-                .appendingPathComponent("claude")
-                .path
-            if isExecutable(candidate) {
-                return .available(path: candidate)
-            }
-        }
-        return .unavailable(reason: "Claude CLI was not found on PATH. Install or restore Claude Code, then test again.")
-    }
-}
 
 struct AnthropicMCPStatusPresentation: Equatable {
     enum ProcessStatus: Equatable {
@@ -828,14 +733,16 @@ private struct AnthropicMCPStatusPanel: View {
             }
         }
         .task(id: provider.auth_status.last_checked_at) {
-            cliAvailability = AnthropicMCPCLIProbe.probe()
+            let availability = await Task.detached(priority: .userInitiated) { AnthropicMCPCLIProbe.probe() }.value
+            guard !Task.isCancelled else { return }
+            cliAvailability = availability
         }
     }
 
     private func runPersistentTest() async {
         isTesting = true
         testResult = ""
-        cliAvailability = AnthropicMCPCLIProbe.probe()
+        cliAvailability = await Task.detached(priority: .userInitiated) { AnthropicMCPCLIProbe.probe() }.value
         if case .unavailable(let reason) = cliAvailability {
             testResult = reason
             isTesting = false

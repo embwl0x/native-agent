@@ -9,10 +9,6 @@ import PersistenceCore
 import TurnTrace
 import WorkshopExecution
 
-public struct SendableUserDefaults: @unchecked Sendable {
-    let value: UserDefaults
-}
-
 private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider {
     let memory: SwiftNativeMemoryV2
     let modelFingerprint: String
@@ -48,10 +44,7 @@ private struct NativeContextMarkdownCompiler: ContextMarkdownCompiling {
     }
 }
 
-actor PersonaContextFlowProvider:
-    ContextRequiredDocumentMirrorProviding,
-    ContextSourceRegistrationRefreshing
-{
+actor PersonaContextFlowProvider: ContextRequiredDocumentMirrorProviding {
     private struct Build: Sendable {
         let mirrors: [RequiredDocumentMirror]
         let registrations: [ContextSourceRegistration]
@@ -64,23 +57,17 @@ actor PersonaContextFlowProvider:
     ]
 
     private let compiler: PersonaCompiler
-    private let personaOverride: @Sendable () -> String?
     private var cachedBuild: Build?
 
     init(
-        compiler: PersonaCompiler? = nil,
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        personaOverride: @escaping @Sendable () -> String? = {
-            PersonaSelection.current()
-        }
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         let standardizedRoot = dataRoot.standardizedFileURL
         let persona = standardizedRoot
             == PersistenceCore.defaultDataRoot().standardizedFileURL
             ? SwiftNativePersonaEngine(dataRoot: standardizedRoot)
             : SwiftNativePersonaEngine.isolated(dataRoot: standardizedRoot)
-        self.compiler = compiler ?? PersonaCompiler(engine: persona)
-        self.personaOverride = personaOverride
+        self.compiler = PersonaCompiler(engine: persona)
     }
 
     func refreshContextSources(in registry: ContextSourceRegistry) async throws {
@@ -106,18 +93,12 @@ actor PersonaContextFlowProvider:
     }
 
     private func makeBuild() async throws -> Build {
-        let requestedOverride = personaOverride()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedOverride = PersonaSelection.current()?.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedOverride = requestedOverride?.isEmpty == false ? requestedOverride : nil
-        var snapshots: [PersonaContextSourceSnapshot] = []
-        for surface in Self.surfaces {
-            // The Mac chat picker is a per-turn override. Remote and autonomous
-            // surfaces retain PersonaCompiler's active-persona resolution.
-            let override = surface == .chat ? selectedOverride : nil
-            snapshots.append(try await compiler.contextSourceSnapshot(
-                surface: surface.rawValue,
-                personaOverride: override
-            ))
-        }
+        let snapshots = try await compiler.contextSourceSnapshots(
+            surfaces: Self.surfaces.map(\.rawValue),
+            personaOverrides: selectedOverride.map { ["chat": $0] } ?? [:]
+        )
 
         var registrations: [ContextSourceID: ContextSourceRegistration] = [:]
         var allowedRoots = Set<URL>()
@@ -303,15 +284,10 @@ public struct NativeContextFlowConfiguration: Sendable, Equatable {
         defaults.set(ContextFlowMode.active.rawValue, forKey: modeDefaultsKey)
     }
 
-    static func resolve(
-        dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        defaults: UserDefaults = .standard,
-        publicSafeMode: Bool? = nil
-    ) -> Self {
-        let isPublicSafe = publicSafeMode ?? NativeAgentPublicSafety.isPublicSafeMode(
-            environment: environment
-        )
+    static func resolve(dataRoot: URL) -> Self {
+        let environment = ProcessInfo.processInfo.environment
+        let defaults = UserDefaults.standard
+        let isPublicSafe = NativeAgentPublicSafety.isPublicSafeMode(environment: environment)
         let preOnboarding = isPublicSafe
             && !NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
         let explicitMode = environment[modeEnvironmentKey]
@@ -328,8 +304,6 @@ public struct NativeContextFlowConfiguration: Sendable, Equatable {
 
 public struct NativeContextFlowModeStatus: Sendable, Equatable {
     public let effectiveMode: ContextFlowMode
-    public let environmentManaged: Bool
-    public let setupForcedOff: Bool
 }
 
 /// A configured runtime that could not start. Carried to the turn that needs
@@ -347,30 +321,15 @@ public enum ContextFlowObservatoryHealthState: Sendable, Equatable {
     case health(ContextFlowCoordinatorHealth)
 }
 
-struct NativeResidentWorkObservationStatus: Equatable, Sendable {
-    let isWatching: Bool
-    let watchedPaths: [String]
-    let missingPaths: [String]
-    let invalidationCount: Int
-}
-
 public actor NativeContextFlowRuntime: ContextTurnPreparing {
     private let dataRoot: URL
-    private let configurationOverride: NativeContextFlowConfiguration?
-    private let memoryOverride: SwiftNativeMemoryV2?
-    private let environmentOverride: [String: String]?
-    private let defaultsOverride: SendableUserDefaults?
-    private let publicSafeModeOverride: Bool?
-    private let personaOverride: @Sendable () -> String?
     private var coordinator: ContextFlowCoordinator?
     private var memoryRuntime: SwiftNativeMemoryV2?
-    private let memoryPressureObserver: (any NativeContextMemoryPressureObserving)?
+    private let memoryPressureObserver: DispatchContextMemoryPressureObserver?
     /// One kqueue-backed invalidation reader over the canonical Desk feed and
     /// Workshop execution records. It carries no payload and owns no work state;
     /// every edge makes the existing ContextFlow coordinator reread the stores.
     private var residentWorkObservationTask: Task<Void, Never>?
-    private var residentWorkObservationPathsSnapshot: [URL] = []
-    private var residentWorkInvalidationCount = 0
     private var terminalResidentWorkRecordPaths: Set<String> = []
     private var starting = false
     private var startupWaiters: [CheckedContinuation<Void, Never>] = []
@@ -388,36 +347,14 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// Packet provenance: accepted with each published memory generation,
     /// read at prepare time to resolve selected memory atoms → record IDs.
     private let memoryProvenanceIndex: MemoryAtomRecordIndex
-    private var lastMemoryProvenanceResolution: NativeContextMemoryProvenanceResolution?
-    private var lastMemoryPressureReceipt: ContextArenaTrimReceipt?
 
-    public init(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        configurationOverride: NativeContextFlowConfiguration? = nil,
-        memoryOverride: SwiftNativeMemoryV2? = nil,
-        environmentOverride: [String: String]? = nil,
-        defaultsOverride: SendableUserDefaults? = nil,
-        publicSafeModeOverride: Bool? = nil,
-        personaOverride: (@Sendable () -> String?)? = nil,
-        memoryPressureObserver: (any NativeContextMemoryPressureObserving)? = nil,
-        memoryProvenanceIndex: MemoryAtomRecordIndex? = nil
-    ) {
+    public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot.standardizedFileURL
-        self.configurationOverride = configurationOverride
-        self.memoryOverride = memoryOverride
-        self.environmentOverride = environmentOverride
-        self.defaultsOverride = defaultsOverride
-        self.publicSafeModeOverride = publicSafeModeOverride
-        self.memoryPressureObserver = memoryPressureObserver
-            ?? (dataRoot.standardizedFileURL
-                == PersistenceCore.defaultDataRoot().standardizedFileURL
-                ? DispatchContextMemoryPressureObserver()
-                : nil)
-        self.memoryProvenanceIndex = memoryProvenanceIndex ?? MemoryAtomRecordIndex()
-        let pickerDefaults = defaultsOverride ?? SendableUserDefaults(value: .standard)
-        self.personaOverride = personaOverride ?? {
-            PersonaSelection.current(defaults: pickerDefaults.value)
-        }
+        self.memoryPressureObserver = dataRoot.standardizedFileURL
+            == PersistenceCore.defaultDataRoot().standardizedFileURL
+            ? DispatchContextMemoryPressureObserver()
+            : nil
+        self.memoryProvenanceIndex = MemoryAtomRecordIndex()
     }
 
     private var usesLiveAppBody: Bool {
@@ -433,7 +370,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         starting = true
         startupFailedClosed = false
         startupFailure = nil
-        lastMemoryPressureReceipt = nil
         let configuration = resolvedConfiguration()
         guard configuration.mode != .off else {
             nativeLog("[context-flow] disabled until onboarding or explicit enablement")
@@ -442,22 +378,14 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         }
 
         do {
-            let memory: SwiftNativeMemoryV2
-            if let memoryOverride {
-                memory = memoryOverride
-            } else {
-                memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
-            }
+            let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
             guard await memory.embeddingEpoch() != nil else {
                 throw MemoryV2Error.storageUnavailable
             }
             let store = try ContextSQLiteStore(dataRoot: dataRoot)
             let arena = try ContextArena(budget: configuration.budget)
             let registry = try ContextSourceRegistry()
-            let provider = PersonaContextFlowProvider(
-                dataRoot: dataRoot,
-                personaOverride: personaOverride
-            )
+            let provider = PersonaContextFlowProvider(dataRoot: dataRoot)
             let coordinator = ContextFlowCoordinator(
                 mode: configuration.mode,
                 store: store,
@@ -477,7 +405,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             )
             memoryRuntime = memory
             self.coordinator = coordinator
-            startResidentWorkObservationIfNeeded()
+            await startResidentWorkObservationIfNeeded()
             if usesLiveAppBody {
                 // 2026-09-06: the installed sink is the pin sink, put in place
                 // at app launch and independent of this runtime. Context Flow
@@ -551,17 +479,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     public func modeStatus() async -> NativeContextFlowModeStatus {
-        let environment = environmentOverride ?? ProcessInfo.processInfo.environment
-        let environmentManaged = environment[NativeContextFlowConfiguration.modeEnvironmentKey]
-            .flatMap { ContextFlowMode(rawValue: $0.lowercased()) } != nil
-        let setupForcedOff = (publicSafeModeOverride
-            ?? NativeAgentPublicSafety.isPublicSafeMode(environment: environment))
-            && !NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
-        return NativeContextFlowModeStatus(
-            effectiveMode: await contextFlowMode(),
-            environmentManaged: environmentManaged,
-            setupForcedOff: setupForcedOff
-        )
+        return NativeContextFlowModeStatus(effectiveMode: await contextFlowMode())
     }
 
     public func prepareForSleep() async {
@@ -584,7 +502,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     private func normalizedPersonaOverride() -> String? {
-        let value = personaOverride()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let value = PersonaSelection.current()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? nil : value
     }
 
@@ -635,32 +553,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         return resolvedConfiguration().mode
     }
 
-    /// Lifecycle evidence for the OS pressure edge. This reports the actual
-    /// bridge state rather than inferring installation from runtime mode.
-    func memoryPressureSourceIsInstalled() -> Bool {
-        memoryPressureObserver?.isRunning ?? false
-    }
-
-    /// The latest typed trim evidence remains available after shutdown so
-    /// diagnostics can distinguish a registered source from a delivered edge.
-    func memoryPressureReceipt() -> ContextArenaTrimReceipt? {
-        lastMemoryPressureReceipt
-    }
-
-    /// The latest prepared turn's provenance resolution is intentionally
-    /// payload-free. It makes a partial reverse-index miss visible to runtime
-    /// diagnostics without putting record identities into Context receipts.
-    func memoryProvenanceResolution() -> NativeContextMemoryProvenanceResolution? {
-        lastMemoryProvenanceResolution
-    }
-
     private func resolvedConfiguration() -> NativeContextFlowConfiguration {
-        configurationOverride ?? NativeContextFlowConfiguration.resolve(
-            dataRoot: dataRoot,
-            environment: environmentOverride ?? ProcessInfo.processInfo.environment,
-            defaults: defaultsOverride?.value ?? .standard,
-            publicSafeMode: publicSafeModeOverride
-        )
+        NativeContextFlowConfiguration.resolve(dataRoot: dataRoot)
     }
 
     public func beginQueryEmbedding(_ text: String) async -> ContextQueryEmbeddingTicket? {
@@ -820,7 +714,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             to: prepared,
             index: memoryProvenanceIndex
         )
-        lastMemoryProvenanceResolution = resolution
         if resolution.unresolvedMemoryAtomCount > 0 {
             // Invariant breach: the packet carries memory atoms the owner
             // index cannot name. Every miss (total or partial) means those
@@ -850,23 +743,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         }
     }
 
-    func prepareFrozenContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
-        // Frozen reads pin the already-published generation. Picker changes
-        // belong to the explicit picker edge or the next ordinary turn, never
-        // a read that promises not to recover or publish derived state.
-        guard let coordinator else {
-            throw ContextTurnPreparationError.coordinatorNotStarted
-        }
-        let prepared = try await coordinator.prepareFrozenTurn(request)
-        attachMemoryProvenance(to: prepared, surface: request.surface.rawValue)
-        return prepared
-    }
-
-    func frozenContextRevision() async -> ContextFrozenRevision? {
-        guard let coordinator else { return nil }
-        return await coordinator.frozenRevision()
-    }
-
     public func prewarm(kind: ContextPrewarmHintKind, id: String, terms: [String]) async {
         guard let coordinator else { return }
         _ = await coordinator.submitPrewarm(kind: kind, id: id, terms: terms)
@@ -880,7 +756,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
 
     private func applyObservedMemoryPressure(_ pressure: ContextArenaPressure) async {
         guard let coordinator else { return }
-        lastMemoryPressureReceipt = try? await coordinator.applyMemoryPressure(pressure)
+        _ = try? await coordinator.applyMemoryPressure(pressure)
     }
 
     /// This decision runs on the memory-pressure queue, never on the runtime
@@ -899,15 +775,19 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// land in a read/subscription gap. Each observed edge re-arms the complete
     /// path set before reconciliation; a Desk close that follows a Workshop
     /// terminal write is therefore buffered instead of being lost.
-    private func startResidentWorkObservationIfNeeded() {
+    private func startResidentWorkObservationIfNeeded() async {
         guard residentWorkObservationTask == nil else { return }
+        let observation = makeResidentWorkObservation()
+        await observation.waitUntilArmed()
+        guard coordinator != nil, !Task.isCancelled else { observation.cancel(); return }
         residentWorkObservationTask = Task { [weak self] in
-            await self?.observeResidentWorkChanges()
+            guard let self else { observation.cancel(); return }
+            await self.observeResidentWorkChanges(observation)
         }
     }
 
-    private func observeResidentWorkChanges() async {
-        var observation = makeResidentWorkObservation()
+    private func observeResidentWorkChanges(_ initial: FileChangeEvents) async {
+        var observation = initial
         defer { observation.cancel() }
         while !Task.isCancelled {
             let changed = await waitForResidentWorkChange(observation)
@@ -917,14 +797,14 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             // Re-arm first. The projection read below can suspend on Desk or
             // Workshop I/O while the canonical owner commits a related edge.
             observation = makeResidentWorkObservation()
-            guard let coordinator else { return }
+            await observation.waitUntilArmed()
+            guard !Task.isCancelled, let coordinator else { return }
             await coordinator.sourceDidChange(DerivedSourceChange(
                 namespace: "resident-work",
                 stableID: "canonical",
                 operation: .reconcile,
                 reason: "resident_work_file_changed"
             ))
-            residentWorkInvalidationCount += 1
         }
     }
 
@@ -1007,23 +887,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         return !WorkshopOutcomeScoreboard.terminalStatuses.contains(status.lowercased())
     }
 
-    func residentWorkObservationStatus() -> NativeResidentWorkObservationStatus {
-        NativeResidentWorkObservationStatus(
-            isWatching: residentWorkObservationTask != nil,
-            watchedPaths: residentWorkObservationPathsSnapshot.map(\.path),
-            missingPaths: residentWorkObservationPathsSnapshot
-                .filter { !FileManager.default.fileExists(atPath: $0.path) }
-                .map(\.path),
-            invalidationCount: residentWorkInvalidationCount
-        )
-    }
-
     private func makeResidentWorkObservation() -> FileChangeEvents {
-        // Resolve once per arm: status describes the exact subscribed paths,
-        // and every canonical edge pays for only one execution-directory scan.
-        let paths = residentWorkObservationPaths()
-        residentWorkObservationPathsSnapshot = paths
-        return FileChangeEvents(paths: paths, emitInitial: false)
+        FileChangeEvents(paths: residentWorkObservationPaths(), emitInitial: false)
     }
 
     private func waitForStartup() async {

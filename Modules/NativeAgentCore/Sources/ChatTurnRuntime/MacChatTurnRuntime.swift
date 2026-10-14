@@ -78,7 +78,7 @@ public final class MacChatTurnRuntime {
     @ObservationIgnored public var phoneControlHandoffSentAt: [String: Date] = [:]
     @ObservationIgnored public var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading = MacChatTurnTranscriptProofReader()
     @ObservationIgnored public var chatTurnLifecycleRepairCompleted = false
-    @ObservationIgnored public var queuedChatTurnStartOverride: (@MainActor @Sendable (QueuedChatTurn, String) async -> MacChatTurnAcceptance)?
+    @ObservationIgnored public var residentRefreshPendingAfterActiveTurns = false
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -134,6 +134,35 @@ public final class MacChatTurnRuntime {
 
     public func lifecycle(for sessionId: String) -> MacChatTurnLifecycleState? {
         lifecycleBySession[sessionId]
+    }
+
+    public func pruneSessionState(_ sessionId: String) {
+        let activeTurnId = activeTurnIDsBySession[sessionId]
+        let retainedTurnId = activeTurnId == nil ? lifecycleBySession[sessionId]?.identity.turnId : nil
+        Task { await updateQueuedTurns { $0.removeValue(forKey: sessionId) } }
+        pausedQueueSessions.remove(sessionId)
+        queuePauseReasons.removeValue(forKey: sessionId)
+        // A joined producer still owns its terminal proof during Stop/Archive.
+        if activeTurnId == nil {
+            lifecycleBySession.removeValue(forKey: sessionId)
+            activeTurnIDsBySession.removeValue(forKey: sessionId)
+        }
+        if let retainedTurnId {
+            Task { [lifecycleStore] in
+                try? await lifecycleStore.remove(sessionId: sessionId, turnId: retainedTurnId)
+            }
+        }
+    }
+
+    public func staleSessionIDs(
+        cached: Set<String>, known: Set<String>, keepVisible: (String) -> Bool
+    ) -> Set<String> {
+        let candidates = cached.union(queuedBySession.keys).union(pausedQueueSessions)
+            .union(lifecycleBySession.keys).union(activeTurnIDsBySession.keys)
+        return candidates.filter {
+            !known.contains($0) && !streamingSessions.contains($0)
+                && !busySessions.contains($0) && !keepVisible($0)
+        }
     }
     public func finishRuntime(sessionId: String, generation: Int) -> Bool {
         guard taskGenerations[sessionId] == generation else { return false }

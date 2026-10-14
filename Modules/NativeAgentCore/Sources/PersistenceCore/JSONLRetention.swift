@@ -48,12 +48,6 @@ final class JSONLCapCheckCounter: @unchecked Sendable {
         let next = (counts[key] ?? 0) + 1
         return next % stride == 1
     }
-
-    /// Test seam: forget the per-path history so a fresh temp path starts at 1.
-    func _testReset() {
-        lock.lock(); defer { lock.unlock() }
-        counts.removeAll()
-    }
 }
 
 /// Trim a JSONL file to its newest `maxLines` lines. Returns the number of
@@ -163,16 +157,11 @@ func enforceJSONLKindLineCap(
 
     var kept = Set(lines.indices.suffix(retainedLines))
     kept.formUnion(reserved)
-    while kept.count > retainedLines {
-        if let oldestUnreserved = kept.sorted().first(where: { !reserved.contains($0) }) {
-            kept.remove(oldestUnreserved)
-        } else if let oldest = kept.min() {
-            // More distinct kinds than the entire line budget: remain bounded
-            // and prefer the newest reserved evidence deterministically.
-            kept.remove(oldest)
-        } else {
-            break
-        }
+    let oldestFirst = kept.sorted()
+    let removalOrder = oldestFirst.filter { !reserved.contains($0) }
+        + oldestFirst.filter { reserved.contains($0) }
+    for index in removalOrder.prefix(max(0, kept.count - retainedLines)) {
+        kept.remove(index)
     }
     let ordered = kept.sorted().map { lines[$0] }
     let dropped = lines.count - ordered.count

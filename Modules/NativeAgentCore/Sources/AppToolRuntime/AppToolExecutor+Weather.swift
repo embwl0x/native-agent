@@ -1,13 +1,11 @@
 import Foundation
+import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
 
 extension AppToolExecutor {
-    func runWeatherForecast(input: [String: JSONValue]) async throws -> JSONValue {
+    func runWeatherForecast(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let place = Self.doorText(input["place"])
-        guard !place.isEmpty else {
-            return Self.failure("place_needed", "Give a city or postal code in args.place. This Mac has no current location reader.")
-        }
         let hours: Int
         if let supplied = input["hours"] {
             guard case .int(let count) = supplied, (1...24).contains(count) else {
@@ -30,11 +28,38 @@ extension AppToolExecutor {
             }
             return result
         }
-        let geocoded = try await fetch("https://geocoding-api.open-meteo.com/v1/search", ["name": place, "count": "1"])
-        guard case .array(let places)? = geocoded["results"], case .object(let location)? = places.first,
-              let latitude = Self.inputString(location["latitude"]), let longitude = Self.inputString(location["longitude"]),
+        let location: [String: JSONValue]
+        if place.isEmpty {
+            let call: [String: JSONValue] = ["action": .string("phone.request"), "args": .object(["kind": .string("location.current")])]
+            let phone: JSONValue
+            do { phone = try await runAppDoor(input: call, surface: surface) }
+            catch {
+                try Task.checkCancellation()
+                phone = ChatToolOutcome.failure(error: error, tool: "phone_request")
+            }
+            guard case .object(let reply) = phone, reply["status"] == .string("completed"),
+                  case .object(let values)? = reply["values"],
+                  let latitude = Self.inputString(values["latitude"]), let lat = Double(latitude), (-90...90).contains(lat),
+                  let longitude = Self.inputString(values["longitude"]), let lon = Double(longitude), (-180...180).contains(lon) else {
+                return Self.doorRefusal("location_unavailable", "The paired iPhone did not provide a current location. No weather was read.",
+                    remedy: "phone_location", "Open NativeAgent on the paired iPhone, allow location access, then make next_call or give args.place.",
+                    next: call, extra: ["phone_result": phone])
+            }
+            var located = try await fetch("https://api.open-meteo.com/v1/forecast",
+                ["latitude": latitude, "longitude": longitude, "timezone": "auto", "forecast_days": "1"])
+            located.merge(values) { _, phoneValue in phoneValue }
+            located["source"] = .string("paired iPhone current location")
+            location = located
+        } else {
+            let geocoded = try await fetch("https://geocoding-api.open-meteo.com/v1/search", ["name": place, "count": "1"])
+            guard case .array(let places)? = geocoded["results"], case .object(let found)? = places.first else {
+                return Self.failure("place_not_found", "No forecast location matched args.place. Give a city with its state or country, or a postal code.")
+            }
+            location = found
+        }
+        guard let latitude = Self.inputString(location["latitude"]), let longitude = Self.inputString(location["longitude"]),
               case .string(let zone)? = location["timezone"], let timezone = TimeZone(identifier: zone) else {
-            return Self.failure("place_not_found", "No forecast location matched args.place. Give a city with its state or country, or a postal code.")
+            return Self.failure("location_unavailable", "Open-Meteo returned no usable forecast coordinates or timezone. No weather was read; check the service status before retrying.")
         }
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timezone
@@ -108,7 +133,7 @@ extension AppToolExecutor {
         }
         result["current"] = .object(current)
         result["status"] = .string("ok")
-        result["source"] = .string("Open-Meteo · https://open-meteo.com/; location data: GeoNames")
+        result["source"] = .string("Open-Meteo · https://open-meteo.com/; location data: " + (place.isEmpty ? "paired iPhone" : "GeoNames"))
         result["place"] = .object(location)
         result["requested_day"] = .string(isoDay)
         result["read_at"] = .string(ISO8601DateFormatter().string(from: Date()))

@@ -8,6 +8,49 @@ import Skills
 import TrustCenter
 
 extension AppToolExecutor {
+    @MainActor
+    func runHouseFile(input: [String: JSONValue], surface: String) async -> JSONValue {
+        guard let title = Self.inputString(input["title"])?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty,
+              let summary = Self.inputString(input["summary"])?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty,
+              let owner = ["me": HarnessFinding.Owner.agent, "builder": .builder, "user": .owner][Self.inputString(input["owner"]) ?? ""] else {
+            return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args",
+                                    "Pass title, summary and owner: me, builder or user.")
+        }
+        let refs: [DeskRef]
+        if let value = input["refs"] {
+            guard case .array(let values) = value else {
+                return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args", "refs takes an array of Desk refs.")
+            }
+            // A plain string is a note; an object names its kind.
+            refs = values.compactMap { value -> DeskRef? in
+                if case .string(let text) = value { return DeskRef(kind: .note(text: text)) }
+                return DeskRef.fromJSON(value)
+            }
+            guard refs.count == values.count else {
+                return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args",
+                    "Each ref is a string (a note) or {kind: file|url|note|commit|gh_issue|gh_pr|agent|approval|trace, …}.")
+            }
+        } else { refs = [] }
+        do {
+            let key = "agent:" + title.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                                              peerID: ChatToolSessionContext.envelope?.verifiedUserId)
+            let carried = DeskRef(kind: .step(DeskStep(words: summary, when: "own_turn",
+                peers: steer.sources, elevated: steer.elevated, session: ChatToolSessionContext.verifiedSessionId,
+                origin: ChatPersistenceContext.originPrincipal, replyRoute: TurnEnvelope.current(surface: surface).persistedMetadata())))
+            let item = try await HarnessQueue.file(HarnessFinding(key: key, title: title,
+                summary: summary, owner: owner,
+                // Only what she owns is carried; builder and User items wait on them.
+                refs: refs.filter { $0.kind.token != "step" } + (owner == .agent ? [carried] : []), source: .agent),
+                dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            let filedOwner = ["agent": "me", "builder": "builder", "owner": "user"][item.assignee ?? ""] ?? item.assignee
+            let ownership = item.assignee == owner.rawValue ? "" : " Owner unchanged: \(filedOwner ?? "unassigned")."
+            return .object(["status": .string("ok"), "id": .string("desk." + item.alias),
+                            "owner": filedOwner.map(JSONValue.string) ?? .null,
+                            "confirmation": .string("Filed: " + item.title + ownership)])
+        } catch { return Self.failure("house_file_failed", error.localizedDescription) }
+    }
+
     /// MY QUEUE's actions (Wave 2 #7): queue a step, or mark one done or
     /// dropped. Each answers with a receipt naming the item. A step queued on
     /// a peer-steered turn keeps that steer (`PeerDataTaint.carried`).
@@ -41,7 +84,9 @@ extension AppToolExecutor {
                                                   peerID: ChatToolSessionContext.envelope?.verifiedUserId)
                 let queued = try await MyQueue.add(DeskStep(words: words, when: when.stored, card: when.card, action: text("action"),
                                                             peers: steer.sources, elevated: steer.elevated,
-                                                            session: ChatToolSessionContext.verifiedSessionId), store: store)
+                                                            session: ChatToolSessionContext.verifiedSessionId,
+                                                            origin: ChatPersistenceContext.originPrincipal,
+                                                            replyRoute: TurnEnvelope.current(surface: surface).persistedMetadata()), store: store)
                 return receipt(queued.entry, queued.change.rawValue)
             }
             guard let id = text("id") else {

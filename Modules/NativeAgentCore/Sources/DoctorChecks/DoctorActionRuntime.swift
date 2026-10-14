@@ -37,8 +37,9 @@ public enum DoctorRepairAttempt: Sendable {
 }
 
 public enum DoctorProviderRuntimeReading: Sendable {
-    case healthy
+    case healthy(DoctorProviderProbeReading)
     case unhealthy(String)
+    case configurationIssue(CheckResult)
     case unavailable
 }
 public enum DoctorProviderProbeReading: Sendable {
@@ -52,7 +53,7 @@ public enum DoctorProviderProbeReading: Sendable {
 public protocol DoctorActionPort: Sendable {
     func doctorProviderAuthStates() async throws -> [String]
     func doctorProviderRuntimeReading() async -> DoctorProviderRuntimeReading
-    func doctorProviderProbeReading() -> DoctorProviderProbeReading
+    func doctorDataRootCheck() -> CheckResult
     func doctorTelegramSnapshot() async throws -> DoctorTelegramSnapshot
     func doctorSearchURL() async throws -> String?
     func doctorProbeSearch(base: String) async -> Bool
@@ -104,7 +105,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             return true
         }
         defer { if ownsRepair { doctorRepairInFlight.withLock { $0 = false } } }
-        var checks = try await impl.runAll(repair: false)
+        var checks = try await impl.runAll()
         checks += await liveDoctorCoverageReadings(probeSearch: true, includeCognition: true)
         var liveRepairs: [String: DoctorExecutableRepair] = [:]
         for check in checks where check.id.hasPrefix("live.") && DoctorSafeRepairPolicy.isAdverse(check.status)
@@ -202,7 +203,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         case "live.providers": return await providerDoctorCoverageCheck()
         case "live.search": return await searchDoctorCoverageCheck(probe: true)
         case "live.telegram": return await telegramDoctorCoverageCheck()
-        case "live.background_loops": return await backgroundLoopsDoctorCoverageCheck()
+        case "live.background_loops": return await port.doctorBackgroundLoopsCheck()
         case "live.bridges": return await bridgesDoctorCoverageCheck()
         case "live.agent_connections": return await port.doctorAgentConnectionsCheck()
         case "live.memory": return await memoryDoctorCoverageCheck()
@@ -242,7 +243,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         // is the same read-only evaluation the Doctor loops section renders,
         // rolled into one row — and it rides the live-coverage lane, so
         // `refreshLiveDoctorCoverage()` keeps it current too.
-        async let loops = backgroundLoopsDoctorCoverageCheck()
+        async let loops = port.doctorBackgroundLoopsCheck()
         async let loopDetails = port.doctorBackgroundLoopChecks()
         async let memory = memoryDoctorCoverageCheck()
         async let bridges = bridgesDoctorCoverageCheck()
@@ -250,7 +251,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         async let inspector = port.doctorInspectorCheck()
         async let embedding = port.doctorEmbeddingDownloadCheck()
         async let pulses = port.doctorOrganPulsesCheck()
-        let common = await [providers, telegram, search, tools, autonomy, loops, memory, bridges, agents, inspector, embedding, pulses] + (await loopDetails)
+        let common = await [providers, telegram, search, tools, autonomy, loops, memory, bridges, agents, inspector, embedding, pulses] + (await loopDetails) + [port.doctorDataRootCheck()]
         return includeCognition ? common + (await port.doctorCognitionChecks()) : common
     }
 
@@ -358,15 +359,13 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         )
     }
 
-    private func backgroundLoopsDoctorCoverageCheck() async -> CheckResult {
-        await port.doctorBackgroundLoopsCheck()
-    }
-
     public func providerDoctorCoverageCheck() async -> CheckResult {
         do {
+            let runtime = await port.doctorProviderRuntimeReading()
+            // A configuration issue replaces registry coverage in the single live.providers row while present.
+            if case .configurationIssue(let check) = runtime { return check }
             let providers = try await port.doctorProviderAuthStates()
             let registryCheck = providerDoctorCoverageCheck(providers)
-            let runtime = await port.doctorProviderRuntimeReading()
             switch runtime {
             case .healthy:
                 break
@@ -382,22 +381,20 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                         : "Open Providers and run Test Connection for the active provider. If it fails, use its reported authentication or connectivity step.",
                     ask: detail.hasPrefix("No usable provider") ? .signIn : nil
                 )
-            case .unavailable:
+            case .unavailable, .configurationIssue:
                 break
             }
-            switch port.doctorProviderProbeReading() {
+            guard case .healthy(let probe) = runtime else { return registryCheck }
+            switch probe {
             case .current:
                 guard registryCheck.status == "ok" else { return registryCheck }
-                if case .healthy = runtime {
-                    return CheckResult(
-                        id: registryCheck.id,
-                        title: registryCheck.title,
-                        status: "ok",
-                        detail: "\(registryCheck.detail) Active provider path is ready.",
-                        repair: nil
-                    )
-                }
-                return registryCheck
+                return CheckResult(
+                    id: registryCheck.id,
+                    title: registryCheck.title,
+                    status: "ok",
+                    detail: "\(registryCheck.detail) Active provider path is ready.",
+                    repair: nil
+                )
             case .stale(let providerID):
                 return CheckResult(
                     id: "live.providers",

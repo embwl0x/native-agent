@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Observation
 
 enum NativeAgentNavigationDestination: Equatable, Sendable {
     case sidebar(SidebarItem)
@@ -83,9 +84,20 @@ enum NativeAgentNavigationRequestReceipt: Equatable, Sendable {
     case queuedForMainScene
 }
 
-@MainActor
+@MainActor @Observable
 final class NativeAgentAppCoordinator {
     static let mainSceneID = "main"
+    var appModel: AppModel?
+    @ObservationIgnored private var preparationTask: Task<Void, Error>?
+
+    func prepare() async throws {
+        if preparationTask == nil {
+            preparationTask = Task {
+                guard await NativeAgentApp.prepare() else { throw CocoaError(.fileReadUnknown) }
+            }
+        }
+        try await preparationTask!.value
+    }
 
     struct ProcessBootstrapDependencies {
         var restoreDetachedChats: () -> Void

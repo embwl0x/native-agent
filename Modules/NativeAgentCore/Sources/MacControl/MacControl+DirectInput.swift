@@ -163,8 +163,7 @@ extension SwiftNativeMacControl {
                 "verified": .bool(false),
             ]),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -369,8 +368,7 @@ extension SwiftNativeMacControl {
             action: "click",
             output: .object(describe),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -430,8 +428,7 @@ extension SwiftNativeMacControl {
             action: "scroll",
             output: .object(output),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 
@@ -626,8 +623,7 @@ extension SwiftNativeMacControl {
                 action: "ax_act",
                 output: .object(output),
                 error: result.error,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
     }

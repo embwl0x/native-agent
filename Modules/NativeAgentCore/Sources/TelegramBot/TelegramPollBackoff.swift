@@ -9,8 +9,7 @@
 //   * `TelegramExponentialBackoff` — deadline-gate backoff state. No sleeps:
 //     callers ask `shouldAttempt()` and simply skip the work while a failure
 //     window is open, so the scheduler keeps its cheap cadence and a tick
-//     during the window costs one timestamp comparison. Clock and jitter RNG
-//     are injectable so tests run on virtual time.
+//     during the window costs one timestamp comparison.
 //   * `TelegramErrorLog` — flock'd append with size-cap rotation for
 //     errors.jsonl, mirroring the MemoryV2 dedup_shadow recipe (5MB cap,
 //     single `.1` backup, rotate inside the same critical section as the
@@ -24,19 +23,15 @@ import PersistenceCore
 // MARK: - TelegramExponentialBackoff
 
 /// Exponential backoff state for transient failures in the Telegram poll
-/// loop (and its command-menu sync). Curve: `base * multiplier^(n-1)`,
+/// loop (and its command-menu sync). Curve: `base * 2^(n-1)`,
 /// capped at `maxDelay`, then jittered by a uniform factor from
-/// `jitterRange`; the jittered delay is re-clamped to `maxDelay` so the
+/// `0.8...1.2`; the jittered delay is re-clamped to `maxDelay` so the
 /// documented cap is a hard ceiling (at the cap, jitter spreads attempts
 /// DOWNWARD — that still de-synchronizes multiple instances without ever
 /// exceeding the cap). One success resets the curve to zero.
 public actor TelegramExponentialBackoff {
     private let baseDelay: TimeInterval
     private let maxDelay: TimeInterval
-    private let multiplier: Double
-    private let jitterRange: ClosedRange<Double>
-    private let now: @Sendable () -> Date
-    private let random: @Sendable (ClosedRange<Double>) -> Double
 
     private var consecutiveFailures: Int = 0
     private var nextAttemptAt: Date?
@@ -52,25 +47,17 @@ public actor TelegramExponentialBackoff {
     /// right for a menu sync, wrong for the lane that carries messages.
     public init(
         baseDelay: TimeInterval = 1,
-        maxDelay: TimeInterval = 60,
-        multiplier: Double = 2,
-        jitterRange: ClosedRange<Double> = 0.8...1.2,
-        now: @escaping @Sendable () -> Date = { Date() },
-        random: @escaping @Sendable (ClosedRange<Double>) -> Double = { Double.random(in: $0) }
+        maxDelay: TimeInterval = 60
     ) {
         self.baseDelay = max(0, baseDelay)
         self.maxDelay = max(0, maxDelay)
-        self.multiplier = max(1, multiplier)
-        self.jitterRange = jitterRange
-        self.now = now
-        self.random = random
     }
 
     /// True when no failure window is open (never failed, or the deadline
     /// from the last recorded failure has passed).
     public func shouldAttempt() -> Bool {
         guard let nextAttemptAt else { return true }
-        return now() >= nextAttemptAt
+        return Date() >= nextAttemptAt
     }
 
     /// Record one failed attempt; arms the next deadline and returns the
@@ -81,9 +68,9 @@ public actor TelegramExponentialBackoff {
         // Exponent clamp keeps pow() finite for absurd failure counts; the
         // min() with maxDelay is what actually bounds the curve.
         let exponent = Double(min(consecutiveFailures - 1, 64))
-        let raw = min(maxDelay, baseDelay * pow(multiplier, exponent))
-        let delay = min(maxDelay, raw * random(jitterRange))
-        nextAttemptAt = now().addingTimeInterval(delay)
+        let raw = min(maxDelay, baseDelay * pow(2, exponent))
+        let delay = min(maxDelay, raw * Double.random(in: 0.8...1.2))
+        nextAttemptAt = Date().addingTimeInterval(delay)
         return delay
     }
 
@@ -95,11 +82,6 @@ public actor TelegramExponentialBackoff {
 
     public func failureCount() -> Int {
         consecutiveFailures
-    }
-
-    /// The instant the current failure window closes (nil → no window).
-    public func currentDeadline() -> Date? {
-        nextAttemptAt
     }
 }
 
@@ -120,12 +102,10 @@ public enum TelegramErrorLog {
     public static let maxBytes = 5 * 1024 * 1024
 
     /// Append one row under flock, rotating first when the live file has
-    /// reached `rotateAtBytes`. FAIL-OPEN: never throws.
-    /// `rotateAtBytes` is test-injectable; production uses `maxBytes`.
+    /// reached `maxBytes`. FAIL-OPEN: never throws.
     public static func append(
         _ row: JSONValue,
-        to logURL: URL,
-        rotateAtBytes: Int = maxBytes
+        to logURL: URL
     ) async {
         do {
             try FileManager.default.createDirectory(
@@ -134,7 +114,7 @@ public enum TelegramErrorLog {
             )
             let persistence = SwiftNativePersistenceCore()
             try await persistence.withFileLock(logURL) {
-                rotateIfNeeded(logURL, cap: rotateAtBytes)
+                rotateIfNeeded(logURL)
                 try await persistence.appendJSONL(row, to: logURL)
             }
         } catch {
@@ -144,17 +124,16 @@ public enum TelegramErrorLog {
         }
     }
 
-    /// Rotate once the live file has reached `cap` bytes: replace any
+    /// Rotate once the live file has reached `maxBytes` bytes: replace any
     /// existing `<name>.1` backup with the live file; the caller's append
     /// then recreates a fresh live log. Call ONLY inside the log's flock
     /// critical section. FAIL-OPEN: a rotation error is logged and the
     /// append proceeds on the un-rotated file (worst case the log keeps
     /// growing until a later rotation succeeds).
-    static func rotateIfNeeded(_ logURL: URL, cap: Int) {
-        guard cap > 0,
-              let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+    static func rotateIfNeeded(_ logURL: URL) {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
               let size = (attrs[.size] as? NSNumber)?.intValue,
-              size >= cap
+              size >= maxBytes
         else { return }
         let backup = logURL.appendingPathExtension("1")
         do {

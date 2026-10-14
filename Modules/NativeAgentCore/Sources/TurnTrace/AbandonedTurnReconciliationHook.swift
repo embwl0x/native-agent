@@ -14,6 +14,15 @@ public enum AbandonedTurnReconciliationHook {
     private static var resuming: Set<String> = []
     private static var inFlight: @Sendable () -> Set<String> = { [] }
     private static var resume: (@Sendable (TurnCheckpoint) async throws -> Void)?
+    private static var retainReplyMirror: (@Sendable (URL, String, String) async throws -> Void)?
+
+    public static func installReplyMirror(_ retain: @escaping @Sendable (URL, String, String) async throws -> Void) {
+        retainReplyMirror = retain
+    }
+
+    public static func retainMirror(dataRoot: URL, sessionId: String, runId: String) async throws {
+        try await retainReplyMirror?(dataRoot, sessionId, runId)
+    }
 
     public static func arm(completedTurnNotification: Notification.Name,
                            inFlight: @escaping @Sendable () -> Set<String>,

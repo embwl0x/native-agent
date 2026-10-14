@@ -18,6 +18,12 @@ import Transcripts
 /// resolver, so the Inbox, the phone and the Mac panel stay in step, and a card
 /// answered anywhere reads settled everywhere. Nothing here decides anything.
 public enum ApprovalChatCards {
+    public static func canResolve(_ approval: ApprovalRecord) -> Bool {
+        !approval.payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public static let unavailableText = "The details of this request are missing. Refresh approvals to check again. You can decide once the details are available."
+
     public enum Outcome: Sendable, Equatable {
         /// Posted into this conversation.
         case posted(String)

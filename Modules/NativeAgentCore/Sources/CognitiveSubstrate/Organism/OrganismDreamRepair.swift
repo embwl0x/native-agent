@@ -203,18 +203,6 @@ public struct OrganismDreamRepairSummary: Codable, Sendable, Equatable {
     public static let empty = OrganismDreamRepairSummary()
 }
 
-public struct OrganismDreamRepairLimits: Sendable, Equatable {
-    public var maximumOperations: Int
-    public var maximumFeltSummaryCharacters: Int
-
-    public init(maximumOperations: Int = 16, maximumFeltSummaryCharacters: Int = 1_200) {
-        self.maximumOperations = max(0, maximumOperations)
-        self.maximumFeltSummaryCharacters = max(0, maximumFeltSummaryCharacters)
-    }
-
-    public static let defaults = OrganismDreamRepairLimits()
-}
-
 public struct OrganismDreamRepairState: Codable, Sendable, Equatable {
     public var receiptCount: Int
     public var lastReceipt: OrganismDreamRepairReceipt?
@@ -269,26 +257,28 @@ public struct OrganismDreamRepairState: Codable, Sendable, Equatable {
 }
 
 public enum OrganismDreamRepair {
+    private static let maximumOperations = 16
+    private static let maximumFeltSummaryCharacters = 1_200
+
     public static func applying(
         signal: SomaticSignal,
         to field: OrganismField,
         state: OrganismDreamRepairState,
-        limits: OrganismDreamRepairLimits = .defaults,
         makeUUID: () -> UUID = { UUID() }
     ) -> (field: OrganismField, state: OrganismDreamRepairState) {
         guard signal.kind == .dreamCompleted || signal.kind == .remIntegrated else {
             return (field, state)
         }
 
-        let feltSummary = feltDaySummary(from: signal.metadata, limit: limits.maximumFeltSummaryCharacters)
+        let feltSummary = feltDaySummary(from: signal.metadata, limit: maximumFeltSummaryCharacters)
         var nextField = field
         var operations: [OrganismRepairOperation] = []
 
-        repairHighChargeNodes(in: &nextField, operations: &operations, limit: limits.maximumOperations)
-        strengthenWarmAssociations(in: &nextField, operations: &operations, limit: limits.maximumOperations)
-        weakenNoisyLoops(in: &nextField, operations: &operations, limit: limits.maximumOperations)
+        repairHighChargeNodes(in: &nextField, operations: &operations, limit: maximumOperations)
+        strengthenWarmAssociations(in: &nextField, operations: &operations, limit: maximumOperations)
+        weakenNoisyLoops(in: &nextField, operations: &operations, limit: maximumOperations)
 
-        let flags = contradictionFlags(in: feltSummary, remaining: max(0, limits.maximumOperations - operations.count))
+        let flags = contradictionFlags(in: feltSummary, remaining: max(0, maximumOperations - operations.count))
         operations.append(contentsOf: flags)
         let evidence = evidenceLinks(
             feltSummary: feltSummary,
@@ -333,7 +323,6 @@ public enum OrganismDreamRepair {
         at date: Date,
         to field: OrganismField,
         state: OrganismDreamRepairState,
-        limits: OrganismDreamRepairLimits = .defaults,
         makeUUID: () -> UUID = { UUID() }
     ) -> (field: OrganismField, state: OrganismDreamRepairState) {
         guard opportunity.ready,
@@ -346,13 +335,13 @@ public enum OrganismDreamRepair {
             ids: opportunity.chargedNodeIDs,
             in: &nextField,
             operations: &operations,
-            limit: limits.maximumOperations
+            limit: maximumOperations
         )
         repairResidualNoise(
             ids: opportunity.noisyEdgeIDs,
             in: &nextField,
             operations: &operations,
-            limit: limits.maximumOperations
+            limit: maximumOperations
         )
         guard !operations.isEmpty else { return (field, state) }
 

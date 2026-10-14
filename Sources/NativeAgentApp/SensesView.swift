@@ -8,6 +8,7 @@ import Senses
 @Observable
 final class SensesSurfaceState {
     var records: [SenseRecord] = []
+    var surfaceNames: [SenseCorner: String] = [:]
     var news: [SenseNews] = []
     var interactiveView: SenseInteractiveView?
     var isWired = false
@@ -17,28 +18,37 @@ final class SensesSurfaceState {
     /// cleared by the next good read.
     var error: String?
     var readError: String?
+    @ObservationIgnored private var refreshGeneration = 0
 
     func refresh() async {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         let hub = SensesHub.shared
-        isWired = hub.registry != nil
+        let wired = hub.registry != nil
+        if isWired != wired { isWired = wired }
         async let news = SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity)
         async let view = SenseNewsBoard.shared.interactiveView()
         do {
-            let records: [SenseRecord]
-            if let registry = hub.registry as? any SenseRegistryManaging { records = try await registry.allChecked() }
-            else { records = try await hub.registry?.all() ?? [] }
-            self.records = records.sorted { $0.corner.key < $1.corner.key }
-            readError = nil
-        } catch { readError = "Senses registry unavailable: \(error.localizedDescription)" }
-        self.news = Array((await news).prefix(12))
-        if let view = await view, self.records.contains(where: {
-            $0.id == view.senseID && $0.version == view.version && $0.status == .on
-        }) {
-            interactiveView = view
-        } else {
-            interactiveView = nil
+            let (sorted, names) = try await hub.presentationRecords()
+            guard generation == refreshGeneration, !Task.isCancelled else { return }
+            if self.records != sorted { self.records = sorted }
+            if surfaceNames != names { surfaceNames = names }
+            if readError != nil { readError = nil }
+        } catch {
+            guard generation == refreshGeneration, !Task.isCancelled else { return }
+            let message = "Senses registry unavailable: \(error.localizedDescription)"
+            if readError != message { readError = message }
         }
-        loaded = true
+        let latest = Array((await news).prefix(12))
+        let nextView = await view
+        guard generation == refreshGeneration, !Task.isCancelled else { return }
+        if self.news != latest { self.news = latest }
+        if let view = nextView, view.isCurrent(in: self.records) {
+            if interactiveView != view { interactiveView = view }
+        } else {
+            if interactiveView != nil { interactiveView = nil }
+        }
+        if !loaded { loaded = true }
     }
 
     func observe() async {
@@ -56,7 +66,8 @@ final class SensesSurfaceState {
             return
         }
         do {
-            _ = try await registry.setStatus(id: record.id, version: record.version, status: enabled ? .on : .archived)
+            _ = try await registry.setStatus(id: record.id, version: record.version, status: enabled ? .on : .off,
+                                             preview: false, ownerAuthorized: true)
             error = nil
         } catch {
             self.error = "I couldn't save this switch: \(error.localizedDescription)"
@@ -85,21 +96,6 @@ final class SensesSurfaceState {
     }
 }
 
-extension SenseCorner {
-    var surfaceName: String {
-        switch self {
-        case .app(let id):
-            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
-                return url.deletingPathExtension().lastPathComponent
-            }
-            return id
-        case .fileKind(let kind): return ".\(kind) files"
-        case .site(let host): return host
-        case .stream(let id), .need(let id): return id
-        }
-    }
-}
-
 struct SensesView: View {
     @State private var state = SensesSurfaceState()
 
@@ -123,9 +119,13 @@ struct SensesView: View {
                     } else if state.records.isEmpty, state.readError == nil {
                         AdvancedEmptyState(title: "No senses yet.")
                     } else {
-                        ForEach(state.records, id: \.id) { record in
-                            senseRow(record)
-                            if record.id != state.records.last?.id { Divider() }
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(state.records, id: \.id) { record in
+                                if let surfaceName = state.surfaceNames[record.corner] {
+                                    senseRow(record, surfaceName: surfaceName)
+                                }
+                                if record.id != state.records.last?.id { Divider() }
+                            }
                         }
                     }
                 }
@@ -151,12 +151,12 @@ struct SensesView: View {
         .quietReadTask(live: false) { await state.refresh() }
     }
 
-    private func senseRow(_ record: SenseRecord) -> some View {
+    private func senseRow(_ record: SenseRecord, surfaceName: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle(isOn: Binding(get: { record.status == .on }, set: { enabled in
                 Task { await state.setEnabled(enabled, record: record) }
             })) {
-                Text("\(record.corner.surfaceName) · v\(record.version)")
+                Text("\(surfaceName) · v\(record.version)")
                     .font(ShellType.labelMedium)
             }
             .toggleStyle(.switch)

@@ -25,9 +25,9 @@ extension SwiftToolDispatcher {
                 "query": .string(rawQuery),
             ])
         }
-        let limit = max(1, min(optionalInt(input, "limit") ?? 3, 4))
-        let deskOffset = max(0, min(optionalInt(input, "desk_offset") ?? 0, 1_000_000))
-        let historyOffset = max(0, min(optionalInt(input, "history_offset") ?? 0, 1_000_000))
+        let limit = max(1, min(Self.jsonInt(input["limit"]) ?? 3, 4))
+        let deskOffset = max(0, min(Self.jsonInt(input["desk_offset"]) ?? 0, 1_000_000))
+        let historyOffset = max(0, min(Self.jsonInt(input["history_offset"]) ?? 0, 1_000_000))
         var continuation = input.filter { ["query", "session_id", "limit"].contains($0.key) && $0.value != .null }
         continuation["query"] = .string(rawQuery)
         continuation["limit"] = .int(Int64(limit))
@@ -54,6 +54,11 @@ extension SwiftToolDispatcher {
         }
 
         async let mail = workContextMail(query: query, surface: surface)
+        async let history = impl_search_chat_history(
+            input: historyInput, invokedAs: "search_chat_history",
+            workContextQuery: query,
+            excludingRunID: ChatTurnExecution.current?.historyRunID
+        )
         var deskResult: JSONValue
         var historyResult: JSONValue
         var partial = false
@@ -105,11 +110,7 @@ extension SwiftToolDispatcher {
             ])
         }
         do {
-            let result = try await impl_search_chat_history(
-                input: historyInput, invokedAs: "search_chat_history",
-                workContextQuery: query,
-                excludingRunID: ChatTurnExecution.current?.historyRunID
-            )
+            let result = try await history
             if case .object(let result) = result {
                 var lane: [String: JSONValue] = [
                     "status": .string("ok"), "source": .string("canonical_chat_history"),
@@ -125,7 +126,7 @@ extension SwiftToolDispatcher {
                 }
                 if result["has_more"] == .bool(true) {
                     var next = continuation
-                    let returned = optionalInt(result, "returned_count") ?? 0
+                    let returned = Self.jsonInt(result["returned_count"]) ?? 0
                     if returned > 0 {
                         next["history_offset"] = .int(Int64(historyOffset + returned))
                         lane["next_read"] = Self.workContextRead("work_context", next)

@@ -160,19 +160,6 @@ public enum MemoryProbeRunner {
             total: probes.count, hits: hits, misses: misses, hitProbeIds: hitProbeIds)
     }
 
-    /// Score the probe set against one store (embeds + evaluates).
-    public static func run(
-        probeSet: MemoryProbeSet,
-        storage: MemoryStorage,
-        embedder: any EmbeddingProvider
-    ) async throws -> MemoryProbeScore {
-        let batch = try await embedQuestionsWithEpoch(probeSet.probes, embedder: embedder)
-        return try await evaluate(
-            storage: storage, probes: probeSet.probes,
-            vectors: batch.vectors, topK: probeSet.topK,
-            embeddingEpoch: batch.epoch
-        )
-    }
 
     /// Score live and candidate with ONE shared embedding pass.
     public static func compare(

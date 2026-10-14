@@ -25,13 +25,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
         for person in knownPeople where !person.isEmpty && knownTermMentioned(person, in: content) {
             add(person, forcedType: "person")
         }
+        let contentRange = NSRange(content.startIndex..<content.endIndex, in: content)
         for term in knownTerms {
-            // 2026-07-21 audit: the bare caseInsensitive substring match had
-            // no word boundary, so "Apple" matched "pineapple" (and any
-            // other word containing a known term). Match on word boundaries
-            // instead. (Diacritic-insensitivity is dropped with the move to
-            // NSRegularExpression — no known term carries diacritics.)
-            if knownTermMentioned(term.name, in: content) {
+            if term.regex.firstMatch(in: content, range: contentRange) != nil {
                 add(term.name, forcedType: term.type)
             }
         }
@@ -235,10 +231,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    /// Whole-word, case-insensitive mention check for `knownTerms`. Word
-    /// boundaries keep "Apple" from firing inside "pineapple" while still
-    /// matching "Apple's" / "(Apple)". All known terms start and end with a
-    /// word character, so `\b…\b` is the correct frame.
+    /// Dynamic people use the same whole-word, case-insensitive frame as the
+    /// fixed terms compiled below.
     private static func knownTermMentioned(_ term: String, in content: String) -> Bool {
         let pattern = "\\b" + NSRegularExpression.escapedPattern(for: term) + "\\b"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
@@ -323,7 +317,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return "concept"
     }
 
-    private static let knownTerms: [(name: String, type: String)] = [
+    private static let knownTerms: [(name: String, type: String, regex: NSRegularExpression)] = [
         ("NativeAgent", "project"),
         ("Claude", "tool"),
         ("GPT", "tool"),
@@ -353,7 +347,12 @@ extension SwiftNativeKnowledgeGraphIndexer {
         ("USER.md", "tool"),
         ("GROWTH.md", "tool"),
         ("AGENTS.md", "tool"),
-    ]
+    ].map { name, type in
+        (name, type, try! NSRegularExpression(
+            pattern: "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b",
+            options: [.caseInsensitive]
+        ))
+    }
 
     private static let canonicalPersonaDocuments: [String: String] = [
         "SOUL.MD": "SOUL.md",

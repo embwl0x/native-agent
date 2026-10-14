@@ -4,10 +4,6 @@ import Foundation
 // no persistence or owning-system dependencies: authority/privacy arrive from
 // canonical sources, and durable learning can leave Context only as a proposal.
 
-public enum ContextFeedbackStorageClass: String, Codable, Sendable {
-    case rebuildableCache = "rebuildable_cache"
-}
-
 public enum ContextCorrectionEffect: String, Codable, Sendable {
     case confirms
     case contradicts
@@ -60,27 +56,20 @@ public struct ContextFeedbackEvent: Codable, Equatable, Sendable {
     }
 }
 
-/// Canonical inputs plus optional compiler defaults. Feedback never mutates the
-/// policy fields; a rebuild obtains them again from the current generation.
+/// Canonical scoring inputs rebuilt from the current generation.
 public struct ContextFeedbackSeed: Codable, Equatable, Sendable {
     public let atomID: ContextAtomID
-    public let authority: ContextAuthority
-    public let privacy: ContextPrivacy
     public let baseUtility: Double
     public let baseActivation: Double
     public let baseDecay: Double
 
     public init(
         atomID: ContextAtomID,
-        authority: ContextAuthority,
-        privacy: ContextPrivacy,
         baseUtility: Double = 0,
         baseActivation: Double = 0,
         baseDecay: Double = 1
     ) {
         self.atomID = atomID
-        self.authority = authority
-        self.privacy = privacy
         self.baseUtility = Self.clamp(baseUtility, to: -1 ... 1)
         self.baseActivation = Self.clamp(baseActivation, to: -1 ... 1)
         self.baseDecay = Self.clamp(baseDecay, to: 0 ... 1)
@@ -91,76 +80,28 @@ public struct ContextFeedbackSeed: Codable, Equatable, Sendable {
     }
 }
 
-public struct ContextFeedbackConfiguration: Codable, Equatable, Sendable {
-    public let minimumUtility: Double
-    public let maximumUtility: Double
-    public let retrievalUtilityCap: Double
-    public let selectionUtilityDelta: Double
-    public let expansionUtilityDelta: Double
-    public let utilityRetentionPerBucket: Double
-    public let activationRetentionPerBucket: Double
-    public let decayRetentionPerBucket: Double
-
-    public init(
-        minimumUtility: Double = -1,
-        maximumUtility: Double = 1,
-        retrievalUtilityCap: Double = 0.18,
-        selectionUtilityDelta: Double = 0.01,
-        expansionUtilityDelta: Double = 0.025,
-        utilityRetentionPerBucket: Double = 0.995,
-        activationRetentionPerBucket: Double = 0.82,
-        decayRetentionPerBucket: Double = 0.997
-    ) {
-        let proposedLower = minimumUtility.isFinite ? minimumUtility : -1
-        let proposedUpper = maximumUtility.isFinite ? maximumUtility : 1
-        self.minimumUtility = min(1, max(-1, min(proposedLower, proposedUpper)))
-        self.maximumUtility = min(1, max(-1, max(proposedLower, proposedUpper)))
-        self.retrievalUtilityCap = min(1, max(0, retrievalUtilityCap))
-        self.selectionUtilityDelta = min(1, max(0, selectionUtilityDelta))
-        self.expansionUtilityDelta = min(1, max(0, expansionUtilityDelta))
-        self.utilityRetentionPerBucket = min(1, max(0, utilityRetentionPerBucket))
-        self.activationRetentionPerBucket = min(1, max(0, activationRetentionPerBucket))
-        self.decayRetentionPerBucket = min(1, max(0, decayRetentionPerBucket))
-    }
+private struct ContextFeedbackConfiguration: Sendable {
+    public let minimumUtility: Double = -1
+    public let maximumUtility: Double = 1
+    public let retrievalUtilityCap: Double = 0.18
+    public let expansionUtilityDelta: Double = 0.025
+    public let utilityRetentionPerBucket: Double = 0.995
+    public let activationRetentionPerBucket: Double = 0.82
+    public let decayRetentionPerBucket: Double = 0.997
 }
 
-public struct ContextFeedbackAtomState: Codable, Equatable, Sendable {
+public struct ContextFeedbackAtomState: Equatable, Sendable {
     public let atomID: ContextAtomID
-    public let authority: ContextAuthority
-    public let privacy: ContextPrivacy
     public let utility: Double
-    public let retrievalUtility: Double
     public let temporaryActivation: Double
     public let decay: Double
-    public let selectionCount: Int
-    public let expansionCount: Int
-    public let correctionCount: Int
-    public let retryCount: Int
-    public let outcomeCount: Int
-    public let lastTimeBucket: Int64?
-
-    fileprivate let outcomeUtility: Double
 }
 
-public struct ContextFeedbackSnapshot: Codable, Equatable, Sendable {
-    public let storageClass: ContextFeedbackStorageClass
+public struct ContextFeedbackSnapshot: Equatable, Sendable {
     public let states: [ContextFeedbackAtomState]
-    public let appliedEventIDs: [String]
-    public let throughTimeBucket: Int64?
 
-    public init(
-        states: [ContextFeedbackAtomState],
-        appliedEventIDs: [String],
-        throughTimeBucket: Int64?
-    ) {
-        storageClass = .rebuildableCache
+    public init(states: [ContextFeedbackAtomState]) {
         self.states = states.sorted { $0.atomID < $1.atomID }
-        self.appliedEventIDs = appliedEventIDs.sorted()
-        self.throughTimeBucket = throughTimeBucket
-    }
-
-    public subscript(atomID: ContextAtomID) -> ContextFeedbackAtomState? {
-        states.first { $0.atomID == atomID }
     }
 }
 
@@ -172,15 +113,13 @@ public enum ContextFeedbackError: Error, Equatable, Sendable {
     case timeBeforeSeed(atomID: ContextAtomID, eventBucket: Int64, stateBucket: Int64)
 }
 
-/// Deterministic FC7 utility reducer. Selection and expansion contribute only
-/// to the separately capped retrieval component. Corrections, retries, and
+/// Deterministic FC7 utility reducer. Expansion contributes only to the
+/// separately capped retrieval component. Corrections, retries, and
 /// outcomes affect the bounded outcome component and temporary activation.
 public struct ContextFeedbackReducer: Sendable {
-    public let configuration: ContextFeedbackConfiguration
+    private let configuration = ContextFeedbackConfiguration()
 
-    public init(configuration: ContextFeedbackConfiguration = .init()) {
-        self.configuration = configuration
-    }
+    public init() {}
 
     public func rebuild(
         seeds: [ContextFeedbackSeed],
@@ -226,9 +165,7 @@ public struct ContextFeedbackReducer: Sendable {
             }
         }
         return ContextFeedbackSnapshot(
-            states: working.values.map { $0.frozen(configuration: configuration) },
-            appliedEventIDs: Array(eventByID.keys),
-            throughTimeBucket: finalBucket
+            states: working.values.map { $0.frozen(configuration: configuration) }
         )
     }
 }
@@ -236,23 +173,14 @@ public struct ContextFeedbackReducer: Sendable {
 private extension ContextFeedbackReducer {
     struct MutableState {
         let atomID: ContextAtomID
-        let authority: ContextAuthority
-        let privacy: ContextPrivacy
         var outcomeUtility: Double
         var retrievalUtility: Double = 0
         var temporaryActivation: Double
         var decay: Double
-        var selectionCount = 0
-        var expansionCount = 0
-        var correctionCount = 0
-        var retryCount = 0
-        var outcomeCount = 0
         var lastTimeBucket: Int64?
 
         init(seed: ContextFeedbackSeed, configuration: ContextFeedbackConfiguration) {
             atomID = seed.atomID
-            authority = seed.authority
-            privacy = seed.privacy
             outcomeUtility = Self.clamp(
                 seed.baseUtility,
                 configuration.minimumUtility ... configuration.maximumUtility
@@ -292,47 +220,34 @@ private extension ContextFeedbackReducer {
             try advance(to: event.timeBucket, configuration: configuration)
             switch event.signal {
             case .selection:
-                // 2026-09-22: count only. Being picked raised the score that
-                // picked it, so the same 8 memories held 75% of slots on every
-                // topic. Expansion and outcomes still move the score.
-                selectionCount += 1
+                break
             case .expansion:
-                expansionCount += 1
                 retrievalUtility += configuration.expansionUtilityDelta
                 temporaryActivation += 0.12
                 decay += 0.035
             case .correction(.confirms):
-                correctionCount += 1
                 outcomeUtility += 0.28
                 temporaryActivation += 0.45
                 decay += 0.15
             case .correction(.contradicts):
-                correctionCount += 1
                 outcomeUtility -= 0.45
                 temporaryActivation -= 0.75
                 decay -= 0.30
             case .retry:
-                retryCount += 1
                 outcomeUtility -= 0.12
                 temporaryActivation -= 0.20
                 decay -= 0.10
             case .outcome(.completed):
-                // A response merely reaching completion is transport evidence,
-                // not evidence that every selected atom helped. Keep the count
-                // for replay/diagnostics without manufacturing retrieval value.
-                outcomeCount += 1
+                break
             case .outcome(.confirmed):
-                outcomeCount += 1
                 outcomeUtility += 0.16
                 temporaryActivation += 0.18
                 decay += 0.08
             case .outcome(.contradicted):
-                outcomeCount += 1
                 outcomeUtility -= 0.30
                 temporaryActivation -= 0.45
                 decay -= 0.22
             case .outcome(.abandoned):
-                outcomeCount += 1
                 outcomeUtility -= 0.14
                 temporaryActivation -= 0.18
                 decay -= 0.12
@@ -352,22 +267,12 @@ private extension ContextFeedbackReducer {
         func frozen(configuration: ContextFeedbackConfiguration) -> ContextFeedbackAtomState {
             ContextFeedbackAtomState(
                 atomID: atomID,
-                authority: authority,
-                privacy: privacy,
                 utility: Self.clamp(
                     outcomeUtility + retrievalUtility,
                     configuration.minimumUtility ... configuration.maximumUtility
                 ),
-                retrievalUtility: retrievalUtility,
                 temporaryActivation: temporaryActivation,
-                decay: decay,
-                selectionCount: selectionCount,
-                expansionCount: expansionCount,
-                correctionCount: correctionCount,
-                retryCount: retryCount,
-                outcomeCount: outcomeCount,
-                lastTimeBucket: lastTimeBucket,
-                outcomeUtility: outcomeUtility
+                decay: decay
             )
         }
 

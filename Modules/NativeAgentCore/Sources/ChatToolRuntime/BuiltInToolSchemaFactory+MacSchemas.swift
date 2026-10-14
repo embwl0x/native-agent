@@ -16,7 +16,7 @@ extension BuiltInToolSchemaFactory {
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "mac_screenshot_save",
-                    description: "Save a system screenshot as PNG with macOS screencapture, without displaying pixels to the model. Defaults to all displays, Desktop and macOS screenshot naming; returns saved paths. Optional window_id, app (front visible window by exact app name) or region selects one capture. Requires Full Mac file access, the Accessibility category and Screen Recording permission; existing files are refused. Use mac.look pixels:true separately to view masked model pixels.",
+                    description: "Save a system screenshot as PNG with macOS screencapture only when a saved file is requested. To look at the screen or take a screenshot and describe it, use mac.look pixels:true, which respects owner takeover and writes no file. Saving defaults to all displays, Desktop and macOS screenshot naming; returns saved paths without displaying pixels to the model. Optional window_id, app (front visible window by exact app name) or region selects one capture. Requires Full Mac file access, the Accessibility category and Screen Recording permission; existing files are refused.",
                     parametersJSON: params(properties: [
                         ("path", strSchema("PNG destination path; defaults to Desktop/Screenshot with the local date and time. Additional displays get numbered PNG paths.")),
                         ("window_id", intSchema("Exact visible window number; cannot combine with app or region.", minimum: 1)),
@@ -388,24 +388,6 @@ extension BuiltInToolSchemaFactory {
             ])
         }
         if includeFullMacAccessibilityInjectionTools {
-            // Action descriptions state their target and required authority.
-            func intArraySchema(_ desc: String) -> JSONValue {
-                obj([
-                    ("type", .string("array")),
-                    ("items", obj([("type", .string("integer"))])),
-                    ("description", .string(desc)),
-                ])
-            }
-            func pointSchema(_ desc: String) -> JSONValue {
-                obj([
-                    ("type", .string("object")),
-                    ("description", .string(desc)),
-                    ("properties", obj([
-                        ("x", intSchema("Screen x coordinate.")),
-                        ("y", intSchema("Screen y coordinate.")),
-                    ])),
-                ])
-            }
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "act",

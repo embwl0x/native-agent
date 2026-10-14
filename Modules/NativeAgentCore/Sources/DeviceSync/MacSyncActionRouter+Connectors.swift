@@ -2,7 +2,7 @@ import Foundation
 
 extension MacSyncActionRouter {
     func connectorAction(_ action: InboxAction) async throws -> [String: String] {
-        if let message = sync.pairedPhones.authorize(action, requiresPairing: true) {
+        if let message = await sync.pairedPhones.authorize(action, requiresPairing: true) {
             return ["status": "error", "ok": "false", "code": "device_not_verified", "message": message]
         }
         let payload = action.payload

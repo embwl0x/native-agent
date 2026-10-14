@@ -1,3 +1,4 @@
+import EngineRuntime
 import Connectors
 import ProviderRouting
 // PATCH-2026-05-07: oauth-registration-2 Inline OAuth wizard — ConnectorWizardView
@@ -67,18 +68,6 @@ enum GoogleOAuthSetupGuidance {
         guard case .nativeOAuth(let id) = ConnectorWizardSetupRoute.resolve(provider: provider),
               id == "gmail" || id == "calendar" else { return nil }
         return id
-    }
-
-    static func clientIDIssue(_ value: String) -> String? {
-        let id = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard id.count <= 512, id.hasSuffix(".apps.googleusercontent.com"),
-              id.count > ".apps.googleusercontent.com".count,
-              !id.unicodeScalars.contains(where: {
-                  CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0)
-              }) else {
-            return "That isn't a Google Client ID. Copy the one ending in .apps.googleusercontent.com from Google Auth Platform › Clients."
-        }
-        return nil
     }
 }
 
@@ -164,7 +153,7 @@ struct ConnectorWizardView: View {
     }
 
     private var slackAllowlistConfigured: Bool {
-        !parseSlackIDs(slackAllowedChannels).isEmpty || !parseSlackIDs(slackAllowedUsers).isEmpty
+        !SlackSocketModeConfig.parseIDs(slackAllowedChannels).isEmpty || !SlackSocketModeConfig.parseIDs(slackAllowedUsers).isEmpty
     }
 
     var body: some View {
@@ -711,7 +700,7 @@ struct ConnectorWizardView: View {
     private func failure(
         _ raw: String?, typed: [String] = [], fallback: String, classify: Bool = true
     ) -> String {
-        let reason = InlineConnectorSetup.failureReason(
+        let reason = NativeOAuthFlow.inlineSetupFailureReason(
             raw ?? "", service: displayName, typed: typed, otherwise: fallback)
         guard classify else { return fallback }
         if reason.hasPrefix("Couldn't reach") {
@@ -785,7 +774,7 @@ struct ConnectorWizardView: View {
             githubCode = code
             copyGitHubCode(code.userCode)
             NSWorkspace.shared.open(code.verificationURI)
-            let outcome = await NativeOAuthFlow.completeGitHubDeviceFlow(code, credentialStore: AppGitHubOAuthCredentials())
+            let outcome = await NativeOAuthFlow.completeGitHubDeviceFlow(code, credentialStore: GitHubCredentialStore.shared)
             guard !Task.isCancelled else { return }
             githubCode = nil
             if outcome.result.ok {
@@ -824,7 +813,7 @@ struct ConnectorWizardView: View {
 
     private func saveAppCredentials() {
         if googleConnectorId != nil,
-           let issue = GoogleOAuthSetupGuidance.clientIDIssue(state.oauthClientId) {
+           let issue = NativeOAuthFlow.googleClientIDIssue(state.oauthClientId) {
             state.errorMessage = issue
             return
         }
@@ -876,8 +865,8 @@ struct ConnectorWizardView: View {
         let result = await NativeOAuthFlow.saveSlackToken(
             slackToken,
             appToken: slackAppToken,
-            allowedChannelIds: parseSlackIDs(slackAllowedChannels),
-            allowedUserIds: parseSlackIDs(slackAllowedUsers),
+            allowedChannelIds: SlackSocketModeConfig.parseIDs(slackAllowedChannels),
+            allowedUserIds: SlackSocketModeConfig.parseIDs(slackAllowedUsers),
             requireMention: slackRequireMention
         )
         guard !Task.isCancelled else { return }
@@ -885,7 +874,7 @@ struct ConnectorWizardView: View {
             slackToken = ""
             slackAppToken = ""
             state.step = .success
-            _ = await BackgroundLoopsManager.shared.restartLoop(id: "slack_socket_mode")
+            _ = await NativeAgentEngine.restartBackgroundLoop(id: "slack_socket_mode")
             await appModel.refreshForSidebarItem(.connectors)
         } else {
             state.errorMessage = failure(
@@ -901,18 +890,12 @@ struct ConnectorWizardView: View {
         slackRequireMention = policy.requireMention
     }
 
-    private func parseSlackIDs(_ raw: String) -> Set<String> {
-        Set(raw.split { $0 == "," || $0 == ";" || $0.isWhitespace }
-            .map(String.init)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty })
-    }
 
     private func saveGitHubToken() async {
         isSaving = true
         defer { isSaving = false }
 
-        let result = await NativeOAuthFlow.saveGitHubToken(githubToken, credentialStore: AppGitHubOAuthCredentials())
+        let result = await NativeOAuthFlow.saveGitHubToken(githubToken, credentialStore: GitHubCredentialStore.shared)
         guard !Task.isCancelled else { return }
         if result.ok {
             githubToken = ""

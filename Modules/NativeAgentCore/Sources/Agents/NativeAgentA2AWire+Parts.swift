@@ -36,38 +36,28 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
         }
     }
 
-    static func decode03(_ object: [String: Any]) throws -> Self {
-        try decode(object, version: "0.3")
-    }
-
     static func decode(_ object: [String: Any], version: String) throws -> Self {
         if version == "0.3", let kind = object["kind"] as? String, !["text", "file", "data"].contains(kind) {
             throw AgentContactFailure(code: -32005, message: "This kind of content is not supported")
         }
-        let value = try JSONDecoder().decode(JSONValue.self, from: JSONSerialization.data(withJSONObject: object))
-        let canonical = try AgentA2AWire.canonicalPart(value, version: version)
-        guard var object = Self.object(try AgentA2AWire.wirePart(canonical, version: "0.3")) as? [String: Any] else { throw invalidPart }
-        // Admission keeps the original Value; wrapping is only a 0.3 output
-        // compatibility rule, not a mutation of the internal attachment.
-        if case .object(let fields) = canonical, let data = fields["data"] { object["data"] = Self.object(data) }
+        let value = JSONValue(fromFoundation: object)
+        guard case .object(let part) = try AgentA2AWire.canonicalPart(value, version: version) else { throw invalidPart }
         let metadata: JSONValue
-        if let value = object["metadata"] {
-            guard value is [String: Any] else { throw AgentContactFailure(code: -32602, message: "Invalid part details") }
-            metadata = try JSONDecoder().decode(JSONValue.self, from: JSONSerialization.data(withJSONObject: value))
+        if let value = part["metadata"] {
+            guard case .object = value else { throw AgentContactFailure(code: -32602, message: "Invalid part details") }
+            metadata = value
         } else { metadata = .object([:]) }
-        switch object["kind"] as? String {
-        case "text":
-            guard let text = object["text"] as? String else { throw invalidPart }
+        if case .string(let text)? = part["text"] {
             return .text(text)
-        case "data":
-            guard let object = object["data"] else { throw invalidPart }
-            let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .fragmentsAllowed])
+        } else if let data = part["data"] {
+            // Keep Foundation's escaped-byte limit for data; file bytes never
+            // take a JSON round trip during admission.
+            let bytes = try JSONSerialization.data(withJSONObject: Self.object(data), options: [.sortedKeys, .fragmentsAllowed])
             guard bytes.count <= 64000 else { throw AgentContactFailure(code: -32602, message: "Data is too large") }
-            return .data(try JSONDecoder().decode(JSONValue.self, from: bytes), metadata: metadata)
-        case "file":
-            guard let file = object["file"] as? [String: Any] else { throw invalidPart }
-            if let uri = file["uri"] {
-                guard file["bytes"] == nil, let uri = uri as? String, uri.utf8.count <= 2048,
+            return .data(data, metadata: metadata)
+        } else {
+            if let uri = part["url"] {
+                guard part["raw"] == nil, case .string(let uri) = uri, uri.utf8.count <= 2048,
                       let url = URL(string: uri), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
                       url.host != nil, url.user == nil, url.password == nil, url.fragment == nil else { throw invalidPart }
                 // Fetching a link can itself be an effect. Never read a caller's
@@ -75,20 +65,21 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
                 // fetch remote content outside the ordinary approval path.
                 throw AgentContactFailure(code: -32005, message: "Send the file's bytes instead of a link")
             }
-            guard let encoded = file["bytes"] as? String, encoded.utf8.count <= 13_333_336,
+            guard case .string(let encoded)? = part["raw"], encoded.utf8.count <= 13_333_336,
                   let bytes = Data(base64Encoded: encoded), !bytes.isEmpty, bytes.count <= maximumFileBytes else { throw invalidPart }
-            let mediaType = file["mimeType"] as? String ?? "application/octet-stream"
+            let mediaType: String
+            if case .string(let value)? = part["mediaType"] { mediaType = value } else { mediaType = "application/octet-stream" }
             guard inputModes.contains(mediaType), mediaType != "application/json" else {
                 throw AgentContactFailure(code: -32005, message: "This file type cannot be attached")
             }
             let fallback = ["image/png": "attachment.png", "image/jpeg": "attachment.jpg", "image/heic": "attachment.heic",
                 "image/webp": "attachment.webp", "image/gif": "attachment.gif", "application/pdf": "attachment.pdf",
                 "text/plain": "attachment.txt"]
-            let name = file["name"] as? String ?? fallback[mediaType] ?? "attachment"
+            let name: String
+            if case .string(let value)? = part["filename"] { name = value } else { name = fallback[mediaType] ?? "attachment" }
             guard safeName(name), let type = ChatAttachmentTypeResolver.typeAndMime(forExtension: (name as NSString).pathExtension.lowercased()),
                   type.mime == mediaType else { throw invalidPart }
             return .file(name: name, mediaType: mediaType, bytes: bytes, metadata: metadata)
-        default: throw AgentContactFailure(code: -32005, message: "This kind of content is not supported")
         }
     }
 

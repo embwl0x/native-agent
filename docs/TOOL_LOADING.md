@@ -37,7 +37,11 @@ Information questions without a strong local action match offer a `web.search`
 next call and `web.read` for the chosen result URL. Nearby queries state when
 the current location is unknown; timezone is not location evidence.
 Action vectors are shared per model epoch; negative clauses lower matching
-actions. Find shows five ranked actions with `matched_actions` and `shown_actions`
+actions. Active authored tools, enabled skills and current on senses share this
+ranking, including declared descriptions, operations and input schemas. Skills
+and sense readers appear in `actions`, rather than separate ranked lists;
+sense verbs require a served thing from the current enabled version.
+Find shows five ranked actions with `matched_actions` and `shown_actions`
 counts. Known service blockers appear as `availability:"unavailable"` and
 `blocker`; page and index lists show the same reason. These are saved setup
 verdicts, not network-health checks, and do not change execution admission.
@@ -106,12 +110,15 @@ discovery tool.
   server list. The built-in search action appears as `web.search`; `web.read`
   reads a page.
 - Self-authored tools follow `tool.propose` → `tool.approve` →
-  `authored.<id>`. A proposal supplies Swift code and input/expected cases,
+  `authored.<id>`. A proposal supplies JavaScript run(input) and optional intercepted fixtures,
   with optional permissions and input schema. Only active registry entries
   become authored actions; approval follows the current Trust policy.
-- Skills provide guidance and optional admitted scripts: discovery can return
-  a `skill.read` call for a relevant body. `skill.save`, `skill.enable`,
-  `skill.run`, `skill.resume` and `skill.rollback` manage those procedures
+- Skills are JavaScript routines: discovery points to `skill.run`.
+  `skill.read` returns metadata and declared params/input schema; source:true
+  reviews exact code and fixtures. A routine without declared params says to
+  read its source before running it.
+  `skill.save`, `skill.validate`, `skill.enable`, `skill.run`, `skill.resume`
+  and `skill.rollback` use the shared executor and candidate lifecycle
   through the same app gates; a skill grants no new authority. See the
   [manifest spec](skill_manifest_spec.md).
 

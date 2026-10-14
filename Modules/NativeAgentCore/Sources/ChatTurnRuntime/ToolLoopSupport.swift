@@ -325,6 +325,7 @@ enum ProviderToolResultProjection {
         if toolName == "app", let data = content.data(using: .utf8),
            let value = try? JSONDecoder().decode(JSONValue.self, from: data),
            case .object(var frame) = value {
+            fields["version"] = frame["version"]
             // A home-item send puts its receipt on top and the room under view.
             if case .object(let view)? = frame["view"] { frame.merge(view) { top, _ in top } }
             let keys: Set<String> = ["status", "workspace", "path", "actions", "windows", "places", "desktop"]

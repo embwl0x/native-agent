@@ -39,7 +39,7 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
             }
             return try await readChanges(corner, address)
         }
-        guard case .fileKind = corner, case .file(let path, _) = try await material(for: corner, address: address) else {
+        guard case .fileKind = corner, case .file(let path, _, _) = try await material(for: corner, address: address) else {
             throw SenseFailure(code: "unsupported", message: "This corner has no event-backed source watch.")
         }
         let root = URL(fileURLWithPath: path)
@@ -53,6 +53,8 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
             var watched = Set(paths)
             defer { events.cancel(); pair.continuation.finish() }
             do {
+                await events.waitUntilArmed()
+                guard !Task.isCancelled else { return }
                 // One race-closing read, rather than one initial edge per
                 // package member. JS compares the actual bytes before notifying.
                 pair.continuation.yield(try await self.material(for: corner, address: address))
@@ -63,6 +65,8 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
                         let nextPaths = try Self.watchPaths(root)
                         if Set(nextPaths) != watched {
                             let next = FileChangeEvents(paths: nextPaths, emitInitial: false)
+                            await next.waitUntilArmed()
+                            guard !Task.isCancelled else { next.cancel(); return }
                             events.cancel(); events = next; watched = Set(nextPaths); rearmed = true
                         }
                         pair.continuation.yield(try await self.material(for: corner, address: address))

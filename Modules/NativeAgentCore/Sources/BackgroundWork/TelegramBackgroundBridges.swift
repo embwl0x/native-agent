@@ -304,19 +304,10 @@ public struct TelegramProviderRoutingBridge: ProviderRoutingRef, Sendable {
 }
 
 public struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
-    let dataRoot: URL
     let memory: SwiftNativeMemoryV2
 
-    public init(
-        dataRoot: URL,
-        memory: SwiftNativeMemoryV2? = nil
-    ) {
-        self.dataRoot = dataRoot
-        if let memory {
-            self.memory = memory
-        } else {
-            self.memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
-        }
+    public init(dataRoot: URL) {
+        self.memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
     }
 
     public func remember(text: String, source: String) async throws -> String {

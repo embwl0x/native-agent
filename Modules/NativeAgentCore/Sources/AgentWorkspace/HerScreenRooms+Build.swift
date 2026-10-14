@@ -1,4 +1,5 @@
 import Foundation
+import MacControl
 import NativeAgentCore
 import PersistenceCore
 
@@ -297,9 +298,9 @@ extension HerScreen {
             return screen(["CODE", "no source checkout on this Mac"], [section("RUNS", runs(dataRoot: dataRoot, now: now))],
                 verbs: [("code.run", "run a shell command in the workspace (text)")])
         }
-        let (status, log) = await Task.detached {
-            (git(["status", "--porcelain=v1", "-b"], in: repo), git(["log", "-3", "--format=%h%x09%ct%x09%s"], in: repo))
-        }.value
+        async let statusRead = git(["status", "--porcelain=v1", "-b"], in: repo)
+        async let logRead = git(["log", "-3", "--format=%h%x09%ct%x09%s"], in: repo)
+        let (status, log) = await (statusRead, logRead)
         var lines = (status ?? "").split(separator: "\n").map(String.init)
         let branch = lines.first.map { $0.hasPrefix("## ") ? String($0.dropFirst(3)) : "" } ?? ""
         if !lines.isEmpty { lines.removeFirst() }
@@ -316,19 +317,11 @@ extension HerScreen {
                     ("code.run", "run a shell command in the checkout (text)"), ("app swift.build · swift.test", "build or test")])
     }
 
-    private static func git(_ args: [String], in repo: URL) -> String? {
-        let process = Process(), pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["-C", repo.path] + args
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        let stop = DispatchWorkItem { if process.isRunning { process.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3, execute: stop)
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        stop.cancel()
-        return process.terminationStatus == 0 ? String(decoding: data.prefix(65_536), as: UTF8.self) : nil
+    private static func git(_ args: [String], in repo: URL) async -> String? {
+        guard let result = try? await SystemProcessAdapter().run(executable: "/usr/bin/git", arguments: ["-C", repo.path] + args,
+            currentDirectory: nil, environment: nil, standardInput: nil, timeoutSeconds: 3, outputByteLimit: 65_536),
+              result.exitCode == 0, !result.timedOut else { return nil }
+        return result.stdout
     }
 
     /// The builder's newest receipts (data/builder_audit), one line each.

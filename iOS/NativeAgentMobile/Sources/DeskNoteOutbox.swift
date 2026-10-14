@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Observation
 
 /// A Desk note written on the phone, held until the Mac confirms it.
 ///
@@ -34,23 +35,26 @@ struct MobileDeskPendingNote: Codable, Identifiable, Sendable {
 /// Drafts (unsubmitted text) and pending notes (submitted, unconfirmed), both
 /// durable and both keyed by Desk handle.
 @MainActor
-final class MobileDeskNoteOutbox: ObservableObject {
+@Observable
+final class MobileDeskNoteOutbox {
     static let shared = MobileDeskNoteOutbox()
 
-    @Published private(set) var drafts: [String: String] = [:] {
+    private(set) var drafts: [String: String] = [:] {
         didSet { persist(drafts, key: Self.draftsKey) }
     }
-    @Published private(set) var pending: [MobileDeskPendingNote] = [] {
+    private(set) var pending: [MobileDeskPendingNote] = [] {
         didSet { persist(pending, key: Self.pendingKey) }
     }
 
     private static let draftsKey = "NativeAgentMobile.deskNoteDrafts.v1"
     private static let pendingKey = "NativeAgentMobile.deskPendingNotes.v1"
     private let defaults: UserDefaults
+    private let storage: MobileLocalStorage
     private var inFlight: Set<String> = []
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        storage = MobileLocalStorage(defaults: defaults)
         if let data = defaults.data(forKey: Self.draftsKey),
            let restored = try? JSONDecoder().decode([String: String].self, from: data) {
             drafts = restored
@@ -61,9 +65,16 @@ final class MobileDeskNoteOutbox: ObservableObject {
         }
     }
 
-    private func persist<Value: Encodable>(_ value: Value, key: String) {
-        if let data = try? JSONEncoder().encode(value) {
-            defaults.set(data, forKey: key)
+    private func persist<Value: Encodable & Sendable>(_ value: Value, key: String) {
+        storage.save(key: key, value: { value }) { error in
+            NSLog("[DeskNoteOutbox] Could not save note: %@", error.localizedDescription)
+        }
+    }
+
+    func flushDrafts() {
+        Task {
+            do { try await storage.flush() }
+            catch { NSLog("[DeskNoteOutbox] Could not save draft: %@", error.localizedDescription) }
         }
     }
 
@@ -114,6 +125,7 @@ final class MobileDeskNoteOutbox: ObservableObject {
         Task { @MainActor in
             defer { inFlight.remove(note.id) }
             do {
+                try await storage.flush()
                 _ = try await engine.appendDeskItemNote(
                     handle: note.handle,
                     text: note.text,
@@ -122,7 +134,9 @@ final class MobileDeskNoteOutbox: ObservableObject {
                     onReplacement: { [weak self = self] replacement in
                         // Persist the replacement before its first send so an
                         // uncertain delivery is retried under the same identity.
-                        self?.replaceSubmission(id: note.id, with: replacement)
+                        guard let self else { throw CancellationError() }
+                        self.replaceSubmission(id: note.id, with: replacement)
+                        try await self.storage.flush()
                     }
                 )
                 // The Mac owns the Desk: its confirmation is what retires this

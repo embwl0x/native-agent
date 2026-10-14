@@ -3,6 +3,7 @@ import os
 
 /// Module diagnostics. Callers must keep credential values out of messages.
 public struct ModuleLog: Sendable {
+    public static let app = ModuleLog(category: "NativeAgentApp")
     private let logger: Logger
 
     public init(category: String) {

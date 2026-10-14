@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 
@@ -12,6 +13,13 @@ public struct TrustPolicyActions: Sendable {
 
     private func postTrustWrite(body: [String: Any]) async throws -> TrustPolicy {
         try await TrustPolicyToolWriter.applyTrustPolicyPatch(body: body, dataRoot: dataRoot)
+    }
+
+    public func saveWorkshopPolicyToggle(enabled: Bool? = nil, showTimeline: Bool? = nil) async throws -> TrustPolicy {
+        var patch: [String: Any] = [:]
+        if let enabled { patch["enabled"] = enabled }
+        if let showTimeline { patch["showTimeline"] = showTimeline }
+        return try await postTrustWrite(body: [WorkshopPolicyBlockVocabulary.wireKey: patch])
     }
 
     /// The Developer Mode toggle is an operator-facing, restart-applied policy
@@ -101,23 +109,7 @@ public struct TrustPolicyActions: Sendable {
         _ policy: TrustMacControlPolicy,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
     ) async throws -> TrustPolicy {
-        let approvalList: [String] = policy.approvalRequiredFor
-        let body: [String: Any] = [
-            "macControlPolicy": [
-                "enabled": policy.enabled,
-                "applescript_allowed": policy.applesScriptAllowed,
-                "jxa_allowed": policy.jxaAllowed,
-                "shortcuts_allowed": policy.shortcutsAllowed,
-                "accessibility_allowed": policy.accessibilityAllowed,
-                "system_control_allowed": policy.systemControlAllowed,
-                "file_ops_allowed": policy.fileOpsAllowed,
-                "shell_allowed": policy.shellAllowed,
-                "notifications_allowed": policy.notificationsAllowed,
-                "spotlight_allowed": policy.spotlightAllowed,
-                "approval_required_for": approvalList,
-                "remote_from_ios_allowed": policy.remoteFromIosAllowed,
-            ] as [String: Any]
-        ]
+        let body: [String: Any] = ["macControlPolicy": policy.wireValue]
         return try await TrustPolicyToolWriter.applyTrustPolicyPatch(
             body: body,
             dataRoot: dataRoot,

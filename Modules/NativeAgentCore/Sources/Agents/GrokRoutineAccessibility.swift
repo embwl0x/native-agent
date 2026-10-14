@@ -52,7 +52,6 @@ public enum DesktopPeerReadLane {
         configuration.activates = false
         _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         for _ in 0..<40 where !running { try? await Task.sleep(nanoseconds: 500_000_000) }
-        if running { try? await Task.sleep(nanoseconds: 4_000_000_000) }
         return running
     }
     nonisolated public static func attribute(_ node: AXUIElement, _ name: String) -> CFTypeRef? {
@@ -88,19 +87,6 @@ public enum DesktopPeerReadLane {
         let windows = attribute(root, kAXWindowsAttribute) as? [AXUIElement] ?? []
         guard windows.count == 1 else { step("Grok Bot shows \(windows.count) windows, not one"); throw Blocker.conversation }
         return windows[0]
-    }
-    static func currentConversation() throws -> String {
-        // Seen on the installed app (09-19 drive): the window is always titled
-        // "Grok Bot", whichever Bot is open. The open Bot is the conversation.
-        let selected = nodes(try window()).filter {
-            string($0, kAXRoleAttribute) == kAXButtonRole
-                && (attribute($0, kAXSelectedAttribute) as? Bool) == true
-        }
-        // The installed app marks no sidebar button as selected (09-20). The
-        // open chat is the conversation; its name is only a label for the person.
-        guard selected.count == 1 else { return "Grok Bot" }
-        let name = label(selected[0])
-        return name.isEmpty ? "Grok Bot" : name
     }
     /// Seen on the installed app (09-20): the box has no placeholder attribute;
     /// an empty box reports "Message <chat name>" as its value. Match only the

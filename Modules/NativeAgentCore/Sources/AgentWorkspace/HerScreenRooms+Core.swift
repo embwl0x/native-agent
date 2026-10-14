@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 
 /// Families on her screen (2026-09-24, tool discovery). Every capability is a
@@ -28,15 +29,9 @@ extension HerScreen {
         .init(name: "images", about: "make a picture", tools: ["image_generate"]),
     ]
 
-    /// Words people use for a place under another name.
-    static let familyAliases: [String: String] = [
-        "bots": "helpers", "bot": "helpers", "twitter": "x",
-        "stocks": "markets", "notifications": "notify", "health": "status",
-    ]
-
     /// A family's actions as a text room, or nil when the name is not a family.
     static func familyRoom(_ raw: String, catalog: AgentWorkspace.Catalog) async throws -> String? {
-        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let name = AppDoorNames.resolve(raw)
         guard let family = families.first(where: { $0.name == name }) else { return nil }
         func member(_ tool: String) -> Bool {
             family.tools.contains { $0 == tool || (($0.hasSuffix("_") || $0.hasSuffix(".")) && tool.hasPrefix($0)) }

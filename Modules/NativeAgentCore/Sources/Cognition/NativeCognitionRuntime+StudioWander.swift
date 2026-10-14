@@ -10,7 +10,7 @@ import PersonaEngine
 
 // MARK: - HER HOUR, wired — personality-depth item 9
 //
-// `StudioWanderLane` (BackgroundLoops) holds the law. This file holds the
+// `StudioWanderLane` holds the law. This file holds the
 // organs: the installation read, the material composition, the one call, the
 // receipts and the trace.
 //
@@ -49,11 +49,6 @@ actor StudioWanderState {
 
     private var installations: [String: StudioWanderLane.Installation] = [:]
     private var inFlight: Set<String> = []
-    /// The most recent instant a turn was observed in flight, per data root.
-    /// The residual reschedule fires on every signal and every deadline, so this
-    /// is a real observation of when she was last being spoken to — not a poll,
-    /// and not a stored copy of anything the turn engine owns.
-    private var lastTurnActivityAt: [String: Date] = [:]
     /// Loaded-once-per-process mirror of the durable refractory stamp. The
     /// double optional distinguishes "not loaded yet" from "loaded, and she has
     /// never had one".
@@ -76,21 +71,6 @@ actor StudioWanderState {
     /// it off must UNINSTALL the lane, not leave a cached `.installed` behind.
     func invalidateInstallation(for dataRoot: URL) {
         installations[dataRoot.standardizedFileURL.path] = nil
-    }
-
-    func noteTurnActivity(for dataRoot: URL, at: Date) {
-        lastTurnActivityAt[dataRoot.standardizedFileURL.path] = at
-    }
-
-    /// The FIRST reading after launch seeds the quiet clock rather than
-    /// answering "quiet since forever". Nothing was being watched before the
-    /// process existed, and a launch that lands mid-conversation must not read
-    /// as half an hour of silence. She waits out one honest quiet window first.
-    func turnActivityOrSeed(for dataRoot: URL, at: Date) -> Date {
-        let key = dataRoot.standardizedFileURL.path
-        if let known = lastTurnActivityAt[key] { return known }
-        lastTurnActivityAt[key] = at
-        return at
     }
 
     /// The durable refractory stamp, read from disk ONCE per process and kept
@@ -150,9 +130,6 @@ extension NativeCognitionRuntime {
         let at = now()
         Task { [weak self] in
             guard await Self.studioWanderIsInstalled(dataRoot: root) else { return }
-            if turnInFlight {
-                await StudioWanderState.shared.noteTurnActivity(for: root, at: at)
-            }
             let lastWander: Date?
             do {
                 lastWander = try await StudioWanderState.shared.lastWanderAt(for: root) {
@@ -165,10 +142,9 @@ extension NativeCognitionRuntime {
             let decision = await StudioWanderLane.decide(
                 now: at,
                 turnInFlight: turnInFlight,
-                lastTurnActivityAt: StudioWanderState.shared
+                lastTurnActivityAt: ChatTurnSteering.shared
                     .turnActivityOrSeed(for: root, at: at),
-                lastWanderAt: lastWander,
-                inQuietHours: Self.studioWanderInQuietHours(dataRoot: root, at: at)
+                lastWanderAt: lastWander
             )
             guard decision == .wander else { return }
             guard await StudioWanderState.shared.claim(root) else { return }
@@ -200,13 +176,6 @@ extension NativeCognitionRuntime {
                     .object(forKey: "cognitiveSubstrateEnabled") == nil
                     || UserDefaults.standard.bool(forKey: "cognitiveSubstrateEnabled")
             )
-    }
-
-    /// The user's own sleep window, read from the same preference file the turn
-    /// clock reads. No second source of truth for when the house is asleep.
-    static func studioWanderInQuietHours(dataRoot: URL, at: Date) -> Bool {
-        guard let window = TurnQuietHoursWindow.read(dataRoot: dataRoot) else { return false }
-        return window.contains(hour: Calendar.current.component(.hour, from: at))
     }
 
     private func runStudioWander(at: Date) async {
@@ -421,14 +390,13 @@ extension NativeCognitionRuntime {
     /// current run's refractory is already reserved, not a reason to reject
     /// its continuation. Foreground activity ends this hour's tool access.
     private func studioWanderStillEligible() async -> Bool {
-        let activity = await StudioWanderState.shared.turnActivityOrSeed(for: dataRoot, at: now())
+        let activity = await ChatTurnSteering.shared.turnActivityOrSeed(for: dataRoot, at: now())
         let installed = Self.studioWanderInstallationNow(dataRoot: dataRoot).isInstalled
         let busy = liveTurnInFlight
         return !Task.isCancelled && !isFlushedForTermination && installed
             && StudioWanderLane.decide(
                 now: now(), turnInFlight: busy,
-                lastTurnActivityAt: activity, lastWanderAt: nil,
-                inQuietHours: Self.studioWanderInQuietHours(dataRoot: dataRoot, at: now())
+                lastTurnActivityAt: activity, lastWanderAt: nil
             ) == .wander
     }
 

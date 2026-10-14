@@ -50,7 +50,6 @@ import PersistenceCore
 //   - `createdAt` is a fresh UTC ISO8601 timestamp per call (non-deterministic).
 //     APPROXIMATES `now_iso()` — NOT byte-identical (millisecond `Z` here vs
 //     Python microsecond `+00:00`); not load-bearing for a freshness stamp.
-//     See `nowISO8601()` below. Injectable for tests via the `now` param.
 //
 // This local-disk read lives in the SelfImprovement module. It remains a pure
 // helper until a product surface chooses to call it; unsupported callers fail
@@ -178,7 +177,7 @@ extension SwiftNativeSelfImprovement {
     ///   current UTC ISO8601 instant (`now_iso()` parity); injectable so tests
     ///   can pin a deterministic value.
     public func improvementGauntletStatusLocal(
-        now: @Sendable () -> String = { SwiftNativeSelfImprovement.nowISO8601() }
+        now: @Sendable () -> String = { NativeTimestampFormat.fractionalZulu(Date()) }
     ) async throws -> ImprovementGauntletStatus {
         let raw = try await persistence
             .readJSON(gauntletRunsPath(), ifMissing: .array([]))
@@ -247,23 +246,4 @@ extension SwiftNativeSelfImprovement {
         )
     }
 
-    /// Approximate `now_iso()` (`datetime.now(timezone.utc).isoformat()`).
-    ///
-    /// NOT BYTE-IDENTICAL to the Python output, by design:
-    ///   - Python:  `2026-06-01T23:53:21.404526+00:00` (microsecond precision,
-    ///              explicit `+00:00` UTC offset).
-    ///   - This:    `2026-06-01T23:53:21.404Z` (millisecond precision, `Z`).
-    /// Both are valid RFC3339/ISO8601 instants for the same UTC moment.
-    ///
-    /// Byte-parity is NOT load-bearing here: `createdAt` is a freshness stamp
-    /// generated fresh on every call (so it never matches across two reads
-    /// anyway), and no consumer parses it for ordering — the Mac app model
-    /// (`Sources/NativeAgentApp/Models.swift:1861`) holds it as an optional
-    /// `String?` it only displays. Chasing microsecond precision would add a
-    /// hand-rolled formatter for zero behavioral gain.
-    public static func nowISO8601() -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fmt.string(from: Date())
-    }
 }

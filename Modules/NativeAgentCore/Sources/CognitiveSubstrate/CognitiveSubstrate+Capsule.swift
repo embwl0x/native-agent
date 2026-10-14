@@ -45,7 +45,6 @@ extension CognitiveSubstrate {
         // the one functional handling line ("never quotes or mentions it")
         // lives in BOTH ChatOrchestration injection seams (structured + text
         // compat), not in her inner voice.
-        let stableKernel = "How you feel:"
         var presentationState = capsulePresentationStateSnapshot()
         var cueWhy = CapsuleCueWhy()
         let lines = innerStateCapsuleLines(
@@ -57,34 +56,9 @@ extension CognitiveSubstrate {
         )
         let dynamicLines = request.surface == Self.cadenceExemptCapsuleSurface ? lines : Self.oneFeltCue(lines)
         let provenanceNodeIds = innerStateProvenance(from: capsuleItems, at: now)
-        let boundedStableKernel = bounded(
-            Self.capsuleStableKernel(stableKernel, dynamicLines: dynamicLines),
-            maxCharacters: maximumCharacters
-        )
-        let separatorCost = dynamicLines.isEmpty || boundedStableKernel.isEmpty ? 0 : 2
-        let remaining = max(0, maximumCharacters - boundedStableKernel.count - separatorCost)
-        let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: remaining)
-        let dynamicContext = fittedLines.text
-        let truncated = fittedLines.truncated
-            || boundedStableKernel.count < Self.capsuleStableKernel(stableKernel, dynamicLines: dynamicLines).count
-        return CognitiveCapsule(
-            generatedAt: now,
-            mode: request.mode,
-            stableKernel: boundedStableKernel,
-            dynamicContext: dynamicContext,
-            provenanceNodeIds: provenanceNodeIds,
-            truncated: truncated
-        )
-    }
-
-    /// Production-equivalent capsule rendering over a previously captured
-    /// frozen workspace. It performs no field snapshot, receipt, persistence,
-    /// or suppress-when-unchanged mutation.
-    public func compileFrozenCapsule(
-        _ request: CognitiveCapsuleRequest,
-        from read: CognitiveFrozenRead
-    ) -> CognitiveCapsule {
-        compileFrozenCapsulePresentation(request, from: read).capsule
+        return assembledCapsule(
+            request, at: now, dynamicLines: dynamicLines,
+            provenanceNodeIds: provenanceNodeIds, maximumCharacters: maximumCharacters)
     }
 
     /// The moment this turn's unbidden recall already resolved, if any. It is a
@@ -99,6 +73,19 @@ extension CognitiveSubstrate {
         remindedOf: CognitiveRecalledMoment? = nil,
         dreamTheme: CognitiveDreamTheme? = nil,
         gapItems: [String]? = nil
+    ) -> CognitivePreparedCapsule {
+        compileFrozenCapsulePresentation(
+            request, from: read, remindedOf: remindedOf, dreamTheme: dreamTheme,
+            gapItems: gapItems, felt: nil)
+    }
+
+    private func compileFrozenCapsulePresentation(
+        _ request: CognitiveCapsuleRequest,
+        from read: CognitiveFrozenRead,
+        remindedOf: CognitiveRecalledMoment?,
+        dreamTheme: CognitiveDreamTheme?,
+        gapItems: [String]?,
+        felt: (signals: FeltSignals, fingerprint: FeltLineRender?)?
     ) -> CognitivePreparedCapsule {
         guard read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
@@ -131,7 +118,6 @@ extension CognitiveSubstrate {
             )
         }
         let items = read.workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
-        let stableKernel = "How you feel:"
         let expectedPresentationState = read.capsulePresentationState
         var nextPresentationState = expectedPresentationState
         // Every cue that passed its own gate, best first; only one is shown.
@@ -144,6 +130,7 @@ extension CognitiveSubstrate {
             remindedOf: remindedOf,
             dreamTheme: dreamTheme,
             gapItems: gapItems,
+            felt: felt,
             presentationState: &nextPresentationState,
             why: &cueWhy
         )
@@ -155,22 +142,9 @@ extension CognitiveSubstrate {
             thoughtSeeds: read.thoughtSeeds,
             trustedPeerIds: read.trustedPeerIds
         )
-        let boundedStableKernel = bounded(
-            Self.capsuleStableKernel(stableKernel, dynamicLines: dynamicLines),
-            maxCharacters: maximumCharacters
-        )
-        let separatorCost = dynamicLines.isEmpty || boundedStableKernel.isEmpty ? 0 : 2
-        let remaining = max(0, maximumCharacters - boundedStableKernel.count - separatorCost)
-        let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: remaining)
-        let capsule = CognitiveCapsule(
-            generatedAt: read.fixedAt,
-            mode: request.mode,
-            stableKernel: boundedStableKernel,
-            dynamicContext: fittedLines.text,
-            provenanceNodeIds: provenanceNodeIds,
-            truncated: fittedLines.truncated
-                || boundedStableKernel.count < Self.capsuleStableKernel(stableKernel, dynamicLines: dynamicLines).count
-        )
+        let capsule = assembledCapsule(
+            request, at: read.fixedAt, dynamicLines: dynamicLines,
+            provenanceNodeIds: provenanceNodeIds, maximumCharacters: maximumCharacters)
         let turnKind = request.resolvedTurnKind
         let commit: CognitiveCapsulePresentationCommit?
         // Phase 5A: an EMPTY capsule is a normal accepted turn now, so it
@@ -196,6 +170,28 @@ extension CognitiveSubstrate {
             why: Self.cueWhyPayload(
                 candidateLines: candidateLines, shown: capsule.dynamicContext, why: cueWhy,
                 signature: Self.associationSignature(request.userMessage)))
+    }
+
+    private func assembledCapsule(
+        _ request: CognitiveCapsuleRequest,
+        at now: Date,
+        dynamicLines: [String],
+        provenanceNodeIds: [UUID],
+        maximumCharacters: Int
+    ) -> CognitiveCapsule {
+        let stableKernel = Self.capsuleStableKernel("How you feel:", dynamicLines: dynamicLines)
+        let boundedStableKernel = bounded(stableKernel, maxCharacters: maximumCharacters)
+        let separatorCost = dynamicLines.isEmpty || boundedStableKernel.isEmpty ? 0 : 2
+        let remaining = max(0, maximumCharacters - boundedStableKernel.count - separatorCost)
+        let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: remaining)
+        return CognitiveCapsule(
+            generatedAt: now,
+            mode: request.mode,
+            stableKernel: boundedStableKernel,
+            dynamicContext: fittedLines.text,
+            provenanceNodeIds: provenanceNodeIds,
+            truncated: fittedLines.truncated || boundedStableKernel.count < stableKernel.count
+        )
     }
 
     /// A cue that passed its gate but was not shown — it lost the one slot or
@@ -295,6 +291,7 @@ extension CognitiveSubstrate {
         remindedOf: CognitiveRecalledMoment? = nil,
         dreamTheme: CognitiveDreamTheme? = nil,
         gapItems: [String]? = nil,
+        felt: (signals: FeltSignals, fingerprint: FeltLineRender?)? = nil,
         presentationState: inout CognitiveCapsulePresentationState,
         why: inout CapsuleCueWhy
     ) -> [String] {
@@ -302,7 +299,7 @@ extension CognitiveSubstrate {
         // Phase 5 B0: what she rejected for this kind of thing never leads.
         let messageTerms = Self.appraisalConcernTerms(in: request.userMessage)
         let dyn = frozenRead?.personalityDynamics ?? dynamics
-        let signals = feltSignalsForCapsule(
+        let signals = felt?.signals ?? feltSignalsForCapsule(
             from: workspaceItems,
             request: request,
             at: now,
@@ -314,7 +311,7 @@ extension CognitiveSubstrate {
         // W4/P11 — the felt MODE, finally doing something. It stays what it always
         // was in the prompt: nothing. Not a word, not a line, not a byte. It only
         // steers WHICH already-attested exemplar the echo reaches for.
-        let mode = (frozenRead?.configuration.affectEnabled ?? configuration.affectEnabled)
+        let mode = (frozenRead?.configuration.enabled ?? configuration.enabled)
             ? Self.feltMode(signals, intensityFloor: dyn.feltIntensityFloor)
             : nil
         // W4/P7 — THE SESSION BRIDGE. The first turn User takes after a real
@@ -330,7 +327,7 @@ extension CognitiveSubstrate {
             previousUserTurn: request.previousUserTurnAt,
             gapItems: gapItems,
             cognitionEnabled: frozenRead?.configuration.enabled,
-            affectEnabled: frozenRead?.configuration.affectEnabled
+            affectEnabled: frozenRead?.configuration.enabled
         )
         if let since, let gapOpened {
             why.sources[since] = "gap:\(Int((now.timeIntervalSince(gapOpened) / 3_600).rounded()))h"
@@ -383,8 +380,7 @@ extension CognitiveSubstrate {
         let bypassInnerCadence = request.surface == Self.cadenceExemptCapsuleSurface
         var innerCandidates: [InnerCandidate] = activeStandingViewInnerCandidates(
             relevantTo: request.userMessage,
-            candidates: frozenRead?.standingViewCapsuleCandidates,
-            relevanceEnabled: frozenRead?.configuration.standingViewCapsuleRelevanceEnabled
+            candidates: frozenRead?.standingViewCapsuleCandidates
         ).map {
             InnerCandidate(line: $0.candidate.line, cadenceKey: Self.innerLineKey($0.candidate.line), tier: .view,
                            source: "view:" + $0.candidate.id.uuidString, score: $0.score)
@@ -431,16 +427,14 @@ extension CognitiveSubstrate {
         // you just thought of is not a thing you are carrying.
         innerCandidates.append(contentsOf: ruminationCandidates(
             at: now, seeds: frozenRead?.thoughtSeeds)
-            .filter { $0.weight >= dyn.threadWeightFloor }
+            .filter { $0.weight >= dyn.threadWeightFloor && ruminationIsPermitted($0, on: request.surface) }
             .compactMap { candidate -> InnerCandidate? in
-                guard let seed = seedPool.first(where: { $0.id == candidate.seedId }),
-                      seed.kind != .reflectionTakeaway,
-                      let line = threadLine(for: seed, at: now) else { return nil }
+                guard let line = threadLine(for: candidate) else { return nil }
                 return InnerCandidate(
                     line: line,
-                    cadenceKey: "thread:" + seed.id.uuidString,
+                    cadenceKey: "thread:" + candidate.seedId.uuidString,
                     tier: .thread,
-                    source: "seed:" + seed.id.uuidString,
+                    source: candidate.externalId.map { "external:" + $0 } ?? "seed:" + candidate.seedId.uuidString,
                     score: candidate.weight)
             })
         let suppressions = frozenRead?.associationSuppressions ?? associationSuppressions
@@ -478,7 +472,7 @@ extension CognitiveSubstrate {
         if let settling = settlingLine(
             mood: frozenRead?.mood ?? derivedMood(at: now),
             incoming: conversationalAppraisal(in: request.userMessage),
-            affectEnabled: frozenRead?.configuration.affectEnabled,
+            affectEnabled: frozenRead?.configuration.enabled,
             cognitionEnabled: frozenRead?.configuration.enabled
         ) {
             // Cadence cap: at most `settlingMaxRun` consecutive presentations;
@@ -505,7 +499,7 @@ extension CognitiveSubstrate {
             negativeRun: presentationState.negativeSoundEchoRun,
             dynamics: dyn,
             cognitionEnabled: frozenRead?.configuration.enabled,
-            affectEnabled: frozenRead?.configuration.affectEnabled
+            affectEnabled: frozenRead?.configuration.enabled
         )
         // ONE gate for the named rut line, whether or not the exemplar echo
         // speaks this turn.
@@ -531,14 +525,20 @@ extension CognitiveSubstrate {
         // the fingerprint; her VIEWS + CONTINUITY stay below (Inner), and the Body +
         // Sound anchors follow. (The prior Focus/Affect/Voice helper tree + its
         // keyword classifiers were swept 2026-07-09 — see git if archaeology calls.)
-        if let fingerprint = feltFingerprintLine(
-            signals: signals,
-            workspaceItems: workspaceItems,
-            request: request,
-            at: now,
-            dynamics: dyn,
-            affectEnabled: frozenRead?.configuration.affectEnabled
-        ) {
+        let fingerprint: FeltLineRender?
+        if let felt {
+            fingerprint = felt.fingerprint
+        } else {
+            fingerprint = feltFingerprintLine(
+                signals: signals,
+                workspaceItems: workspaceItems,
+                request: request,
+                at: now,
+                dynamics: dyn,
+                affectEnabled: frozenRead?.configuration.enabled
+            )
+        }
+        if let fingerprint {
             // W4/P4 — SUPPRESS WHEN UNCHANGED. The rule the echo learned the hard
             // way generalizes to the line that matters most: a signal delivered on
             // every single turn stops being information and becomes a standing
@@ -555,7 +555,6 @@ extension CognitiveSubstrate {
                 family: fingerprint.family,
                 at: now,
                 dynamics: dyn,
-                mayStayQuiet: true,
                 presentationState: &presentationState)
             if verdict.speak, verdict.run == 1 || bypassInnerCadence {
                 fingerprintSpoken = fingerprint.bareText
@@ -812,27 +811,6 @@ extension CognitiveSubstrate {
         return unique(ids)
     }
 
-    public func prepareCapsule(_ request: CognitiveCapsuleRequest) async -> CognitiveCapsule? {
-        let requestTurnKind = request.resolvedTurnKind
-        guard requestTurnKind == .live || request.allowNonLiveProjection else { return nil }
-        let capsule = await compileCapsule(request)
-        guard capsule.mode == .inject,
-              !capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-        return capsule
-    }
-
-    /// Compile the production capsule from one fixed-time copied read in a
-    /// single substrate admission. The live field, persistence, decay anchors,
-    /// and surfaced-state bookkeeping remain untouched.
-    public func prepareFrozenCapsule(
-        _ request: CognitiveCapsuleRequest,
-        at fixedAt: Date
-    ) async -> CognitiveCapsule? {
-        await prepareFrozenCapsulePresentation(request, at: fixedAt)?.nonEmptyCapsule
-    }
-
     /// Production preparation seam: one immutable cognition epoch plus a pure
     /// presentation commit for the accepted-turn boundary.
     public func prepareFrozenCapsulePresentation(
@@ -848,7 +826,8 @@ extension CognitiveSubstrate {
         // …and re-checked against LIVE cadence/ledger state on the way out: the
         // lookup suspended, and an accepted turn may have surfaced this very
         // moment while it did (`revalidatedRemindedOf`).
-        let remindedOf = await remindedOfMoment(for: request, from: read)
+        var felt: (signals: FeltSignals, fingerprint: FeltLineRender?)?
+        let remindedOf = await remindedOfMoment(for: request, from: read, felt: &felt)
             .flatMap { revalidatedRemindedOf($0, against: read) }
         // Phase 5 B: the two continuity lookups, local and gated the same way
         // (a dream only when the cooldown is open and the message has words;
@@ -857,7 +836,7 @@ extension CognitiveSubstrate {
         let gapItems = await sinceGapItems(for: request, from: read)
         let prepared = compileFrozenCapsulePresentation(
             request, from: read, remindedOf: remindedOf,
-            dreamTheme: dreamTheme, gapItems: gapItems)
+            dreamTheme: dreamTheme, gapItems: gapItems, felt: felt)
         // An empty capsule still returns, carrying its commit (Phase 5A);
         // callers inject only `nonEmptyCapsule`.
         guard prepared.capsule.mode == .inject else { return nil }
@@ -1105,7 +1084,7 @@ extension CognitiveSubstrate {
         cognitionEnabled: Bool? = nil
     ) -> String? {
         guard cognitionEnabled ?? configuration.enabled,
-              affectEnabled ?? configuration.affectEnabled else { return nil }
+              affectEnabled ?? configuration.enabled else { return nil }
         guard mood.basis > 0, mood.valence < Self.settlingMoodThreshold else { return nil }
         guard incoming.valence > 0, incoming.warmth > 0 || incoming.affection else { return nil }
         return "- Settling: still settling from a hard stretch; the kindness lands, "

@@ -161,13 +161,13 @@ public enum CodexCompletionTranscriptEvidence {
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
-    public static func recoverResponse(
+    public static func recoverRunId(
         from rows: [JSONValue],
         deliveryId: String,
-        requestDigest: String,
+        requestDigest: String?,
         sessionId: String
-    ) throws -> ChatResponse? {
-        var matches: [ChatResponse] = []
+    ) throws -> String? {
+        var matches: [String] = []
         for row in rows {
             guard case .object(let object) = row,
                   case .string(let role)? = object["role"], role == "assistant",
@@ -179,8 +179,8 @@ public enum CodexCompletionTranscriptEvidence {
                   case .string(let rowDelivery)? = binding["deliveryId"],
                   rowDelivery == deliveryId,
                   case .string(let rowRequestDigest)? = binding["requestDigest"],
-                  rowRequestDigest == requestDigest,
-                  case .string(let model)? = binding["model"],
+                  requestDigest == nil || rowRequestDigest == requestDigest,
+                  case .string? = binding["model"],
                   case .string(let storedResponseDigest)? = binding["responseDigest"]
             else { continue }
             let attachments = try decodeAttachments(metadata["attachments"])
@@ -192,21 +192,7 @@ public enum CodexCompletionTranscriptEvidence {
             ) == storedResponseDigest else {
                 throw RecoveryError.corruptBinding
             }
-            let effort: String?
-            if case .string(let value)? = binding["reasoningEffort"] { effort = value }
-            else { effort = nil }
-            var response = ChatResponse(
-                runId: runId,
-                model: model,
-                reasoningEffort: effort,
-                output: content,
-                sessionId: sessionId,
-                attachments: attachments.isEmpty ? nil : attachments
-            )
-            if case .string(let state)? = metadata["terminalState"] {
-                response.terminalState = TurnEngineResult.TerminalState(rawValue: state)
-            }
-            matches.append(response)
+            matches.append(runId)
         }
         guard matches.count <= 1 else { throw RecoveryError.ambiguousBinding }
         return matches.first
@@ -391,7 +377,7 @@ extension SwiftNativeChatOrchestrationClient {
                 timestamp: createdAt,
                 messagesPath: path,
                 source: messageSource,
-                mechanicalRow: nil
+                metadata: nil
             )
         } catch {
             await Self.reportTranscriptWriteFailure(
@@ -866,18 +852,7 @@ extension SwiftNativeChatOrchestrationClient {
     /// a retried delivery finds its row and adds none.
     public func appendAnswerForAskingChat(sessionID: String, text: String, attachments: [MultimodalAttachment],
                                           surface: String, deliveryID: String) async throws {
-        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
-            throw ChatOrchestrationError.underlying("invalid chat session id")
-        }
-        let path = dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl")
-        if FileManager.default.fileExists(atPath: path.path) {
-            let rows = try await persistence.readJSONL(path)
-            if rows.contains(where: { row in
-                guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return false }
-                return metadata["answerFor"] == .string(deliveryID)
-            }) { return }
-        }
-        try await appendMessage(sessionId: safeSessionId, role: "assistant", content: text, runId: UUID().uuidString,
+        try await appendMessage(sessionId: sessionID, role: "assistant", content: text, runId: UUID().uuidString,
                                 attachments: attachments, source: surface, answerFor: deliveryID)
     }
 
@@ -944,7 +919,7 @@ extension SwiftNativeChatOrchestrationClient {
         guard changed.count > 0, case .object(let last)? = changed.last, case .string(let content)? = last["content"],
               case .string(let at)? = last["createdAt"] else { return changed.count }
         try await syncSessionIndex(sessionId: safeSessionId, role: "assistant", content: content, timestamp: at,
-                                   messagesPath: path, source: "agent-bridge", mechanicalRow: nil)
+                                   messagesPath: path, source: "agent-bridge", metadata: nil)
         NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: safeSessionId)
         return changed.count
     }
@@ -982,9 +957,9 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     /// Admission makes only this pre-appended input available to future prompts.
-    func consumeEnqueuedMessage(sessionId: String, runId: String) async throws {
+    func consumeEnqueuedMessage(sessionId: String, runId: String) async throws -> AfterTurnOrigin? {
         let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
-        try await persistence.withFileLock(path) {
+        return try await persistence.withFileLock(path) {
             var (rows, report) = try await self.persistence.readJSONLReporting(path)
             guard report.isClean else {
                 throw ChatOrchestrationError.underlying("Queued input cannot be consumed until its transcript is repaired")
@@ -996,8 +971,9 @@ extension SwiftNativeChatOrchestrationClient {
                 row["metadata"] = .object(metadata)
                 rows[index] = .object(row)
                 try Self.writeJSONLAtomically(rows, to: path)
-                return
+                break
             }
+            return try Self.afterTurnOrigin(in: rows, sessionId: sessionId, runId: runId)
         }
     }
 
@@ -1357,7 +1333,14 @@ extension SwiftNativeChatOrchestrationClient {
         // same lock that guards the write is what makes the recorded count
         // trustworthy: no other lock-respecting writer, in this process or
         // another, can slip a row in between the read and the record.
-        let replacedTurnTraceID: String? = try await persistence.withFileLock(path) {
+        let (appended, replacedTurnTraceID): (Bool, String?) = try await persistence.withFileLock(path) {
+            if let answerFor, FileManager.default.fileExists(atPath: path.path) {
+                let rows = try await persistence.readJSONL(path)
+                if rows.contains(where: { row in
+                    guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return false }
+                    return metadata["answerFor"] == .string(answerFor)
+                }) { return (false, nil) }
+            }
             if let expectedLastMessageID {
                 let bytes = try Data(contentsOf: path)
                 guard bytes.count <= 8 * 1024 * 1024,
@@ -1424,7 +1407,7 @@ extension SwiftNativeChatOrchestrationClient {
                 // emits one non-blank line per row, which is precisely what
                 // `countJSONLLines` counts.
                 ChatTranscriptLineCountCache.shared.record(count: replaced.count, at: path)
-                return priorTurnTraceID
+                return (true, priorTurnTraceID)
             } else {
                 let priorCount = ChatTranscriptLineCountCache.shared.count(
                     at: path,
@@ -1445,9 +1428,10 @@ extension SwiftNativeChatOrchestrationClient {
                 try await persistence.appendJSONLDurable(messageRow, to: path)
                 // `appendJSONLDurable` writes exactly one serialized line plus "\n".
                 ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
-                return nil
+                return (true, nil)
             }
         }
+        guard appended else { return nil }
         if role == "user" {
             do {
                 _ = try await OutcomeFeedbackStore(
@@ -1491,7 +1475,7 @@ extension SwiftNativeChatOrchestrationClient {
             timestamp: createdAt,
             messagesPath: path,
             source: messageSource,
-            mechanicalRow: mechanicalRow
+            metadata: metadata
         )
         // One signal for every row any door writes: an open chat and the phone
         // see Telegram, phone and agent turns as they land, not on the next turn.
@@ -1522,9 +1506,13 @@ extension SwiftNativeChatOrchestrationClient {
         guard let text = String(data: data, encoding: .utf8) else {
             throw ChatOrchestrationError.underlying("incoming transcript is not UTF-8")
         }
-        let matches = try text.split(separator: "\n").compactMap { line -> AfterTurnOrigin? in
-            let parsed = try JSONValue.parse(Data(line.utf8))
-            guard case .object(let row) = parsed,
+        let rows = try text.split(separator: "\n").map { try JSONValue.parse(Data($0.utf8)) }
+        return try Self.afterTurnOrigin(in: rows, sessionId: sessionId, runId: runId)
+    }
+
+    private static func afterTurnOrigin(in rows: [JSONValue], sessionId: String, runId: String) throws -> AfterTurnOrigin? {
+        let matches = rows.compactMap { value -> AfterTurnOrigin? in
+            guard case .object(let row) = value,
                   row["role"] == .string("user"), row["runId"] == .string(runId),
                   case .string(let id)? = row["id"], !id.isEmpty,
                   case .string(let content)? = row["content"] else { return nil }
@@ -1782,7 +1770,6 @@ extension SwiftNativeChatOrchestrationClient {
                     backupPath: backupPath,
                     messagesReplaced: messagesReplaced,
                     turnModel: model,
-                    providerID: providerID,
                     surface: surface,
                     runId: runId
                 )
@@ -1959,8 +1946,9 @@ extension SwiftNativeChatOrchestrationClient {
             metadata[CognitiveMechanicalRowKind.metadataKey] = .string(mechanicalRow.rawValue)
         }
         let turnKind = Self.cognitiveMessageTurnKind(
-            role: normalizedRole, source: source,
-            redactedContent: redactedSummary, origin: origin,
+            redactedContent: normalizedRole == "user"
+                ? ChatSecretRedactor.redactText(TurnRelevanceContext.queryUserMessage ?? content)
+                : redactedSummary,
             mechanicalRow: mechanicalRow
         )
         let subject: CognitiveSubjectReference
@@ -2013,36 +2001,9 @@ extension SwiftNativeChatOrchestrationClient {
     /// One workload-class boundary for accepted events and their capsules.
     /// Capsule preparation must not reinterpret admitted live prose as debug.
     nonisolated static func cognitiveMessageTurnKind(
-        role: String,
-        source: String,
         redactedContent: String,
-        origin: ChatMessageOrigin?,
         mechanicalRow: CognitiveMechanicalRowKind? = nil
     ) -> CognitiveTurnKind {
-        // Chat workload class comes from surface provenance, never from topic
-        // words. An ordinary user asking about the scheduler/doctor/observatory
-        // is still a live turn. Verified out-of-band bridge origin makes
-        // bounded content markers eligible to classify diagnostic traffic as
-        // debug/verification; the runtime then carries that class through the
-        // correlated run to tools and reply.
-        let classificationSignals: [String]
-        if role == "user", let origin, Self.isTrustedBridgeOrigin(origin) {
-            // Content markers are eligible only behind a server-bound bridge
-            // lane. This is transport provenance, not a claim inferred from
-            // prose supplied by the human.
-            // The synthetic prefix keeps the existing Codex debug classifier
-            // behavior without trusting prose supplied by a Mac user.
-            classificationSignals = [
-                source,
-                origin.surface,
-                origin.agent.map { "[from: \($0), via bridge]" } ?? "",
-                redactedContent,
-            ]
-        } else if role == "user" {
-            classificationSignals = [source]
-        } else {
-            classificationSignals = [source, redactedContent]
-        }
         // A TEMPLATED LINE IS NOT AN EXPERIENCE (Agent, item 5, 2026-09-14).
         //
         // ASKED FIRST, AND OF BOTH ROLES. The card lane was the first writer to
@@ -2073,25 +2034,10 @@ extension SwiftNativeChatOrchestrationClient {
         //     one ("…; nothing else changes.") was dropped from felt appraisal
         //     (2026-09-14). Provenance is the only honest signal, and the writer
         //     is the only thing that has it.
-        let inferredTurnKind = CognitiveTurnKind.inferred(fromSignals: classificationSignals)
+        let inferredTurnKind = CognitiveTurnKind.inferred(fromSignals: [redactedContent])
         return switch inferredTurnKind {
         case .debug, .verification: inferredTurnKind
         case .live, .system, .mechanical: .live
-        }
-    }
-
-    private static func isTrustedBridgeOrigin(_ origin: ChatMessageOrigin) -> Bool {
-        let surface = origin.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let agent = origin.agent?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        switch (surface, agent) {
-        case ("claude-bridge", "claude"),
-             ("codex-bridge", "codex"),
-             ("omp-bridge", "omp"):
-            return true
-        default:
-            return false
         }
     }
 
@@ -2388,7 +2334,7 @@ extension SwiftNativeChatOrchestrationClient {
         timestamp: String,
         messagesPath: URL,
         source: String,
-        mechanicalRow: CognitiveMechanicalRowKind?
+        metadata: [String: JSONValue]?
     ) async throws {
         let dataRoot = self.dataRoot
         let sessionsPath = dataRoot
@@ -2408,28 +2354,16 @@ extension SwiftNativeChatOrchestrationClient {
         // Continuity is person-bound, never inferred from a title, allowlist,
         // or storage key. A paired phone and this Mac belong to the operator;
         // remote senders remain in their transport's identity namespace.
-        let continuityParticipant: String? = {
-            guard normalizedRole == "user", ChatPersistenceContext.originProvenance == nil,
-                  mechanicalRow == nil,
-                  envelope?.agent == nil else { return nil }
-            switch source {
-            case "app": return "local_operator"
-            case "ios" where envelope?.commandSignatureVerified == true
-                || ChatToolSessionContext.commandSignatureVerified == true:
-                return "local_operator"
-            case "telegram", "slack":
-                guard let user = envelope?.verifiedUserId ?? ChatToolSessionContext.verifiedUserId,
-                      !user.isEmpty else { return nil }
-                return source + ":" + user
-            default: return nil
-            }
+        let continuity: [String: JSONValue]? = {
+            guard normalizedRole == "user", PeerDataTaint.abilityWriteCheck() == nil,
+                  source != "ios" || envelope?.commandSignatureVerified == true
+                    || ChatToolSessionContext.commandSignatureVerified == true,
+                  case .object(let binding)? = ChatSessionRecollections.continuityBinding(
+                    role: normalizedRole, metadata: metadata) else { return nil }
+            return binding
         }()
-        let continuityScope: String? = {
-            guard source == "telegram" || source == "slack",
-                  let chat = envelope?.verifiedChatId ?? ChatToolSessionContext.verifiedChatId else { return nil }
-            let thread = envelope?.deliveryRoute?.threadId ?? ChatToolSessionContext.replyRoute?.threadId
-            return chat + "\u{1F}" + (thread ?? "")
-        }()
+        let continuityParticipant: String? = if case .string(let value)? = continuity?["participant"] { value } else { nil }
+        let continuityScope: String? = if case .string(let value)? = continuity?["scope"] { value } else { nil }
         // Same value, same moment, same definition as the old
         // `countJSONLLines(at: messagesPath)` that stood here — this count is
         // NOT advisory bookkeeping. `SessionDigestProvider.swift:243` renders

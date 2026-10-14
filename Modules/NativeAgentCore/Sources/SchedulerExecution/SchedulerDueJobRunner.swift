@@ -1,6 +1,5 @@
 import Privacy
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TelegramBot
@@ -8,16 +7,6 @@ import TriggerScheduler
 
 public actor SchedulerDueJobRunner {
     typealias CycleNotificationDelivery = @Sendable (String, String, String, String, String?) async -> JSONValue
-    /// The scheduler's single effect handoff. Production leaves this nil and
-    /// dispatches the native kind switch; hermetic owners supply a recorder so
-    /// the durable claim → effect → settlement boundary can be exercised
-    /// without borrowing process-global clients from another data root.
-    typealias JobExecutionOverride = @Sendable (JobKind, DueJob, Date) async throws -> JobResult
-
-    /// Canonical scheduler effect vocabulary. Every job crosses this resolver
-    /// before either the production switch or a hermetic execution owner runs.
-    /// Keeping it typed prevents an injected recorder from masking a removed or
-    /// misspelled production dispatch case.
     enum JobKind: String, CaseIterable, Sendable {
         case notify
         case connectorAction = "connector_action"
@@ -28,59 +17,8 @@ public actor SchedulerDueJobRunner {
         case workshop
     }
 
-    struct DueJob: Sendable {
-        let id: String
-        let name: String
-        let kind: String
-        let payload: [String: JSONValue]
-        let row: JSONValue
-        let dueEpoch: Double
-        /// Stable identity for exactly one scheduled occurrence. This key is
-        /// persisted before any effect and survives process restart.
-        let occurrenceKey: String
-
-        init(
-            id: String,
-            name: String,
-            kind: String,
-            payload: [String: JSONValue],
-            row: JSONValue,
-            dueEpoch: Double,
-            occurrenceKey: String? = nil
-        ) {
-            self.id = id
-            self.name = name
-            self.kind = kind
-            self.payload = payload
-            self.row = row
-            self.dueEpoch = dueEpoch
-            self.occurrenceKey = occurrenceKey ?? Self.makeOccurrenceKey(jobId: id, dueEpoch: dueEpoch)
-        }
-
-        static func makeOccurrenceKey(jobId: String, dueEpoch: Double) -> String {
-            let millis = Int64((dueEpoch * 1_000).rounded())
-            let canonical = "\(jobId.utf8.count):\(jobId):\(millis)"
-            let digest = SHA256.hash(data: Data(canonical.utf8))
-                .map { String(format: "%02x", $0) }
-                .joined()
-            // 74 bytes: safely inside downstream 128-byte idempotency limits,
-            // even when a repaired legacy job carries an unusually long id.
-            return "scheduler.\(digest)"
-        }
-    }
-
-    struct OccurrenceRecovery: Sendable {
-        let jobId: String
-        let jobName: String
-        let kind: String
-        let occurrenceKey: String
-        let detail: String
-    }
-
-    struct ClaimedDueJobs: Sendable {
-        let jobs: [DueJob]
-        let recoveredUnknown: [OccurrenceRecovery]
-    }
+    typealias DueJob = SwiftNativeTriggerScheduler.DueJob
+    typealias ClaimedDueJobs = SwiftNativeTriggerScheduler.ClaimedDueJobs
 
     struct JobResult: Sendable {
         let status: String
@@ -97,21 +35,12 @@ public actor SchedulerDueJobRunner {
     let root: URL
     let platform: any SchedulerExecutionPlatform
     let persistence = SwiftNativePersistenceCore()
+    let schedulerJobs: SwiftNativeTriggerScheduler
     let cycleNotificationDelivery: CycleNotificationDelivery
-    let executionOverride: JobExecutionOverride?
     /// The loop owner reads this after a tick and publishes a failed loop
     /// receipt. Activity evidence is not best-effort: if it cannot be written,
     /// subsequent scheduled effects stop rather than becoming unaccountable.
     public internal(set) var activityFeedError: String?
-    /// Consecutive failures to put a restart-reconciliation notice on record,
-    /// keyed by occurrence key. 2026-09-06: an unwritable notice used to abort
-    /// the whole pass, and since selection claims only the earliest due row the
-    /// next pass re-detected the same preserved claim and every later job
-    /// starved. The occurrence is deferred to the next pass instead, and after
-    /// `maxUnknownNoticeAttempts` the claim is released anyway so one broken
-    /// inbox cannot hold a job forever.
-    var unknownNoticeFailures: [String: Int] = [:]
-    static let maxUnknownNoticeAttempts = 3
     var running = false
     /// Bodies that crossed their caller-facing deadline but have not actually
     /// exited yet. A new scheduler pass must not overlap them.
@@ -137,49 +66,19 @@ public actor SchedulerDueJobRunner {
         root: URL = PersistenceCore.defaultDataRoot(),
         platform: any SchedulerExecutionPlatform
     ) {
-        self.init(
-            root: root,
-            platform: platform,
-            cycleNotificationDelivery: { title, body, jobId, source, itemId in
-                await SchedulerDueJobRunner.deliverCycleNotification(
-                    title: title, body: body, jobId: jobId, source: source, itemId: itemId,
-                    platform: platform
-                )
-            }
-        )
-    }
-
-    init(
-        root: URL = PersistenceCore.defaultDataRoot(),
-        platform: any SchedulerExecutionPlatform,
-        cycleNotificationDelivery: @escaping CycleNotificationDelivery,
-        executionOverride: JobExecutionOverride? = nil
-    ) {
         self.root = root
+        self.schedulerJobs = SwiftNativeTriggerScheduler(root: root)
         self.platform = platform
-        self.cycleNotificationDelivery = cycleNotificationDelivery
-        self.executionOverride = executionOverride
+        self.cycleNotificationDelivery = { title, body, jobId, source, itemId in
+            await SchedulerDueJobRunner.deliverCycleNotification(
+                title: title, body: body, jobId: jobId, source: source, itemId: itemId,
+                platform: platform
+            )
+        }
     }
 
     var isLiveDataRoot: Bool {
         root.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
-    }
-
-    /// Read the canonical scheduler array without converting damaged durable
-    /// state into an empty genesis file. `readJSON(defaultValue:)` is right for
-    /// optional projections, but unsafe at this authority boundary: callers
-    /// immediately rewrite jobs.json and would erase every user job after one
-    /// malformed byte. Missing is the only state that means an empty schedule.
-    public nonisolated static func readJobRowsChecked(at path: URL) throws -> [JSONValue] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        let data = try Data(contentsOf: path)
-        let parsed = try JSONValue.parse(data)
-        guard case .array(let rows) = parsed else {
-            throw PersistenceCoreError.ioFailure(
-                "scheduler jobs state is not a JSON array: \(path.path)"
-            )
-        }
-        return rows
     }
 
     public func runDueJobs(maxJobs: Int = 5) async -> [String] {
@@ -211,7 +110,7 @@ public actor SchedulerDueJobRunner {
                     payload: .object(["inboxItemId": .string(backfilled)])
                 )
             }
-            let retiredJobs = try await pruneRetiredJobs(now: now)
+            let retiredJobs = try await schedulerJobs.pruneJobs { Self.pruneRetiredRows($0, now: now) }
             if retiredJobs > 0 {
                 try await appendActivity(
                     jobId: nil,
@@ -250,7 +149,7 @@ public actor SchedulerDueJobRunner {
         for _ in 0..<max(1, maxJobs) {
             let claimed: ClaimedDueJobs
             do {
-                claimed = try await claimDueJobs(now: now, maxJobs: 1, excludingJobIds: deferredJobIds)
+                claimed = try await claimDueJob(now: now, excludingJobIds: deferredJobIds)
             } catch {
                 do {
                     try await appendActivity(
@@ -268,33 +167,13 @@ public actor SchedulerDueJobRunner {
             // A durable claim left by a prior process means the effect may
             // have happened. Never blindly replay it.
             for recovery in claimed.recoveredUnknown {
-                if await recordUnknownOccurrence(recovery) {
-                    unknownNoticeFailures.removeValue(forKey: recovery.occurrenceKey)
-                } else {
-                    // 2026-09-06: the notice did not write, so nothing is
-                    // released — but this pass is not over. Defer the row and
-                    // keep running the other due jobs. Once the same occurrence
-                    // has failed maxUnknownNoticeAttempts times, release the
-                    // claim anyway with a stderr line so an unwritable inbox
-                    // cannot pin a job's schedule indefinitely.
-                    let failures = (unknownNoticeFailures[recovery.occurrenceKey] ?? 0) + 1
-                    unknownNoticeFailures[recovery.occurrenceKey] = failures
-                    guard failures >= Self.maxUnknownNoticeAttempts else {
-                        deferredJobIds.insert(recovery.jobId)
-                        continue
-                    }
-                    FileHandle.standardError.write(Data(
-                        ("SchedulerDueJobRunner: releasing scheduler occurrence \(recovery.occurrenceKey) "
-                            + "on job \(recovery.jobId) after \(failures) failed reconciliation-notice "
-                            + "writes; the unknown outcome is recorded on the job row only.\n").utf8))
-                    unknownNoticeFailures.removeValue(forKey: recovery.occurrenceKey)
+                guard await recordUnknownOccurrence(recovery) else {
+                    deferredJobIds.insert(recovery.jobId)
+                    continue
                 }
-                // The notice is on record (or has been given up on), so the
-                // claim may now be released and the job advanced. Doing it in
-                // the other order meant a failed notice write lost the
-                // reconciliation entirely.
+                // Release only after the unknown outcome is durably on record.
                 do {
-                    try await settleUnknownOccurrence(recovery, now: now)
+                    try await schedulerJobs.settleUnknownOccurrence(recovery, now: now)
                 } catch {
                     if activityFeedError == nil {
                         activityFeedError = "Scheduler reconciliation could not release occurrence "
@@ -367,7 +246,7 @@ public actor SchedulerDueJobRunner {
         return completedNames
     }
 
-    private func recordUnknownOccurrence(_ recovery: OccurrenceRecovery) async -> Bool {
+    private func recordUnknownOccurrence(_ recovery: SwiftNativeTriggerScheduler.OccurrenceRecovery) async -> Bool {
         do {
             try await appendActivity(
                 jobId: recovery.jobId,

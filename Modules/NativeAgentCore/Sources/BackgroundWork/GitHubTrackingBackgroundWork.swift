@@ -3,6 +3,7 @@ import BackgroundLoops
 import Cognition
 import GitHubConnector
 import PersistenceCore
+import StandingBots
 
 // GitHub tracking is event/deadline driven. Canonical config, snapshot, Desk,
 // and GitHub Command changes wake a reread; the connector's learned cadence
@@ -49,10 +50,6 @@ private struct GitHubTrackingRunner: EventDeadlineLoopRunner {
     // calls, so a long timeout cannot overlap refreshes; stop() does not
     // wait for a tick to drain, so quit is unaffected.
     var tickTimeoutOverride: TimeInterval? { 600 }
-
-    func tick() async {
-        _ = await tickOutcome()
-    }
 
     func physiologyEvents() -> AsyncStream<Void> {
         return EventDeadlinePhysiology.storeAndFileEvents(
@@ -105,4 +102,10 @@ public protocol GitHubTrackingWorkPort: Sendable {
     func processConnectorChangesIfChanged(refreshed: Bool) async
     func evaluateApprovalSnapshot(dataRoot: URL) async
     func evaluateBotSnapshot(dataRoot: URL) async
+}
+
+extension BotGitHubEventWatcher {
+    public static let shared = BotGitHubEventWatcher { dataRoot in
+        await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
+    }
 }

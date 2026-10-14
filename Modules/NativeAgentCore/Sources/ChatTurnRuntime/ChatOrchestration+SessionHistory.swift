@@ -57,8 +57,7 @@ extension SwiftNativeTurnEngine {
         queryUserMessage: String? = nil,
         // Turn-start instant for the clock line (see buildTurnContext) —
         // tool loops pass the same value every iteration.
-        clockNowOverride: Date? = nil,
-        quietHoursSnapshot: TurnQuietHoursSnapshot? = nil
+        clockNowOverride: Date? = nil
     ) async throws -> TurnContext {
         // Non-nil queryUserMessage is authoritative EVEN WHEN BLANK — an
         // attachment-only text-compat turn must not fall back to the hinted
@@ -128,12 +127,7 @@ extension SwiftNativeTurnEngine {
         // Capture once at the outer turn boundary. The base builder owns the
         // receipt flag and this history wrapper owns final clock rendering;
         // both must observe the same preference bytes without a second read.
-        let quietHoursWindow: TurnQuietHoursWindow?
-        if let quietHoursSnapshot {
-            quietHoursWindow = quietHoursSnapshot.window
-        } else {
-            quietHoursWindow = readTurnQuietHours()
-        }
+        let quietHoursWindow = readTurnQuietHours()
         let rawBase: TurnContext
         do {
             rawBase = try await buildTurnContext(
@@ -164,9 +158,7 @@ extension SwiftNativeTurnEngine {
                 provider: sessionDigest
             )
         }
-        let naturalExpressionCue = naturalExpressionGuidanceEnabled
-            ? NaturalExpressionGuidance.pendingCues(from: prior, userMessage: queryMessage)
-            : nil
+        let naturalExpressionCue = NaturalExpressionGuidance.pendingCues(from: prior, userMessage: queryMessage)
         trace.setFlag("expression.rhythmCuePending", naturalExpressionCue != nil)
         // Sweep R4 W3: the ONLY production caller of the history renderer, and
         // the first place in prompt assembly where the admitted model for this
@@ -181,8 +173,7 @@ extension SwiftNativeTurnEngine {
             dataRoot: historyReader.dataRoot
         )
         let historyBudget = ContextBudgetPolicy.resolve(
-            windowTokens: historyWindowTokens,
-            surface: surface
+            windowTokens: historyWindowTokens
         )
         let preparedMiddle = middleStats == nil
             ? preparedHistory : middleCandidates.compactMap(SessionHistoryPromptRenderer.renderable)
@@ -191,7 +182,6 @@ extension SwiftNativeTurnEngine {
                 renderables: preparedHistory,
                 middleCandidates: preparedMiddle,
                 userMessage: queryMessage,
-                surface: surface,
                 historyLimit: historyLimit,
                 windowTokens: historyWindowTokens,
                 consumeToolReceipt: SwiftToolDispatcher.consumeRenderedToolReceipt
@@ -218,7 +208,6 @@ extension SwiftNativeTurnEngine {
             renderables: priorForPrefix.prefix(priorForPrefix.count - prior.count)
                 .compactMap(SessionHistoryPromptRenderer.renderable) + preparedHistory,
             historyLimit: historyLimit,
-            surface: surface,
             windowTokens: historyWindowTokens
            ) {
             // The window head moves at most once per turn, oldest-first, and
@@ -227,8 +216,7 @@ extension SwiftNativeTurnEngine {
             // tool loop's later iterations no-ops by construction, so a lane
             // that rebuilds context per iteration cannot slide the prefix
             // mid-turn.
-            let cursorStore = await HistoryWindowCursorStoreRegistry.shared
-                .store(dataRoot: historyReader.dataRoot)
+            let cursorStore = HistoryWindowCursorStore(dataRoot: historyReader.dataRoot)
             let advance = try await cursorStore.advanceIfNeeded(
                 sessionId: sessionId,
                 admitted: admission.rows,
@@ -307,7 +295,7 @@ extension SwiftNativeTurnEngine {
         if let receiptStrip, let evidence = try? JSONValue.parse(Data(receiptStrip.utf8)) {
             SwiftToolDispatcher.consumePersistedHistoryEvidence(evidence)
         }
-        let historyParts = [renderedHistory.historyBlock, receiptStrip].compactMap { $0 }
+        let historyParts = [renderedHistory, receiptStrip].compactMap { $0 }
         let historyBlock = historyParts.isEmpty ? nil : historyParts.joined(separator: "\n\n")
         trace.setCount("history.prompt.sourceBytes", priorStats.sourceBytes)
         trace.setCount("history.prompt.bytesRead", priorStats.bytesRead)
@@ -409,29 +397,11 @@ extension SwiftNativeTurnEngine {
                     : seg.dynamic + "\n\n" + historyBlock
             )
         }
-        let contextWithHistory = TurnContext(
-            surface: base.surface,
-            personaID: base.personaID,
-            personaDocs: base.personaDocs,
-            personaFingerprint: base.personaFingerprint,
-            recalled: base.recalled,
-            modelId: base.modelId,
-            reasoningEffort: base.reasoningEffort,
-            providerId: base.providerId,
-            serviceTier: base.serviceTier,
-            toolsAvailable: base.toolsAvailable,
-            systemPrompt: combinedWithoutClock,
-            userMessage: base.userMessage,
-            toolSchemas: base.toolSchemas,
-            systemSegments: segmentsWithoutClock,
-            imageBlocks: base.imageBlocks,
-            fluidContextTurn: base.fluidContextTurn,
-            naturalExpressionCue: base.naturalExpressionCue,
-            historyMessages: historyMessages,
-            turnVolatileBlock: base.turnVolatileBlock,
-            historyWindowReceipt: historyWindowReceipt,
-            preparationMs: base.preparationMs
-        )
+        var contextWithHistory = base
+        contextWithHistory.systemPrompt = combinedWithoutClock
+        contextWithHistory.systemSegments = segmentsWithoutClock
+        contextWithHistory.historyMessages = historyMessages
+        contextWithHistory.historyWindowReceipt = historyWindowReceipt
         let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
         let clocked = await contextByAppendingCurrentTurnFacts(
             contextWithHistory,
@@ -546,38 +516,9 @@ extension SwiftNativeTurnEngine {
         )
     }
 
-    /// U3 wave-2 item 8: inject the per-session digest at the HEAD of the
-    /// DYNAMIC segment. Rebuilds `systemPrompt` from the new segments so the
-    /// adapter-verified invariant `systemPrompt == stable + "\n\n" + dynamic`
-    /// holds by construction. Fail-open on every edge:
-    ///   - no systemSegments on the context → no safe mid-string insertion
-    ///     point → return the context unchanged (legacy combined behavior)
-    ///   - provider returns nil/empty (fresh session, source errors, blank
-    ///     sessionId) → unchanged.
-    ///
-    /// CACHE-CORRECTNESS (2026-07-24): this used to append to the END of the
-    /// STABLE segment, on the reasoning that "the provider caches per session,
-    /// so the injected bytes are identical on every turn of the session".
-    /// That premise is FALSE. Anthropic's prompt cache is an exact-prefix
-    /// match scoped to the ORGANIZATION, not to a session — a prefix written
-    /// by session A is readable by session B iff the bytes match. The digest
-    /// describes the PREVIOUS session (its title, message count, end
-    /// timestamp, and activity list), so it changes on every new session and
-    /// on background activity. Sitting inside the stable segment, it churned
-    /// the tail of the block the stable-end cache_control breakpoint covers,
-    /// so that breakpoint could only ever hit WITHIN one session and was a
-    /// guaranteed miss ACROSS sessions. Measured: two identical bridge turns
-    /// 7s apart shared 10,605 bytes of stable prefix and then diverged inside
-    /// the "# Since last session" block — cacheRead=0 on both, paying the
-    /// 1.25x write premium every turn and never collecting the 0.1x read.
-    ///
-    /// Moving it to the head of the DYNAMIC segment is byte-identical in
-    /// `combined` for all four emptiness cases (empty segments collapse the
-    /// "\n\n" separator, so stable+"\n\n"+digest+"\n\n"+dynamic is produced
-    /// either way) — the model sees exactly the same system prompt, in the
-    /// same order. Only the breakpoint boundary moves: the stable block is
-    /// now persona packet + REM pins ONLY, which is genuinely invariant
-    /// across sessions and therefore cacheable across them.
+    /// A handoff belongs at the dynamic head so it cannot churn the shared
+    /// stable cache prefix. It is optional context: failure leaves the turn
+    /// intact and traced, while cancellation still stops assembly.
     nonisolated static func injectingSessionDigest(
         into base: TurnContext,
         sessionId: String,
@@ -597,35 +538,28 @@ extension SwiftNativeTurnEngine {
         // turn's own user row is excluded by runId, so turn 1 is empty here.
         guard !hasPriorHistory else { return base }
         guard let seg = base.systemSegments else { return base }
-        guard let digest = try await provider.digest(
-            forSessionId: sessionId, model: base.modelId, surface: base.surface, userMessage: base.userMessage),
-              !digest.isEmpty else { return base }
+        let digest: String
+        do {
+            guard let value = try await provider.digest(
+                forSessionId: sessionId, model: base.modelId, surface: base.surface, userMessage: base.userMessage),
+                  !value.isEmpty else { return base }
+            digest = value
+        } catch {
+            if error is CancellationError { throw error }
+            try Task.checkCancellation()
+            TurnTraceBus.fireFromContext(
+                kind: "context.digest.failed", sessionId: sessionId, surface: base.surface,
+                payload: .object(["reason": .string(String(describing: error))])
+            )
+            return base
+        }
         let dynamic = seg.dynamic.isEmpty ? digest : digest + "\n\n" + seg.dynamic
         let segments = SystemPromptSegments(
             stable: seg.stable, stableSuffix: seg.stableSuffix, dynamic: dynamic
         )
-        return TurnContext(
-            surface: base.surface,
-            personaID: base.personaID,
-            personaDocs: base.personaDocs,
-            personaFingerprint: base.personaFingerprint,
-            recalled: base.recalled,
-            modelId: base.modelId,
-            reasoningEffort: base.reasoningEffort,
-            providerId: base.providerId,
-            serviceTier: base.serviceTier,
-            toolsAvailable: base.toolsAvailable,
-            systemPrompt: segments.combined,
-            userMessage: base.userMessage,
-            toolSchemas: base.toolSchemas,
-            systemSegments: segments,
-            imageBlocks: base.imageBlocks,
-            fluidContextTurn: base.fluidContextTurn,
-            naturalExpressionCue: base.naturalExpressionCue,
-            historyMessages: base.historyMessages,
-            turnVolatileBlock: base.turnVolatileBlock,
-            historyWindowReceipt: base.historyWindowReceipt,
-            preparationMs: base.preparationMs
-        )
+        var copy = base
+        copy.systemPrompt = segments.combined
+        copy.systemSegments = segments
+        return copy
     }
 }

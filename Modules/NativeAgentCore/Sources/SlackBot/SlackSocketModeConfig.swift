@@ -5,6 +5,13 @@ import PersistenceCore
 import SlackConnector
 
 public struct SlackSocketModeConfig: Sendable, Equatable {
+    public static func parseIDs(_ raw: String) -> Set<String> {
+        Set(raw.split { $0 == "," || $0 == ";" || $0.isWhitespace }
+            .map(String.init)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })
+    }
+
     let botToken: String
     let appToken: String
     let botUserId: String?
@@ -31,7 +38,10 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
     public static func loadIngressPolicy(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> SlackIngressPolicy {
-        let objects = tokenObjects(dataRoot: dataRoot)
+        parseIngressPolicy(tokenObjects(dataRoot: dataRoot))
+    }
+
+    private static func parseIngressPolicy(_ objects: [[String: Any]]) -> SlackIngressPolicy {
         return SlackIngressPolicy(
             allowedChannelIds: firstStringSet(
                 keys: ["allowed_channel_ids", "allowedChannelIds", "allowed_chat_ids", "allowedChatIds"],
@@ -48,6 +58,7 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
 
     static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> SlackSocketModeConfig? {
         let objects = tokenObjects(dataRoot: dataRoot)
+        let ingress = parseIngressPolicy(objects)
         // The tokens are Keychain's (SlackCredentials); the files say the rest.
         let botToken = try? SlackCredentials.read(.bot, dataRoot: dataRoot)
         let appToken = try? SlackCredentials.read(.app, dataRoot: dataRoot)
@@ -74,21 +85,15 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
         return SlackSocketModeConfig(
             botToken: botToken,
             appToken: appToken,
-            botUserId: firstString(keys: ["user_id", "bot_user_id", "bot_id"], in: objects),
+            botUserId: ingress.botUserId,
             teamId: firstString(keys: ["team_id"], in: objects),
             enabled: enabled,
             historyPollEnabled: historyPollEnabled,
             historyPollInterval: historyPollInterval,
             historyConversationRefreshInterval: historyConversationRefreshInterval,
-            allowedChannelIds: firstStringSet(
-                keys: ["allowed_channel_ids", "allowedChannelIds", "allowed_chat_ids", "allowedChatIds"],
-                in: objects
-            ),
-            allowedUserIds: firstStringSet(
-                keys: ["allowed_user_ids", "allowedUserIds"],
-                in: objects
-            ),
-            requireMention: firstBool(keys: ["require_mention", "requireMention"], in: objects) ?? true
+            allowedChannelIds: ingress.allowedChannelIds,
+            allowedUserIds: ingress.allowedUserIds,
+            requireMention: ingress.requireMention
         )
     }
 

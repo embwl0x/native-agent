@@ -6,7 +6,11 @@ extension ChatStore {
     // N5 fix (R18): called by ChatView when an iCloud reply arrives.
     // Finds the matching placeholder (by sent message ID in correlationId or
     // by taking the oldest pending placeholder) and updates it.
-    func receiveICloudReply(_ msg: BridgeMessage) {
+    func receiveICloudReply(_ msg: BridgeMessage) async {
+        await restorationTask?.value
+        let offscreen = msg.correlationID.flatMap { pendingExchanges[$0] }
+            .map { $0.sessionID != Self.cleanSessionID(selectedSessionID) } ?? false
+        if !offscreen { await sessionCacheLoadTask?.value }
         guard msg.sender == "mac" else { return }  // only accept Mac replies
         if let correlation = msg.correlationID,
            let placeholder = pendingICloudPlaceholders[correlation] ?? timedOutPendingIds[correlation],
@@ -20,7 +24,6 @@ extension ChatStore {
            record.sessionID != Self.cleanSessionID(selectedSessionID) {
             let kind = msg.metadata?["kind"]
             if kind == nil || kind == "reply" || kind == "final" || kind == "error" || kind == "cancelled" {
-                var cached = loadCachedMessages(for: record.sessionID)
                 let text: String
                 if kind == "cancelled" {
                     text = "(stopped)"
@@ -40,25 +43,18 @@ extension ChatStore {
                 )
                 reply.runId = correlationID
                 reply.completionState = kind == "error" ? "failed" : kind == "cancelled" ? nil : "completed"
-                if let index = cached.firstIndex(where: { $0.id == record.placeholderID }) {
-                    cached[index] = reply
-                } else {
-                    cached.append(reply)
-                }
-                let envelope = CachedTranscript(
-                    schemaVersion: 2,
-                    sessionID: record.sessionID,
-                    messages: cachedTranscriptRows(cached),
-                    appliedTranscriptGeneration: record.sessionID.flatMap { appliedTranscriptGenerations[$0] }
-                )
                 do {
-                    let data = try JSONEncoder().encode(envelope)
-                    defaults.set(data, forKey: transcriptStorageKey(for: record.sessionID))
+                    try await storage.checkpointReply(reply, key: transcriptStorageKey(for: record.sessionID),
+                        legacyKey: transcriptKey, sessionID: record.sessionID)
                 } catch {
                     errorBanner = error.localizedDescription
                     return
                 }
                 cancelReplyWaits(for: correlationID)
+                if record.sessionID == Self.cleanSessionID(selectedSessionID) {
+                    await receiveICloudReply(msg)
+                    return
+                }
                 markICloudReplyResolved(correlationID)
                 return
             }
@@ -326,17 +322,21 @@ extension ChatStore {
             $0.runId == runId && ($0.isTerminalReply || $0.completionState == "failed") && macPublishedMessageIDs.contains($0.id)
         }
         if let saved, let failure {
-            messages[saved].failureDetail = failure
-            messages[saved].completionState = state
+            var updated = messages[saved]
+            updated.failureDetail = failure
+            updated.completionState = state
+            messages[saved] = updated
         }
         if saved != nil || (answer.isEmpty && failure == nil) {
             // Only a bubble of our own: a Mac row it became stays.
             if let bubble, !macPublishedMessageIDs.contains(bubble) { messages.removeAll { $0.id == bubble } }
         } else if let bubble, let index = messages.firstIndex(where: { $0.id == bubble }) {
             // Failure keeps the partial reply and its cause in this same bubble.
-            messages[index].text = msg.text
-            messages[index].failureDetail = failure
-            messages[index].completionState = state
+            var updated = messages[index]
+            updated.text = msg.text
+            updated.failureDetail = failure
+            updated.completionState = state
+            messages[index] = updated
         } else {
             var reply = ChatMessage(role: .assistant, text: msg.text, awaitingMacTranscript: true,
                 runId: runId, failureDetail: failure)
@@ -365,11 +365,11 @@ extension ChatStore {
             let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, beforeID: oldest.id.uuidString)
             guard Self.cleanSessionID(selectedSessionID) == session,
                   let at = messages.firstIndex(where: { $0.id == oldest.id }) else { return }
-            let older = page.messages.filter { row in !messages.contains { $0.id == row.id } }
+            let existingIDs = Set(messages.map(\.id))
+            let older = page.messages.filter { !existingIDs.contains($0.id) }
             pagedHistoryIDs.formUnion(older.map(\.id))
             messages.insert(contentsOf: older, at: at)
             if !page.hasOlder { historyExhaustedSessionIDs.insert(session) }
-            persistMessages()
         } catch {
             errorBanner = "Earlier messages did not load: \(error.localizedDescription)"
         }
@@ -382,10 +382,10 @@ extension ChatStore {
         defer { isLoadingHistory = false }
         do {
             let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, throughID: id.uuidString, limit: 1)
-            guard let whole = page.messages.first(where: { $0.id == id }),
+            guard Self.cleanSessionID(selectedSessionID) == session,
+                  let whole = page.messages.first(where: { $0.id == id }),
                   let index = messages.firstIndex(where: { $0.id == id }) else { return }
             messages[index].text = whole.text
-            persistMessages()
         } catch {
             errorBanner = "The whole message did not load: \(error.localizedDescription)"
         }
@@ -494,16 +494,18 @@ extension ChatStore {
             let seq = Int(msg.metadata?["toolSeq"] ?? "")
             guard let seq else { return }
             let activity = msg.metadata?["activity"]
-            if let eventIndex = messages[idx].toolEvents.firstIndex(where: { $0.seq == seq }) {
-                if let activity { messages[idx].toolEvents[eventIndex].activity = activity }
+            var bubble = messages[idx]
+            if let eventIndex = bubble.toolEvents.firstIndex(where: { $0.seq == seq }) {
+                if let activity { bubble.toolEvents[eventIndex].activity = activity }
             } else {
-                messages[idx].toolEvents.append(ToolEvent(name: clean, seq: seq, activity: activity))
-                messages[idx].toolEvents.sort { $0.seq < $1.seq }
+                bubble.toolEvents.append(ToolEvent(name: clean, seq: seq, activity: activity))
+                bubble.toolEvents.sort { $0.seq < $1.seq }
             }
-            if kind == "tool_result", let eventIndex = messages[idx].toolEvents.firstIndex(where: { $0.seq == seq }) {
-                messages[idx].toolEvents[eventIndex].outcome = msg.metadata?["outcome"]
-                messages[idx].toolEvents[eventIndex].resultDetail = msg.metadata?["resultDetail"]
+            if kind == "tool_result", let eventIndex = bubble.toolEvents.firstIndex(where: { $0.seq == seq }) {
+                bubble.toolEvents[eventIndex].outcome = msg.metadata?["outcome"]
+                bubble.toolEvents[eventIndex].resultDetail = msg.metadata?["resultDetail"]
             }
+            messages[idx] = bubble
             noteEvidencedActivity(correlationID: correlationID,
                                   activity: activity ?? ToolActivityPresentation.progress(clean))
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
@@ -616,11 +618,6 @@ extension ChatStore {
     /// The transcript snapshot re-read is the slow safety net, not the
     /// transport. Was every 5s for the first 60s.
     static let iCloudReplySnapshotBackstopSeconds: TimeInterval = 30
-    /// 2026-09-13: the snapshot backstop used to stop after 120s and hand the
-    /// outcome to a local timeout that failed the bubble. Nothing replaces
-    /// observation now, so it keeps reading for as long as the request is
-    /// outstanding — that is the whole point of pocketing the phone.
-    static let iCloudReplySnapshotBackstopWindowSeconds: TimeInterval = 120
     static let iCloudReplyPollingHintAfterSeconds: TimeInterval = 10
 
     func armReplyPoll(for pendingId: String, client: MacBridgeClient) {
@@ -629,7 +626,7 @@ extension ChatStore {
         // drains the transport and resolves the placeholder, so this loop is a
         // backstop rather than the transport. The hot path drains incoming only
         // at the 8s floor; the heavier transcript-snapshot re-read moves to a
-        // 30s cadence over a 120s window.
+        // 30s cadence while the request is outstanding.
         let task = Task { [weak self, weak client] in
             let startedAt = Date()
             var nextSnapshotPollAt = startedAt.addingTimeInterval(Self.iCloudReplySnapshotBackstopSeconds)

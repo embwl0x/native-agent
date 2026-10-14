@@ -26,35 +26,7 @@ extension CognitiveSubstrate {
         try? await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now())
     }
 
-    /// Strict receipt write for a mutation whose durable outcome depends on the
-    /// receipt itself. Unlike best-effort diagnostics, a disabled or missing
-    /// persistence lane is a refusal rather than a quiet no-op.
-    public func recordReceiptChecked(
-        kind: String,
-        payload: JSONValue = .object([:]),
-        id: UUID? = nil
-    ) async throws {
-        guard configuration.enabled, configuration.persistenceEnabled else {
-            throw CognitivePersistenceError.storeUnavailable
-        }
-        guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        guard !persistenceWritesBlocked else {
-            throw CognitivePersistenceError.writesBlocked(
-                status: persistenceHealth.status,
-                detail: persistenceHealth.failureDetail
-            )
-        }
-        try await store.appendReceipt(
-            kind: kind,
-            payload: payload,
-            at: dependencies.now(),
-            id: id ?? UUID()
-        )
-    }
-
-    /// The honest receipt read used by observational surfaces.  Existing
-    /// callers that only need best-effort diagnostics may continue to use
-    /// `receiptSnapshot`; a UI must preserve this outcome state instead.
+    /// Observational surfaces preserve unavailable receipt evidence explicitly.
     public func receiptReadSnapshot(limit: Int = 40) async -> CognitiveReceiptRead {
         guard configuration.enabled else { return .unavailable(.cognitionDisabled) }
         guard configuration.persistenceEnabled else { return .unavailable(.persistenceDisabled) }
@@ -64,14 +36,6 @@ extension CognitiveSubstrate {
         } catch {
             return .unavailable(.readFailed)
         }
-    }
-
-    /// Compatibility best-effort projection for non-UI callers.  New
-    /// observability surfaces must use `receiptReadSnapshot` so an unavailable
-    /// store cannot be mistaken for an idle cognition loop.
-    public func receiptSnapshot(limit: Int = 40) async -> [CognitiveReceiptRecord] {
-        let read = await receiptReadSnapshot(limit: limit)
-        return read.receipts
     }
 
     func persistArtifact(kind: String, id: UUID, status: String, score: Double, payload: JSONValue) async {

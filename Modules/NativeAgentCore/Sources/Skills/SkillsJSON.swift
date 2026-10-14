@@ -1,12 +1,13 @@
 import Foundation
-import CryptoKit
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - Skills registry shaping (mirror Runtime.list_skills)
 
 public enum SkillsRegistry {
+    /// Callers hold the registry lock through persistence of assigned identities.
     static func decode(_ raw: JSONValue) throws -> [JSONValue] {
-        let rows: [JSONValue]
+        var rows: [JSONValue]
         switch raw {
         case .array(let values): rows = values
         case .object(let object):
@@ -19,6 +20,22 @@ public enum SkillsRegistry {
         }
         guard rows.allSatisfy({ $0.objectValue != nil }) else {
             throw SkillsError.invalidRegistry("skill registry contains a non-object row")
+        }
+        var ids: Set<String> = []
+        for case .object(let row) in rows {
+            guard let value = row["id"], value != .null, value != .string("") else { continue }
+            guard case .string(let id) = value, ids.insert(id.lowercased()).inserted else {
+                throw SkillsError.invalidRegistry("skill registry contains an invalid or duplicate id")
+            }
+        }
+        for index in rows.indices {
+            var row = rows[index].objectValue!
+            if row["id"] == nil || row["id"] == .null || row["id"] == .string("") {
+                let id = SkillMutation.availableID(for: SkillMutation.string(rows[index], "name"), existingIDs: ids)
+                row["id"] = .string(id)
+                ids.insert(id.lowercased())
+                rows[index] = .object(row)
+            }
         }
         return rows
     }
@@ -47,79 +64,13 @@ public enum SkillsRegistry {
     }
 }
 
-// MARK: - Manifest registry merge + reshape (mirror manifest_registered_skills + route)
-
-public enum SkillManifestRegistry {
-    /// Faithful port of Runtime.manifest_registered_skills MERGE, parameterized
-    /// over the two input files' raw contents so it is purely functional and
-    /// testable. `entries` is ordered [legacy, dataRoot]; later files win on a
-    /// name collision (mirrors the Python loop's `merged["skills"][name] = item`
-    /// overwrite as it walks [legacy_path, self.manifest_skills_path]).
-    ///
-    /// - Parameter entries: list of (rawJSON, parentPath, filePath) tuples in
-    ///   the SAME order the daemon iterates them. A file whose root is not an
-    ///   object, or whose `skills` is not an object, is skipped (matches the
-    ///   `continue` guards). Each surviving entry value is copied and gets
-    ///   `sourceRoot` (defaulted to its file's parent dir) and `registryPath`
-    ///   (defaulted to its file path) — only when those keys are absent
-    ///   (setdefault semantics).
-    ///
-    /// - Returns: an ORDER-PRESERVING list of (name, mergedEntry) pairs. A
-    ///   colliding name updates the value IN PLACE without moving its key's
-    ///   position — exactly Python dict `merged[name] = item` semantics, where
-    ///   re-assigning an existing key keeps its original insertion order.
-    ///   This is what the GET /v1/skills/manifest route's
-    ///   `for k, v in merged["skills"].items()` iterates over, so preserving the
-    ///   order keeps the emitted list byte-order-equivalent to the daemon
-    ///   (gpt-5.5 review finding #2, 2026-06-01).
-    public static func merge(
-        entries: [(raw: JSONValue, parentPath: String, filePath: String)]
-    ) -> [(name: String, entry: JSONValue)] {
-        var order: [String] = []
-        var byName: [String: JSONValue] = [:]
-        for (raw, parentPath, filePath) in entries {
-            guard case .object(let root) = raw else { continue }
-            guard let skillsV = root["skills"], case .object(let skills) = skillsV else { continue }
-            // Python dict iteration over `data["skills"].items()` is insertion
-            // order. JSONValue.object backs onto a Swift Dictionary which is
-            // unordered, so the per-FILE ordering of brand-new names within one
-            // file is not recoverable here. The cross-FILE order (legacy before
-            // data-root) and the stable-position-on-collision rule — the parts
-            // the route's emitted list actually depends on for a colliding skill
-            // name — ARE preserved. Within a single file, names are visited in
-            // sorted order for determinism.
-            for name in skills.keys.sorted() {
-                guard case .object(var entry) = skills[name]! else { continue }  // not a dict → skip
-                if entry["sourceRoot"] == nil { entry["sourceRoot"] = .string(parentPath) }
-                if entry["registryPath"] == nil { entry["registryPath"] = .string(filePath) }
-                if byName[name] == nil { order.append(name) }  // first-seen position
-                byName[name] = .object(entry)                  // collision updates in place
-            }
-        }
-        return order.map { (name: $0, entry: byName[$0]!) }
-    }
-
-    /// The route's reshape:
-    ///   [{"name": k, **v} for k, v in merged["skills"].items()]
-    /// Consumes the order-preserving merge output so the emitted list matches
-    /// the daemon's iteration order.
-    public static func reshapeToList(_ merged: [(name: String, entry: JSONValue)]) -> [JSONValue] {
-        merged.map { (name, entryV) in
-            guard case .object(var entry) = entryV else {
-                return .object(["name": .string(name)])
-            }
-            // {"name": k, **v} — the explicit "name" key is FIRST, so a `name`
-            // already inside the entry value (from **v) WINS, mirroring Python's
-            // `{"name": k, **v}` where the spread overwrites the leading literal.
-            if entry["name"] == nil { entry["name"] = .string(name) }
-            return .object(entry)
-        }
-    }
-}
-
 // MARK: - JSONValue convenience (local to Skills)
 
 extension JSONValue {
+    var arrayValue: [JSONValue]? {
+        if case .array(let values) = self { return values }
+        return nil
+    }
     /// The backing dict if this is an `.object`, else nil. Local helper for the
     /// mutation paths' field reads.
     var objectValue: [String: JSONValue]? {
@@ -131,9 +82,7 @@ extension JSONValue {
 // MARK: - Python-semantics helpers for the mutation port
 
 enum SkillMutation {
-    /// The agent's marks on a skill row (skill_manage): who disabled it,
-    /// when she moved it to the trash, and why upkeep retired it.
-    static let agentMarks = ["disabledBy", "trashedAt", "retired"]
+    static let agentMarks = ["disabledBy"]
 
     /// `urllib.parse.unquote` — percent-decode using UTF-8 (matches Python's
     /// default). Leaves a string with no `%` sequences untouched.
@@ -232,7 +181,7 @@ enum SkillMutation {
         }
     }
 
-    /// 2026-09-06: an id becomes a filename (`skills/bodies/<id>.md`), so it
+    /// 2026-09-06: an id becomes a candidate-directory component, so it
     /// has to BE a filename: one path segment, nothing that walks. Legacy ids
     /// keep their spelling — this rejects only what could leave the directory.
     static func isSafeSkillID(_ value: String) -> Bool {

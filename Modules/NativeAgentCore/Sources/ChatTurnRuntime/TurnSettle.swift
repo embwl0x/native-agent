@@ -67,17 +67,6 @@ enum TurnSettle {
         ])
     }
 
-    /// True when the turn settles as waiting on a card. A raised need
-    /// outranks the per-round final of the round that raised it — on the
-    /// text lane that is the model's `<tool_use …>` marker and nothing else,
-    /// and letting it stand persisted the marker as Agent's reply
-    /// (2026-09-13). It never outranks a genuine terminal round
-    /// (`finishedRound`), nor, where the lane passes it, a capped stop whose
-    /// own reply says why the turn ended (`capped`).
-    static func isWaitingOnCard(finishedRound: Bool, capped: Bool) -> Bool {
-        !finishedRound && !capped && ChatTurnExecution.current?.waitingForInteraction == true
-    }
-
     /// The terminal of a turn that ended waiting on a card: the prose the
     /// person watched render, cut at the first marker, plus — on a route that
     /// cannot draw the card — the card said out loud

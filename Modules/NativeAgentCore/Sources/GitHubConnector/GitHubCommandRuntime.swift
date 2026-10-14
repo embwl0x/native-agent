@@ -13,11 +13,9 @@ public actor GitHubCommandRuntime {
     /// from. nil until the first replay, so the first tick after launch always
     /// replays. See `processConnectorChangesIfChanged`.
     private var opLogFingerprint: String?
-    private var connectorReplayCount = 0
     private let observationLoader: ObservationLoader
     private let notificationSender: NotificationSender
     private let outcomeObserver: OutcomeObserver
-    private let residentStateLoader: @Sendable () async throws -> [GitHubCommandItem]
     private var residentOutcomeFingerprints: [String: String] = [:]
     private var residentOutcomeBaselinePrimed = false
     /// Both launch branches require the same baseline before they can safely
@@ -25,14 +23,12 @@ public actor GitHubCommandRuntime {
     /// so a boolean guard alone is reentrant and permits duplicate full-store
     /// reductions. Every concurrent caller awaits this one in-flight read.
     private var residentOutcomeBaselineTask: Task<[GitHubCommandItem], Error>?
-    private var residentOutcomeBaselineLoadCount = 0
 
     public init(
         dataRoot: URL,
         observationLoader: @escaping ObservationLoader,
         notificationSender: @escaping NotificationSender,
-        outcomeObserver: @escaping OutcomeObserver = { _ in },
-        residentStateLoader: (@Sendable () async throws -> [GitHubCommandItem])? = nil
+        outcomeObserver: @escaping OutcomeObserver = { _ in }
     ) {
         let store = GitHubCommandStore(dataRoot: dataRoot)
         self.store = store
@@ -40,9 +36,6 @@ public actor GitHubCommandRuntime {
         self.observationLoader = observationLoader
         self.notificationSender = notificationSender
         self.outcomeObserver = outcomeObserver
-        self.residentStateLoader = residentStateLoader ?? {
-            try await store.liveState().items
-        }
     }
 
     /// Captures the pre-refresh semantic baseline after launch without turning
@@ -56,9 +49,8 @@ public actor GitHubCommandRuntime {
             task = inFlight
             ownsTask = false
         } else {
-            residentOutcomeBaselineLoadCount += 1
-            let loader = residentStateLoader
-            let created = Task { try await loader() }
+            let store = self.store
+            let created = Task { try await store.liveState().items }
             residentOutcomeBaselineTask = created
             task = created
             ownsTask = true
@@ -93,15 +85,7 @@ public actor GitHubCommandRuntime {
                     return false
                 }
             }
-            var observations: [GitHubCommandObservation] = []
-            var failures: [(String, String)] = []
-            for item in items {
-                do {
-                    observations.append(try await observationLoader(item))
-                } catch {
-                    failures.append((item.itemId, GitHubCommandRuntime.readableDetail(error)))
-                }
-            }
+            let (observations, failures) = await loadObservations(items)
             let observed = try await store.observe(observations)
             await observeOutcomes(observed)
             for (itemId, detail) in failures {
@@ -115,38 +99,15 @@ public actor GitHubCommandRuntime {
         }
     }
 
-    /// Called after a connector refresh has already written live observations.
-    public func processConnectorChanges() async {
-        connectorReplayCount += 1
-        await processWatcherState()
-    }
-
-    /// A1/FIX-2: the former 300s github_tracking poll used to call
-    /// `processConnectorChanges()` unconditionally, so every tick paid a full
-    /// `liveState()` decode + reducer replay of a ~2MB op log (~630MB/day) just
-    /// to learn nothing had changed.
-    ///
-    /// The replay now runs when the connector actually refreshed, OR when the
-    /// op-log pair's (mtime,size) fingerprint differs from the one we last
-    /// replayed from. The out-of-process-writer recovery property is PRESERVED
-    /// exactly: canonical GitHub Command base/tail invalidations now wake the
-    /// event/deadline runner directly, while its six-hour integrity sweep
-    /// repairs any missed file event. Either path fingerprints both files and
-    /// replays on ANY change — an external append (size grows), a compaction
-    /// (base rewritten, ops truncated, size SHRINKS), or a same-size rewrite
-    /// with a new mtime. It skips only when the bytes it would decode are
-    /// provably the bytes it already decoded.
-    ///
-    /// The fingerprint is captured BEFORE the replay on purpose. Work done
-    /// during the replay mutates the op log and therefore invalidates the
-    /// stamp we just took, which costs one extra replay next tick — the safe
-    /// direction. Capturing it afterwards would fold a concurrent external
-    /// write into the cache without ever having processed it.
+    /// Replay after a connector refresh or a changed base/tail fingerprint.
+    /// Canonical file invalidations wake the runner; its six-hour integrity
+    /// sweep catches missed events. Capture before replay so a concurrent
+    /// writer or our own notification claims remain visible on the next pass.
     public func processConnectorChangesIfChanged(refreshed: Bool) async {
         let fingerprint = opLogFingerprintNow()
         guard refreshed || opLogFingerprint != fingerprint else { return }
         opLogFingerprint = fingerprint
-        await processConnectorChanges()
+        await processWatcherState()
     }
 
     private func opLogFingerprintNow() -> String {
@@ -164,11 +125,6 @@ public actor GitHubCommandRuntime {
         }
         .joined(separator: "|")
     }
-
-    /// Test seam: how many full `liveState()` replay cycles this runtime has
-    /// actually performed.
-    func _testConnectorReplayCount() -> Int { connectorReplayCount }
-    func _testResidentBaselineLoadCount() -> Int { residentOutcomeBaselineLoadCount }
 
     /// Legacy compatibility for callbacks from work that was already in flight
     /// before GitHub Command became watcher-only. This path cannot create or
@@ -193,15 +149,7 @@ public actor GitHubCommandRuntime {
                 noWorkObserved: noWorkObserved
             )
             await observeOutcomes(items)
-            var observations: [GitHubCommandObservation] = []
-            var failures: [(String, String)] = []
-            for item in items {
-                do {
-                    observations.append(try await observationLoader(item))
-                } catch {
-                    failures.append((item.itemId, GitHubCommandRuntime.readableDetail(error)))
-                }
-            }
+            let (observations, failures) = await loadObservations(items)
             let observed = try await store.observe(observations)
             await observeOutcomes(observed)
             for (itemId, detail) in failures {
@@ -212,6 +160,19 @@ public actor GitHubCommandRuntime {
         } catch {
             nativeLog("github_command: callback correlation failed: \(error.localizedDescription)")
         }
+    }
+
+    private func loadObservations(_ items: [GitHubCommandItem]) async -> ([GitHubCommandObservation], [(String, String)]) {
+        var observations: [GitHubCommandObservation] = []
+        var failures: [(String, String)] = []
+        for item in items {
+            do {
+                observations.append(try await observationLoader(item))
+            } catch {
+                failures.append((item.itemId, Self.readableDetail(error)))
+            }
+        }
+        return (observations, failures)
     }
 
     private func processWatcherState() async {
@@ -253,8 +214,7 @@ public actor GitHubCommandRuntime {
     /// baseline (a missing entry diffs as changed and would re-fire the
     /// observer every cycle); a retired item that somehow reappears re-seeds
     /// next observation — one honest re-fire, not a stale baseline.
-    /// Internal (not private) so the runtime tests can drive it directly.
-    func pruneResidentOutcomeFingerprints(reportedItems: [GitHubCommandItem]) {
+    private func pruneResidentOutcomeFingerprints(reportedItems: [GitHubCommandItem]) {
         let reported = Set(reportedItems.map {
             GitHubCommandStore.motorActionReadModel(item: $0).actionIdentity
         })

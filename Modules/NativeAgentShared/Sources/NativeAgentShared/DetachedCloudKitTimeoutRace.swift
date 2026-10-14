@@ -22,31 +22,10 @@ public func detachedCloudKitTimeoutRace<T: Sendable>(
         }
     }
 
-    return await withTaskGroup(of: DetachedCloudKitTimeoutOutcome<T>.self) { group in
-        group.addTask {
-            guard let result = await state.wait() else {
-                return .cancelled
-            }
-            switch result {
-            case .success(let value):
-                return .success(value)
-            case .failure(let error):
-                return .failure(String(describing: error))
-            }
-        }
-        group.addTask {
-            do {
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                return .timedOut
-            } catch {
-                return .cancelled
-            }
-        }
-
-        let first = await group.next()
-        group.cancelAll()
-        workTask.cancel()
-        await state.cancelWaiter()
-        return first ?? .cancelled
+    switch await state.race(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds) {
+    case .success(let value): return .success(value)
+    case .failure(let error): return .failure(String(describing: error))
+    case .timedOut: return .timedOut
+    case .cancelled: return .cancelled
     }
 }

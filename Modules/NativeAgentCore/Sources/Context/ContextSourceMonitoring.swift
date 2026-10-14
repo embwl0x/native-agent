@@ -134,10 +134,6 @@ public actor ContextSourceRegistry {
         return directories.sorted { $0.path < $1.path }
     }
 
-    public func allowedRootList() -> [URL] {
-        allowedRoots.sorted { $0.path < $1.path }
-    }
-
     private static func canonicalFileURL(_ url: URL) throws -> URL {
         guard url.isFileURL else {
             throw ContextSourceRegistryError.nonFileURL(url.absoluteString)

@@ -64,16 +64,9 @@ extension FeatureSurfaceRecord {
     }
 }
 
-// MARK: - Client protocol
-
-public protocol ContextClient: Sendable {
-    /// Feature-surface lookup; unsupported lookup types return nil.
-    func lookup(body: [String: JSONValue]) async -> ContextLookupResult?
-}
-
 // MARK: - SwiftNative impl
 
-public actor SwiftNativeContextClient: ContextClient {
+public actor SwiftNativeContextClient {
     private let now: @Sendable () -> Date
     private let dataRoot: URL
     private let store: PersistenceCoreProtocol

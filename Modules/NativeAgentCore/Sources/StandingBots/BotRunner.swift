@@ -9,8 +9,7 @@ public struct BotTurnReply: Sendable {
     public var artifacts: [BotArtifact]
     public var status: BotRunStatus
     public var detail: String?
-    /// What the turn actually ran on. A bot requires a saved provider, model
-    /// and Think level; the runner refuses an incomplete or unavailable choice.
+    /// What the turn actually ran on.
     public var model: String?
     /// Set when the turn stopped on an approval, so the shelf entry can be
     /// reconciled against that approval's own resolution later.
@@ -23,14 +22,11 @@ public struct BotTurnReply: Sendable {
 }
 
 public enum BotRunnerError: Error, CustomStringConvertible {
-    case budgetStop, notPermitted, dailySpendLimit
-    /// User, 2026-09-13: a bot runs on the model it was made with. One saved
-    /// before that rule has none — or names a route that is not connected — and
-    /// is never given one silently. Carries what to fix, in a person's words.
+    case notPermitted, dailySpendLimit
+    /// Carries what to fix, in a person's words.
     case cannotRun(String)
     public var description: String {
         switch self {
-        case .budgetStop: return "Stopped at the per-run limit."
         case .notPermitted: return "This action is not permitted."
         case .dailySpendLimit: return "Stopped at the daily token ceiling."
         case .cannotRun(let problem): return problem
@@ -68,21 +64,15 @@ public actor BotRunGate {
 }
 
 extension BotDefinition {
-    /// A bot can only run on a tuple that actually works: a connected route, a
-    /// model that route serves, and a Think level that model supports. Bots made
-    /// before 2026-09-13 could be saved with none of it and quietly borrowed
-    /// Chat's; a half-filled tuple (a route with no Think level, say) would
-    /// reach a provider and fail there instead.
+    public mutating func followProviders() {
+        modelPinned = false
+        provider = nil; model = nil; reasoningEffort = nil; fast = nil
+    }
+
     public var needsModelChoice: Bool { modelChoiceProblem != nil }
 
-    /// The shape test — a route, a model and a Think level are all present.
-    /// Deliberately local to StandingBots: this module does not depend on
-    /// provider catalogs, and a bot card has to render without asking one.
-    /// Whether the route is CONNECTED and actually offers that model is the
-    /// live test, `SwiftNativeProviderRouting.botChoiceRejection`, run where a
-    /// tuple is chosen (the editor, the bot tools) and before a session accepts
-    /// one — see `BotRunGate`.
     public var modelChoiceProblem: String? {
+        guard modelPinned == true else { return nil }
         let route = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let id = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let effort = reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -90,6 +80,14 @@ extension BotDefinition {
         if id.isEmpty { return "Choose a model on that account." }
         if effort.isEmpty { return "Choose a Think level for that model." }
         return nil
+    }
+
+    public func modelSelection(currentModel: String? = nil) -> String {
+        if modelPinned == true {
+            "pinned: \(model ?? "unavailable")"
+        } else {
+            "follows Providers (\(currentModel.flatMap { $0.isEmpty ? nil : $0 } ?? "unavailable"))"
+        }
     }
 }
 

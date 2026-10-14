@@ -3,133 +3,125 @@ import NativeAgentCore
 import PersistenceCore
 
 public enum ToolRegistryActions {
-    /// Read both supported registry shapes without mutating the store.
+    public static func mutate(id: String, dataRoot root: URL, ownerAuthorized: Bool = false,
+        body: @escaping @Sendable ([String: JSONValue]?) throws -> [String: JSONValue]) async throws {
+        try withRows(root, ownerAuthorized: ownerAuthorized) { rows in
+            let index = rows.firstIndex { $0["id"] == .string(id) }
+            let fields = try body(index.map { rows[$0] })
+            guard fields["id"] == .string(id), ToolRecord(json: .object(fields)) != nil else {
+                throw ToolRegistryError.invalidState("The tool mutation has no checked identity or status.")
+            }
+            if let index { rows[index] = fields } else { rows.append(fields) }
+            return (true, ())
+        }
+    }
+
+    public static func recordUse(id: String, version: String, receipt: JSONValue, codeFault: Bool,
+                                 cleanCode: String?, dataRoot root: URL) async throws {
+        try await mutate(id: id, dataRoot: root) { current in
+            guard var row = current else { throw ToolRegistryError.toolNotFound(id) }
+            guard row["codeFingerprint"] == .string(version) else { return row }
+            let count: Int64 = if case .int(let count)? = row["useCount"] { count } else { 0 }
+            let failures: Int64 = if case .int(let count)? = row["failuresInARow"] { count } else { 0 }
+            let fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { [:] }
+            row["lastUsedAt"] = .string(SwiftNativeToolRegistry.isoTimestamp(Date()))
+            row["useCount"] = .int(count + 1)
+            row["lastRunVersion"] = .string(version)
+            row["lastRun"] = .object(fields.filter { ["status", "effects", "version", "calls", "error", "stopped"].contains($0.key) })
+            row["failuresInARow"] = .int(codeFault ? failures + 1 : cleanCode != nil ? 0 : failures)
+            if let cleanCode { row["lastCleanCode"] = .string(cleanCode); row["lastCleanVersion"] = .string(version) }
+            return row
+        }
+    }
+
+    public static func drop(id: String, dataRoot root: URL, preview: Bool = false, ownerAuthorized: Bool = false) async throws -> Bool {
+        try AbilityStore.withLock {
+            let store = AbilityStore(dataRoot: root)
+            guard try store.files(kind: .tool).contains(where: { $0.id == id }) else { throw ToolRegistryError.toolNotFound(id) }
+            try store.remove(id: id, ownerAuthorized: ownerAuthorized, preview: preview)
+            return true
+        }
+    }
+
+    public static func rollbackVersion(_ value: JSONValue) -> String? {
+        guard case .object(let row) = value, case .string(let digest)? = row["previousVersion"] else { return nil }
+        return digest
+    }
+
+    public static func read(_ tool: ToolRecord) -> JSONValue {
+        guard case .object(let row) = tool.toJSON() else { return .null }
+        let rollback = rollbackVersion(tool.toJSON()).map(JSONValue.string) ?? .null
+        return .object(["id": .string(tool.id), "name": .string(tool.name), "status": .string(tool.status),
+            "description": .string(tool.description), "dropped": .bool(false),
+            "versions": .object(["current": row["codeFingerprint"] ?? .null, "candidate": row["candidateDigest"] ?? .null,
+                "last_clean": row["lastCleanVersion"] ?? .null,
+                "retained": .array(rollback == .null ? [] : [.object(["digest": rollback])]),
+                "drop": .object(["detail": .string("Permanently deletes this ability, its proposed and previous versions, and its run state.")]),
+                "rollback": .object(["target": rollback, "detail": .string(rollback == .null
+                    ? "No previous version." : "Swaps the current and previous versions; unadmitted code needs tool.approve, and the owner's off-switch remains.")])])])
+    }
+
     public static func entries(dataRoot root: URL) throws -> [JSONValue] {
-        let rows = try readRows(root.appendingPathComponent("tools/registry.json"))
-        return rows.map { JSONValue(fromFoundation: $0) }
+        guard case .array(let rows) = try AbilityStore(dataRoot: root).registry(kind: .tool) else {
+            throw ToolRegistryError.registryUnreadable(reason: "abilities must contain tool records")
+        }
+        return rows
     }
 
     public static func updateTool(id: String, autoRun: Bool, dataRoot root: URL, validate: @escaping @Sendable (ToolRecord) throws -> Void) async throws -> ToolRecord {
         throw NSError(domain: "NativeAgentSwiftOnly", code: -405, userInfo: [
-            NSLocalizedDescriptionKey: "Authored-tool auto-run is unavailable; this setting does not control execution. Quarantine the tool to stop it."
+            NSLocalizedDescriptionKey: "Authored-tool auto-run is unavailable; this setting does not control execution. Turn the tool off to stop it."
         ])
     }
 
-    /// A proposal's row (`tool.propose`), replacing the one with its id, kept
-    /// stamps and counts merged in; the Tools page lists it as the registry has it.
-    public static func upsertProposal(_ record: JSONValue, dataRoot root: URL) async throws {
-        let regPath = root.appendingPathComponent("tools/registry.json")
-        let data = try record.serializedData(pretty: false)
-        try await SwiftNativePersistenceCore().withFileLock(regPath) {
-            guard let row = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-            var rows = try readRows(regPath)
-            if let idx = rows.firstIndex(where: { ($0["id"] as? String) == row["id"] as? String }) {
-                rows[idx].merge(row) { $1 }
-            } else {
-                rows.append(row)
+    public static func checkEnable(id: String, dataRoot root: URL) async throws {
+        try withRows(root) { rows in
+            guard let row = rows.first(where: { $0["id"] == .string(id) }) else { throw ToolRegistryError.toolNotFound(id) }
+            _ = try CapabilityLifecycle.preservingOwnerOff(row, before: row, enabling: true)
+            return (false, ())
+        }
+    }
+
+    public static func restore(id: String, dataRoot root: URL, preview: Bool = false, ownerAuthorized: Bool = false) async throws -> String? {
+        try withRows(root, ownerAuthorized: ownerAuthorized, enabling: true) { rows in
+            guard let i = rows.firstIndex(where: { $0["id"] == .string(id) }), rows[i]["status"] == .string("disabled") else {
+                return (false, nil)
             }
-            let out = try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys, .prettyPrinted])
-            try out.write(to: regPath, options: .atomic)
+            let status = rows[i]["admission"] == nil ? "proposed" : "active"
+            rows[i]["status"] = .string(status); rows[i]["phase"] = .string(status)
+            rows[i]["enabledAt"] = .string(SwiftNativeToolRegistry.isoTimestamp(Date()))
+            rows[i]["updatedAt"] = rows[i]["enabledAt"]
+            return (!preview, status)
         }
     }
 
-    // MARK: - Lifecycle (`CapabilityLifecycle`), the same one her skills have
-
-    /// A call of a tool she wrote is a use. Returns the one MY QUEUE line
-    /// when this call made its failures in a row reach the streak.
-    public static func recordCall(id: String, failed: Bool, cleanCode: String? = nil, dataRoot root: URL) async throws -> String? {
-        try await withRows(root) { rows in
-            guard let i = rows.firstIndex(where: { ($0["id"] as? String) == id }) else { return (false, nil) }
-            let streak = failed ? ((rows[i]["failuresInARow"] as? Int) ?? 0) + 1 : 0
-            rows[i]["lastUsedAt"] = SwiftNativeToolRegistry.isoTimestamp(Date())
-            rows[i]["useCount"] = ((rows[i]["useCount"] as? Int) ?? 0) + 1
-            rows[i]["failuresInARow"] = streak
-            if let cleanCode { rows[i]["lastCleanCode"] = cleanCode }
-            return (true, streak == CapabilityLifecycle.toolFailureStreak
-                ? "\(id) failed twice in a row; improve it? (tool.quarantine, then tool.propose or tool.rollback)" : nil)
-        }
-    }
-
-    /// Active and unused for 30 days → archived, never deleted: it doesn't
-    /// run and isn't offered, and tool.restore brings it back. One line each.
-    public static func upkeep(dataRoot root: URL, now: Date = Date()) async throws -> [String] {
-        try await withRows(root) { rows in
-            var lines: [String] = []
-            for i in rows.indices where rows[i]["status"] as? String == "active" {
-                let used = [rows[i]["lastUsedAt"], rows[i]["updatedAt"], rows[i]["createdAt"]].lazy.compactMap { $0 as? String }.first
-                guard CapabilityLifecycle.isUnused(used: used, enabled: [rows[i]["promotedAt"] as? String, rows[i]["enabledAt"] as? String],
-                                                   now: now) else { continue }
-                rows[i]["status"] = CapabilityLifecycle.archived
-                rows[i]["archivedAt"] = SwiftNativeToolRegistry.isoTimestamp(now)
-                lines.append("\(rows[i]["id"] as? String ?? "a tool") archived: unused for \(CapabilityLifecycle.unusedDays) days, "
-                    + "not deleted; tool.restore brings it back")
+    public static func reject(id: String, dataRoot root: URL, preview: Bool = false) async throws -> Bool {
+        try AbilityStore.withLock {
+            let store = AbilityStore(dataRoot: root)
+            guard let proposal = try store.read(id: id, slot: .next), proposal.kind == .tool else { return false }
+            if !preview {
+                if try store.read(id: id) == nil { try store.remove(id: id) }
+                else { try store.remove(id: id, slot: .next) }
             }
-            return (!lines.isEmpty, lines)
+            return true
         }
     }
 
-    /// Archived → active again, its clock started over; false when it isn't
-    /// archived. `preview` answers the same and writes nothing.
-    public static func restore(id: String, dataRoot root: URL, preview: Bool = false) async throws -> Bool {
-        try await withRows(root) { rows in
-            guard let i = rows.firstIndex(where: { ($0["id"] as? String) == id }),
-                  rows[i]["status"] as? String == CapabilityLifecycle.archived else { return (false, false) }
-            if preview { return (false, true) }
-            rows[i]["status"] = "active"
-            rows[i]["enabledAt"] = SwiftNativeToolRegistry.isoTimestamp(Date())
-            rows[i].removeValue(forKey: "archivedAt")
-            return (true, true)
-        }
-    }
-
-    /// The SHA-256 of the code its last clean call ran, kept for rollback.
-    public static func lastCleanCode(id: String, dataRoot root: URL) -> String? {
-        let regPath = root.appendingPathComponent("tools/registry.json")
-        guard FileManager.default.fileExists(atPath: regPath.path) else { return nil }
-        return ((try? readRows(regPath)) ?? []).first { ($0["id"] as? String) == id }?["lastCleanCode"] as? String
-    }
-
-    /// Her archived tools, id and description, for find.
-    public static func archived(dataRoot root: URL) -> [(id: String, about: String)] {
-        let regPath = root.appendingPathComponent("tools/registry.json")
-        guard FileManager.default.fileExists(atPath: regPath.path) else { return [] }
-        return ((try? readRows(regPath)) ?? []).compactMap { row in
-            guard row["status"] as? String == CapabilityLifecycle.archived, let id = row["id"] as? String else { return nil }
-            return (id, row["description"] as? String ?? "")
-        }
-    }
-
-    /// The rows under the registry's lock; written back only when `body` says it changed them.
-    private static func withRows<T: Sendable>(_ root: URL, _ body: @escaping @Sendable (inout [[String: Any]]) -> (Bool, T)) async throws -> T {
-        let regPath = root.appendingPathComponent("tools/registry.json")
-        return try await SwiftNativePersistenceCore().withFileLock(regPath) {
-            var rows = try readRows(regPath)
-            let (changed, out) = body(&rows)
-            if changed {
-                try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys, .prettyPrinted]).write(to: regPath, options: .atomic)
+    private static func withRows<T>(_ root: URL, ownerAuthorized: Bool = false, enabling: Bool = false,
+        _ body: (inout [[String: JSONValue]]) throws -> (Bool, T)) throws -> T {
+        try AbilityStore.withLock {
+            let store = AbilityStore(dataRoot: root)
+            var rows = try entries(dataRoot: root).map { value in
+                guard case .object(let row) = value else { throw ToolRegistryError.registryUnreadable(reason: "tool record must be an object") }
+                return row
+            }
+            let (changed, out) = try body(&rows)
+            if changed { try store.saveRegistry(.array(rows.map(JSONValue.object)), kind: .tool, ownerAuthorized: ownerAuthorized, enabling: enabling) }
+            else if enabling {
+                _ = try CapabilityLifecycle.preservingOwnerOff(.array(rows.map(JSONValue.object)), before: store.registry(kind: .tool),
+                    ownerAuthorized: ownerAuthorized, enabling: true)
             }
             return out
         }
     }
-
-    /// The registry's rows; absent is empty, unreadable bytes are an error, never empty.
-    private static func readRows(_ regPath: URL) throws -> [[String: Any]] {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: regPath.path) else { return [] }
-        let data = try Data(contentsOf: regPath)
-        let raw: Any
-        do {
-            raw = try JSONSerialization.jsonObject(with: data, options: [])
-        } catch {
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
-                NSLocalizedDescriptionKey: "updateTool: tools registry is malformed"
-            ])
-        }
-        if let arr = raw as? [[String: Any]] { return arr }
-        if let dict = raw as? [String: Any], let arr = dict["tools"] as? [[String: Any]] { return arr }
-        throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
-            NSLocalizedDescriptionKey: "updateTool: tools registry must contain an array of records"
-        ])
-    }
-
 }

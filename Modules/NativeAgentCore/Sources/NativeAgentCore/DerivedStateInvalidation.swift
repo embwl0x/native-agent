@@ -127,12 +127,6 @@ public actor DerivedStateInvalidationCenter {
     }
 
     public func flush() async {
-        await flush(onAdmission: nil)
-    }
-
-    /// Internal admission receipt keeps concurrency fixtures deterministic
-    /// without exposing payloads or adding a production observer API.
-    func flush(onAdmission: (@Sendable (Int) -> Void)?) async {
         deliveryGeneration &+= 1
         let scheduledDelivery = deliveryTask
         deliveryTask = nil
@@ -143,7 +137,6 @@ public actor DerivedStateInvalidationCenter {
         // hold a new owner hostage. Earlier flushes retain their own tasks.
         let admitted = inFlightDeliveries.sorted { $0.key < $1.key }
             .map(\.value).filter { $0.sinkEpoch == sinkEpoch }.map(\.task)
-        onAdmission?(admitted.count)
         for delivery in admitted { await delivery.value }
     }
 

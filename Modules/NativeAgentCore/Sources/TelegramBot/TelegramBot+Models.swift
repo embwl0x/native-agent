@@ -43,30 +43,22 @@ public struct TelegramStatus: Sendable, Codable, Equatable {
         "extras",
     ]
 
-    private struct AnyKey: CodingKey, Hashable {
-        var stringValue: String
-        var intValue: Int? { nil }
-        init(_ s: String) { self.stringValue = s }
-        init?(stringValue: String) { self.stringValue = stringValue }
-        init?(intValue: Int) { return nil }
-    }
-
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: AnyKey.self)
+        let c = try decoder.container(keyedBy: _TGAnyKey.self)
         func bool(_ k: String) throws -> Bool? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
+            guard let key = _TGAnyKey(stringValue: k) else { return nil }
             return try c.decodeIfPresent(Bool.self, forKey: key)
         }
         func str(_ k: String) throws -> String? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
+            guard let key = _TGAnyKey(stringValue: k) else { return nil }
             return try c.decodeIfPresent(String.self, forKey: key)
         }
         func int(_ k: String) throws -> Int? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
+            guard let key = _TGAnyKey(stringValue: k) else { return nil }
             return try c.decodeIfPresent(Int.self, forKey: key)
         }
         func jv(_ k: String) throws -> JSONValue? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
+            guard let key = _TGAnyKey(stringValue: k) else { return nil }
             return try c.decodeIfPresent(JSONValue.self, forKey: key)
         }
         self.enabled = try bool("enabled")
@@ -94,17 +86,17 @@ public struct TelegramStatus: Sendable, Codable, Equatable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: AnyKey.self)
-        try c.encodeIfPresent(enabled, forKey: AnyKey("enabled"))
-        try c.encodeIfPresent(tokenConfigured, forKey: AnyKey("tokenConfigured"))
-        try c.encodeIfPresent(pollerEnabled, forKey: AnyKey("pollerEnabled"))
-        try c.encodeIfPresent(lastSeenUpdateId, forKey: AnyKey("lastSeenUpdateId"))
-        try c.encodeIfPresent(lastSeenAt, forKey: AnyKey("lastSeenAt"))
-        try c.encodeIfPresent(lastReplyAt, forKey: AnyKey("lastReplyAt"))
-        try c.encodeIfPresent(lastError, forKey: AnyKey("lastError"))
+        var c = encoder.container(keyedBy: _TGAnyKey.self)
+        try c.encodeIfPresent(enabled, forKey: _TGAnyKey("enabled"))
+        try c.encodeIfPresent(tokenConfigured, forKey: _TGAnyKey("tokenConfigured"))
+        try c.encodeIfPresent(pollerEnabled, forKey: _TGAnyKey("pollerEnabled"))
+        try c.encodeIfPresent(lastSeenUpdateId, forKey: _TGAnyKey("lastSeenUpdateId"))
+        try c.encodeIfPresent(lastSeenAt, forKey: _TGAnyKey("lastSeenAt"))
+        try c.encodeIfPresent(lastReplyAt, forKey: _TGAnyKey("lastReplyAt"))
+        try c.encodeIfPresent(lastError, forKey: _TGAnyKey("lastError"))
         if case .object(let obj)? = extras {
             for (k, v) in obj where !Self.knownKeys.contains(k) {
-                try c.encode(v, forKey: AnyKey(k))
+                try c.encode(v, forKey: _TGAnyKey(k))
             }
         }
     }
@@ -256,15 +248,6 @@ public protocol TelegramBotProtocol: Sendable {
     func sendTestMessage(message: String?, chatId: String?) async throws -> TelegramTestResult
     func clearLogs() async throws
 }
-
-public extension TelegramBotProtocol {
-    /// Back-compat overload — preserves the pre-wave-30 `sendTestMessage(message:)`
-    /// call shape (no chat targeting).
-    func sendTestMessage(message: String?) async throws -> TelegramTestResult {
-        try await sendTestMessage(message: message, chatId: nil)
-    }
-}
-
 
 // MARK: - TelegramMessage / TelegramUpdate / TelegramPollResult
 

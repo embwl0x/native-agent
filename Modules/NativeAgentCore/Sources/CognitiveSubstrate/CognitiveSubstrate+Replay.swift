@@ -3,13 +3,6 @@ import NativeAgentCore
 import PersistenceCore
 
 extension CognitiveSubstrate {
-    @discardableResult
-    public func integrateReplay(
-        _ input: CognitiveReplayIntegrationInput
-    ) async -> CognitiveReplayIntegrationResult {
-        (try? await integrateReplayChecked(input)) ?? CognitiveReplayIntegrationResult()
-    }
-
     /// Scheduled replay's checked boundary. All replay artifacts, lineage, and
     /// its receipt commit in one SQLite transaction; in-memory state rolls back
     /// on failure so evidence remains eligible for a later retry.
@@ -18,7 +11,7 @@ extension CognitiveSubstrate {
         _ input: CognitiveReplayIntegrationInput
     ) async throws -> CognitiveReplayIntegrationResult {
         await waitForMaintenanceTransition()
-        guard configuration.enabled, configuration.replayEnabled else { return CognitiveReplayIntegrationResult() }
+        guard configuration.enabled else { return CognitiveReplayIntegrationResult() }
         let now = dependencies.now()
         let priorEpisodes = episodes
         let priorSchemas = schemaProposals
@@ -261,7 +254,7 @@ extension CognitiveSubstrate {
         evidenceNodeIds: [UUID] = []
     ) async -> CognitiveEpisodeReference? {
         await waitForMaintenanceTransition()
-        guard configuration.enabled, configuration.replayEnabled else { return nil }
+        guard configuration.enabled else { return nil }
         let now = dependencies.now()
         let episode = CognitiveEpisodeReference(
             id: dependencies.makeUUID(),
@@ -418,11 +411,7 @@ extension CognitiveSubstrate {
     }
 
     private func dateFromInternetDate(_ raw: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let parsed = formatter.date(from: raw) { return parsed }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: raw)
+        NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     private func boundedExternalEvidenceIds(_ ids: [String]) -> [String] {

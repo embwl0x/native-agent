@@ -1,5 +1,6 @@
 import FeedPolicy
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// Result of patching the loop's diagnostic state. State is observational, but
@@ -48,19 +49,13 @@ enum SlackRuntimeStateStore {
                 // of diagnostic keys. Its update time lets readers distinguish
                 // a quiet-but-live socket (kept fresh by ping) from a bridge
                 // that stopped reporting altogether.
-                object["updatedAt"] = .string(timestamp(now))
+                object["updatedAt"] = .string(NativeTimestampFormat.fractionalZulu(now))
                 try await persistence.writeJSON(.object(object), to: statePath)
                 return .stored
             }
         } catch {
             return .unavailableWriteFailure
         }
-    }
-
-    private static func timestamp(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
     }
 }
 
@@ -108,7 +103,7 @@ public enum SlackRuntimeStateFeed {
                 return .unavailable("Slack runtime state has no boolean connection flag")
             }
             guard case .string(let updatedAt)? = object["updatedAt"],
-                  let date = parseTimestamp(updatedAt) else {
+                  let date = NativeTimestampFormat.parseISO8601FractionalFirst(updatedAt) else {
                 return .unavailable("Slack runtime state has no valid update timestamp")
             }
             guard date <= now else {
@@ -140,15 +135,6 @@ public enum SlackRuntimeStateFeed {
         } catch {
             return .unavailable("Slack runtime state could not be read")
         }
-    }
-
-    private static func parseTimestamp(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: raw) { return date }
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return standard.date(from: raw)
     }
 }
 
@@ -302,7 +288,36 @@ enum SlackReceiptErrorFeed {
         let errors = errorRows.count
         let windowStart = now.addingTimeInterval(-max(0, window))
         let newestReceiptAt = newestTimestamp(in: receiptRows)
-        let newestErrorAt = newestTimestamp(in: errorRows)
+        let formatter = timestampFormatter()
+        var newestErrorAt: String?
+        var errorsInWindow = 0
+        var contexts: [String: Int] = [:]
+        var classes: [String: Int] = [:]
+        for row in errorRows {
+            guard case .object(let object) = row,
+                  case .string(let timestamp)? = object["at"] else { continue }
+            newestErrorAt = max(newestErrorAt ?? timestamp, timestamp)
+            guard let date = formatter.date(from: timestamp), date >= windowStart else { continue }
+            errorsInWindow += 1
+            let context = normalizedString(object["context"], fallback: "unknown_context")
+            let errorClass = normalizedString(object["errorClass"], fallback: "legacy_unclassified")
+            contexts[context, default: 0] += 1
+            classes["\(context)\u{1F}\(errorClass)", default: 0] += 1
+        }
+        let days = max(window / (24 * 60 * 60), 1.0 / 24.0)
+        var contextRates: [Report.ContextRate] = contexts.map { context, rows in
+            Report.ContextRate(context: context, rows: rows, ratePerDay: Double(rows) / days)
+        }
+        contextRates.sort { $0.rows == $1.rows ? $0.context < $1.context : $0.rows > $1.rows }
+        let rankedErrorLeads = classes.compactMap { key, rows -> Report.RankedErrorLead? in
+            let parts = key.split(separator: "\u{1F}", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return nil }
+            return Report.RankedErrorLead(context: parts[0], errorClass: parts[1], rows: rows)
+        }.sorted {
+            if $0.rows != $1.rows { return $0.rows > $1.rows }
+            if $0.context != $1.context { return $0.context < $1.context }
+            return $0.errorClass < $1.errorClass
+        }
         let ratio = receipts > 0 ? Double(errors) / Double(receipts) : nil
         var leads: [String] = []
         if receiptBytes > retention.maxBytes {
@@ -331,8 +346,8 @@ enum SlackReceiptErrorFeed {
         return Report(
             receiptCount: receipts,
             errorCount: errors,
-            receiptRowsInWindow: rowCount(in: receiptRows, since: windowStart),
-            errorRowsInWindow: rowCount(in: errorRows, since: windowStart),
+            receiptRowsInWindow: rowCount(in: receiptRows, since: windowStart, formatter: formatter),
+            errorRowsInWindow: errorsInWindow,
             receiptBytes: receiptBytes,
             errorBytes: errorBytes,
             receiptMalformedLineCount: receiptReadReport.malformedLineCount,
@@ -343,8 +358,8 @@ enum SlackReceiptErrorFeed {
             newestErrorAt: newestErrorAt,
             errorToReceiptRatio: ratio,
             errorsAreAtRetentionCap: errors >= retention.maxLines,
-            contextRates: contextRates(in: errorRows, since: windowStart, window: window),
-            rankedErrorLeads: rankedErrorLeads(in: errorRows, since: windowStart),
+            contextRates: contextRates,
+            rankedErrorLeads: rankedErrorLeads,
             rankedLeads: leads
         )
     }
@@ -362,60 +377,13 @@ enum SlackReceiptErrorFeed {
         }.max()
     }
 
-    private static func rowCount(in rows: [JSONValue], since windowStart: Date) -> Int {
-        let formatter = timestampFormatter()
+    private static func rowCount(in rows: [JSONValue], since windowStart: Date, formatter: ISO8601DateFormatter) -> Int {
         return rows.reduce(into: 0) { count, row in
             guard case .object(let object) = row,
                   case .string(let timestamp)? = object["at"],
                   let date = formatter.date(from: timestamp),
                   date >= windowStart else { return }
             count += 1
-        }
-    }
-
-    private static func contextRates(
-        in rows: [JSONValue],
-        since windowStart: Date,
-        window: TimeInterval
-    ) -> [Report.ContextRate] {
-        let formatter = timestampFormatter()
-        var counts: [String: Int] = [:]
-        for row in rows {
-            guard case .object(let object) = row,
-                  case .string(let timestamp)? = object["at"],
-                  let date = formatter.date(from: timestamp),
-                  date >= windowStart else { continue }
-            counts[normalizedString(object["context"], fallback: "unknown_context"), default: 0] += 1
-        }
-        let days = max(window / (24 * 60 * 60), 1.0 / 24.0)
-        return counts.map { context, rows in
-            Report.ContextRate(context: context, rows: rows, ratePerDay: Double(rows) / days)
-        }.sorted { $0.rows == $1.rows ? $0.context < $1.context : $0.rows > $1.rows }
-    }
-
-    private static func rankedErrorLeads(
-        in rows: [JSONValue],
-        since windowStart: Date
-    ) -> [Report.RankedErrorLead] {
-        let formatter = timestampFormatter()
-        var counts: [String: Int] = [:]
-        for row in rows {
-            guard case .object(let object) = row,
-                  case .string(let timestamp)? = object["at"],
-                  let date = formatter.date(from: timestamp),
-                  date >= windowStart else { continue }
-            let context = normalizedString(object["context"], fallback: "unknown_context")
-            let errorClass = normalizedString(object["errorClass"], fallback: "legacy_unclassified")
-            counts["\(context)\u{1F}\(errorClass)", default: 0] += 1
-        }
-        return counts.compactMap { key, rows -> Report.RankedErrorLead? in
-            let parts = key.split(separator: "\u{1F}", maxSplits: 1).map(String.init)
-            guard parts.count == 2 else { return nil }
-            return Report.RankedErrorLead(context: parts[0], errorClass: parts[1], rows: rows)
-        }.sorted {
-            if $0.rows != $1.rows { return $0.rows > $1.rows }
-            if $0.context != $1.context { return $0.context < $1.context }
-            return $0.errorClass < $1.errorClass
         }
     }
 

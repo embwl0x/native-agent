@@ -1,13 +1,5 @@
 import Foundation
 
-public struct ContextExpansionConfiguration: Equatable, Sendable {
-    public let maximumCharacters: Int
-
-    public init(maximumCharacters: Int = 12_000) {
-        self.maximumCharacters = max(1, maximumCharacters)
-    }
-}
-
 public enum ContextExpansionError: Error, Equatable, Sendable {
     case invalidCharacterLimit
     case invalidCharacterOffset
@@ -81,11 +73,9 @@ public struct ContextExpansionResult: Codable, Equatable, Sendable {
 /// Resolves a selector-issued, on-demand pointer without mutating context state
 /// or deriving any new authority from the pointed-to atom.
 public struct ContextExpander: Sendable {
-    public let configuration: ContextExpansionConfiguration
+    private static let maximumCharacters = 12_000
 
-    public init(configuration: ContextExpansionConfiguration = .init()) {
-        self.configuration = configuration
-    }
+    public init() {}
 
     /// - Parameter offeredSelectedItems: selected representations whose
     ///   pointers this turn's packet offered. Empty admits only `.onDemand`.
@@ -104,8 +94,8 @@ public struct ContextExpander: Sendable {
         guard offset >= 0 else {
             throw ContextExpansionError.invalidCharacterOffset
         }
-        let characterLimit = min(requestedMaximum ?? configuration.maximumCharacters,
-                                 configuration.maximumCharacters)
+        let characterLimit = min(requestedMaximum ?? Self.maximumCharacters,
+                                 Self.maximumCharacters)
         let generationID = generation.generation.id
 
         if let requested = need.availableGenerationID, requested != generationID {

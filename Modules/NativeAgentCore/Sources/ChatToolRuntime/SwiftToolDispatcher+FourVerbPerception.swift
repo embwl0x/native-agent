@@ -29,11 +29,7 @@ struct MacVisualObstruction: Sendable, Equatable {
     }
 }
 
-protocol MacVisualObstructionProbing: Sendable {
-    func obstructions(over frame: MacAXFrame, targetPID: Int32) -> [MacVisualObstruction]
-}
-
-struct SystemMacVisualObstructionProbe: MacVisualObstructionProbing {
+struct SystemMacVisualObstructionProbe: Sendable {
     func obstructions(over frame: MacAXFrame, targetPID: Int32) -> [MacVisualObstruction] {
         guard let raw = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly], kCGNullWindowID
@@ -94,9 +90,9 @@ struct SystemMacVisualObstructionProbe: MacVisualObstructionProbing {
 /// VisionPerception compiler. MacControl stays independent of VisionPerception;
 /// the four-verb surface receives one additive, source-neutral supplement.
 struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerceptionSource {
-    let host: any MacFourVerbsHost
+    let host: any MacControlClient
     let liveScene: SwiftToolDispatcherFourVerbLiveScene
-    let obstructionProbe: any MacVisualObstructionProbing
+    let obstructionProbe = SystemMacVisualObstructionProbe()
     /// Words for the verb this observation belongs to, for the chat's live
     /// computer pane. Carried per call rather than read from ambient state so a
     /// caption and a frame can never come from different verbs. `nil` means
@@ -107,21 +103,15 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
     let pixels: FourVerbPixelAttachment?
 
     init(
-        host: any MacFourVerbsHost,
-        liveScene: SwiftToolDispatcherFourVerbLiveScene = SwiftToolDispatcherFourVerbLiveScene(),
-        obstructionProbe: any MacVisualObstructionProbing = SystemMacVisualObstructionProbe(),
+        host: any MacControlClient,
+        liveScene: SwiftToolDispatcherFourVerbLiveScene,
         previewCaption: String? = nil,
         pixels: FourVerbPixelAttachment? = nil
     ) {
         self.host = host
         self.liveScene = liveScene
-        self.obstructionProbe = obstructionProbe
         self.previewCaption = previewCaption
         self.pixels = pixels
-    }
-
-    func observe() async -> MacFourVerbsSupplement? {
-        await observe(app: nil)
     }
 
     func rejected() { pixels?.discard(); SenseAppReadCapture.current?.discardWindowText() }
@@ -280,14 +270,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                     h: obstruction.frame.h * Double(crop.image.height) / crop.logicalSize.height
                 )
             }
-            let percept = try VisionPerceptionCompiler(
-                config: VisionPerceptionConfig(
-                    text: VisionTextLayerConfig(sparseRecoveryMaxBoxes: 3)
-                ),
-                salience: VisionKitSalienceProvider()
-            ).compile(
+            let percept = try VisionPerceptionCompiler().compile(
                 image: crop.image,
-                using: VisionKitTextRecognizer(),
                 excludedRegions: excludedRegions
             )
             let sceneKey = [bundleIdentifier, appName, title]
@@ -363,6 +347,17 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 ), at: 0)
             }
             let obstruction = obstructions.max { $0.coverage < $1.coverage }
+            let timings: [String: JSONValue] = [
+                "vision_capture_ms": .int(elapsedMilliseconds(from: observationStartedNs, to: captureFinishedNs)),
+                "vision_compile_ms": .int(elapsedMilliseconds(from: visualCompileStartedNs, to: visualCompileFinishedNs)),
+                "capture_ax_snapshot_ms": output["ax_snapshot_ms"] ?? .null,
+                "capture_screen_capture_ms": output["screen_capture_ms"] ?? .null,
+                "capture_image_render_ms": output["image_render_ms"] ?? .null,
+                "capture_scene_selection_ms": output["scene_selection_ms"] ?? .null,
+                "capture_post_render_ms": output["post_render_ms"] ?? .null,
+                "capture_view_total_ms": output["view_total_ms"] ?? .null,
+            ]
+            OwnedProgramRunner.ReadContent.current?.record(.object(timings), content: .object([:]))
             return MacFourVerbsSupplement(
                 appName: appName,
                 bundleIdentifier: bundleIdentifier,
@@ -374,17 +369,11 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 controls: structural.controls + vision.controls,
                 values: structural.values + visionValues,
                 targets: structural.targets + visionTargets,
-                diagnostics: [
+                diagnostics: ([
                     "vision_isolated_window": output["capture_isolated_window"] ?? .bool(false),
                     "vision_recognized_strings": .int(Int64(percept.recognizedStrings)),
                     "vision_text_tiled": .bool(percept.textTiled),
                     "vision_text_tiling_reason": .string(percept.textTilingReason),
-                    "vision_capture_ms": .int(elapsedMilliseconds(
-                        from: observationStartedNs, to: captureFinishedNs
-                    )),
-                    "vision_compile_ms": .int(elapsedMilliseconds(
-                        from: visualCompileStartedNs, to: visualCompileFinishedNs
-                    )),
                     "vision_frame_pixels": .object([
                         "w": .double(percept.frameSize.width),
                         "h": .double(percept.frameSize.height),
@@ -396,18 +385,12 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                         ?? .array([]),
                     "capture_image_downscale": output["image_downscale"] ?? .null,
                     "capture_image_pixels": output["image_pixel_size"] ?? .null,
-                    "capture_ax_snapshot_ms": output["ax_snapshot_ms"] ?? .null,
-                    "capture_screen_capture_ms": output["screen_capture_ms"] ?? .null,
-                    "capture_image_render_ms": output["image_render_ms"] ?? .null,
-                    "capture_scene_selection_ms": output["scene_selection_ms"] ?? .null,
-                    "capture_post_render_ms": output["post_render_ms"] ?? .null,
-                    "capture_view_total_ms": output["view_total_ms"] ?? .null,
                     "visual_world_obstructed": .bool(obstruction != nil),
                     "visual_world_obstruction_count": .int(Int64(obstructions.count)),
                     "visual_world_blocked_targets": .int(Int64(vision.targets.count - visionTargets.count)),
                     "visual_world_obstruction_owner": obstruction.map { .string($0.ownerName) } ?? .null,
                     "visual_world_obstruction_coverage": obstruction.map { .double($0.coverage) } ?? .null,
-                ]
+                ] as [String: JSONValue]).merging(timings) { _, timing in timing }
             )
         } catch {
             return structural

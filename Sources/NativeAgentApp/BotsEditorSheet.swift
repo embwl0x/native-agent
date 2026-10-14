@@ -8,11 +8,13 @@ struct BotsEditorSheet: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.dismiss) private var dismiss
     let definition: BotDefinition?
-    let save: (BotDefinition) throws -> Void
+    let save: (BotDefinition) async throws -> Void
     @State private var name = ""
     @State private var brief = ""
     @State private var provider = ""
     @State private var model = ""
+    @State private var modelPinned = false
+    @State private var followingModel: String?
     @State private var think = ""
     @State private var fast: Bool?
     @State private var when = "Manual only"
@@ -35,8 +37,9 @@ struct BotsEditorSheet: View {
     @State private var condition = ""
     @State private var providers: [ProviderThenModelPicker.Provider] = []
     @State private var error: String?
+    @State private var saving = false
 
-    init(definition: BotDefinition?, save: @escaping (BotDefinition) throws -> Void) {
+    init(definition: BotDefinition?, save: @escaping (BotDefinition) async throws -> Void) {
         self.definition = definition
         self.save = save
     }
@@ -57,19 +60,24 @@ struct BotsEditorSheet: View {
             if let error { Text(error).font(.subheadline).foregroundStyle(.red) }
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel") { dismiss() }.disabled(saving)
                 Button(definition == nil ? "Create" : "Save") {
-                    do { try save(makeDefinition()); dismiss() }
-                    catch { self.error = BotsShelfView.problem(error, action: "save that helper") }
+                    saving = true
+                    Task {
+                        defer { saving = false }
+                        do { try await save(makeDefinition()); dismiss() }
+                        catch { self.error = BotsShelfView.problem(error, action: "save that helper") }
+                    }
                 }.keyboardShortcut(.defaultAction)
-                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(saving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(24).frame(width: 570)
         .houseSheet()
+        .interactiveDismissDisabled(saving)
         .task {
             populate()
-            switch await ProviderSettingsRefreshAction.perform(appModel: appModel, refreshCatalog: false) {
+            switch await appModel.engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause) {
             case .loaded(let snapshot):
                 providers = snapshot.providers.map { account in
                     ProviderThenModelPicker.Provider(id: account.provider_id, name: account.provider_id == "codex" ? "OpenAI (subscription)" : account.display_name,
@@ -78,33 +86,10 @@ struct BotsEditorSheet: View {
                                 supportedEfforts: $0.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"], supportsFast: $0.supports_fast)
                         })
                 }
-                await preselectFromChat()
+                followingModel = try? await SwiftNativeProviderRouting(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()).modelForSurface("chat").model
             case .failed(let message): error = message
             }
         }
-    }
-
-    /// A new bot opens on Chat's routing — the same provider, model and Think
-    /// the composer shows — so one connected account is enough to press Create.
-    /// Each of the three stays a choice: this only fills them in.
-    private func preselectFromChat() async {
-        guard definition == nil, provider.isEmpty else { return }
-        var chatModel = appModel.chatModel
-        var chatThink = appModel.chatReasoningEffort
-        if chatModel.isEmpty,
-           let preference = try? await SwiftNativeProviderRouting().modelForSurface("chat") {
-            chatModel = preference.model
-            if chatThink.isEmpty { chatThink = preference.reasoningEffort }
-        }
-        let ready = providers.filter(\.ready)
-        guard let account = ready.first(where: { $0.id == appModel.chatProvider && $0.models.contains { $0.id == chatModel } })
-                ?? ready.first(where: { $0.models.contains { $0.id == chatModel } }),
-              let match = account.models.first(where: { $0.id == chatModel })
-        else { return }
-        provider = account.id
-        model = match.id
-        let efforts = match.supportedEfforts ?? []
-        think = efforts.contains(chatThink) ? chatThink : (efforts.first ?? "")
     }
 
     private var fields: some View {
@@ -113,7 +98,13 @@ struct BotsEditorSheet: View {
                     editor("What to do", text: $brief, height: 110)
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Model").font(.subheadline)
-                        Text("Starts from Chat's model; a bot runs on what you choose here.").font(.caption).foregroundStyle(.secondary)
+                        Picker("Model selection", selection: $modelPinned) {
+                            Text("Follow Providers").tag(false)
+                            Text("Pin a model").tag(true)
+                        }
+                        if modelPinned == false {
+                            Text("follows Providers (\(followingModel ?? "unavailable"))").font(.caption).foregroundStyle(.secondary)
+                        } else {
                         ModelChoiceRow {
                             // A Picker, not a Menu: a pop-up button hands its
                             // options to accessibility, so a driver can set the
@@ -151,6 +142,7 @@ struct BotsEditorSheet: View {
                         }
                         if !provider.isEmpty, let caption = ProviderToolCapability.caption(providerID: provider) {
                             Text(caption).font(.caption).foregroundStyle(NativeAgentShell.secondary)
+                        }
                         }
                         Divider().padding(.vertical, 4)
                             Picker("When", selection: $when) {
@@ -227,6 +219,7 @@ struct BotsEditorSheet: View {
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .joined(separator: "\n\n")
         provider = bot.provider ?? ""; model = bot.model ?? ""; think = bot.reasoningEffort ?? ""; fast = bot.fast
+        modelPinned = bot.modelPinned ?? false
         tokens = String(bot.budget.tokens); seconds = String(bot.budget.seconds); daily = bot.dailyTokenCeiling.map(String.init) ?? ""
         tell = bot.notificationCondition != nil; condition = bot.notificationCondition ?? ""
         if let trigger = bot.eventTrigger {
@@ -262,65 +255,12 @@ struct BotsEditorSheet: View {
     }
     private var timingKey: [String] { [when, hours, cron, zone, String(weekday), clockText] }
     private func makeDefinition() throws -> BotDefinition {
-        // User, 2026-09-13: "Bots has no default model; Agent is supposed to pick
-        // the model when she makes one." There is no blank-means-Chat any more:
-        // the route, model and Think level are part of the bot.
-        guard let selectedModel, providers.first(where: { $0.id == provider })?.ready == true,
-              selectedModel.supportedEfforts?.contains(think) == true else {
-            throw EditorError.message("Choose a connected account, a model it serves, and a supported Think level. A bot runs on the model you choose, not on Chat's.")
-        }
-        let tokenLimit = tokens.isEmpty ? BotRunLimits.maximumTokens : Int(tokens) ?? 0
-        let timeLimit = seconds.isEmpty ? BotRunLimits.maximumSeconds : Double(seconds) ?? 0
-        let dailyLimit = daily.isEmpty ? BotRunLimits.dailyTokens : Int(daily) ?? 0
-        guard tokenLimit > 0, timeLimit.isFinite, timeLimit > 0, dailyLimit > 0 else {
-            throw EditorError.message("Limits must be positive numbers, or blank for the defaults.")
-        }
-        let timing: BotCadence
-        if let definition, timingKey == loadedTiming {
-            timing = definition.cadence
-        } else {
-            switch when {
-            case "Manual only": timing = .manual
-            case "Daily", "Weekdays", "Weekly":
-                timing = try StandingBotSchedule.parse(when == "Weekly"
-                    ? "weekly on \(StandingBotSchedule.weekdays[weekday]) at \(clockText)" : "\(when) at \(clockText)",
-                    timezone: zone.isEmpty ? nil : zone)
-            case "Every N hours":
-                guard let value = Double(hours), value.isFinite, value > 0 else { throw EditorError.message("Enter the number of hours.") }
-                timing = .interval(seconds: value * 3600)
-            case "Custom": timing = .cron(expression: cron, timeZone: zone)
-            // An event-woken bot keeps no schedule: the event is the occurrence.
-            case "On an event": timing = .manual
-            default: timing = .manual
-            }
-        }
-        var trigger: BotEventTrigger?
-        if when == "On an event" {
-            let target = eventFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !target.isEmpty else {
-                throw EditorError.message(eventSource == .github
-                    ? "Enter the repository as owner/repo." : "Enter the Slack channel ID.")
-            }
-            if eventSource == .slack, !BotEventTrigger.isChannelID(target) {
-                throw EditorError.message("Enter the Slack channel ID, such as C0123ABCD. In Slack, open the channel, choose View channel details, and copy the ID at the bottom.")
-            }
-            trigger = BotEventTrigger(source: eventSource,
-                filter: eventSource == .slack ? target.uppercased() : target,
-                keyword: eventKeyword)
-        }
-        var bot = definition ?? BotDefinition(name: name, brief: brief, cadence: timing,
-            budget: BotBudget(tokens: tokenLimit, seconds: timeLimit))
-        bot.name = name; bot.brief = brief; bot.outputFormat = nil
-        bot.provider = provider; bot.model = model; bot.reasoningEffort = think
-        bot.fast = selectedModel.supportsFast == true ? (fast ?? false) : false
-        bot.eventTrigger = trigger
-        bot.cadence = timing; bot.budget = BotBudget(tokens: tokenLimit, seconds: timeLimit); bot.dailyTokenCeiling = dailyLimit
-        if tell && condition.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { throw EditorError.message("Enter a condition or turn Tell me if off.") }
-        bot.notificationCondition = tell ? condition : nil
-        return bot
-    }
-    private enum EditorError: LocalizedError {
-        case message(String)
-        var errorDescription: String? { switch self { case .message(let text): text } }
+        try BotDefinitionStore.editorDefinition(definition, name: name, brief: brief,
+            provider: provider, model: model, think: think, modelPinned: modelPinned,
+            providerReady: providers.first(where: { $0.id == provider })?.ready == true,
+            supportedEfforts: selectedModel?.supportedEfforts, supportsFast: selectedModel?.supportsFast == true,
+            fast: fast, tokens: tokens, seconds: seconds, daily: daily, when: when, hours: hours,
+            cron: cron, zone: zone, weekday: weekday, clockText: clockText, timingUnchanged: timingKey == loadedTiming,
+            eventSource: eventSource, eventFilter: eventFilter, eventKeyword: eventKeyword, tell: tell, condition: condition)
     }
 }

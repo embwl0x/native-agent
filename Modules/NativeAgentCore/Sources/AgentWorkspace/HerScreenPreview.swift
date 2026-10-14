@@ -14,18 +14,19 @@ package enum AgentWorkspaceScreenPreview {
     /// rooms home's own sections and footer open.
     public static func tabs(_ layout: SurfaceLayout, profile: String?) -> [String] {
         var names = ["home"]
-        for name in layout.shown("places", profile: profile).map(\.name) + ["people", "helpers", "mac", "conversations", "windows", "arrivals", "work"]
+        for name in (layout.shown("places", profile: profile).map(\.name) + ["people", "helpers", "mac", "conversations", "windows", "arrivals", "work"]).map(AppDoorNames.resolve)
             where !names.contains(name) { names.append(name) }
         return names
     }
 
     /// What home, rooms and the glance read, relative to the data root.
     public static let watchedPaths = [
-        "agents/peers.json", "agents/conversations.json", "agents/grok-requests", "chat/sessions.json",
+        "agents/peers.json", "agents/conversations.json", "agents/grok-requests", "agents/resident-wake.json", "chat/sessions.json",
         "desk/desk_ops.jsonl", "desk/desk_ops_base.json", "workshop/executions", "bots/definitions",
         "bots/shelf-index.json", "bots/run-queue.json", "workflows/approvals/requests.json",
         "memory/memory.sqlite", "memory/memory.sqlite-wal", "memory/profile.json", "swarms/live.json", "swarms/runs.json",
         "connectors/github/tracking_snapshot.json", "her_screen/last_seen.json", "her_screen/touched.json",
+        "abilities",
         // Home's sections and places in the layout's order.
         "ui/layout.json",
     ]
@@ -34,7 +35,10 @@ package enum AgentWorkspaceScreenPreview {
     public static func glance(dataRoot: URL, scope: String) async -> String? {
         if scope.hasPrefix("bot-") { return nil }
         return await HerScreen.$previewing.withValue(true) {
-            await HerScreen.renderGlance(dataRoot: dataRoot, scope: scope.isEmpty ? nil : scope, now: Date(), reach: .unlocked)
+            let now = Date()
+            async let abilities = AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: now)
+            let home = await HerScreen.renderGlance(dataRoot: dataRoot, scope: scope.isEmpty ? nil : scope, now: now, reach: .unlocked)
+            return await [home, abilities].compactMap { $0 }.joined(separator: "\n")
         }
     }
 
@@ -53,23 +57,17 @@ package enum AgentWorkspaceScreenPreview {
         let catalog: AgentWorkspace.Catalog = { schemas ?? [] }
         let noCatalog = room.uppercased() + " · laid out from the tools her chat offers. She hasn't opened a place since the app started, so this view has no tool list to show it from."
 
-        // The workspace's order: her names, an alias, then a family.
-        func resolve(_ name: String) async -> HerScreen.Target? {
-            await HerScreen.resolve(name, dataRoot: dataRoot, scope: scope, browserPages: pages,
-                                    openPlaces: await navigation.places(key: key), currentPlace: await navigation.current(key: key))
-        }
-        let alias = HerScreen.familyAliases[room]
-        var target = await resolve(room)
-        if target == nil, let alias { target = await resolve(alias) }
+        let target = await HerScreen.resolve(room, dataRoot: dataRoot, scope: scope, browserPages: pages,
+                                            openPlaces: await navigation.places(key: key), currentPlace: await navigation.current(key: key))
         let location: AgentWorkspaceLocation
         switch target {
         case .page(let text)?: return text
         case .action(.window(.open(let place)))?, .action(.open(let place))?: location = place
         case .action?: return room.uppercased() + " · opens as an action, not a room."
         case nil:
-            guard HerScreen.families.contains(where: { $0.name == alias ?? room }) else { return room.uppercased() + " · not a name her workspace opens." }
+            guard HerScreen.families.contains(where: { $0.name == AppDoorNames.resolve(room) }) else { return room.uppercased() + " · not a name her workspace opens." }
             guard schemas != nil else { return noCatalog }
-            do { return try await HerScreen.familyRoom(alias ?? room, catalog: catalog) ?? noCatalog } catch {
+            do { return try await HerScreen.familyRoom(room, catalog: catalog) ?? noCatalog } catch {
                 return room.uppercased() + " · couldn't read the tool list: \(error.localizedDescription)"
             }
         }

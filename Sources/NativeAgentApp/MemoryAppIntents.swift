@@ -91,6 +91,7 @@ struct ListPendingMemoryProposalsIntent: AppIntent {
 
     func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
         do {
+            try await NativeAgentAppCoordinator.shared.prepare()
             let pending = try await SwiftNativeMemoryV2.shared.listProposals(status: "pending")
             if pending.isEmpty {
                 return .result(value: "0 pending proposals.", dialog: "No pending memory proposals.")

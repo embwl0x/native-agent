@@ -49,35 +49,45 @@ extension iCloudSyncEngine {
 
     // MARK: - Setup (called after iCloudBridge.setup() completes)
 
-    func setup(docsURL: URL) {
+    func setup(docsURL: URL) async {
         if isSetUp, !prefersCloudKitSnapshotCache,
            driveSnapshotRoot == docsURL.appendingPathComponent(Folder.snapshots) {
             return
         }
         tearDown()
         lifecycleGeneration &+= 1
-        isSetUp = true
-        let fm = FileManager.default
+        let generation = lifecycleGeneration
+        let snapshot: URL?, inbox: URL?, responses: URL, transactions: URL, driveRoot: URL?
         if prefersCloudKitSnapshotCache {
             let root = cloudKitCacheRoot()
-            snapshotDir = cloudKitSnapshotCacheDirectory(pairing: pairingStore?.iCloudPairingSecret)
-            inboxDir = nil
-            responsesDir = root.appendingPathComponent(Folder.responses)
-            transactionDir = root.appendingPathComponent("transactions", isDirectory: true)
+            snapshot = cloudKitSnapshotCacheDirectory(pairing: pairingStore?.iCloudPairingSecret)
+            inbox = nil
+            responses = root.appendingPathComponent(Folder.responses)
+            transactions = root.appendingPathComponent("transactions", isDirectory: true)
+            driveRoot = nil
         } else {
             let root = docsURL.appendingPathComponent(Folder.snapshots)
-            driveSnapshotRoot = root
+            driveRoot = root
             let secret = pairingStore?.iCloudPairingSecret
-            snapshotDir = AgentNameCache.fingerprint(secret) == nil
+            snapshot = AgentNameCache.fingerprint(secret) == nil
                 ? nil : Self.cachedSnapshotDirectory(in: root, pairing: secret)
-            inboxDir = docsURL.appendingPathComponent(Folder.inbox)
-            responsesDir = docsURL.appendingPathComponent(Folder.responses)
-            transactionDir = docsURL.appendingPathComponent(Folder.transactions)
+            inbox = docsURL.appendingPathComponent(Folder.inbox)
+            responses = docsURL.appendingPathComponent(Folder.responses)
+            transactions = docsURL.appendingPathComponent(Folder.transactions)
         }
-
-        for dir in [snapshotDir, inboxDir, responsesDir, transactionDir].compactMap({ $0 }) {
-            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
+        let directories = [snapshot, inbox, responses, transactions].compactMap { $0 }
+        do {
+            try await Task.detached(priority: .utility) {
+                for directory in directories { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+            }.value
+        } catch { syncError = error.localizedDescription; return }
+        guard generation == lifecycleGeneration else { return }
+        snapshotDir = snapshot
+        inboxDir = inbox
+        responsesDir = responses
+        transactionDir = transactions
+        driveSnapshotRoot = driveRoot
+        isSetUp = true
 
         if !prefersCloudKitSnapshotCache {
             NotificationCenter.default.addObserver(
@@ -94,7 +104,6 @@ extension iCloudSyncEngine {
         // Initial load stays light. Heavy/tab-specific snapshots are loaded
         // by the visible tab on demand so launch cannot hydrate every chat
         // transcript or memory payload into iPhone RAM.
-        Task { await refreshLightweightSnapshots() }
     }
 
     /// 2026-09-06: `responses/` and `transactions/` are ephemeral mailboxes —
@@ -252,7 +261,7 @@ extension iCloudSyncEngine {
     /// Select the local cache populated by bounded CloudKit NAStatus records.
     /// The bytes retain the existing snapshot contracts; only their transport
     /// changes for public Mac builds that cannot use CloudDocuments.
-    func enableCloudKitSnapshotCache() {
+    func enableCloudKitSnapshotCache() async {
         lifecycleGeneration &+= 1
         snapshotRefreshGeneration &+= 1
         targetedRefreshGeneration &+= 1
@@ -273,19 +282,21 @@ extension iCloudSyncEngine {
         let snapshots = cloudKitSnapshotCacheDirectory(pairing: pairingStore?.iCloudPairingSecret)
         let responses = root.appendingPathComponent("responses", isDirectory: true)
         let transactions = root.appendingPathComponent("transactions", isDirectory: true)
-        for directory in [snapshots, responses, transactions] {
-            try? FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true
-            )
-        }
+        let generation = lifecycleGeneration
+        do {
+            try await Task.detached(priority: .utility) {
+                for directory in [snapshots, responses, transactions] {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                }
+            }.value
+        } catch { isSetUp = false; syncError = error.localizedDescription; return }
+        guard generation == lifecycleGeneration else { return }
         snapshotDir = snapshots
         inboxDir = nil
         responsesDir = responses
         transactionDir = transactions
         isSetUp = true
         pruneEphemeralDirectoriesIfDue()
-        Task { await refreshLightweightSnapshots() }
     }
 
     /// 2026-09-06: returns whether the delivery was durably applied. The
@@ -306,7 +317,7 @@ extension iCloudSyncEngine {
         guard AgentNameCache.fingerprint(deliveryPairing) != nil else { return false }
         do {
             let directory = cloudKitSnapshotCacheDirectory(pairing: deliveryPairing)
-            try await Task.detached(priority: .utility) {
+            let versions = try await Task.detached(priority: .utility) {
                 let files = try NAMobileSnapshotStatusCodec.decode(
                     value,
                     expectedGroup: group
@@ -325,6 +336,8 @@ extension iCloudSyncEngine {
                         options: .atomic
                     )
                 }
+                return files.filter { $0.key == "knowledge_graph.json" || $0.key == "telegram.json" }
+                    .mapValues { Data(SHA256.hash(data: $0)) }
             }.value
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return true }
@@ -343,6 +356,9 @@ extension iCloudSyncEngine {
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return true }
             if refreshed {
+                for (filename, version) in versions where pageSnapshotVersions[filename] != version {
+                    pageSnapshotVersions[filename] = version
+                }
                 if let writtenAt {
                     iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
                 }

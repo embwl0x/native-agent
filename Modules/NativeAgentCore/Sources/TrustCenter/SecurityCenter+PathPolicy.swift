@@ -7,15 +7,15 @@ extension SwiftNativeSecurityCenter {
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
     ) -> Bool {
-        let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
         for path in pathLikeStrings(in: .object(input)) {
             let expanded = HomePath.expand(path.trimmingCharacters(in: .whitespacesAndNewlines))
             guard expanded.hasPrefix("/") else { continue }
             let normalized = URL(fileURLWithPath: expanded)
                 .standardizedFileURL
-                .resolvingSymlinksInPath()
-            if isSelfOrAncestor(root: root, of: normalized) { continue }
-            if trustedWorkspaceRoots.contains(where: { isSelfOrAncestor(root: $0, of: normalized) }) { continue }
+                .resolvingSymlinksInPath().path
+            if isSelfOrAncestor(rootPath: root, candidatePath: normalized) { continue }
+            if trustedWorkspaceRoots.contains(where: { isSelfOrAncestor(rootPath: $0.path, candidatePath: normalized) }) { continue }
             return true
         }
         return false

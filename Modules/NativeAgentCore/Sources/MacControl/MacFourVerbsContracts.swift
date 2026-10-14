@@ -2,18 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - Seams
-
-/// The organ surface the four verbs drive. `SwiftNativeMacControl` conforms
-/// below; a test drives the REAL client with the same synthetic AX seams
-/// `MacActClosedLoopTests` uses, so nothing about the act path is faked out
-/// from under these verbs.
-public protocol MacFourVerbsHost: Sendable {
-    func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult
-}
-
-extension SwiftNativeMacControl: MacFourVerbsHost {}
-
 /// A target discovered by the fused screenshot/vision lane. The addressing
 /// tokens remain on this side of the four-verb wall: the model sees the label
 /// or role ordinal, while the implementation may use a current view mark or a
@@ -137,32 +125,14 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
 }
 
 public protocol MacFourVerbsSupplementalPerceptionSource: Sendable {
-    func observe() async -> MacFourVerbsSupplement?
     func observe(app: String?) async -> MacFourVerbsSupplement?
     /// The last observed supplement was not this look's own window and was
     /// discarded; a source must drop anything it kept from that capture.
     func rejected()
 }
 
-public extension MacFourVerbsSupplementalPerceptionSource {
-    func rejected() {}
-    func observe(app: String?) async -> MacFourVerbsSupplement? {
-        guard app == nil else { return nil }
-        return await observe()
-    }
-}
-
-/// PATIENCE's clock. Injectable for exactly one reason: a `wait` test must run
-/// instantly and must be able to model a screen that never settles.
-public protocol MacFourVerbsClock: Sendable {
-    func now() -> Date
-    func monotonicSeconds() -> Double
-    func sleep(seconds: Double) async
-}
-
-public struct SystemMacFourVerbsClock: MacFourVerbsClock {
+public struct SystemMacFourVerbsClock: Sendable {
     public init() {}
-    public func now() -> Date { Date() }
     public func monotonicSeconds() -> Double { ProcessInfo.processInfo.systemUptime }
     public func sleep(seconds: Double) async {
         guard seconds > 0 else { return }

@@ -135,23 +135,9 @@ public final class NativeAgentEngine: Sendable {
     }
 
     /// The app's tool chain.
-    ///
-    /// `denyExternalMcp` (2026-06-13): on human-OUT-of-the-loop bridge clients the
-    /// external MCP namespace (`mcp__*` — third-party connectors, including a wired
-    /// real-money brokerage) must stay closed. A bridge turn has no human at the
-    /// trigger and those connectors run side effects we cannot gate from here, so
-    /// pass `true` to wrap the tool set in `ClaudeBridgeDenyDispatcher` (now an
-    /// mcp__-only guard). NativeAgent-NATIVE tools — builder (shell/git/…),
-    /// integration-send — are FULLY available on the bridge per
-    /// the user's 2026-06-13 call ("the bridges should be open"); they stay gated by the
-    /// SAME yolo window / Trust Center path as local Mac chat,
-    /// not by a bridge-specific fence. Genuine local Mac chat (NativeClient) keeps
-    /// the default `false`: MCP tools available, consent-gated, the user present.
     public func toolDispatchClient(
-        denyExternalMcp: Bool = false,
         enforceAppAutonomy: Bool = true,
-        swarmApprovalFiler: (any ApprovalFiler)? = nil,
-        innerTools: (any ToolDispatchClient)? = nil
+        swarmApprovalFiler: (any ApprovalFiler)? = nil
     ) -> any ToolDispatchClient {
         let dataRoot = self.dataRoot
         // The app's own tools reach Core's one catalog through this port; a
@@ -160,10 +146,7 @@ public final class NativeAgentEngine: Sendable {
         let appToolExecutor: AppToolExecutor? = (hasBody ? ports : nil).map { ports in
             ports.appTools(securityCenter, enforceAppAutonomy)
         }
-        // Keep the injection seam below AppChatToolDispatcher. Hermetic boundary
-        // tests can replace the core tool body without bypassing app-owned
-        // interception, SecurityCenter, or the bridge chain's wrapper order.
-        let inner: any ToolDispatchClient = innerTools ?? SwiftToolDispatcher(
+        let inner = SwiftToolDispatcher(
             dataRoot: dataRoot,
             allowProcessGlobalTools: hasBody,
             providerLifecycleObserver: cognition,
@@ -247,35 +230,24 @@ public final class NativeAgentEngine: Sendable {
                 interactions: ports.interactions, platform: ports.chatPlatform
             )
         }
-        // Bridge clients pass denyExternalMcp:true so the external `mcp__*`
-        // namespace is stripped at dispatch AND in the catalog; everything
-        // NativeAgent-native passes straight through to the normal gated chain.
         // 2026-09-15: the inbound-peer tool fence that used to wrap this chain is
         // gone. A peer turn loads her whole tool set; an EFFECT it asks for raises
         // the person's permission card in AutonomyGatedDispatcher rather than
         // running. See AgentBridgeSurface and PeerTurnEffectPolicy.
-        return denyExternalMcp
-            ? ClaudeBridgeDenyDispatcher(inner: appTools)
-            : appTools
+        return appTools
     }
 
     /// The raw bridge tool RPC: the same app tool chain chat uses, inside the
     /// bridge's conservative read-only/autonomy envelope, with ordinary
     /// nonblocking approval filing when the caller supplies a filer.
-    /// `ClaudeBridgeDenyDispatcher` intentionally stays outermost: external MCP
-    /// names are rejected before they can probe TrustCenter or the inner catalog.
     public func bridgeToolDispatchClient(
-        appInnerTools: (any ToolDispatchClient)? = nil,
         fileAccess: String = "read_only",
         approvalFiler: (any ApprovalFiler)? = nil,
         approvalTimeoutSeconds: Double = 30,
         trust: (any AutonomyResolver)? = nil,
         verifiedSessionId: String? = nil
     ) -> any ToolDispatchClient {
-        let tools = toolDispatchClient(
-            denyExternalMcp: false,
-            innerTools: appInnerTools
-        )
+        let tools = toolDispatchClient()
         return makeGatedToolDispatchClient(
             tools: tools,
             fileAccess: fileAccess,
@@ -283,8 +255,7 @@ public final class NativeAgentEngine: Sendable {
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
             trust: trust,
-            verifiedSessionId: verifiedSessionId,
-            restrictBeforeGates: { ClaudeBridgeDenyDispatcher(inner: $0) }
+            verifiedSessionId: verifiedSessionId
         )
     }
 
@@ -292,7 +263,7 @@ public final class NativeAgentEngine: Sendable {
     public func standingBotSession() -> BotRunnerSession {
         { [self] bot, message in
             let client = chatClient(
-                tools: toolDispatchClient(denyExternalMcp: false),
+                tools: toolDispatchClient(),
                 approvalFiler: NativeAgentChatApprovalFiler(dataRoot: dataRoot),
                 continuationCapabilityProfile: .mac)
             return try await StandingBotContinuity.session(client: client, dataRoot: dataRoot)(bot, message)
@@ -342,7 +313,6 @@ public final class NativeAgentEngine: Sendable {
                 ? NativeAgentChatApprovalFiler(dataRoot: dataRoot)
                 : nil)
         let tools = toolDispatchClient(
-            denyExternalMcp: profile.deniesExternalMCP,
             // The shared ChatOrchestration membrane resolves autonomy once, after
             // SecurityCenter authenticates the exact origin, and owns approval
             // filing/replay. Keep the inner app dispatcher on hard SecurityCenter
@@ -372,8 +342,8 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
     func chatClient(tools: any ToolDispatchClient) -> SwiftNativeChatOrchestrationClient {
         engine.chatClient(tools: tools)
     }
-    func toolDispatchClient(denyExternalMcp: Bool, enforceAppAutonomy: Bool) -> any ToolDispatchClient {
-        engine.toolDispatchClient(denyExternalMcp: denyExternalMcp, enforceAppAutonomy: enforceAppAutonomy)
+    func toolDispatchClient(enforceAppAutonomy: Bool) -> any ToolDispatchClient {
+        engine.toolDispatchClient(enforceAppAutonomy: enforceAppAutonomy)
     }
     func bridgeToolDispatchClient(fileAccess: String, verifiedSessionId: String?) -> any ToolDispatchClient {
         engine.bridgeToolDispatchClient(fileAccess: fileAccess, verifiedSessionId: verifiedSessionId)
@@ -383,5 +353,23 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
     }
     func cognitionChanges() async -> AsyncStream<NativeCognitionRuntimeChange>? {
         await engine.cognition?.changes()
+    }
+}
+
+extension NativeAgentEngine {
+    public static let live: NativeAgentEngine = {
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        return NativeAgentEngine(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot))
+    }()
+    /// The running app's mind. The live root is built with the app's body.
+    public static var liveCognition: NativeCognitionRuntime { live.cognition! }
+    /// The running app's device sync; the live root is built with a body.
+    public static var liveDeviceSync: DeviceSync { live.deviceSync! }
+
+    /// The engine for one root: the live one at the default root, otherwise a
+    /// bodiless engine that reads and writes only that root.
+    public static func forRoot(_ dataRoot: URL) -> NativeAgentEngine {
+        dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
+            ? live : NativeAgentEngine(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot), hasBody: false)
     }
 }

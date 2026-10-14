@@ -81,7 +81,7 @@ extension CognitiveSubstrate {
     ]
     /// A seed must be at least this old to ruminate at all. Below it, the thing
     /// is simply the work in progress.
-    static let ruminationMinimumAge: TimeInterval = 30 * 60
+    public static let ruminationMinimumAge: TimeInterval = 30 * 60
     /// The kinds that can nag. `reflectionTakeaway` is deliberately absent: a
     /// takeaway is a conclusion, not an open loop, and it already owns the
     /// `- Inner:` line.
@@ -106,7 +106,7 @@ extension CognitiveSubstrate {
     /// take. Two of three: the seeds keep one, so a busy Desk can never mute
     /// what she noticed herself.
     static let externalRuminationSlots = 2
-    /// Bound on the external set she may carry at once.
+    /// Bound on the non-carried external window; carried items keep closure tracking.
     static let externalRuminationCap = 8
     /// Longest an external label may be. Payload-free by construction: a title,
     /// through the same capsule-text extractor every other surfaced line uses.
@@ -197,12 +197,16 @@ extension CognitiveSubstrate {
         public let lastTouchedAt: Date
         /// Nil for Desk rows; moment rows retain their resolved disclosure scope.
         public let permittedSurfaces: Set<String>?
+        public let isCarried: Bool
+        public let isReady: Bool
 
-        public init(id: String, label: String, lastTouchedAt: Date, permittedSurfaces: Set<String>? = nil) {
+        public init(id: String, label: String, lastTouchedAt: Date, permittedSurfaces: Set<String>? = nil, isCarried: Bool = false, isReady: Bool = true) {
             self.id = String(id.prefix(120))
             self.label = String(label.prefix(CognitiveSubstrate.externalRuminationLabelCharacters))
             self.lastTouchedAt = lastTouchedAt
             self.permittedSurfaces = permittedSurfaces
+            self.isCarried = isCarried
+            self.isReady = isReady
         }
     }
 
@@ -245,7 +249,7 @@ extension CognitiveSubstrate {
         // The external lane does not need the seed family to be on: a Desk item
         // she opened is her own open loop whether or not seeds are enabled.
         let external = externalRuminationCandidates(at: now)
-        guard configuration.thoughtSeedsEnabled else {
+        guard configuration.enabled else {
             return Array(external.prefix(Self.externalRuminationSlots))
         }
         let population = seeds ?? projectedThoughtSeeds(at: now)
@@ -330,12 +334,18 @@ extension CognitiveSubstrate {
             }
     }
 
+    func ruminationIsPermitted(_ candidate: CognitiveRuminationRead, on surface: String?) -> Bool {
+        guard let id = candidate.externalId,
+              let permitted = externalRuminations[id]?.permittedSurfaces else { return true }
+        return surface.map { permitted.contains($0) } ?? false
+    }
+
     /// The external half, heaviest first. Same inverted-decay weight law, aged
     /// from the last time the owner touched the item.
     func externalRuminationCandidates(at now: Date) -> [CognitiveRuminationRead] {
         guard !externalRuminations.isEmpty else { return [] }
         var out: [CognitiveRuminationRead] = []
-        for item in externalRuminations.values {
+        for item in externalRuminations.values where item.isReady {
             let age = now.timeIntervalSince(item.lastTouchedAt)
             let weight = Self.ruminationWeight(ageSeconds: age)
             guard weight > 0 else { continue }
@@ -353,9 +363,16 @@ extension CognitiveSubstrate {
                 externalId: item.id
             ))
         }
-        return out.sorted { lhs, rhs in
+        let ranked = out.sorted { lhs, rhs in
             if lhs.weight != rhs.weight { return lhs.weight > rhs.weight }
             return (lhs.externalId ?? "") < (rhs.externalId ?? "")
+        }
+        let carried = ranked.filter { externalRuminations[$0.externalId ?? ""]?.isCarried == true }.prefix(1)
+        let others = ranked.filter { externalRuminations[$0.externalId ?? ""]?.isCarried != true }
+            .prefix(Self.externalRuminationSlots - carried.count)
+        return (Array(carried) + others).sorted {
+            if $0.weight != $1.weight { return $0.weight > $1.weight }
+            return ($0.externalId ?? "") < ($1.externalId ?? "")
         }
     }
 
@@ -386,8 +403,8 @@ extension CognitiveSubstrate {
         Set(externalRuminations.keys)
     }
 
-    /// Replace the bounded window. Only owner-confirmed closures stage relief;
-    /// exclusion from the window is not evidence that an item closed.
+    /// Track every carried item for closure; presentation retains one slot.
+    /// Only owner-confirmed closures stage relief.
     ///
     /// HONEST BOUND: the set is in-memory, so after a restart the first push
     /// finds no prior set and an item that closed while the app was down mints
@@ -395,44 +412,49 @@ extension CognitiveSubstrate {
     /// seed lane's durable marker buys.
     public func setExternalRuminations(
         _ items: [CognitiveExternalRumination],
-        confirmedClosedIDs: Set<String> = [],
+        confirmedClosures: [String: Date] = [:],
         at now: Date
     ) {
         guard configuration.enabled else { return }
         externalRuminationsRefreshedAt = now
         var next: [String: CognitiveExternalRumination] = [:]
-        for item in items.prefix(Self.externalRuminationCap) {
+        for item in Array(items.filter { !$0.isCarried }.prefix(Self.externalRuminationCap)) + items.filter(\.isCarried) {
             let label = capsuleSignalText(
                 item.label,
                 maxCharacters: Self.externalRuminationLabelCharacters
             )
-            guard !label.isEmpty, isUsefulCapsuleSignalText(label) else { continue }
+            let presentable = !label.isEmpty && isUsefulCapsuleSignalText(label)
+            guard item.isCarried || presentable else { continue }
             next[item.id] = CognitiveExternalRumination(
                 id: item.id,
                 label: label,
                 lastTouchedAt: item.lastTouchedAt,
-                permittedSurfaces: item.permittedSurfaces
+                permittedSurfaces: item.permittedSurfaces,
+                isCarried: item.isCarried,
+                isReady: item.isReady && presentable
             )
         }
         // Heal what left the set — but only what had actually started to itch.
         // A thing closed the same hour it opened never nagged, so it owes no
         // relief (design law 4: no weight, no exhale).
-        let closed = externalRuminations.keys.filter { next[$0] == nil && confirmedClosedIDs.contains($0) }
+        let closed = externalRuminations.keys.filter { next[$0] == nil && confirmedClosures[$0] != nil }
         let itching = Set(externalRuminationCandidates(at: now).compactMap(\.externalId))
-        for id in closed.sorted() where itching.contains(id) {
-            guard let item = externalRuminations[id] else { continue }
+        for id in closed.sorted() {
+            guard let item = externalRuminations[id], let closedAt = confirmedClosures[id], item.isReady,
+                  item.isCarried || itching.contains(id) else { continue }
             let weight = Self.ruminationWeight(
                 ageSeconds: now.timeIntervalSince(item.lastTouchedAt)
             )
+            guard weight > 0 else { continue }
             deferredExternalRuminationRelief[id] = externalRuminationReliefEvent(
-                for: item, weight: weight, at: now
+                for: item, closedAt: closedAt, weight: weight, at: now
             )
         }
         stageDeferredExternalRuminationRelief()
         // Deferred closures retain tracking slots until their relief is staged.
         let available = max(0, Self.externalRuminationCap - deferredExternalRuminationRelief.count)
-        let retainedIDs = Set(items.map(\.id).filter { next[$0] != nil }.prefix(available))
-        externalRuminations = next.filter { retainedIDs.contains($0.key) }
+        let retainedIDs = Set(items.filter { !$0.isCarried && next[$0.id] != nil }.prefix(available).map(\.id))
+        externalRuminations = next.filter { $0.value.isCarried || retainedIDs.contains($0.key) }
     }
 
     /// Relief for a commitment she finished. Labelled `workflowAdvance` — D-2's
@@ -442,11 +464,12 @@ extension CognitiveSubstrate {
     /// organism's workflow resolutions already are.
     private func externalRuminationReliefEvent(
         for item: CognitiveExternalRumination,
+        closedAt: Date,
         weight: Double,
         at now: Date
     ) -> CognitiveEvent {
         CognitiveEvent(
-            id: "rumination_release:external:\(item.id)",
+            id: "rumination_release:external:\(item.id):\(closedAt.timeIntervalSince1970)",
             kind: .organismResolutionFelt,
             subject: CognitiveSubjectReference(
                 type: "organism_path",

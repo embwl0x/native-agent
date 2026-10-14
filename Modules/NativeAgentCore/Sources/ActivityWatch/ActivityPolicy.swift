@@ -203,22 +203,13 @@ public struct ActivityPolicyStore: Sendable {
     }
 
     public let fileURL: URL
-    private let persistence: any PersistenceCoreProtocol
 
     public init(dataRoot: URL) {
         self.fileURL = ActivityWatchPaths.policyURL(dataRoot: dataRoot)
-        self.persistence = makePersistenceCore()
     }
 
     public init(fileURL: URL) {
         self.fileURL = fileURL
-        self.persistence = makePersistenceCore()
-    }
-
-    /// Missing file, unreadable file, or garbage → the SAFE default. A policy
-    /// we cannot read must never fail open into capturing.
-    public func load() -> ActivityPolicy {
-        (try? loadChecked()) ?? ActivityPolicy()
     }
 
     /// Missing is the documented safe bootstrap. An existing unreadable,
@@ -263,5 +254,28 @@ public struct ActivityPolicyStore: Sendable {
             [.posixPermissions: NSNumber(value: Int16(0o600))],
             ofItemAtPath: fileURL.path
         )
+    }
+}
+
+extension ActivityPolicy {
+    public enum TitleCapture: Hashable, CaseIterable {
+        case appNamesOnly, windowTitles, windowAndBrowserTitles
+
+        public init(policy: ActivityPolicy) {
+            if policy.appNameOnlyMode || !policy.captureTitles {
+                self = .appNamesOnly
+            } else {
+                self = policy.browserTitlesEnabled ? .windowAndBrowserTitles : .windowTitles
+            }
+        }
+
+        public func applied(to policy: ActivityPolicy) -> ActivityPolicy {
+            var next = policy
+            next.appNameOnlyMode = self == .appNamesOnly
+            next.captureTitles = self != .appNamesOnly
+            next.browserTitlesEnabled = self == .windowAndBrowserTitles
+            return next
+        }
+
     }
 }

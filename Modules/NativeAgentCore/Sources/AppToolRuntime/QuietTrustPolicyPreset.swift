@@ -45,6 +45,29 @@ public enum TrustPolicyPreset: CaseIterable, Equatable, Sendable {
     /// it to Full Mac is the person's alone.
     public static var quietWritable: [TrustPolicyPreset] { [.safe, .work, .builder] }
 
+    public static func matching(policy: TrustPolicy, accessMode: String?) -> TrustPolicyPreset? {
+        // Developer mode is a separate axis; the Full Mac fence is its access policy.
+        let fullMac = TrustPolicyPreset.fullMac.plan
+        if accessMode == fullMac.agentAccessMode,
+           policy.permissionLevel == fullMac.permissionLevel,
+           (policy.filePolicy?.outsideWorkspaceDefault ?? "deny") == fullMac.outsideDefault {
+            return .fullMac
+        }
+        return allCases.first {
+            guard $0 != .fullMac else { return false }
+            let plan = $0.plan
+            return plan.agentAccessMode == accessMode
+                && plan.permissionLevel == policy.permissionLevel
+                && plan.autonomyDefault == (policy.autonomyDefault ?? "supervised")
+                && plan.requireBackups == (policy.filePolicy?.requireBackupBeforeWrite ?? true)
+                && plan.outsideDefault == (policy.filePolicy?.outsideWorkspaceDefault ?? "deny")
+                && plan.developerMode == policy.developerMode
+                && (policy.filePolicy?.allowDestructiveActions ?? false) == plan.developerMode
+                && (policy.macControlPolicy?.shellAllowed ?? false) == plan.developerMode
+                && (policy.macControlPolicy?.systemControlAllowed ?? false) == plan.developerMode
+        }
+    }
+
     /// The Mac picker and paired phone share one complete, locked preset patch.
     public func save(
         dataRoot: URL,

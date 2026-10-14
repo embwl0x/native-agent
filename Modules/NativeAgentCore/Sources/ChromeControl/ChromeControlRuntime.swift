@@ -17,9 +17,7 @@ public enum ChromeControlInvocationContext {
 
 public enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case disabled
-    case unavailable
     case disconnected
-    case extensionNotLoaded
     case connectionUnavailable(String)
     case extensionReconnecting(startedAt: Date, retryAfter: Date)
     case handshakeRejected(String)
@@ -38,7 +36,7 @@ public enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatabl
     public var failureEffects: ToolFailureError.Effects? {
         switch self {
         case .outcomeUnknown: .unknown
-        case .disabled, .unavailable, .disconnected, .extensionNotLoaded,
+        case .disabled, .disconnected,
              .connectionUnavailable, .extensionReconnecting, .handshakeRejected,
              .socketPathTooLong, .relayUnavailable, .unsafeSocketPath: .some(.none)
         case .invalidResponse, .requestTimedOut, .extensionRejected, .socketFailure, .conversationContext: nil
@@ -60,9 +58,7 @@ public enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatabl
     public var errorDescription: String? {
         switch self {
         case .disabled: return "Chrome control is off in Trust Center."
-        case .unavailable: return "Chrome control authority could not be verified."
         case .disconnected: return "The Chrome extension's connection to NativeAgent ended. raw view · Chrome native messaging transport; no page was read."
-        case .extensionNotLoaded: return "No Chrome extension connection has been confirmed on this Mac. raw view · Chrome native messaging transport; extension installation is unverified."
         case .connectionUnavailable(let reason): return reason + " raw view · Chrome native messaging transport; no page was read."
         case .extensionReconnecting(let startedAt, let retryAfter):
             return Self.reconnectInstruction(startedAt: startedAt, retryAfter: retryAfter)
@@ -262,6 +258,7 @@ actor ChromeControlChannel {
     private var actionDriver: MacDriverBinding?
     private var pending: [String: Pending] = [:]
     private var ownTabs: [Int64: [String: JSONValue]] = [:]
+    private var projectedTabs: [Int64: ChromeConversationTab]
     private var pageSnapshots: [Int64: JSONValue] = [:]
     private var pageGenerations: [Int64: Int64] = [:]
     private let onCaptureFailure: @Sendable (Int64, String, Date) -> Void
@@ -274,11 +271,12 @@ actor ChromeControlChannel {
     private var closed = false
     private let onDisconnect: @Sendable () -> Void
 
-    init(descriptor: Int32, requestTimeout: Duration = .seconds(30),
+    init(descriptor: Int32, previousTabs: [Int64: ChromeConversationTab] = [:], requestTimeout: Duration = .seconds(30),
          onReloadFailure: @escaping @Sendable (String, String) -> Void = { _, _ in },
          onCaptureFailure: @escaping @Sendable (Int64, String, Date) -> Void = { _, _, _ in },
          onDisconnect: @escaping @Sendable () -> Void = {}) {
         socket = ChromeSocketHandle(descriptor: descriptor)
+        projectedTabs = previousTabs
         self.requestTimeout = requestTimeout
         self.onReloadFailure = onReloadFailure
         self.onCaptureFailure = onCaptureFailure
@@ -303,8 +301,16 @@ actor ChromeControlChannel {
                 while !Task.isCancelled, let data = try await offPool(readQueue, {
                     Result { try framer.readMessage(from: handle) }
                 }).get() {
-                    try framer.validateJSONObject(data)
-                    await self?.receive(data)
+                    let value: JSONValue = try autoreleasepool {
+                        let raw: Any
+                        do { raw = try JSONSerialization.jsonObject(with: data) }
+                        catch { throw NativeMessagingFramingError.invalidJSON }
+                        guard raw is [String: Any] else {
+                            throw NativeMessagingFramingError.topLevelJSONMustBeObject
+                        }
+                        return JSONValue(fromFoundation: raw)
+                    }
+                    await self?.receive(value)
                 }
                 await self?.connectionEnded(error: ChromeControlRuntimeError.disconnected)
             } catch {
@@ -366,6 +372,7 @@ actor ChromeControlChannel {
         guard !closed else { return }
         closed = true
         ownTabs.removeAll()
+        projectedTabs.removeAll()
         closeSocket()
         readTask?.cancel(); readTask = nil
         driverTask?.cancel(); driverTask = nil
@@ -396,7 +403,15 @@ actor ChromeControlChannel {
         ]) { _, new in new })])
     }
 
-    func tabs() -> [Int64: [String: JSONValue]] { ownTabs }
+    func tabs() -> [Int64: ChromeConversationTab] { projectedTabs }
+
+    private func replaceTabs(_ tabs: [Int64: [String: JSONValue]]) {
+        ownTabs = tabs
+        projectedTabs = tabs.compactMapValues { fields in
+            guard case .int(let id)? = fields["tabId"] else { return nil }
+            return ChromeConversationTab(result: fields, previous: projectedTabs[id])
+        }
+    }
 
     func existingPageAddress(host: String, tabID: Int64?) throws -> [String: JSONValue] {
         let matches = pageSnapshots.compactMap { id, snapshot -> (Int64, JSONValue)? in
@@ -439,9 +454,8 @@ actor ChromeControlChannel {
         } else { pageSnapshots.removeAll(); pageGenerations.removeAll() }
     }
 
-    private func receive(_ data: Data) {
-        guard let value = try? JSONValue.parse(data),
-              case .object(let object) = value,
+    private func receive(_ value: JSONValue) {
+        guard case .object(let object) = value,
               case .int(1)? = object["version"],
               case .string(let type)? = object["type"] else {
             connectionEnded(error: ChromeControlRuntimeError.invalidResponse)
@@ -481,18 +495,33 @@ actor ChromeControlChannel {
                 return
             }
             if case .object(let result)? = object["result"] {
-                if row.expectedAction == .attach, case .array(let tabs)? = result["tabs"] {
-                    ownTabs = Dictionary(tabs.compactMap { value -> (Int64, [String: JSONValue])? in
-                        guard case .object(let tab) = value, case .int(let id)? = tab["tabId"] else { return nil }
-                        return (id, tab)
-                    }, uniquingKeysWith: { _, new in new })
+                if row.expectedAction == .attach {
+                    let tabs: [JSONValue] = if case .array(let values)? = result["tabs"] { values } else { [] }
+                    var rebuilt: [Int64: [String: JSONValue]] = [:]
+                    var projection: [Int64: ChromeConversationTab] = [:]
+                    for value in tabs {
+                        guard case .object(let fields) = value, case .int(let id)? = fields["tabId"],
+                              let tab = ChromeConversationTab(result: fields, previous: projectedTabs[id]),
+                              rebuilt[id] == nil else {
+                            row.continuation?.resume(throwing: ChromeControlRuntimeError.invalidResponse)
+                            connectionEnded(error: ChromeControlRuntimeError.invalidResponse)
+                            return
+                        }
+                        rebuilt[id] = fields
+                        projection[id] = tab
+                    }
+                    ownTabs = rebuilt
+                    projectedTabs = projection
                 }
                 if case .int(let tabID)? = result["tabId"] {
                     if row.expectedAction == .closeTab, result["tabClosed"] == .bool(true) {
                         ownTabs.removeValue(forKey: tabID)
+                        projectedTabs.removeValue(forKey: tabID)
                         endPageObservers(tabID: tabID, error: ChromeControlRuntimeError.conversationContext("The Chrome tab was closed."))
                     } else if (row.expectedAction == .navigate && result["outcome"] == .string("succeeded")) || ownTabs[tabID] != nil {
-                        ownTabs[tabID] = (ownTabs[tabID] ?? [:]).merging(result) { _, new in new }
+                        let fields = (ownTabs[tabID] ?? [:]).merging(result) { _, new in new }
+                        ownTabs[tabID] = fields
+                        projectedTabs[tabID] = ChromeConversationTab(result: fields, previous: projectedTabs[tabID])
                         if row.expectedAction == .snapshot { pageSnapshots[tabID] = .object(result) }
                     }
                 }
@@ -515,6 +544,7 @@ actor ChromeControlChannel {
             }
             if code == "tab_not_owned", let tabID = row.tabID {
                 ownTabs.removeValue(forKey: tabID)
+                projectedTabs.removeValue(forKey: tabID)
                 endPageObservers(tabID: tabID, error: ChromeControlRuntimeError.extensionRejected(code: code, message: message))
                 NotificationCenter.default.post(name: Notification.Name("NativeAgentChromeTabEnded"), object: nil,
                     userInfo: ["tabId": tabID, "closed": false])
@@ -551,7 +581,7 @@ actor ChromeControlChannel {
                 NotificationCenter.default.post(name: Notification.Name("NativeAgentChromeTabEnded"), object: nil,
                     userInfo: ["tabId": id, "closed": false])
             }
-            ownTabs = projected
+            replaceTabs(projected)
             return
         }
         guard case .string(let event)? = object["event"],
@@ -559,6 +589,7 @@ actor ChromeControlChannel {
               case .int(let tabID)? = payload["tabId"] else { return }
         if event == "tab.yielded" || event == "tab.closed" {
             ownTabs.removeValue(forKey: tabID)
+            projectedTabs.removeValue(forKey: tabID)
             NotificationCenter.default.post(name: Notification.Name("NativeAgentChromeTabEnded"), object: nil,
                 userInfo: ["tabId": tabID, "closed": event == "tab.closed"])
             let reason: String = if case .string(let value)? = payload["reason"] { value } else { "tab_closed" }
@@ -676,6 +707,7 @@ actor ChromeControlChannel {
         closed = true
         endPageObservers(error: error)
         ownTabs.removeAll()
+        projectedTabs.removeAll()
         closeSocket()
         readTask?.cancel()
         readTask = nil
@@ -953,9 +985,8 @@ public enum ChromeControlConnectionState: Sendable, Equatable {
 /// Read that exact manifest as well as the app's shipped manifest; never infer
 /// a folder from a checkout name or substitute a version literal.
 private struct ChromeExtensionFiles {
-    let path: String
-    let diskVersion: String
-    let shippedVersion: String
+    private var bundled: (url: URL, revision: NSDictionary, key: String, id: String, version: String)?
+    private(set) var watchedPaths = Set<URL>()
 
     static func components(_ version: String) -> [Int]? {
         let parts = version.split(separator: ".", omittingEmptySubsequences: false)
@@ -988,24 +1019,38 @@ private struct ChromeExtensionFiles {
         return value
     }
 
-    static func read() throws -> Self {
+    mutating func read() throws -> (path: String, diskVersion: String, shippedVersion: String) {
+        watchedPaths.removeAll()
+        let root = InstallPaths.current.chromeManifest.deletingLastPathComponent().deletingLastPathComponent()
+        watchedPaths.insert(root.appendingPathComponent("Local State"))
         guard let resources = Bundle.main.resourceURL else {
             throw ChromeControlRuntimeError.connectionUnavailable("NativeAgent's shipped Chrome manifest is unavailable.")
         }
         let bundledURL = resources.appendingPathComponent("NativeAgentChrome/manifest.json")
-        let bundled = try object(bundledURL)
-        let shippedVersion = try version(bundled, path: bundledURL.path)
-        guard let key = bundled["key"] as? String, let bytes = Data(base64Encoded: key) else {
-            throw ChromeControlRuntimeError.connectionUnavailable("NativeAgent's shipped Chrome manifest has no valid extension identity key.")
+        watchedPaths.insert(bundledURL)
+        // File identity detects bundle replacement even when its version and
+        // modification date were preserved.
+        let revision = try FileManager.default.attributesOfItem(atPath: bundledURL.path) as NSDictionary
+        let shipped: (url: URL, revision: NSDictionary, key: String, id: String, version: String)
+        if let bundled, bundled.url == bundledURL, bundled.revision == revision {
+            shipped = bundled
+        } else {
+            bundled = nil
+            let manifest = try Self.object(bundledURL)
+            let version = try Self.version(manifest, path: bundledURL.path)
+            guard let key = manifest["key"] as? String, let bytes = Data(base64Encoded: key) else {
+                throw ChromeControlRuntimeError.connectionUnavailable("NativeAgent's shipped Chrome manifest has no valid extension identity key.")
+            }
+            // Chrome's extension id is the first 128 bits of the public key's
+            // SHA256, encoded a-p; stable across bundle and unpacked copies.
+            let alphabet = Array("abcdefghijklmnop")
+            let id = SHA256.hash(data: bytes).prefix(16).map {
+                String(alphabet[Int($0 >> 4)]) + String(alphabet[Int($0 & 15)])
+            }.joined()
+            shipped = (bundledURL, revision, key, id, version)
+            bundled = shipped
         }
-        // Chrome's extension id is the first 128 bits of the public key's SHA256,
-        // encoded a-p. It is stable across the bundle and unpacked copies.
-        let alphabet = Array("abcdefghijklmnop")
-        let id = SHA256.hash(data: bytes).prefix(16).map {
-            String(alphabet[Int($0 >> 4)]) + String(alphabet[Int($0 & 15)])
-        }.joined()
-        let root = InstallPaths.current.chromeManifest.deletingLastPathComponent().deletingLastPathComponent()
-        let state = try object(root.appendingPathComponent("Local State"))
+        let state = try Self.object(root.appendingPathComponent("Local State"))
         guard let profile = state["profile"] as? [String: Any], let profiles = profile["info_cache"] as? [String: Any] else {
             throw ChromeControlRuntimeError.connectionUnavailable("Chrome's profile inventory is unavailable at \(root.path).")
         }
@@ -1019,11 +1064,12 @@ private struct ChromeExtensionFiles {
             // Inspect both; contradictory paths are unavailable, never selected.
             for filename in ["Preferences", "Secure Preferences"] {
                 let url = profileURL.appendingPathComponent(filename)
+                watchedPaths.insert(url)
                 guard FileManager.default.fileExists(atPath: url.path) else { continue }
-                let prefs = try object(url)
+                let prefs = try Self.object(url)
                 guard let extensions = prefs["extensions"] as? [String: Any],
                       let settings = extensions["settings"] as? [String: Any],
-                      let entry = settings[id] as? [String: Any] else { continue }
+                      let entry = settings[shipped.id] as? [String: Any] else { continue }
                 guard let path = entry["path"] as? String, path.hasPrefix("/") else {
                     throw ChromeControlRuntimeError.connectionUnavailable("Chrome's registered extension folder is not an absolute unpacked path (\(url.path)).")
                 }
@@ -1034,11 +1080,12 @@ private struct ChromeExtensionFiles {
             throw ChromeControlRuntimeError.connectionUnavailable("Chrome's registered extension folder is \(paths.isEmpty ? "missing" : "ambiguous: " + paths.sorted().joined(separator: ", ")).")
         }
         let manifestURL = URL(fileURLWithPath: path).appendingPathComponent("manifest.json")
-        let manifest = try object(manifestURL)
-        guard manifest["key"] as? String == key else {
+        watchedPaths.insert(manifestURL)
+        let manifest = try Self.object(manifestURL)
+        guard manifest["key"] as? String == shipped.key else {
             throw ChromeControlRuntimeError.connectionUnavailable("Chrome's extension manifest identity differs from NativeAgent's at \(path).")
         }
-        return Self(path: path, diskVersion: try version(manifest, path: manifestURL.path), shippedVersion: shippedVersion)
+        return (path: path, diskVersion: try Self.version(manifest, path: manifestURL.path), shippedVersion: shipped.version)
     }
 }
 
@@ -1101,15 +1148,19 @@ public actor ChromeControlRuntime {
     private var signatureFailures: [pid_t: ChromeRelayRefusal] = [:]
     private var publishedConnectionState: ChromeControlConnectionState?
     private var captureErrors: [String: JSONValue] = [:]
-    private var conversationTabs: [String: ChromeConversationTab] = [:]
     private let conversationTabsURL: URL
     private var rememberedTabIDs: [String: Int64] = [:]
     private var conversationTabsStorageError: String?
     private var groupTabs: [Int64: ChromeConversationTab] = [:]
     private var busyConversations: Set<String> = []
     private var connectionObservers: [UUID: AsyncStream<ChromeControlConnectionState>.Continuation] = [:]
-    private var extensionFiles: ChromeExtensionFiles?
+    private var extensionFileReader = ChromeExtensionFiles()
+    private var extensionFiles: (path: String, diskVersion: String, shippedVersion: String)?
     private var extensionFilesError: String?
+    private var extensionFileEvents: FileChangeEvents?
+    private var extensionFileTask: Task<Void, Never>?
+    private var extensionFilePaths = Set<URL>()
+    private var extensionFileAccess: [URL: Bool] = [:]
     private var connectedBrowserPID: pid_t?
     private var automaticReloadPairs: Set<String> = []
     fileprivate struct ExtensionReloadAttempt: Codable {
@@ -1168,14 +1219,39 @@ public actor ChromeControlRuntime {
         return latest ?? .null
     }
 
-    private func readExtensionFiles() {
+    private func readExtensionFiles(fresh: Bool = false) {
+        // Content follows file events; permission-only changes need an access check.
+        let access = Dictionary(uniqueKeysWithValues: extensionFilePaths.map {
+            ($0, FileManager.default.isReadableFile(atPath: $0.path))
+        })
+        if !fresh, extensionFileEvents != nil, access == extensionFileAccess {
+            return
+        }
         do {
-            extensionFiles = try ChromeExtensionFiles.read()
+            extensionFiles = try extensionFileReader.read()
             extensionFilesError = nil
         } catch {
             extensionFiles = nil
             extensionFilesError = "Chrome extension version check failed: \(error.localizedDescription)"
         }
+        let paths = extensionFileReader.watchedPaths
+        extensionFileAccess = Dictionary(uniqueKeysWithValues: paths.map {
+            ($0, access[$0] ?? FileManager.default.isReadableFile(atPath: $0.path))
+        })
+        guard paths != extensionFilePaths || extensionFileEvents == nil else { return }
+        extensionFileTask?.cancel()
+        extensionFileEvents?.cancel()
+        extensionFilePaths = paths
+        let events = FileChangeEvents(paths: Array(paths), emitInitial: false)
+        extensionFileEvents = events
+        extensionFileTask = Task { [weak self] in
+            for await _ in events.stream {
+                guard !Task.isCancelled else { return }
+                await self?.readExtensionFiles(fresh: true)
+            }
+        }
+        // Registration is synchronous; close the read-before-watch race.
+        readExtensionFiles(fresh: true)
     }
 
     /// The explicit reversible verb can retry a failed/stale automatic attempt.
@@ -1261,6 +1337,7 @@ public actor ChromeControlRuntime {
     }
 
     private func beginExtensionReload(on connection: ChromeControlChannel, source: ReloadSource) async throws {
+        readExtensionFiles(fresh: true)
         guard let files = extensionFiles, let before = facts.extensionVersion,
               let pid = connectedBrowserPID, pid > 1,
               let birthStamp = ChromeHostIdentity.processBirthStamp(pid) else {
@@ -1363,15 +1440,13 @@ public actor ChromeControlRuntime {
     private func refreshGroupTabs() async {
         guard let channel = readyChannel else { return }
         let rows = await channel.tabs()
-        groupTabs = rows.compactMapValues { row in
-            guard case .int(let id)? = row["tabId"] else { return nil }
-            return ChromeConversationTab(result: row, previous: groupTabs[id])
-        }
-        conversationTabs = rememberedTabIDs.compactMapValues { groupTabs[$0] }
+        guard readyChannel === channel else { return }
+        groupTabs = rows
     }
 
     private func rememberTab(_ id: Int64, session: String) {
         guard NativeAgentChatSessionID.isSafePathComponent(session) else { return }
+        guard rememberedTabIDs[session] != id || conversationTabsStorageError != nil else { return }
         rememberedTabIDs[session] = id
         do {
             try FileManager.default.createDirectory(at: conversationTabsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1382,7 +1457,7 @@ public actor ChromeControlRuntime {
 
     public func conversationTabStatus(_ verifiedSessionID: String?) async -> [String: JSONValue] {
         await refreshGroupTabs()
-        let current = verifiedSessionID.flatMap { conversationTabs[$0]?.tabID }
+        let current = verifiedSessionID.flatMap { rememberedTabIDs[$0] }.flatMap { groupTabs[$0]?.tabID }
         let tabs = groupTabs.keys.sorted().compactMap { id -> JSONValue? in
             guard let tab = groupTabs[id] else { return nil }
             return .object(["tab_id": .int(id), "title": tab.title.map(JSONValue.string) ?? .null,
@@ -1620,6 +1695,11 @@ public actor ChromeControlRuntime {
     private var socketIdentity: FileIdentity?
     private var tokenIdentity: FileIdentity?
 
+    deinit {
+        extensionFileTask?.cancel()
+        extensionFileEvents?.cancel()
+    }
+
     public init(
         socketPath: String = ChromeControlRuntime.defaultSocketPath(),
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -1690,7 +1770,7 @@ public actor ChromeControlRuntime {
     }
 
     public func conversationSnapshotView(_ verifiedSessionID: String?, tabID: Int64? = nil) -> [String: JSONValue]? {
-        let tab = tabID.flatMap { groupTabs[$0] } ?? verifiedSessionID.flatMap { conversationTabs[$0] }
+        let tab = tabID.flatMap { groupTabs[$0] } ?? verifiedSessionID.flatMap { rememberedTabIDs[$0] }.flatMap { groupTabs[$0] }
         return tab?.hasReadView == true ? tab?.readingView : nil
     }
 
@@ -1722,7 +1802,7 @@ public actor ChromeControlRuntime {
         let explicitID: Int64? = if case .int(let id)? = payload["tabId"] { id } else { nil }
         let rememberedID = session.flatMap { rememberedTabIDs[$0] }
         let current = explicitID.flatMap { groupTabs[$0] }
-            ?? (explicitID == nil ? session.flatMap { conversationTabs[$0] } : nil)
+            ?? (explicitID == nil ? rememberedID.flatMap { groupTabs[$0] } : nil)
         if resolved["tabId"] == nil {
             if let rememberedID { resolved["tabId"] = .int(rememberedID) }
             else if let current { resolved["tabId"] = .int(current.tabID) }
@@ -1736,12 +1816,11 @@ public actor ChromeControlRuntime {
         }
         let (response, respondingChannel) = try await performOnChannel(effect, payload: resolved)
         if channel === respondingChannel, case .object(let envelope) = response, case .object(let result)? = envelope["result"] {
-            if effect == .closeTab, result["tabClosed"] == .bool(true), case .int(let id)? = result["tabId"] {
-                groupTabs.removeValue(forKey: id)
-                conversationTabs = conversationTabs.filter { $0.value.tabID != id }
-            } else if (effect != .navigate || result["outcome"] == .string("succeeded")), let tab = ChromeConversationTab(result: result, previous: current) {
-                groupTabs[tab.tabID] = tab
-                if let session, !session.isEmpty { conversationTabs[session] = tab; rememberTab(tab.tabID, session: session) }
+            await refreshGroupTabs()
+            if channel === respondingChannel, !(effect == .closeTab && result["tabClosed"] == .bool(true)),
+               effect != .navigate || result["outcome"] == .string("succeeded"),
+               case .int(let id)? = result["tabId"], groupTabs[id] != nil {
+                if let session, !session.isEmpty { rememberTab(id, session: session) }
             }
         }
         if effect == .media || effect == .closeTab, case .object(var envelope) = response,
@@ -1752,10 +1831,6 @@ public actor ChromeControlRuntime {
             return .object(envelope)
         }
         return response
-    }
-
-    func perform(_ effect: ChromeControlEffect, payload: [String: JSONValue]) async throws -> JSONValue {
-        try await performOnChannel(effect, payload: payload).response
     }
 
     private func performOnChannel(
@@ -1831,10 +1906,6 @@ public actor ChromeControlRuntime {
     public func stop() async {
         policyGeneration &+= 1
         await stopLocked()
-    }
-
-    func installAcceptedDescriptorForTesting(_ descriptor: Int32) async {
-        await installAcceptedDescriptor(descriptor, generation: listenerGeneration)
     }
 
     /// Registered before the handshake so `stopLocked` can reach the socket
@@ -2000,7 +2071,7 @@ public actor ChromeControlRuntime {
             Darwin.close(descriptor)
             return
         }
-        let next = ChromeControlChannel(descriptor: descriptor, onReloadFailure: { [weak self] id, reason in
+        let next = ChromeControlChannel(descriptor: descriptor, previousTabs: groupTabs, onReloadFailure: { [weak self] id, reason in
             Task { await self?.extensionReloadFailed(id: id, reason: reason) }
         }, onCaptureFailure: { [weak self] tabID, reason, at in
             Task { await self?.recordCaptureError(reason, tabID: tabID, at: at) }
@@ -2020,6 +2091,7 @@ public actor ChromeControlRuntime {
                   version.utf8.count <= 128, ChromeExtensionFiles.components(version) != nil else {
                 throw ChromeControlRuntimeError.handshakeRejected("the extension returned an invalid attach greeting.")
             }
+            let tabs = await next.tabs()
             guard installation == installationGeneration, generation == listenerGeneration,
                   connectingChannel === next, await transportAvailable(),
                   installation == installationGeneration, generation == listenerGeneration,
@@ -2032,16 +2104,7 @@ public actor ChromeControlRuntime {
             let capabilities: [JSONValue] = if case .array(let list)? = result["capabilities"] { list } else { [] }
             extensionCanReload = capabilities.contains(.string("extension.reload"))
             extensionHasTabProtocol = if case .array? = result["tabs"] { capabilities.contains(.string("tab.close")) } else { false }
-            let tabs: [JSONValue] = if case .array(let list)? = result["tabs"] { list } else { [] }
-            var rebuilt: [Int64: ChromeConversationTab] = [:]
-            for value in tabs {
-                guard case .object(let row) = value, case .int(let id)? = row["tabId"], let tab = ChromeConversationTab(result: row, previous: groupTabs[id]), rebuilt[tab.tabID] == nil else {
-                    throw ChromeControlRuntimeError.invalidResponse
-                }
-                rebuilt[tab.tabID] = tab
-            }
-            groupTabs = rebuilt
-            conversationTabs = rememberedTabIDs.compactMapValues { rebuilt[$0] }
+            groupTabs = tabs
             if case .object(let error)? = result["lastExtensionError"],
                case .string(let message)? = error["message"], !message.isEmpty, message.utf8.count <= 4096 {
                 facts.extensionError = message

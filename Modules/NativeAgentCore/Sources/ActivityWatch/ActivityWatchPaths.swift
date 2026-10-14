@@ -1,5 +1,4 @@
 import Foundation
-import PersistenceCore
 
 /// The ONE place the watcher's on-disk home is named.
 ///
@@ -19,13 +18,7 @@ import PersistenceCore
 /// asserts exactly that, by reading those lists out of the app sources.
 public enum ActivityWatchPaths {
     /// Directory name under the data root. Deliberately NOT "activity".
-    ///
-    /// 2026-09-06: the literal itself moved to `HumanPresenceStamp` in
-    /// PersistenceCore, because the trigger scheduler has to name this
-    /// directory to read the presence stamp and it may not link this module.
-    /// This is still the file that EXPLAINS the name; there is still exactly
-    /// one string.
-    public static let directoryName = HumanPresenceStamp.activityWatchDirectoryName
+    public static let directoryName = "activity_watch"
 
     public static func directory(dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent(directoryName, isDirectory: true)
@@ -43,10 +36,8 @@ public enum ActivityWatchPaths {
         directory(dataRoot: dataRoot).appendingPathComponent("activity_retention_state.json")
     }
 
-    /// The human-presence stamp (2026-09-06). Deliberately NOT a table in the
-    /// spans database: the trigger scheduler reads it synchronously from
-    /// inside a flock and must never open this module's SQLite store.
-    public static func presenceStampURL(dataRoot: URL) -> URL {
-        HumanPresenceStamp.url(dataRoot: dataRoot)
+    /// Exact file watched by the trigger scheduler for present/away crossings.
+    public static func presenceTransitionURL(dataRoot: URL) -> URL {
+        directory(dataRoot: dataRoot).appendingPathComponent("presence_transition.json")
     }
 }

@@ -14,8 +14,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// User, 2026-09-06: `producing` false is Settings ▸ "Knowledge graph" off.
     /// The removal half still runs and nothing is re-derived, so the rebuild
     /// RETIRES every indexer-owned node instead of minting a fresh graph — the
-    /// same answer the mutation hook gives while the switch is off (it routes
-    /// every write as a delete). The gate lives in MemoryV2, which depends on
+    /// same retirement the projection reconciler owns when the switch turns
+    /// off. The gate lives in MemoryV2, which depends on
     /// this module, so it arrives as an argument rather than a read from here.
     /// Default true: every existing caller behaves exactly as before.
     public func rebuildMemoryDerivedGraphFromCanonicalStore(
@@ -31,22 +31,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let dbPool = try await pool()
         let primaryUserName = resolvedPrimaryUserName()
         return try await dbPool.write { db in
-            let memoryTableExists = (try Int.fetchOne(
-                db,
-                sql: """
-                    SELECT COUNT(*) FROM sqlite_master
-                    WHERE type = 'table' AND name = 'memories'
-                    """
-            ) ?? 0) > 0
-            guard memoryTableExists else {
-                return KnowledgeGraphMemoryRebuildReport(
-                    factsIndexed: 0,
-                    entitiesRemoved: 0,
-                    relationshipsRemoved: 0,
-                    indexRowsRemoved: 0
-                )
-            }
-
             let rows = try Row.fetchAll(db, sql: """
                 SELECT id, content, source, status, created_at, updated_at,
                        metadata_json

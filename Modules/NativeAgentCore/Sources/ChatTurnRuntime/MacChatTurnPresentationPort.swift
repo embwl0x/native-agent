@@ -1,9 +1,15 @@
 import Foundation
+import PersonaEngine
 import NativeAgentShared
 import MacControl
 
 public enum MacChatTurnPresentationEvent: Sendable {
     case status(String)
+    case dropDraft(sessionId: String)
+    case moveDraft(from: String, to: String)
+    case selectMigratedSession(String)
+    case workingCommentary(sessionId: String, bubbleId: String, characters: Int)
+    case profileCompiled(CompiledPersonalityWire?)
     case clearPreview(String)
     case movePreview(from: String, to: String)
     case moveReplying(from: String, to: String)
@@ -25,6 +31,7 @@ public protocol MacChatTurnPresentationPort: AnyObject, Sendable {
     func presentMacChatTurn(_ event: MacChatTurnPresentationEvent)
     func recordMacControlHandoff(text: String, reply: String, sessionId: String) async throws
     func cancelICloudChatTurnForControlHandoff(sessionId: String)
+    func refreshChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool) async
     func runMacChatTurnBody(
         _ text: String, attachments: [NativeAgentShared.MultimodalAttachment],
         sessionId: String, generation: Int, ctx: MacChatTurnBodyContext,

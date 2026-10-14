@@ -176,12 +176,8 @@ public enum DeskNagEvaluator {
         // `state.items` already excludes archived rows, so keying on presence
         // bounds both maps to the size of the VISIBLE DESK — that is the actual
         // bound, and it is the whole bound (gpt-5.5 review 2026-08-02, NIT 5).
-        // An earlier version of this comment claimed terminal rows leave "on the
-        // archive sweep", which overclaims: `archiveSweep` (DeskStore) refuses
-        // PINNED items and `.standing` items outright, and a parent with any
-        // non-terminal descendant, so those rows stay in `state.items` — and
-        // therefore hold an `observed`/`ledger` entry — for as long as User keeps
-        // them on the desk, sweep or no sweep. That is bounded and intended:
+        // Terminal rows retain an `observed`/`ledger` entry for as long as User
+        // keeps them on the desk. That is bounded and intended:
         // the desk is a human-sized surface, so the maps are human-sized too.
         // What is NOT true is that every terminal item's entry is guaranteed to
         // age out on its own. A reopen inheriting its pre-close baseline is the

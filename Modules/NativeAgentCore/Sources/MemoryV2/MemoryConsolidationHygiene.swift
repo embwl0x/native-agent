@@ -52,6 +52,88 @@ import TrustCenter
 /// two can never drift on report shape or on what a "hygiene run" means.
 public enum MemoryConsolidationHygiene {
 
+    public static func runConsolidation(dataRoot: URL, dryRun: Bool) async throws -> [String: Any] {
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        if dryRun {
+            let active = (try? await storage.listMemories(persona: nil, status: "active", limit: nil).count) ?? 0
+            let pending = (try? await storage.listProposals(status: "pending").count) ?? 0
+            return [
+                "ok": true,
+                "dry_run": true,
+                "processed": pending,
+                "active_memories": active,
+                "pending_proposals": pending,
+                "detail": "Preview only; no memory records were changed.",
+            ]
+        }
+        let consolidator = MemoryConsolidator(storage: storage)
+        // Honest-status fix (2026-07-24): consolidation is gated — it stages
+        // an approval card and never mutates the live store here. Surface the
+        // real outcome so the UI can say "queued for approval" instead of
+        // reporting planned counters as applied work.
+        let outcome = try await consolidator.consolidateGated()
+        let report: ConsolidationReport
+        var extra: [String: Any] = [:]
+        switch outcome {
+        case .staged(let approvalId, _, _, let plan):
+            report = plan
+            extra["status"] = "pending_approval"
+            extra["approval_id"] = approvalId
+        case .alreadyStaged(let approvalId):
+            report = ConsolidationReport(
+                processed: 0, duplicatesMerged: 0,
+                pendingForReview: 0, staleArchived: 0, errors: [])
+            extra["status"] = "pending_approval"
+            extra["approval_id"] = approvalId
+        case .refusedRegression(_, let plan):
+            report = plan
+            extra["status"] = "refused"
+        case .noChanges(let plan):
+            report = plan
+        }
+        var envelope: [String: Any] = [
+            "ok": true,
+            "processed": report.processed,
+            "duplicates_merged": report.duplicatesMerged,
+            "pending_for_review": report.pendingForReview,
+            "stale_archived": report.staleArchived,
+            "errors": report.errors,
+        ]
+        envelope.merge(extra) { _, new in new }
+        return envelope
+    }
+
+    public static func report(dataRoot root: URL, dryRun: Bool, approvedDirectRun: Bool) async throws -> MemoryHygieneReport {
+        if dryRun {
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: root)
+            let before = (try? await storage.listMemories(persona: nil, status: nil, limit: nil).count) ?? 0
+            let pending = (try? await storage.listProposals(status: "pending").count) ?? 0
+            let now = Date()
+            let nowISO = SwiftNativeManifestSigner.isoTimestamp(now)
+            let nextISO = SwiftNativeManifestSigner.isoTimestamp(now.addingTimeInterval(7 * 24 * 3600))
+            return MemoryHygieneReport(
+                id: "hygiene-preview-\(UUID().uuidString.lowercased())",
+                status: "dry_run",
+                reason: "Preview only; no memory records were changed.",
+                version: "swift-memory-v2-consolidator",
+                createdAt: nowISO,
+                beforeCount: before,
+                afterCount: before,
+                normalized: pending,
+                archivedDuplicates: nil,
+                archivedReflections: nil,
+                distilledFactsAdded: nil,
+                decayedMemories: nil,
+                proposalHygiene: MemoryProposalHygiene(rejectedLowValue: nil, nearDuplicates: nil),
+                consolidationRunId: nil,
+                nextScheduled: nextISO
+            )
+        }
+
+        return try await MemoryConsolidationHygiene.runOnce(
+            dataRoot: root, approvedDirectRun: approvedDirectRun)
+    }
+
     /// Thrown when a caller reaches the direct-consolidate path without
     /// asserting it carries an approval.
     struct DirectRunNotApprovedError: Error, CustomStringConvertible {

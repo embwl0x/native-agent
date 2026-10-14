@@ -1,9 +1,15 @@
+import TrustCenter
+import Desk
+import MultimodalTTS
 import ChatOrchestration
+import EngineRuntime
 import AppToolRuntime
+import TrustCenter
 import SwiftUI
 import PersistenceCore
 import NativeAgentShared
 import MacControl
+import ProviderRouting
 
 /// The composer's three settings, each rendered as the word that names it.
 ///
@@ -59,6 +65,276 @@ enum ComposerPane: Hashable {
         case .trust: .trust
         case .context: .context
         }
+    }
+}
+
+extension QuietComposerCommands {
+    static let cardNames = ["model", "think", "trust", "context"]
+
+    @MainActor
+    fileprivate struct Routing: ChatComposerRoutingReading {
+        let appModel: AppModel
+        var botContract: BotChatContract? { nil }
+        var cardState: ComposerShellState? { QuietSelfAdmin.shared.composerCards }
+    }
+
+    @MainActor
+    fileprivate static func draft(_ sessionID: String, appModel: AppModel) -> String {
+        (sessionID == appModel.activeChatSessionId ? QuietSelfAdmin.shared.composerDraft?.text : nil)
+            ?? appModel.chatDrafts[sessionID]
+            ?? ""
+    }
+
+    fileprivate static func cardName(_ card: ChatComposerCard?) -> String? {
+        switch card {
+        case .model: return "model"
+        case .effort: return "think"
+        case .trust: return "trust"
+        case .context: return "context"
+        case nil: return nil
+        }
+    }
+
+    private static func card(named raw: String) -> ChatComposerCard? {
+        switch raw {
+        case "model": return .model
+        case "think", "effort", "thinking": return .effort
+        case "trust": return .trust
+        case "context", "receipt": return .context
+        default: return nil
+        }
+    }
+
+    @MainActor
+    fileprivate static func openCard(_ raw: String, appModel: AppModel) -> Outcome {
+        guard let shell = QuietSelfAdmin.shared.composerCards else {
+            return .refuse("composer pane", "composer_unavailable", "No composer is mounted.")
+        }
+        guard let card = card(named: raw) else {
+            return .refuse(
+                "composer pane", "unknown_card",
+                "The composer panes are: " + cardNames.joined(separator: ", ") + "."
+            )
+        }
+        let pane = ComposerPane.opening(card, provider: appModel.chatProvider)
+        let changed = shell.activePane != pane
+        shell.activePane = pane
+        shell.flyoutIndex = nil
+        return .done(
+            "composer \(cardName(card) ?? raw) pane",
+            "The pane is open.",
+            changed: changed
+        )
+    }
+
+    @MainActor
+    fileprivate static func closeCard() -> Outcome {
+        guard let shell = QuietSelfAdmin.shared.composerCards else {
+            return .refuse("composer pane", "composer_unavailable", "No composer is mounted.")
+        }
+        let was = cardName(shell.activePane.word)
+        shell.dismiss()
+        return .done(
+            "composer \(was ?? "shell") pane",
+            was == nil ? "No pane was open." : "The pane is closed.",
+            changed: was != nil
+        )
+    }
+
+    @MainActor
+    static func showPane(_ raw: String, ref: String) -> Outcome {
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let tab: WorkPaneTab
+        switch key {
+        case "steps": tab = .steps
+        case "screen": tab = .screen
+        case "make":
+            let ref = ref.trimmingCharacters(in: .whitespacesAndNewlines)
+            tab = .make(ref: ref.isEmpty ? nil : ref)
+        default:
+            return .refuse("Work pane", "unknown_view", "No Work pane view is called that. The views are: steps, screen, make.")
+        }
+        let mode = SimpleViewMode.resolved(UserDefaults.standard.string(forKey: SimpleViewMode.key) ?? "")
+        guard mode == SimpleViewMode.advanced else {
+            return .refuse("Work pane", "no_work_pane",
+                           "\(mode.capitalized) view is on screen and has no Work pane, so nothing was opened.")
+        }
+        WorkPaneState.shared.agentShow(tab)
+        // The pane lives on Chat; on another page User sees it when he goes back.
+        let onChat = NativeAgentAppCoordinator.shared.currentPage?.item == .chat
+        return .done("Work pane", "The Work pane is open on \(key)"
+            + (onChat ? "." : ", but the person is on another page; they see it when they go back to Chat."))
+    }
+
+    static let sheets: [String: ActivitySection] = [
+        "approvals": .approvals, "today_inbox": .inbox, "memory_proposals": .memoryProposals,
+        "self_improvement": .selfImprovement, "standing_views": .cognitionProposals,
+    ]
+    static let tabs: [String: (page: SidebarItem, tab: String)] = [
+        "knowledge": (.memories, "knowledge"), "minds": (.personality, "minds"),
+        "dreams": (.personality, "dreams"), "agents": (.connectors, "agents"),
+        "doctor": (.diagnostics, DiagnosticsView.DiagnosticsMode.doctor.rawValue),
+        "status": (.diagnostics, DiagnosticsView.DiagnosticsMode.status.rawValue),
+        "runs": (.diagnostics, DiagnosticsView.DiagnosticsMode.runs.rawValue),
+        "cognition": (.diagnostics, DiagnosticsView.DiagnosticsMode.cognition.rawValue),
+        "inspector": (.diagnostics, DiagnosticsView.DiagnosticsMode.inspector.rawValue),
+        "skills": (.diagnostics, "skills"), "tools": (.diagnostics, "tools"),
+        "trust_access": (.trust, TrustTab.access.rawValue),
+        "trust_features": (.trust, TrustTab.features.rawValue),
+        "trust_mac_browser": (.trust, "mac"),
+        "trust_advanced": (.trust, TrustTab.advanced.rawValue),
+    ]
+
+    /// Quiet delivery changes the mounted scene without activating a window.
+    @MainActor
+    static func setPage(
+        _ raw: String, item: String, appModel: AppModel, coordinator: NativeAgentAppCoordinator = .shared
+    ) async -> Outcome {
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let destination: NativeAgentNavigationDestination
+        let shown: SidebarItem
+        var tab: String?
+        var title = key
+        if let section = sheets[key] {
+            destination = .activity(section)
+            shown = section == .memoryProposals ? .memories : .activity
+        } else if let home = tabs[key] {
+            (destination, shown, tab) = (.sidebar(home.page), home.page, home.tab)
+        } else if let page = QuietPages.page(named: raw) {
+            destination = .sidebar(page.item)
+            shown = SidebarItem.shellHome(for: page.item)?.parent ?? page.item
+            (tab, title) = (page.tab, page.id)
+        } else {
+            return .refuse(
+                "rail", "unknown_page",
+                "No page is called that. The pages are: " + QuietPages.ids.joined(separator: ", ")
+                + ". Inside them: " + (Array(sheets.keys) + Array(tabs.keys)).sorted().joined(separator: ", ")
+                + ". Value desk with a Desk item's handle in choice opens that item."
+            )
+        }
+        let handle = item.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !handle.isEmpty {
+            guard shown == .desk else {
+                return .refuse("Desk item", "item_needs_desk", "choice opens a Desk item, so pass value desk with it.")
+            }
+            let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            do {
+                guard try await SwiftNativeDeskStore(dataRoot: root).liveState().items.contains(where: { $0.handle == handle }) else {
+                    return .refuse("Desk item", "unknown_desk_item", "No Desk item has the handle \(handle). app desk.read lists the handles.")
+                }
+            } catch {
+                return .refuse("Desk item", "desk_unreadable", "The Desk could not be read (\(error.localizedDescription)), so nothing was opened. Try again.")
+            }
+        }
+        guard coordinator.deliverQuietly(destination) else {
+            return .refuse(
+                "rail", "no_mounted_window",
+                "The main window is not mounted in this process, so the rail cannot be moved "
+                + "without opening one — and opening one is not quiet."
+            )
+        }
+        if let tab { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(shown)) }
+        if !handle.isEmpty { appModel.pendingDeskHandle = handle }
+        let leftSimple = SimpleViewMode.isShowing
+        if leftSimple { UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key) }
+        guard coordinator.currentPage?.item == shown else {
+            return .refuse("rail", "page_not_shown", "The window has not switched to \(title).")
+        }
+        return .done(
+            "rail row \"\(title)\"",
+            "The window is now showing \(title)" + (handle.isEmpty ? "" : ", opening Desk item \(handle)")
+                + (leftSimple ? ", in Advanced view (Simple view has no pages)." : ".")
+        )
+    }
+
+}
+
+extension AppModel: QuietComposerCommandPort {
+    var quietChatBrainSavePending: Bool { engine.providers.chatBrainSaveTask != nil }
+    var quietComposerProviderGroups: [(id: String, provider: String, models: [ModelCatalogItem])] {
+        QuietComposerCommands.Routing(appModel: self).providerGroups.map { ($0.id, $0.provider, $0.models) }
+    }
+    var quietComposerEfforts: [ReasoningEffortOption] { QuietComposerCommands.Routing(appModel: self).efforts }
+    var quietComposerSupportsFast: Bool { QuietComposerCommands.Routing(appModel: self).selectedModelSupportsFast }
+    func quietComposerDraft(_ sessionID: String) -> String {
+        QuietComposerCommands.draft(sessionID, appModel: self)
+    }
+    func setQuietComposerDraft(_ after: String, sessionID: String) {
+        if sessionID != activeChatSessionId {
+            if after != quietComposerDraft(sessionID) { injectChatDraft(after, sessionId: sessionID) }
+        } else {
+            if let live = QuietSelfAdmin.shared.composerDraft, live.sessionId == sessionID || live.sessionId.isEmpty {
+                live.edit(after)
+                live.sessionId = sessionID
+            }
+            if after.isEmpty { chatDrafts.removeValue(forKey: sessionID) } else { chatDrafts[sessionID] = after }
+            touchChatDraft(sessionId: sessionID)
+        }
+    }
+    func clearQuietAcceptedDraft(_ message: String, sessionID: String, editedAt: Date) {
+        if let live = QuietSelfAdmin.shared.composerDraft, live.sessionId == sessionID, live.text == message {
+            live.edit("")
+        }
+        clearChatDraftAfterSend(message, sessionId: sessionID, editedAt: editedAt)
+        bumpChatDraftInjectionGeneration()
+    }
+    func quietComposerPaneClosed(turnID: String?) -> Bool { WorkPaneState.shared.userClosed(turnID: turnID) }
+    func quietComposerPresentation(verb: String, value: String, choice: String) async -> QuietComposerOutcome {
+        switch verb {
+        case "open_card": return QuietComposerCommands.openCard(value, appModel: self)
+        case "close_card": return QuietComposerCommands.closeCard()
+        case "set_page": return await QuietComposerCommands.setPage(value, item: choice, appModel: self)
+        case "show_browser":
+            BrowserWindowController.shared.showWindow()
+            return .done("Window > Browser", "The browser window is in front.")
+        case "show_pane": return QuietComposerCommands.showPane(value, ref: choice)
+        case "hide_pane":
+            WorkPaneState.shared.agentHide()
+            return .done("Work pane", "The Work pane is closed.")
+        case "check_updates":
+            let check = await UpdateController.shared.probeForUpdate()
+            return check.refusal.map { .refuse("Check for Updates", $0.reason, $0.detail) }
+                ?? .done("Check for Updates", check.detail, changed: false)
+        default: preconditionFailure("Core requested an unknown composer presentation effect")
+        }
+    }
+    func selectQuietComposerModel(_ model: ModelCatalogItem, provider: String) -> Task<String?, Never>? {
+        QuietComposerCommands.Routing(appModel: self).select(model: model, provider: provider)
+    }
+    func saveQuietChatBrain() async -> (succeeded: Bool, agentMessage: String, reasoningEffort: String) {
+        let result = await saveChatBrainDefaults()
+        switch result {
+        case .failed: return (false, result.agentMessage, chatReasoningEffort)
+        case .saved(let selection), .unchanged(let selection): return (true, result.agentMessage, selection.reasoningEffort)
+        }
+    }
+    func startQuietSpeech(_ text: String) async -> String? {
+        let voice = VoiceOutputController.sharedMessagePlayback
+        await voice.speak(text: text, policy: engine.trust.policy,
+                          loadPolicy: { try await self.engine.trust.load() }, ownerID: "agent.speak")
+        return voice.consumeError(ownerID: "agent.speak")
+    }
+    func writeQuietScratch(key: String, value: String, sessionId: String) async -> (succeeded: Bool, agentMessage: String) {
+        let result = await writeScratch(key: key, value: value, sessionId: sessionId)
+        return (result.succeeded, result.agentMessage)
+    }
+    func quietComposerPresentationState(sessionID: String) async -> [String: JSONValue] {
+        let routing = QuietComposerCommands.Routing(appModel: self)
+        var body: [String: JSONValue] = [
+            "provider": .string(chatProvider), "model": .string(chatModel), "model_word": .string(routing.modelWord),
+            "think": .string(chatReasoningEffort), "think_word": .string(routing.effortWord),
+            "think_choices": .array(routing.efforts.map { .string($0.id) }), "fast": .bool(routing.fastIsOn),
+            "trust_word": .string(routing.trustWord), "persona": .string(chatPersona),
+            "open_card": .string(QuietComposerCommands.cardName(QuietSelfAdmin.shared.composerCards?.activePane.word) ?? "none"),
+        ]
+        if !sessionID.isEmpty, let status = try? await getSessionContext(sessionId: sessionID, model: chatModel) {
+            let usage = ContextFillPresentation.usage(status)
+            body["ring_fraction"] = .double(usage.fillFraction)
+            body["ring_percent"] = .int(Int64(usage.percent.rounded()))
+            body["context_used_tokens"] = .int(Int64(status.used_tokens))
+            body["context_budget_tokens"] = .int(Int64(status.budget))
+        }
+        return body
     }
 }
 
@@ -528,8 +804,6 @@ final class ComposerShellState {
     }
 }
 
-let chatComposerFallbackEfforts = ["low", "medium", "high", "xhigh"]
-
 /// Everything both halves of the composer's settings derive from the routing
 /// snapshot. The words render it and the card edits it, so it lives in one
 /// place instead of being computed twice.
@@ -601,51 +875,10 @@ extension ChatComposerRoutingReading {
     /// Every provider a person can pick from today, each carrying its own
     /// models. Providers are section headers in the card, never a control.
     var providerGroups: [ChatComposerModelGroup] {
-        // One pass over the catalog, not one search per model: this runs on
-        // every hover and OpenRouter alone is hundreds of rows (User 09-27).
-        var catalogById: [String: ModelCatalogItem] = [:]
-        for model in appModel.engine.providers.catalog?.models ?? [] where catalogById[model.id] == nil {
-            catalogById[model.id] = model
-        }
-        return appModel.engine.providers.connections
-            .filter {
-                $0.provider_id == "codex"
-                    || $0.auth_status.state == "ready"
-                    || $0.provider_id == appModel.chatProvider
-            }
-            .sorted { lhs, rhs in
-                // The provider in use leads; the rest are alphabetical.
-                if (lhs.provider_id == appModel.chatProvider) != (rhs.provider_id == appModel.chatProvider) {
-                    return lhs.provider_id == appModel.chatProvider
-                }
-                return lhs.display_name < rhs.display_name
-            }
-            .compactMap { provider in
-                let models = provider.models.map { item in
-                    let catalogModel = catalogById[item.id]
-                    // Provider-scoped capabilities stay authoritative: the
-                    // global catalog holds duplicate ids for transports with
-                    // different contracts.
-                    return ModelCatalogItem(
-                        id: item.id,
-                        displayName: item.name,
-                        description: catalogModel?.description,
-                        defaultReasoningEffort: item.default_reasoning_effort
-                            ?? catalogModel?.defaultReasoningEffort ?? "high",
-                        supportedReasoningEfforts: item.supported_reasoning_efforts
-                            ?? catalogModel?.supportedReasoningEfforts
-                            ?? chatComposerFallbackEfforts,
-                        supportsFast: item.supports_fast ?? catalogModel?.supportsFast,
-                        priority: catalogModel?.priority ?? 0
-                    )
-                }
-                guard !models.isEmpty else { return nil }
-                return ChatComposerModelGroup(
-                    id: provider.provider_id,
-                    provider: provider.display_name,
-                    models: models
-                )
-            }
+        ChatComposerModelGroup.groups(
+            connections: appModel.engine.providers.connections,
+            catalog: appModel.engine.providers.catalog, providerID: appModel.chatProvider
+        )
     }
 
 
@@ -675,17 +908,9 @@ extension ChatComposerRoutingReading {
     }
 
     var efforts: [ReasoningEffortOption] {
-        let supported = selectedModel?.supportedReasoningEfforts ?? chatComposerFallbackEfforts
-        let catalogOptions = Dictionary(
-            (appModel.engine.providers.catalog?.reasoningEfforts ?? []).map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first })
-        return supported.map { effort in
-            catalogOptions[effort] ?? ReasoningEffortOption(
-                id: effort,
-                label: effort == "xhigh" ? "XHigh" : effort.capitalized,
-                description: nil
-            )
-        }
+        ProvidersFacade.reasoningOptions(
+            from: appModel.engine.providers.catalog, selectedModel: selectedModel
+        )
     }
 
     var effortIndex: Int {
@@ -730,15 +955,15 @@ extension ChatComposerRoutingReading {
 
     var trustWord: String {
         guard let policy = appModel.engine.trust.policy else { return "Trust unavailable" }
-        let access = AppModel.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
-        return TrustCenterPolicyStatusPresentation.preset(policy: policy, accessMode: access)?.title
+        let access = TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
+        return TrustPolicyPreset.matching(policy: policy, accessMode: access)?.title
             ?? "Custom Trust"
     }
 
     var activeTrustPreset: TrustPolicyPreset? {
         guard let policy = appModel.engine.trust.policy else { return nil }
-        let access = AppModel.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
-        return TrustCenterPolicyStatusPresentation.preset(policy: policy, accessMode: access)
+        let access = TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
+        return TrustPolicyPreset.matching(policy: policy, accessMode: access)
     }
 
     // MARK: - Applying
@@ -764,13 +989,14 @@ extension ChatComposerRoutingReading {
     @discardableResult
     func select(model: ModelCatalogItem, provider: String) -> Task<String?, Never>? {
         guard !appModel.isSavingChatBrain else { return nil }
-        let supported = model.supportedReasoningEfforts ?? chatComposerFallbackEfforts
-        let effort = supported.contains(appModel.chatReasoningEffort)
-            ? appModel.chatReasoningEffort
-            : (model.defaultReasoningEffort ?? supported.first ?? "high")
-        let fast = model.supportsFast == true && appModel.chatFastMode
+        let choice = ProviderTurnChoice(
+            provider: provider, model: model.id,
+            reasoningEffort: appModel.chatReasoningEffort, fast: appModel.chatFastMode,
+            supportedReasoningEfforts: model.supportedReasoningEfforts ?? ProvidersFacade.chatComposerFallbackEfforts,
+            defaultReasoningEffort: model.defaultReasoningEffort, supportsFast: model.supportsFast
+        )
 
-        appModel.chatBrainSaveGeneration &+= 1
+        appModel.engine.providers.chatBrainSaveGeneration &+= 1
         appModel.isSavingChatBrain = true
         return Task { @MainActor in
             defer { appModel.isSavingChatBrain = false }
@@ -779,8 +1005,8 @@ extension ChatComposerRoutingReading {
                     surface: "chat",
                     providerID: provider,
                     model: model.id,
-                    reasoningEffort: effort,
-                    serviceTier: fast ? "priority" : "default"
+                    reasoningEffort: choice.reasoningEffort,
+                    serviceTier: choice.fast ? "priority" : "default"
                 )
                 // What actually landed on disk, not what was asked for.
                 let canonical = response.current.chat
@@ -798,7 +1024,7 @@ extension ChatComposerRoutingReading {
     func setEffort(index: Int) {
         // A provider/model transaction owns the tuple until its receipt lands.
         // The effort drain may still coalesce its own subsequent slider edits.
-        guard !appModel.isSavingChatBrain || appModel.chatBrainSaveTask != nil else { return }
+        guard !appModel.isSavingChatBrain || appModel.engine.providers.chatBrainSaveTask != nil else { return }
         guard efforts.indices.contains(index) else { return }
         let effort = efforts[index].id
         guard effort != appModel.chatReasoningEffort else { return }
@@ -877,7 +1103,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                         NotificationCenter.default.post(name: .openCommandRouteRequest, object: "bots")
                         return
                     }
-                    guard !appModel.isSavingChatBrain || appModel.chatBrainSaveTask != nil else { return }
+                    guard !appModel.isSavingChatBrain || appModel.engine.providers.chatBrainSaveTask != nil else { return }
                     appModel.chatFastMode = false
                     appModel.enqueueChatBrainDefaultsSave()
                 } label: {
@@ -1155,7 +1381,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                     Toggle("Fast", isOn: Binding(
                         get: { appModel.chatFastMode },
                         set: { newValue in
-                            guard !appModel.isSavingChatBrain || appModel.chatBrainSaveTask != nil else { return }
+                            guard !appModel.isSavingChatBrain || appModel.engine.providers.chatBrainSaveTask != nil else { return }
                             appModel.chatFastMode = newValue
                             appModel.enqueueChatBrainDefaultsSave()
                         }
@@ -1939,7 +2165,7 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
                 Toggle(isOn: Binding(
                     get: { appModel.chatFastMode },
                     set: { newValue in
-                        guard !appModel.isSavingChatBrain || appModel.chatBrainSaveTask != nil else { return }
+                        guard !appModel.isSavingChatBrain || appModel.engine.providers.chatBrainSaveTask != nil else { return }
                         appModel.chatFastMode = newValue
                         appModel.enqueueChatBrainDefaultsSave()
                     }
@@ -2089,7 +2315,7 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
             }
             ScrollViewReader { scroller in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
+                    LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(Array(group.models.enumerated()), id: \.element.id) { index, model in
                             modelRow(model, provider: providerID, shortcut: index < 9 ? index + 1 : 0,
                                      highlighted: highlight == index)
@@ -2385,33 +2611,5 @@ private struct RowTopReporter: ViewModifier {
         } action: { top in
             state.rowTop[key] = top
         }
-    }
-}
-
-struct ChatComposerModelGroup: Identifiable {
-    let id: String
-    let provider: String
-    let models: [ModelCatalogItem]
-
-    /// A provider whose models are "company/model" and too many for one list
-    /// opens to its companies first (OpenRouter: ~460 models, 63 companies).
-    var vendorGroups: [ChatComposerModelGroup]? {
-        guard models.count > 40, models.allSatisfy({ $0.id.contains("/") }) else { return nil }
-        let byVendor = Dictionary(grouping: models) { String($0.id.prefix { $0 != "/" }) }
-        return byVendor.keys
-            .map { ChatComposerModelGroup(id: $0, provider: Self.vendorName($0), models: byVendor[$0] ?? []) }
-            .sorted { $0.provider.localizedCaseInsensitiveCompare($1.provider) == .orderedAscending }
-    }
-
-    private static let knownVendorNames = [
-        "openai": "OpenAI", "anthropic": "Anthropic", "google": "Google", "x-ai": "xAI",
-        "meta-llama": "Meta", "mistralai": "Mistral", "qwen": "Qwen", "deepseek": "DeepSeek",
-        "z-ai": "Z.ai", "nvidia": "NVIDIA", "moonshotai": "Moonshot", "microsoft": "Microsoft",
-        "amazon": "Amazon", "cohere": "Cohere", "perplexity": "Perplexity", "minimax": "MiniMax",
-    ]
-
-    static func vendorName(_ id: String) -> String {
-        if let known = knownVendorNames[id] { return known }
-        return id.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
     }
 }

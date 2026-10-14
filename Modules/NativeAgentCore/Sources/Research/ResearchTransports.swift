@@ -1,27 +1,24 @@
 import Foundation
 import NativeAgentCore
+import MacControl
 
 // MARK: - URLSession-backed HTTP client (production)
 
-public final class URLSessionResearchHTTPClient: ResearchHTTPClient {
-    private let session: URLSession
-    private let userAgent: String
+public final class URLSessionResearchHTTPClient: Sendable {
+    public init() {}
 
-    public init(session: URLSession = .shared, userAgent: String = "NativeAgent/0.1") {
-        self.session = session
-        self.userAgent = userAgent
-    }
-
-    public func getBounded(url: URL, timeout: TimeInterval, maxBytes: Int) async throws -> ResearchHTTPResponse {
+    public func getBounded(
+        url: URL, timeout: TimeInterval, maxBytes: Int, pdfMaxBytes: Int? = nil
+    ) async throws -> ResearchHTTPResponse {
         try Task.checkCancellation()
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = timeout
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        let configuration = session.configuration
+        request.setValue("NativeAgent/0.1", forHTTPHeaderField: "User-Agent")
+        let configuration = URLSession.shared.configuration
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
-        let collector = BoundedResearchDownload(limit: max(0, maxBytes))
+        let collector = BoundedResearchDownload(limit: max(0, maxBytes), pdfLimit: pdfMaxBytes.map { max(0, $0) })
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 collector.start(request: request, configuration: configuration, continuation: continuation)
@@ -29,19 +26,6 @@ public final class URLSessionResearchHTTPClient: ResearchHTTPClient {
         } onCancel: {
             collector.cancel()
         }
-    }
-
-    public func get(url: URL, timeout: TimeInterval) async throws -> (Int, Data, String?) {
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.timeoutInterval = timeout
-        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw ResearchClientError.transport("non-HTTP response")
-        }
-        let contentType = http.value(forHTTPHeaderField: "Content-Type")
-        return (http.statusCode, data, contentType)
     }
 }
 
@@ -59,7 +43,7 @@ public struct SearXNGStartError: LocalizedError, Sendable {
 /// Returns nil if docker isn't on PATH or the call fails, matching
 /// `Daemon.docker_searxng_candidates`'s `except Exception: return []`
 /// branch.
-public final class SystemDockerPSExecutor: DockerPSExecutor {
+public final class SystemDockerPSExecutor: Sendable {
     public init() {}
 
     public func runJSONLines() async -> String? {
@@ -181,7 +165,7 @@ public final class SystemDockerPSExecutor: DockerPSExecutor {
             app.deleteLastPathComponent()
         }
         guard app.pathExtension == "app",
-              await runResearchSubprocess(executable: "/usr/bin/open", arguments: ["-g", app.path], timeout: 8)?.status == 0
+              await runResearchSubprocess(executable: "/usr/bin/open", arguments: ["-g", app.path], timeout: 8)?.exitCode == 0
         else {
             throw SearXNGStartError(message: "Docker's daemon is not running and no Docker Desktop app was found to start it.")
         }
@@ -197,8 +181,8 @@ public final class SystemDockerPSExecutor: DockerPSExecutor {
         // Locate `docker` on PATH (matches Python's shutil.which).
         guard let dockerPath = Self.whichDocker(),
               let result = await runResearchSubprocess(executable: dockerPath, arguments: arguments, timeout: 8),
-              result.status == 0 else { return nil }
-        return String(data: result.stdout, encoding: .utf8)
+              result.exitCode == 0 else { return nil }
+        return result.stdout
     }
 
     private static func whichDocker() -> String? {
@@ -219,131 +203,11 @@ public final class SystemDockerPSExecutor: DockerPSExecutor {
 func runResearchSubprocess(
     executable: String, arguments: [String], environment: [String: String]? = nil,
     cwd: URL? = nil, timeout: TimeInterval
-) async -> (status: Int32, stdout: Data, stderr: Data, timedOut: Bool)? {
+) async -> ProcessRunResult? {
     guard !Task.isCancelled else { return nil }
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
-    if let environment { process.environment = environment }
-    if let cwd { process.currentDirectoryURL = cwd }
-    process.standardInput = FileHandle.nullDevice
-    let stdoutPipe = Pipe()
-    let stderrPipe = Pipe()
-    process.standardOutput = stdoutPipe
-    process.standardError = stderrPipe
-
-    // Drain stdout/stderr CONTINUOUSLY while the child runs. The old shape
-    // (waitUntilExit BEFORE readDataToEndOfFile) deadlocked any docker
-    // output larger than the ~64KB pipe buffer: docker blocked in
-    // write(2), never exited, the 8s SIGTERM fired, and the call
-    // misreported nil. Same pattern as ToolExecution+RunSandbox
-    // (audit 2026-06-09; applied here 2026-06-10).
-    let stdoutBuf = ResearchPipeCaptureBuffer()
-    let stderrBuf = ResearchPipeCaptureBuffer()
-    stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-        let chunk = handle.availableData
-        if chunk.isEmpty { handle.readabilityHandler = nil } else { stdoutBuf.append(chunk) }
-    }
-    stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-        let chunk = handle.availableData
-        if chunk.isEmpty { handle.readabilityHandler = nil } else { stderrBuf.append(chunk) }
-    }
-
-    do {
-        try process.run()
-    } catch {
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        return nil
-    }
-    // HANG-PROOFING (2026-08-25): the previous shape parked this
-    // continuation on `DispatchQueue.global().async { waitUntilExit() }`
-    // with a separate 8s Task that only ever called `terminate()`. Under
-    // full-suite subprocess churn the shared GCD pool starves — the queued
-    // block never STARTS, so the continuation is never resumed even though
-    // the child exited long ago (release-gauntlet wedge: 75+ min at 0% CPU
-    // with no child process). Same landmine ToolExecution+RunSandbox
-    // documents; same cure: a dedicated reap Thread that polls under the
-    // deadline, escalates SIGTERM → grace → SIGKILL, and resumes the
-    // continuation UNCONDITIONALLY. Worst case is bounded (deadline + 2s),
-    // never a hang, with zero dependence on GCD scheduling.
-    let pidRef = process
-    let cancellation = ResearchSubprocessCancellation()
-    let timedOut = await withTaskCancellationHandler {
-        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            let reaper = Thread {
-                let deadline = Date().addingTimeInterval(timeout)
-                while pidRef.isRunning && Date() < deadline && !cancellation.isCancelled {
-                    Thread.sleep(forTimeInterval: 0.02)
-                }
-                let late = pidRef.isRunning
-                if late {
-                    pidRef.terminate() // SIGTERM
-                    let grace = Date().addingTimeInterval(2)
-                    while pidRef.isRunning && Date() < grace {
-                        Thread.sleep(forTimeInterval: 0.02)
-                    }
-                    if pidRef.isRunning {
-                        // SIGKILL by pid is reuse-safe HERE: the child is not
-                        // yet reaped (waitUntilExit below is the reap), so the
-                        // pid cannot be recycled. waitUntilExit after an
-                        // unignorable SIGKILL returns promptly.
-                        kill(pidRef.processIdentifier, SIGKILL)
-                        pidRef.waitUntilExit()
-                    }
-                }
-                cont.resume(returning: late && !cancellation.isCancelled)
-            }
-            reaper.qualityOfService = .userInitiated
-            reaper.start()
-        }
-    } onCancel: {
-        cancellation.cancel()
-    }
-
-    // Final drain: nil the handlers, then grab whatever is still buffered
-    // WITHOUT blocking — a grandchild holding an inherited write end would
-    // make an EOF-waiting read (readDataToEndOfFile) hang forever.
-    stdoutPipe.fileHandleForReading.readabilityHandler = nil
-    stderrPipe.fileHandleForReading.readabilityHandler = nil
-    stdoutBuf.appendNonBlockingDrain(from: stdoutPipe.fileHandleForReading)
-    stderrBuf.appendNonBlockingDrain(from: stderrPipe.fileHandleForReading)
-    guard !Task.isCancelled else { return nil }
-    return (process.terminationStatus, stdoutBuf.data, stderrBuf.data, timedOut)
-}
-
-/// The existing reap thread handles cancellation with the same bounded
-/// SIGTERM/SIGKILL sequence as a deadline. Registration also catches a task
-/// cancelled between process launch and installation of the handler.
-private final class ResearchSubprocessCancellation: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cancelled = false
-
-    var isCancelled: Bool { lock.withLock { cancelled } }
-
-    func cancel() { lock.withLock { cancelled = true } }
-}
-
-/// Thread-safe capture buffer for subprocess pipes — appended from
-/// FileHandle's readabilityHandler queue, read after exit. Local copy of
-/// ToolExecution's PipeCaptureBuffer (private there; same shape).
-private final class ResearchPipeCaptureBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage = Data()
-    func append(_ chunk: Data) { lock.lock(); storage.append(chunk); lock.unlock() }
-    var data: Data { lock.lock(); defer { lock.unlock() }; return storage }
-    /// Grab whatever is already buffered without waiting for EOF — a
-    /// grandchild holding an inherited write end would make a blocking
-    /// read wait forever.
-    func appendNonBlockingDrain(from handle: FileHandle) {
-        let fd = handle.fileDescriptor
-        let flags = fcntl(fd, F_GETFL, 0)
-        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-        var chunk = [UInt8](repeating: 0, count: 65_536)
-        while true {
-            let n = read(fd, &chunk, chunk.count)
-            guard n > 0 else { break }
-            append(Data(bytes: chunk, count: n))
-        }
-    }
+    return try? await SystemProcessAdapter().run(
+        executable: executable, arguments: arguments, currentDirectory: cwd,
+        environment: environment, standardInput: nil, timeoutSeconds: timeout,
+        outputByteLimit: Int.max
+    )
 }

@@ -14,44 +14,23 @@ import DeviceSync
 public struct KGNativeStackStatus: Equatable, Sendable {
     public var sqliteEntities: Int
     public var embeddingDim: Int
-    public var spotlightIndexed: Int
     public var cloudKitState: String
     public var lastChecked: Date?
     public static let empty = KGNativeStackStatus(
-        sqliteEntities: 0, embeddingDim: 0, spotlightIndexed: 0,
+        sqliteEntities: 0, embeddingDim: 0,
         cloudKitState: "unknown", lastChecked: nil
     )
 
-    /// Read-only probe of the apple-native stack. Mirrors the
-    /// `MemoryV2NativeStackSnapshot.load()` pattern in ContentView (same data
-    /// root, same SQLite store, same Spotlight sentinel) but scoped to the KG
-    /// view's compact header.
-    public static func load(graphCounts: (entities: Int, edges: Int)) async -> KGNativeStackStatus {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+    public static func load(entityCount: Int) async -> KGNativeStackStatus {
         var status = KGNativeStackStatus.empty
         status.lastChecked = Date()
-        status.embeddingDim = (await SwiftNativeMemoryV2.shared.embedderDimensions()) ?? 0
-
-        status.sqliteEntities = graphCounts.entities
-        let spotMarker = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent(".spotlight_reindexed", isDirectory: false)
-        if FileManager.default.fileExists(atPath: spotMarker.path) {
-            status.spotlightIndexed = status.sqliteEntities
-        }
-        // CloudKit account probe — disabled by default because CKContainer
-        // traps synchronously when the provisioning profile lacks the CloudKit
-        // service grant.
-        if nativeAgentCloudKitAccountProbeEnabled() {
-            status.cloudKitState = await withCKTimeout("KGNativeStackStatus.cloudKitAccount") {
-                let s = try await CKContainer.default().accountStatus()
-                return UserFacingError.iCloudAccount(s)
-            } ?? UserFacingError.iCloudNoAnswer
-        } else {
-            status.cloudKitState = nativeAgentCloudKitDisabledStatus
-        }
+        let snapshot = await MemoryV2NativeStackSnapshot.load()
+        status.sqliteEntities = entityCount
+        status.embeddingDim = snapshot.runtimeEmbedderDimensions ?? 0
+        status.cloudKitState = snapshot.cloudKitAccountStatus
         return status
     }
+
 }
 
 struct KGNativeStackHeader: View {

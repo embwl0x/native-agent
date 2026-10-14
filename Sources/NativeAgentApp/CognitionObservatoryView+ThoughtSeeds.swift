@@ -16,11 +16,11 @@ extension CognitionObservatoryView {
         } else {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                 ForEach(Array(seeds.prefix(8)), id: \.id) { seed in
-                    Text("\(CognitionObservatoryPresentation.thoughtKindLabel(seed.kind)): \(seed.text)")
+                    Text("\(CognitionThoughtSeedPresentation.thoughtKindLabel(seed.kind)): \(seed.text)")
                         .font(.caption)
                         .textSelection(.enabled)
                 }
-                if let overflow = CognitionObservatoryPresentation.thoughtSeedOverflowLabel(total: seeds.count) {
+                if let overflow = CognitionThoughtSeedPresentation.thoughtSeedOverflowLabel(total: seeds.count) {
                     Text(overflow)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -40,7 +40,7 @@ extension CognitionObservatoryView {
                 ForEach(Array(suggestions.prefix(6)), id: \.id) { suggestion in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text(CognitionObservatoryPresentation.thoughtKindLabel(suggestion.kind))
+                            Text(CognitionThoughtSeedPresentation.thoughtKindLabel(suggestion.kind))
                                 .font(.caption.weight(.semibold))
                             Spacer()
                             Text(String(format: "%.2f", suggestion.interruptionScore))
@@ -59,4 +59,21 @@ extension CognitionObservatoryView {
             }
         }
     }
+}
+
+enum CognitionThoughtSeedPresentation {
+    static func thoughtKindLabel(_ kind: CognitiveThoughtSeedKind) -> String {
+        switch kind {
+        case .openQuestion: "Open question"
+        case .anomaly: "Something unexpected"
+        case .followUp: "Follow-up"
+        case .reflectionTakeaway: "Reflection takeaway"
+        }
+    }
+
+    static func thoughtSeedOverflowLabel(total: Int, visibleLimit: Int = 8) -> String? {
+        guard total > visibleLimit else { return nil }
+        return "Showing \(visibleLimit) of \(total) thought seeds."
+    }
+
 }

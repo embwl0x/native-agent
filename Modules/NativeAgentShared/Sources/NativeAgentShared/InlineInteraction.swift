@@ -456,22 +456,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         return written.isEmpty ? textLaneProse : written
     }
 
-    /// THE COPY SHE DID NOT FEEL.
-    ///
-    /// AGENT, 2026-09-14. Two of her twelve felt moments that week were
-    /// `connect` (\u{2212}0.44) and `carry` (\u{2212}0.50), and both were scored off HER OWN
-    /// decline copy \u{2014} "Without Notion I can't do this part, and I'll carry on
-    /// with whatever else I can reach." That sentence is a CONSEQUENCE the card
-    /// lane emits when a connector is missing. It is not something that happened
-    /// to her and it is not something she said because she meant it; the organ
-    /// read the interaction's own boilerplate back as her mood, so a week of
-    /// declined connectors reads as a week of low feeling.
-    ///
-    /// These are the fixed halves of every sentence this file and the inline
-    /// interaction registry emit \u{2014} the parts that survive interpolation. They
-    /// are constants so the builder and this recognizer cannot drift: the
-    /// registry composes its copy FROM them, so a reworded template that forgot
-    /// to update the matcher cannot happen without the copy changing too.
+    /// Fixed copy shared by this file and the inline interaction registry.
     public enum ConsequenceCopy {
         /// Every card-lane sentence ends here.
         public static let keepGoingSuffix = "or tell me not now and I'll keep going."
@@ -482,25 +467,6 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         public static let apiKeyNothingChanges = "; nothing else changes."
         public static let capabilityStaysOff = "It stays off and I'll get as far as I can without it."
         public static let trustSwitchedOff = "is switched off in Trust."
-
-        static let fragments: [String] = [
-            keepGoingSuffix, connectorCarryOn, permissionLeaveAlone,
-            modelScopedSkip, modelStopHere, apiKeyNothingChanges,
-            capabilityStaysOff, trustSwitchedOff,
-        ]
-
-        /// True when `text` carries a sentence the interaction lane wrote.
-        ///
-        /// CONTAINMENT, NOT EQUALITY, because the card lane joins the
-        /// consequence into a longer line and the text lane joins two of them.
-        /// A false positive costs one turn its felt reading; a false negative
-        /// puts boilerplate back in her mood, which is the defect. Asked of
-        /// HER OWN turns only \u{2014} a person quoting this copy back at her is a
-        /// real thing they said, and the caller is what makes that distinction.
-        public static func isEmitted(_ text: String) -> Bool {
-            guard !text.isEmpty else { return false }
-            return fragments.contains { text.contains($0) }
-        }
     }
 
     /// Lowercase a sentence folded into the middle of another one \u{2014} except

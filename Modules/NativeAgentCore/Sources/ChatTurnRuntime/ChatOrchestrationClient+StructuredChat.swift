@@ -192,15 +192,13 @@ extension SwiftNativeChatOrchestrationClient {
         persona: String?,
         surface: String,
         suppressUserAppend: Bool,
-        persistToolMessages: Bool,
         progress: ChatOrchestrationProgressHandler?,
         noticeSink: @escaping @Sendable (String, String) async -> Void
     ) async throws -> StructuredChatExecution {
         let persona = PersonaSelection.current() ?? persona
-        // "Take over" continues where User was: each door captured it when the
-        // message arrived (MacWorkContinuation.admit). An agent's turn never
-        // inherits his.
-        let takeover = ChatToolSessionContext.envelope?.agent == nil
+        let fileAccess = FileAccessGatedDispatcher.sharedFileAccess(fileAccess)
+        // Trusted turns retain the working context captured at arrival.
+        let takeover = PeerDataTaint.abilityWriteCheck() == nil
             ? ChatToolSessionContext.envelope?.macContinuation ?? MacWorkContinuation.current : nil
         return try await MacWorkContinuation.$current.withValue(takeover) {
         try await SenseTurnReads.$current.withValue(SenseTurnReads()) {
@@ -215,7 +213,7 @@ extension SwiftNativeChatOrchestrationClient {
         let runId = ChatPersistenceContext.pinnedTurnRunID ?? UUID().uuidString
         ChatTurnExecution.current?.bindHistoryRunID(runId)
         var livePartial: String?
-        let boundTurnId = StructuredTurnTraceIdentity.currentOrMint()
+        let boundTurnId = TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()
         // Finish evidence must reach disk before recovery ownership is removed.
         var terminal: TurnTraceEvent?
         defer {
@@ -230,6 +228,23 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
         do {
+        let admittedAt = clock()
+        await ChatTurnSteering.shared.noteTurnActivity(for: dataRoot, at: admittedAt)
+        let carried: [MyQueue.Entry]
+        var queueUnavailable = false
+        if ChatTurnExecution.transcriptRowKind == nil {
+            let projection = await (cognitiveContextProvider as? any MyQueueTurnProjectionProviding)?.queueTurnCandidates()
+            let candidates = projection?.candidates
+            queueUnavailable = candidates == nil && projection?.refreshPendingAfterWrite == true
+            carried = candidates.map { MyQueueReady.forTurn(items: $0, session: resolvedSession, door: surface,
+                personTurn: ChatPersistenceContext.originPrincipal == "person", at: admittedAt)
+                .filter { ChatToolSessionContext.envelope?.workIdentity != "carry." + $0.item.handle } } ?? []
+        } else { carried = [] }
+        let taint = carried.isEmpty ? PeerDataTaint.current : PeerDataTaint(
+            restoring: (PeerDataTaint.current?.checkpointSources ?? []) + carried.flatMap { $0.step.peers },
+            elevated: (PeerDataTaint.current?.elevatedSources ?? []) + carried.flatMap { $0.step.elevated })
+        taint?.keep(line: carried.filter(\.peerBorn).map { $0.step.words }.joined(separator: "\n"))
+        func executeCarriedTurn() async throws -> StructuredChatExecution {
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
         // #19 + B7: derive the per-session cancel flag AT TURN ACCEPT, keyed by
         // this run, so a stale flag from a prior turn cannot kill this one and a
@@ -250,6 +265,15 @@ extension SwiftNativeChatOrchestrationClient {
             queryUserMessage: TurnRelevanceContext.queryUserMessage)
         let imageBlocks = attachmentInput.imageBlocks
         var modelMessage = attachmentInput.userMessage
+        if queueUnavailable { modelMessage += "\n\n[MY QUEUE is unavailable; no queued step was admitted with this message.]" }
+        if !carried.isEmpty {
+            let items = carried.map { entry in
+                var arrival = ResidentWake.carriedArrival(entry.item, crossing: admittedAt)
+                arrival.reason = "what you carry"
+                return arrival
+            }
+            modelMessage += "\n\n" + ResidentWake.text(items, live: true)
+        }
         if ChatTurnExecution.transcriptRowKind == nil,
            let contract = StandingBotContinuity.currentContract {
             modelMessage = contract.instructions + "\n\nMessage for this turn:\n" + modelMessage
@@ -271,8 +295,7 @@ extension SwiftNativeChatOrchestrationClient {
                 mechanicalRow: ChatTurnExecution.transcriptRowKind
             )
         } else {
-            try await consumeEnqueuedMessage(sessionId: resolvedSession, runId: runId)
-            origin = try afterTurnOrigin(sessionId: resolvedSession, runId: runId)
+            origin = try await consumeEnqueuedMessage(sessionId: resolvedSession, runId: runId)
         }
         var afterTurnStarted = false
         var survivingReply = ""
@@ -343,7 +366,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
         let steeringToken = await ChatTurnSteering.shared.openTurn(
-            sessionId: resolvedSession, turnId: TurnTraceContext.turnId ?? runId, persist: steeringPersister)
+            sessionId: resolvedSession, turnId: TurnTraceContext.turnId ?? runId, dataRoot: dataRoot, persist: steeringPersister)
         defer {
             if TurnAdmission.token == nil {
                 Task {
@@ -499,48 +522,42 @@ extension SwiftNativeChatOrchestrationClient {
             surface: surface
         )
 
-        let toolProgressRecorder = persistToolMessages ? ToolProgressPersistenceBuffer() : nil
+        let toolProgressRecorder = ToolProgressPersistenceBuffer()
         let receiptWriter = ToolReceiptWriter(
             client: self, sessionId: resolvedSession, runId: runId, surface: surface,
             laneLabel: "", onNotice: noticeSink
         )
-        let effectiveProgress: ChatOrchestrationProgressHandler?
-        if progress != nil || toolProgressRecorder != nil {
-            effectiveProgress = { event in
-                let redactedEvent = Self.redactedProgressEvent(event)
-                if let toolProgressRecorder,
-                   let record = await toolProgressRecorder.recordableToolResult(from: event) {
-                    await receiptWriter.write(ToolReceipt(
-                        toolName: record.name,
-                        inputJSON: (try? ChatSecretRedactor.redactValue(record.input).serialize(pretty: false)) ?? "{}",
-                        resultJSON: (try? ChatSecretRedactor.redactValue(record.output).serialize(pretty: false)) ?? "null",
-                        ok: record.ok,
-                        cognitiveOutput: record.output
-                    ))
-                }
-                if case .delta = redactedEvent,
-                   await outputMilestoneGate.claim() {
-                    TurnLifecycleTelemetry.emit(
-                        .surfaceOutputEnqueued,
-                        surface: surface,
-                        sessionId: resolvedSession,
-                        observedBy: "structured_stream.progress"
-                    )
-                }
-                await self.observeCognitiveProgressEvent(
-                    sessionId: resolvedSession,
-                    runId: runId,
-                    surface: surface,
-                    event: redactedEvent,
-                    toolResultAlreadyPersisted: toolProgressRecorder != nil
-                )
-                if case .delta(let text) = redactedEvent {
-                    ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId, .delta(text))
-                }
-                await progress?(redactedEvent)
+        let effectiveProgress: ChatOrchestrationProgressHandler = { event in
+            let redactedEvent = Self.redactedProgressEvent(event)
+            if let record = await toolProgressRecorder.recordableToolResult(from: event) {
+                await receiptWriter.write(ToolReceipt(
+                    toolName: record.name,
+                    inputJSON: (try? ChatSecretRedactor.redactValue(record.input).serialize(pretty: false)) ?? "{}",
+                    resultJSON: (try? ChatSecretRedactor.redactValue(record.output).serialize(pretty: false)) ?? "null",
+                    ok: record.ok,
+                    cognitiveOutput: record.output
+                ))
             }
-        } else {
-            effectiveProgress = nil
+            if case .delta = redactedEvent,
+               await outputMilestoneGate.claim() {
+                TurnLifecycleTelemetry.emit(
+                    .surfaceOutputEnqueued,
+                    surface: surface,
+                    sessionId: resolvedSession,
+                    observedBy: "structured_stream.progress"
+                )
+            }
+            await self.observeCognitiveProgressEvent(
+                sessionId: resolvedSession,
+                runId: runId,
+                surface: surface,
+                event: redactedEvent,
+                toolResultAlreadyPersisted: true
+            )
+            if case .delta(let text) = redactedEvent {
+                ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId, .delta(text))
+            }
+            await progress?(redactedEvent)
         }
 
         let loopObservation = ToolLoopTraceObservation()
@@ -837,6 +854,8 @@ extension SwiftNativeChatOrchestrationClient {
             terminal = nil
         }
         return StructuredChatExecution(response: response, turn: result)
+        }
+        return try await PeerDataTaint.$current.withValue(taint, operation: executeCarriedTurn)
         } catch {
             // A run that ended before naming its own terminal (attachments,
             // the user row, a queued message's pickup, the reply's save).
@@ -1029,17 +1048,10 @@ extension SwiftNativeChatOrchestrationClient {
             maximumCharacters: ContextBudgetPolicy.resolve(
                 model: LLMCallContext.admittedModel,
                 providerID: LLMCallContext.providerId,
-                dataRoot: dataRoot,
-                surface: surface
+                dataRoot: dataRoot
             ).capsuleChars,
-            allowNonLiveProjection: Self.shouldProjectCognitiveStateForTrustedBridgeEnvelope(
-                userMessage
-            ),
             turnKind: Self.cognitiveMessageTurnKind(
-                role: "user",
-                source: surface,
-                redactedContent: ChatSecretRedactor.redactText(userMessage),
-                origin: ChatPersistenceContext.originProvenance
+                redactedContent: ChatSecretRedactor.redactText(TurnRelevanceContext.queryUserMessage ?? userMessage)
             ),
             fromUser: fromUser,
             previousUserTurnAt: fromUser ? UserTurnStamp.previous(dataRoot: dataRoot) : nil
@@ -1096,10 +1108,6 @@ extension SwiftNativeChatOrchestrationClient {
         let projection = Self.droppingDuplicateRemindedOf(
             projection, packetMemoryIDs: Set(context.fluidContextTurn?.selectedMemoryRecordIDs ?? []))
         guard let runtimeContext = Self.cognitiveRuntimeContext(
-            runId: runId,
-            sessionId: sessionId,
-            surface: surface,
-            fileAccess: fileAccess,
             capsule: projection?.capsule,
             posture: projection?.posture
         ) else {
@@ -1195,29 +1203,10 @@ extension SwiftNativeChatOrchestrationClient {
         guard !modelOverride.isEmpty || !effortOverride.isEmpty else {
             return context
         }
-        return TurnContext(
-            surface: context.surface,
-            personaID: context.personaID,
-            personaDocs: context.personaDocs,
-            personaFingerprint: context.personaFingerprint,
-            recalled: context.recalled,
-            modelId: modelOverride.isEmpty ? context.modelId : modelOverride,
-            reasoningEffort: effortOverride.isEmpty ? context.reasoningEffort : effortOverride,
-            providerId: context.providerId,
-            serviceTier: context.serviceTier,
-            toolsAvailable: context.toolsAvailable,
-            systemPrompt: context.systemPrompt,
-            userMessage: context.userMessage,
-            toolSchemas: context.toolSchemas,
-            systemSegments: context.systemSegments,
-            imageBlocks: context.imageBlocks,
-            fluidContextTurn: context.fluidContextTurn,
-            naturalExpressionCue: context.naturalExpressionCue,
-            historyMessages: context.historyMessages,
-            turnVolatileBlock: context.turnVolatileBlock,
-            historyWindowReceipt: context.historyWindowReceipt,
-            preparationMs: context.preparationMs
-        )
+        var copy = context
+        if !modelOverride.isEmpty { copy.modelId = modelOverride }
+        if !effortOverride.isEmpty { copy.reasoningEffort = effortOverride }
+        return copy
     }
 
     func makeTurnPlan(
@@ -1245,10 +1234,6 @@ extension SwiftNativeChatOrchestrationClient {
     static let cognitiveHeaderLine = "[CognitiveSubstrate] private — it colors you; never quote it."
 
     static func cognitiveRuntimeContext(
-        runId: String,
-        sessionId: String,
-        surface: String,
-        fileAccess: String,
         capsule: CognitiveCapsule?,
         posture: OrganismBehaviorPosture?
     ) -> String? {
@@ -1256,21 +1241,13 @@ extension SwiftNativeChatOrchestrationClient {
         // The ops line rides FIRST and on its own, so it never reads as part of
         // her private inner state; it is empty on a default posture.
         if let posture {
-            sections.append(posture.privateRuntimeContext(
-                runId: runId,
-                sessionId: sessionId,
-                surface: surface,
-                fileAccess: fileAccess
-            ))
+            sections.append(posture.privateRuntimeContext())
         }
         if let capsule,
            !capsule.combined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // One functional line, no disclaimers: her guardrails live in her soul
-            // (persona), and actions are hard-gated by TrustCenter regardless of
-            // prompt text (User, 2026-07-01). Phase 5A: the run/session/surface
-            // ids were trace plumbing the model paid for on every call; the
-            // trace reader keys on this exact line instead.
-            sections.append(Self.cognitiveHeaderLine + "\n" + capsule.combined)
+            // The stable prefix identifies this section to the trace reader.
+            sections.append(Self.cognitiveHeaderLine
+                + " Snapshot as of \(capsule.generatedAt.formatted(.iso8601)): selected inner cues; no external-state reads, full Doctor check or complete activity log.\n" + capsule.combined)
         }
         let combined = sections
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1279,15 +1256,6 @@ extension SwiftNativeChatOrchestrationClient {
         return combined.isEmpty ? nil : combined
     }
 
-    nonisolated static func shouldProjectCognitiveStateForTrustedBridgeEnvelope(
-        _ userMessage: String
-    ) -> Bool {
-        let normalized = userMessage
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return normalized.hasPrefix("[from: codex, via bridge]")
-            || normalized.hasPrefix("[from: claude, via bridge]")
-    }
 }
 
 /// Phase 5 E2: when User last took a turn at one of his verified doors (Mac,

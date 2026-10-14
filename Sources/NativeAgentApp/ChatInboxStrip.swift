@@ -1,4 +1,8 @@
+import Cognition
+import EngineRuntime
+import ApprovalTransactions
 import SwiftUI
+import ApprovalTransactions
 import NotificationInbox
 import ApprovalInbox
 import AppKit
@@ -62,13 +66,13 @@ struct InboxStripContainer<Header: View>: View {
         }
     }
     private var stripCards: [InboxItemRecord] {
-        items.filter { $0.source == InteractionCardDelivery.source && $0.chat_session_id != appModel.activeChatSessionId }
+        items.filter { $0.source == InlineInteractionDelivery.source && $0.chat_session_id != appModel.activeChatSessionId }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
         header(InboxNotesCapsule(
-            items: items.filter { $0.source != InteractionCardDelivery.source && !$0.hasLinkedApproval },
+            items: items.filter { $0.source != InlineInteractionDelivery.source && !$0.hasLinkedApproval },
             onAction: { id, actionID in
                 try await appModel.inboxAction(id, action: actionID)
                 // Every successful action changes inbox state. Reload now so
@@ -91,10 +95,10 @@ struct InboxStripContainer<Header: View>: View {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(stripApprovals.prefix(2)) { approval in
                     Group {
-                        if ApprovalPayloadPreviewPresentation.canResolve(approval) {
-                            InlineApprovalCard(message: InlineApprovalCard.message(for: approval))
+                        if ApprovalChatCards.canResolve(approval) {
+                            InlineApprovalCard(message: ChatMessage(approval: approval))
                         } else {
-                            Text(ApprovalPayloadPreviewPresentation.unavailableText)
+                            Text(ApprovalChatCards.unavailableText)
                         }
                     }
                     .padding(.bottom, 8)
@@ -119,7 +123,7 @@ struct InboxStripContainer<Header: View>: View {
             let inboxPath = (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
                 .appendingPathComponent("notifications", isDirectory: true)
                 .appendingPathComponent("inbox.jsonl")
-            await ViewFileRefreshTask.run(paths: [inboxPath]) {
+            await EventDeadlinePhysiology.refreshOnChanges(paths: [inboxPath]) {
                 await reload()
             }
         }
@@ -146,7 +150,7 @@ struct InboxStripContainer<Header: View>: View {
                 try await appModel.engine.inbox.list().filter {
                     // Reading a request is not resolving it. Delivery archives
                     // its pointer when the originating interaction settles.
-                    $0.source == InteractionCardDelivery.source
+                    $0.source == InlineInteractionDelivery.source
                         ? $0.normalizedStatus != "archived"
                         : $0.isUnread
                 }

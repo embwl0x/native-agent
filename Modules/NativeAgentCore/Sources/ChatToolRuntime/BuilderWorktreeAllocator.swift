@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import MacControl
 import PersistenceCore
+import TurnTrace
 
 /// The narrow isolation seam for asynchronous coding builders.
 ///
@@ -382,8 +383,7 @@ actor BuilderWorktreeAllocator {
     /// holding a commit unique to its branch is kept. Branches are never
     /// deleted — the reclaimable cost is the checkout, and a branch that still
     /// exists means a retired worktree can be recreated at its own tip.
-    /// Each outcome, including a refusal, is appended to `retirements.jsonl`
-    /// beside the pointers.
+    /// Retirement observations join the allocating turn's existing trace.
     private func retireIdleWorktrees(
         agent: Agent,
         repoRoot: URL,
@@ -476,7 +476,6 @@ actor BuilderWorktreeAllocator {
                   unique.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "0"
             else { continue }
 
-            let idleDays = Int(now.timeIntervalSince(touchedAt) / 86_400)
             let remove = await git(
                 ["worktree", "remove", worktreeRoot.path],
                 cwd: repoRoot
@@ -494,36 +493,15 @@ actor BuilderWorktreeAllocator {
                 }
                 removed += 1
             }
-            await appendRetirementReceipt([
-                "at": Self.iso8601(now),
-                "agent": agent.rawValue,
-                "worktree": worktreeRoot.path,
-                "branch": branch,
-                "lastTouchedAt": Self.iso8601(touchedAt),
-                "idleDays": idleDays,
-                "uniqueCommits": 0,
-                "status": remove.status == 0 ? "retired" : "remove_refused",
-                "detail": remove.status == 0 ? "" : boundedDetail(remove),
-            ], configRoot: configRoot)
-        }
-    }
-
-    private static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.string(from: date)
-    }
-
-    private func appendRetirementReceipt(_ row: [String: Any], configRoot: URL) async {
-        let ledger = configRoot
-            .appendingPathComponent("nativeagent-builder-worktrees", isDirectory: true)
-            .appendingPathComponent("retirements.jsonl")
-        guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]),
-              let record = try? JSONValue.parse(data)
-        else { return }
-        let persistence = SwiftNativePersistenceCore()
-        _ = try? await persistence.withFileLock(ledger) {
-            try await persistence.appendJSONL(record, to: ledger)
+            TurnTraceBus.fireFromContext(kind: "builder.worktree_retirement", payload: .object([
+                "agent": .string(agent.rawValue),
+                "worktree": .string(ChatSecretRedactor.redactText(worktreeRoot.path)),
+                "branch": .string(branch),
+                "idleDays": .int(Int64(now.timeIntervalSince(touchedAt) / 86_400)),
+                "uniqueCommits": .int(0),
+                "status": .string(remove.status == 0 ? "retired" : "remove_refused"),
+                "detail": .string(ChatSecretRedactor.redactText(remove.status == 0 ? "" : boundedDetail(remove))),
+            ]))
         }
     }
 

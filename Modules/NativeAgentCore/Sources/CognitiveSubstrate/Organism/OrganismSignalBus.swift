@@ -1,29 +1,8 @@
 import Foundation
 
-public protocol SomaticSignalObserving: Sendable {
-    func observe(_ signal: SomaticSignal) async
-}
-
-extension OrganismKernel: SomaticSignalObserving {
-    public func observe(_ signal: SomaticSignal) async {
-        await ingest(signal, movesFeelings: CognitiveSomaticSignalAdapter.movesFeelings(signal.kind))
-    }
-}
-
-public struct SomaticSignalBusDependencies: Sendable {
-    public var makeUUID: @Sendable () -> UUID
-
-    public init(makeUUID: @escaping @Sendable () -> UUID = { UUID() }) {
-        self.makeUUID = makeUUID
-    }
-
-    public static let live = SomaticSignalBusDependencies()
-}
-
 public actor SomaticSignalBus {
     private var configuration: OrganismConfiguration
-    private let observer: any SomaticSignalObserving
-    private let dependencies: SomaticSignalBusDependencies
+    private let observer: OrganismKernel
     private var deliveredEventKeys: Set<String> = []
     private var deliveredEventKeyOrder: [String] = []
 
@@ -34,12 +13,10 @@ public actor SomaticSignalBus {
 
     public init(
         configuration: OrganismConfiguration = .disabled,
-        observer: any SomaticSignalObserving,
-        dependencies: SomaticSignalBusDependencies = .live
+        observer: OrganismKernel
     ) {
         self.configuration = configuration
         self.observer = observer
-        self.dependencies = dependencies
     }
 
     public func configure(_ configuration: OrganismConfiguration) async {
@@ -53,7 +30,7 @@ public actor SomaticSignalBus {
         guard !deliveredEventKeys.contains(eventKey) else { return nil }
         guard let signal = CognitiveSomaticSignalAdapter.signal(
             from: event,
-            id: dependencies.makeUUID(),
+            id: UUID(),
             bounds: configuration.metadataBounds
         ) else {
             return nil
@@ -62,7 +39,7 @@ public actor SomaticSignalBus {
         // delivered while the first observation is still being integrated.
         deliveredEventKeys.insert(eventKey)
         rememberDeliveredEventKey(eventKey)
-        await observer.observe(signal)
+        await observer.ingest(signal, movesFeelings: CognitiveSomaticSignalAdapter.movesFeelings(signal.kind))
         return signal
     }
 

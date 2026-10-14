@@ -66,24 +66,13 @@ extension SwiftToolDispatcher {
 
     func impl_persona_read(input: [String: JSONValue]) async throws -> JSONValue {
         let kind = canonicalPersonaKind(try requireString(input, "kind"))
-        let allowedKinds: Set<String> = ["soul", "user", "voice", "growth", "agents", "skill"]
+        let allowedKinds: Set<String> = ["soul", "user", "voice", "growth", "agents"]
         guard allowedKinds.contains(kind) else {
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher persona_read kind must be one of: \(allowedKinds.sorted().joined(separator: ", "))"
             )
         }
-        let skillName = optionalString(input, "skill_name")
-        if kind == "skill" && skillName == nil {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher persona_read requires skill_name when kind=skill"
-            )
-        }
-        if let skillName, !validatePersonaSkillName(skillName) {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher persona_read invalid skill_name '\(skillName)'"
-            )
-        }
-        guard let target = try personaToolPath(kind: kind, skillName: skillName) else {
+        guard let target = personaToolPath(kind: kind) else {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher persona_read could not resolve persona path")
         }
         guard let bytes = try? Data(contentsOf: target),
@@ -142,7 +131,6 @@ extension SwiftToolDispatcher {
             let result = try await engine.personaWrite(
                 kind: kind,
                 content: content,
-                skillName: optionalString(input, "skill_name"),
                 keeping: canonicalPersonaKind(kind) == "growth" ? keeping : nil
             )
             var fields: [String: JSONValue] = [:]
@@ -237,8 +225,10 @@ extension SwiftToolDispatcher {
         }
         guard fullDetail else { return .object(response) }
 
-        let availableTools = Set(try await modelVisibleToolNames())
-        let mcpTools = modelVisibleMCPToolNames().sorted()
+        let catalog = await catalogSnapshot(includeSchemas: false)
+        let availableTools = Set(catalog.names.filter { !catalog.hiddenMCPNames.contains($0) && !Self.isModelHidden($0) })
+        MCPToolCatalogWarmer.shared.kickDetached(dataRoot: dataRoot)
+        let mcpTools = catalog.externalMCPNames.sorted()
         let modelVisibleAvailableTools = Self.modelVisibleCatalogToolNames(availableTools)
         let activeTools = Self.alwaysOnCoreNames
             .union(LLMCallContext.turnActiveTools ?? [])

@@ -1,6 +1,9 @@
 import Agents
+import AttentionRouting
 import BackgroundWork
+import BackgroundLoops
 import ChatOrchestration
+import CognitiveSubstrate
 import CryptoKit
 import Desk
 import Foundation
@@ -10,9 +13,14 @@ import PersistenceCore
 import ProviderRouting
 import StandingBots
 import TelegramBot
+import SlackBot
+import SlackConnector
+import DeviceSync
+import Transcripts
 import TrustCenter
 import WorkshopExecution
 import TurnTrace
+import ApprovalTransactions
 
 /// Continuations use the same admitted turn and reply path; Desk receipts and
 /// approval claims retain their own settlement and retry rules.
@@ -20,14 +28,125 @@ public struct TurnContinuationRuntime: Sendable {
     private let dataRoot: URL
     private let engine: NativeAgentEngine
     private let telegramApprovalFiler: @Sendable () -> (any ApprovalFiler)?
-    private let makeSender: @Sendable (@escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending
+    private let makeSender: @Sendable (Bool, String?, @escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending
 
     public init(dataRoot: URL, engine: NativeAgentEngine, telegramApprovalFiler: @escaping @Sendable () -> (any ApprovalFiler)? = { nil },
-                makeSender: @escaping @Sendable (@escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending) {
+                makeSender: @escaping @Sendable (Bool, String?, @escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending) {
         self.dataRoot = dataRoot
         self.engine = engine
         self.telegramApprovalFiler = telegramApprovalFiler
         self.makeSender = makeSender
+    }
+
+    public func resumeAtLaunch(_ checkpoint: TurnCheckpoint,
+        resumeMacTurn: @Sendable (TurnCheckpoint, TurnContinuationRuntime) async throws -> Void) async throws {
+        if checkpoint.capabilityProfile == "mac", checkpoint.surface == "chat", checkpoint.helperDefinition == nil {
+            try await resumeMacTurn(checkpoint, self)
+        } else { try await resumeTurn(checkpoint) }
+    }
+
+    /// User, 2026-10-01: what is said in the conversation he is in reaches his other
+    /// doors — and only that conversation. After a turn User started there at the
+    /// Mac, the phone or Slack (never an agent's, judged by the turn's user row),
+    /// its reply goes to the Telegram chat bound to that session, and to the phone
+    /// as a push unless the phone asked. A Telegram turn travels nowhere: Telegram
+    /// already notifies his phone, and a second push doubled it. User, 2026-10-04:
+    /// a Mac turn means he is at the Mac, so its Telegram copy lands silently and
+    /// the phone gets no push, only the transcript snapshot every completion
+    /// already publishes. Terminal settlement retains the exact mirror intent;
+    /// the delivery-state event owner sends it without blocking the turn's stream.
+    @MainActor
+    public static func installReplyMirror() {
+        AbandonedTurnReconciliationHook.installReplyMirror { root, session, run in
+            try await retainMirrorIntent(sessionId: session, runId: run, dataRoot: root)
+        }
+    }
+
+    private static let mirrorDoors = ["app": "Mac", "chat": "Mac", "ios": "iPhone", "slack": "Slack"]
+
+    private static func mirrorLifecycle(dataRoot: URL) -> CodexCompletionLifecycle {
+        CodexCompletionLifecycle(receiptURL: dataRoot.appendingPathComponent("chat/anchor-mirror/receipts.jsonl"),
+            ownerInstanceId: CodexCompletionLifecycle.processOwnerInstanceId, dataRoot: dataRoot)
+    }
+
+    private static func retainMirrorIntent(sessionId: String, runId: String, dataRoot: URL, requiresAnchor: Bool = true) async throws {
+        guard !requiresAnchor || sessionId == ConversationAnchor.currentSessionId(dataRoot: dataRoot),
+              let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: sessionId, runId: runId),
+              !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
+        let persistence = SwiftNativePersistenceCore()
+        let read = try await persistence.withFileLock(path) { try await persistence.readJSONLReporting(path) }
+        guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine,
+              read.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else { throw CocoaError(.fileReadCorruptFile) }
+        guard case .object(let reply)? = read.rows.last(where: {
+            if case .object(let row) = $0 { return row["role"] == .string("assistant") && row["runId"] == .string(runId) }; return false
+        }), case .string(let rowId)? = reply["id"],
+            case .object(let ask)? = read.rows.last(where: {
+                if case .object(let row) = $0 { return row["role"] == .string("user") && row["runId"] == .string(runId) }; return false
+            }), case .object(let metadata)? = ask["metadata"], metadata["origin"] == nil,
+            metadata[CognitiveMechanicalRowKind.metadataKey] == nil, case .object(let envelope)? = metadata["envelope"],
+            envelope["agent"] == nil, case .string(let surface)? = envelope["surface"], let door = mirrorDoors[surface] else { return }
+        let deliveryId = "anchor-mirror:" + rowId
+        let digest = SHA256.hash(data: Data((rowId + "\u{1f}" + response.output).utf8)).map { String(format: "%02x", $0) }.joined()
+        var route: AgentBridgeCompletionRoute?
+        var preparationError: Error?
+        do {
+            var notificationId: String?
+            if door == "Slack" {
+                if case .object(let metadata)? = reply["metadata"], case .object(let intent)? = metadata["resultDelivery"],
+                   case .string(let eventID)? = intent["eventId"] {
+                    guard eventID.hasPrefix("requested-result:") else {
+                        throw NSError(domain: "TurnContinuationRuntime", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "The requested result has not been accepted for phone delivery."])
+                    }
+                    notificationId = String(eventID.dropFirst("requested-result:".count))
+                } else { notificationId = deliveryId }
+                try await SwiftNativeChatOrchestrationClient.retainRequestedResult(dataRoot: dataRoot, sessionId: sessionId,
+                    runId: runId, deliveryId: "requested-result:" + (notificationId ?? deliveryId))
+            }
+            guard let telegram = try await TelegramSessionStore(dataRoot: dataRoot).outboundDestination(sessionId: sessionId) else { return }
+            route = AgentBridgeCompletionRoute(surface: "telegram", sessionId: sessionId,
+                destinationId: String(telegram.chatId), threadId: telegram.threadId.map(String.init),
+                sourceKey: surface, correlationId: notificationId)
+        } catch { preparationError = error }
+        let lifecycle = mirrorLifecycle(dataRoot: dataRoot)
+        switch try await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: sessionId,
+                                         responseRunId: runId, route: route, source: surface) {
+        case .start, .inProgress:
+            var mirror = response
+            mirror.attachments = []
+            try await lifecycle.cacheResponse(mirror, deliveryId: deliveryId, requestDigest: digest)
+        case .cached: break
+        case .settled, .outcomeUnknown, .conflict: throw CodexCompletionLifecycle.LifecycleError.requestConflict
+        }
+        if let preparationError {
+            try await lifecycle.recordDelivery(AgentBridgeCompletionDelivery(status: "owed", surface: "telegram",
+                delivery: "anchor_mirror", artifactCount: 1, attempts: 0, reason: preparationError.localizedDescription),
+                deliveryId: deliveryId, requestDigest: digest)
+            throw preparationError
+        }
+    }
+
+    public func reconcileReplyMirror() async throws {
+        let lifecycle = Self.mirrorLifecycle(dataRoot: dataRoot)
+        _ = try await lifecycle.reconcileInterruptedClaims()
+        for row in try await lifecycle.reconciliationRows() where (row.status == "owed" || row.status == "sent_unconfirmed") && !row.routeSettled {
+            guard let response = row.response else { continue }
+            guard let route = row.route else {
+                if let session = response.sessionId {
+                    try await Self.retainMirrorIntent(sessionId: session, runId: response.runId, dataRoot: dataRoot, requiresAnchor: false)
+                }
+                continue
+            }
+            guard let surface = route.sourceKey else { continue }
+            let text = "[\(Self.mirrorDoors[surface] ?? surface)]\n" + response.output
+            _ = await AgentBridgeCompletionRouter.deliver(deliveryId: row.id, requestDigest: row.digest,
+                text: text, attachments: [], route: route,
+                sender: makeSender(surface == "app" || surface == "chat", route.correlationId, { config, chatID in
+                    TelegramPollLoop.inboundAuthorizationDecision(allowedChatIds: config.allowedChatIds,
+                        allowedUserIds: config.allowedUserIds, chatId: chatID, fromUserId: chatID > 0 ? chatID : nil) == .allowed
+                }), lifecycle: lifecycle, notifyRequestedResult: surface == "slack")
+        }
     }
 
     public func makeDeskContinuationScheduler() -> DeskContinuationScheduler {
@@ -82,21 +201,31 @@ public struct TurnContinuationRuntime: Sendable {
     }
 
     public func resumeTurn(_ checkpoint: TurnCheckpoint, progress: ChatOrchestrationProgressHandler? = nil) async throws {
+        guard let surface = text(checkpoint.replyRoute, "surface") else { throw DeskContinuationError.unavailable }
+        let route = AgentBridgeCompletionRoute(surface: surface, sessionId: checkpoint.sessionId,
+            destinationId: text(checkpoint.replyRoute, "destinationId"), threadId: text(checkpoint.replyRoute, "threadId"),
+            sourceKey: text(checkpoint.replyRoute, "sourceKey"), replyTo: text(checkpoint.replyRoute, "replyTo"),
+            correlationId: text(checkpoint.replyRoute, "correlationId"), requesterUserId: text(checkpoint.replyRoute, "requesterUserId"))
+        let resume: @Sendable () async throws -> Void = {
+            try await resumeCheckpoint(checkpoint, route: route, progress: progress)
+        }
+        if route.kind == .callerResult {
+            try await engine.agents.tasks.resume(route, runID: checkpoint.runId, operation: resume)
+        } else { try await resume() }
+    }
+
+    private func resumeCheckpoint(_ checkpoint: TurnCheckpoint, route: AgentBridgeCompletionRoute,
+                                  progress: ChatOrchestrationProgressHandler?) async throws {
         guard let saved = TurnEnvelope.fromPersistedMetadata(.object(checkpoint.envelope)),
               let name = checkpoint.capabilityProfile,
               let profile = NativeAgentAppChatSurfaceProfile(rawValue: name),
-              let sources = checkpoint.peerSources,
-              let surface = text(checkpoint.replyRoute, "surface") else {
+              let sources = checkpoint.peerSources else {
             throw DeskContinuationError.unavailable
         }
         let envelope = TurnEnvelope(surface: saved.surface, agent: saved.agent,
             verifiedChatId: saved.verifiedChatId, verifiedUserId: saved.verifiedUserId,
             commandSignatureVerified: checkpoint.commandSignatureVerified,
             deliveryRoute: saved.deliveryRoute, declaredRemote: checkpoint.declaredRemote)
-        let route = AgentBridgeCompletionRoute(surface: surface, sessionId: checkpoint.sessionId,
-            destinationId: text(checkpoint.replyRoute, "destinationId"), threadId: text(checkpoint.replyRoute, "threadId"),
-            sourceKey: text(checkpoint.replyRoute, "sourceKey"), replyTo: text(checkpoint.replyRoute, "replyTo"),
-            correlationId: text(checkpoint.replyRoute, "correlationId"))
         let request = followUpRequest(message: checkpoint.userMessage, sessionID: checkpoint.sessionId,
             fileAccess: checkpoint.fileAccess, surface: checkpoint.surface, envelope: envelope,
             replyRoute: route.chatToolReplyRoute, pinnedRunID: checkpoint.runId)
@@ -105,15 +234,10 @@ public struct TurnContinuationRuntime: Sendable {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         let item = try await store.liveState().items.first { $0.continuation?.runID == checkpoint.runId }
         let journal: DeskContinuationTurn?
-        if let item, var record = item.continuation {
+        if let item, let record = item.continuation {
             guard item.status != .canceled else {
                 throw DeskContinuationError.unavailable
             }
-            let expected = record.revision
-            record.state = .running
-            record.processID = DeskContinuationScope.processID
-            record.revision = UUID().uuidString
-            try await store.setContinuation(item.handle, expectedRevision: expected, record: record)
             journal = DeskContinuationTurn(store: store, record: record, handle: item.handle)
         } else { journal = nil }
         let response = try await PeerDataTaint.$current.withValue(PeerDataTaint(restoring: sources)) {
@@ -155,7 +279,7 @@ public struct TurnContinuationRuntime: Sendable {
         let route = AgentBridgeCompletionRoute(surface: surface, sessionId: record.sessionID,
             destinationId: text(record.replyRoute, "destinationId"), threadId: text(record.replyRoute, "threadId"),
             sourceKey: text(record.replyRoute, "sourceKey"), replyTo: text(record.replyRoute, "replyTo"),
-            correlationId: text(record.replyRoute, "correlationId"))
+            correlationId: text(record.replyRoute, "correlationId"), requesterUserId: text(record.replyRoute, "requesterUserId"))
         let journal = DeskContinuationTurn(store: SwiftNativeDeskStore(dataRoot: dataRoot), record: record, handle: item.handle)
         do {
             if record.reason != "reply_ready" {
@@ -228,8 +352,7 @@ public struct TurnContinuationRuntime: Sendable {
         let responses = AsyncStream<ChatResponse>.makeStream()
         defer { responses.continuation.finish() }
         let runner = BotRunner(dataRoot: dataRoot, session: { bot, _ in
-            let choice = ProviderTurnChoice(provider: bot.provider ?? "", model: bot.model ?? "",
-                reasoningEffort: bot.reasoningEffort ?? "", fast: bot.fast ?? false)
+            let choice = try await BotChatContract.choice(for: bot, dataRoot: self.dataRoot)
             return try await StandingBotContinuity.$currentBot.withValue(bot) {
                 try await runAdmittedContinuation(sessionID: bot.sessionID) {
                     try await ProviderTurnChoice.$current.withValue(choice) {
@@ -282,11 +405,9 @@ public struct TurnContinuationRuntime: Sendable {
                                      fileAccess: String,
                                      turnOptions: @escaping @Sendable () -> (persona: String?, serviceTier: String?)) async throws {
         let door = ConversationSurfaceProfile(envelope.surface)
-        // A card from Claude's or Codex's own bridge lane is that agent's
-        // ask, whatever the card recorded (their lanes latch no steer of
-        // their own), so the follow-up is held to the peer floor for it.
+        // A named bridge's follow-up carries its verified principal, not its route name.
         if let lane = ["claude-bridge": "claude", "codex-bridge": "codex"][door.id] {
-            PeerDataTaint.current?.mark(peer: lane)
+            PeerDataTaint.current?.mark(peer: envelope.verifiedUserId.map { "peer:" + $0 } ?? lane)
         }
         let profile: NativeAgentAppChatSurfaceProfile = door.isAgentBridge || ["claude-bridge", "codex-bridge"].contains(door.id)
             ? .bridge : door.isIOSRemote ? .ios : NativeAgentAppChatSurfaceProfile(rawValue: door.id) ?? .mac
@@ -303,7 +424,7 @@ public struct TurnContinuationRuntime: Sendable {
         guard ["telegram", "slack", "ios", "iphone", "mobile", "icloud"].contains(deliverySurface) else { return }
         let route = AgentBridgeCompletionRoute(surface: saved.surface, sessionId: sessionID,
             destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
-            replyTo: saved.replyTo, correlationId: saved.correlationId)
+            replyTo: saved.replyTo, correlationId: saved.correlationId, requesterUserId: saved.requesterUserId)
         _ = try await settleReply(response: response, route: route, envelope: envelope, settlement: .approvalClaim)
     }
 
@@ -351,7 +472,7 @@ public struct TurnContinuationRuntime: Sendable {
         case .durable: requiresDestinationMatch = true
         case .approvalClaim: requiresDestinationMatch = false
         }
-        let sender = makeSender { config, chatID in
+        let sender = makeSender(false, nil) { config, chatID in
             (!requiresDestinationMatch || route.destinationId == envelope.verifiedChatId)
                 && TelegramPollLoop.inboundAuthorizationDecision(
                     allowedChatIds: config.allowedChatIds, allowedUserIds: config.allowedUserIds,
@@ -364,27 +485,125 @@ public struct TurnContinuationRuntime: Sendable {
                 receiptURL: dataRoot.appendingPathComponent("chat/human-reply-delivery/receipts.jsonl"),
                 ownerInstanceId: CodexCompletionLifecycle.processOwnerInstanceId, dataRoot: dataRoot)
             _ = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+            switch try await lifecycle.claim(deliveryId: deliveryID, requestDigest: digest, sessionId: response.sessionId, responseRunId: response.runId, route: route) {
+            case .start:
+                try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
+            case .cached: break
+            case .inProgress:
+                try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
+            case .settled(let delivery):
+                return delivery?.status == "sent_unconfirmed" || delivery?.status == "failed_before_answer" ? "completed" : delivery?.status ?? "completed"
+            case .outcomeUnknown, .conflict: throw CodexCompletionLifecycle.LifecycleError.requestConflict
+            }
             let delivery = await AgentBridgeCompletionRouter.deliver(
                 deliveryId: deliveryID, requestDigest: digest, text: response.output,
                 attachments: response.attachments ?? [], route: route, sender: sender, lifecycle: lifecycle,
                 notifyRequestedResult: notifyRequestedResult)
-            return delivery.status
+            return ["sent_unconfirmed", "failed_before_answer"].contains(delivery.status) ? "completed" : delivery.status
         case .approvalClaim:
-            // The approval claim already covers the turn and its single send.
-            // Delivery failure never admits another model turn.
-            let surface = route.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let artifacts = try AgentBridgeCompletionRouter.artifacts(deliveryId: response.runId,
-                surface: surface, text: response.output, attachments: response.attachments ?? [])
-            try await sender.preflight(surface: surface, route: route, artifacts: artifacts)
-            for artifact in artifacts {
-                switch await sender.send(artifact: artifact, idempotencyKey: artifact.id, surface: surface, route: route) {
-                case .accepted: break
-                case .rejected(let reason, _), .ambiguous(let reason):
-                    throw NSError(domain: "ApprovalContinuationDelivery", code: 1,
-                                  userInfo: [NSLocalizedDescriptionKey: reason])
-                }
-            }
-            return "completed"
+            let delivery = try await sender.deliverReply(response, deliveryId: response.runId, route: route,
+                priorVerdict: nil, notifyRequestedResult: false)
+            return delivery.status == "sent_unconfirmed" ? "completed" : delivery.status
         }
     }
+}
+
+public struct EngineAgentBridgeCompletionSender: AgentBridgeCompletionSending {
+  let authorizeTelegramReply: (@Sendable (TelegramConfig, Int) -> Bool)?
+
+  typealias DeliveryError = AgentBridgeCompletionRouter.DeliveryError
+
+  private let engine: @Sendable () -> NativeAgentEngine
+  private let router: @Sendable () -> AttentionRouter
+  let dataRoot: URL
+  /// Telegram text lands without a sound or alert (context, not a ping).
+  let silentTelegram: Bool
+  let requestedResultDeliveryID: String?
+
+  public init(engine: @escaping @Sendable () -> NativeAgentEngine, router: @escaping @Sendable () -> AttentionRouter,
+       dataRoot: URL = PersistenceCore.defaultDataRoot(),
+       silentTelegram: Bool = false,
+       requestedResultDeliveryID: String? = nil,
+       authorizeTelegramReply: (@Sendable (TelegramConfig, Int) -> Bool)? = nil) {
+    self.engine = engine
+    self.router = router
+    self.dataRoot = dataRoot
+    self.silentTelegram = silentTelegram
+    self.requestedResultDeliveryID = requestedResultDeliveryID
+    self.authorizeTelegramReply = authorizeTelegramReply
+  }
+
+  public func refreshLocalChat(sessionId: String?) async {
+    await MainActor.run {
+      NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionId)
+    }
+  }
+
+  public func deliverReply(_ response: ChatResponse, deliveryId: String, route: AgentBridgeCompletionRoute,
+                    priorVerdict: String?, notifyRequestedResult: Bool) async throws -> AgentBridgeCompletionDelivery {
+    try await AgentBridgeCompletionRouter.deliverReply(deliveryId: deliveryId, route: route,
+      notifyRequestedResult: notifyRequestedResult, recoverTelegram: {
+      guard let raw = route.destinationId, let chatID = Int(raw), response.sessionId != nil,
+            let config = TelegramConfig.loadFromDisk(dataRoot: dataRoot), config.enabled,
+            authorizeTelegramReply?(config, chatID) != false,
+            route.threadId == nil || route.threadId.flatMap(Int.init) != nil,
+            let loop = await BackgroundLoops.BackgroundLoopsManager.shared.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop else {
+        throw DeliveryError.invalidTelegramDestination
+      }
+      return try await loop.recoverReply(response, originRunId: response.runId,
+        destination: TelegramDestination(chatId: chatID, threadId: route.threadId.flatMap(Int.init)),
+        requesterUserId: route.requesterUserId.flatMap(Int.init), silent: silentTelegram, priorVerdict: priorVerdict)
+    }, recoverSlack: {
+      guard let loop = await BackgroundLoops.BackgroundLoopsManager.shared.loopRunner(loopId: "slack_socket_mode") as? SlackSocketModeLoop else {
+        throw DeliveryError.missingSlackDestination
+      }
+      return try await loop.recoverReply(response, originRunId: response.runId, route: route, priorVerdict: priorVerdict)
+    }, recoverIOS: {
+      try await engine().deviceSync!.bridge.recoverReply(response, route: route, priorVerdict: priorVerdict)
+    }, deliverRequestedResult: {
+      guard try await router().deliverRequestedResult(
+        deliveryID: requestedResultDeliveryID ?? deliveryId, sessionID: route.turnSessionId ?? response.sessionId,
+        opening: route.turnSessionId == nil ? nil : route.sessionId, dataRoot: dataRoot
+      ) else { throw DeliveryError.notificationNotAccepted }
+    })
+  }
+
+  public func preflight(surface: String, route: AgentBridgeCompletionRoute,
+                 artifacts: [AgentBridgeCompletionArtifact]) async throws {
+    guard !artifacts.isEmpty else { throw DeliveryError.emptyCompletion }
+    for artifact in artifacts {
+      try AgentBridgeCompletionRouter.validateAttachmentExpectations(artifact.attachmentExpectations)
+    }
+    switch route.kind {
+    case .telegram:
+      guard let config = TelegramConfig.loadFromDisk(dataRoot: dataRoot), config.enabled, !config.botToken.isEmpty,
+            let raw = route.destinationId, let chatID = Int(raw), authorizeTelegramReply?(config, chatID) != false,
+            route.threadId == nil || route.threadId.flatMap(Int.init) != nil else { throw DeliveryError.invalidTelegramDestination }
+    case .slack: try SlackConnectorActions.requireConfiguredToken(dataRoot: dataRoot)
+    case .ios:
+      guard let key = route.sourceKey, AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(key) else { throw DeliveryError.missingIOSSourceKey }
+    default: break
+    }
+    if route.kind == .callerResult { _ = try await engine().agents.tasks.callerResultTarget(route) }
+  }
+
+  public func send(artifact: AgentBridgeCompletionArtifact, idempotencyKey: String,
+            surface: String, route: AgentBridgeCompletionRoute) async -> AgentBridgeTransportResult {
+    await AgentBridgeCompletionRouter.sendCallerResult(artifact: artifact, idempotencyKey: idempotencyKey,
+      route: route, tasks: { engine().agents.tasks })
+  }
+}
+
+/// The running Telegram loop's approval filer, so an approval follow-up on
+/// Telegram files its cards with the same inline buttons (Wave 2 #8).
+public final class TelegramApprovalFilerRef: @unchecked Sendable {
+    public static let shared = TelegramApprovalFilerRef()
+    private let lock = NSLock()
+    private var filer: TelegramApprovalFiler?
+
+    public func configure(_ filer: TelegramApprovalFiler) {
+        lock.withLock { self.filer = filer }
+        ApprovalChatCards.useTelegram(filer)
+    }
+    public func current() -> TelegramApprovalFiler? { lock.withLock { filer } }
 }

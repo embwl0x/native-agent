@@ -62,14 +62,9 @@ final class ShareComposeModel: ObservableObject {
                         mime: "application/pdf", name: provider.suggestedName ?? "Shared.pdf", byteSize: data.count))
                 } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                     let raw = try await data(from: provider, type: UTType.image.identifier)
-                    guard let source = CGImageSourceCreateWithData(raw as CFData, nil),
-                          let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                            kCGImageSourceCreateThumbnailFromImageAlways: true,
-                            kCGImageSourceCreateThumbnailWithTransform: true,
-                            kCGImageSourceThumbnailMaxPixelSize: 1400
-                          ] as CFDictionary),
-                          let jpeg = MobileChatAttachmentPreparation.preparedJPEGData(
-                            from: UIImage(cgImage: thumbnail), maxBytes: fileBudget) else {
+                    guard let jpeg = await Task.detached(priority: .userInitiated, operation: {
+                        MobileChatAttachmentPreparation.preparedJPEGData(from: raw, maxBytes: fileBudget)
+                    }).value else {
                         throw SharedChatInbox.failure("This image could not be prepared for chat.")
                     }
                     files.append(MultimodalAttachment(type: "image", base64: jpeg.base64EncodedString(),

@@ -59,12 +59,6 @@ public actor UserMDGenerator {
     /// Single in-flight trailing-edge timer task; nil when none scheduled.
     /// Lifecycle: set in `scheduleTrailingEdge`, cleared in `flushPending`.
     private var pendingTask: Task<Void, Never>?
-    /// Deterministic contention seam; nil in production.
-    private var beforeProjectionLockForTesting: (@Sendable () async -> Void)?
-
-    internal func _testSetBeforeProjectionLock(_ hook: (@Sendable () async -> Void)?) {
-        beforeProjectionLockForTesting = hook
-    }
 
     public init(
         storage: MemoryStorage,
@@ -207,7 +201,6 @@ public actor UserMDGenerator {
         let target = userMDPath(persona: projectionPersona)
         let parent = target.deletingLastPathComponent()
 
-        await beforeProjectionLockForTesting?()
         let core = SwiftNativePersistenceCore()
         let manifestPath = dataRoot.appendingPathComponent("onboarding/pending-completion.json")
         // Match onboarding's lock order and hold its manifest lock from the
@@ -227,9 +220,9 @@ public actor UserMDGenerator {
                 )
                 let now = nowProvider()
                 let body = Self.renderBody(memories: memories, now: now)
-                let preamble = try Self.loadPreambleForRegeneration(at: target)
-                let payload = Self.assemble(preamble: preamble, body: body)
-                try Self.atomicReplaceIfChanged(payload, at: target)
+                let existing = try Self.loadPreambleForRegeneration(at: target)
+                let payload = Self.assemble(preamble: existing.preamble, body: body)
+                try Self.atomicReplaceIfChanged(payload, existingBytes: existing.bytes, at: target)
                 return now
             }
         }
@@ -241,7 +234,7 @@ public actor UserMDGenerator {
     /// the same temp-fsync + rename + parent-directory-fsync contract used by
     /// canonical chat/session state; a successful regeneration must survive a
     /// power loss, not merely a process crash.
-    private static func atomicReplaceIfChanged(_ payload: String, at target: URL) throws {
+    private static func atomicReplaceIfChanged(_ payload: String, existingBytes: Data?, at target: URL) throws {
         let bytes = Data(payload.utf8)
         // Launch reconciliation is intentionally allowed to call regenerate,
         // but an identical derived projection must not manufacture a file
@@ -249,7 +242,7 @@ public actor UserMDGenerator {
         // watchers, and backup/sync surfaces even though canonical memory did
         // not move. Compare under the same file lock that protects the write;
         // unreadable/damaged documents have already failed closed above.
-        if (try? Data(contentsOf: target)) == bytes { return }
+        if existingBytes == bytes { return }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: target)
     }
 
@@ -352,9 +345,9 @@ public actor UserMDGenerator {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func loadPreambleForRegeneration(at url: URL) throws -> String? {
+    private static func loadPreambleForRegeneration(at url: URL) throws -> (preamble: String?, bytes: Data?) {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path) else { return nil }
+        guard fm.fileExists(atPath: url.path) else { return (nil, nil) }
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -366,7 +359,7 @@ public actor UserMDGenerator {
         }
         let startCount = existing.components(separatedBy: preambleStartMarker).count - 1
         let endCount = existing.components(separatedBy: preambleEndMarker).count - 1
-        if startCount == 0 && endCount == 0 { return nil }
+        if startCount == 0 && endCount == 0 { return (nil, data) }
         guard startCount == 1, endCount == 1,
               let startRange = existing.range(of: preambleStartMarker),
               let endRange = existing.range(of: preambleEndMarker),
@@ -375,7 +368,7 @@ public actor UserMDGenerator {
                 "preamble markers are missing, duplicated, or out of order"
             )
         }
-        return String(existing[startRange.upperBound..<endRange.lowerBound])
+        return (String(existing[startRange.upperBound..<endRange.lowerBound]), data)
     }
 
     static func assemble(preamble: String?, body: String) -> String {
@@ -390,5 +383,12 @@ public actor UserMDGenerator {
         if !body.hasSuffix("\n") { out += "\n" }
         out += "\(bodyEndMarker)\n"
         return out
+    }
+}
+
+extension UserMDGenerator {
+    /// Zero-arg shorthand the launch hook uses.
+    public func regenerate() async throws -> URL {
+        try await self.regenerate(persona: MemoryV2Defaults.personaID)
     }
 }

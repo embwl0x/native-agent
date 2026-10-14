@@ -35,8 +35,8 @@ public final class SyncFacade {
             .store(in: &subscriptions)
     }
 
-    public func setStatus(_ status: PairedPhoneStore.Phone.Status, id: String) {
-        owner?.pairedPhones.setStatus(status, id: id)
+    public func setStatus(_ status: PairedPhoneStore.Phone.Status, id: String) async {
+        _ = await owner?.pairedPhones.setStatus(status, id: id)
     }
 
     public func loadSecret(quiet: Bool) async {
@@ -76,12 +76,12 @@ public final class SyncFacade {
             catch { return (nil, error.localizedDescription) }
         }.value
         guard let persistedSecret = result.0 else {
-            owner.engine.finishPairingSecretRotation(with: nil)
+            await owner.engine.finishPairingSecretRotation(with: nil)
             let detail = result.1 ?? "The existing key was preserved."
             pairingError = "Pairing key regeneration failed. \(detail)"
             return
         }
-        owner.engine.finishPairingSecretRotation(with: persistedSecret)
+        await owner.engine.finishPairingSecretRotation(with: persistedSecret)
         async let kvsPublished = PairingSecretManager.publishMaterialToKVS(persistedSecret)
         async let cloudKitPublished = owner.bridge.publishPairingSecret(persistedSecret)
         let published = await (kvsPublished, cloudKitPublished)
@@ -131,7 +131,4 @@ public enum PairingPublicationHealth {
         return warning
     }
 
-    public static func currentWarning(defaults: UserDefaults = .standard) -> String? {
-        defaults.string(forKey: warningDefaultsKey)
-    }
 }

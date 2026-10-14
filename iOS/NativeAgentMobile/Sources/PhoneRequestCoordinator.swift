@@ -16,7 +16,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
     static let shared = PhoneRequestCoordinator()
     @Published private(set) var active: PhoneRequest?
     @Published var errorMessage: String?
-    private struct Record: Codable {
+    private struct Record: Codable, Sendable {
         var request: PhoneRequest
         var pairing: String
         var executing = false
@@ -26,19 +26,22 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
         var recoveryAttempts: Int?
         var sent = false
     }
-    private var records: [Record] = []
-    private struct Replay: Codable {
+    private var records: [Record] = [] { didSet { stateRevision += 1 } }
+    private struct Replay: Codable, Sendable {
         let id: String
         let kind: PhoneRequest.Kind
         let state: PhoneRequestResult.Status
         let expiresAt: Date
         let finishedAt: Date
     }
-    private struct History: Codable {
+    private struct History: Codable, Sendable {
         var pending: [Record]
         var replay: [Replay]
     }
-    private var replay: [Replay] = []
+    private var replay: [Replay] = [] { didSet { stateRevision += 1 } }
+    private var stateRevision = 0
+    private let storage = MobileLocalStorage()
+    private var loadTask: Task<History, Error>?
     private var loaded = false
     private var publishing = false
     private let connectivity = NWPathMonitor()
@@ -64,33 +67,40 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
         connectivity.start(queue: DispatchQueue(label: "phone-request-connectivity"))
     }
 
-    private func load() throws {
+    private func load() async throws {
         guard !loaded else { return }
-        if FileManager.default.fileExists(atPath: file.path) {
-            let data = try Data(contentsOf: file)
-            let decoder = JSONDecoder()
-            replay = []
-            if data.first(where: { ![9, 10, 13, 32].contains($0) }) == 91 {
-                // Migrate the original array, scrubbing previously sent payloads.
-                records = try decoder.decode([Record].self, from: data)
-                for record in records where record.sent {
-                    remember(record, state: record.result?.status ?? .completed)
+        let file = file
+        if loadTask == nil {
+            loadTask = Task.detached(priority: .utility) {
+                guard FileManager.default.fileExists(atPath: file.path) else { return History(pending: [], replay: []) }
+                let data = try Data(contentsOf: file)
+                let decoder = JSONDecoder()
+                guard data.first(where: { ![9, 10, 13, 32].contains($0) }) == 91 else {
+                    return try decoder.decode(History.self, from: data)
                 }
-                records.removeAll { $0.sent }
-            } else {
-                let history = try decoder.decode(History.self, from: data)
-                records = history.pending
-                replay = history.replay
+                let rows = try decoder.decode([Record].self, from: data)
+                let now = Date()
+                let replay = rows.filter { $0.sent && $0.request.expiresAt > now.addingTimeInterval(-86_400) }.map {
+                    Replay(id: $0.request.id, kind: $0.request.kind, state: $0.result?.status ?? .completed,
+                        expiresAt: $0.request.expiresAt, finishedAt: now)
+                }
+                let history = History(pending: rows.filter { !$0.sent }, replay: Array(replay.suffix(128)))
+                try JSONEncoder().encode(history).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                return history
             }
-            try save()
         }
-        loaded = true
+        guard let loadTask else { return }
+        do {
+            let history = try await loadTask.value
+            guard !loaded else { return }
+            records = history.pending; replay = history.replay
+            loaded = true
+            self.loadTask = nil
+        } catch { self.loadTask = nil; throw error }
     }
 
-    private func save() throws {
-        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder().encode(History(pending: records, replay: replay))
-            .write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    private func save() async throws {
+        try await storage.checkpoint(History(pending: records, replay: replay), to: file)
     }
 
     private func remember(_ record: Record, state: PhoneRequestResult.Status) {
@@ -124,14 +134,14 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
                 return true
             }
             validRequest = true
-            try load()
+            try await load()
             expireObsolete(pairing: pairing)
-            try save()
+            try await save()
             if replay.contains(where: { $0.id == request.id }) { return true }
             if !records.contains(where: { $0.request.id == request.id }) {
                 guard records.count < 128 else { throw DeviceSyncError.underlying(message: "Phone request history is full.") }
                 records.append(Record(request: request, pairing: pairing))
-                do { try save() } catch { records.removeLast(); throw error }
+                do { try await save() } catch { records.removeAll { $0.request.id == request.id }; throw error }
             }
             // Do not hold the shared CloudKit drain while waiting for a person.
             Task { await self.resume() }
@@ -147,21 +157,31 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
 
     func resume(retrying: Bool = false) async {
         do {
-            try load()
+            try await load()
             guard let pairing = AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else { return }
-            expireObsolete(pairing: pairing)
-            try save()
             let previous = records
+            let previousReplay = replay
+            expireObsolete(pairing: pairing)
+            var changed = previous.map(\.request.id) != records.map(\.request.id)
+                || previousReplay.map(\.id) != replay.map(\.id)
             for index in records.indices where records[index].result == nil {
                 let record = records[index]
                 if record.pairing != pairing || record.request.expiresAt <= Date() {
+                    changed = true
                     records[index].result = PhoneRequestResult(requestID: record.request.id, status: .expired)
                 } else if record.executing && active?.id != record.request.id {
+                    changed = true
                     records[index].result = PhoneRequestResult(requestID: record.request.id, status: .failed,
                         message: "The app closed while handling this request. It was not repeated.")
                 }
             }
-            do { try save() } catch { records = previous; throw error }
+            if changed {
+                let revision = stateRevision
+                do { try await save() } catch {
+                    if stateRevision == revision { records = previous; replay = previousReplay }
+                    throw error
+                }
+            }
             if let active, records.first(where: { $0.request.id == active.id })?.result != nil { clearActive() }
             if active == nil, UIApplication.shared.applicationState == .active,
                let record = records.first(where: { $0.result == nil && $0.pairing == pairing }) {
@@ -180,7 +200,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
     func syncDidSucceed() {
         // One bounded batch per recovery/success signal; our own sends must not
         // recursively trigger publication. No collection is repeated here.
-        guard !publishing, !recoveryQueued else { return }
+        guard !publishing, !recoveryQueued, !loaded || !records.isEmpty else { return }
         recoveryQueued = true
         Task {
             defer { self.recoveryQueued = false }
@@ -216,11 +236,11 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
                         self.records[index].attachments = []
                         self.records[index].result = PhoneRequestResult(requestID: id, status: result.status)
                         if retrying { self.records[index].recoveryAttempts = (self.records[index].recoveryAttempts ?? 0) + 1 }
-                        try self.save()
+                        try await self.save()
                     })
                 guard let index = records.firstIndex(where: { $0.request.id == id }) else { continue }
                 remember(records.remove(at: index), state: result.status)
-                try save()
+                try await save()
             } catch { errorMessage = "Phone result is waiting to sync: \(error.localizedDescription)" }
         }
     }
@@ -232,9 +252,12 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
         records[index].result = PhoneRequestResult(requestID: id, status: expired ? .expired : status,
             values: expired ? [:] : values, message: message)
         records[index].attachments = expired ? [] : attachments
-        do { try save() } catch {
-            records[index].result = nil
-            records[index].attachments = []
+        let revision = stateRevision
+        do { try await save() } catch {
+            if stateRevision == revision, let index = records.firstIndex(where: { $0.request.id == id }) {
+                records[index].result = nil
+                records[index].attachments = []
+            }
             errorMessage = "Could not save phone result: \(error.localizedDescription)"
             return
         }
@@ -253,22 +276,28 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
         active = nil
     }
 
-    func begin(_ request: PhoneRequest) -> Bool {
+    func begin(_ request: PhoneRequest) async -> Bool {
         guard active?.id == request.id, request.expiresAt > Date(),
               let index = records.firstIndex(where: { $0.request.id == request.id }),
               records[index].pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests),
               records[index].result == nil, !records[index].executing else { return false }
         records[index].executing = true
-        do { try save(); return true }
-        catch {
-            records[index].executing = false
+        let revision = stateRevision
+        do {
+            try await save()
+            return active?.id == request.id && request.expiresAt > Date()
+                && records.contains { $0.request.id == request.id && $0.result == nil && $0.executing }
+        } catch {
+            if stateRevision == revision, let index = records.firstIndex(where: { $0.request.id == request.id }) {
+                records[index].executing = false
+            }
             errorMessage = "Could not save phone request: \(error.localizedDescription)"
             return false
         }
     }
 
-    func locate(_ request: PhoneRequest) {
-        guard begin(request) else { return }
+    func locate(_ request: PhoneRequest) async {
+        guard await begin(request) else { return }
         locationRequestID = request.id
         let manager = CLLocationManager()
         locationManager = manager
@@ -309,7 +338,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
     }
 
     func picked(_ item: PhotosPickerItem, request: PhoneRequest) async {
-        guard begin(request) else { return }
+        guard await begin(request) else { return }
         do {
             guard let data = try await item.loadTransferable(type: Data.self) else {
                 throw DeviceSyncError.underlying(message: "The selected photo could not be read.")
@@ -319,7 +348,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
     }
 
     func openCamera(_ request: PhoneRequest) async -> Bool {
-        guard begin(request) else { return false }
+        guard await begin(request) else { return false }
         guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
             await complete(request.id, status: .failed, message: "This device has no available camera.")
             return false
@@ -407,7 +436,7 @@ struct PhoneRequestSheet: View {
             Text(request.kind == .currentLocation ? "Share your current location?"
                  : request.kind == .capturePhoto ? "Take a photo to share." : "Choose a photo to share.")
             if request.kind == .currentLocation {
-                Button("Share location") { working = true; coordinator.locate(request) }.disabled(working)
+                Button("Share location") { working = true; Task { await coordinator.locate(request) } }.disabled(working)
             } else if request.kind == .capturePhoto {
                 Button("Open camera") {
                     working = true

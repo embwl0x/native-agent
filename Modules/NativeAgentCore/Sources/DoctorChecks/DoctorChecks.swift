@@ -221,21 +221,17 @@ public protocol CreateMissingDoctorCheck: RepairingDoctorCheck {
 /// SwiftNative impl never throws (the actor catches everything and reflects
 /// it as `status: "fail"`).
 public protocol DoctorChecksProtocol: Sendable {
-    func runAll(repair: Bool) async throws -> [CheckResult]
+    func runAll() async throws -> [CheckResult]
     func runCheck(id: String, repair: Bool, scope: DoctorRepairScope) async throws -> CheckResult?
 }
 
 // MARK: - Errors
 
 public enum DoctorChecksError: Error, LocalizedError {
-    case invalidResponse(status: Int)
-    case unavailable(underlying: Error)
     case underlying(String)
 
     public var errorDescription: String? {
         switch self {
-        case .invalidResponse(let s): return "doctor HTTP returned status \(s)"
-        case .unavailable(let e): return "doctor unavailable: \(e.localizedDescription)"
         case .underlying(let m): return m
         }
     }
@@ -246,21 +242,12 @@ public enum DoctorChecksError: Error, LocalizedError {
 private enum DoctorJSONShape: Sendable {
     case object
     case array
-    case objectOrArray
 }
 
 private struct DoctorJSONStoreSpec: Sendable {
     let relativePath: String
-    let label: String
     let shape: DoctorJSONShape
     let defaultValue: JSONValue
-
-    init(_ relativePath: String, _ label: String, _ shape: DoctorJSONShape, _ defaultValue: JSONValue) {
-        self.relativePath = relativePath
-        self.label = label
-        self.shape = shape
-        self.defaultValue = defaultValue
-    }
 }
 
 public enum DoctorFileRepair {
@@ -284,11 +271,11 @@ public enum DoctorFileRepair {
         return backup
     }
 
-    static func writeJSON(_ value: JSONValue, to url: URL) async throws {
+    fileprivate static func writeJSON(_ value: JSONValue, to url: URL) async throws {
         try await SwiftNativePersistenceCore().writeJSON(value, to: url)
     }
 
-    static func createJSON(_ value: JSONValue, at url: URL) throws {
+    fileprivate static func createJSON(_ value: JSONValue, at url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         // Exclusive creation also protects files/symlinks appearing after the check.
         try value.serializedData(pretty: true).write(to: url, options: [.withoutOverwriting])
@@ -303,7 +290,6 @@ public enum DoctorFileRepair {
         switch (shape, value) {
         case (.object, .object): return true
         case (.array, .array): return true
-        case (.objectOrArray, .object), (.objectOrArray, .array): return true
         default: return false
         }
     }
@@ -333,8 +319,8 @@ let STORAGE_SUBDIRS: [String] = [
     "backups",
     "release",
     "connectors", "connectors/workspaces",
-    "skills", "skills/bodies",
-    "tools", "tools/proposals", "tools/active", "tools/quarantine", "tools/runtime", "tools/logs",
+    "abilities", "skills", "skills/runs",
+    "tools", "tools/runtime", "tools/logs",
     "capabilities",
     "routing",
     "workflows", "workflows/approvals", "workflows/run_state",
@@ -352,11 +338,7 @@ let STORAGE_SUBDIRS: [String] = [
     "native_power/notifications",
     "connectors/actions",
     "improvements/gauntlet",
-    "nextgen", "nextgen/actions", "nextgen/observability", "nextgen/eval_os",
-    "nextgen/proactive", "nextgen/mac_control", "nextgen/multimodal", "nextgen/simulation",
-    "nextgen/remote", "nextgen/sdk", "nextgen/learning", "nextgen/ops",
-    "nextgen/provider_router", "nextgen/eval_packs", "nextgen/promotion",
-    "nextgen/release_train", "nextgen/phase_93_112",
+    "nextgen", "nextgen/actions", "nextgen/remote",
     "production", "production/exports", "production/support", "production/migrations",
 ]
 
@@ -655,6 +637,27 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
     }
 }
 
+// MARK: - AbilityFilesCheck
+
+public struct AbilityFilesCheck: DoctorCheck {
+    public let id = "ability_files"
+    public let title = "Ability Files"
+    private let root: URL
+
+    public init(root: URL = defaultDataRoot()) { self.root = root }
+
+    public func run() async -> CheckResult {
+        do {
+            let files = try AbilityStore(dataRoot: root).files()
+            return CheckResult(id: id, title: title, status: "ok", detail: "\(files.count) ability files read successfully.")
+        } catch {
+            return CheckResult(id: id, title: title, status: "fail", detail: error.localizedDescription,
+                harm: "The affected ability cannot load. A failed migration leaves all original stores untouched.",
+                human_action: "Correct the named ability row or file, then read Doctor again. Doctor never resets ability files.")
+        }
+    }
+}
+
 // MARK: - RuntimeJSONStoresCheck
 
 /// Verifies the app-owned JSON files that route core runtime behavior.
@@ -663,16 +666,9 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
     public let id: String = "runtime_json_stores"
     public let title: String = "Runtime JSON Stores"
     private let root: URL
-    private let specs: [DoctorJSONStoreSpec]
 
     public init(root: URL = defaultDataRoot()) {
         self.root = root
-        self.specs = Self.defaultSpecs
-    }
-
-    private init(root: URL, specs: [DoctorJSONStoreSpec]) {
-        self.root = root
-        self.specs = specs
     }
 
     public func run(repair: Bool) async -> CheckResult {
@@ -690,7 +686,7 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
         var repaired: [String] = []
         var unrepaired: [String] = []
 
-        for spec in specs {
+        for spec in Self.specs {
             let path = root.appendingPathComponent(spec.relativePath)
             var isDir: ObjCBool = false
             let exists = FileManager.default.fileExists(atPath: path.path, isDirectory: &isDir)
@@ -764,7 +760,7 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
                 id: id,
                 title: title,
                 status: "ok",
-                detail: "Runtime JSON stores are valid after repair (\(specs.count) checked).",
+                detail: "Runtime JSON stores are valid after repair (\(Self.specs.count) checked).",
                 repair: repaired.joined(separator: "; ")
             )
         }
@@ -795,13 +791,13 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
             id: id,
             title: title,
             status: "ok",
-            detail: "Runtime JSON stores are valid (\(specs.count) checked)."
+            detail: "Runtime JSON stores are valid (\(Self.specs.count) checked)."
         )
     }
 
-    private static let defaultSpecs: [DoctorJSONStoreSpec] = [
-        .init("providers/active.json", "Active providers", .object, .object([:])),
-        .init("providers/surfaces.json", "Surface model picks", .object, .object([:])),
+    private static let specs: [DoctorJSONStoreSpec] = [
+        .init(relativePath: "providers/active.json", shape: .object, defaultValue: .object([:])),
+        .init(relativePath: "providers/surfaces.json", shape: .object, defaultValue: .object([:])),
         // `trust/policy.json` is DELIBERATELY ABSENT. Doctor's repair resets a
         // malformed store to its spec default, and the spec default for an
         // object store is `{}` — which TrustCenter's canonical read treats as a
@@ -812,20 +808,18 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
         // CLOSED on bytes it cannot read (`loadAuthorizationSnapshot` →
         // `failClosedTrustPolicy`), so the repair had nothing to add and one
         // way to raise the fence by itself.
-        .init("scheduler/jobs.json", "Scheduler jobs", .array, .array([])),
-        .init("mcp/servers.json", "MCP servers", .array, .array([])),
-        .init("mcp/cache/tools.json", "MCP tool cache", .object, .object([:])),
-        .init("mcp/cache/resources.json", "MCP resource cache", .object, .object([:])),
-        .init("mcp/sessions/state.json", "MCP session state", .object, .object([:])),
-        .init("mcp/consent/ledger.json", "MCP consent ledger", .array, .array([])),
-        .init("notifications/push_tokens.json", "Swift push tokens", .object, .object([:])),
-        .init("mobile_push/tokens.json", "Legacy mobile push tokens", .array, .array([])),
-        .init("connectors/registry.json", "Connector registry", .array, .array([])),
-        .init("connectors/workspaces.json", "Connector workspaces", .array, .array([])),
-        .init("tools/registry.json", "Tool registry", .array, .array([])),
-        .init("skills/registry.json", "Skill registry", .array, .array([])),
-        .init("catalog/registry.json", "Capability pack catalog", .array, .array([])),
-        .init("workflows/registry.json", "Workflow registry", .array, .array([])),
+        .init(relativePath: "scheduler/jobs.json", shape: .array, defaultValue: .array([])),
+        .init(relativePath: "mcp/servers.json", shape: .array, defaultValue: .array([])),
+        .init(relativePath: "mcp/cache/tools.json", shape: .object, defaultValue: .object([:])),
+        .init(relativePath: "mcp/cache/resources.json", shape: .object, defaultValue: .object([:])),
+        .init(relativePath: "mcp/sessions/state.json", shape: .object, defaultValue: .object([:])),
+        .init(relativePath: "mcp/consent/ledger.json", shape: .array, defaultValue: .array([])),
+        .init(relativePath: "notifications/push_tokens.json", shape: .object, defaultValue: .object([:])),
+        .init(relativePath: "mobile_push/tokens.json", shape: .array, defaultValue: .array([])),
+        .init(relativePath: "connectors/registry.json", shape: .array, defaultValue: .array([])),
+        .init(relativePath: "connectors/workspaces.json", shape: .array, defaultValue: .array([])),
+        .init(relativePath: "catalog/registry.json", shape: .array, defaultValue: .array([])),
+        .init(relativePath: "workflows/registry.json", shape: .array, defaultValue: .array([])),
     ]
 }
 
@@ -881,13 +875,6 @@ actor ChatMessagesScanCache {
     func retain(paths: Set<String>, under prefix: String) {
         entries = entries.filter { !$0.key.hasPrefix(prefix) || paths.contains($0.key) }
     }
-
-    /// Test seam: forget everything (a fresh-process equivalent).
-    func reset() {
-        entries.removeAll()
-    }
-
-    func count() -> Int { entries.count }
 }
 
 public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
@@ -895,9 +882,8 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
     public let title: String = "Chat Message Logs"
     private let root: URL
 
-    /// Process-wide memo. Injectable so a test can own an isolated one.
+    /// Process-wide fingerprint memo.
     static let sharedScanCache = ChatMessagesScanCache()
-    private let scanCache: ChatMessagesScanCache
 
     /// Memo key. Symlinks are resolved so the same file reached through
     /// `/var/...` and `/private/var/...` is one entry, and so directory-scoped
@@ -922,12 +908,6 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
 
     public init(root: URL = defaultDataRoot()) {
         self.root = root
-        self.scanCache = Self.sharedScanCache
-    }
-
-    init(root: URL, scanCache: ChatMessagesScanCache) {
-        self.root = root
-        self.scanCache = scanCache
     }
 
     public func run(repair: Bool) async -> CheckResult {
@@ -1008,7 +988,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
             scannedPaths.insert(cacheKey)
             let fingerprint = Self.fingerprint(file)
             if useCache,
-               let memo = await scanCache.lookup(path: cacheKey, stamp: fingerprint) {
+               let memo = await Self.sharedScanCache.lookup(path: cacheKey, stamp: fingerprint) {
                 totalLines += memo.totalLines
                 malformedLines += memo.malformedLines
                 if memo.unreadable || memo.malformedLines > 0 { malformedFiles.append(file) }
@@ -1017,7 +997,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else {
                 malformedFiles.append(file)
                 if useCache, let fingerprint {
-                    await scanCache.store(
+                    await Self.sharedScanCache.store(
                         path: cacheKey,
                         entry: .init(
                             stamp: fingerprint,
@@ -1039,7 +1019,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
             }
             totalLines += fileTotal
             if useCache, let fingerprint {
-                await scanCache.store(
+                await Self.sharedScanCache.store(
                     path: cacheKey,
                     entry: .init(
                         stamp: fingerprint,
@@ -1083,7 +1063,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
         }
 
         if useCache {
-            await scanCache.retain(
+            await Self.sharedScanCache.retain(
                 paths: scannedPaths, under: Self.cacheKey(dir) + "/"
             )
         }
@@ -1697,11 +1677,9 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
     public let id = "oauth_token_expiry"
     public let title = "OAuth Token Expiry"
     private let root: URL
-    private let now: Date?
 
-    public init(root: URL = defaultDataRoot(), now: Date? = nil) {
+    public init(root: URL = defaultDataRoot()) {
         self.root = root
-        self.now = now
     }
 
     private struct Credential {
@@ -1797,7 +1775,7 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
     public func run() async -> CheckResult { await run(repair: false) }
 
     public func run(repair: Bool) async -> CheckResult {
-        let now = self.now ?? Date()
+        let now = Date()
         var findings: [String] = []
         var asks: [String] = []
         var repaired: [String] = []
@@ -1892,6 +1870,7 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         return [
             StorageCheck(root: dataRoot),
             RuntimeJSONStoresCheck(root: dataRoot),
+            AbilityFilesCheck(root: dataRoot),
             RunLedgerIntegrityCheck(root: dataRoot),
             TurnTraceIntegrityCheck(root: dataRoot),
             ChatSessionsCheck(root: dataRoot),
@@ -1923,25 +1902,7 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         self.checks = checks
     }
 
-    public func runAll(repair: Bool) async throws -> [CheckResult] {
-        // Bulk repairs run the automatic scope sequentially; persona writes
-        // still require runCheck with explicit button scope.
-        // The repair:false path is read-only — every check only stats,
-        // reads and parses its own subtree — so the checks are independent and
-        // run concurrently. Results are re-sorted back into declaration order,
-        // so the emitted array (and therefore the rollup, the wire shape, and
-        // every consumer's index assumptions) is byte-identical to the
-        // sequential run.
-        if repair {
-            var results: [CheckResult] = []
-            results.reserveCapacity(checks.count)
-            for check in checks {
-                if let result = try await runCheck(id: check.id, repair: true, scope: .automatic) {
-                    results.append(result)
-                }
-            }
-            return results
-        }
+    public func runAll() async throws -> [CheckResult] {
         // gpt-5.5 wave-1 NEEDS_FIX: StorageCheck is NOT read-only even under
         // repair:false — it creates the root/subdirectory tree and writes a
         // probe file. Mutating checks run sequentially FIRST (so the tree
@@ -1960,9 +1921,6 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         let ordered = await withTaskGroup(of: (Int, CheckResult).self) { group in
             for (index, check) in concurrentChecks {
                 group.addTask {
-                    if let repairable = check as? any RepairingDoctorCheck {
-                        return (index, await repairable.run(repair: false))
-                    }
                     return (index, await check.run())
                 }
             }

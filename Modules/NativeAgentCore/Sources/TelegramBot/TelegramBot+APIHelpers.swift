@@ -19,6 +19,12 @@ func _tgBuildBotURL(
     var comps = URLComponents()
     comps.scheme = "https"
     comps.host = "api.telegram.org"
+    if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_TELEGRAM_LOOPBACK_API"],
+       let local = URLComponents(string: raw), ["127.0.0.1", "localhost"].contains(local.host ?? "") {
+        comps.scheme = local.scheme
+        comps.host = local.host
+        comps.port = local.port
+    }
     comps.percentEncodedPath = "/bot\(encodedToken)/\(method)"
     if !queryItems.isEmpty {
         comps.queryItems = queryItems

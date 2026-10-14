@@ -1,20 +1,30 @@
 import Foundation
+import PersistenceCore
 
-public func decodeTolerantDisplayString<K: CodingKey>(_ container: KeyedDecodingContainer<K>, _ key: K) -> String? {
-    if let value = try? container.decodeIfPresent(String.self, forKey: key) {
-        return value
+extension JSONValue {
+    public var nextGenDisplayString: String {
+        switch self {
+        case .string(let value):
+            return value
+        case .int(let value):
+            return String(value)
+        case .double(let value):
+            if let integer = Int(exactly: value) {
+                return String(integer)
+            }
+            return String(value)
+        case .bool(let value):
+            return value ? "true" : "false"
+        case .null:
+            return "null"
+        case .array(let values):
+            return values.map(\.nextGenDisplayString).joined(separator: ", ")
+        case .object(let object):
+            return object
+                .sorted { $0.key < $1.key }
+                .prefix(4)
+                .map { "\($0.key): \($0.value.nextGenDisplayString)" }
+                .joined(separator: ", ")
+        }
     }
-    if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
-        return String(value)
-    }
-    if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
-        return String(value)
-    }
-    if let value = try? container.decodeIfPresent(Bool.self, forKey: key) {
-        return value ? "true" : "false"
-    }
-    if let value = try? container.decodeIfPresent(NextGenJSONValue.self, forKey: key) {
-        return value.displayString
-    }
-    return nil
 }

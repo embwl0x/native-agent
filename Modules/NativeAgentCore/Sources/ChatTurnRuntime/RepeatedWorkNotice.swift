@@ -36,6 +36,9 @@ extension SwiftNativeTurnEngine {
         } else if ["workshop", "swarms"].contains(folded) {
             (folded, folded == "workshop" ? "Workshop" : "A swarm worker")
         } else { ("her", nil) }
+        // A turn another agent authored (Claude's drives, any peer's ask on a
+        // trusted bridge) is that agent's habit, not hers (User 10-12).
+        if agent.key == "her", ChatPersistenceContext.originPrincipal.hasPrefix("agent:") { return }
         let turn = TurnTraceContext.turnId ?? UUID().uuidString
         Task.detached(priority: .utility) {
             let lines = SkillPatterns.observe(turn: turn, agent: agent.key, name: agent.name, calls: calls, root: root, session: sessionId)
@@ -45,9 +48,9 @@ extension SwiftNativeTurnEngine {
             for line in lines {
                 let peers = line.skill.flatMap { InstalledSkillInventory.match($0, in: skills) }.map { SkillScript.voices($0.row) } ?? []
                 do {
-                    let source = line.examples.isEmpty ? nil : "Repeated work: \(line.words) Examples: \(line.examples.joined(separator: ", ")). Read those examples before deciding whether to make or change a skill."
+                    let source = line.examples.isEmpty ? nil : "Repeated work: \(line.words) Examples: \(line.examples.joined(separator: ", ")). Read those examples before authoring or revising run(input), then save, validate and enable the exact routine."
                     let queued = try await MyQueue.add(DeskStep(words: line.words, when: MyQueue.When.quiet.stored,
-                                                              source: source, peers: peers, session: sessionId),
+                                                              source: source, peers: peers, session: sessionId, origin: "self"),
                                                        store: store)
                     // A line filed as a peer's (or matching one a peer filed) is not hers, so not linked.
                     SkillPatterns.queued(line, item: queued.entry.peerBorn ? nil : queued.entry.item.handle, root: root)

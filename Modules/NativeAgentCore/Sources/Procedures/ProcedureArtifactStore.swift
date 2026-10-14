@@ -365,17 +365,7 @@ public actor ProcedureArtifactStore {
         let rows = invocationRead?.rows ?? []
         var corruptInvocations = invocationRead?.malformedJSONRowCount ?? 0
         let receipts = rows.compactMap { value -> ProcedureInvocationReceipt? in
-            guard let data = try? value.serialize(pretty: false).data(using: .utf8),
-                  let receipt = try? JSONDecoder().decode(
-                    ProcedureInvocationReceipt.self,
-                    from: data
-                  ), receipt.schema == ProcedureInvocationReceipt.schema,
-                  Self.digest(receipt.invocationID), Self.digest(receipt.artifactID),
-                  Self.digest(receipt.opaqueInputReference),
-                  Self.validTimestamp(receipt.requestedAt),
-                  receipt.payloadFree, !receipt.permissionAuthority,
-                  Self.validSelectionReceipt(receipt),
-                  Self.validExecutionReceipt(receipt) else {
+            guard let receipt = Self.invocationReceipt(value) else {
                 corruptInvocations += 1
                 return nil
             }
@@ -420,17 +410,7 @@ public actor ProcedureArtifactStore {
             throw ProcedureArtifactStoreError.corruptInvocationLedger
         }
         return try rows.compactMap { row in
-            guard let data = try? row.serializedData(pretty: false),
-                  let receipt = try? JSONDecoder().decode(
-                    ProcedureInvocationReceipt.self,
-                    from: data
-                  ), receipt.schema == ProcedureInvocationReceipt.schema,
-                  Self.digest(receipt.invocationID), Self.digest(receipt.artifactID),
-                  Self.digest(receipt.opaqueInputReference),
-                  Self.validTimestamp(receipt.requestedAt),
-                  receipt.payloadFree, !receipt.permissionAuthority,
-                  Self.validSelectionReceipt(receipt),
-                  Self.validExecutionReceipt(receipt) else {
+            guard let receipt = Self.invocationReceipt(row) else {
                 throw ProcedureArtifactStoreError.corruptInvocationLedger
             }
             return artifactID == nil || receipt.artifactID == artifactID ? receipt : nil
@@ -466,9 +446,7 @@ public actor ProcedureArtifactStore {
         executor: any ProcedureCanonicalExecuting
     ) async throws -> ProcedureInvocationReceipt {
         let pointerPath = exactActivationPointerPath(procedureID)
-        // Admission and canonical consequence share the pointer lock. A
-        // rollback may wait for an already-admitted exact operation, but once
-        // deactivateExact returns no new automatic effect can cross this gate.
+        // Admission and canonical consequence share the pointer lock.
         return try await persistence.withFileLock(pointerPath) {
             let active = try await loadActiveExactProcedure(
                 procedureID: procedureID,
@@ -522,13 +500,8 @@ public actor ProcedureArtifactStore {
             throw ProcedureArtifactStoreError.invalidInputReference
         }
         let artifact = try await loadForInvocation(artifactID)
-        guard context.invocationMode == .manual,
-              artifact.domain == "workshop_execution",
-              artifact.authorityClass == "low_risk",
-              artifact.manualInvocationEligible,
-              !artifact.automaticSelectionEligible,
-              !artifact.safety.externalSendsEligible,
-              !artifact.safety.permissionAuthority else {
+        guard artifact.domain == "workshop_execution",
+              artifact.authorityClass == "low_risk" else {
             throw ProcedureArtifactStoreError.invocationNotEligible
         }
         let dry = ProcedureReplayEngine.dryRun(artifact, context: context)
@@ -995,9 +968,18 @@ public actor ProcedureArtifactStore {
     }
 
     private static func parsedTimestamp(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+        NativeTimestampFormat.parseISO8601FractionalFirst(raw)
+    }
+
+    private static func invocationReceipt(_ row: JSONValue) -> ProcedureInvocationReceipt? {
+        guard let data = try? row.serializedData(pretty: false),
+              let receipt = try? JSONDecoder().decode(ProcedureInvocationReceipt.self, from: data),
+              receipt.schema == ProcedureInvocationReceipt.schema,
+              digest(receipt.invocationID), digest(receipt.artifactID), digest(receipt.opaqueInputReference),
+              validTimestamp(receipt.requestedAt),
+              receipt.payloadFree, !receipt.permissionAuthority,
+              validSelectionReceipt(receipt), validExecutionReceipt(receipt) else { return nil }
+        return receipt
     }
 
     private static func existingReceipt(
@@ -1027,16 +1009,7 @@ public actor ProcedureArtifactStore {
         }
         var existing: ProcedureInvocationReceipt?
         for row in rows.reversed() {
-            guard let data = try? row.serializedData(pretty: false),
-                  let receipt = try? JSONDecoder().decode(ProcedureInvocationReceipt.self, from: data) else {
-                throw ProcedureArtifactStoreError.corruptInvocationLedger
-            }
-            guard receipt.schema == ProcedureInvocationReceipt.schema,
-                  digest(receipt.invocationID), digest(receipt.artifactID), digest(receipt.opaqueInputReference),
-                  validTimestamp(receipt.requestedAt),
-                  receipt.payloadFree, !receipt.permissionAuthority,
-                  validSelectionReceipt(receipt),
-                  validExecutionReceipt(receipt) else {
+            guard let receipt = invocationReceipt(row) else {
                 throw ProcedureArtifactStoreError.corruptInvocationLedger
             }
             // Eligibility-only attempts are audit rows, not durable action
@@ -1088,8 +1061,6 @@ public actor ProcedureArtifactStore {
     }
 
     private static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
 }

@@ -1,3 +1,4 @@
+import EngineRuntime
 import SelfImprovement
 import Foundation
 import Observation
@@ -90,7 +91,7 @@ extension AppModel {
             return outcome
         }
         do {
-            let run = try await makeResearchClient(dataRoot: engine.dataRoot).runResearchLab(objective: trimmed, maxResults: 5)
+            let run = try await SwiftNativeResearchClient(dataRoot: engine.dataRoot).runResearchLab(objective: trimmed, maxResults: 5)
             engine.desk.researchRuns.removeAll { $0.id == run.id }
             engine.desk.researchRuns.insert(run, at: 0)
             let outcome = ResearchLabActionOutcome.recorded(run)
@@ -235,27 +236,16 @@ extension AppModel {
         defer { isRunningNextGenAction = false }
 
         do {
-            let result = try await nextGenActionResponse(id: id, dryRun: dryRun)
-            latestNextGenReceipt = result.displayReceipt
-            // U5 W-A item 1 (:2944): the post-action refresh fell back
-            // stale-then-empty via bare `try?` — a failed refresh rendered
-            // as healthy receipts with no signal. decodeLogged keeps the
-            // stale fallback but records the real error.
-            let root = engine.dataRoot
-            nextGenSummary = await decodeLogged("getNextGenSummary") {
-                try await NextGenStatusProjection(dataRoot: root).getNextGenSummary()
-            } ?? nextGenSummary
-            nextGenPhases = await decodeLogged(
-                "getNextGenPhases", default: nextGenSummary?.phases ?? nextGenPhases
-            ) {
-                try await NextGenStatusProjection(dataRoot: root).getNextGenPhases()
+            let receipt = try await nextGenActionReceipt(id: id, dryRun: dryRun)
+            latestNextGenReceipt = receipt
+            nextGenReceipts = NextGenStatusProjection.merging([receipt], into: nextGenReceipts)
+            if let snapshot = await decodeLogged("nextgen snapshot", {
+                try await NextGenStatusProjection(dataRoot: engine.dataRoot).snapshot()
+            }) {
+                nextGenSummary = snapshot.summary
+                nextGenPhases = snapshot.phases
+                nextGenReceipts = NextGenStatusProjection.merging([receipt] + snapshot.receipts, into: nextGenReceipts)
             }
-            let refreshedReceipts = await decodeLogged(
-                "getNextGenReceipts", default: nextGenSummary?.displayReceipts ?? []
-            ) {
-                try await NextGenStatusProjection(dataRoot: root).getNextGenReceipts()
-            }
-            mergeNextGenReceipts([result.displayReceipt] + refreshedReceipts)
             let label = dryRun ? "Next-gen dry run" : "Next-gen action"
             statusText = "\(label): \(latestNextGenReceipt?.displayStatus ?? "recorded")"
             return true
@@ -271,10 +261,6 @@ extension AppModel {
         await runNextGenAction(id: action.id, dryRun: dryRun)
     }
 
-    private func mergeNextGenReceipts(_ receipts: [NextGenReceipt]) {
-        var seen = Set<String>()
-        nextGenReceipts = (receipts + nextGenReceipts).filter { seen.insert($0.id).inserted }
-    }
 
     @MainActor
     func runBrowserDryRun(url: String = "https://example.com") async {
@@ -312,7 +298,7 @@ extension AppModel {
         do {
             latestConnectorActionReceipt = try await ConnectorActions(platform: AppConnectorActionPlatform(dataRoot: engine.dataRoot))
                 .runConnectorAction(id: action.id, dryRun: true)
-            connectorActionRegistry = try? await ConnectorActionRegistry.read(dataRoot: engine.dataRoot)
+            connectorActionRegistry = try? await ConnectorActionRegistry.read(dataRoot: engine.dataRoot, platform: AppConnectorStatusPlatform())
             statusText = "Connector action: \(latestConnectorActionReceipt?.status ?? "recorded")"
         } catch {
             setFailureStatus(error, action: "run that connector action")
@@ -336,13 +322,7 @@ extension AppModel {
         isInstallingDemoCapabilityPack = true
         defer { isInstallingDemoCapabilityPack = false }
         do {
-            let receipt = try await CapabilityPackInstall.installDemo(dataRoot: engine.dataRoot)
-            let signature = receipt.signature?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard receipt.status == "installed", !signature.isEmpty else {
-                throw NSError(domain: "NativeAgent.CapabilityPack", code: -422, userInfo: [
-                    NSLocalizedDescriptionKey: "Capability pack did not return a verified installed receipt."
-                ])
-            }
+            let receipt = try await NativeSkillRegistryActions.installDemoCapabilityPack(dataRoot: engine.dataRoot)
             disabledFeature = nil
             let name = receipt.name ?? receipt.packId
             capabilityCatalogInstallOutcome = .installed(name: name)
@@ -374,30 +354,23 @@ extension AppModel {
     @MainActor
     func createProductionExport(support: Bool = false) async -> ProductionExportCreationOutcome {
         let label = support ? "Support bundle" : "Export"
+        let root = engine.dataRoot
         do {
             let export = support
-                ? try await ProductionExport.createSupportBundle(dataRoot: engine.dataRoot)
-                : try await ProductionExport.createArchive(dataRoot: engine.dataRoot)
-            let attributes = try FileManager.default.attributesOfItem(atPath: export.path)
-            let actualBytes = (attributes[.size] as? NSNumber)?.intValue ?? 0
-            guard actualBytes > 0 else {
-                let detail = "the archive was empty after it was created"
+                ? try await ProductionExport.createSupportBundle(
+                    dataRoot: root, host: .app, runProcess: SystemProcessAdapter.runBounded,
+                    diagnostics: { @Sendable in try await SupportDiagnostics.read(reusingChecks: nil) },
+                    health: { @Sendable in DoctorFacade(dataRoot: root).readHealth() }
+                )
+                : try await ProductionExport.createArchive(
+                    dataRoot: root, host: .app, runProcess: SystemProcessAdapter.runBounded
+                ) { @Sendable in try await DoctorStatusProjection.getProductionHardening(dataRoot: root) }
+            let verification = try await export.verifyRegistry(dataRoot: root)
+            if let detail = verification.failure {
                 statusText = "\(label) failed verification: \(detail)"
                 return .failed(support: support, detail: detail)
             }
-            guard export.sizeBytes == actualBytes else {
-                let detail = "the archive size did not match its creation receipt"
-                statusText = "\(label) failed verification: \(detail)"
-                return .failed(support: support, detail: detail)
-            }
-
-            let persisted = try await ProductionExport.list(dataRoot: engine.dataRoot)
-            guard persisted.contains(where: { $0.id == export.id && $0.path == export.path && $0.sizeBytes == actualBytes }) else {
-                let detail = "the export registry did not confirm the created archive"
-                statusText = "\(label) failed verification: \(detail)"
-                return .failed(support: support, detail: detail)
-            }
-            productionExports = persisted
+            productionExports = verification.records
             statusText = "\(label) created and verified: \(export.id)"
             return .verified(export)
         } catch {
@@ -407,12 +380,5 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func runHarnessBenchmark() async {
-        let result = await HarnessBenchmarkRun.run(dataRoot: engine.dataRoot)
-        let passed = result.checks?.filter { $0.passed == true }.count ?? 0
-        let total = result.checks?.count ?? 0
-        statusText = "Harness benchmark \(result.status ?? "completed"): \(passed)/\(total) checks"
-    }
 
 }

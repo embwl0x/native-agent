@@ -10,6 +10,7 @@ import Foundation
 import os
 import MemoryV2
 import NativeAgentCore
+import PersistenceCore
 
 extension NativeCognitionRuntime {
     // MARK: - B1 dream residue
@@ -17,11 +18,11 @@ extension NativeCognitionRuntime {
     /// The newest diary's residue: up to five of its own theme lines, chosen
     /// and embedded with the local memory embedder. A CACHE, not memory: the
     /// next diary replaces it, and nothing reads it as something that happened.
-    struct DreamThemeFile: Codable, Equatable {
+    struct DreamThemeFile: Codable, Equatable, Sendable {
         var diary: String
         var stamp: Double
         var phrases: [Phrase]
-        struct Phrase: Codable, Equatable {
+        struct Phrase: Codable, Equatable, Sendable {
             var id: String
             var text: String
             var vector: [Float]
@@ -74,6 +75,9 @@ extension NativeCognitionRuntime {
 
     /// One message vector, kept: the same turn recompiled asks again.
     private static let lastMessageVector = OSAllocatedUnfairLock<(String, [Float])?>(initialState: nil)
+    private static let lastDreamTheme = OSAllocatedUnfairLock<(
+        url: URL, stamp: SnapshotTailOpLog.FileStamp, file: DreamThemeFile
+    )?>(initialState: nil)
 
     nonisolated static func messageVector(
         _ message: String,
@@ -105,9 +109,20 @@ extension NativeCognitionRuntime {
 
     /// The cached themes, when they were extracted from exactly this diary.
     nonisolated static func cachedDreamTheme(dataRoot: URL, diary: LivingDiary) -> DreamThemeFile? {
-        guard let data = try? Data(contentsOf: dreamThemeURL(dataRoot)),
+        let url = dreamThemeURL(dataRoot).standardizedFileURL
+        guard let stamp = SnapshotTailOpLog.fileStamp(url), case .present = stamp else {
+            lastDreamTheme.withLock { $0 = nil }
+            return nil
+        }
+        if let hit = lastDreamTheme.withLock({ $0 }), hit.url == url, hit.stamp == stamp,
+           hit.file.diary == diary.name, hit.file.stamp == diary.written.timeIntervalSince1970 {
+            return hit.file
+        }
+        guard let data = try? Data(contentsOf: url),
               let cached = try? JSONDecoder().decode(DreamThemeFile.self, from: data),
-              cached.diary == diary.name, cached.stamp == diary.written.timeIntervalSince1970 else { return nil }
+              cached.diary == diary.name, cached.stamp == diary.written.timeIntervalSince1970,
+              SnapshotTailOpLog.fileStamp(url) == stamp else { return nil }
+        lastDreamTheme.withLock { $0 = (url, stamp, cached) }
         return cached
     }
 
@@ -184,12 +199,14 @@ extension NativeCognitionRuntime {
         worklogURL: URL? = nil,
         codexURL: URL? = nil
     ) async -> [String] {
+        async let memoryRecords = try? SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).listMemory(kind: "moment")
+        async let deskState = try? SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
         var items: [String] = []
         let inGap: (Date?) -> Bool = { date in date.map { $0 > from && $0 <= to } ?? false }
 
         // A moment she kept from while he was away (her peer threads, mostly),
         // through the same disclosure rule recall applies on this surface.
-        if let records = try? await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).listMemory(kind: "moment") {
+        if let records = await memoryRecords {
             let kept = records.filter { record in
                 (record.status ?? "active") == "active"
                     && inGap(MemoryMoments.parseTimestamp(record.observedAt ?? record.createdAt))
@@ -202,7 +219,7 @@ extension NativeCognitionRuntime {
 
         // A Desk outcome: an item finished in the gap that has a real title
         // (not a machine step like "A step from peer:…").
-        if let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() {
+        if let state = await deskState {
             let done = state.items
                 .filter {
                     $0.status == .done && inGap($0.closedAt.flatMap(DeskClock.parseISO)) && isRealTitle($0.title)

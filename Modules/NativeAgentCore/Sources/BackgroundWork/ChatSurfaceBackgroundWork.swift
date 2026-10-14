@@ -72,7 +72,8 @@ public enum ChatSurfaceBackgroundWork {
                 destinationId: String(chatId),
                 // The topic a tool-driven send or an approval prompt must
                 // answer in. Nil keeps the historical whole-chat route.
-                threadId: destination.threadId.map(String.init)
+                threadId: destination.threadId.map(String.init),
+                requesterUserId: context.fromUserId.map(String.init)
             )
             // Downloaded Telegram files use the same attachment types as Mac
             // chat, so document ingestion and its Trust policy stay in Core.

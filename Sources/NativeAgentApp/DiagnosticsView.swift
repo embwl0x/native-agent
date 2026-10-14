@@ -1,3 +1,4 @@
+import DoctorChecks
 // Move-only extraction (tightness Wave C) from SidebarFlattenViews.swift
 
 import SwiftUI

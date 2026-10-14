@@ -46,14 +46,11 @@ public enum ContextArenaEntryError: Error, Equatable, Sendable {
     case emptySourceFingerprint
     case negativeGeneration
     case negativeRetentionPriority
-    case negativeLastAccessOrdinal
-    case negativeCacheOverhead
     case logicalByteOverflow
 }
 
 /// A store-independent resident value. The fixed overhead and every payload
-/// component are accounted deterministically; callers may add measured cache
-/// overhead for indexes or object graphs represented by this entry.
+/// component are accounted deterministically.
 public struct ContextArenaEntry: Sendable, Equatable {
     public let key: ContextArenaEntryKey
     public let tier: ContextArenaTier
@@ -61,10 +58,7 @@ public struct ContextArenaEntry: Sendable, Equatable {
     public let summary: String?
     public let metadata: Data
     public let vector: [Float]
-    public let indexBytes: Data
     public let retentionPriority: Int
-    public let lastAccessOrdinal: Int64
-    public let cacheOverheadByteCount: Int
     public let logicalByteCount: Int
 
     public init(
@@ -74,10 +68,7 @@ public struct ContextArenaEntry: Sendable, Equatable {
         summary: String? = nil,
         metadata: Data = Data(),
         vector: [Float] = [],
-        indexBytes: Data = Data(),
-        retentionPriority: Int = 0,
-        lastAccessOrdinal: Int64 = 0,
-        cacheOverheadByteCount: Int = 0
+        retentionPriority: Int = 0
     ) throws {
         guard !key.namespace.isEmpty else { throw ContextArenaEntryError.emptyNamespace }
         guard !key.id.isEmpty else { throw ContextArenaEntryError.emptyID }
@@ -87,12 +78,6 @@ public struct ContextArenaEntry: Sendable, Equatable {
         guard key.generationID >= 0 else { throw ContextArenaEntryError.negativeGeneration }
         guard retentionPriority >= 0 else {
             throw ContextArenaEntryError.negativeRetentionPriority
-        }
-        guard lastAccessOrdinal >= 0 else {
-            throw ContextArenaEntryError.negativeLastAccessOrdinal
-        }
-        guard cacheOverheadByteCount >= 0 else {
-            throw ContextArenaEntryError.negativeCacheOverhead
         }
 
         let vectorBytes = vector.count.multipliedReportingOverflow(by: MemoryLayout<Float>.stride)
@@ -106,8 +91,6 @@ public struct ContextArenaEntry: Sendable, Equatable {
             summary?.utf8.count ?? 0,
             metadata.count,
             vectorBytes.partialValue,
-            indexBytes.count,
-            cacheOverheadByteCount,
         ]
         var total = 0
         for component in components {
@@ -122,10 +105,7 @@ public struct ContextArenaEntry: Sendable, Equatable {
         self.summary = summary
         self.metadata = metadata
         self.vector = vector
-        self.indexBytes = indexBytes
         self.retentionPriority = retentionPriority
-        self.lastAccessOrdinal = lastAccessOrdinal
-        self.cacheOverheadByteCount = cacheOverheadByteCount
         self.logicalByteCount = total
     }
 }
@@ -149,7 +129,6 @@ public struct ContextGenerationSnapshot: Sendable, Equatable {
     public let warmEntries: [ContextArenaEntry]
     public let selectionIndex: [ContextAtomID: ContextSelectionIndexEntry]
     public let hotLogicalByteCount: Int
-    public let warmLogicalByteCount: Int
     public let logicalByteCount: Int
 
     public init(
@@ -215,12 +194,7 @@ public struct ContextGenerationSnapshot: Sendable, Equatable {
         self.warmEntries = sortedWarm
         self.selectionIndex = selectionIndex
         self.hotLogicalByteCount = hotBytes
-        self.warmLogicalByteCount = warmBytes
         self.logicalByteCount = totalBytes
-    }
-
-    public func entry(for key: ContextArenaEntryKey) -> ContextArenaEntry? {
-        hotEntries.first { $0.key == key } ?? warmEntries.first { $0.key == key }
     }
 
     fileprivate func retainingWarmEntries(_ retained: [ContextArenaEntry]) throws -> Self {
@@ -254,7 +228,6 @@ public enum ContextArenaPublicationFailure: Error, Equatable, Sendable {
     case prewarmingDisabled(ContextArenaPressure)
     case logicalBudgetExceeded(actual: Int, limit: Int)
     case hotTierLimitExceeded(actual: Int, limit: Int)
-    case buildFailed(String)
 }
 
 public enum ContextArenaPublicationOutcome: Equatable, Sendable {
@@ -278,11 +251,8 @@ public struct ContextArenaTrimReceipt: Sendable, Equatable {
     public let pressure: ContextArenaPressure
     public let beforeLogicalBytes: Int
     public let afterLogicalBytes: Int
-    public let beforeEntryCount: Int
-    public let afterEntryCount: Int
     public let evictedWarmEntryKeys: [ContextArenaEntryKey]
     public let pinnedGenerations: [Int64: Int]
-    public let targetLogicalBytes: Int
 }
 
 public struct ContextArenaMetrics: Sendable, Equatable {
@@ -290,7 +260,6 @@ public struct ContextArenaMetrics: Sendable, Equatable {
     public let hotTierByteLimit: Int
     public let currentGenerationID: Int64?
     public let currentLogicalBytes: Int
-    public let retainedLeaseLogicalBytes: Int
     public let residentLogicalBytes: Int
     public let activeLeaseCount: Int
     public let pinnedGenerations: [Int64: Int]
@@ -313,12 +282,6 @@ public final class ContextGenerationLease: @unchecked Sendable {
     ) {
         self.snapshot = snapshot
         self.releaseHandler = releaseHandler
-    }
-
-    public var isReleased: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return released
     }
 
     public func release() {
@@ -384,26 +347,6 @@ public final class ContextArena: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return state.current?.snapshot
-    }
-
-    /// Builds before entering the publication lock. Any failure retains the
-    /// current snapshot and is surfaced as a last-good outcome.
-    @discardableResult
-    public func attemptPublication(
-        _ build: () throws -> ContextGenerationSnapshot
-    ) -> ContextArenaPublicationOutcome {
-        let candidate: ContextGenerationSnapshot
-        do {
-            candidate = try build()
-        } catch {
-            lock.lock()
-            defer { lock.unlock() }
-            return .retainedLastGood(
-                failure: .buildFailed(String(reflecting: error)),
-                generationID: state.current?.snapshot.generationID
-            )
-        }
-        return publish(candidate)
     }
 
     @discardableResult
@@ -521,15 +464,13 @@ public final class ContextArena: @unchecked Sendable {
         state.pressure = pressure
         state.prewarmingAllowed = pressure == .normal
         let before = current.snapshot
-        let target: Int
         let retainedWarm: [ContextArenaEntry]
 
         switch pressure {
         case .normal:
-            target = budget.byteLimit
             retainedWarm = before.warmEntries
         case .warning:
-            target = budget.byteLimit / 2
+            let target = budget.byteLimit / 2
             var projectedBytes = before.logicalByteCount
             var retainedKeys = Set(before.warmEntries.map(\.key))
             let evictionOrder = before.warmEntries.sorted(by: Self.shouldEvictBefore)
@@ -539,7 +480,6 @@ public final class ContextArena: @unchecked Sendable {
             }
             retainedWarm = before.warmEntries.filter { retainedKeys.contains($0.key) }
         case .critical:
-            target = before.hotLogicalByteCount
             retainedWarm = []
         }
 
@@ -559,11 +499,8 @@ public final class ContextArena: @unchecked Sendable {
             pressure: pressure,
             beforeLogicalBytes: before.logicalByteCount,
             afterLogicalBytes: after.logicalByteCount,
-            beforeEntryCount: before.hotEntries.count + before.warmEntries.count,
-            afterEntryCount: after.hotEntries.count + after.warmEntries.count,
             evictedWarmEntryKeys: evicted,
-            pinnedGenerations: pinnedGenerationsLocked(),
-            targetLogicalBytes: target
+            pinnedGenerations: pinnedGenerationsLocked()
         )
     }
 
@@ -582,7 +519,6 @@ public final class ContextArena: @unchecked Sendable {
             hotTierByteLimit: hotTierByteLimit,
             currentGenerationID: state.current?.snapshot.generationID,
             currentLogicalBytes: currentBytes,
-            retainedLeaseLogicalBytes: retainedBytes,
             residentLogicalBytes: currentBytes + retainedBytes,
             activeLeaseCount: state.activeSnapshots.values.reduce(into: 0) {
                 $0 += $1.leaseCount
@@ -638,9 +574,6 @@ public final class ContextArena: @unchecked Sendable {
     private static func shouldEvictBefore(_ lhs: ContextArenaEntry, _ rhs: ContextArenaEntry) -> Bool {
         if lhs.retentionPriority != rhs.retentionPriority {
             return lhs.retentionPriority < rhs.retentionPriority
-        }
-        if lhs.lastAccessOrdinal != rhs.lastAccessOrdinal {
-            return lhs.lastAccessOrdinal < rhs.lastAccessOrdinal
         }
         return lhs.key < rhs.key
     }

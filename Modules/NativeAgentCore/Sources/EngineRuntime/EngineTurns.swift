@@ -6,6 +6,9 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
+import WorkshopExecution
+import TrustCenter
+import Dispatcher
 
 /// `NativeAgentEngine.turns` (S10): the Mac's running chat turns for one data
 /// root — which sessions are thinking, streaming and replying, each session's
@@ -175,6 +178,12 @@ public final class TurnsFacade {
         busySessions.union(streamingSessions).filter { !isReplyTextSettled($0) }
     }
 
+    public func isThinkingBeforeReply(for sessionId: String) -> Bool {
+        guard isBusy(sessionId) || isStreaming(sessionId) else { return false }
+        guard let lifecycle = lifecycle(for: sessionId) else { return true }
+        return !lifecycle.presentation.isTerminal && lifecycle.presentation.streamedTextLength == 0
+    }
+
     /// True if any session anywhere is streaming.
     public var anyStreaming: Bool { !streamingSessions.isEmpty }
 
@@ -200,18 +209,6 @@ public final class TurnsFacade {
             .trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty
         else { return nil }
         return reason
-    }
-
-    /// The live-task-backed running set used by pinned conversation tabs.
-    /// `streamingSessions` is intentionally a broad runtime marker while a
-    /// producer unwinds, migrates a placeholder, or processes Stop. A tab's
-    /// green dot is a narrower claim: this exact session still has an
-    /// in-flight chat task. Intersecting the two owners prevents a stale
-    /// marker from becoming permanent "running" chrome.
-    public var runningTabSessionIDs: Set<String> {
-        Set(Set(tasks.keys).intersection(streamingSessions).filter {
-            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isReplyTextSettled($0)
-        })
     }
 
     /// Task-backed turns remain live regardless of age. Only orphaned runtime
@@ -273,5 +270,67 @@ public final class TurnsFacade {
     /// on it, and a turn another door started has none of those here.
     public nonisolated func inFlightTurns() -> [ChatCancelFlag.InFlightTurn] {
         ChatCancelFlag.inFlightTurns(dataRoot: dataRoot)
+    }
+}
+
+
+struct EngineWorkshopSessionEffects: WorkshopSessionEffects {
+    func makeToolDispatcher(dataRoot: URL) -> any ToolDispatchClient {
+        SwiftToolDispatcher(
+            dataRoot: dataRoot,
+            allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot(),
+            agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+        )
+    }
+
+    /// The production turn: one ephemeral, read-only tool turn on the
+    /// "workshop" surface (P2-3; "missions" on 0.3.x installs).
+    /// surface. No chat session state, no transcript, her pinned model resolves
+    /// from the surface picker. The membrane governs writes.
+    func productionTurnExecutor(
+        dataRoot: URL
+    ) -> @Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String) {
+        return { request, tools in
+            let client = NativeAgentEngine.live.chatClient(tools: tools)
+            let response = try await LLMCallContext.$purpose.withValue("workshop") {
+            try await client.runEphemeralToolTurn(
+                message: request.promptSeed,
+                fileAccess: "read_only",
+                autonomyResolver: WorkshopAutonomyResolver(
+                    base: SwiftNativeTrustCenter(dataRoot: dataRoot)
+                ),
+                requireCompleted: true,
+                surface: WorkshopSurfaceVocabulary.canonical
+            )
+            }
+            return (response.model, response.output)
+        }
+    }
+}
+
+extension NativeAgentEngine {
+    @MainActor
+    public func compactSession(
+        sessionId: String, model: String? = nil, providerID: String? = nil,
+        force: Bool = false, client: SwiftNativeChatOrchestrationClient
+    ) async throws -> ChatSessionCompactionOutcome {
+        let trimmedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedModel = trimmedModel.flatMap { $0.isEmpty ? nil : $0 }
+        let routedModel = await providers.routing.modelStringForSurface("compaction")
+        let outcome = try await client.compactSession(
+            sessionId: sessionId, model: resolvedModel ?? routedModel ?? "",
+            surface: "compaction", runId: nil, providerID: providerID, force: force)
+        if outcome.compacted {
+            NotificationCenter.default.post(name: .chatTurnCompleted, object: outcome.sessionId)
+        }
+        return outcome
+    }
+
+    public nonisolated func dispatchToolData(tool: String, inputData: Data, sessionId: String?) async throws -> DispatchResult {
+        guard case .object(let input)? = try? JSONValue.parse(inputData) else {
+            throw NSError(domain: "NativeAgent", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Could not deserialize inputData"])
+        }
+        return try await dispatchSlashCommand(tool: tool, input: input, sessionId: sessionId, dataRoot: dataRoot)
     }
 }

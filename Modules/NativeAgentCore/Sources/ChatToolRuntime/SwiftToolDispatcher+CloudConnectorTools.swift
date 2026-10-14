@@ -16,14 +16,16 @@ extension SwiftToolDispatcher {
                 url: URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/profile")!
             )
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            let object = try await cloudConnectorJSONObject(
+            async let profile = cloudConnectorJSONObject(
                 request,
                 connector: "gmail"
             )
             // The inbox's own counts: what "how much mail do I have" asks.
             var inboxRequest = URLRequest(url: URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/labels/INBOX")!)
             inboxRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            let inbox = (try? await cloudConnectorJSONObject(inboxRequest, connector: "gmail")) ?? [:]
+            async let inboxRead = try? cloudConnectorJSONObject(inboxRequest, connector: "gmail")
+            let object = try await profile
+            let inbox = await inboxRead ?? [:]
             return .object([
                 "status": .string("ok"),
                 "inbox_total": Self.cloudInt(inbox["messagesTotal"]).map { .int(Int64($0)) } ?? .null,
@@ -42,7 +44,7 @@ extension SwiftToolDispatcher {
     func impl_gmail_search(input: [String: JSONValue]) async -> JSONValue {
         let input = input.filter { $0.value != .string("") }
         let query = Self.cloudInputString(input["query"] ?? input["q"]) ?? ""
-        let limit = max(1, min(Self.cloudInputInt(input["limit"]) ?? 10, 20))
+        let limit = max(1, min(Self.jsonInt(input["limit"]) ?? 10, 20))
         return await cloudConnectorRead(connector: "gmail") { token in
             var components = URLComponents(
                 string: "https://gmail.googleapis.com/gmail/v1/users/me/messages"
@@ -169,7 +171,7 @@ extension SwiftToolDispatcher {
     func impl_google_calendar_list(input: [String: JSONValue]) async -> JSONValue {
         let input = input.filter { $0.value != .string("") }
         let calendarID = Self.cloudInputString(input["calendar_id"]) ?? "primary"
-        let limit = max(1, min(Self.cloudInputInt(input["limit"]) ?? 20, 50))
+        let limit = max(1, min(Self.jsonInt(input["limit"]) ?? 20, 50))
         var now = Date()
         var end = now.addingTimeInterval(7 * 24 * 60 * 60)
         // A bare day ("today", "tomorrow", "2026-09-25") is that local day;
@@ -343,7 +345,7 @@ extension SwiftToolDispatcher {
            auth.scopes.isDisjoint(with: ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/calendar.events"]) {
             return .object(["status": .string("unavailable"), "outcome": .string("unmet"),
                 "effects": .string("none"), "detail": .string("Google Calendar lacks event-write access."),
-                "fix": .string("The owner must sign in to Google Calendar in Settings > Connectors.")])
+                "fix": .string("The owner can sign in to Google Calendar by requesting a setup card in chat or opening Connectors in Advanced view.")])
         }
         return await cloudConnectorRead(connector: "calendar") { token in
             let base = "https://www.googleapis.com/calendar/v3/calendars/\(Self.cloudPath(calendarID))/events"
@@ -463,7 +465,7 @@ extension SwiftToolDispatcher {
     func impl_notion_search(input: [String: JSONValue]) async -> JSONValue {
         let input = input.filter { $0.value != .string("") }
         let query = Self.cloudInputString(input["query"] ?? input["q"]) ?? ""
-        let limit = max(1, min(Self.cloudInputInt(input["limit"]) ?? 20, 50))
+        let limit = max(1, min(Self.jsonInt(input["limit"]) ?? 20, 50))
         return await cloudConnectorRead(connector: "notion") { token in
             var request = URLRequest(url: URL(string: "https://api.notion.com/v1/search")!)
             request.httpMethod = "POST"
@@ -545,7 +547,7 @@ extension SwiftToolDispatcher {
                 url: URL(string: "https://api.notion.com/v1/pages/\(Self.cloudPath(id))")!
             )
             Self.applyNotionHeaders(token: token, to: &pageRequest)
-            let page = try await cloudConnectorJSONObject(
+            async let pageRead = cloudConnectorJSONObject(
                 pageRequest,
                 connector: "notion"
             )
@@ -557,10 +559,12 @@ extension SwiftToolDispatcher {
             if let startCursor { components.queryItems?.append(URLQueryItem(name: "start_cursor", value: startCursor)) }
             var blocksRequest = URLRequest(url: components.url!)
             Self.applyNotionHeaders(token: token, to: &blocksRequest)
-            let blocks = try await cloudConnectorJSONObject(
+            async let blocksRead = cloudConnectorJSONObject(
                 blocksRequest,
                 connector: "notion"
             )
+            let page = try await pageRead
+            let blocks = try await blocksRead
             let rows = blocks["results"] as? [[String: Any]] ?? []
             let text = Self.notionPlainText(rows)
             let projection = Self.notionObjectProjection(page)
@@ -601,7 +605,7 @@ extension SwiftToolDispatcher {
                 "connected": .bool(false), "connector": .string(connector),
                 "effects": .string("none"),
                 "detail": .string("\(Self.cloudConnectorDisplayName(connector)) is not connected."),
-                "fix": .string("The owner must sign in to \(Self.cloudConnectorDisplayName(connector)) in Settings > Connectors."),
+                "fix": .string("The owner can sign in to \(Self.cloudConnectorDisplayName(connector)) by requesting a setup card in chat or opening Connectors in Advanced view."),
             ]
             if !statusRead {
                 result["error"] = .string("not_connected")
@@ -662,7 +666,7 @@ extension SwiftToolDispatcher {
             "detail": .string(cloudErrorDetail(error)),
         ]
         if reauthenticate {
-            output["fix"] = .string("The owner must sign in to \(cloudConnectorDisplayName(connector)) in Settings > Connectors.")
+            output["fix"] = .string("The owner can sign in to \(cloudConnectorDisplayName(connector)) by requesting a setup card in chat or opening Connectors in Advanced view.")
         }
         if let retryAfter = (error as? CloudConnectorHTTPError)?.retryAfter {
             output["retryAfter"] = .string(retryAfter)
@@ -771,7 +775,7 @@ extension SwiftToolDispatcher {
         _ text: String, field: String, input: [String: JSONValue],
         nextInput: [String: JSONValue], output: inout [String: JSONValue]
     ) {
-        let offset = max(0, min(cloudInputInt(input["text_offset"]) ?? 0, text.count))
+        let offset = max(0, min(Self.jsonInt(input["text_offset"]) ?? 0, text.count))
         let part = String(text.dropFirst(offset).prefix(20_000))
         let end = offset + part.count
         var next = nextInput
@@ -939,15 +943,6 @@ extension SwiftToolDispatcher {
         guard case .string(let string)? = value else { return nil }
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func cloudInputInt(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let value): Int(value)
-        case .double(let value): Int(exactly: value.rounded(.towardZero))
-        case .string(let value): Int(value)
-        default: nil
-        }
     }
 
     private static func cloudString(_ value: Any?) -> String? {

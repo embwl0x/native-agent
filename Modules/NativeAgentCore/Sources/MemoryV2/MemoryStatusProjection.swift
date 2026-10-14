@@ -3,6 +3,13 @@ import PersistenceCore
 
 /// Read-only status and hygiene projections using the existing stores and runtime.
 public enum MemoryStatusProjection {
+    public static func embeddingRuntime(dataRoot: URL) async throws -> EmbeddingRuntimeSnapshot {
+        guard let runtime = await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).embeddingRuntimeSnapshot() else {
+            throw MemoryV2Error.storageUnavailable
+        }
+        return runtime
+    }
+
     public static func afterTurnRecovery(dataRoot: URL) -> AfterTurnMemoryRecoveryStatus {
         do {
             let held = try AdaptiveMemoryPromoter.readHeld(dataRoot: dataRoot)
@@ -53,12 +60,7 @@ public enum MemoryStatusProjection {
     }
 
     public static func getMemoryV2Status(dataRoot: URL) async throws -> MemoryV2Status {
-        // fix3/F2: route truthfully through SwiftNativeMemoryV2.shared. Counts
-        // come from MemoryStorage; pinned reads metadata.pinned; pending
-        // proposals reads storage.listProposals(status: "pending"); embedding
-        // backend reflects the live runtime snapshot — CoreML when MiniLM
-        // loaded, mock when the user explicitly opted in (config or env),
-        // fail-closed otherwise.
+        // Counts stay in SQLite; embedding fields share one runtime snapshot.
         var memCount = 0
         var activeCount = 0
         var pinnedCount = 0
@@ -66,49 +68,19 @@ public enum MemoryStatusProjection {
         var storageReadable = false
         do {
             let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            let all = try await storage.listMemories(persona: nil, status: nil, limit: nil)
+            let counts = try await storage.statusCounts()
             storageReadable = true
-            memCount = all.count
-            for m in all {
-                // ONE MEANING OF "active" (Astra comb 4, lane4 finding 6). The
-                // count read `status` alone while the browser also excludes the
-                // corrected/contradicted/deleted lifecycles, so the summary said
-                // "190 active" over a list that could only ever show 169: the 21
-                // `status=active, lifecycle=corrected` rows (`FDF6A630-…` and
-                // `BF12BC92-…`, both superseded sleep-schedule statements) were
-                // counted by one surface and excluded by the other. Same
-                // predicate as `listMemories(status: "active")`.
-                if m.status == "active", MemoryLifecycle.isRecallEligible(m.lifecycle) {
-                    activeCount += 1
-                }
-                // SQLite schema has no `pinned` column; updateMemory()
-                // encodes the flag under metadata.pinned. Surface the
-                // real count by inspecting the metadata blob.
-                if case .object(let obj)? = m.metadata,
-                   case .bool(true)? = obj["pinned"] {
-                    pinnedCount += 1
-                }
-            }
-            if let pending = try? await storage.listProposals(status: "pending") {
-                pendingProposals = pending.count
-            }
+            memCount = counts.memories
+            activeCount = counts.active
+            pinnedCount = counts.pinned
+            pendingProposals = counts.pendingProposals
         } catch {
             storageReadable = false
         }
-        let modelId = await SwiftNativeMemoryV2.shared.embedderModelId()
-        let dims = await SwiftNativeMemoryV2.shared.embedderDimensions()
-        // gpt-5.5 review-4 STILL-NEEDS-FIX: `embedderModelId()` returns
-        // "all-MiniLM-L6-v2" whenever config requests CoreML — even when the
-        // effective runtime is fail-closed (resources missing, embed() throws).
-        // Deriving `isReal` from `modelId != "mock"` therefore lied to the UI:
-        // a broken install surfaced as `realSemanticAvailable: true` with
-        // `fallbackReason: nil`. Drive off the runtime snapshot's
-        // `effectiveBackend` instead, which is the single source of truth
-        // computed inside ManagedEmbeddingProvider with all the branch logic.
         let runtimeSnapshot = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot()
         let effective = runtimeSnapshot?.effectiveBackend
         let isReal = (effective == ManagedEmbeddingProvider.coreMLBackend)
-        let backend = modelId.map { "\($0)\(dims.map { "/d\($0)" } ?? "")" }
+        let backend = runtimeSnapshot.map { "\($0.modelId)/d\($0.dimensions)" }
         let fallback: String? = {
             guard !isReal else { return nil }
             switch effective {
@@ -288,4 +260,448 @@ public enum MemoryStatusProjection {
         decoder.dateDecodingStrategy = .iso8601
         return decoder
     }
+}
+
+public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
+    public var sqliteRecordCount: Int
+    public var sqliteProposalCount: Int
+    /// `nil` before the direct store probe, `false` when it could not read.
+    public var storageReadable: Bool?
+    public var migrated: Bool
+    public var coreMLReady: Bool
+    public var coreMLModelLabel: String
+    public var embedderDimensions: Int
+    public var runtimeEmbedderDimensions: Int? = nil
+    // Runtime state distinguishes an installed model from a working embedder.
+    public var coreMLLoaded: Bool
+    public var coreMLLastLoadError: String?
+    public var coreMLLoadCount: Int
+    public var embeddingMode: String
+    public var requestedEmbeddingBackend: String
+    public var effectiveEmbeddingBackend: String
+    public var spotlightReindexed: Bool
+    public var spotlightIndexedCount: Int
+    public var cloudKitAccountStatus: String
+    public var dataRootPath: String
+
+    /// Visual + textual status derived from the runtime fields above.
+    /// Distinguishes real-model readiness from disabled or mock search.
+    public enum EmbedderHealth {
+        case working(loadCount: Int)   // green
+        case ready                      // orange — resources present, never loaded
+        case broken(reason: String)     // red — lastLoadError set
+        case missing                    // red — bundled resources not reachable
+        case disabled
+        case mock
+
+        public var isHealthy: Bool {
+            if case .working = self { return true }
+            return false
+        }
+        public var needsAttention: Bool {
+            switch self {
+            case .broken, .missing: return true
+            default: return false
+            }
+        }
+    }
+
+    /// Derive the at-a-glance health state. Caller decides how to
+    /// render — typical: green for working, orange for ready, red for
+    /// broken/missing.
+    public var embedderHealth: EmbedderHealth {
+        if requestedEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
+            return .disabled
+        }
+        if effectiveEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
+            return .mock
+        }
+        if let err = coreMLLastLoadError {
+            return .broken(reason: err)
+        }
+        if coreMLLoaded {
+            return .working(loadCount: coreMLLoadCount)
+        }
+        if coreMLReady {
+            return .ready
+        }
+        return .missing
+    }
+
+    public var shouldPollEmbeddingStartup: Bool {
+        embeddingMode == ManagedEmbeddingProvider.performanceMode
+            && effectiveEmbeddingBackend == ManagedEmbeddingProvider.coreMLBackend
+            && coreMLReady
+            && !coreMLLoaded
+            && coreMLLastLoadError == nil
+    }
+
+    public static let empty = MemoryV2NativeStackSnapshot(
+        sqliteRecordCount: 0,
+        sqliteProposalCount: 0,
+        storageReadable: nil,
+        migrated: false,
+        coreMLReady: false,
+        coreMLModelLabel: "MiniLM-L6-v2 (pending .mlpackage)",
+        embedderDimensions: 384,
+        coreMLLoaded: false,
+        coreMLLastLoadError: nil,
+        coreMLLoadCount: 0,
+        embeddingMode: "unknown",
+        requestedEmbeddingBackend: "unknown",
+        effectiveEmbeddingBackend: "unknown",
+        spotlightReindexed: false,
+        spotlightIndexedCount: 0,
+        cloudKitAccountStatus: "checking…",
+        dataRootPath: ""
+    )
+
+    public static func read(
+        dataRoot: URL
+    ) async -> MemoryV2NativeStackSnapshot {
+        var snap = MemoryV2NativeStackSnapshot.empty
+        snap.dataRootPath = dataRoot.path
+        var spotlightEligibleCount = 0
+        var storageGeneration: String?
+
+        // SQLite probe — open the same store MemoryV2+Storage.swift uses and
+        // count active rows. A clean empty store is 0; a failed read remains
+        // explicit so the panel cannot present it as an empty memory profile.
+        do {
+            let store = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+            let counts = try await store.statusCounts()
+            snap.storageReadable = true
+            snap.sqliteRecordCount = counts.active
+            spotlightEligibleCount = counts.active
+            storageGeneration = try await store.projectionGenerationFingerprint()
+            snap.sqliteProposalCount = counts.pendingProposals
+        } catch {
+            snap.storageReadable = false
+        }
+
+        // Migration marker — written by MemoryV2Migrator on a successful
+        // JSON → SQLite import. Presence proves the new store is the
+        // canonical backend on this data root.
+        let marker = dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent(".migrated_to_sqlite_v1", isDirectory: false)
+        snap.migrated = FileManager.default.fileExists(atPath: marker.path)
+
+        // Core ML MiniLM probe. 2026-06-07 task #88: this used to roll its
+        // own `Bundle.main.url(forResource: "MiniLM_L6_v2", ...)` check that
+        // (a) used the wrong filename (the actual SPM resource is
+        // `minilm.mlpackage`) and (b) couldn't traverse into the
+        // NativeAgentCore_MemoryV2.bundle sub-bundle where the runtime
+        // actually looks. Result: page perpetually said "pending .mlpackage"
+        // even with a fully staged model. Now we ask the runtime's own
+        // resolver — single source of truth, both `bundled` and
+        // installedAppFallbackBundle paths covered. An installed model whose
+        // manifest is unusable is NOT ready and never reads as the bundled
+        // MiniLM (S12, 2026-09-26); refreshEmbeddingRuntime() below carries
+        // the reason as the load error.
+        do {
+            if let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
+                snap.coreMLReady = true
+                snap.coreMLModelLabel = installed.modelID + " (installed)"
+                snap.embedderDimensions = installed.dimensions
+            } else if CoreMLEmbeddingProvider.bundledResourcesAvailable() {
+                snap.coreMLReady = true
+                snap.coreMLModelLabel = CoreMLEmbeddingProvider.bundledModelID + " (bundled)"
+            }
+        } catch {
+            snap.coreMLModelLabel = "installed model did not load"
+        }
+
+        // Runtime truth fields — the disk probe above tells us if
+        // resources are reachable, but only the runtime knows whether
+        // the model actually loaded and inference works. Pull
+        // coreMLLoaded / lastLoadError / loadCount from
+        // SwiftNativeMemoryV2's snapshot.
+        await snap.refreshEmbeddingRuntime()
+
+        // Spotlight — the `.spotlight_reindexed` sentinel is written by
+        // MemorySpotlightBootstrap on first launch after the
+        // cutover. Presence alone is not proof: a failed reindex can clear the
+        // domain after a previous marker was written. The marker is valid only
+        // when it names the current canonical projection generation.
+        let spotMarker = SwiftNativeMemoryIndexer.markerURL(dataRoot: dataRoot)
+        if let storageGeneration,
+           let markerData = try? Data(contentsOf: spotMarker),
+           String(data: markerData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) == storageGeneration {
+            snap.spotlightReindexed = true
+            snap.spotlightIndexedCount = spotlightEligibleCount
+        }
+
+        return snap
+    }
+
+    public mutating func refreshEmbeddingRuntime() async {
+        guard let runtime = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot() else {
+            return
+        }
+        runtimeEmbedderDimensions = runtime.dimensions
+        embeddingMode = runtime.mode
+        requestedEmbeddingBackend = runtime.requestedBackend
+        effectiveEmbeddingBackend = runtime.effectiveBackend
+        coreMLLoaded = runtime.coreMLLoaded
+        coreMLLastLoadError = runtime.lastLoadError
+        coreMLLoadCount = runtime.loadCount
+    }
+}
+
+extension MemoryStatusProjection {
+    // Swift-native embedding status. The app no longer installs or probes
+    // sentence-transformers/Python extras; the live truth is the MemoryV2
+    // root-resolved embedder. Three terminal states: CoreML MiniLM when the
+    // bundled model loads, explicit mock when the user opted out via config
+    // OR set NATIVE_AGENT_EMBEDDING_MOCK=1, and fail-closed (embed() throws)
+    // when CoreML was requested but resources are missing / load failed and
+    // no env opt-in.
+    //
+    // Every embedding action resolves the root's memory owner, which may
+    // open, migrate and prune the store, so all of them run off the main actor.
+    public static func embeddingsStatus(dataRoot: URL) async throws -> EmbeddingsStatus {
+        return embeddingsStatus(from: try await MemoryStatusProjection.embeddingRuntime(dataRoot: dataRoot))
+    }
+
+    /// Project a status from one runtime snapshot.
+    private static func embeddingsStatus(from runtime: EmbeddingRuntimeSnapshot) -> EmbeddingsStatus {
+        let readiness = MemoryStatusProjection.embeddingReadiness(runtime)
+        let requestedCoreML = readiness.requestedCoreML
+        // effectiveCoreML must be TRUE only when the runtime is ACTUALLY
+        // serving CoreML vectors — not when it's mock and not when it's
+        // fail-closed (CoreML failed + no NATIVE_AGENT_EMBEDDING_MOCK opt-in).
+        // The earlier check `effectiveBackend != mockBackend` returned true
+        // for "fail-closed" too, so the UI reported "local"/"Active" while
+        // every embed() call was throwing. Match against the canonical CoreML
+        // backend instead.
+        let isFailClosed = readiness.isFailClosed
+        let modelName: String = {
+            if isFailClosed {
+                return "Unavailable / \(runtime.dimensions)d (\(runtime.lastLoadError ?? "CoreML resources missing"))"
+            }
+            if requestedCoreML {
+                let loaded = runtime.coreMLLoaded ? "loaded" : "idle"
+                return "\(runtime.modelId) / \(runtime.dimensions)d (\(loaded))"
+            }
+            return "Deterministic mock / \(runtime.dimensions)d (semantic embeddings off)"
+        }()
+        let modeDetail = EmbeddingsMemoryModeDetail(
+            mode: runtime.mode,
+            title: embeddingModeTitle(runtime.mode),
+            detail: embeddingModeDetail(runtime, requestedCoreML: requestedCoreML),
+            idleUnloadSeconds: runtime.idleUnloadSeconds
+        )
+        let reindexState = EmbeddingsInstallState(
+            state: "complete",
+            currentStep: embeddingCurrentStep(runtime, requestedCoreML: requestedCoreML),
+            progress: 100,
+            error: runtime.lastLoadError,
+            detail: embeddingStatusDetail(runtime, requestedCoreML: requestedCoreML),
+            startedAt: nil,
+            failedAt: nil,
+            completedAt: ISO8601DateFormatter().string(from: Date()),
+            extrasPath: nil,
+            hfCachePath: nil,
+            total: nil,
+            candidates: nil,
+            embedded: nil,
+            skipped: nil,
+            failed: nil,
+            reason: nil,
+            lastUpdatedAt: nil
+        )
+        return EmbeddingsStatus(
+            libraryAvailable: runtime.coreMLResourcesAvailable,
+            modelLoadable: runtime.modelLoadable,
+            configBackend: runtime.requestedBackend,
+            envEnabled: true,
+            effectiveBackend: readiness.effectiveBackend,
+            modelName: modelName,
+            requestedEnabled: requestedCoreML,
+            memoryMode: runtime.mode,
+            memoryModeDetail: modeDetail,
+            idleUnloadSeconds: runtime.idleUnloadSeconds,
+            modelState: EmbeddingsModelState(
+                mode: runtime.mode,
+                loaded: runtime.coreMLLoaded,
+                parentLoaded: runtime.coreMLLoaded,
+                workerRunning: false,
+                workerPid: nil,
+                lastUsedAt: runtime.lastUsedAt,
+                lastLoadedAt: runtime.lastLoadedAt,
+                lastUnloadedAt: runtime.lastUnloadedAt,
+                unloadReason: runtime.unloadReason,
+                loadCount: runtime.loadCount,
+                unloadCount: runtime.unloadCount,
+                cacheSize: nil,
+                cacheMaxSize: nil
+            ),
+            installState: nil,
+            reindexState: reindexState,
+            extrasPath: nil
+        )
+    }
+
+    private static func embeddingModeTitle(_ mode: String) -> String {
+        switch mode {
+        case "performance": return "Fast"
+        case "low_memory": return "Low"
+        default: return "Balanced"
+        }
+    }
+
+    // gpt-5.5 review-3 NEEDS_FIX: the three UI-string helpers below now drive
+    // off `runtime.effectiveBackend` so the env-mock-opt-in case
+    // (NATIVE_AGENT_EMBEDDING_MOCK=1 with requestedCoreML=true) doesn't get
+    // mislabeled as fail-closed when embed() is actually returning mock
+    // vectors. Snapshot already computes the right `effectiveBackend` value
+    // (coreml-minilm / mock / fail-closed); these strings just have to honor
+    // it instead of re-deriving from individual fields.
+
+    private static func embeddingModeDetail(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String {
+        guard requestedCoreML else {
+            return EmbeddingPlainCopy.headline(.turnedOff)
+        }
+        // Env-mock opt-in path: user wanted CoreML, set the env var, runtime
+        // returns mock vectors. Say so honestly.
+        if runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend {
+            return EmbeddingPlainCopy.headline(.testVectors)
+        }
+        if runtime.effectiveBackend == ManagedEmbeddingProvider.failClosedBackend {
+            return EmbeddingPlainCopy.headline(runtime.lastLoadError == nil ? .modelMissing : .modelFailed)
+        }
+        return EmbeddingPlainCopy.modeLine(mode: runtime.mode)
+    }
+
+    private static func embeddingCurrentStep(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String {
+        if !requestedCoreML { return "Semantic CoreML embedder disabled by user" }
+        if runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend {
+            return "Mock embedder active (NATIVE_AGENT_EMBEDDING_MOCK opt-in)"
+        }
+        if runtime.coreMLLoaded { return "CoreML semantic embedder loaded" }
+        if runtime.effectiveBackend == ManagedEmbeddingProvider.coreMLBackend
+            && runtime.lastLoadError == nil {
+            return "CoreML semantic embedder ready to lazy-load"
+        }
+        return "Semantic embedder fail-closed (CoreML resources missing or load failed)"
+    }
+
+    // This value lands in the SECONDARY line under a plain headline
+    // (SlimSettingsView.modelUnavailableRow), so it is where the identifiers
+    // are allowed to live — the headline above it never carries them.
+    private static func embeddingStatusDetail(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String? {
+        if !requestedCoreML { return EmbeddingPlainCopy.technicalDetail(.turnedOff) }
+        if runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend {
+            return EmbeddingPlainCopy.technicalDetail(.testVectors)
+        }
+        if let error = runtime.lastLoadError {
+            return EmbeddingPlainCopy.technicalDetail(.modelFailed, error: error)
+        }
+        if runtime.coreMLLoaded { return nil }
+        if runtime.effectiveBackend == ManagedEmbeddingProvider.failClosedBackend {
+            return EmbeddingPlainCopy.technicalDetail(.modelMissing)
+        }
+        return EmbeddingPlainCopy.notLoadedYetLine
+    }
+
+    // DAEMON-DEAD PORT (2026-06-03): configure the Swift embedding runtime.
+    // The managed provider persists <dataRoot>/config/embeddings.json::backend
+    // and immediately releases CoreML when disabled.
+    public static func toggleEmbeddingsBackend(enabled: Bool, dataRoot: URL) async throws -> EmbeddingsToggleResult {
+        let result = try await SwiftNativeMemoryV2.configureEmbeddingBackendAndReindex(enabled: enabled, dataRoot: dataRoot)
+        let report = result.report
+        let detail = "Atomically activated one embedding epoch across \(report.memories) memories, \(report.proposals) proposals, and \(report.tombstones) tombstones."
+        return EmbeddingsToggleResult(ok: true, error: nil, detail: detail, status: embeddingsStatus(from: result.runtime))
+    }
+
+    // DAEMON-DEAD PORT (2026-06-02): configure the managed Swift embedding
+    // runtime's idle-retention mode and return current status.
+    public static func setEmbeddingsMemoryMode(_ mode: String, dataRoot: URL) async throws -> EmbeddingsToggleResult {
+        try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).configureEmbeddingMemoryMode(mode)
+        let status = try await embeddingsStatus(dataRoot: dataRoot)
+        return EmbeddingsToggleResult(ok: true, error: nil, detail: nil, status: status)
+    }
+
+}
+
+public enum EmbeddingPlainCopy {
+
+    /// What the embedding runtime is actually doing for search right now.
+    public enum SearchState: Equatable {
+        /// The on-device model is serving real vectors.
+        case byMeaning
+        /// The user opted out of semantic embeddings in settings.
+        case turnedOff
+        /// NATIVE_AGENT_EMBEDDING_MOCK opt-in: deterministic test vectors.
+        case testVectors
+        /// Model resources are not on disk.
+        case modelMissing
+        /// Model resources exist but failed to load.
+        case modelFailed
+    }
+
+    /// Leads with the user's loss, never with a backend name.
+    public static func headline(_ state: SearchState) -> String {
+        switch state {
+        case .byMeaning:
+            return "Memory search finds results by meaning."
+        case .turnedOff:
+            return "Memory search by meaning is turned off."
+        case .testVectors:
+            return "Memory search is running on test data, so results will not match meaning."
+        case .modelMissing:
+            return "Memory search is unavailable because a required model is not installed."
+        case .modelFailed:
+            return "Memory search is unavailable because the search model could not load."
+        }
+    }
+
+    /// The secondary line. Nil when there is nothing technical worth naming.
+    public static func technicalDetail(_ state: SearchState, error: String? = nil) -> String? {
+        switch state {
+        case .byMeaning:
+            return nil
+        case .turnedOff:
+            return "Semantic embeddings are off in settings. Turn them on to use the bundled Core ML MiniLM model."
+        case .testVectors:
+            return "NATIVE_AGENT_EMBEDDING_MOCK is set, so search uses deterministic test vectors instead of the bundled Core ML MiniLM model."
+        case .modelMissing:
+            return "Search model: Core ML MiniLM. The bundled resources are not on disk."
+        case .modelFailed:
+            let trimmed = error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if trimmed.isEmpty {
+                return "Search model: Core ML. Load failed."
+            }
+            return "Search model: Core ML. Load failed: \(trimmed)"
+        }
+    }
+
+    /// Idle-retention mode, described by what the user feels rather than by
+    /// which model unloads when.
+    public static func modeLine(mode: String) -> String {
+        switch mode {
+        case "performance":
+            return "The search model stays loaded, so searches return as fast as possible."
+        case "low_memory":
+            return "The search model unloads after 45 seconds of no use, to keep memory free."
+        default:
+            return "The search model loads when you search and unloads after 5 minutes of no use."
+        }
+    }
+
+    /// Transient: the model is fine, just not resident this second.
+    public static let notLoadedYetLine =
+        "The search model is not loaded right now. It loads on your next search."
+}
+
+extension MemoryStatusProjection {
+    /// This ISO week's and last week's misses by lesson; nil when the ledger
+    /// could not be read.
+    public static func recentMisses(dataRoot: URL) async -> [MemoryMissLesson]? {
+        try? await MemoryStatusProjection.misses(
+            dataRoot: dataRoot, weeks: [MemoryStatusProjection.isoWeek(), MemoryStatusProjection.isoWeek(ago: 1)])
+    }
+
 }

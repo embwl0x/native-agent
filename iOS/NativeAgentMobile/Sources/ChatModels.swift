@@ -69,7 +69,7 @@ struct ToolEvent: Codable, Equatable, Identifiable {
     var resultDetail: String? = nil
 }
 
-struct ChatMessage: Identifiable, Codable, Equatable {
+struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
     enum Role: String, Codable { case user, assistant }
     let id: UUID
     let role: Role

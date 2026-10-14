@@ -26,9 +26,9 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
         self.sourceContentID = sourceContentID
     }
 
-    public static var current: NativeAgentBuildIdentity {
+    public static let current: NativeAgentBuildIdentity = {
         from(infoDictionary: Bundle.main.infoDictionary ?? [:], resourcesURL: Bundle.main.resourceURL)
-    }
+    }()
 
     public static func from(
         infoDictionary: [String: Any],

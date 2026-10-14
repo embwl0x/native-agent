@@ -14,7 +14,7 @@ import Skills
 /// the retired daemon `_SKILL_DESC_MAX_LEN = 280`
 
 /// the retired daemon `_PERSONA_READ_KINDS`.
-let personaReadKinds: Set<String> = ["soul", "user", "skill", "voice", "growth", "agents"]
+let personaReadKinds: Set<String> = ["soul", "user", "voice", "growth", "agents"]
 
 enum PersonaSystemActions {
 
@@ -38,26 +38,13 @@ enum PersonaSystemActions {
         return PersistenceCore.defaultDataRoot()
     }
 
-    /// Resolve skill bodies through the checked inventory; fixed docs stay
-    /// under the persona root. Invalid or missing skill names return nil.
-    static func personaPath(
-        kind: String, skillName: String?, dataRoot: URL, personaRoot: URL
-    ) throws -> URL? {
+    static func personaPath(kind: String, personaRoot: URL) -> URL? {
         switch kind {
         case "soul":   return personaRoot.appendingPathComponent("SOUL.md")
         case "user":   return personaRoot.appendingPathComponent("USER.md")
         case "voice":  return personaRoot.appendingPathComponent("VOICE.md")
         case "growth": return personaRoot.appendingPathComponent("GROWTH.md")
         case "agents": return personaRoot.appendingPathComponent("AGENTS.md")
-        case "skill":
-            guard let sn = skillName, !sn.isEmpty else { return nil }
-            let entries = try InstalledSkillInventory.entries(
-                dataRoot: dataRoot, personaRoot: personaRoot)
-            // Registered identity wins over a stale loose body with the same name.
-            let entry = InstalledSkillInventory.match(sn, in: entries.filter {
-                $0.row["source"] == .string("runtime_registry")
-            }) ?? InstalledSkillInventory.match(sn, in: entries)
-            return entry?.bodyURL
         default:
             return nil
         }
@@ -88,27 +75,9 @@ enum PersonaSystemActions {
             return FileSystemActions.errResult(
                 "kind must be one of: \(allowed)", code: "bad_input")
         }
-        // skill_name: Python `inp.get("skill_name") or None` — empty string → nil.
-        var skillName: String? = nil
-        if case .string(let s)? = input["skill_name"], !s.isEmpty { skillName = s }
-        if kind == "skill" && skillName == nil {
-            return FileSystemActions.errResult(
-                "skill_name is required when kind=skill", code: "bad_input")
-        }
-        let dataRoot = dataRootURL(ctx)
         let personaRoot = personaRootURL(ctx)
-        let target: URL
-        do {
-            guard let resolved = try personaPath(
-                kind: kind, skillName: skillName, dataRoot: dataRoot, personaRoot: personaRoot
-            ) else {
-                return FileSystemActions.errResult(
-                    "Could not resolve persona path", code: "bad_input")
-            }
-            target = resolved
-        } catch {
-            return FileSystemActions.errResult(
-                String(describing: error), code: "persona_not_found")
+        guard let target = personaPath(kind: kind, personaRoot: personaRoot) else {
+            return FileSystemActions.errResult("Could not resolve persona path", code: "bad_input")
         }
 
         let resolved = FileSystemActions.resolvePath(target.path, repoRoot: ctx.repoRoot)
@@ -135,14 +104,6 @@ enum PersonaSystemActions {
             return FileSystemActions.errResult(
                 String(describing: error), code: "persona_not_found")
         }
-        if kind == "skill" {
-            let hygieneViolations = SkillBodyHygiene.violations(in: content)
-            if !hygieneViolations.isEmpty {
-                return FileSystemActions.errResult(
-                    "skill body hygiene failed: \(SkillBodyHygiene.failureMessage(for: hygieneViolations))",
-                    code: "skill_hygiene_failed")
-            }
-        }
         let sizeBytes = content.utf8.count
         return .object([
             "ok": .bool(true),
@@ -166,11 +127,10 @@ enum PersonaSystemActions {
         let offset = intOrZero(input["offset"])
 
         let dataRoot = dataRootURL(ctx)
-        let personaRoot = personaRootURL(ctx)
         var records: [String: SkillRecord] = [:]
         let entries: [InstalledSkillInventory.Entry]
         do {
-            entries = try InstalledSkillInventory.entries(dataRoot: dataRoot, personaRoot: personaRoot)
+            entries = try InstalledSkillInventory.entries(dataRoot: dataRoot)
         } catch {
             return FileSystemActions.errResult(
                 "Could not load skill inventory: \(error.localizedDescription)", code: "skill_inventory_unavailable")
@@ -185,7 +145,7 @@ enum PersonaSystemActions {
             let triggers: [JSONValue]?
             if case .array(let values)? = row["triggers"], !values.isEmpty { triggers = values } else { triggers = nil }
             records[entry.name] = SkillRecord(name: entry.name, source: source,
-                path: entry.bodyURL?.path ?? text("bodyPath"), description: text("description"),
+                path: text("bodyPath"), description: text("description"),
                 triggers: triggers, kind: text("kind").isEmpty ? nil : text("kind"),
                 useCount: row["useCount"] == .null ? nil : row["useCount"])
         }

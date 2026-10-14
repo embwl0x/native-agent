@@ -1,4 +1,5 @@
 import AppKit
+import EngineRuntime
 import AppToolRuntime
 import Agents
 import SwiftUI
@@ -15,97 +16,32 @@ import os
 // agent's ordinary chat, a contact's or helper's thread, or a crew's work beside it.
 // Reads the stores the rest of the app already keeps; writes nothing.
 
-/// A contact, keyed the way the agent's conversation records key it:
-/// `peer:<id>` for a saved contact, `codex` / `claude` / `omp` for a
-/// built-in lane.
-struct SimpleContact: Identifiable, Equatable, Sendable {
-    let id: String
-    let name: String
-    let builtIn: Bool
-    /// How the agent reaches it, in a line.
-    let via: String
-    /// A saved connection stays visible even when it cannot initiate a turn.
-    var sendRestriction: String? = nil
-    /// Proven traffic counts even when its transcript is no longer retained.
-    var lastActivityAt: Date? = nil
-    /// The Mac app behind it, when there is one, for its avatar.
-    var appBundleID: String? = nil
-    /// How it is connected, when two contacts share one app ("Grok" the
-    /// desktop app and "Grok Bot" the routine).
-    var link: Link? = nil
-    /// Its initials tint: a palette slot three on from the row above (SimpleAvatar).
-    var tintSlot: Int? = nil
-    /// Claude — the Claude Code bridge (Claude here) or Claude Desktop —
-    /// wears Clawd instead of an app icon (User 09-28).
-    var clawd = false
-    /// ChatGPT Dot: his conversation is Agent's Dot chat session, not a conversation record.
-    var dot = false
-    var health: AgentLocalHealth? = nil
-    var recoveredFailure = false
-    var initial: String { name.first.map { String($0).uppercased() } ?? "?" }
+typealias SimpleContact = AgentContactPresentation
+typealias SimpleThreadLine = AgentContactThreadLine
+typealias SimpleFlight = AgentContactFlight
 
-    enum Link: Equatable, Sendable {
-        case desktopApp, routine
-        var words: String { self == .desktopApp ? "Desktop app" : "Routine" }
-    }
-}
+@MainActor @Observable
+final class SimpleFlightProjection {
+    @ObservationIgnored var flight: SimpleFlight?
+    var structure: SimpleFlight?
+    var partial: String?
+    var hasPartial = false
 
-/// One thing said between the agent and a contact.
-struct SimpleThreadLine: Identifiable, Equatable, Sendable {
-    let id: String
-    let fromAgent: Bool
-    let text: String
-    let at: Date
-    /// Typed by the person in this thread rather than sent by the agent.
-    var byPerson = false
-    var door: String? = nil
-    var fetched = false
-}
-
-/// What is moving on a contact's thread now: the other agent's live progress
-/// on the send in flight, follow-ups queued behind it, and a stop asked for
-/// on it. Nil when none of that is there.
-struct SimpleFlight: Equatable, Sendable {
-    let recordID: String
-    /// How agent_cancel names the contact and its conversation.
-    let agent: String
-    let label: String
-    let scope: String
-    /// The send is still going or its reply is still coming.
-    let inFlight: Bool
-    var live: AgentConversationLive?
-    var queued: [Queued]
-    /// Only the stop asked for on this send.
-    var stop: AgentConversationStop?
-
-    struct Queued: Identifiable, Equatable, Sendable {
-        enum State: Equatable, Sendable { case queued, sending, held(String) }
-        let id: String
-        let text: String
-        let at: Date
-        let byPerson: Bool
-        let state: State
-    }
-
-    init?(_ record: AgentConversationRecord, live: AgentConversationLive?) {
-        let queued = (record.queued ?? []).map { item in
-            Queued(id: item.id, text: item.text, at: item.queuedAt, byPerson: item.byPerson == true,
-                   state: item.held.map { .held($0) } ?? (item.id == record.queueReservation ? .sending : .queued))
+    func update(_ value: SimpleFlight?) {
+        flight = value
+        let text = value?.partial
+        if partial != text { partial = text }
+        if hasPartial != (text != nil) { hasPartial = text != nil }
+        var shape = value
+        if var live = shape?.live {
+            live.partial = nil
+            live.partialChars = 0
+            live.partialTruncated = false
+            live.lastActivityAt = live.startedAt
+            live.firstActivityAt = nil
+            shape?.live = live
         }
-        let stop = record.stop?.operationID == record.operationID ? record.stop : nil
-        let inFlight = ["sending", "waiting"].contains(record.phase)
-        guard live != nil || !queued.isEmpty || stop != nil else { return nil }
-        (recordID, agent, label, scope) = (record.id, record.agent, record.label, record.scopeSessionID)
-        (self.inFlight, self.live, self.queued, self.stop) = (inFlight, live, queued, stop)
-    }
-
-    /// The other agent is on it right now (not just handed off).
-    var working: Bool { inFlight && live?.state == "working" }
-    /// Streamed words so far, when its lane streams them.
-    var partial: String? {
-        guard working, live?.streams == true, let text = live?.partial?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty else { return nil }
-        return live?.partialTruncated == true ? "…" + text : text
+        if structure != shape { structure = shape }
     }
 }
 
@@ -177,8 +113,10 @@ final class SimpleViewStore {
     /// none came: delivered, read, failed, not delivered.
     var status: [String: AgentConversationDelivery] = [:]
     /// Per contact id: its live reply, queue and stop, while there are any.
-    var flights: [String: SimpleFlight] = [:]
+    @ObservationIgnored private var flights: [String: SimpleFlight] = [:]
+    @ObservationIgnored private var flightSlots: [String: SimpleFlightProjection] = [:]
     var helpers: [BotsShelfRecord] = []
+    var helperRuns: [UUID: [ShelfEntry]] = [:]
     /// False until the first read lands, so an empty list isn't claimed early.
     var loaded = false
     /// A failed refresh keeps the last proven conversation snapshot visible.
@@ -188,65 +126,26 @@ final class SimpleViewStore {
     /// Crews at work now, then the few most recently finished.
     var crews: [SimpleCrew] = []
 
-    private struct Snapshot: Sendable {
-        var contacts: [SimpleContact]
-        var lines: [String: [SimpleThreadLine]]
-        var waiting: Set<String>
-        var status: [String: AgentConversationDelivery]
-        var flights: [String: SimpleFlight]
-        var helpers: [BotsShelfRecord]
-        var running: Set<UUID>
-        /// Not compared: which record each contact's flight comes from, and the
-        /// records file as last read, so a live-only tick re-reads just flights.
-        var flightRecords: [String: String] = [:]
-        var recordsStamp = ""
+    private typealias Snapshot = AgentContactThreads.Snapshot
+    private typealias ContactList = AgentContactThreads.ContactList
+
+    nonisolated static func key(_ helper: UUID) -> String { AgentContactThreads.key(helper) }
+
+    private func slot(_ id: String) -> SimpleFlightProjection {
+        if let slot = flightSlots[id] { return slot }
+        let slot = SimpleFlightProjection()
+        flightSlots[id] = slot
+        return slot
     }
 
-    /// What a read changed, worked out off the main actor; nil is unchanged.
-    private struct Delta: Sendable {
-        var contacts: [SimpleContact]?
-        var lines: [String: [SimpleThreadLine]]?
-        var waiting: Set<String>?
-        var status: [String: AgentConversationDelivery]?
-        var flights: [String: SimpleFlight]?
-        var helpers: [BotsShelfRecord]?
-        var running: Set<UUID>?
+    func flight(for id: String) -> SimpleFlight? {
+        let slot = slot(id)
+        _ = slot.structure
+        _ = slot.hasPartial
+        return slot.flight
     }
 
-    nonisolated private static func changes(from old: Snapshot, to new: Snapshot) -> Delta? {
-        let delta = Delta(contacts: old.contacts == new.contacts ? nil : new.contacts,
-                          lines: old.lines == new.lines ? nil : new.lines,
-                          waiting: old.waiting == new.waiting ? nil : new.waiting,
-                          status: old.status == new.status ? nil : new.status,
-                          flights: old.flights == new.flights ? nil : new.flights,
-                          helpers: old.helpers == new.helpers ? nil : new.helpers,
-                          running: old.running == new.running ? nil : new.running)
-        let unchanged = delta.contacts == nil && delta.lines == nil && delta.waiting == nil
-            && delta.status == nil && delta.flights == nil && delta.helpers == nil && delta.running == nil
-        return unchanged ? nil : delta
-    }
-
-    /// The saved contacts with their icons and tints, kept until what
-    /// they are made of can have changed: peers.json, the usable built-in
-    /// lanes, or an approved ACP program (each check re-hashes the program
-    /// and reads Keychain, so it is not redone on every message).
-    private struct ContactList: Sendable {
-        var stamp: [String]
-        var programs: [String]
-        var contacts: [SimpleContact]
-    }
-
-    /// A file's identity, size, times and mode; any change re-checks.
-    nonisolated private static func stamp(_ path: String) -> String {
-        var info = stat()
-        guard lstat(path, &info) == 0 else { return path + " -" }
-        return "\(path) \(info.st_ino) \(info.st_size) \(info.st_mode) "
-            + "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
-    }
-
-    /// A helper's conversation key in `lines` / `waiting`: how the agent
-    /// messages it (`agent_message` to `bot:<id>`).
-    nonisolated static func key(_ helper: UUID) -> String { "bot:" + helper.uuidString }
+    func partial(for id: String) -> String? { slot(id).partial }
 
     /// Reload whenever the contact list, the conversation records, a chat
     /// (any append rewrites the chat index) or the helpers' shelf change on disk, a helper's run takes its
@@ -259,9 +158,10 @@ final class SimpleViewStore {
                      "agents/local-health.json", "agents/reply-reads.json"]
             + ids.map { "bots/\($0.uuidString)/run.lock" }
         let liveFile = root.appendingPathComponent("agents/conversation-live.json").standardizedFileURL
-        let bridges = NativeAgentPaths.bridgeConfigRoot(dataRoot: root)
+        let bridges = InstallPaths.current.bridgeConfigRoot(dataRoot: root)
         let inboxes = ["claude", "codex", "omp"].compactMap { AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: bridges) }
-        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) } + inboxes, emitInitial: true)
+        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) } + inboxes
+            + [bridges.appendingPathComponent("claude-bridge/claude-live")], emitInitial: true)
         let (ticks, tick) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
         // Set by every change, cleared just before a read: a tick buffered
         // while that read's burst settled finds it clear and is skipped.
@@ -298,19 +198,33 @@ final class SimpleViewStore {
                     return state.full || first || retry
                 }
                 do {
-                    let (next, contactList, delta) = try await Task.detached(priority: .userInitiated) { [last, list] in
+                    let (next, contactList, delta, runs) = try await Task.detached(priority: .userInitiated) { [last, list] in
                         // A records change that rode in on the live file's tick still gets its full read.
-                        if !full, let flights = Self.readFlights(root: root, last: last) {
+                        if !full, let flights = AgentContactThreads.readFlights(root: root, last: last) {
                             var next = last
                             next.flights = flights
-                            return (next, list, Self.changes(from: last, to: next))
+                            return (next, list, AgentContactThreads.changes(from: last, to: next), Optional<[UUID: [ShelfEntry]]>.none)
                         }
                         if try AgentPeerStore(dataRoot: root).list().contains(where: ChatGPTDotIPCTransport.owns) {
                             _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
                         }
                         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
-                        let (next, contactList) = try Self.read(root: root, cached: list)
-                        return (next, contactList, Self.changes(from: last, to: next))
+                        let (snapshot, contactList) = try AgentContactThreads.read(root: root, cached: list)
+                        var next = snapshot
+                        let tinted = next.contacts.indices.filter { next.contacts[$0].appBundleID == nil }
+                            .sorted { next.contacts[$0].id < next.contacts[$1].id }
+                        for (step, index) in tinted.enumerated() { next.contacts[index].tintSlot = step * 3 % SimpleAvatar.slotCount }
+                        let delta = AgentContactThreads.changes(from: last, to: next)
+                        let runs: [UUID: [ShelfEntry]]? = if delta?.helpers != nil || delta?.lines != nil {
+                            Dictionary(uniqueKeysWithValues: next.helpers.map { helper in
+                                let said = Set((next.lines[Self.key(helper.id)] ?? []).filter { !$0.fromAgent }
+                                    .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) })
+                                return (helper.id, Array(helper.sortedEntries.lazy.filter {
+                                    !said.contains($0.actualReply.trimmingCharacters(in: .whitespacesAndNewlines))
+                                }.prefix(40)))
+                            })
+                        } else { nil }
+                        return (next, contactList, delta, runs)
                     }.value
                     last = next
                     list = contactList
@@ -319,10 +233,16 @@ final class SimpleViewStore {
                         if let value = delta.lines { lines = value }
                         if let value = delta.waiting { waiting = value }
                         if let value = delta.status { status = value }
-                        if let value = delta.flights { flights = value }
+                        if let value = delta.flights {
+                            for id in Set(flights.keys).union(value.keys) where flights[id] != value[id] {
+                                slot(id).update(value[id])
+                            }
+                            flights = value
+                        }
                         if let value = delta.helpers { helpers = value }
                         if let value = delta.running { running = value }
                     }
+                    if let runs, helperRuns != runs { helperRuns = runs }
                     if !loaded { loaded = true }
                     refreshError = nil
                 } catch {
@@ -341,7 +261,9 @@ final class SimpleViewStore {
         let paths = ["swarms/live.json", "swarms/runs.json"].map { root.appendingPathComponent($0) }
         // The watcher arms on the folder, so the first crew is seen even
         // before one has ever run. An empty folder; nothing else is written.
-        try? FileManager.default.createDirectory(at: paths[0].deletingLastPathComponent(), withIntermediateDirectories: true)
+        await Task.detached(priority: .utility) {
+            try? FileManager.default.createDirectory(at: paths[0].deletingLastPathComponent(), withIntermediateDirectories: true)
+        }.value
         let events = FileChangeEvents(paths: paths, emitInitial: true)
         await withTaskCancellationHandler {
             for await _ in events.stream {
@@ -354,299 +276,9 @@ final class SimpleViewStore {
         } onCancel: { events.cancel() }
     }
 
-    /// The contact's own app when it is on this Mac: its desktop address, else
-    /// its known-agent row. Grok Bot wears the Grok app's icon (User 09-27);
-    /// only a desktop-app contact carries the small window badge.
-    nonisolated private static func appBundleID(_ row: AgentContactRow) -> String? {
-        if row.contact?.transport == .grokBot {
-            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: GrokBotRoute.bundleID) == nil
-                ? nil : GrokBotRoute.bundleID
-        }
-        let host = row.builtIn ? String(row.id.dropFirst("builtin:".count))
-            : row.contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? row.id
-        let bundle = row.contact.flatMap { AgentPeerStore.desktopBundleID($0.endpoint) }
-            ?? AgentHostDirectory.rows.first { $0.id == host }?.bundleIDs.first
-        return bundle.flatMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) == nil ? nil : $0 }
-    }
-
-    nonisolated private static func isClaude(_ row: AgentContactRow) -> Bool {
-        row.id == "builtin:claude" || row.contact?.endpoint.absoluteString == "mcp://claude-desktop"
-    }
-
-    nonisolated private static func sendRestriction(_ row: AgentContactRow) -> String? {
-        guard let contact = row.contact else { return nil }
-        if ChatGPTDotIPCTransport.owns(contact), !contact.canStartTurn { return ChatGPTDotIPCTransport.detail }
-        if !contact.canStartTurn {
-            return contact.transport == .mcpHost ? "Replies only"
-                : "Reconnect to approve its program before sending a message."
-        }
-        return contact.unavailableAt != nil || !row.credentialAvailable ? "This connection is unavailable for sending." : nil
-    }
-
-    nonisolated private static func contactList(root: URL, cached: ContactList?) throws -> ContactList {
-        let peersFile = root.appendingPathComponent("agents/peers.json").path
-        let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
-        let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-        let head = [stamp(peersFile), stamp(AgentLocalHealth.url(root).path), usable.sorted().joined(separator: ","), ChatGPTDotIPCTransport.detail]
-        if let cached, cached.stamp == head + cached.programs.map(stamp) { return cached }
-        // The same contact list the Agents page shows, minus apps that are
-        // merely installed: saved contacts, then the usable built-in lanes.
-        let peers = try AgentPeerStore(dataRoot: root).list()
-        let programs = peers.filter { $0.transport == .acp }.compactMap { $0.approvedACPExecutable?.path }
-        // Stamped before the checks, so a change during them re-checks next time.
-        let stamps = head + programs.map(stamp)
-        let dates = ISO8601DateFormatter()
-        let identity = AgentContactIdentity(dataRoot: root)
-        let health = AgentLocalHealth.read(root)
-        let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: usable)
-        func key(_ row: AgentContactRow) -> String { row.builtIn ? String(row.id.dropFirst("builtin:".count)) : row.id }
-        var seen: Set<String> = []
-        // Once per row: the restriction reads Keychain and the program's file.
-        let restrictions = rows.map(sendRestriction)
-        let grouped = rows.indices.sorted { a, b in
-            if rows[a].builtIn != rows[b].builtIn { return rows[a].builtIn }
-            return restrictions[a] == nil && restrictions[b] != nil
-        }.filter { seen.insert(identity.canonical(key(rows[$0]))).inserted }
-        var contacts = grouped.map { index in
-            let row = rows[index]
-            return SimpleContact(id: row.builtIn ? String(row.id.dropFirst("builtin:".count)) : row.id,
-                                 name: identity.canonical(key(row)) == "claude" ? "Claude" : identity.canonical(key(row)) == "codex" ? "Codex" : row.name,
-                                 builtIn: row.builtIn, via: via(row),
-                                 sendRestriction: restrictions[index],
-                                 lastActivityAt: [row.contact?.provenInboundAt, row.contact?.provenOutboundAt]
-                                   .compactMap { $0.flatMap { dates.date(from: $0) } }.max(),
-                                 appBundleID: appBundleID(row),
-                                 link: link(row),
-                                 clawd: isClaude(row),
-                                 dot: row.contact.map(ChatGPTDotIPCTransport.owns) ?? false,
-                                 health: health[key(row)])
-        }
-        // A tint is who a contact is, so it follows the contact, not its row:
-        // in stable id order each initials avatar sits three hues of the eight
-        // on from the one before, so up to eight never share a tint and a new
-        // message never recolours anyone.
-        let tinted = contacts.indices.filter { contacts[$0].appBundleID == nil }.sorted { contacts[$0].id < contacts[$1].id }
-        for (step, index) in tinted.enumerated() {
-            contacts[index].tintSlot = step * 3 % SimpleAvatar.slotCount
-        }
-        return ContactList(stamp: stamps, programs: programs, contacts: contacts)
-    }
-
-    nonisolated static func mobileThreads(root: URL) throws -> [MobileAgentThread] {
-        Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
-        let snapshot = try read(root: root, cached: nil, includeHelpers: false).0
-        return snapshot.contacts.map { contact in
-            let lines = snapshot.lines[contact.id] ?? []
-            let status: String
-            if let problem = contact.health?.problem { status = problem }
-            else if snapshot.waiting.contains(contact.id) { status = "Waiting for reply" }
-            else if contact.recoveredFailure, snapshot.status[contact.id] == nil { status = "Ready" }
-            else {
-                switch snapshot.status[contact.id] {
-                case .sending?, .waiting?: status = "Waiting for reply"
-                case .delivered?: status = "Delivered"
-                case .read?: status = "Read"
-                case .answered?: status = "Replied"
-                case .failed?: status = "No reply"
-                case .notDelivered?: status = "Not delivered"
-                case nil: status = ""
-                }
-            }
-            let last = lines.last { !contact.recoveredFailure || !AgentLocalHealth.authenticationFailure(.string($0.text)) }
-            let row = MobileAgentRow(id: contact.id, name: contact.name, via: contact.via,
-                                     lastExchange: String((last?.text ?? "").prefix(240)), status: status,
-                                     sendRestriction: contact.sendRestriction)
-            let tail = lines.suffix(32)
-            return MobileAgentThread(agent: row, lines: tail.map {
-                MobileAgentLine(id: $0.id, speaker: $0.byPerson ? "You" : $0.fromAgent ? "Agent" : contact.name,
-                                text: String($0.text.prefix(2_000)), at: $0.at.timeIntervalSince1970)
-            }, truncated: lines.count > tail.count || tail.contains { $0.text.count > 2_000 })
-        }
-    }
-
-    nonisolated private static func read(root: URL, cached: ContactList?, includeHelpers: Bool = true) throws -> (Snapshot, ContactList) {
-        let list = try contactList(root: root, cached: cached)
-        var contacts = list.contacts
-        let identity = AgentContactIdentity(dataRoot: root)
-        let displayed = Dictionary(contacts.map { (identity.canonical($0.id), $0.id) }, uniquingKeysWith: { first, _ in first })
-        let ids = Set(contacts.map(\.id))
-        let dots = Set(contacts.filter(\.dot).map(\.id))
-        func owner(_ agent: String) -> String? {
-            if ids.contains(agent) { return agent }
-            if let id = displayed[identity.canonical(agent)] { return id }
-            // A helper's thread, keyed by the helper whatever case its id came in.
-            if agent.hasPrefix("bot:") { return UUID(uuidString: String(agent.dropFirst(4))).map(key) }
-            return nil
-        }
-
-        let recordsStamp = threadStamp(root: root)
-        let records = try AgentConversationStore(dataRoot: root).records()
-        var lines: [String: [SimpleThreadLine]] = [:]
-        var replies: [String: [SimpleThreadLine]] = [:]
-        var latest: [String: AgentConversationRecord] = [:]
-        var lastActive = Dictionary(contacts.compactMap { contact in
-            contact.lastActivityAt.map { (contact.id, $0) }
-        }, uniquingKeysWith: { first, _ in first })
-        for record in records {
-            // Dot sends straight through; his old record is no part of his thread.
-            guard let id = owner(record.agent), !dots.contains(id) else { continue }
-            lastActive[id] = max(lastActive[id] ?? .distantPast, record.updatedAt)
-            if record.updatedAt >= (latest[id]?.updatedAt ?? .distantPast) { latest[id] = record }
-            // A contact's thread is its own session (below); its record says
-            // only where the current send stands. A helper's is its record.
-            guard id.hasPrefix("bot:") else { continue }
-            let history = record.exchanges ?? []
-            for exchange in history {
-                if let prompt = exchange.prompt, !prompt.isEmpty {
-                    lines[id, default: []].append(.init(id: exchange.id + ":sent", fromAgent: true,
-                        text: prompt, at: exchange.sentAt, byPerson: exchange.byPerson == true))
-                }
-                // The newest exchange's answer sits in the record's receipt
-                // until the next send folds it into the history.
-                var reply = exchange.reply
-                if reply == nil, exchange.id == record.operationID, record.phase != "sending" {
-                    reply = receiptReply(record.receipt)
-                }
-                if let reply, !reply.isEmpty {
-                    replies[id, default: []].append(.init(id: exchange.id + ":reply", fromAgent: false,
-                        text: reply, at: exchange.sentAt.addingTimeInterval(0.001)))
-                }
-            }
-            if history.isEmpty, let reply = receiptReply(record.receipt) {
-                replies[id, default: []].append(.init(id: record.id + ":reply", fromAgent: false,
-                    text: reply, at: record.updatedAt))
-            }
-        }
-        // Everything a contact and the agent said to each other, from its own session.
-        for contact in contacts {
-            let said = try ContactThread.mergedLines(dataRoot: root, owner: contact.builtIn ? contact.id : String(contact.id.dropFirst(5)))
-            if !said.isEmpty {
-                lines[contact.id] = said.map { SimpleThreadLine(id: $0.id, fromAgent: $0.mine, text: $0.text, at: $0.at, byPerson: $0.byPerson,
-                                                             door: $0.door, fetched: $0.fetched) }
-            }
-        }
-        for (id, said) in replies { lines[id, default: []] += said }
-        for key in lines.keys {
-            lines[key]?.sort { $0.at < $1.at }
-            if let last = lines[key]?.last { lastActive[key] = max(lastActive[key] ?? .distantPast, last.at) }
-        }
-
-        var waiting: Set<String> = []
-        var status: [String: AgentConversationDelivery] = [:]
-        let health = AgentLocalHealth.read(root)
-        let bridges = NativeAgentPaths.bridgeConfigRoot(dataRoot: root)
-        for (id, record) in latest {
-            if let index = contacts.firstIndex(where: { $0.id == id }),
-               health[record.agent]?.resolves(record) == true {
-                contacts[index].recoveredFailure = true
-                if lines[id]?.last?.fetched == true { status[id] = .read }
-                continue
-            }
-            // A failed outbound attempt says nothing about a newer inbound turn's answer.
-            if let last = lines[id]?.last, last.at > record.updatedAt {
-                if last.fromAgent, last.fetched { status[id] = .read }
-                continue
-            }
-            // A contact that has spoken since the send answered it, whatever its record says.
-            if record.phase != "attention", !id.hasPrefix("bot:"), lines[id]?.last.map({ !$0.fromAgent }) == true { continue }
-            let message: String? = if case .string(let value)? = record.readInput?["message_id"] { value } else { nil }
-            // Read: the recipient's own inbox marked this message read.
-            let read = message.flatMap { message in
-                AgentConversationDelivery.inbox(agent: record.agent, bridgeConfigRoot: bridges).map {
-                    DelegationStatusProjector.requestTexts(inbox: $0, ids: [message], field: "read")[message] != nil
-                }
-            } ?? false
-            switch AgentConversationDelivery.of(record, read: read) {
-            case .sending, .waiting: waiting.insert(id)
-            case .answered: break
-            case let state: status[id] = state
-            }
-        }
-        for contact in contacts where latest[contact.id] == nil && lines[contact.id]?.last?.fetched == true {
-            status[contact.id] = .read
-        }
-        // Dot's thread owns its wait; every view uses the same reply projection.
-        for id in dots {
-            guard let last = lines[id]?.last, last.fromAgent else { continue }
-            if case .object(let reply) = AgentConversationView.dotReply(.object([:]), sentAt: last.at), reply["terminal"] == .bool(true) {
-                status[id] = .failed
-            } else { waiting.insert(id) }
-        }
-        let hub = AgentConversationLiveStore(dataRoot: root)
-        var flights: [String: SimpleFlight] = [:]
-        for (id, record) in latest { flights[id] = SimpleFlight(record, live: hub.current(for: record)) }
-        let ordered = contacts.enumerated().sorted { a, b in
-            switch (lastActive[a.element.id], lastActive[b.element.id]) {
-            case let (x?, y?): return x != y ? x > y : a.offset < b.offset
-            case (_?, nil): return true
-            case (nil, _?): return false
-            case (nil, nil): return a.offset < b.offset
-            }
-        }.map(\.element)
-        let helpers = includeHelpers ? (try? BotsShelfView.readRecords(root: root)) ?? [] : []
-        // Queued, or claimed by a runner in this app: the shelf's own "Running".
-        let running = (try? BotRunQueue(dataRoot: root).activeOrQueuedIDs()) ?? []
-        return (Snapshot(contacts: ordered, lines: lines, waiting: waiting, status: status, flights: flights,
-                         helpers: helpers, running: running, flightRecords: latest.mapValues(\.id),
-                         recordsStamp: recordsStamp), list)
-    }
-
-    nonisolated private static func threadStamp(root: URL) -> String {
-        stamp(root.appendingPathComponent("agents/conversations.json").path)
-            + stamp(root.appendingPathComponent("chat/sessions.json").path)
-    }
-
-    /// Only the flights, for a tick of the live file alone. Nil when the
-    /// records or chat index moved since the last full read.
-    nonisolated private static func readFlights(root: URL, last: Snapshot) -> [String: SimpleFlight]? {
-        guard threadStamp(root: root) == last.recordsStamp,
-              let records = try? AgentConversationStore(dataRoot: root).records() else { return nil }
-        let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        let hub = AgentConversationLiveStore(dataRoot: root)
-        var flights: [String: SimpleFlight] = [:]
-        for (contact, id) in last.flightRecords {
-            if let record = byID[id] { flights[contact] = SimpleFlight(record, live: hub.current(for: record)) }
-        }
-        return flights
-    }
-
-    /// How a contact is reached, in words a person uses.
-    nonisolated private static func via(_ row: AgentContactRow) -> String {
-        if row.builtIn { return "Built-in connection on this Mac" }
-        guard let contact = row.contact else { return "On this Mac" }
-        if ChatGPTDotIPCTransport.owns(contact) { return ChatGPTDotIPCTransport.detail }
-        switch contact.transport {
-        case .grokBot: return "Routine · replies come back here"
-        case .acp: return "Runs on this Mac"
-        case .a2a: return "Over the network (A2A)"
-        case .nativeAgent: return "Another NativeAgent"
-        case .desktop: return "Desktop app on this Mac"
-        case .desktopChat: return "Desktop app · through its chat window"
-        case .mcpHost: return contact.canStartTurn ? "Through its settings on this Mac (MCP)" : "Replies only · Through its settings on this Mac (MCP)"
-        }
-    }
-
-    nonisolated private static func link(_ row: AgentContactRow) -> SimpleContact.Link? {
-        switch row.contact?.transport {
-        case .grokBot?: return .routine
-        case .desktop?, .desktopChat?: return .desktopApp
-        default: return nil
-        }
-    }
-
     /// A bridged turn without the bracketed notes the bridge puts on top (and
     /// the bare contact-metadata line replies carried before 09-25).
     nonisolated static func bridgedText(_ content: String) -> String { ContactThread.bridgedText(content) }
-
-    nonisolated private static func receiptReply(_ receipt: JSONValue?) -> String? {
-        guard case .object(let root)? = receipt else { return nil }
-        var value = root
-        if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
-        for key in ["reply", "answer", "agent_reply_text", "agent_reply_text_head", "completion_text_head"] {
-            if case .string(let text)? = value[key], !text.isEmpty { return text }
-        }
-        return nil
-    }
 
     /// The first line of some text with its markdown marks gone, for a row.
     nonisolated static func firstLine(_ text: String) -> String {
@@ -854,8 +486,14 @@ private struct SimpleSidebar: View {
 
     var body: some View {
         // Talked to, newest first; the rest fold at the end.
-        let talked = store.contacts.filter { !isQuiet($0) }
-        let unheard = store.contacts.filter(isQuiet)
+        let health = AgentContactHealth.read(dataRoot: appModel.dataRootOverride ?? appModel.engine.dataRoot)
+        let contacts = store.contacts.map { contact in
+            var contact = contact
+            contact.health = health[contact.id]
+            return contact
+        }
+        let talked = contacts.filter { !isQuiet($0) }
+        let unheard = contacts.filter(isQuiet)
         // The Mac's own sidebar List (User 09-27: all controls native): its
         // selection, arrow keys and folds.
         // Her card is home, not a row: it wears its own quiet wash instead
@@ -1029,7 +667,7 @@ private struct SimpleSidebar: View {
 
     private func isQuiet(_ contact: SimpleContact) -> Bool {
         contact.lastActivityAt == nil && (store.lines[contact.id] ?? []).isEmpty && !store.waiting.contains(contact.id)
-            && store.status[contact.id] == nil && store.flights[contact.id] == nil && contact.health?.problem == nil
+            && store.status[contact.id] == nil && store.flight(for: contact.id) == nil && contact.health?.problem == nil
     }
 
     private func contactRow(_ contact: SimpleContact) -> some View {
@@ -1045,7 +683,7 @@ private struct SimpleSidebar: View {
         }
         // Working with her: the whole row wears the moving rim.
         .background {
-            if store.waiting.contains(contact.id) || store.flights[contact.id]?.working == true {
+            if store.waiting.contains(contact.id) || store.flight(for: contact.id)?.working == true {
                 WorkingRim(cornerRadius: 10).padding(.horizontal, -6).padding(.vertical, 1)
             }
         }
@@ -1105,7 +743,7 @@ private struct SimpleSidebar: View {
     /// What is moving on the thread now, in a word; it outranks Delivered
     /// and Read. Nil leaves the waiting or delivery word to speak.
     private func flightWord(_ contact: SimpleContact) -> String? {
-        guard let flight = store.flights[contact.id] else { return nil }
+        guard let flight = store.flight(for: contact.id) else { return nil }
         if flight.stop?.state == "stopping" { return "Stopping…" }
         if flight.stop?.state == "stopped", !flight.inFlight { return "Stopped" }
         if flight.working { return flight.partial != nil ? "Typing…" : "Working…" }
@@ -1177,7 +815,7 @@ private struct SimpleAgentCard: View {
            let partner = presentation.delegateName, !partner.isEmpty {
             return ("Working · with \(partner)", false)
         }
-        if appModel.isThinkingBeforeReply { return ("Thinking…", false) }
+        if appModel.engine.turns.isThinkingBeforeReply(for: appModel.activeChatSessionId) { return ("Thinking…", false) }
         if appModel.isBusy || appModel.isChatStreaming { return ("Replying…", false) }
         return (appModel.ownerWaitingCount ?? 0) > 0 ? ("Waiting on you", true) : ("Here", false)
     }
@@ -1188,7 +826,7 @@ private struct SimpleAgentCard: View {
         let name = AgentVoice(name: appModel.agentDisplayName).name
         let line = doing
         // The rim while the reply streams; before it, the plate shimmers.
-        let replying = (appModel.isBusy || appModel.isChatStreaming) && !appModel.isThinkingBeforeReply
+        let replying = (appModel.isBusy || appModel.isChatStreaming) && !appModel.engine.turns.isThinkingBeforeReply(for: appModel.activeChatSessionId)
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
                 SimpleBreathingOrb(replying: replying)
@@ -1312,20 +950,14 @@ struct SimpleAvatar: View {
     let contact: SimpleContact
     var size: CGFloat = 30
 
-    /// Resolved once per bundle id; nil when the app is not on this Mac.
-    @MainActor private static var icons: [String: NSImage?] = [:]
     /// Eight hues 45° apart (OKLCH h 25…340, L 0.53, C 0.075): one muted
     /// lightness, so no slot is louder than another, each ≥5.09:1 under a
     /// white initial. Adjacent slots are a full eighth of the wheel apart.
     nonisolated private static let tints: [UInt32] = [0x925A56, 0x886439, 0x6A713C, 0x42795D, 0x2B7880, 0x496F96, 0x6F6393, 0x895A79]
     nonisolated static var slotCount: Int { tints.count }
 
-    @MainActor private static func icon(_ bundleID: String) -> NSImage? {
-        if let cached = icons[bundleID] { return cached }
-        let icon = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID).map { NSWorkspace.shared.icon(forFile: $0.path) }
-        icons[bundleID] = icon
-        return icon
-    }
+    @State private var loadedIcon: NSImage?
+
 
     private static func tint(_ contact: SimpleContact) -> Color {
         let rgb = tints[contact.tintSlot ?? 0]
@@ -1336,7 +968,7 @@ struct SimpleAvatar: View {
         Group {
             if contact.clawd {
                 ClawdMark(size: size)
-            } else if let icon = contact.appBundleID.flatMap(Self.icon) {
+            } else if let icon = loadedIcon {
                 // The icon's squircle fills the circle; its transparent margin falls outside.
                 Image(nsImage: icon).resizable().interpolation(.high).scaledToFit().scaleEffect(1.24)
             } else {
@@ -1363,6 +995,13 @@ struct SimpleAvatar: View {
             }
         }
         .accessibilityHidden(true)
+        .task(id: contact) {
+            guard let bundleID = contact.appBundleID else { loadedIcon = nil; return }
+            let icon = await Task.detached(priority: .utility) {
+                NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID).map { NSWorkspace.shared.icon(forFile: $0.path) }
+            }.value
+            if !Task.isCancelled { loadedIcon = icon }
+        }
     }
 }
 

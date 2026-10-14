@@ -2,914 +2,467 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+import ToolRegistry
+import Senses
+import Network
+import Security
+import MacControl
 
-/// Sandbox config for invoking a tool subprocess.
-public struct ToolRunSandbox: Sendable {
-    public let toolRoot: URL
-    public let entrypoint: String
-    public let timeoutSeconds: Int
-    public let executableCommand: String
-    public let dataRoot: URL?
-    public let permissions: Set<String>
-
-    public init(
-        toolRoot: URL,
-        entrypoint: String = "tool.swift",
-        timeoutSeconds: Int = 10,
-        executableCommand: String = "/usr/bin/swift",
-        dataRoot: URL? = nil,
-        permissions: Set<String> = []
-    ) {
-        self.toolRoot = toolRoot
-        self.entrypoint = entrypoint
-        self.timeoutSeconds = timeoutSeconds
-        self.executableCommand = executableCommand
-        self.dataRoot = dataRoot
-        self.permissions = permissions
-    }
-
-    func profile(scratch: URL) throws -> String {
-        guard permissions.isSubset(of: SwiftToolValidator.knownToolPermissions) else {
-            throw ToolRunError.spawnFailed("Tool declares unknown permissions")
-        }
-        func quoted(_ url: URL) -> String {
-            let path = MacControlGate.resolvedPath(url.path)
-            return "\"" + path.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-        }
-        let toolchainReads = ["/System", "/usr", "/Library/Developer", "/Applications/Xcode.app"]
-            .map { "(subpath \(quoted(URL(fileURLWithPath: $0))))" }.joined(separator: "\n")
-        var rules = [
-            "(version 1)", "(allow default)",
-            "(deny file-read-data)", "(deny file-write*)", "(deny network*)",
-            "(deny mach-lookup)", "(deny appleevent-send)", "(deny process-exec)",
-            // Dyld opens the root directory before finding its shared cache.
-            "(allow file-read-data \(toolchainReads) (subpath \(quoted(toolRoot))) (subpath \(quoted(scratch))) (literal \"/\") (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))",
-            "(allow file-read-data (literal \"/Library/Preferences/com.apple.dt.Xcode.plist\"))",
-            "(allow file-write* (subpath \(quoted(scratch))) (literal \"/dev/null\"))",
-            "(allow process-exec (literal \"/usr/bin/swift\") (literal \"/usr/bin/xcrun\") (subpath \"/Library/Developer\") (subpath \"/Applications/Xcode.app\"))",
-        ]
-        if permissions.contains("computer_files") { rules.append("(allow file-read-data)") }
-        if permissions.contains("arbitrary_file_write") { rules.append("(allow file-write*)") }
-        if permissions.contains("app_data_read") || permissions.contains("app_data_write") {
-            guard let dataRoot else { throw ToolRunError.spawnFailed("Tool app-data root is unavailable") }
-            rules.append("(allow file-read-data (subpath \(quoted(dataRoot))))")
-            if permissions.contains("app_data_write") {
-                rules.append("(allow file-write* (subpath \(quoted(dataRoot))))")
-            }
-        }
-        if permissions.contains("network") {
-            rules.append("(allow network*)")
-        } else {
-            if permissions.contains("network_public") {
-                rules.append("(allow network-outbound (require-all (remote ip \"*:*\") (require-not (remote ip \"localhost:*\"))))")
-            }
-            if permissions.contains("network_localhost") {
-                rules.append("(allow network-outbound (remote ip \"localhost:*\"))")
-                rules.append("(allow network-bind network-inbound (local ip \"localhost:*\"))")
-            }
-        }
-        if !permissions.isDisjoint(with: ["network", "network_public", "network_localhost"]) {
-            rules.append("(allow mach-lookup (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.mDNSResponder\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))")
-        }
-        if permissions.contains("shell") { rules.append("(allow process-exec)") }
-        if let dataRoot {
-            // General file grants cannot disclose credentials or rewrite the
-            // stores that own approvals, identity, and executable authority.
-            let privateStores = [
-                "secrets", "credentials", "oauth_tokens", "providers", "codex_home", "codex_child_home",
-                "connectors", "telegram/config.json", "slack/config.json",
-                "tools/.manifest_signing_key", "catalog/.pack_signing_key",
-                "icloud_pairing_secret.bin", "mobile", "mobile_push", "notifications/push_tokens.json",
-                "claude", "bridge-config",
-                "senses/ledger", "senses/news",
-            ]
-            for path in privateStores {
-                rules.append("(deny file-read-data file-write* (subpath \(quoted(dataRoot.appendingPathComponent(path)))))")
-            }
-            for path in ["trust", "security", "catalog", "tools", "persona", "workflows/approvals", "approvals", "paired_phones.json", "telegram", "slack"] {
-                rules.append("(deny file-write* (subpath \(quoted(dataRoot.appendingPathComponent(path)))))")
-            }
-            let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-            rules.append("(deny file-write* (subpath \(quoted(personaRoot))))")
-            rules.append("(deny file-write-unlink (literal \(quoted(dataRoot))))")
-            rules.append("(deny file-write-unlink (literal \(quoted(dataRoot.appendingPathComponent("workflows")))))")
-            rules.append("(deny file-write-unlink (literal \(quoted(dataRoot.appendingPathComponent("senses")))))")
-        }
-        // The executing artifact stays immutable, including for data writers.
-        rules.append("(deny file-write* (subpath \(quoted(toolRoot))))")
-        return rules.joined(separator: "\n")
-    }
-}
-
-public struct ToolRunResult: Sendable, Codable {
-    public let stdout: String
-    public let stderr: String
-    public let exitCode: Int32
-    public let durationSeconds: Double
-    public let timedOut: Bool
-    public let parsedOutput: JSONValue?
-
-    public init(
-        stdout: String,
-        stderr: String,
-        exitCode: Int32,
-        durationSeconds: Double,
-        timedOut: Bool,
-        parsedOutput: JSONValue?
-    ) {
-        self.stdout = stdout
-        self.stderr = stderr
-        self.exitCode = exitCode
-        self.durationSeconds = durationSeconds
-        self.timedOut = timedOut
-        self.parsedOutput = parsedOutput
-    }
-}
-
-public enum ToolRunError: Error, LocalizedError {
-    case toolNotActive(id: String, currentStatus: String)
-    case fingerprintMismatch(expected: String, actual: String)
-    case entrypointMissing(path: String)
-    case spawnFailed(String)
-    case timeout
-    case outputLimitExceeded(stream: String, limitBytes: Int)
-    case nonZeroExit(code: Int32, signalled: Bool, stderr: String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .toolNotActive(let id, let status):
-            return "Tool \(id) is not active (status=\(status))"
-        case .fingerprintMismatch(let expected, let actual):
-            return "Tool code fingerprint mismatch (expected=\(expected) actual=\(actual))"
-        case .entrypointMissing(let path):
-            return "Tool entrypoint missing at \(path)"
-        case .spawnFailed(let why):
-            return "Failed to spawn tool subprocess: \(why)"
-        case .timeout:
-            return "Tool subprocess exceeded timeout and was killed"
-        case .outputLimitExceeded(let stream, let limitBytes):
-            return "Tool subprocess exceeded the \(limitBytes)-byte \(stream) capture limit and was killed"
-        case .nonZeroExit(let code, let signalled, let stderr):
-            let reason = signalled ? "terminated by signal \(code) (\(String(cString: strsignal(code))))" : "exited \(code)"
-            let detail = stderr.isEmpty ? "No stderr was captured.\(signalled ? " Inspect the macOS crash report for this subprocess." : "")" : String(stderr.prefix(4000))
-            return "Tool subprocess \(reason): \(detail)"
-        }
-    }
-}
-
-/// SHA-256 fingerprint over manifest.json + entrypoint + tests.json bytes,
-/// interleaved with `<basename>\0<bytes>\0` markers. Mirrors the daemon's
-/// `tool_code_fingerprint`.
-public func computeToolCodeFingerprint(toolRoot: URL, entrypointName: String) -> String {
-    let entrypointURL = toolRoot.appendingPathComponent(entrypointName)
-    let paths: [URL] = [
-        toolRoot.appendingPathComponent("manifest.json"),
-        entrypointURL,
-        toolRoot.appendingPathComponent("tests.json"),
+/// Declared-reach primitives for the shared JavaScript executor.
+actor ToolPrimitiveBroker {
+    static let knownPermissions: Set<String> = [
+        "app_data_read", "app_data_write", "network_localhost", "network_public",
+        "network", "shell", "computer_files", "arbitrary_file_write",
     ]
-    var hasher = SHA256Streaming()
-    for path in paths {
-        let name = path.lastPathComponent
-        hasher.update(Data(name.utf8))
-        hasher.update(Data([0]))
-        if let bytes = try? Data(contentsOf: path) {
-            hasher.update(bytes)
-        }
-        hasher.update(Data([0]))
-    }
-    return hasher.finalizeHex()
-}
-
-/// Test-only escalation timeline events. Emitted from the reap thread so a
-/// regression can prove the SIGTERM→grace→SIGKILL sequence actually ran (and
-/// was not shortcut by a spurious cancellation signal). Never used in
-/// production paths — the observer is nil unless a test installs one.
-public enum ToolRunEscalationEvent: Sendable, Equatable {
-    case initialWaitEnded(exited: Bool, cancelled: Bool, timedOut: Bool)
-    case sigterm
-    case sigkill
-    case reaped
-}
-
-public actor ToolRunSandboxRunner {
-    /// A tool result is provider-bound data, not an archival log. Keep each
-    /// pipe comfortably above ordinary structured results while preventing a
-    /// noisy or compromised subprocess from retaining memory until timeout.
-    private static let maximumCapturedBytesPerStream = 4 * 1_024 * 1_024
-
-    public init() {}
-
-    /// Grace window (ms) between SIGTERM and SIGKILL in the reap escalation.
-    /// Overridable via `_setEscalationGraceMillis` so a cancel-during-grace
-    /// regression can widen the window and land its cancel deterministically.
-    private var escalationGraceMillis: Int = 200
-    /// Test observer for the escalation timeline (see `ToolRunEscalationEvent`).
-    private var escalationObserver: (@Sendable (ToolRunEscalationEvent) -> Void)?
-
-    /// Test seam — widen the SIGTERM→SIGKILL grace window.
-    public func _setEscalationGraceMillis(_ ms: Int) { escalationGraceMillis = max(1, ms) }
-    /// Test seam — observe the reap escalation timeline.
-    public func _setEscalationObserver(_ observer: (@Sendable (ToolRunEscalationEvent) -> Void)?) {
-        escalationObserver = observer
-    }
-
-    /// Invoke the tool with `input` as compact-JSON on stdin. Capture
-    /// stdout/stderr/exitCode. Kill after timeoutSeconds. Returns ToolRunResult.
-    public func runTool(
-        sandbox: ToolRunSandbox,
-        input: JSONValue,
-        expectedFingerprint: String?,
-        actualFingerprint: String?
-    ) async throws -> ToolRunResult {
-        if let expected = expectedFingerprint, !expected.isEmpty {
-            let actual = actualFingerprint ?? computeToolCodeFingerprint(
-                toolRoot: sandbox.toolRoot, entrypointName: sandbox.entrypoint
-            )
-            if expected != actual {
-                throw ToolRunError.fingerprintMismatch(expected: expected, actual: actual)
+    static let readOperations = Set(AuthoredToolEffects.primitiveCapabilities.compactMap { $0.value.contains("safe_read") ? $0.key : nil })
+    static let operations = Set(AuthoredToolEffects.primitiveCapabilities.keys)
+    static func appTargets(_ permissions: Set<String>) -> [String: String] {
+        var targets: [String: String] = [:]
+        for permission in permissions {
+            let parts = permission.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2, ["app_read", "app_write"].contains(parts[0]) {
+                if targets[parts[1]] != "write" { targets[parts[1]] = parts[0] == "app_write" ? "write" : "read" }
             }
         }
+        return targets
+    }
+    static func knownPermission(_ permission: String) -> Bool {
+        knownPermissions.contains(permission) || !appTargets([permission]).isEmpty
+    }
+    static func readOnly(_ operation: String, _ arguments: JSONValue) -> Bool {
+        AuthoredToolEffects.primitiveEffects(operation, arguments: arguments).contains("safe_read")
+    }
+    static let privateStores = [
+        "secrets", "credentials", "oauth_tokens", "providers", "codex_home", "codex_child_home",
+        "connectors", "telegram/config.json", "slack/config.json", "tools/.manifest_signing_key",
+        "catalog/.pack_signing_key", "icloud_pairing_secret.bin", "mobile", "mobile_push",
+        "notifications/push_tokens.json", "claude", "bridge-config", "senses/ledger", "senses/news",
+    ]
+    private let root: URL
+    private let permissions: Set<String>
+    private var connections: [String: NWConnection] = [:]
+    private var listeners: [String: (NWListener, AsyncThrowingStream<String, Error>, AsyncThrowingStream<String, Error>.Continuation)] = [:]
+    private let queue = DispatchQueue(label: "nativeagent.authored.network")
+    private var closed = false
+    private static let byteLimit = 4 * 1024 * 1024
 
-        let entrypointURL = sandbox.toolRoot.appendingPathComponent(sandbox.entrypoint)
-        if !FileManager.default.fileExists(atPath: entrypointURL.path) {
-            throw ToolRunError.entrypointMissing(path: entrypointURL.path)
-        }
+    init(root: URL, permissions: Set<String>) {
+        self.root = root.standardizedFileURL.resolvingSymlinksInPath(); self.permissions = permissions
+    }
 
-        // If the enclosing Task was already cancelled before we spawn, bail
-        // loud before creating a subprocess at all — no orphan to reap.
+    func check(_ operation: String, arguments: JSONValue) throws {
         try Task.checkCancellation()
-
-        let inputBytes = try input.serializedData(pretty: false)
-
-        let process = Process()
-        let parts = sandbox.executableCommand.split(separator: " ").map(String.init)
-        guard let executable = parts.first else { throw ToolRunError.spawnFailed("Tool executable is missing") }
-        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("nativeagent-tool-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true,
-                                               attributes: [.posixPermissions: 0o700])
-        defer { try? FileManager.default.removeItem(at: scratch) }
-        let profile = try sandbox.profile(scratch: scratch)
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
-        let compilerArguments = executable == "/usr/bin/swift" ? ["-module-cache-path", scratch.path] : []
-        process.arguments = ["-p", profile, executable] + Array(parts.dropFirst()) + compilerArguments + [entrypointURL.path]
-        process.environment = [
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "HOME": scratch.path, "TMPDIR": scratch.path,
-            "xcrun_db": scratch.appendingPathComponent("xcrun_db").path,
-            "CLANG_MODULE_CACHE_PATH": scratch.path,
-        ]
-        if executable == "/usr/bin/swift" {
-            // Resolve Apple's compiler into scratch before confining the authored code.
-            let compiler = Process()
-            compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-            compiler.arguments = ["--sdk", "macosx", "--find", "swift"]
-            compiler.environment = process.environment
-            let output = Pipe()
-            compiler.standardOutput = output
-            compiler.standardError = output
-            try compiler.run()
-            let compilerPath = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            compiler.waitUntilExit()
-            guard compiler.terminationStatus == 0, compilerPath.hasPrefix("/") else {
-                throw ToolRunError.spawnFailed("Swift compiler lookup failed: \(compilerPath)")
+        guard !closed, Self.operations.contains(operation), case .object(let args) = arguments else {
+            throw SenseFailure(code: "bad_input", message: "A known primitive and named arguments are required.")
+        }
+        if operation == "apps.call" {
+            guard case .string(let bundleID)? = args["bundle_id"], let access = Self.appTargets(permissions)[bundleID] else {
+                throw SenseFailure(code: "undeclared_target", message: "Declare app_read:<bundle_id> or app_write:<bundle_id> for this target.")
             }
-            process.arguments?[2] = compilerPath
-        }
-        if let dataRoot = sandbox.dataRoot { process.environment?["NATIVEAGENT_DATA_ROOT"] = dataRoot.path }
-        process.currentDirectoryURL = sandbox.toolRoot
-
-        let stdinPipe = Pipe()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardInput = stdinPipe
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        let stdinWriter = try PipeInputWriter(
-            handle: stdinPipe.fileHandleForWriting,
-            input: inputBytes
-        )
-        // Two-channel wake accounting so cancellation can never corrupt the
-        // kill escalation (W3d review, finding 1):
-        //   • terminationSignal — signaled ONLY by the process terminationHandler
-        //     (a genuine child exit). Consumed ONLY by the escalation grace-waits
-        //     below. Because nothing else can signal it, a grace-wait that ends
-        //     in `.success` PROVES the child died; `.timedOut` PROVES it is still
-        //     alive. The escalation is therefore unpollutable.
-        //   • wakeSignal — signaled by the terminationHandler (prompt wake on a
-        //     real exit) AND by `onCancel` (prompt wake on cancellation).
-        //     Consumed ONLY by the initial wait's slice loop; its counts never
-        //     reach a grace-wait, so a cancel can never shortcut SIGTERM→SIGKILL.
-        //   • terminatedBox — set ONLY by the terminationHandler; the escalation
-        //     consults this flag (not raw wait results) to decide "already gone".
-        let terminationSignal = DispatchSemaphore(value: 0)
-        let wakeSignal = DispatchSemaphore(value: 0)
-        let terminatedBox = TerminatedFlag()
-        process.terminationHandler = { _ in
-            terminatedBox.set(true)
-            terminationSignal.signal()
-            wakeSignal.signal()
-        }
-
-        let outputLimitBox = OutputLimitBox()
-        let stdoutBuf = PipeCaptureBuffer(
-            stream: "stdout",
-            limitBytes: Self.maximumCapturedBytesPerStream,
-            overflow: outputLimitBox
-        )
-        let stderrBuf = PipeCaptureBuffer(
-            stream: "stderr",
-            limitBytes: Self.maximumCapturedBytesPerStream,
-            overflow: outputLimitBox
-        )
-        // Drain stdout/stderr continuously while the tool runs. This deliberately
-        // avoids FileHandle.readabilityHandler: Foundation implements it with a
-        // dispatch source, and full-suite parallel subprocess churn can close the
-        // pipe while libdispatch still owns that source, tripping
-        // "Unexpected EV_VANISHED". A nonblocking POSIX read loop has an explicit
-        // stop point and no hidden descriptor owner.
-        let stdoutDrain = try PipeDrainLoop(
-            fileDescriptor: stdoutPipe.fileHandleForReading.fileDescriptor,
-            buffer: stdoutBuf
-        )
-        let stderrDrain = try PipeDrainLoop(
-            fileDescriptor: stderrPipe.fileHandleForReading.fileDescriptor,
-            buffer: stderrBuf
-        )
-        outputLimitBox.setWakeHandler { wakeSignal.signal() }
-        stdoutDrain.start()
-        stderrDrain.start()
-
-        let startNs = DispatchTime.now().uptimeNanoseconds
-        do {
-            try process.run()
-            try? stdinPipe.fileHandleForReading.close()
-            try? stdoutPipe.fileHandleForWriting.close()
-            try? stderrPipe.fileHandleForWriting.close()
-        } catch {
-            stdoutDrain.stopAndWait()
-            stderrDrain.stopAndWait()
-            try? stdinPipe.fileHandleForReading.close()
-            try? stdoutPipe.fileHandleForWriting.close()
-            try? stderrPipe.fileHandleForWriting.close()
-            throw ToolRunError.spawnFailed(String(describing: error))
-        }
-        let childPid = process.processIdentifier
-        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(childPid)
-        let launchedTree = Self.captureOwnedTree(rootPID: childPid)
-
-        // Feed stdin off-thread without a blocking write. A descendant may
-        // retain the read end after the direct child exits, so child exit alone
-        // does not guarantee EPIPE or release this writer's input/thread.
-        stdinWriter.start()
-
-        let timeoutSeconds = max(1, sandbox.timeoutSeconds)
-        let timedOutBox = TimedOutBox()
-        let cancelledBox = CancelFlag()
-        let pidRef = process
-        let graceMillis = escalationGraceMillis
-        let observer = escalationObserver
-
-        // Wait for the child to exit, hit its timeout, or the enclosing Task to
-        // be cancelled. `onCancel` bridges Swift cancellation onto the dedicated
-        // reap thread by flipping `cancelledBox` and poking `wakeSignal` — it
-        // NEVER touches `terminationSignal`, so the SIGTERM→grace→SIGKILL
-        // escalation's grace-waits (which consult `terminationSignal` alone) can
-        // only ever end on a genuine child exit. The block runs the SAME reap
-        // escalation for a timeout and a cancel, so the child is reaped on both
-        // paths — no orphaned process.
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                // A dedicated thread is intentional. Full-suite subprocess
-                // churn can saturate the shared GCD pool; cancellation/reaping
-                // is lifecycle-critical and must not wait behind unrelated
-                // global-queue work.
-                let reaper = Thread {
-                    // Initial wait is purely event/deadline driven. A child
-                    // exit and cancellation both signal `wakeSignal`; no
-                    // periodic polling heartbeat is needed.
-                    let deadline = DispatchTime.now() + .seconds(timeoutSeconds)
-                    while true {
-                        if terminatedBox.get() { break }
-                        if cancelledBox.get() { break }
-                        if outputLimitBox.exceeded != nil { break }
-                        if wakeSignal.wait(timeout: deadline) == .timedOut { break }
-                    }
-
-                    let didExit = terminatedBox.get()
-                    let wasCancelled = cancelledBox.get()
-                    let exceededOutputLimit = outputLimitBox.exceeded != nil
-                    observer?(.initialWaitEnded(
-                        exited: didExit,
-                        cancelled: wasCancelled,
-                        timedOut: !didExit && !wasCancelled && !exceededOutputLimit
-                    ))
-
-                    var ownedTree = Self.captureOwnedTree(rootPID: childPid, retaining: launchedTree)
-                    if !didExit {
-                        // Timeout or cancel — escalate to reap the child.
-                        // Cancellation takes priority over timeout for the
-                        // surfaced error; only stamp timedOut when NOT cancelled.
-                        if !wasCancelled && !exceededOutputLimit { timedOutBox.set(true) }
-                        let terminationTree = ownedTree
-                        ProcessTreeReaper.signal(terminationTree, signal: SIGTERM)
-                        observer?(.sigterm)
-                        // Grace-wait consults `terminationSignal` ALONE. It can
-                        // ONLY end early on a genuine exit — a cancel that lands
-                        // during this window signals `wakeSignal`, never this
-                        // semaphore, so it cannot shortcut the SIGKILL. Consult
-                        // `terminatedBox` too, belt-and-suspenders, so the kill
-                        // decision keys on the real-exit flag rather than a raw
-                        // wait result.
-                        let graceExpired = terminationSignal.wait(
-                            timeout: .now() + .milliseconds(graceMillis)
-                        ) == .timedOut
-                        let killTree = Self.captureOwnedTree(
-                            rootPID: childPid,
-                            retaining: terminationTree
-                        )
-                        ownedTree = killTree
-                        if (graceExpired && !terminatedBox.get())
-                            || ProcessTreeReaper.hasLiveDescendant(in: killTree) {
-                            // Freeze the verified tree, rescan it, then kill.
-                            // A one-shot leaf-first SIGKILL leaves a narrow
-                            // scan-vs-fork race where the tool can create a new
-                            // child after the snapshot and orphan it as the
-                            // parent dies.
-                            ownedTree = Self.quiesceAndKillOwnedTree(killTree)
-                            observer?(.sigkill)
-                        }
-                        // Do not make prompt cancellation depend on the
-                        // scheduling latency of Foundation's termination
-                        // callback. `waitUntilExit` performs the authoritative
-                        // reap on this dedicated thread after the direct PID has
-                        // received an unignorable SIGKILL when needed.
-                        if pidRef.isRunning { pidRef.waitUntilExit() }
-                        observer?(.reaped)
-                    }
-                    // A successful direct-child exit does not end ownership:
-                    // background children can still hold pipes or do work.
-                    let survivors = Self.captureOwnedTree(rootPID: childPid, retaining: ownedTree)
-                    if ProcessTreeReaper.hasLiveDescendant(in: survivors) {
-                        Self.quiesceAndKillOwnedTree(survivors)
-                    }
-                    cont.resume()
+            guard access == "write" || AuthoredToolEffects.appReadOnly(args) else {
+                throw SenseFailure(code: "read_only", message: "A read-declared app refuses modifying or unclassified events.")
+            }
+            try SystemAppleScriptAdapter.checkAppScript(args)
+        } else if operation.hasPrefix("files.") {
+            _ = try path(args, write: !Self.readOperations.contains(operation) && operation != "files.copy")
+            if operation == "files.copy" || operation == "files.move" { _ = try path(args, key: "to", write: true) }
+        } else {
+            guard !permissions.isDisjoint(with: ["network", "network_public", "network_localhost"]) else {
+                throw denied("Declare the network permission this operation needs.")
+            }
+            if operation == "network.connect" || operation == "network.listen" {
+                let local = Self.loopback(try text(args, "host"))
+                guard permissions.contains("network") || local && permissions.contains("network_localhost")
+                    || operation == "network.connect" && !local && permissions.contains("network_public") else {
+                    throw denied("This network host or listening operation is outside the declared reach.")
                 }
-                reaper.qualityOfService = .userInitiated
-                reaper.start()
+                _ = try port(args, zero: operation == "network.listen")
             }
-        } onCancel: {
-            cancelledBox.set(true)
-            // Wake the initial wait's slice loop NOW. Signals `wakeSignal` ONLY —
-            // never `terminationSignal` — so the escalation grace-waits stay
-            // honest (a spurious cancel can't be mistaken for a child exit).
-            wakeSignal.signal()
         }
-        process.terminationHandler = nil
-        stdinWriter.stopAndWait()
-
-        let endNs = DispatchTime.now().uptimeNanoseconds
-        let duration = Double(endNs &- startNs) / 1_000_000_000.0
-
-        // Stop the readers after the direct child exits. A grandchild may keep a
-        // write end inherited from stdout/stderr open forever, so the readers do
-        // not wait for EOF here.
-        stdoutDrain.stopAndWait()
-        stderrDrain.stopAndWait()
-        try? stdinPipe.fileHandleForReading.close()
-        try? stdoutPipe.fileHandleForReading.close()
-        try? stderrPipe.fileHandleForReading.close()
-
-        // Cancellation is loud and takes priority: the child was reaped by the
-        // escalation above, surviving descendants are killed, and the drain
-        // threads are joined, so surface CancellationError
-        // rather than a silent partial result. Checked before `timedOut`
-        // because a cancel never stamps `timedOutBox`.
-        if cancelledBox.get() {
-            throw CancellationError()
-        }
-
-        if let exceeded = outputLimitBox.exceeded {
-            throw ToolRunError.outputLimitExceeded(
-                stream: exceeded.stream,
-                limitBytes: exceeded.limitBytes
-            )
-        }
-
-        let stdoutData = stdoutBuf.data
-        let stderrData = stderrBuf.data
-
-        let stdoutStr = String(data: stdoutData, encoding: .utf8) ?? ""
-        let stderrStr = String(decoding: stderrData, as: UTF8.self)
-        let exit = process.terminationStatus
-        let timedOut = timedOutBox.get()
-
-        if timedOut {
-            throw ToolRunError.timeout
-        }
-
-        let parsed: JSONValue? = (try? JSONValue.parse(stdoutData))
-
-        if exit != 0 {
-            throw ToolRunError.nonZeroExit(code: exit, signalled: process.terminationReason == .uncaughtSignal, stderr: stderrStr)
-        }
-
-        return ToolRunResult(
-            stdout: stdoutStr,
-            stderr: stderrStr,
-            exitCode: exit,
-            durationSeconds: duration,
-            timedOut: false,
-            parsedOutput: parsed
-        )
     }
 
-    private nonisolated static func captureOwnedTree(
-        rootPID: Int32,
-        retaining prior: ProcessTreeSnapshot? = nil
-    ) -> ProcessTreeSnapshot {
-        let current = ProcessTreeReaper.snapshot(rootPID: rootPID, retaining: prior)
-        let ownerIdentity = prior?.rootIdentity ?? current.rootIdentity
-        let tree = ProcessTreeSnapshot(rootPID: rootPID, rootIdentity: ownerIdentity,
-                                       descendants: current.descendants)
-        guard rootPID > 0 else { return tree }
-        // Group members survive reparenting when the direct child exits.
-        // Retain their start identities, and never adopt a reused root PID.
-        if let prior {
-            if let liveRoot = ProcessTreeReaper.snapshot(rootPID: rootPID).rootIdentity,
-               liveRoot != prior.rootIdentity { return tree }
-            guard prior.rootIdentity != nil || !prior.descendants.isEmpty else { return tree }
+    func perform(_ operation: String, arguments: JSONValue) async throws -> JSONValue {
+        try check(operation, arguments: arguments)
+        let args = SwiftNativeToolExecution.fields(arguments)
+        if operation == "apps.call" { return try await SystemAppleScriptAdapter().callApp(arguments, targets: Self.appTargets(permissions)) }
+        if operation.hasPrefix("network.") { return try await network(operation, args: args) }
+        let source = try path(args, write: !Self.readOperations.contains(operation) && operation != "files.copy")
+        switch operation {
+        case "files.read":
+            let fd = try VerifiedPath.open(source, flags: O_RDONLY | O_NONBLOCK)
+            defer { _ = Darwin.close(fd) }
+            var metadata = stat()
+            guard fstat(fd, &metadata) == 0, metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                  metadata.st_size >= 0 else {
+                throw SenseFailure(code: "bad_input", message: "Read a regular file.")
+            }
+            let offset = try offset(args), length = args["length"] ?? .int(Int64(Self.byteLimit))
+            guard case .int(let count) = length, count > 0, count <= Self.byteLimit else {
+                throw SenseFailure(code: "bad_input", message: "Read length is 1 to 4 MiB; use offset for the next chunk.")
+            }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+            try handle.seek(toOffset: offset)
+            let bytes = try handle.read(upToCount: Int(count)) ?? Data()
+            return .object(["base64": .string(bytes.base64EncodedString()), "bytes": .int(Int64(bytes.count)),
+                            "offset": .int(Int64(offset)), "eof": .bool(offset + UInt64(bytes.count) >= UInt64(metadata.st_size))])
+        case "files.write":
+            let bytes = try Self.data(args)
+            let parent = try VerifiedPath.openParent(of: source)
+            defer { parent.release() }
+            let name = ".\(UUID().uuidString).write"
+            let fd = openat(parent.fd, name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            guard fd >= 0 else { throw VerifiedPath.Failure.posix(errno) }
+            defer { _ = Darwin.close(fd); _ = unlinkat(parent.fd, name, 0) }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+            if args["offset"] != nil || args["append"] == .bool(true) {
+                let original = openat(parent.fd, parent.name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+                if original >= 0 {
+                    defer { _ = Darwin.close(original) }
+                    var metadata = stat()
+                    guard fstat(original, &metadata) == 0, metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+                        throw SenseFailure(code: "bad_input", message: "Write a regular file.")
+                    }
+                    guard fcopyfile(original, fd, nil, copyfile_flags_t(COPYFILE_ALL)) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+                } else if errno != ENOENT { throw VerifiedPath.Failure.posix(errno) }
+                if args["append"] == .bool(true) { try handle.seekToEnd() }
+                else { try handle.seek(toOffset: offset(args)) }
+            }
+            try Task.checkCancellation()
+            try handle.write(contentsOf: bytes)
+            try Task.checkCancellation()
+            try permitted(source, write: true)
+            guard renameat(parent.fd, name, parent.fd, parent.name) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+            return .object(["path": .string(source.path), "bytes": .int(Int64(bytes.count))])
+        case "files.mkdir":
+            if args["parents"] == .bool(true) {
+                let parent = try VerifiedPath.openParent(of: source.appendingPathComponent(".directory"), createIntermediates: true)
+                parent.release()
+            } else {
+                let parent = try VerifiedPath.openParent(of: source)
+                defer { parent.release() }
+                try Task.checkCancellation()
+                guard mkdirat(parent.fd, parent.name, 0o755) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+            }
+        case "files.remove":
+            let parent = try VerifiedPath.openParent(of: source)
+            defer { parent.release() }
+            try remove(parent.fd, name: parent.name)
+        case "files.copy": try copy(source, to: path(args, key: "to", write: true))
+        case "files.move": try VerifiedPath.transfer(from: source, to: path(args, key: "to", write: true), copy: false, overwrite: false)
+        case "files.info":
+            var metadata = stat()
+            if source.path == "/" {
+                let fd = try VerifiedPath.open(source, flags: O_RDONLY | O_DIRECTORY)
+                defer { _ = Darwin.close(fd) }
+                guard fstat(fd, &metadata) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+            } else {
+                let parent = try VerifiedPath.openParent(of: source)
+                defer { parent.release() }
+                guard fstatat(parent.fd, parent.name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+            }
+            let type = metadata.st_mode & mode_t(S_IFMT)
+            return .object(["path": .string(source.path), "bytes": .int(metadata.st_size),
+                            "regular": .bool(type == mode_t(S_IFREG)), "directory": .bool(type == mode_t(S_IFDIR)),
+                            "symbolicLink": .bool(type == mode_t(S_IFLNK))])
+        case "files.list", "files.count":
+            let fd = try VerifiedPath.open(source, flags: O_RDONLY | O_DIRECTORY)
+            defer { _ = Darwin.close(fd) }
+            var paths: [JSONValue] = [], count: Int64 = 0
+            let options: FileManager.DirectoryEnumerationOptions = args["skipHidden"] == .bool(true) ? [.skipsHiddenFiles] : []
+            guard let enumerator = FileManager.default.enumerator(at: source, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], options: options)
+                else { throw SenseFailure(code: "world_error", message: "The folder could not be enumerated.") }
+            while let entry = enumerator.nextObject() as? URL {
+                try Task.checkCancellation()
+                guard let values = try? entry.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                    else { enumerator.skipDescendants(); continue }
+                if values.isSymbolicLink == true || args["recursive"] != .bool(true) { enumerator.skipDescendants() }
+                do { try permitted(entry, write: false) }
+                catch { enumerator.skipDescendants(); continue }
+                if args["regularOnly"] == .bool(true), values.isSymbolicLink == true || values.isRegularFile != true { continue }
+                count += 1
+                if operation == "files.list" { paths.append(.string(entry.path)) }
+            }
+            let result: JSONValue = operation == "files.count" ? .object(["count": .int(count)]) : .array(paths)
+            guard try result.serializedData(pretty: false).count <= Self.byteLimit else {
+                throw SenseFailure(code: "output_limit", message: "File listing exceeds the 4 MiB primitive limit.")
+            }
+            return result
+        default: throw SenseFailure(code: "unsupported", message: "Unknown file primitive.")
         }
-        let bytes = proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(rootPID), nil, 0)
-        guard bytes > 0 else { return tree }
-        var pids = [Int32](repeating: 0, count: Int(bytes) / MemoryLayout<Int32>.stride + 16)
-        let used = proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(rootPID), &pids,
-                                Int32(pids.count * MemoryLayout<Int32>.stride))
-        var identities = tree.descendants
-        for pid in pids.prefix(max(0, Int(used)) / MemoryLayout<Int32>.stride)
-        where pid > 0 && pid != rootPID {
-            var info = proc_bsdinfo()
-            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
-            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
-                  info.pbi_pgid == UInt32(rootPID) else { continue }
-            let identity = ProcessTreeIdentity(pid: pid, startSeconds: info.pbi_start_tvsec,
-                                               startMicroseconds: info.pbi_start_tvusec)
-            if !identities.contains(identity) { identities.append(identity) }
+        return .object(["path": .string(source.path)])
+    }
+
+    private func path(_ args: [String: JSONValue], key: String = "path", write: Bool) throws -> URL {
+        let scope = try text(args, "root"), given = try text(args, key)
+        guard !given.split(separator: "/").contains("..") else { throw denied("Paths must not contain '..' components.") }
+        let url: URL
+        if scope == "app_data" {
+            guard !given.hasPrefix("/"), !given.hasPrefix("~"),
+                  !given.contains("\0") else { throw denied("App-data paths must stay relative to the app-data root.") }
+            url = root.appendingPathComponent(given.split(separator: "/").filter { $0 != "." }.joined(separator: "/"))
+            guard under(url, root) else { throw denied("The app-data path resolves outside its root.") }
+            guard permissions.contains("app_data_write") || !write && permissions.contains("app_data_read") else {
+                throw denied("Declare app_data_read or app_data_write for this path.")
+            }
+        } else if scope == "computer" {
+            guard given.hasPrefix("/") || given.hasPrefix("~"), !given.contains("\0") else { throw denied("Computer paths must be absolute.") }
+            let expanded = (given as NSString).expandingTildeInPath
+            guard expanded.hasPrefix("/") else { throw denied("Computer paths must be absolute.") }
+            url = URL(fileURLWithPath: "/" + expanded.split(separator: "/").filter { $0 != "." }.joined(separator: "/"))
+            guard write ? permissions.contains("arbitrary_file_write") : permissions.contains("computer_files") else {
+                throw denied("This path is outside the declared reach (requires \(write ? "arbitrary_file_write" : "computer_files")).")
+            }
+        } else { throw denied("The file root is app_data or computer.") }
+        try permitted(url, write: write)
+        return url
+    }
+
+    private func permitted(_ path: URL, write: Bool) throws {
+        if write { try CapabilityLifecycle.requireFileMutation(path, dataRoot: root) }
+        let privatePaths = Self.privateStores.map { root.appendingPathComponent($0).resolvingSymlinksInPath() }
+        guard !privatePaths.contains(where: { under(path, $0) || write && under($0, path) }) else {
+            throw denied("The path reaches a protected app store or executable authority.")
         }
-        let groupTree = ProcessTreeSnapshot(rootPID: tree.rootPID, rootIdentity: ownerIdentity,
-                                           descendants: identities)
-        let refreshed = ProcessTreeReaper.snapshot(rootPID: rootPID, retaining: groupTree)
-        // Ownership outlives the leader; signal() still verifies its identity
-        // before signaling that PID, even when this retained identity is stale.
-        return ProcessTreeSnapshot(rootPID: rootPID, rootIdentity: ownerIdentity,
-                                   descendants: refreshed.descendants)
-    }
-
-    @discardableResult
-    private nonisolated static func quiesceAndKillOwnedTree(
-        _ tree: ProcessTreeSnapshot
-    ) -> ProcessTreeSnapshot {
-        // Freeze the whole owned group before enumeration, including when its
-        // leader has exited. A verified member proves the group still belongs
-        // to this invocation; a naked group ID could belong to a reused PID.
-        for identity in [tree.rootIdentity].compactMap({ $0 }) + tree.descendants {
-            guard ProcessTreeReaper.snapshot(rootPID: identity.pid).rootIdentity == identity,
-                  getpgid(identity.pid) == tree.rootPID else { continue }
-            _ = killpg(tree.rootPID, SIGSTOP)
-            break
+        if write {
+            let protected = CapabilityLifecycle.protectedStores.map { root.appendingPathComponent($0).resolvingSymlinksInPath() }
+                + [PersistenceCore.defaultPersonaRoot(dataRoot: root).resolvingSymlinksInPath()]
+            guard !protected.contains(where: { under(path, $0) || under($0, path) }) else {
+                throw denied("The path reaches a protected app store or executable authority.")
+            }
         }
-        let frozen = Self.captureOwnedTree(rootPID: tree.rootPID, retaining: tree)
-        let killed = ProcessTreeReaper.quiesceAndKill(frozen)
-        return ProcessTreeSnapshot(rootPID: tree.rootPID, rootIdentity: tree.rootIdentity,
-                                   descendants: killed.descendants)
-    }
-}
-
-// MARK: - Helpers
-
-private final class TimedOutBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = false
-    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
-    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
-}
-
-/// Thread-safe cancellation flag — flipped by the `onCancel` handler (which
-/// runs off-actor on the cancelling task's thread) and read on the GCD wait
-/// thread + the actor after the wait resumes.
-private final class CancelFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = false
-    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
-    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
-}
-
-/// Thread-safe real-exit flag — set ONLY by the process terminationHandler
-/// (which fires off-actor on a background queue) and read on the reap thread.
-/// The escalation keys its "already gone?" decision on this, not on raw
-/// semaphore wait results, so a cancel can never masquerade as a child exit.
-private final class TerminatedFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = false
-    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
-    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
-}
-
-// Thread-safe capture buffer for subprocess pipes — appended from drain
-// workers, read on the actor after exit.
-final class OutputLimitBox: @unchecked Sendable {
-    struct Exceeded: Sendable {
-        let stream: String
-        let limitBytes: Int
     }
 
-    private let lock = NSLock()
-    private var value: Exceeded?
-    private var wakeHandler: (@Sendable () -> Void)?
-
-    var exceeded: Exceeded? {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
+    private func under(_ path: URL, _ root: URL) -> Bool { path.path == root.path || path.path.hasPrefix(root.path + "/") }
+    private func remove(_ parent: Int32, name: String, checkingCancellation: Bool = true) throws {
+        if checkingCancellation { try Task.checkCancellation() }
+        var metadata = stat()
+        guard fstatat(parent, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+        let directory = metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+        if directory {
+            let fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0, let stream = fdopendir(fd) else {
+                if fd >= 0 { _ = Darwin.close(fd) }
+                throw VerifiedPath.Failure.posix(errno)
+            }
+            defer { closedir(stream) }
+            while let entry = readdir(stream) {
+                let child = withUnsafePointer(to: &entry.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+                }
+                if child != ".", child != ".." { try remove(fd, name: child, checkingCancellation: checkingCancellation) }
+            }
+        }
+        if checkingCancellation { try Task.checkCancellation() }
+        guard unlinkat(parent, name, directory ? AT_REMOVEDIR : 0) == 0 else { throw VerifiedPath.Failure.posix(errno) }
     }
 
-    func setWakeHandler(_ handler: @escaping @Sendable () -> Void) {
-        lock.lock()
-        wakeHandler = handler
-        let shouldWake = value != nil
-        lock.unlock()
-        if shouldWake { handler() }
+    private func copy(_ source: URL, to target: URL) throws {
+        try Task.checkCancellation()
+        guard !under(target, source) else { throw SenseFailure(code: "bad_input", message: "Copy to a path outside the source folder.") }
+        let parent = try VerifiedPath.openParent(of: target, createIntermediates: true)
+        defer { parent.release() }
+        let temporary = ".\(UUID().uuidString).copy"
+        let stage = target.deletingLastPathComponent().appendingPathComponent(temporary)
+        defer { try? remove(parent.fd, name: temporary, checkingCancellation: false) }
+        try copyContents(source, to: stage)
+        try Task.checkCancellation()
+        guard renameatx_np(parent.fd, temporary, parent.fd, parent.name, UInt32(RENAME_EXCL)) == 0 else {
+            throw VerifiedPath.Failure.posix(errno)
+        }
     }
 
-    func markExceeded(stream: String, limitBytes: Int) {
-        lock.lock()
-        guard value == nil else {
-            lock.unlock()
+    private func copyContents(_ source: URL, to target: URL) throws {
+        try Task.checkCancellation()
+        try permitted(source, write: false); try permitted(target, write: true)
+        let fd = try VerifiedPath.open(source, flags: O_RDONLY | O_NONBLOCK)
+        defer { _ = Darwin.close(fd) }
+        var metadata = stat()
+        guard fstat(fd, &metadata) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+        if metadata.st_mode & mode_t(S_IFMT) != mode_t(S_IFDIR) {
+            try VerifiedPath.transfer(from: source, to: target, copy: true, overwrite: false)
             return
         }
-        value = Exceeded(stream: stream, limitBytes: limitBytes)
-        let handler = wakeHandler
-        lock.unlock()
-        handler?()
-    }
-}
-
-final class PipeCaptureBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage = Data()
-    private let stream: String
-    private let limitBytes: Int
-    private let overflow: OutputLimitBox
-
-    init(stream: String, limitBytes: Int, overflow: OutputLimitBox) {
-        self.stream = stream
-        self.limitBytes = limitBytes
-        self.overflow = overflow
-    }
-
-    func append(_ chunk: Data) {
-        lock.lock()
-        let available = max(0, limitBytes - storage.count)
-        if available > 0 {
-            storage.append(chunk.prefix(available))
-        }
-        let exceeded = chunk.count > available
-        lock.unlock()
-        if exceeded {
-            overflow.markExceeded(stream: stream, limitBytes: limitBytes)
-        }
-    }
-    var data: Data { lock.lock(); defer { lock.unlock() }; return storage }
-}
-
-/// Foundation Pipe handles are not close-on-exec by default. A subprocess
-/// inheriting a stop-channel writer could keep our POLLHUP edge from arriving.
-func makeToolSandboxWakePipe() throws -> Pipe {
-    let pipe = Pipe()
-    for handle in [pipe.fileHandleForReading, pipe.fileHandleForWriting] {
-        let flags = fcntl(handle.fileDescriptor, F_GETFD, 0)
-        guard flags >= 0,
-              fcntl(handle.fileDescriptor, F_SETFD, flags | FD_CLOEXEC) == 0 else {
-            throw ToolRunError.spawnFailed("stop pipe setup failed (errno \(errno))")
-        }
-    }
-    return pipe
-}
-
-/// One input payload, with an explicit lifetime bounded by the tool invocation.
-/// Full stdin waits on writability OR a private stop pipe, with no polling tick.
-final class PipeInputWriter: @unchecked Sendable {
-    private let handle: FileHandle
-    private let input: Data
-    private let wake: Pipe
-    private let lock = NSLock()
-    private let done = DispatchGroup()
-    private var started = false
-    private var stopped = false
-
-    init(handle: FileHandle, input: Data) throws {
-        self.handle = handle
-        self.input = input
-        self.wake = try makeToolSandboxWakePipe()
-        let fd = handle.fileDescriptor
-        let flags = fcntl(fd, F_GETFL, 0)
-        guard flags >= 0,
-              fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0,
-              fcntl(fd, F_SETNOSIGPIPE, 1) == 0 else {
-            throw ToolRunError.spawnFailed("stdin pipe setup failed (errno \(errno))")
-        }
-    }
-
-    func start() {
-        lock.lock()
-        guard !started, !stopped else { lock.unlock(); return }
-        started = true
-        done.enter()
-        lock.unlock()
-        let thread = Thread { [self] in
-            defer {
-                try? handle.close()
-                done.leave()
+        let parent = try VerifiedPath.openParent(of: target)
+        defer { parent.release() }
+        try Task.checkCancellation()
+        guard mkdirat(parent.fd, parent.name, 0o755) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+        guard let stream = fdopendir(dup(fd)) else { throw VerifiedPath.Failure.posix(errno) }
+        defer { closedir(stream) }
+        while let entry = readdir(stream) {
+            let child = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
             }
-            input.withUnsafeBytes { bytes in
-                guard let base = bytes.baseAddress else { return }
-                var offset = 0
-                while offset < bytes.count {
-                    if isStopped() { return }
-                    let written = Darwin.write(handle.fileDescriptor, base.advanced(by: offset), bytes.count - offset)
-                    if written > 0 { offset += written; continue }
-                    if written == 0 { return }
-                    if errno == EINTR { continue }
-                    guard errno == EAGAIN || errno == EWOULDBLOCK else { return }
-                    guard waitUntilWritable() else { return }
+            if child != ".", child != ".." { try copyContents(source.appendingPathComponent(child), to: target.appendingPathComponent(child)) }
+        }
+    }
+    private func denied(_ detail: String) -> SenseFailure { SenseFailure(code: "permission_denied", message: detail) }
+    private func text(_ args: [String: JSONValue], _ key: String) throws -> String {
+        guard case .string(let text)? = args[key], !text.isEmpty else { throw SenseFailure(code: "bad_input", message: "\(key) is required.") }
+        return text
+    }
+    private func offset(_ args: [String: JSONValue]) throws -> UInt64 {
+        guard case .int(let value) = args["offset"] ?? .int(0), let offset = UInt64(exactly: value) else {
+            throw SenseFailure(code: "bad_input", message: "offset must be a nonnegative integer.")
+        }
+        return offset
+    }
+    private func port(_ args: [String: JSONValue], zero: Bool) throws -> NWEndpoint.Port {
+        guard case .int(let value)? = args["port"], value >= (zero ? 0 : 1), let raw = UInt16(exactly: value),
+              let port = NWEndpoint.Port(rawValue: raw) else { throw SenseFailure(code: "bad_input", message: "Pass a valid network port.") }
+        return port
+    }
+    private static func data(_ args: [String: JSONValue]) throws -> Data {
+        guard case .string(let base64)? = args["base64"], let data = Data(base64Encoded: base64), data.count <= byteLimit else {
+            throw SenseFailure(code: "bad_input", message: "Pass base64 bytes of at most 4 MiB.")
+        }
+        return data
+    }
+    private static func loopback(_ host: String) -> Bool {
+        host.lowercased() == "localhost" || host == "::1" || host.hasPrefix("127.") || host.hasPrefix("::ffff:127.")
+    }
+
+    private func address(_ host: String) throws -> String {
+        var hints = addrinfo(); hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM
+        var first: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &first) == 0, let start = first else {
+            throw SenseFailure(code: "world_error", message: "Network host could not be resolved.")
+        }
+        defer { freeaddrinfo(start) }
+        var cursor: UnsafeMutablePointer<addrinfo>? = start, addresses: [String] = []
+        while let at = cursor {
+            var bytes = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(at.pointee.ai_addr, at.pointee.ai_addrlen, &bytes, socklen_t(bytes.count), nil, 0, NI_NUMERICHOST) == 0 {
+                addresses.append(String(decoding: bytes.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
+            }
+            cursor = at.pointee.ai_next
+        }
+        guard let chosen = addresses.first, permissions.contains("network")
+            || addresses.allSatisfy({ Self.loopback($0) ? permissions.contains("network_localhost") : permissions.contains("network_public") }) else {
+            throw denied("The resolved address is outside the declared network reach.")
+        }
+        return chosen
+    }
+
+    private func network(_ operation: String, args: [String: JSONValue]) async throws -> JSONValue {
+        switch operation {
+        case "network.connect", "network.listen":
+            let host = try text(args, "host"), address = try address(host), port = try port(args, zero: operation == "network.listen")
+            let parameters: NWParameters
+            if args["transport"] == .string("udp") { parameters = .udp }
+            else if args["tls"] == .bool(true), operation == "network.connect" {
+                let tls = NWProtocolTLS.Options()
+                sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, host)
+                parameters = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+            } else { parameters = .tcp }
+            let id = UUID().uuidString
+            if operation == "network.connect" {
+                let connection = NWConnection(host: NWEndpoint.Host(address), port: port, using: parameters)
+                connections[id] = connection
+                try await ready(connection)
+                return .object(["id": .string(id)])
+            }
+            guard permissions.contains("network") || Self.loopback(address) && permissions.contains("network_localhost") else {
+                throw denied("Listening requires the declared inbound network reach.")
+            }
+            parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(address), port: port)
+            let listener = try NWListener(using: parameters, on: port)
+            let stream = AsyncThrowingStream<String, Error>.makeStream(bufferingPolicy: .bufferingOldest(OwnedProgramRunner.actionLimit))
+            listeners[id] = (listener, stream.stream, stream.continuation)
+            listener.newConnectionHandler = { connection in Task { await self.incoming(connection, listener: id) } }
+            try await networkReply(cancel: { listener.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
+                listener.stateUpdateHandler = { state in
+                    if case .ready = state { done.yield(()); done.finish() }
+                    if case .failed(let error) = state { done.finish(throwing: error); stream.continuation.finish(throwing: error) }
+                    if case .cancelled = state { done.finish(throwing: CancellationError()); stream.continuation.finish(throwing: CancellationError()) }
                 }
+                listener.start(queue: self.queue)
             }
-        }
-        thread.name = "ToolRunSandbox.stdin"
-        thread.qualityOfService = .userInitiated
-        thread.start()
-    }
-
-    func stopAndWait() {
-        lock.lock()
-        let signalStop = !stopped
-        stopped = true
-        let wasStarted = started
-        lock.unlock()
-        // Closing this private write end wakes poll with POLLHUP. No write can
-        // block, and the data descriptor stays owned by the writer until join.
-        if signalStop { try? wake.fileHandleForWriting.close() }
-        if wasStarted { done.wait() } else { try? handle.close() }
-    }
-
-    private func waitUntilWritable() -> Bool {
-        while !isStopped() {
-            var descriptors = [
-                pollfd(fd: handle.fileDescriptor, events: Int16(POLLOUT), revents: 0),
-                pollfd(fd: wake.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0),
-            ]
-            let result = descriptors.withUnsafeMutableBufferPointer {
-                Darwin.poll($0.baseAddress, nfds_t($0.count), -1)
+            return .object(["id": .string(id), "port": .int(Int64(listener.port?.rawValue ?? port.rawValue))])
+        case "network.accept":
+            let id = try text(args, "id")
+            guard let slot = listeners[id] else { throw denied("This invocation does not own that listener.") }
+            let accepted = try await withTaskCancellationHandler {
+                var iterator = slot.1.makeAsyncIterator()
+                return try await iterator.next()
+            } onCancel: { slot.2.finish(throwing: CancellationError()); slot.0.cancel() }
+            guard let accepted, let connection = connections[accepted] else { throw CancellationError() }
+            try await ready(connection)
+            return .object(["id": .string(accepted)])
+        case "network.send", "network.receive":
+            let id = try text(args, "id")
+            guard let connection = connections[id] else { throw denied("This invocation does not own that connection.") }
+            if operation == "network.send" {
+                let data = try Self.data(args)
+                try await networkReply(cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
+                    connection.send(content: data, completion: .contentProcessed { error in
+                        if let error { done.finish(throwing: error) } else { done.yield(()); done.finish() }
+                    })
+                }
+                return .object(["bytes": .int(Int64(data.count))])
             }
-            if result < 0 {
-                if errno == EINTR { continue }
-                return false
-            }
-            if descriptors[1].revents != 0 { return false }
-            if descriptors[0].revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0 { return false }
-            if descriptors[0].revents & Int16(POLLOUT) != 0 { return true }
-        }
-        return false
-    }
-
-    private func isStopped() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return stopped
-    }
-}
-
-final class PipeDrainLoop: @unchecked Sendable {
-    private let fd: Int32
-    private let buffer: PipeCaptureBuffer
-    private let wake: Pipe
-    private let done = DispatchSemaphore(value: 0)
-    private let lock = NSLock()
-    private var stopped = false
-    private var started = false
-
-    init(fileDescriptor: Int32, buffer: PipeCaptureBuffer) throws {
-        self.fd = fileDescriptor
-        self.buffer = buffer
-        self.wake = try makeToolSandboxWakePipe()
-    }
-
-    func start() {
-        lock.lock()
-        guard !started else {
-            lock.unlock()
-            return
-        }
-        started = true
-        lock.unlock()
-
-        let flags = fcntl(fd, F_GETFL, 0)
-        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-
-        let thread = Thread { [self] in
-            defer { done.signal() }
-            var chunk = [UInt8](repeating: 0, count: 65_536)
-            var stopBytesRemaining: Int?
-            while true {
-                while true {
-                    if stopBytesRemaining == nil, isStopped() {
-                        // A surviving descendant can refill the pipe forever,
-                        // so EAGAIN is not a shutdown boundary. Preserve only
-                        // the finite backlog already queued at stop, then join
-                        // before the caller closes (and may reuse) this FD.
-                        var available: Int32 = 0
-                        // Darwin FIONREAD = _IOR('f', 127, int). Swift cannot
-                        // import the sizeof-based C macro from sys/filio.h.
-                        let fionread: UInt = 0x4000_0000 | (UInt(MemoryLayout<Int32>.size) << 16)
-                            | (UInt(0x66) << 8) | 127
-                        guard ioctl(fd, fionread, &available) == 0 else { return }
-                        stopBytesRemaining = max(0, Int(available))
+            return try await networkReply(cancel: { connection.cancel() }) { (done: AsyncThrowingStream<JSONValue, Error>.Continuation) in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: Self.byteLimit) { data, _, complete, error in
+                    if let error { done.finish(throwing: error) }
+                    else {
+                        done.yield(.object(["base64": .string((data ?? Data()).base64EncodedString()),
+                                            "bytes": .int(Int64(data?.count ?? 0)), "eof": .bool(complete)])); done.finish()
                     }
-                    let count = min(chunk.count, stopBytesRemaining ?? chunk.count)
-                    if count == 0 { return }
-                    let n = read(fd, &chunk, count)
-                    if n > 0 {
-                        buffer.append(Data(bytes: chunk, count: n))
-                        if let remaining = stopBytesRemaining {
-                            stopBytesRemaining = remaining - n
-                        }
-                        continue
-                    }
-                    if n == 0 { return } // EOF: all writers closed.
-                    if errno == EINTR { continue }
-                    if errno == EAGAIN || errno == EWOULDBLOCK { break }
-                    return
                 }
-
-                // Stop may have arrived just after EAGAIN while the exiting
-                // parent queued its final bytes. Re-enter the snapshot path
-                // instead of dropping that tail here.
-                if isStopped() { continue }
-                // Quiet tools need no heartbeat. Wait for readable bytes/EOF
-                // or our private stop edge; unlike readabilityHandler this
-                // has no hidden dispatch-source descriptor owner.
-                var descriptors = [
-                    pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
-                    pollfd(fd: wake.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0),
-                ]
-                let ready = descriptors.withUnsafeMutableBufferPointer {
-                    Darwin.poll($0.baseAddress, nfds_t($0.count), -1)
-                }
-                if ready < 0, errno != EINTR { return }
             }
-        }
-        thread.qualityOfService = .userInitiated
-        thread.start()
-    }
-
-    func stopAndWait() {
-        lock.lock()
-        let signalStop = !stopped
-        stopped = true
-        let wasStarted = started
-        lock.unlock()
-        if signalStop { try? wake.fileHandleForWriting.close() }
-        if wasStarted {
-            // The stopped reader consumes a finite nonblocking snapshot. Do
-            // not time out and close its descriptor while it still owns it.
-            done.wait()
+        case "network.close":
+            let id = try text(args, "id")
+            if let connection = connections.removeValue(forKey: id) { connection.cancel() }
+            else if let slot = listeners.removeValue(forKey: id) { slot.0.cancel(); slot.2.finish() }
+            else { throw denied("This invocation does not own that network handle.") }
+            return .object(["id": .string(id)])
+        default: throw SenseFailure(code: "unsupported", message: "Unknown network primitive.")
         }
     }
 
-    private func isStopped() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return stopped
+    private func incoming(_ connection: NWConnection, listener id: String) {
+        guard !closed, let slot = listeners[id] else { connection.cancel(); return }
+        let key = UUID().uuidString
+        connections[key] = connection
+        if case .dropped = slot.2.yield(key) { connections.removeValue(forKey: key); connection.cancel() }
     }
-}
 
-// Minimal streaming SHA-256 wrapper over CommonCrypto.
-import CommonCrypto
-
-private struct SHA256Streaming {
-    private var ctx = CC_SHA256_CTX()
-    init() { CC_SHA256_Init(&ctx) }
-    mutating func update(_ data: Data) {
-        data.withUnsafeBytes { buf in
-            if let base = buf.baseAddress, buf.count > 0 {
-                CC_SHA256_Update(&ctx, base, CC_LONG(buf.count))
+    private func ready(_ connection: NWConnection) async throws {
+        try await networkReply(cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
+            connection.stateUpdateHandler = { state in
+                if case .ready = state { done.yield(()); done.finish() }
+                if case .failed(let error) = state { done.finish(throwing: error) }
+                if case .cancelled = state { done.finish(throwing: CancellationError()) }
             }
+            connection.start(queue: self.queue)
         }
     }
-    mutating func finalizeHex() -> String {
-        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        CC_SHA256_Final(&digest, &ctx)
-        return digest.map { String(format: "%02x", $0) }.joined()
+
+    private func networkReply<T: Sendable>(cancel: @escaping @Sendable () -> Void,
+                                  start: (AsyncThrowingStream<T, Error>.Continuation) -> Void) async throws -> T {
+        let stream = AsyncThrowingStream<T, Error>.makeStream(bufferingPolicy: .bufferingOldest(1))
+        try Task.checkCancellation()
+        start(stream.continuation)
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            var iterator = stream.stream.makeAsyncIterator()
+            guard let value = try await iterator.next() else { throw CancellationError() }
+            return value
+        } onCancel: { stream.continuation.finish(throwing: CancellationError()); cancel() }
+    }
+
+    func close() {
+        closed = true
+        for connection in connections.values { connection.cancel() }
+        for slot in listeners.values { slot.0.cancel(); slot.2.finish() }
+        connections.removeAll(); listeners.removeAll()
+    }
+
+    static func checkInput(_ input: JSONValue, schema: JSONValue) throws {
+        guard case .object(let fields) = input, case .object(let spec) = schema else {
+            throw SenseFailure(code: "bad_input", message: "Tool input and inputSchema must be JSON objects.")
+        }
+        guard SwiftNativeToolExecution.strings(spec["required"]).allSatisfy({ fields[$0] != nil }) else {
+            throw SenseFailure(code: "bad_input", message: "Tool input is missing a required schema field.")
+        }
     }
 }

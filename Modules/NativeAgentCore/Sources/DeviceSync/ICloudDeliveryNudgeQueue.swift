@@ -15,16 +15,6 @@ struct ICloudDeliveryNudgeOutcome: Sendable, Equatable {
     let disposition: ICloudDeliveryNudgeDisposition
 }
 
-struct ICloudDeliveryNudgeSnapshot: Sendable, Equatable {
-    let plannedCount: Int
-    let pendingCount: Int
-    let synchronizedCount: Int
-    let unavailableCount: Int
-    let failedCount: Int
-    let activeWorkerCount: Int
-    let workerStartCount: Int
-}
-
 actor ICloudDeliveryNudgeQueue {
     typealias Availability = @Sendable () async -> Bool
     typealias NudgeSender = @Sendable (String) async -> Bool
@@ -36,28 +26,20 @@ actor ICloudDeliveryNudgeQueue {
     }
 
     private let delaysNanoseconds: [UInt64]
-    private let automaticallyRun: Bool
     private let isAvailable: Availability
     private let sendNudge: NudgeSender
     private let observeOutcome: OutcomeObserver
 
     private var pending: [PendingNudge] = []
     private var workerTask: Task<Void, Never>?
-    private var workerStartCount = 0
-    private var plannedCount = 0
-    private var synchronizedCount = 0
-    private var unavailableCount = 0
-    private var failedCount = 0
 
     init(
         delaysNanoseconds: [UInt64] = ICloudDeliveryNudgePlan.delaysNanoseconds,
-        automaticallyRun: Bool = true,
         isAvailable: @escaping Availability,
         sendNudge: @escaping NudgeSender,
         observeOutcome: @escaping OutcomeObserver = { _ in }
     ) {
         self.delaysNanoseconds = delaysNanoseconds.filter { $0 > 0 }
-        self.automaticallyRun = automaticallyRun
         self.isAvailable = isAvailable
         self.sendNudge = sendNudge
         self.observeOutcome = observeOutcome
@@ -74,32 +56,8 @@ actor ICloudDeliveryNudgeQueue {
                 messageID: messageID,
                 dueAt: scheduledAt.addingTimeInterval(delaySeconds)
             ))
-            plannedCount += 1
         }
         startWorkerIfNeeded()
-    }
-
-    func snapshot() -> ICloudDeliveryNudgeSnapshot {
-        ICloudDeliveryNudgeSnapshot(
-            plannedCount: plannedCount,
-            pendingCount: pending.count,
-            synchronizedCount: synchronizedCount,
-            unavailableCount: unavailableCount,
-            failedCount: failedCount,
-            activeWorkerCount: workerTask == nil ? 0 : 1,
-            workerStartCount: workerStartCount
-        )
-    }
-
-    /// Hermetic evaluation seam. It runs the same availability, KVS-send, and
-    /// outcome accounting path without waiting for wall-clock delivery delays.
-    func drainImmediatelyForTesting() async {
-        let scheduled = pending
-        cancelAll()
-        await workerTask?.value
-        for nudge in scheduled {
-            await deliver(nudge)
-        }
     }
 
     func cancelAll() {
@@ -110,8 +68,7 @@ actor ICloudDeliveryNudgeQueue {
     private func startWorkerIfNeeded() {
         // 2026-09-18: an empty queue must not re-spawn; a cancelled worker
         // retains ownership until it exits so a new enqueue cannot overlap it.
-        guard automaticallyRun, workerTask == nil, !pending.isEmpty else { return }
-        workerStartCount += 1
+        guard workerTask == nil, !pending.isEmpty else { return }
         workerTask = Task { [weak self] in
             await self?.runScheduledNudges()
         }
@@ -145,20 +102,17 @@ actor ICloudDeliveryNudgeQueue {
         let outcome: ICloudDeliveryNudgeOutcome
         if await isAvailable() {
             if await sendNudge(nudge.messageID) {
-                synchronizedCount += 1
                 outcome = ICloudDeliveryNudgeOutcome(
                     messageID: nudge.messageID,
                     disposition: .synchronized
                 )
             } else {
-                failedCount += 1
                 outcome = ICloudDeliveryNudgeOutcome(
                     messageID: nudge.messageID,
                     disposition: .synchronizeFailed
                 )
             }
         } else {
-            unavailableCount += 1
             outcome = ICloudDeliveryNudgeOutcome(
                 messageID: nudge.messageID,
                 disposition: .unavailable

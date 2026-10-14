@@ -1,26 +1,33 @@
 import Foundation
 import PersistenceCore
 import Skills
+import Senses
+import TrustCenter
 
 public enum NativeSkillRegistryActions {
-    public static func deleteSkill(id: String, dataRoot: URL) async throws {
-        // wave 32 W15: gate to SwiftNativeSkillsClient.deleteSkill (registry
-        // delete + body-file cleanup + manifest fallback + record_activity, all
-        // flocked). The daemon route returns `{id, deleted:true[, source]}`;
-        // the Mac caller discards the body (EmptyResponse), so we just run the
-        // mutation and ignore the returned object.
-        let impl = makeSkillsClient(root: dataRoot)
-        _ = try await impl.deleteSkill(id: id)
+    public static func installDemoCapabilityPack(dataRoot: URL) async throws -> CapabilityPackInstall {
+        let host = AppScriptRunner.Host(call: { _ in .null }, toolHost: true, dataRoot: dataRoot)
+        return try await OwnedProgramInvocation.$host.withValue(host) {
+            try await CapabilityPackInstall.installDemo(dataRoot: dataRoot)
+        }
     }
 
-    /// Enable a skill. `admitScript` admits a script skill's exact digest as
-    /// User's (the one he reviewed, refused if the script changed since); an
-    /// approved card turns on only what needs no admission.
+    public static func deleteSkill(id: String, dataRoot: URL) async throws {
+        let impl = makeSkillsClient(root: dataRoot)
+        _ = try await impl.deleteSkill(id: id, ownerAuthorized: true)
+    }
+
+    /// Enable a skill. `admitScript` binds the complete candidate digest as
+    /// User's (the one he reviewed, refused if any artifact changed since); an
+    /// approved card binds the complete candidate, including fixtures and dependencies.
     public static func enableSkill(
         name: String, dataRoot: URL, reviewedDigest: String?, admitScript: Bool
     ) async throws {
-        _ = try await SwiftNativeSkillsClient(root: dataRoot).enableSkill(
-            name: name, admittedBy: admitScript ? "user" : nil, reviewedDigest: reviewedDigest)
+        let host = AppScriptRunner.Host(call: { _ in .null }, toolHost: true, dataRoot: dataRoot)
+        _ = try await OwnedProgramInvocation.$host.withValue(host) {
+            try await SwiftNativeSkillsClient(root: dataRoot).enableSkill(
+                name: name, admittedBy: admitScript ? "user" : nil, reviewedDigest: reviewedDigest, ownerAuthorized: true)
+        }
     }
 
     public static func disableSkill(name: String, dataRoot: URL) async throws {

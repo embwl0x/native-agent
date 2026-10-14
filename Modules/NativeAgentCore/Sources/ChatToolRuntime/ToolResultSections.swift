@@ -7,7 +7,11 @@ package enum ToolResultSections {
     package static let pageBudget = 24_000
 
     package static func pages(content: String, query: String = "", budget: Int = pageBudget) -> [[JSONValue]] {
-        var sections: [(value: JSONValue, text: String)] = []
+        pages(sections: projection(content: content, budget: budget), query: query, budget: budget)
+    }
+
+    static func projection(content: String, budget: Int) -> [(value: JSONValue, text: String, bytes: Int)] {
+        var sections: [(value: JSONValue, text: String, bytes: Int)] = []
         func append(_ value: JSONValue, path: [JSONValue], paragraph: Int? = nil, sentence: Int? = nil) {
             var row: [String: JSONValue] = ["path": .array(path), "value": value]
             if let paragraph { row["paragraph"] = .int(Int64(paragraph)) }
@@ -38,10 +42,11 @@ package enum ToolResultSections {
             // Match actual Unicode words, not the transport's ASCII escapes.
             let searchable: String
             if case .string(let text) = value { searchable = text }
-            else if !query.isEmpty, let data = try? JSONEncoder().encode(value) {
+            else if let data = try? JSONEncoder().encode(value) {
                 searchable = String(decoding: data, as: UTF8.self)
             } else { searchable = encoded }
-            sections.append((.object(row), searchable))
+            let section = JSONValue.object(row)
+            sections.append((section, searchable, ((try? section.serialize(pretty: false))?.utf8.count ?? 0) + 1))
         }
         func appendParagraph(_ text: String, path: [JSONValue], paragraph: Int) {
             if ((try? JSONValue.string(text).serialize(pretty: false))?.utf8.count ?? 0) <= budget - 1_024 {
@@ -92,6 +97,11 @@ package enum ToolResultSections {
             }
         }
         visit((try? JSONValue.parse(Data(content.utf8))) ?? .string(content), path: [])
+        return sections
+    }
+
+    static func pages(sections projection: [(value: JSONValue, text: String, bytes: Int)], query: String, budget: Int) -> [[JSONValue]] {
+        var sections = projection
         let terms = query.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
         if !terms.isEmpty {
             let scores: [Int] = sections.map { section in
@@ -105,7 +115,7 @@ package enum ToolResultSections {
         var pages: [[JSONValue]] = [[]]
         var bytes = 2
         for section in sections {
-            let size = ((try? section.value.serialize(pretty: false))?.utf8.count ?? 0) + 1
+            let size = section.bytes
             if bytes + size > budget, !pages[pages.count - 1].isEmpty {
                 pages.append([]); bytes = 2
             }

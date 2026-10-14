@@ -29,32 +29,6 @@ public struct CausalInterventionAssignment: Codable, Sendable, Equatable {
     public let chosenAlternative: String?
     public let confounderFlags: [String]?
     public let coverageFlags: [String]?
-
-    public init(
-        assignmentID: String,
-        intervention: String,
-        evidenceClass: EvidenceClass,
-        experimentID: String? = nil,
-        taskScenarioFamily: String? = nil,
-        treatment: String? = nil,
-        baseline: String? = nil,
-        eligibleAlternatives: [String]? = nil,
-        chosenAlternative: String? = nil,
-        confounderFlags: [String]? = nil,
-        coverageFlags: [String]? = nil
-    ) {
-        self.assignmentID = assignmentID
-        self.intervention = intervention
-        self.evidenceClass = evidenceClass
-        self.experimentID = experimentID
-        self.taskScenarioFamily = taskScenarioFamily
-        self.treatment = treatment
-        self.baseline = baseline
-        self.eligibleAlternatives = eligibleAlternatives
-        self.chosenAlternative = chosenAlternative
-        self.confounderFlags = confounderFlags
-        self.coverageFlags = coverageFlags
-    }
 }
 
 /// Authority class used by the causal model. It is deliberately derived from
@@ -210,8 +184,6 @@ public struct CausalTransitionEvidence: Codable, Sendable, Equatable {
             return .controlledProduction
         }
     }
-
-    public var isObservational: Bool { evidenceClass == .observational }
 
     public static func opaqueIdentity(_ raw: String) -> String {
         SHA256.hash(data: Data(raw.utf8)).map { String(format: "%02x", $0) }.joined()

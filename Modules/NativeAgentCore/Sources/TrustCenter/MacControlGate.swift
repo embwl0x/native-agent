@@ -1,35 +1,6 @@
 import Foundation
 import PersistenceCore
 
-// MARK: - Subsystem #19 wave 29 W4 (2026-06-01) — MacControl _gate pipeline port.
-//
-// Faithful Swift port of the Python gate pipeline in the retired daemon:
-//
-//   • _gate                  → MacControlGate.gate(category:trigger:)
-//       (master enabled + remote_ios + per-category)
-//   • DEFAULT_MAC_CONTROL_POLICY / _CATEGORY_KEY
-//                            → MacControlPolicy + categoryPolicyKey(_:)
-//   • _full_mac_active       → MacControlGate.fullMacActive(_:)
-//       (2026-09-10: no longer a timed window - saved policy only)
-//   • _file_policy_reason    → MacControlGate.fileReason(forPaths:)
-//   • bridge-required (in _run, the retired daemon)
-//                            → MacControlGate.bridgeRequired(category:argv0:)
-//
-// PURPOSE: unblock the 14 DORMANT-PROXY mac_control routes for a FUTURE
-// cutover wave. This port reproduces the SAME order of checks and the SAME
-// user-facing refusal-reason strings as Python so a flipped route is
-// behaviourally identical. THIS WAVE DOES NOT FLIP ANY ROUTE — the dispatch
-// table in MacControl.swift is unchanged; this is pure library code + tests.
-//
-// Refusal-reason parity is load-bearing: these strings surface to the user
-// (block_reason on the receipt). They are reproduced verbatim from Python:
-//   "mac_control_disabled: master gate off"
-//   "remote_ios_disabled: remote_from_ios_allowed is off"
-//   "category_disabled: <key> is off"
-//   "file_policy_denied: <resolved> is outside configured workspaces"
-//   "file_policy_requires_approval: <resolved> is outside configured workspaces"
-//   "mac_control_bridge_required: NativeAgent.app bridge is unavailable"
-
 // MARK: - Policy input shapes
 
 /// Swift mirror of the gate-relevant subset of `DEFAULT_MAC_CONTROL_POLICY`
@@ -44,8 +15,6 @@ public struct MacControlPolicy: Sendable, Equatable {
     public var enabled: Bool
     /// `remote_from_ios_allowed`.
     public var remoteFromIOSAllowed: Bool
-    /// `require_app_bridge_for_tcc`.
-    public var requireAppBridgeForTCC: Bool
     /// Per-category allow flags keyed by POLICY KEY (e.g. `shell_allowed`).
     /// A missing key reads as `false` — matching `policy.get(key, False)`.
     public var categoryAllowed: [String: Bool]
@@ -69,7 +38,6 @@ public struct MacControlPolicy: Sendable, Equatable {
     public init(
         enabled: Bool = false,
         remoteFromIOSAllowed: Bool = false,
-        requireAppBridgeForTCC: Bool = true,
         categoryAllowed: [String: Bool] = [:],
         trustPolicy: MacControlTrustPolicy? = nil,
         workspaceRoots: [String] = [],
@@ -77,7 +45,6 @@ public struct MacControlPolicy: Sendable, Equatable {
     ) {
         self.enabled = enabled
         self.remoteFromIOSAllowed = remoteFromIOSAllowed
-        self.requireAppBridgeForTCC = requireAppBridgeForTCC
         self.categoryAllowed = categoryAllowed
         self.trustPolicy = trustPolicy
         self.workspaceRoots = workspaceRoots
@@ -90,7 +57,6 @@ public struct MacControlPolicy: Sendable, Equatable {
     public static let `default` = MacControlPolicy(
         enabled: false,
         remoteFromIOSAllowed: false,
-        requireAppBridgeForTCC: true,
         categoryAllowed: [
             "applescript_allowed": false,
             "jxa_allowed": false,
@@ -176,22 +142,25 @@ public struct MacControlGateDecision: Sendable, Equatable {
     public static let allow = MacControlGateDecision(allowed: true, reason: "")
 }
 
-/// Pure, side-effect-free port of the daemon gate pipeline. Every method is
-/// static and takes its inputs explicitly so it is trivially unit-testable
-/// (no clock, FS, or actor dependency except the injectable `now`).
+/// Canonical Mac-control admission and the policy gate pipeline.
 public enum MacControlGate {
 
-    /// Categories that require the NativeAgent.app bridge (TCC attribution)
-    /// — `bridge_required_categories` in `_run`.
-    public static let bridgeRequiredCategories: Set<String> = [
-        "applescript", "jxa", "accessibility", "system", "file_ops", "shell",
-    ]
-
-    /// argv[0] basenames that force bridge-required regardless of category —
-    /// the `Path(cmd[0]).name in {...}` clause in `_run`.
-    public static let bridgeRequiredArgv0: Set<String> = [
-        "osascript", "bash", "zsh", "sh",
-    ]
+    public static func continuationCaptureRefusal(dataRoot: URL) async -> String? {
+        do {
+            let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+            let authority = SwiftNativeSecurityCenter.fullMacYoloAuthority(tool: "mac_control",
+                surface: "chat", originTrusted: true, snapshot: snapshot)
+            let policy = policyForAdmittedFullMac(
+                MacControlPolicy.fromTrustPolicyObject(snapshot.policy), admitted: authority.state == .admitted)
+            guard fullMacActive(policy.trustPolicy ?? MacControlTrustPolicy()),
+                  gate(policy, category: "accessibility", trigger: "user").allowed else {
+                return "accessibility_read_not_authorized"
+            }
+            return nil
+        } catch {
+            return "trust_policy_unavailable"
+        }
+    }
 
     /// Project current Full Mac authority into the legacy category policy for
     /// this admitted call only. The caller must obtain `admitted` from the
@@ -214,27 +183,6 @@ public enum MacControlGate {
 
     // MARK: master / remote / per-category
 
-    /// Mirror of `_gate` master clause:
-    /// `policy.get("enabled", False)`.
-    public static func masterEnabled(_ policy: MacControlPolicy) -> Bool {
-        policy.enabled
-    }
-
-    /// Mirror of `_gate` remote clause: only the
-    /// `ios` trigger is gated on `remote_from_ios_allowed`. Returns true
-    /// (allowed) for any non-ios trigger.
-    public static func remoteIOSAllowed(_ policy: MacControlPolicy, trigger: String) -> Bool {
-        if trigger == "ios" { return policy.remoteFromIOSAllowed }
-        return true
-    }
-
-    /// Mirror of `_gate` category clause:
-    /// `policy.get(_CATEGORY_KEY.get(category, f"{category}_allowed"), False)`.
-    public static func perCategoryEnabled(_ policy: MacControlPolicy, category: String) -> Bool {
-        let key = categoryPolicyKey(category)
-        return policy.categoryAllowed[key] ?? false
-    }
-
     /// Full port of `MacControl._gate`. Preserves
     /// the EXACT order of checks and the EXACT refusal strings:
     ///   1. master gate  → "mac_control_disabled: master gate off"
@@ -245,7 +193,7 @@ public enum MacControlGate {
         category: String,
         trigger: String = "user"
     ) -> MacControlGateDecision {
-        if !masterEnabled(policy) {
+        if !policy.enabled {
             return MacControlGateDecision(allowed: false, reason: "mac_control_disabled: master gate off")
         }
         if trigger == "ios" && !policy.remoteFromIOSAllowed {
@@ -323,49 +271,6 @@ public enum MacControlGate {
         }
         return nil
     }
-
-    /// Convenience boolean form: true when the file ops are allowed
-    /// (no reason). Mirrors the `if reason := self._file_policy_reason(...)`
-    /// idiom where empty reason ⇒ proceed.
-    public static func fileAllowed(
-        _ policy: MacControlPolicy,
-        forPaths paths: [String]
-    ) -> Bool {
-        fileReason(policy, forPaths: paths) == nil
-    }
-
-    // MARK: bridge-required
-
-    /// Faithful port of the bridge-required computation in `_run`
-    ///:
-    ///   bridge_required = require_app_bridge_for_tcc AND
-    ///       (category ∈ bridge_required_categories
-    ///        OR basename(argv0) ∈ {osascript, bash, zsh, sh})
-    ///
-    /// `argv0` is the first element of the command vector (the executable);
-    /// pass `nil`/empty when there is no command (pure category check).
-    public static func bridgeRequired(
-        _ policy: MacControlPolicy,
-        category: String?,
-        argv0: String? = nil
-    ) -> Bool {
-        guard policy.requireAppBridgeForTCC else { return false }
-        let cat = category ?? ""
-        if bridgeRequiredCategories.contains(cat) { return true }
-        if let a = argv0, !a.isEmpty {
-            let base = (a as NSString).lastPathComponent
-            if bridgeRequiredArgv0.contains(base) { return true }
-        }
-        return false
-    }
-
-    /// Mirror of the refusal in `_run` when bridge is required and the
-    /// local fallback is not allowed. The exact
-    /// stderr string a blocked caller sees. NOTE: in Python this rides on a
-    /// 125 exit code, not a block_reason; reproduced here so a future
-    /// Swift execution path can surface the identical message.
-    public static let bridgeRequiredUnavailableReason =
-        "mac_control_bridge_required: NativeAgent.app bridge is unavailable"
 
     // MARK: - helpers
 
@@ -587,7 +492,6 @@ public extension MacControlPolicy {
         return MacControlPolicy(
             enabled: bool(mac, "enabled", default: defaults.enabled),
             remoteFromIOSAllowed: bool(mac, "remote_from_ios_allowed", default: defaults.remoteFromIOSAllowed),
-            requireAppBridgeForTCC: bool(mac, "require_app_bridge_for_tcc", default: defaults.requireAppBridgeForTCC),
             categoryAllowed: categoryAllowed,
             trustPolicy: trustPolicy,
             workspaceRoots: workspaceRoots,

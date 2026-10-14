@@ -138,7 +138,6 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
               !record.processID.isEmpty, !record.surface.isEmpty, !record.originRunID.isEmpty,
               !record.remainingWork.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               record.resumeCount >= 0, record.settled.count + record.pending.count <= 128,
-              (record.peerSources?.count ?? 0) <= 8,
               Set((record.settled + record.pending).map(\.id)).count == record.settled.count + record.pending.count,
               (record.settled + record.pending).allSatisfy({ !$0.id.isEmpty && !$0.tool.isEmpty }),
               record.nextRunAt.timeIntervalSince1970.isFinite,
@@ -205,6 +204,15 @@ public actor DeskContinuationTurn {
         record.revision = UUID().uuidString
         try await store.setContinuation(handle, expectedRevision: item.continuation?.revision, record: record)
         self.handle = handle
+    }
+
+    public func resume() async throws {
+        await acquireWriter()
+        defer { releaseWriter() }
+        guard !fenced else { throw DeskContinuationError.unsafe }
+        record.state = .running
+        record.processID = DeskContinuationScope.processID
+        try await save()
     }
 
     public func begin(_ step: DeskContinuation.Step, peerSources: [String]) async throws {
@@ -317,7 +325,7 @@ public actor DeskContinuationTurn {
 
     private func retainPeerSources(_ sources: [String]) {
         var retained = record.peerSources ?? []
-        for source in sources where !retained.contains(source) && retained.count < 8 {
+        for source in sources where !retained.contains(source) {
             retained.append(source)
         }
         record.peerSources = retained

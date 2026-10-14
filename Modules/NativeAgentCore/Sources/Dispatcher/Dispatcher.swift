@@ -146,74 +146,33 @@ public struct DispatchResult: Sendable, Equatable {
 
 public enum DispatcherError: Error, LocalizedError, Equatable {
     case missingTool
-    case invalidInput(String)
-    case unavailable
-    case invalidResponse(status: Int, body: String)
-    case decodeFailure(String)
     case ledgerFailure(String)
 
     public var errorDescription: String? {
         switch self {
         case .missingTool: return "dispatcher: tool name is required"
-        case .invalidInput(let m): return "dispatcher: invalid input: \(m)"
-        case .unavailable: return "dispatcher: unavailable"
-        case .invalidResponse(let s, let b):
-            let truncated = b.count > 200 ? String(b.prefix(200)) + "...(truncated)" : b
-            return "dispatcher: native handler returned status \(s): \(truncated)"
-        case .decodeFailure(let m): return "dispatcher: decode failed: \(m)"
         case .ledgerFailure(let m): return "dispatcher: ledger write failed: \(m)"
         }
     }
 }
 
-// MARK: - Protocol
-
-/// One-method tool dispatch protocol. Both impls implement this.
-public protocol DispatcherClient: Sendable {
-    func dispatch(
-        tool: String,
-        input: [String: JSONValue],
-        ctx: DispatchContext,
-        dryRun: Bool
-    ) async throws -> DispatchResult
-}
-
-// MARK: - Request shaping (shared by both impls)
-
-/// Build the `/v1/dispatch` POST body matching the daemon handler at
-/// the retired daemon. Tested directly so request-shape parity
-/// stays a tested contract, not an implementation detail.
-public func buildDispatchRequestBody(
-    tool: String,
-    input: [String: JSONValue],
-    ctx: DispatchContext,
-    dryRun: Bool
-) throws -> Data {
-    let trimmedTool = tool.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmedTool.isEmpty {
-        throw DispatcherError.missingTool
+// Only input and extra context can contain non-serializable values. Preserve
+// the original field paths and extra-context override order without encoding
+// a retired HTTP envelope on every native dispatch.
+private func validateDispatchValues(_ value: JSONValue, path: String = "") throws {
+    switch value {
+    case .double(let number) where !number.isFinite:
+        throw PersistenceCoreError.nonFiniteFloat(number, path: path)
+    case .array(let values):
+        for (index, value) in values.enumerated() {
+            try validateDispatchValues(value, path: "\(path)[\(index)]")
+        }
+    case .object(let fields):
+        for key in fields.keys.sorted(by: { $0.utf8.lexicographicallyPrecedes($1.utf8) }) {
+            try validateDispatchValues(fields[key]!, path: path.isEmpty ? key : "\(path).\(key)")
+        }
+    default: break
     }
-    // Python: `if not isinstance(_d_input, dict): 400`. Our typed input is
-    // already a dict, but we validate non-emptiness of the key set is OK
-    // (zero-key dict is legal — some tools take no args).
-
-    var body: [String: JSONValue] = [:]
-    body["tool"]      = .string(trimmedTool)
-    body["input"]     = .object(input)
-    body["surface"]   = .string(ctx.surface.isEmpty ? "chat" : ctx.surface)
-    body["dry_run"]   = .bool(dryRun)
-    if !ctx.sessionId.isEmpty { body["session_id"] = .string(ctx.sessionId) }
-    if !ctx.persona.isEmpty   { body["persona"]    = .string(ctx.persona) }
-    if !ctx.activeProvider.isEmpty {
-        body["active_provider"] = .string(ctx.activeProvider)
-    }
-    if !ctx.repoRoot.isEmpty  { body["repo_root"]  = .string(ctx.repoRoot) }
-    if !ctx.cwd.isEmpty       { body["cwd"]        = .string(ctx.cwd) }
-    // Merge ctx.extra LAST so callers can override the defaults above (e.g.
-    // a test pinning `surface` to a custom token); first-write-wins would
-    // surprise the caller more than last-write-wins.
-    for (k, v) in ctx.extra { body[k] = v }
-    return try JSONValue.object(body).serializedData(pretty: false)
 }
 
 // MARK: - Dispatch ledger
@@ -298,39 +257,6 @@ public actor DispatchLedger {
         }
     }
 
-    /// Tail the most recent dispatch entries. Convenience for tests + the
-    /// upcoming dispatch debug panel.
-    public func tail(limit: Int = 20) async throws -> [DispatchLedgerEntry] {
-        let raw = try await persistence.tailJSONL(ledgerPath, limit: limit, maxBytes: 1_048_576)
-        var out: [DispatchLedgerEntry] = []
-        out.reserveCapacity(raw.count)
-        for entry in raw {
-            guard case .object(let obj) = entry else { continue }
-            guard case .string(let id) = obj["id"] ?? .null else { continue }
-            let kind: String = {
-                if case .string(let s) = obj["kind"] ?? .null { return s }
-                return "dispatch"
-            }()
-            let title: String = {
-                if case .string(let s) = obj["title"] ?? .null { return s }
-                return ""
-            }()
-            let status: String = {
-                if case .string(let s) = obj["status"] ?? .null { return s }
-                return "ok"
-            }()
-            let createdAt: String = {
-                if case .string(let s) = obj["createdAt"] ?? .null { return s }
-                return ""
-            }()
-            let payload = obj["payload"] ?? .null
-            out.append(DispatchLedgerEntry(
-                id: id, kind: kind, title: title, status: status,
-                payload: payload, createdAt: createdAt
-            ))
-        }
-        return out
-    }
 }
 
 // MARK: - Helpers
@@ -390,33 +316,22 @@ enum DispatchClockMonotonic {
 // execution, and the ledger. Missing action handlers fail closed; they are not
 // proxied to any daemon process.
 
-public actor SwiftNativeDispatcher: DispatcherClient {
+/// A read-only dispatcher; writable registrations fail closed before execution.
+public actor SwiftNativeDispatcher {
     private let ledger: DispatchLedger
-    private let clock: @Sendable () -> Date
-    private let runIdFactory: @Sendable () -> String
     /// Runs registered connector actions in-process. Nil or missing handlers
     /// fail closed; production callers supply NativeActionDispatch's registry.
     private let localActions: LocalConnectorActions?
     private let timeout: TimeInterval
-    /// Resolves the autonomy level ("auto"/"ask"/"never") for a given tool.
-    /// Without a resolver, read-only handlers are automatic and side-effecting
-    /// registrations are refused by makeDispatcher.
-    private let autonomyResolver: (@Sendable (String) async -> String)?
 
     public init(
         timeout: TimeInterval = 60,
         ledger: DispatchLedger? = nil,
-        clock: @escaping @Sendable () -> Date = { Date() },
-        runIdFactory: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
-        localActions: LocalConnectorActions? = nil,
-        autonomyResolver: (@Sendable (String) async -> String)? = nil
+        localActions: LocalConnectorActions? = nil
     ) {
         self.timeout = timeout
         self.ledger = ledger ?? DispatchLedger(ledgerPath: DispatchLedger.defaultLedgerPath())
-        self.clock = clock
-        self.runIdFactory = runIdFactory
         self.localActions = localActions
-        self.autonomyResolver = autonomyResolver
     }
 
     public func dispatch(
@@ -425,14 +340,13 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         ctx: DispatchContext,
         dryRun: Bool
     ) async throws -> DispatchResult {
-        // 1. Request-shape validation — explicit, surfaces clear errors before
-        //    we touch the network.
+        // Reject malformed input before native execution.
         let trimmed = tool.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             // Write a failed ledger entry first so the dispatch attempt is
             // visible even when the input is malformed.
             await tryWriteLedger(
-                runId: runIdFactory(),
+                runId: UUID().uuidString.lowercased(),
                 tool: trimmed,
                 status: "failed",
                 executed: false,
@@ -449,12 +363,12 @@ public actor SwiftNativeDispatcher: DispatcherClient {
             throw DispatcherError.missingTool
         }
 
-        let runId = runIdFactory()
-        let startedAt = dispatcherNowISO(clock())
+        let runId = UUID().uuidString.lowercased()
+        let startedAt = dispatcherNowISO(Date())
         do {
-            _ = try buildDispatchRequestBody(
-                tool: trimmed, input: input, ctx: ctx, dryRun: dryRun
-            )
+            var values = ctx.extra
+            if values["input"] == nil { values["input"] = .object(input) }
+            try validateDispatchValues(.object(values))
         } catch {
             await tryWriteLedger(
                 runId: runId,
@@ -476,11 +390,9 @@ public actor SwiftNativeDispatcher: DispatcherClient {
             throw error
         }
 
-        // 1b. NATIVE execution (wave 29 W3). If a local connector-action
-        //     registry is wired AND knows this tool, run it in-process and
-        //     skip the HTTP round-trip. Still writes the client-side ledger
-        //     entry.
-        if let actions = localActions, actions.canHandle(trimmed) {
+        // Writable registrations use the same fail-closed receipt as absent
+        // handlers, including when callers construct the dispatcher directly.
+        if let actions = localActions, actions.canHandle(trimmed), !actions.isSideEffecting(trimmed) {
             return await runNativeAction(
                 actions: actions,
                 tool: trimmed,
@@ -535,32 +447,6 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         )
     }
 
-    /// Wave 29 W3: run a connector action natively and shape its result into a
-    /// DispatchResult, writing the client-side ledger entry. Mirrors the
-    /// daemon's receipt construction for these tools: a result dict with
-    /// `ok=false` + `error_code` becomes status="failed" + a structured error;
-    /// otherwise status="ok". Side-effecting tools (write_file) are NOT executed
-    /// on dry_run — they return status="dry_run" / executed=false.
-    /// Map the trust-policy autonomy vocabulary to the dispatcher's three
-    /// internal levels — "auto" (execute), "ask" (queue for approval), "never"
-    /// (block) — mirroring `AutonomyGate.map`. Unknown levels FAIL CLOSED to
-    /// "ask" (require approval), never to "auto". This is the single source of
-    /// truth for the resolver path; keep it in sync with AutonomyGate.map.
-    static func normalizeDispatchAutonomy(_ raw: String) -> String {
-        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
-        case "auto", "app_data_autonomous", "workspace_autonomous":
-            return "auto"
-        case "ask", "supervised", "confirm", "send_approval":
-            return "ask"
-        case "never", "deny", "blocked":
-            return "never"
-        default:
-            // Unknown level — safe default (matches AutonomyGate.map). Better an
-            // unnecessary approval prompt than a silent auto-execute.
-            return "ask"
-        }
-    }
-
     private func runNativeAction(
         actions: LocalConnectorActions,
         tool: String,
@@ -573,72 +459,10 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         let connectorCtx = ConnectorActionContext.fromDispatch(ctx)
         let argsHash = dispatcherArgsHash(input)
 
-        let resolvedAutonomy = "auto"
-        let effective: String
-        let autonomySource: String
-        if let resolver = autonomyResolver {
-            let v = await resolver(tool).trimmingCharacters(in: .whitespaces).lowercased()
-            // Match AutonomyGate's vocabulary; unknown levels require approval.
-            effective = Self.normalizeDispatchAutonomy(v)
-            autonomySource = "trust_policy"
-        } else {
-            // Without a resolver, only read-only tools may execute automatically.
-            effective = actions.isSideEffecting(tool) ? "ask" : resolvedAutonomy
-            autonomySource = "native"
-        }
+        let effective = "auto"
+        let autonomySource = "native"
 
-        // 'never' — refuse outright; do not execute, do not queue.
-        if effective == "never" && !dryRun {
-            let err = DispatchError(
-                code: "tool_blocked",
-                message: "tool '\(tool)' is blocked by trust policy (effectiveAutonomy=never)",
-                tool: tool,
-                argsHash: argsHash,
-                recoverable: false
-            )
-            await tryWriteLedger(
-                runId: runId, tool: tool, status: "blocked", executed: false,
-                ctx: ctx, input: input, error: err,
-                startedAt: startedAt, runIdOverride: runId, argsHashOverride: argsHash,
-                effectiveAutonomy: effective, autonomySource: autonomySource
-            )
-            return DispatchResult(
-                ok: false, tool: tool, status: "blocked", output: nil, error: err,
-                executed: false, verifyPassed: nil, durationUs: 0, durationMs: 0,
-                argsHash: argsHash, effectiveAutonomy: effective, autonomySource: autonomySource,
-                providerMatch: true, traceEventId: "", runId: runId, startedAt: startedAt
-            )
-        }
-
-        // 'ask' — queue for approval; do not execute. The approval inbox
-        // owns the queued record; we return a pending receipt the caller
-        // can poll on. The actual enqueue lives behind the approval flow
-        // wired by the app layer; here we surface the gate decision so the
-        // caller never silently executes.
-        if effective == "ask" && !dryRun {
-            await tryWriteLedger(
-                runId: runId, tool: tool, status: "pending_approval", executed: false,
-                ctx: ctx, input: input, error: nil,
-                startedAt: startedAt, runIdOverride: runId, argsHashOverride: argsHash,
-                effectiveAutonomy: effective, autonomySource: autonomySource
-            )
-            return DispatchResult(
-                ok: false, tool: tool, status: "pending_approval", output: nil, error: nil,
-                executed: false, verifyPassed: nil, durationUs: 0, durationMs: 0,
-                argsHash: argsHash, effectiveAutonomy: effective, autonomySource: autonomySource,
-                providerMatch: true, traceEventId: "", runId: runId, startedAt: startedAt
-            )
-        }
-
-        // §6.30 prereq #8 (dry-run uniformity) — wave 36 W11. The Python
-        // `Dispatcher.run` short-circuits dry_run for ALL tools BEFORE the
-        // handler executes (the retired daemon — status="dry_run",
-        // executed=False, output=None), not just side-effecting ones. The
-        // original native guard only skipped execution for side-effecting tools,
-        // so a read-only native tool would EXECUTE on a dry-run — diverging from
-        // Python. Skip execution for EVERY native tool on dry_run, matching the
-        // daemon's uniform short-circuit. (output=None mirrors the daemon's
-        // dry_run receipt; the prior side-effecting branch already returned nil.)
+        // Dry runs leave even read-only handlers unexecuted.
         if dryRun {
             await tryWriteLedger(
                 runId: runId, tool: tool, status: "dry_run", executed: false,
@@ -656,7 +480,7 @@ public actor SwiftNativeDispatcher: DispatcherClient {
 
         let t0 = DispatchClockMonotonic.now()
         let raw: JSONValue
-        if ["read_file", "file_excerpt", "list_dir"].contains(tool), !actions.isSideEffecting(tool) {
+        if ["read_file", "file_excerpt", "list_dir"].contains(tool) {
             let imageSink = LocalToolImage.sink
             // Folder permission prompts and unavailable volumes can block even
             // metadata reads. Keep them off the caller's executor; BoundedWait
@@ -715,55 +539,8 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         } else {
             status = "failed"
             verifyPassed = nil
-            // §6.159 (wave 37 W06) — first-live-flip parity fix. The daemon's
-            // failed-handler-return receipt sets recoverable=TRUE
-            //`),
-            // NOT false. That branch is the EXACT path this native code mirrors: a
-            // handler that RAN (executed=true, above) and returned a dict with
-            // ok=False — including persona_read's own graceful failures
-            // (`bad_input` on an unknown kind, `persona_not_found` on a missing
-            // file). The daemon's only recoverable=FALSE error envelopes are the
-            // PRE-EXECUTION rejects (tool_unknown:1146 / provider_unsupported:1184 /
-            // tool_blocked:1217), all executed=FALSE — none of which this branch can
-            // reach (native canHandle() gates tool_unknown; provider/autonomy gating
-            // stays server-side; this branch is reached only AFTER the handler ran).
-            // Hardcoding false here meant the persona_read native flip — LIVE behind
-            // .dispatchPersonaRead via LocalConnectorActions.personaReadOnly — emitted
-            // a non-recoverable receipt for a failure the daemon marks recoverable, a
-            // real divergence the LLM/UI sees when the flag flips. Match the daemon:
-            // a handler that executed and failed is recoverable=true.
-            // §6.158 #6 fix (wave 37 W08): a handler that RAN and returned a
-            // failed dict must report recoverable=TRUE — the daemon's
-            // failed-handler branch sets recoverable=True (the retired daemon
-            // L1427), so the model gets a retryable error it can recover from.
-            // The W36-W11 persona_read flip hard-coded `false` here, diverging
-            // from the daemon on every native failure (e.g. persona_not_found,
-            // workspace_list path_not_allowed); both flipped read-only actions
-            // traverse THIS shared branch. Pre-execution rejects (unknown tool
-            // at L603/629, transport failures) keep their own `false`/`status>=500`
-            // recoverability — this only governs the handler-ran-then-failed case
-            // that mirrors the daemon's L1410-1428 path.
-            // §6.180 (wave 38 W04) — daemon parity fix. The daemon's
-            // failed-handler-return branch defaults to ErrorCode.handler_raised
-            // ("handler_raised"), NOT "tool_error", when the tool supplies no
-            // error_code of its own. The W08
-            // workspace_list flip surfaced the divergence: its NotADirectory
-            // catch (PersonaSystemActions.swift:439-444) returns {ok:false}
-            // with NO error_code, so this branch hit "tool_error" natively
-            // while the daemon emits "handler_raised" — a code consumers
-            // pattern-match on. Match the daemon default.
-            // §6.180 (wave 38 W07) — CLOSES §6.179 #4 (error_code parity). The
-            // daemon's failed-handler-return branch
-            // respects the handler's OWN `error_code` when present, else defaults to
-            // `ErrorCode.handler_raised.value` (= "handler_raised"). The Swift seam
-            // here previously defaulted a missing error_code to "tool_error" — a
-            // real divergence the consumer sees on any native failure dict that
-            // omits error_code (e.g. workspace_list's `contentsOfDirectory` catch
-            // branch returns `{ok:false, error:str(exc)}` with NO error_code). Match
-            // the daemon: default to "handler_raised". `time_now` (this wave's flip)
-            // always sets error_code="bad_input" on its only failure branch, so it
-            // never hits the default — but this is the SHARED branch every flipped
-            // read-only action traverses, so the fix lands once here for all of them.
+            // Executed failures remain recoverable and keep the handler's own
+            // error code, with the established handler_raised default.
             dispatchError = DispatchError(
                 code: errorCode ?? "handler_raised",
                 message: errorMessage.isEmpty ? "native action failed" : errorMessage,
@@ -828,7 +605,7 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         verifyPassed: Bool? = nil
     ) async {
         do {
-            let createdAt = startedAt ?? dispatcherNowISO(clock())
+            let createdAt = startedAt ?? dispatcherNowISO(Date())
             let argsHash = argsHashOverride ?? dispatcherArgsHash(input)
             var payload: [String: JSONValue] = [
                 "id":                 .string(UUID().uuidString.lowercased()),
@@ -888,57 +665,14 @@ private func truncateForTrace(_ value: JSONValue, maxChars: Int = 200) -> String
 
 // MARK: - Factory
 
-/// Swift-native dispatcher factory.
-///
-/// 2026-07-21 audit (pending_approval dead-end): the dispatch-time A4b guard
-/// resolves a SIDE-EFFECTING action with no autonomy resolver to "ask" and
-/// returns status="pending_approval" — but NO approval record is staged
-/// anywhere and this factory historically couldn't even accept a resolver, so
-/// the dispatch queued into the void (latent only because every production
-/// registry is read-only). This factory is the production registration seam,
-/// so the fail-closed guard lives HERE: registering a side-effecting action
-/// without wiring an `autonomyResolver` REFUSES the registration — the
-/// side-effecting handlers are stripped (a dispatch then fails HONESTLY with
-/// native_handler_missing instead of dead-ending on an unapprovable
-/// pending_approval) and a stderr line names the refused tools. Read-only
-/// actions pass through exactly as today; a resolver-wired factory keeps the
-/// full registry. Direct `SwiftNativeDispatcher` construction is deliberately
-/// unguarded so the dispatch-time A4b guard (and its pin test) stays intact.
+/// Swift-native read-only dispatcher factory.
 public func makeDispatcher(
     ledger: DispatchLedger? = nil,
     // Nil keeps this dispatcher fail-closed for every tool. Production callers
     // pass the concrete Swift registry they want to expose.
-    localActions: LocalConnectorActions? = nil,
-    // Resolves the trust-policy autonomy level for a tool. REQUIRED when the
-    // registry carries any side-effecting action (see the guard above).
-    autonomyResolver: (@Sendable (String) async -> String)? = nil
-) -> any DispatcherClient {
-    var actions = localActions
-    if let registry = localActions, autonomyResolver == nil {
-        let refused = registry.toolNames.filter { registry.isSideEffecting($0) }.sorted()
-        if !refused.isEmpty {
-            FileHandle.standardError.write(Data((
-                "makeDispatcher: refusing side-effecting action(s) registered without an autonomyResolver "
-                + "(unapprovable pending_approval dead-end): \(refused.joined(separator: ", "))\n"
-            ).utf8))
-            var handlers: [String: ConnectorActionHandler] = [:]
-            var trivialVerify: Set<String> = []
-            for name in registry.toolNames where !registry.isSideEffecting(name) {
-                handlers[name] = { input, ctx in registry.run(name, input: input, ctx: ctx) ?? .null }
-                if registry.isTrivialVerify(name) { trivialVerify.insert(name) }
-            }
-            actions = LocalConnectorActions(
-                handlers: handlers,
-                sideEffecting: [],
-                trivialVerify: trivialVerify
-            )
-        }
-    }
-    return SwiftNativeDispatcher(
-        ledger: ledger,
-        localActions: actions,
-        autonomyResolver: autonomyResolver
-    )
+    localActions: LocalConnectorActions? = nil
+) -> SwiftNativeDispatcher {
+    SwiftNativeDispatcher(ledger: ledger, localActions: localActions)
 }
 
 /// A chat slash command dispatched straight to the read-only local actions:
@@ -952,23 +686,7 @@ public func dispatchSlashCommand(
     sessionId: String?,
     dataRoot: URL
 ) async throws -> DispatchResult {
-    // The registries are disjoint, so the union order is immaterial.
-    var handlers: [String: ConnectorActionHandler] = [:]
-    var sideEffecting: Set<String> = []
-    var trivialVerify: Set<String> = []
-    for registry in [
-        LocalConnectorActions.personaReadOnly, .workspaceListReadOnly, .timeNowReadOnly,
-        .personaListSkillsReadOnly, .readFileReadOnly, .fileExcerptReadOnly, .systemInfoReadOnly,
-    ] {
-        for name in registry.toolNames {
-            handlers[name] = { input, ctx in registry.run(name, input: input, ctx: ctx) ?? .null }
-            if registry.isSideEffecting(name) { sideEffecting.insert(name) }
-            if registry.isTrivialVerify(name) { trivialVerify.insert(name) }
-        }
-    }
-    let dispatcher = makeDispatcher(localActions: LocalConnectorActions(
-        handlers: handlers, sideEffecting: sideEffecting, trivialVerify: trivialVerify
-    ))
+    let dispatcher = makeDispatcher(localActions: .nativeReadOnly)
     let ctx: DispatchContext
     // Only the two file reads get the sandbox context. An empty repo root
     // would leave `FileSystemActions.allowedRoots` empty and skip the sandbox

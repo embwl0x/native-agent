@@ -42,7 +42,7 @@ public extension GitHubConnectorActions {
             var params = ["per_page": String(limit)]
             if filter != "all" { params["status"] = filter }
             if let branch { params["branch"] = branch }
-            var runs: [[String: Any]] = [], coverage: [[String: Any]] = []
+            var runs: [[String: Any]] = [], totals: [(repository: String, count: Int)] = []
             for repository in repos {
                 guard let response = try await call(path: "repos/\(repository)/actions/runs", params: params, dataRoot: dataRoot) as? [String: Any],
                       let rows = response["workflow_runs"] as? [[String: Any]], let total = response["total_count"] as? Int else {
@@ -53,17 +53,22 @@ public extension GitHubConnectorActions {
                     projected["repository"] = repository
                     return projected
                 }
-                coverage.append(["repository": repository, "total_count": total, "returned_count": min(rows.count, limit), "results_truncated": total > min(rows.count, limit)])
+                totals.append((repository, total))
             }
             runs.sort { ($0["created_at"] as? String ?? "") > ($1["created_at"] as? String ?? "") }
+            runs = Array(runs.prefix(limit))
+            let coverage: [[String: Any]] = totals.map { repository, total in
+                let returned = runs.filter { $0["repository"] as? String == repository }.count
+                return ["repository": repository, "total_count": total, "returned_count": returned, "results_truncated": total > returned]
+            }
             return envelope("github.runs", fields: [
                 "scope": .string(repo == nil ? "recently_pushed_owned_repositories" : "repository"),
                 "run_status": .string(filter), "branch": branch.map(JSONValue.string) ?? .null,
-                "count": .int(Int64(min(runs.count, limit))), "limit": .int(Int64(limit)),
+                "count": .int(Int64(runs.count)), "limit": .int(Int64(limit)),
                 "repositoriesTruncated": .bool(reposTruncated),
-                "resultsTruncated": .bool(runs.count > limit || coverage.contains { $0["results_truncated"] as? Bool == true }),
+                "resultsTruncated": .bool(coverage.contains { $0["results_truncated"] as? Bool == true }),
                 "coverage": JSONValue(fromFoundation: coverage),
-                "runs": JSONValue(fromFoundation: Array(runs.prefix(limit))),
+                "runs": JSONValue(fromFoundation: runs),
             ])
         }
     }
@@ -151,15 +156,16 @@ public extension GitHubConnectorActions {
             path: "repos/\(repository.fullName)",
             dataRoot: dataRoot
         )
-        let root = try await optionalRepositoryCall(
+        async let rootRead = optionalRepositoryCall(
             path: "repos/\(repository.fullName)/contents",
             dataRoot: dataRoot
         )
-        let readme = try await optionalRepositoryCall(
+        async let readmeRead = optionalRepositoryCall(
             path: "repos/\(repository.fullName)/readme",
             dataRoot: dataRoot
         )
 
+        let (root, readme) = try await (rootRead, readmeRead)
         let rootProjection = repositoryEntries(root, limit: 100)
         var payload: [String: JSONValue] = [
             "actionId": .string("github.get_repository"),

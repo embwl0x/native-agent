@@ -108,17 +108,12 @@ public enum ProviderStreamGuard {
         providerLabel: String,
         isOutput: @escaping @Sendable (Element) -> Bool
     ) -> AsyncThrowingStream<Element, Error> {
-        if config.wallTimeout == 0 {
-            return workingStream(makeUpstream)
-        }
-        let effectiveConfig = config
-
         return AsyncThrowingStream { continuation in
             let state = ProviderStreamGuardState(startedAt: monotonicNow())
             let producer = Task {
                 do {
                     try Task.checkCancellation()
-                    try await ProviderStreamContext.$stallOnly.withValue(effectiveConfig.wallTimeout == 0) {
+                    try await ProviderStreamContext.$stallOnly.withValue(config.wallTimeout == 0) {
                     try await ProviderStreamContext.$activity.withValue({
                         _ = state.markProviderActivity(monotonicNow())
                     }) {
@@ -133,6 +128,7 @@ public enum ProviderStreamGuard {
                         guard state.markActivity(monotonicNow(), output: isOutput(chunk)) else { break }
                         continuation.yield(chunk)
                     }
+                    try Task.checkCancellation()
                     state.finish(continuation)
                     }
                     }
@@ -142,7 +138,7 @@ public enum ProviderStreamGuard {
                 }
             }
 
-            let watchdog = Task {
+            let watchdog = config.wallTimeout > 0 ? Task {
                 while !Task.isCancelled {
                     let snapshot = state.snapshot()
                     if snapshot.finished {
@@ -150,11 +146,11 @@ public enum ProviderStreamGuard {
                     }
 
                     let now = monotonicNow()
-                    if let timeout = timeout(snapshot: snapshot, now: now, config: effectiveConfig) {
+                    if let timeout = timeout(snapshot: snapshot, now: now, config: config) {
                         let ended = state.finish(
                             continuation,
                             throwing: timeout.error(providerLabel: providerLabel, snapshot: snapshot,
-                                                    waited: now - snapshot.startedAt, config: effectiveConfig),
+                                                    waited: now - snapshot.startedAt, config: config),
                             ifUnchanged: snapshot
                         )
                         if ended {
@@ -164,43 +160,16 @@ public enum ProviderStreamGuard {
                         continue // provider activity won the timeout race
                     }
 
-                    let delay = nextDelay(snapshot: snapshot, now: now, config: effectiveConfig)
+                    let delay = nextDelay(snapshot: snapshot, now: now, config: config)
                     let nanos = UInt64(max(0.01, delay) * 1_000_000_000)
                     try? await Task.sleep(nanoseconds: nanos)
                 }
-            }
+            } : nil
 
             continuation.onTermination = { _ in
                 producer.cancel()
-                watchdog.cancel()
+                watchdog?.cancel()
             }
-        }
-    }
-
-    /// Keep cancellation and real transport activity without an idle or wall
-    /// watchdog. A quiet open response is not evidence of a dead connection.
-    private static func workingStream<Element: Sendable>(
-        _ makeUpstream: @escaping @Sendable () -> AsyncThrowingStream<Element, Error>
-    ) -> AsyncThrowingStream<Element, Error> {
-        AsyncThrowingStream { continuation in
-            let state = ProviderStreamGuardState(startedAt: monotonicNow())
-            let producer = Task {
-                do {
-                    try await ProviderStreamContext.$stallOnly.withValue(true) {
-                    try await ProviderStreamContext.$admitted.withValue({ state.markAdmitted() }) {
-                        for try await chunk in makeUpstream() {
-                            try Task.checkCancellation()
-                            continuation.yield(chunk)
-                        }
-                        try Task.checkCancellation()
-                    }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: ProviderFailure.normalize(error, admitted: state.snapshot().admitted))
-                }
-            }
-            continuation.onTermination = { _ in producer.cancel() }
         }
     }
 
@@ -211,27 +180,31 @@ public enum ProviderStreamGuard {
     private enum TimeoutKind {
         case idle, wall, firstOutput
 
-        /// The cut says how long it waited, what arrived, and on what evidence;
-        /// admission rides along (only an unadmitted request may be sent again).
+        /// The cut carries wire evidence so recovery can distinguish a live
+        /// slow start from an unopened connection without reading its wording.
         func error(providerLabel p: String, snapshot: ProviderStreamGuardState.Snapshot,
                    waited: TimeInterval, config: ProviderStreamGuardConfig) -> Error {
             let waited = Int(waited.rounded()), idle = Int(config.idleTimeout.rounded())
             let deadline = config.firstOutput
-            let arrived = !snapshot.admitted ? (snapshot.eventCount == 0 ? "nothing arrived" : "headers only")
+            let arrived = !snapshot.admitted ? (!snapshot.hasWireActivity ? "nothing arrived" : "headers only")
                 : snapshot.keepAlives == 0 ? "headers only" : "headers and \(snapshot.keepAlives) keep-alives"
             let evidence = deadline.seconds == nil
                 ? "its first-output deadline is unmeasured (\(deadline.calls) of \(FirstOutputDeadline.callsNeeded) calls)."
-                : "its slowest first word in the last \(deadline.calls) calls was \(Int((deadline.slowest ?? 0).rounded())) s."
+                : "its slowest first output in the last \(deadline.calls) calls was \(Int((deadline.slowest ?? 0).rounded())) s."
             let account: String
             switch (self, snapshot.yieldedAny) {
-            case (.firstOutput, _): account = "No first word from \(p) in \(waited) s (\(arrived)); \(evidence)"
-            case (.wall, false): account = "No first word from \(p) by the call's \(waited) s limit (\(arrived)); \(evidence)"
-            case (.idle, false): account = "No first word from \(p), and nothing on the line for \(idle) s (\(arrived) in \(waited) s)."
+            case (.firstOutput, _): account = "No first output from \(p) in \(waited) s (\(arrived)); \(evidence)"
+            case (.wall, false):
+                let evidence = ProviderStreamContext.retryingLiveFirstOutputCut
+                    ? "the learned first-output deadline was skipped after a live-stream cut." : evidence
+                account = "No first output from \(p) by the call's \(waited) s limit (\(arrived)); \(evidence)"
+            case (.idle, false): account = "No first output from \(p), and nothing on the line for \(idle) s (\(arrived) in \(waited) s)."
             case (.wall, true): account = "\(p) was still replying at the call's \(waited) s limit (\(snapshot.eventCount) events)."
             case (.idle, true): account = "\(p) went silent for \(idle) s mid-reply (\(snapshot.eventCount) events in \(waited) s)."
             }
             let cut = ProviderFailure.noReply(provider: p, seconds: waited, events: snapshot.eventCount, account: account)
-            return ProviderFailure.Diagnostic(cause: cut, detail: account, deadlineExpired: true, admitted: snapshot.admitted)
+            return ProviderFailure.Diagnostic(cause: cut, detail: account, deadlineExpired: true,
+                admitted: snapshot.admitted, liveFirstOutputCut: self == .firstOutput && snapshot.hasWireActivity)
         }
     }
 
@@ -244,12 +217,13 @@ public enum ProviderStreamGuard {
            now - snapshot.startedAt >= config.wallTimeout {
             return .wall
         }
-        if config.idleTimeout > 0,
+        if !ProviderStreamContext.retryingLiveFirstOutputCut, config.idleTimeout > 0,
            let lastActivityAt = snapshot.lastActivityAt,
            now - lastActivityAt >= config.idleTimeout {
             return .idle
         }
-        if !snapshot.yieldedAny, let deadline = config.firstOutput.seconds,
+        if !ProviderStreamContext.retryingLiveFirstOutputCut,
+           !snapshot.yieldedAny, let deadline = config.firstOutput.seconds,
            now - snapshot.startedAt >= deadline {
             return .firstOutput
         }
@@ -262,14 +236,15 @@ public enum ProviderStreamGuard {
         config: ProviderStreamGuardConfig
     ) -> TimeInterval {
         var candidates = [config.checkInterval]
-        if config.idleTimeout > 0,
+        if !ProviderStreamContext.retryingLiveFirstOutputCut, config.idleTimeout > 0,
            let lastActivityAt = snapshot.lastActivityAt {
             candidates.append(config.idleTimeout - (now - lastActivityAt))
         }
         if config.wallTimeout > 0 {
             candidates.append(config.wallTimeout - (now - snapshot.startedAt))
         }
-        if !snapshot.yieldedAny, let deadline = config.firstOutput.seconds {
+        if !ProviderStreamContext.retryingLiveFirstOutputCut,
+           !snapshot.yieldedAny, let deadline = config.firstOutput.seconds {
             candidates.append(deadline - (now - snapshot.startedAt))
         }
         return max(0.01, candidates.min() ?? config.checkInterval)
@@ -284,6 +259,7 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
         /// its first upstream `next()` call.
         var lastActivityAt: TimeInterval?
         var eventCount: Int
+        var hasWireActivity: Bool
         var admitted: Bool
         /// Wire events after admission (pings, comments, content-free events).
         var keepAlives: Int
@@ -357,6 +333,7 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
             startedAt: startedAt,
             lastActivityAt: lastActivityAt,
             eventCount: providerEvents > 0 ? providerEvents : yieldedEvents,
+            hasWireActivity: providerEvents > 0,
             admitted: admitted,
             keepAlives: admitted ? providerEvents - eventsAtAdmission : 0,
             yieldedAny: yieldedAny

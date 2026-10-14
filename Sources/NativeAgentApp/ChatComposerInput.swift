@@ -1,5 +1,8 @@
+import Dispatcher
 import SwiftUI
+import ToolRegistry
 import AppKit
+import ChatOrchestration
 
 /// The composer: the text field, its slash menu, and the control strip around
 /// it.
@@ -24,8 +27,8 @@ struct ChatComposerInput: View {
     var isActive = true
     /// "To: <agent>" before the field (Simple view); nil hides it.
     var recipient: String? = nil
-    let voiceInput: VoiceInputController
-    let capabilitiesStore: CapabilitiesStore
+    let voiceInput: VoiceInputCapture
+    let capabilitiesStore: ToolsFacade
     /// The conversation dictation started in, and the one on screen. Speech may
     /// only write into the composer it started in (2026-09-06).
     let voiceSessionId: String
@@ -67,7 +70,7 @@ struct ChatComposerInput: View {
     }
 
     private var slashCommands: [SlashCommandMenu.SlashCmd] {
-        SlashCommandMenu.commands(filter: slashFilter, extraTools: capabilitiesStore.slashCommandTools())
+        SlashCommandMenu.commands(filter: slashFilter, extraTools: capabilitiesStore.slashTools)
     }
 
     private var selectedSlashCommand: SlashCommandMenu.SlashCmd? {
@@ -201,7 +204,7 @@ struct ChatComposerInput: View {
                     SlashCommandMenu(filter: slashFilter, selectedCommand: selectedSlashCommand?.id,
                                      onSelect: selectSlashCommand, onDismiss: {
                         showSlashMenu = false
-                    }, extraTools: capabilitiesStore.slashCommandTools())
+                    }, extraTools: capabilitiesStore.slashTools)
                     .fixedSize()
                     .houseSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { slashMenuHeight = $0 }

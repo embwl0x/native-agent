@@ -125,7 +125,7 @@ public struct WorkshopCadenceRow: Identifiable, Equatable, Sendable {
 /// unavailable read is represented by a nil model (the panel then renders an
 /// "unavailable" notice), never a zeroed-out one.
 public struct WorkshopObservatoryModel: Equatable, Sendable {
-    public let openPursuits: [WorkshopPursuitRow]
+    public let openPursuitCount: Int
     public let cadenceItems: [WorkshopCadenceRow]
     /// Distinct reservations across ALL pursuits (open + terminal) reserved today
     /// — the same count the store's global 6/day cap is measured against.
@@ -133,21 +133,13 @@ public struct WorkshopObservatoryModel: Equatable, Sendable {
     public let globalCap: Int
     public let maxOpenPursuits: Int
 
-    public var openPursuitCount: Int { openPursuits.count }
-
     /// L11: sourced from the FULL DeskState (store query), never the capped
     /// projection — every open agent pursuit is present so none falls out of the
     /// veto view.
     public static func build(state: DeskState, now: Date) -> WorkshopObservatoryModel {
         let today = DeskClock.dayStamp(now)
 
-        // OPEN self-pursuits: origin=agent, non-terminal. (A terminal/canceled
-        // pursuit is excluded — it's closed, nothing to veto.) Ordered by live
-        // score, highest first, so the pursuit the pump would pick sits on top.
-        let openPursuits = state.items
-            .filter { $0.isPursuit && !$0.status.isTerminal }
-            .map { WorkshopPursuitRow.from(item: $0, now: now) }
-            .sorted { ($0.score?.total ?? -.infinity) > ($1.score?.total ?? -.infinity) }
+        let openPursuitCount = state.items.lazy.filter { $0.isPursuit && !$0.status.isTerminal }.count
 
         // Owner cadence items with a now-live beating cadence.
         let cadenceItems = state.items.compactMap { item -> WorkshopCadenceRow? in
@@ -176,7 +168,7 @@ public struct WorkshopObservatoryModel: Equatable, Sendable {
         let sessionsToday = state.workSessions(on: today)
 
         return WorkshopObservatoryModel(
-            openPursuits: openPursuits,
+            openPursuitCount: openPursuitCount,
             cadenceItems: cadenceItems,
             sessionsToday: sessionsToday,
             globalCap: SwiftNativeDeskStore.maxWorkSessionsGlobalPerDay,
@@ -264,7 +256,7 @@ public enum WorkshopReceiptsReader {
 public struct WorkshopObservatorySnapshot: Equatable, Sendable {
     public let model: WorkshopObservatoryModel?
     public let deskUnavailable: String?
-    public let receipts: WorkshopReceiptsState
+    public let receipts: WorkshopReceiptsState?
 
     /// A one-line hint for the collapsible header while collapsed.
     public var hint: String {
@@ -275,6 +267,7 @@ public struct WorkshopObservatorySnapshot: Equatable, Sendable {
     public static func load(
         store: SwiftNativeDeskStore,
         receiptsPath: URL,
+        includeReceipts: Bool,
         now: Date = Date()
     ) async -> WorkshopObservatorySnapshot {
         let model: WorkshopObservatoryModel?
@@ -287,8 +280,42 @@ public struct WorkshopObservatorySnapshot: Equatable, Sendable {
             model = nil
             deskUnavailable = String("\(error)".prefix(WorkshopReceiptsReader.maxErrorChars))
         }
-        let receipts = await WorkshopReceiptsReader.load(receiptsPath: receiptsPath)
+        let receipts = includeReceipts ? await WorkshopReceiptsReader.load(receiptsPath: receiptsPath) : nil
         return WorkshopObservatorySnapshot(
             model: model, deskUnavailable: deskUnavailable, receipts: receipts)
     }
+}
+
+public enum DeskPursuitVetoRationale {
+    public static func row(for item: DeskItem, now: Date) -> WorkshopPursuitRow? {
+        guard item.pursuit != nil else { return nil }
+        return WorkshopPursuitRow.from(item: item, now: now)
+    }
+
+    public static func reasonLabel(_ rationale: String?) -> String? {
+        guard let rationale else { return nil }
+        let trimmed = rationale
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = trimmed.hasPrefix(WorkshopPursuitRow.choiceMarker)
+            ? String(trimmed.dropFirst(WorkshopPursuitRow.choiceMarker.count))
+            : trimmed
+        let cleaned = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : cleaned
+    }
+}
+
+extension WorkshopReceiptRow {
+    public var displayStatus: String {
+        guard self.isDirectedTask,
+              ["completed", "done", "succeeded"].contains(
+                self.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            return self.status
+        }
+        switch self.verificationStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "satisfied": return self.status
+        case "failed": return "verification failed"
+        default: return "unverified"
+        }
+    }
+
 }

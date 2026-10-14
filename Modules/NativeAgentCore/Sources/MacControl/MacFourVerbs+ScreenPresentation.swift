@@ -136,23 +136,21 @@ extension MacFourVerbs {
     struct Zoom {
         enum Scope { case whole, controls, readouts, visual }
         let screen: MacScreenRender.Screen
-        let options: MacScreenRender.Options
         let note: String
         let scope: Scope
 
-        init(screen: MacScreenRender.Screen, options: MacScreenRender.Options, note: String, scope: Scope = .whole) {
-            self.screen = screen; self.options = options; self.note = note; self.scope = scope
+        init(screen: MacScreenRender.Screen, note: String, scope: Scope = .whole) {
+            self.screen = screen; self.note = note; self.scope = scope
         }
     }
 
     /// Scoping, WITHOUT renumbering. Controls carry no ordinals, so a control
     /// zoom filters them; content rows carry the addresses she acts with, so a
-    /// content zoom raises the cap and names the matching ordinals instead of
+    /// content zoom names the matching ordinals instead of
     /// dropping their neighbours.
     static func zoom(
         _ screen: MacScreenRender.Screen,
-        part: String,
-        options: MacScreenRender.Options
+        part: String
     ) -> Zoom? {
         let needle = normalize(part)
         guard !needle.isEmpty else { return nil }
@@ -191,17 +189,6 @@ extension MacFourVerbs {
             )
             return Zoom(
                 screen: scoped,
-                options: MacScreenRender.Options(
-                    maxRows: max(options.maxRows, Self.zoomMaxRows),
-                    maxControls: options.maxControls,
-                    maxValues: options.maxValues,
-                    maxWhereSteps: options.maxWhereSteps,
-                    // Visual object details carry compact colour, normalized
-                    // geometry, and motion. The ordinary 40-character UI
-                    // label cap cuts those facts at "at …"; this scoped world
-                    // has few rows and can afford the bounded wider field.
-                    maxLabelChars: max(options.maxLabelChars, 96)
-                ),
                 note: "Visual surface retained with \(visualRows + visualControls.count) interpreted region"
                     + (visualRows + visualControls.count == 1 ? "" : "s")
                     + "; surrounding controls omitted.",
@@ -229,11 +216,7 @@ extension MacFourVerbs {
                 values: matchingValues, totalValues: asksForReadouts ? screen.totalValues : matchingValues.count,
                 unclassifiedOmittedTargets: screen.unclassifiedOmittedTargets
             )
-            return Zoom(screen: scoped, options: MacScreenRender.Options(
-                maxRows: options.maxRows, maxControls: options.maxControls,
-                maxValues: max(options.maxValues, Self.zoomMaxRows), maxWhereSteps: options.maxWhereSteps,
-                maxLabelChars: options.maxLabelChars
-            ), note: "\(matchingValues.count) observed readout\(matchingValues.count == 1 ? "" : "s") match; surrounding controls omitted.", scope: .readouts)
+            return Zoom(screen: scoped, note: "\(matchingValues.count) observed readout\(matchingValues.count == 1 ? "" : "s") match; surrounding controls omitted.", scope: .readouts)
         }
 
         if asksForControls || (!matchingControls.isEmpty && matchingRows.isEmpty) {
@@ -255,13 +238,6 @@ extension MacFourVerbs {
             )
             return Zoom(
                 screen: scoped,
-                options: MacScreenRender.Options(
-                    maxRows: options.maxRows,
-                    maxControls: max(options.maxControls, Self.zoomMaxRows),
-                    maxValues: options.maxValues,
-                    maxWhereSteps: options.maxWhereSteps,
-                    maxLabelChars: options.maxLabelChars
-                ),
                 note: "\(matchingControls.count) of \(screen.totalControls) actionable match"
                     // A capped read is not the whole window: say what it left out.
                     + (asksForControls && screen.unclassifiedOmittedTargets > 0
@@ -272,30 +248,19 @@ extension MacFourVerbs {
             )
         }
 
-        // Content zoom: the whole section, cap raised, ordinals intact.
-        let wide = MacScreenRender.Options(
-            maxRows: max(options.maxRows, Self.zoomMaxRows),
-            maxControls: options.maxControls,
-            maxValues: options.maxValues,
-            maxWhereSteps: options.maxWhereSteps,
-            maxLabelChars: options.maxLabelChars
-        )
+        // Content zoom: the whole section, ordinals intact.
         if matchingRows.isEmpty {
             return Zoom(
                 screen: screen,
-                options: wide,
                 note: "Nothing here is named \"\(part)\" — this is the whole screen."
             )
         }
         return Zoom(
             screen: screen,
-            options: wide,
             note: "Matching row\(matchingRows.count == 1 ? "" : "s"): "
                 + matchingRows.map(String.init).joined(separator: ", ") + "."
         )
     }
-
-    static let zoomMaxRows = 60
 
     // MARK: - Words
 

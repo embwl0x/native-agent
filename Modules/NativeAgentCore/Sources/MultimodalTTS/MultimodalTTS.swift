@@ -120,19 +120,11 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
     }
 }
 
-/// One-call protocol so the synthesizer is injectable for tests.
-public protocol MultimodalTTSSynthesizing: Sendable {
-    /// Synthesize `text` to audio bytes via OpenAI TTS. Returns the raw audio
-    /// `Data` (mp3/etc per `format`) on success, throws `MultimodalTTSError`
-    /// otherwise.
-    func synthesize(text: String, voice: String, format: String) async throws -> Data
-}
-
 /// SwiftNative OpenAI TTS client. Calls https://api.openai.com/v1/audio/speech
 /// directly via URLSession, resolving the platform key with
 /// `LLMCredentialResolver`. Byte-for-byte request parity with the daemon's
 /// `_VisionClient.tts`.
-public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
+public final class SwiftOpenAITTSClient: Sendable {
     /// Matches the retired daemon `OPENAI_TTS_URL`.
     public static let ttsURL = URL(string: "https://api.openai.com/v1/audio/speech")!
     /// The speech model this client sends. Supplied by the caller from the
@@ -147,23 +139,11 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
     /// Matches the daemon's 60s urlopen timeout.
     public static let timeoutSeconds: TimeInterval = 60
 
-    private let session: URLSession
-    private let endpoint: URL
-    private let apiKeyOverride: String?
     private let dataRoot: URL
 
-    public init(
-        model: String,
-        session: URLSession = .shared,
-        endpoint: URL = SwiftOpenAITTSClient.ttsURL,
-        apiKeyOverride: String? = nil,
-        dataRoot: URL? = nil
-    ) {
+    public init(model: String) {
         self.model = model
-        self.session = session
-        self.endpoint = endpoint
-        self.apiKeyOverride = apiKeyOverride
-        self.dataRoot = dataRoot ?? PersistenceCore.defaultDataRoot()
+        self.dataRoot = PersistenceCore.defaultDataRoot()
     }
 
     /// Read the flag through canonical saved authority; damaged policies deny.
@@ -183,7 +163,6 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
         if text.isEmpty { throw MultimodalTTSError.emptyText }
 
         // The one key source: <dataRoot>/providers/openai.json `api_key`.
-        // (apiKeyOverride is for tests.)
         //
         // REPO_PATH parity (wave 36 W08 / §6.138): resolve against the SAME
         // `dataRoot` the trust gate above already uses
@@ -194,10 +173,9 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
         // in the stamped/AppSupport data root. The daemon's `_VisionClient` is
         // constructed with `provider_config_dir=self.root / "providers"`, so
         // resolving against `dataRoot` is exact parity for installed builds.
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
-                    providerConfigFile: "openai.json",
-                    dataRoot: dataRoot),
+        guard let key = LLMCredentialResolver.resolveAPIKey(
+                providerConfigFile: "openai.json",
+                dataRoot: dataRoot),
               !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MultimodalTTSError.notConfigured
         }
@@ -208,15 +186,9 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
         // `Character` (grapheme) and drift for combining marks / emoji ZWJ
         // sequences. `.prefix` on a scalar view can split a grapheme; that
         // matches Python exactly (Python would split there too).
-        let scalars = text.unicodeScalars
-        let truncated: String
-        if scalars.count > SwiftOpenAITTSClient.maxInputChars {
-            truncated = String(String.UnicodeScalarView(scalars.prefix(SwiftOpenAITTSClient.maxInputChars)))
-        } else {
-            truncated = text
-        }
+        let truncated = String(String.UnicodeScalarView(text.unicodeScalars.prefix(SwiftOpenAITTSClient.maxInputChars)))
 
-        var req = URLRequest(url: endpoint)
+        var req = URLRequest(url: SwiftOpenAITTSClient.ttsURL)
         req.httpMethod = "POST"
         req.timeoutInterval = SwiftOpenAITTSClient.timeoutSeconds
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -234,7 +206,7 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await URLSession.shared.data(for: req)
         } catch {
             // Propagate cancellation cleanly (same convention as the ProviderRouting adapters).
             if error is CancellationError { throw CancellationError() }

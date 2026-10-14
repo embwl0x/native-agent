@@ -81,20 +81,34 @@ public enum TrustAccessModeCapabilityCatalog {
                 "critical": developerMode ? "auto" : "deny",
             ]
             : defaultRiskGate
-        return [
-            "enabled": policy.enabled,
-            "applescript_allowed": policy.applesScriptAllowed,
-            "jxa_allowed": policy.jxaAllowed,
-            "shortcuts_allowed": policy.shortcutsAllowed,
-            "accessibility_allowed": policy.accessibilityAllowed,
-            "system_control_allowed": policy.systemControlAllowed,
-            "file_ops_allowed": policy.fileOpsAllowed,
-            "shell_allowed": policy.shellAllowed,
-            "notifications_allowed": policy.notificationsAllowed,
-            "spotlight_allowed": policy.spotlightAllowed,
-            "remote_from_ios_allowed": policy.remoteFromIosAllowed,
-            "approval_required_for": policy.approvalRequiredFor,
-            "riskGatePolicy": riskGate,
-        ]
+        var value = policy.wireValue
+        value["riskGatePolicy"] = riskGate
+        return value
     }
+}
+
+public enum MacIntegrationPreset: String, Identifiable {
+    case off
+    case watch
+    case assistant
+    case full
+
+    public var id: String { rawValue }
+
+}
+
+extension TrustAccessModeCapabilityCatalog {
+    public static func macIntegrationPreset(for policy: TrustMacControlPolicy) -> MacIntegrationPreset {
+        if policy.enabled == false {
+            return .off
+        }
+        if policy.shellAllowed && policy.fileOpsAllowed && policy.accessibilityAllowed && policy.approvalRequiredFor.isEmpty {
+            return .full
+        }
+        if policy.fileOpsAllowed || policy.shellAllowed || policy.systemControlAllowed || policy.accessibilityAllowed || policy.applesScriptAllowed || policy.jxaAllowed {
+            return .assistant
+        }
+        return .watch
+    }
+
 }

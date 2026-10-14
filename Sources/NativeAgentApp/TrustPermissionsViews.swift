@@ -1,23 +1,10 @@
+import EngineRuntime
 import SwiftUI
-import AppKit
-import CoreGraphics
-import ScreenCaptureKit
-import ScreenVision
-import Speech
-import AVFoundation
-import UniformTypeIdentifiers
 import NativeAgentShared
-import MemoryV2
 import PersistenceCore
 import ChromeControl
 import BackgroundWork
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
 import TrustCenter
-#endif
 
 struct ChromeControlPermissionsView: View {
     @Environment(AppModel.self) private var appModel
@@ -27,7 +14,7 @@ struct ChromeControlPermissionsView: View {
     @State private var connectionState: ChromeControlConnectionState = .extensionNotLoaded
 
     private var fullMacActive: Bool {
-        appModel.engine.trust.policy.map(AppModel.fullMacGrantIsActive) ?? false
+        appModel.engine.trust.policy.map(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive) ?? false
     }
 
     private var isOn: Bool { enabled || fullMacActive }
@@ -227,7 +214,7 @@ struct TrainingPermissionsView: View {
     /// Full Mac (or checked Full Mac YOLO) admits unattended work whatever
     /// `enableAutonomy` says — including an upgraded policy that never carried
     /// the key. The switch shows the EFFECTIVE state, so it can never read OFF
-    /// while `BackgroundLoopsAssembly.unattendedWorkAllowed` is admitting work.
+    /// while `WorkshopBackgroundWork.unattendedWorkAllowed` is admitting work.
     @State private var unattendedForced = false
     @State private var isSaving = false
     @State private var completedInitialRead = false
@@ -277,10 +264,10 @@ struct TrainingPermissionsView: View {
     private func refreshUnattended() async {
         let request = unattendedReadGate.begin()
         let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let fullMac = appModel.engine.trust.policy.map(AppModel.fullMacGrantIsActive) ?? false
-        let yolo = await WorkshopBackgroundWork.isWideOpenTrust(dataRoot: root)
+        let forced = await WorkshopBackgroundWork.unattendedWorkForced(
+            policy: appModel.engine.trust.policy, dataRoot: root)
         guard !Task.isCancelled, unattendedReadGate.accepts(request) else { return }
-        unattendedForced = fullMac || yolo
+        unattendedForced = forced
     }
 
     private func syncDraftsFromPolicy() {

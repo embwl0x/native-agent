@@ -187,16 +187,7 @@ public enum CognitiveTurnKind: String, Sendable, Equatable, CaseIterable {
         }
 
         let debugMarkers = [
-            "[from: codex",
-            "from codex",
-            "via bridge] codex",
-            "codex replied to your message",
-            "codex landed",
-            "codex can read this through the local nativeagent bridge inbox",
-            "codex_bridge",
-            "codex-nativeagent-bridge",
             "codex-health",
-            "codex's second receipt",
             "debug-filter probe",
             "snapshot clean, codex",
             "inner-state capsule reads clean",
@@ -241,9 +232,7 @@ public enum CognitiveTurnKind: String, Sendable, Equatable, CaseIterable {
         //   2. failing that, the EVENT KIND, which is itself provenance —
         //      tool/provider/lifecycle/felt-resolution events are machine-
         //      originated, chat turns are person-originated.
-        // `.debug`/`.verification` above stay marker-driven: those markers are
-        // bridge PROVENANCE PREFIXES stamped onto the wire by the originating
-        // harness, not topic words a person would type.
+        // Debug and verification markers describe the operation, never its sender.
         return .live
     }
 }

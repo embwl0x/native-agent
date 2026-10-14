@@ -78,7 +78,7 @@ extension CognitiveSubstrate {
         marksSubstrateDirty: Bool,
         undoable: Bool = false
     ) async -> CognitiveThoughtSeed? {
-        guard configuration.enabled, configuration.thoughtSeedsEnabled else { return nil }
+        guard configuration.enabled else { return nil }
         let trimmed = bounded(text.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 240)
         guard !trimmed.isEmpty, configuration.maximumThoughtSeeds > 0 else { return nil }
         let now = dependencies.now()
@@ -182,7 +182,7 @@ extension CognitiveSubstrate {
     /// mutation into its larger SQLite transaction.
     @discardableResult
     func decayThoughtSeedsInMemory(at now: Date) -> Bool {
-        guard configuration.enabled, configuration.thoughtSeedsEnabled else { return false }
+        guard configuration.enabled else { return false }
         var changed = false
         for id in thoughtSeeds.keys {
             guard var seed = thoughtSeeds[id] else { continue }
@@ -209,9 +209,23 @@ extension CognitiveSubstrate {
         limit: Int = 5,
         minimumInterruptionScore: Double = 0.45
     ) async -> [CognitiveThoughtSuggestion] {
-        guard configuration.enabled, configuration.thoughtSeedsEnabled, limit > 0 else { return [] }
+        guard configuration.enabled, limit > 0 else { return [] }
+        return thoughtSuggestionSnapshot(
+            surface: surface,
+            limit: limit,
+            minimumInterruptionScore: minimumInterruptionScore,
+            workspace: await workspaceSnapshot()
+        )
+    }
+
+    public func thoughtSuggestionSnapshot(
+        surface: String,
+        limit: Int = 5,
+        minimumInterruptionScore: Double = 0.45,
+        workspace: CognitiveWorkspaceSnapshot
+    ) -> [CognitiveThoughtSuggestion] {
+        guard configuration.enabled, limit > 0 else { return [] }
         let boundedSurface = bounded(surface.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 80)
-        let workspace = await workspaceSnapshot()
         let now = workspace.generatedAt
         let activeWorkspaceNodeIds = Set(workspace.items.map(\.node.id))
         let currentAffect = projectedAffect(at: now)
@@ -269,7 +283,7 @@ extension CognitiveSubstrate {
     /// Pure bounded family projection. Expired seeds disappear from live reads
     /// immediately even if their physical deletion waits for maintenance.
     func projectedThoughtSeeds(at now: Date) -> [CognitiveThoughtSeed] {
-        guard configuration.enabled, configuration.thoughtSeedsEnabled else { return [] }
+        guard configuration.enabled else { return [] }
         return thoughtSeeds.values.compactMap { stored in
             var projected = stored
             projected.priority = effectiveThoughtSeedPriority(stored, at: now)
@@ -328,7 +342,7 @@ extension CognitiveSubstrate {
             + recency * 0.06
             + pressureBoost
             + uncertaintyBoost
-        return clamp(score)
+        return (score).clamped01()
     }
 
     private func thoughtSeedKindBoost(_ kind: CognitiveThoughtSeedKind) -> Double {

@@ -48,7 +48,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
     let approvalTimeoutSeconds: Double
     let historyLimit: Int
     let continuationCapabilityProfile: String?
-    let promoter: (any MemoryPromoting)?
     let cognitiveObserver: (any CognitiveEventObserving)?
     let cognitiveContextProvider: (any CognitiveContextProviding)?
     let providerLifecycleObserverInstalled: Bool
@@ -68,7 +67,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         approvalTimeoutSeconds: Double = 30,
         historyLimit: Int = 400,
         continuationCapabilityProfile: String? = nil,
-        promoter: (any MemoryPromoting)? = nil,
         cognitiveObserver: (any CognitiveEventObserving)? = nil,
         cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
         providerLifecycleObserverInstalled: Bool = false,
@@ -99,7 +97,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         self.approvalTimeoutSeconds = approvalTimeoutSeconds
         self.historyLimit = historyLimit
         self.continuationCapabilityProfile = continuationCapabilityProfile
-        self.promoter = promoter
         self.cognitiveObserver = cognitiveObserver
         let runtime = cognitiveObserver as? (any CognitiveRuntimeProviding)
         self.cognitiveContextProvider = cognitiveContextProvider ?? runtime
@@ -260,7 +257,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
                 suppressUserAppend: suppressUserAppend,
                 // Saved conversational evidence must not depend on whether
                 // this caller consumes live progress (bridge vs. Telegram).
-                persistToolMessages: true,
                 // chat() callers await the reply; deltas they draw (Telegram's
                 // draft) are a preview, not the answer.
                 progress: progress,

@@ -22,7 +22,7 @@ extension MacSyncEngine {
         if action.signature == nil {
             error = "missing signature"
         } else {
-            error = await validateInboxAction(data: data, action: action, enforceFreshness: false)
+            error = await validateInboxAction(data: data, action: action)
         }
         guard let error else { return true }
         await quarantineUnauthenticatedInboxFile(data: data, fileURL: fileURL, inboxDir: inboxDir, reason: error)
@@ -152,26 +152,6 @@ extension MacSyncEngine {
         await Task.detached(priority: .utility) { [fileURL, archiveURL] in
             try? FileManager.default.moveItem(at: fileURL, to: archiveURL)
         }.value
-    }
-
-    /// Exclusive creation also protects against a row appearing after the
-    /// earlier lookup while the signed response is being persisted.
-    nonisolated static func writeRejectedTransactionIfAbsent(_ record: ICloudTransactionRecord, in directory: URL) -> Bool {
-        guard let url = InboxActionFileBoundary.jsonURL(in: directory, validatedID: record.id) else { return false }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-        guard let data = try? encoder.encode(record) else { return false }
-        var wrote = false
-        var error: NSError?
-        NSFileCoordinator().coordinate(writingItemAt: url, options: [], error: &error) { coordinatedURL in
-            do {
-                try data.write(to: coordinatedURL, options: .withoutOverwriting)
-                wrote = true
-            } catch {
-                nativeLog("[MacSyncEngine] Rejection ledger creation refused: %@", error.localizedDescription)
-            }
-        }
-        return wrote && error == nil
     }
 
     private func processInboxFiles() async {
@@ -312,7 +292,7 @@ extension MacSyncEngine {
                     )
                 }
                 recordProcessed(staleAction.msgId)
-                saveProcessedIds()
+                await saveProcessedIds()
                 let archiveURL = inboxDir.appendingPathComponent("processed_\(pendingURL.lastPathComponent).done")
                 await Task.detached(priority: .utility) { [pendingURL, archiveURL] in
                     try? FileManager.default.moveItem(at: pendingURL, to: archiveURL)
@@ -531,7 +511,7 @@ extension MacSyncEngine {
                 // refusal leaves no processed id, because nothing ran.
                 if ledgerRefusal == nil {
                     recordProcessed(action.msgId)
-                    saveProcessedIds()
+                    await saveProcessedIds()
                 }
                 let archiveURL = inboxDir.appendingPathComponent("processed_\(fileURL.lastPathComponent).done")
                 await Task.detached(priority: .utility) { [fileURL, archiveURL] in
@@ -656,20 +636,19 @@ extension MacSyncEngine {
             // pending file in place with no processed id, and the next sweep
             // (or the next launch) re-ran the remote Mac action. Both steps are
             // now CHECKED, and if either fails we write a durable local marker
-            // that loadProcessedIds() reads back as "already processed".
+            // that restoreState reads back as "already processed".
             recordProcessed(action.msgId)
-            let processedSaved = saveProcessedIds()
+            let processedSaved = await saveProcessedIds()
             let archiveURL = inboxDir.appendingPathComponent("processed_\(fileURL.lastPathComponent).done")
             let archiveError = await Task.detached(priority: .utility) { [pendingURL, archiveURL] () -> String? in
                 do { try FileManager.default.moveItem(at: pendingURL, to: archiveURL); return nil }
                 catch { return error.localizedDescription }
             }.value
-            let commit = Self.commitCompletionBookkeeping(
-                dataRoot: PersistenceCore.defaultDataRoot(),
-                msgId: action.msgId,
-                processedSaved: processedSaved,
-                archiveError: archiveError
-            )
+            let root = sync.dataRoot
+            let commit = await sync.storage.perform {
+                Self.commitCompletionBookkeeping(dataRoot: root, msgId: action.msgId,
+                    processedSaved: processedSaved, archiveError: archiveError)
+            }
             if !commit.clean {
                 syncError = commit.syncError
                 await writeTransaction(
@@ -744,7 +723,8 @@ extension MacSyncEngine {
     /// inner-HMAC, freshness, idempotency, TrustCenter/router, receipt, and
     /// response-signing boundaries as the legacy Drive inbox.
     func processCloudKitActionMessage(_ message: BridgeMessage) async -> Bool {
-        let actionStateRoot = cloudKitActionStateRootOverride ?? PersistenceCore.defaultDataRoot()
+        guard isActive else { return false }
+        let actionStateRoot = PersistenceCore.defaultDataRoot()
         guard message.sender == "ios" else {
             return iCloudBridge.quarantineIncomingSender(message, dataRoot: actionStateRoot)
         }
@@ -766,14 +746,14 @@ extension MacSyncEngine {
         if action.signature == nil {
             authenticationError = "missing signature"
         } else {
-            authenticationError = await validateInboxAction(data: data, action: action, enforceFreshness: false)
+            authenticationError = await validateInboxAction(data: data, action: action)
         }
         if let authenticationError {
             syncError = "Rejected CloudKit action: \(authenticationError)"
             if authenticationError.contains("pairing secret unavailable") { return false }
             return iCloudBridge.quarantineIncomingSender(message, dataRoot: actionStateRoot)
         }
-        guard let responsesDir,
+        guard isActive, let responsesDir,
               let responseURL = InboxActionFileBoundary.jsonURL(
                 in: responsesDir,
                 validatedID: ids.messageID
@@ -1049,12 +1029,11 @@ extension MacSyncEngine {
         // the in-process guard at the top of this function still holds, but a
         // restart would lose it — so leave the durable marker instead.
         recordProcessed(action.msgId)
-        let commit = Self.commitCompletionBookkeeping(
-            dataRoot: actionStateRoot,
-            msgId: action.msgId,
-            processedSaved: cloudKitActionProcessedIDPersistence?() ?? saveProcessedIds(),
-            archiveError: nil  // CloudKit lane has no pending file to archive.
-        )
+        let processedSaved = await saveProcessedIds()
+        let commit = await sync.storage.perform {
+            Self.commitCompletionBookkeeping(dataRoot: actionStateRoot, msgId: action.msgId,
+                processedSaved: processedSaved, archiveError: nil)
+        }
         if !commit.clean { syncError = commit.syncError }
 
         do {

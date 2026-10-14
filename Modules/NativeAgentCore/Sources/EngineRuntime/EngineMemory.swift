@@ -4,6 +4,7 @@ import PersistenceCore
 import MemoryV2
 import KnowledgeGraph
 import TrustCenter
+import NativeAgentShared
 
 /// `NativeAgentEngine.memory` (S10's first typed facade): MemoryV2 and the
 /// Knowledge Graph for one data root, in
@@ -14,6 +15,16 @@ import TrustCenter
 @Observable
 public final class MemoryFacade {
     public nonisolated let dataRoot: URL
+    public private(set) var cachedAgentDisplayName = UserDefaults.standard.string(forKey: "cachedAgentDisplayName")
+
+    public func teachAssistantName(_ profile: PersonalityProfile?) {
+        if let profile {
+            cachedAgentDisplayName = profile.name
+            UserDefaults.standard.set(profile.name, forKey: "cachedAgentDisplayName")
+        }
+        let name = profile?.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !name.isEmpty { AdaptiveCandidateHygiene.insertAssistantName(name) }
+    }
 
     /// The newest 200 active memories, written by the app's refresh paths.
     public var memories: [MemoryV2.MemoryRecord] = []
@@ -22,6 +33,8 @@ public final class MemoryFacade {
         didSet { proposalsDidChange?() }
     }
     @ObservationIgnored public var proposalsDidChange: (@MainActor () -> Void)?
+
+    public private(set) var proposalsReadFailed = false
 
     /// Semantic search for the Memories field. nil results mean no search.
     public private(set) var searchResults: [MemoryV2.MemoryRecord]?
@@ -84,10 +97,21 @@ public final class MemoryFacade {
     /// current quality contract, is never offered for acceptance. History
     /// reads keep every row, including the fragments the gate let go.
     public nonisolated func proposals(status: String) async throws -> [ProposalRecord] {
-        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        return try await storage.listProposals(status: status)
-            .filter { status != "pending" || SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }
-            .map(ProposalRecord.init(stored:))
+        do {
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+            let records = try await storage.listProposals(status: status)
+                .filter { status != "pending" || SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }
+                .map(ProposalRecord.init(stored:))
+            if status == "pending" { await recordProposalsRead(failed: false) }
+            return records
+        } catch {
+            if status == "pending" { await recordProposalsRead(failed: true) }
+            throw error
+        }
+    }
+
+    private func recordProposalsRead(failed: Bool) {
+        proposalsReadFailed = failed
     }
 
     // MARK: - Writes
@@ -155,7 +179,11 @@ public final class MemoryFacade {
         let lower = trimmed.lowercased()
         // Only the memory's words: its layer is an internal label ("semantic"
         // on every row), and matching it put every row under "man" or "sem".
-        let lexical = memories.filter { $0.text.lowercased().contains(lower) }
+        let memories = memories
+        let lexical = await Task.detached {
+            memories.filter { $0.text.lowercased().contains(lower) }
+        }.value
+        guard !Task.isCancelled, searchGate.accepts(requestToken) else { return }
         let owner = owner
         do {
             // User, 2026-09-06: retrieve WITHOUT crediting use_count. This runs
@@ -211,7 +239,7 @@ public final class MemoryFacade {
             .appendingPathComponent("knowledge_graph.json")
     }
 
-    nonisolated private var graphReader: any KnowledgeGraphReader {
+    nonisolated private var graphReader: SwiftNativeKnowledgeGraphReader {
         makeKnowledgeGraphReader(graphPath: graphPath)
     }
 
@@ -354,5 +382,26 @@ extension ProposalRecord {
                 : "Observed \(recurrence)x; session evidence unavailable"
         }
         return "Observed \(recurrence)x in \(sessions) session\(sessions == 1 ? "" : "s")"
+    }
+}
+
+extension MemoryFacade {
+    private static let reviewReminderThreshold = 10
+    private static let reviewReminderArmedKey = "memoryReviewReminder.belowThreshold"
+
+    public func reviewReminder(pending: Int, agentName: String) -> (title: String, body: String)? {
+        let defaults = UserDefaults.standard
+        // Absent key reads as armed, so a first crossing on an existing pile fires.
+        let armed = defaults.object(forKey: Self.reviewReminderArmedKey) as? Bool ?? true
+        if pending < Self.reviewReminderThreshold {
+            if !armed { defaults.set(true, forKey: Self.reviewReminderArmedKey) }
+            return nil
+        }
+        guard armed else { return nil }
+        defaults.set(false, forKey: Self.reviewReminderArmedKey)
+        return (
+            title: "Memories to look over",
+            body: "\(DeskPageWords.spelled(pending)) things \(agentName) wants to keep are waiting for your yes or no on the Memories page."
+        )
     }
 }

@@ -33,30 +33,12 @@ final class DeskLiveReloader {
     /// equal activation stay cheap while a changed root replaces every exact
     /// watcher and bus subscription.
     private var watchedPaths: Set<URL> = []
-    private(set) var configurationError: String?
     private var reloadSequence: UInt64 = 0
     private var reload: (@MainActor @Sendable () async -> Void)?
     private let debounceDelay: Duration
     private let visibilityResolver: @MainActor @Sendable () -> Bool
     private lazy var debouncer = StoreReloadDebouncer(delay: debounceDelay) { [weak self] in
         await self?.performReload()
-    }
-
-    /// Diagnostic file trace (2026-08-27): this app emits nothing to the
-    /// unified log and refuses lldb, so the desk-never-loads class of bug is
-    /// otherwise unobservable in the installed build. One appended line per
-    /// lifecycle event, /tmp-rooted so reboots clean it up.
-    nonisolated static let tracePath = NSTemporaryDirectory() + InstallPaths.current.name("nativeagent-desk-reloader-trace.log")
-    nonisolated static func trace(_ line: String) {
-        let msg = "\(Date().timeIntervalSince1970) \(line)\n"
-        guard let data = msg.data(using: .utf8) else { return }
-        if let handle = FileHandle(forWritingAtPath: tracePath) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: URL(fileURLWithPath: tracePath))
-        }
     }
 
     /// The facts about one window that decide glanceability, separated from
@@ -85,18 +67,13 @@ final class DeskLiveReloader {
     init(
         debounceDelay: Duration = .milliseconds(500),
         visibilityResolver: @escaping @MainActor @Sendable () -> Bool = {
-            {
-                let facts = NSApp.windows.map { window in
-                    WindowFacts(
-                        isVisible: window.isVisible,
-                        occlusionVisible: window.occlusionState.contains(.visible),
-                        canBecomeMain: window.canBecomeMain)
-                }
-                trace("resolver windows=" + facts.map {
-                    "[v:\($0.isVisible) o:\($0.occlusionVisible) m:\($0.canBecomeMain)]"
-                }.joined())
-                return resolveGlanceVisibility(windows: facts)
-            }()
+            let facts = NSApp.windows.map { window in
+                WindowFacts(
+                    isVisible: window.isVisible,
+                    occlusionVisible: window.occlusionState.contains(.visible),
+                    canBecomeMain: window.canBecomeMain)
+            }
+            return resolveGlanceVisibility(windows: facts)
         }
     ) {
         self.debounceDelay = debounceDelay
@@ -104,33 +81,26 @@ final class DeskLiveReloader {
     }
 
     /// Binding or removing one page never replaces another page's lifecycle.
-    @discardableResult
     func activate(
         subscriber id: UUID,
         paths: [URL],
         reload: @escaping @MainActor @Sendable () async -> Void
-    ) -> String? {
+    ) {
         let subscriber = subscribers[id] ?? DeskLiveReloader(
             debounceDelay: debounceDelay, visibilityResolver: visibilityResolver)
         subscribers[id] = subscriber
         subscriber.reload = reload
         let normalized = Set(paths.map(\.standardizedFileURL))
         let changed = !subscriber.started || subscriber.watchedPaths != normalized
-        Self.trace("activate subscriber=\(id) paths=\(paths.count) changed=\(changed)")
-        guard subscriber.start(paths: paths) else {
-            subscriber.setViewVisible(false)
-            return subscriber.configurationError
-        }
+        subscriber.start(paths: paths)
         subscriber.setViewVisible(true)
         // Initial binding and newly discovered record paths each need one
         // registration-race read. An unchanged binding adds no dirty edge.
         if changed { subscriber.sourceDidChange() }
-        return nil
     }
 
     func deactivate(subscriber id: UUID) {
         guard let subscriber = subscribers.removeValue(forKey: id) else { return }
-        Self.trace("deactivate subscriber=\(id)")
         subscriber.setViewVisible(false)
         subscriber.reload = nil
         subscriber.stop()
@@ -148,25 +118,14 @@ final class DeskLiveReloader {
         subscribers[id]?.scheduleRefresh(at: deadline)
     }
 
-    @discardableResult
-    private func start(paths: [URL]) -> Bool {
+    private func start(paths: [URL]) {
         let normalized = Set(paths.map(\.standardizedFileURL))
         if started {
-            guard watchedPaths != normalized else { return true }
+            guard watchedPaths != normalized else { return }
             stop()
-        }
-        for path in normalized {
-            do {
-                try FileManager.default.createDirectory(
-                    at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            } catch {
-                configurationError = UserFacingError.message(error, action: "turn on Desk live updates")
-                return false
-            }
         }
         started = true
         watchedPaths = normalized
-        configurationError = nil
         watchGeneration &+= 1
         let generation = watchGeneration
         // A vnode source can watch an absent file only through an existing
@@ -198,10 +157,9 @@ final class DeskLiveReloader {
         }
         refreshWindowVisibility()
         updateVisibility()
-        return true
     }
 
-    private func setViewVisible(_ value: Bool) { Self.trace("setViewVisible \(value)"); viewVisible = value; updateVisibility() }
+    private func setViewVisible(_ value: Bool) { viewVisible = value; updateVisibility() }
     /// Schedule the next semantic freshness transition. Replacing the value
     /// replaces the single sleeper; nil cancels it. If the deadline fires while
     /// hidden, StoreReloadDebouncer retains one dirty edge for the next visible
@@ -260,7 +218,6 @@ final class DeskLiveReloader {
     }
     private func refreshWindowVisibility() {
         windowVisible = visibilityResolver()
-        Self.trace("refreshWindowVisibility -> \(windowVisible)")
         updateVisibility()
     }
     private func updateVisibility() {
@@ -272,7 +229,6 @@ final class DeskLiveReloader {
         // pausing — occluded, minimized, and closed all read as not visible.
         // Scene changes only refresh the window facts.
         let value = viewVisible && windowVisible
-        Self.trace("updateVisibility view=\(viewVisible) window=\(windowVisible) -> \(value)")
         if value != effectivelyVisible {
             effectivelyVisible = value
             Self.logger.notice("visibility active=\(value, privacy: .public)")
@@ -283,7 +239,6 @@ final class DeskLiveReloader {
         }
     }
     private func performReload() async {
-        Self.trace("performReload viewVisible=\(viewVisible) reloadNil=\(reload == nil)")
         guard started, viewVisible, let reload else { return }
         guard windowVisible else {
             // A visibility update can cross the actor hop just after a pending
@@ -304,7 +259,6 @@ final class DeskLiveReloader {
         Self.logger.notice(
             "reload complete sequence=\(sequence, privacy: .public) duration_ms=\(milliseconds, privacy: .public)"
         )
-        Self.trace("reload complete ms=\(milliseconds)")
     }
 
     deinit {

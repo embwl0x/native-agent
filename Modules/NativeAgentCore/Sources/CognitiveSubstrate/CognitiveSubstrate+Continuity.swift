@@ -125,7 +125,7 @@ extension CognitiveSubstrate {
         from read: CognitiveFrozenRead
     ) async -> [String]? {
         guard read.configuration.enabled,
-              read.configuration.affectEnabled,
+              read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
               request.mode == .inject,
               request.resolvedTurnKind == .live,

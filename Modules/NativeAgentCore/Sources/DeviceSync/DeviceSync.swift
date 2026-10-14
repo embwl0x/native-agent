@@ -14,6 +14,7 @@ typealias ChatSession = NativeAgentShared.ChatSession
 /// integration projection, APNs and the mobile notification relay.
 @MainActor
 public final class DeviceSync {
+    nonisolated let storage = DeviceSyncStorage()
     public nonisolated let dataRoot: URL
     nonisolated let host: any DeviceSyncHost
     nonisolated let cognition: NativeCognitionRuntime
@@ -21,9 +22,9 @@ public final class DeviceSync {
     nonisolated let needsUser: NeedsUserEdgeNotifier
 
     public lazy var bridge = iCloudBridge(sync: self)
-    public lazy var engine = MacSyncEngine(sync: self, stateDataRootOverride: nil)
+    public lazy var engine = MacSyncEngine(sync: self)
     public lazy var relay = MacSyncMobileNotificationRelay(sync: self)
-    public lazy var pairedPhones = PairedPhoneStore(url: dataRoot.appendingPathComponent("paired_phones.json"))
+    public lazy var pairedPhones = PairedPhoneStore(url: dataRoot.appendingPathComponent("paired_phones.json"), storage: storage)
 
     public nonisolated init(dataRoot: URL, host: any DeviceSyncHost, cognition: NativeCognitionRuntime) {
         self.dataRoot = dataRoot
@@ -39,6 +40,12 @@ public final class DeviceSync {
     public nonisolated func evaluateNeedsUser(items: [DeskItem]) async {
         await needsUser.evaluate(items: items)
     }
+}
+
+/// Disk bookkeeping shares one executor; admission and acknowledgements await
+/// its checked result while the UI remains on the main actor.
+actor DeviceSyncStorage {
+    func perform<T: Sendable>(_ work: @Sendable () throws -> T) rethrows -> T { try work() }
 }
 
 extension Notification.Name {

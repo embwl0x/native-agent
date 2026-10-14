@@ -3,8 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import ToolRegistry
-import Desk
-import CryptoKit
+import Senses
 
 // MARK: - Errors
 
@@ -12,16 +11,12 @@ import CryptoKit
 public enum ToolExecutionError: Error, LocalizedError {
     case invalidProposal(String)
     case proposalNotFound(String)
-    case validationFailed([String])
-    case invalidResponse(status: Int)
     case underlying(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidProposal(let msg): return "invalid proposal: \(msg)"
         case .proposalNotFound(let id): return "proposal not found: \(id)"
-        case .validationFailed(let errs): return "validation failed: \(errs.joined(separator: "; "))"
-        case .invalidResponse(let status): return "invalid response: HTTP \(status)"
         case .underlying(let m): return m
         }
     }
@@ -48,32 +43,6 @@ public struct ProposalRecord: Sendable, Equatable, Codable {
     public var validatedAt: String?
     public var validationErrors: [String]?
     public var extras: JSONValue?
-
-    public init(
-        id: String,
-        name: String,
-        description: String? = nil,
-        manifest: JSONValue,
-        riskClass: String? = nil,
-        permissions: [String]? = nil,
-        status: String,
-        createdAt: String,
-        validatedAt: String? = nil,
-        validationErrors: [String]? = nil,
-        extras: JSONValue? = nil
-    ) {
-        self.id = id
-        self.name = name
-        self.description = description
-        self.manifest = manifest
-        self.riskClass = riskClass
-        self.permissions = permissions
-        self.status = status
-        self.createdAt = createdAt
-        self.validatedAt = validatedAt
-        self.validationErrors = validationErrors
-        self.extras = extras
-    }
 }
 
 extension ProposalRecord {
@@ -170,602 +139,354 @@ public struct ProposalValidationResult: Sendable, Equatable, Codable {
     public var valid: Bool
     public var autoPromotable: Bool
     public var errors: [String]
+    public var candidateDigest: String?
+    public var capture: String?
 
-    public init(valid: Bool, autoPromotable: Bool, errors: [String]) {
+    public init(valid: Bool, autoPromotable: Bool, errors: [String], candidateDigest: String? = nil, capture: String? = nil) {
         self.valid = valid
         self.autoPromotable = autoPromotable
         self.errors = errors
+        self.candidateDigest = candidateDigest
+        self.capture = capture
     }
 }
 
-// MARK: - Protocol
 
-public protocol ToolExecutionProtocol: Sendable {
-    func createProposal(_ body: JSONValue) async throws -> ProposalRecord
-    func listProposals() async throws -> [ProposalRecord]
-    func getProposal(id: String) async throws -> ProposalRecord?
-    func validateProposal(id: String, promote: Bool) async throws -> ProposalValidationResult
-    // RUN sandbox + PROMOTE-with-signing land in sibling files
-    // (ToolExecution+Run.swift / ToolExecution+Promote.swift). The stubs
-    // here exist so callers can write against the full protocol surface
-    // today; calling them throws an explicit carve-out message.
-    func runTool(id: String, input: JSONValue) async throws -> JSONValue
-    @discardableResult
-    func promote(id: String, allowRisky: Bool) async throws -> ProposalRecord
-}
+public actor SwiftNativeToolExecution {
+    let root: URL
+    var store: OwnedProgramStore { OwnedProgramStore(root: root.appendingPathComponent("tools")) }
+    var abilities: AbilityStore { AbilityStore(dataRoot: root) }
 
-// MARK: - SwiftNative impl
-
-/// File-backed proposal lifecycle mirroring the retired daemon
-/// create_tool_proposal (L33285-33356). Actor-isolated for R-M-W safety on
-/// `<root>/tools/proposals/<id>/manifest.json`.
-///
-/// Split across sibling Swift files:
-///   - manifestSignature / signedAt / signatureVersion       (HMAC signing)
-///   - codeFingerprint                                       (run sandbox path)
-///   - activePath / quarantinePath                           (promote/quarantine)
-///   - autoPromotable / autoRun / autoPromote                (policy fields)
-/// All carve-outs round-trip via `extras` untouched on read; the SwiftNative
-/// validate pass here is intentionally small (manifest presence + permission
-/// shape) because full validation lives in `ToolExecution+Promote.swift` and
-/// `ToolExecution+RunSandbox.swift`.
-public actor SwiftNativeToolExecution: ToolExecutionProtocol {
-    private let root: URL
-    private let persistence: any PersistenceCoreProtocol
-    private let clock: @Sendable () -> Date
-
-    public init(
-        root: URL = PersistenceCore.defaultDataRoot(),
-        persistence: (any PersistenceCoreProtocol)? = nil,
-        clock: @escaping @Sendable () -> Date = { Date() }
-    ) {
+    public init(root: URL = PersistenceCore.defaultDataRoot()) {
         self.root = root
-        self.persistence = persistence ?? SwiftNativePersistenceCore()
-        self.clock = clock
     }
 
-    public var proposalsDir: URL {
-        root
-            .appendingPathComponent("tools", isDirectory: true)
-            .appendingPathComponent("proposals", isDirectory: true)
-    }
-
-    public func createProposal(_ body: JSONValue) async throws -> ProposalRecord {
-        guard case .object(let obj) = body else {
-            throw ToolExecutionError.invalidProposal("body must be a JSON object")
-        }
-        let id: String = {
-            if case .string(let s) = obj["id"] ?? .null, !s.isEmpty { return s }
-            return ""
-        }()
-        let name: String = {
-            if case .string(let s) = obj["name"] ?? .null, !s.isEmpty { return s }
-            return ""
-        }()
-        if id.isEmpty { throw ToolExecutionError.invalidProposal("id is required") }
-        if name.isEmpty { throw ToolExecutionError.invalidProposal("name is required") }
-        // The id becomes an on-disk directory name — reject traversal /
-        // separator ids before any path construction (audit 2026-06-09).
-        guard Self.isSafeToolId(id) else {
-            throw ToolExecutionError.invalidProposal("id must be a single safe path component")
-        }
-        let dir = proposalsDir.appendingPathComponent(id, isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let manifestPath = dir.appendingPathComponent("manifest.json")
-        let stamp = Self.isoTimestamp(clock())
-        var manifestObj = obj
-        manifestObj["id"] = .string(id)
-        manifestObj["name"] = .string(name)
-        if manifestObj["status"] == nil { manifestObj["status"] = .string("proposed") }
-        if manifestObj["createdAt"] == nil { manifestObj["createdAt"] = .string(stamp) }
-        // Persist the manifest atomically via PersistenceCore.
-        try await persistence.writeJSON(.object(manifestObj), to: manifestPath)
-        // Build the record: status=proposed, createdAt=now. The carve-outs
-        // (validationStatus/autoPromotable/signing) are absent here — they
-        // get filled by validate / promote in sibling subsystems.
-        var rec = ProposalRecord(
-            id: id,
-            name: name,
-            manifest: .object(manifestObj),
-            status: "proposed",
-            createdAt: stamp
-        )
-        if case .string(let d) = obj["description"] ?? .null { rec.description = d }
-        if case .string(let r) = obj["riskClass"] ?? .null { rec.riskClass = r }
-        if case .array(let arr) = obj["permissions"] ?? .null {
-            rec.permissions = arr.compactMap { v in
-                if case .string(let s) = v { return s } else { return nil }
-            }
-        }
-        return rec
-    }
-
-    public func listProposals() async throws -> [ProposalRecord] {
-        let dir = proposalsDir
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: nil
-        ) else { return [] }
-        var out: [ProposalRecord] = []
-        for entry in entries {
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: entry.path, isDirectory: &isDir),
-                  isDir.boolValue else { continue }
-            let manifestPath = entry.appendingPathComponent("manifest.json")
-            let raw = try await persistence.readJSON(manifestPath, ifMissing: .null)
-            if case .null = raw { continue }
-            guard case .object(var obj) = raw else { continue }
-            // Synthesize required fields if the on-disk manifest lacks them
-            // (the daemon's `no_tool.json` skip-marker files contain no id).
-            if obj["status"] == nil { obj["status"] = .string("proposed") }
-            if obj["createdAt"] == nil { obj["createdAt"] = .string("") }
-            // Use directory name as id fallback so daemon-written manifests
-            // that put id at top level still parse.
-            if case .string(let s) = obj["id"] ?? .null, s.isEmpty || s == "" {
-                obj["id"] = .string(entry.lastPathComponent)
-            } else if obj["id"] == nil {
-                obj["id"] = .string(entry.lastPathComponent)
-            }
-            if obj["name"] == nil, case .string(let s) = obj["id"] ?? .null {
-                obj["name"] = .string(s)
-            }
-            if let rec = ProposalRecord(json: .object(obj)) {
-                out.append(rec)
-            }
-        }
-        return out.sorted { $0.createdAt > $1.createdAt }
-    }
-
-    public func getProposal(id: String) async throws -> ProposalRecord? {
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return nil }
-        let all = try await listProposals()
-        return all.first { $0.id == trimmed }
-    }
-
-    public func validateProposal(id: String, promote: Bool) async throws -> ProposalValidationResult {
-        // U5 W-B: wired to the REAL SwiftToolValidator — the same checks the
-        // promote path applies (tests.json presence, dangerous-import scan
-        // of the entrypoint, permission allow-list, safe-auto subset). The
-        // pre-U5 stub here returned valid+autoPromotable for ANY readable
-        // manifest — a silent pass-through. The `promote` flag does not
-        // relax or tighten anything: validation ground truth is identical
-        // either way, and the promote engine re-runs it before activation.
-        guard let rec = try await getProposal(id: id) else {
-            throw ToolExecutionError.proposalNotFound(id)
-        }
-        var errors: [String] = []
-        if rec.name.isEmpty { errors.append("name is required") }
-        guard case .object(let manifestObj) = rec.manifest else {
-            errors.append("manifest missing")
-            return ProposalValidationResult(valid: false, autoPromotable: false, errors: errors)
-        }
-        let proposalDir = proposalsDir.appendingPathComponent(rec.id, isDirectory: true)
-        let deep = await SwiftToolValidator.validate(manifest: manifestObj, proposalDir: proposalDir)
-        errors.append(contentsOf: deep.errors)
-        let valid = errors.isEmpty && deep.valid
-        return ProposalValidationResult(
-            valid: valid,
-            autoPromotable: valid && deep.autoPromotable,
-            errors: errors
-        )
-    }
-
-    public func runTool(id: String, input: JSONValue) async throws -> JSONValue {
-        try await runTool(id: id, input: input, requiredFingerprint: nil)
-    }
-
-    /// R9 (review round 2): `requiredFingerprint` lets a caller that already
-    /// ADMITTED a specific code fingerprint pin the run to it — closing the
-    /// TOCTOU where a registry/manifest mutation between the caller's check
-    /// and this run would otherwise downgrade to an unverified execution.
-    /// When non-nil it OVERRIDES the record/manifest fingerprint as the
-    /// expected value; a swap then fails as fingerprintMismatch.
-    public func runTool(
-        id: String,
-        input: JSONValue,
-        requiredFingerprint: String?
-    ) async throws -> JSONValue {
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard Self.isSafeToolId(trimmed) else {
-            throw ToolExecutionError.invalidProposal("tool id is required and must be a single safe path component")
-        }
-        let registry = SwiftNativeToolRegistry(root: root, persistence: persistence, clock: clock)
-        guard let record = try await registry.getTool(id: trimmed) else {
-            throw ToolExecutionError.proposalNotFound(trimmed)
-        }
-        guard record.status == "active" else {
-            throw ToolRunError.toolNotActive(id: trimmed, currentStatus: record.status)
-        }
-
-        let activeRoot = root
-            .appendingPathComponent("tools", isDirectory: true)
-            .appendingPathComponent("active", isDirectory: true)
-        let toolRoot = try Self.resolveActiveToolRoot(record: record, id: trimmed, activeRoot: activeRoot)
-        let manifestRaw = try await persistence.readJSON(
-            toolRoot.appendingPathComponent("manifest.json"),
-            ifMissing: .null
-        )
-        guard case .object(let manifest) = manifestRaw else {
-            throw ToolExecutionError.underlying("active tool manifest is missing or unreadable: \(trimmed)")
-        }
-        let entrypoint = try Self.safeEntrypointName(manifest)
-        let timeoutSeconds = Self.timeoutSeconds(manifest)
-        let expectedFingerprint = requiredFingerprint
-            ?? record.codeFingerprint
-            ?? Self.stringField(manifest, "codeFingerprint")
-        let actualFingerprint = computeToolCodeFingerprint(toolRoot: toolRoot, entrypointName: entrypoint)
-        guard case .array(let declared)? = manifest["permissions"],
-              declared.allSatisfy({ if case .string = $0 { return true }; return false }) else {
-            throw ToolExecutionError.underlying("active tool permissions are missing or malformed: \(trimmed)")
-        }
-        let permissions = Set(declared.compactMap { if case .string(let permission) = $0 { return permission }; return nil })
-        guard let registeredPermissions = record.permissions,
-              permissions == Set(registeredPermissions) else {
-            throw ToolExecutionError.underlying("active tool permissions do not match its registry: \(trimmed)")
-        }
-        let runner = ToolRunSandboxRunner()
-        let result: ToolRunResult
-        do {
-            result = try await runner.runTool(
-                sandbox: ToolRunSandbox(
-                    toolRoot: toolRoot,
-                    entrypoint: entrypoint,
-                    timeoutSeconds: timeoutSeconds,
-                    dataRoot: root,
-                    permissions: permissions
-                ),
-                input: input,
-                expectedFingerprint: expectedFingerprint,
-                actualFingerprint: actualFingerprint
-            )
-        } catch {
-            await noteCall(trimmed, failed: true)
-            throw error
-        }
-        let envelope = Self.runEnvelope(toolId: trimmed, result: result)
-        let failed = result.timedOut || result.exitCode != 0 || Self.parsedToolStatus(result.parsedOutput ?? .null) == "failed"
-        await noteCall(trimmed, failed: failed, clean: failed ? nil
-            : (try? String(contentsOf: toolRoot.appendingPathComponent(entrypoint), encoding: .utf8)).map(Self.sha))
-        return envelope
-    }
-
-    /// A call is a use (`CapabilityLifecycle`), a clean one names its code;
-    /// failing twice in a row asks, as one quiet MY QUEUE line, whether to improve it.
-    private func noteCall(_ id: String, failed: Bool, clean: String? = nil) async {
-        guard let line = try? await ToolRegistryActions.recordCall(id: id, failed: failed, cleanCode: clean, dataRoot: root)
-        else { return }
-        _ = try? await MyQueue.add(DeskStep(words: line, when: "quiet"), store: SwiftNativeDeskStore(dataRoot: root))
-    }
-
-    @discardableResult
-    public func promote(id: String, allowRisky: Bool) async throws -> ProposalRecord {
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Same gate as runTool: the id becomes a path component that the
-        // promote engine removeItem()s — a traversal id like "../active/<x>"
-        // must never get that far (audit 2026-06-09).
-        guard Self.isSafeToolId(trimmed) else {
-            throw ToolExecutionError.invalidProposal("tool id is required and must be a single safe path component")
-        }
-        let signer = SwiftNativeManifestSigner(dataRoot: root, clock: clock)
-        // FINDING #1 fix — wire the real SwiftToolValidator instead of the
-        // permissive default. Pinned to the proposal dir so the validator
-        // can ground-truth tests.json + entrypoint off disk.
-        let proposalDir = root
-            .appendingPathComponent("tools", isDirectory: true)
-            .appendingPathComponent("proposals", isDirectory: true)
-            .appendingPathComponent(trimmed, isDirectory: true)
-        let engine = ToolPromoteEngine(
-            signer: signer,
-            dataRoot: root,
-            validator: SwiftToolValidator.make(proposalDir: proposalDir),
-            clock: clock
-        )
-        let promoted: [String: JSONValue]
-        do {
-            promoted = try await engine.promote(
-                proposalId: trimmed,
-                allowRisky: allowRisky,
-                approvedBy: allowRisky ? "user_requested" : "safe_auto"
-            )
-        } catch ToolPromoteError.unknownProposal {
-            throw ToolExecutionError.proposalNotFound(trimmed)
-        } catch ToolPromoteError.validationFailed(let errs) {
-            throw ToolExecutionError.validationFailed(errs)
-        } catch ToolPromoteError.riskyWithoutAllowRisky(let perms) {
-            throw ToolExecutionError.validationFailed(
-                ["risky permissions require allowRisky=true: \(perms.joined(separator: ","))"]
-            )
-        } catch {
-            throw ToolExecutionError.underlying(error.localizedDescription)
-        }
-        // The engine returns the full merged manifest+record dict. Every
-        // promoted field round-trips through ProposalRecord's typed slots +
-        // extras-bag (activePath / manifestSignature / signedAt /
-        // signatureVersion / codeFingerprint / phase / promotedAt /
-        // validationStatus / risk-ack fields all land in extras and survive
-        // toJSON()). No ProposalRecord schema extension needed.
-        guard let rec = ProposalRecord(json: .object(promoted)) else {
-            throw ToolExecutionError.underlying("promote returned malformed record")
-        }
-        return rec
-    }
-
-    public nonisolated static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") {
-            return String(zulu.dropLast()) + "+00:00"
-        }
-        return zulu
-    }
-
-    private nonisolated static func isSafeToolId(_ id: String) -> Bool {
-        guard !id.isEmpty else { return false }
-        if id == "." || id == ".." { return false }
-        if id.contains("/") || id.contains("\\") || id.contains("\0") { return false }
-        // Reserved for the promote engine's staged-swap machinery (U5 W-B):
-        // a tool named like swap litter would be swept/restored by the
-        // promote entry sweep.
-        if id.hasPrefix(ToolPromoteEngine.stagingPrefix) || id.hasPrefix(ToolPromoteEngine.retiredPrefix) {
-            return false
-        }
-        return true
-    }
-
-    private nonisolated static func resolveActiveToolRoot(
-        record: ToolRecord,
-        id: String,
-        activeRoot: URL
-    ) throws -> URL {
-        let activeRootResolved = activeRoot.standardizedFileURL.resolvingSymlinksInPath()
-        let expected = activeRootResolved
-            .appendingPathComponent(id, isDirectory: true)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-        let candidate: URL
-        if let raw = record.activePath?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
-            candidate = URL(fileURLWithPath: raw, isDirectory: true)
-                .standardizedFileURL
-                .resolvingSymlinksInPath()
-        } else {
-            candidate = expected
-        }
-        guard candidate.path == expected.path else {
-            throw ToolExecutionError.underlying(
-                "activePath for \(id) must resolve to \(expected.path)"
-            )
-        }
-        return candidate
-    }
-
-    private nonisolated static func safeEntrypointName(_ manifest: [String: JSONValue]) throws -> String {
-        let entrypoint = stringField(manifest, "entrypoint") ?? "tool.swift"
-        let parts = entrypoint.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-        if entrypoint.hasPrefix("/") || parts.contains(where: { $0 == ".." || $0.isEmpty }) {
-            throw ToolExecutionError.underlying("unsafe tool entrypoint: \(entrypoint)")
-        }
-        return entrypoint
-    }
-
-    private nonisolated static func timeoutSeconds(_ manifest: [String: JSONValue]) -> Int {
-        let raw = manifest["timeoutSeconds"] ?? manifest["timeout_seconds"]
-        let parsed: Int
-        switch raw {
-        case .int(let i): parsed = Int(i)
-        case .double(let d): parsed = Int(exactly: d.rounded(.towardZero)) ?? 10
-        case .string(let s): parsed = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 10
-        case .bool(let b): parsed = b ? 1 : 10
-        default: parsed = 10
-        }
-        return min(120, max(1, parsed))
-    }
-
-    private nonisolated static func stringField(_ obj: [String: JSONValue], _ key: String) -> String? {
-        if case .string(let s)? = obj[key], !s.isEmpty { return s }
-        return nil
-    }
-
-    private nonisolated static func runEnvelope(toolId: String, result: ToolRunResult) -> JSONValue {
-        let parsed = result.parsedOutput ?? .null
-        let status = parsedToolStatus(parsed)
-        var obj: [String: JSONValue] = [
-            "toolId": .string(toolId),
-            "status": .string(status),
-            "stdout": .string(result.stdout),
-            "stderr": .string(result.stderr),
-            "exitCode": .int(Int64(result.exitCode)),
-            "durationSeconds": .double(result.durationSeconds),
-            "timedOut": .bool(result.timedOut),
-            "parsedOutput": parsed,
-            "result": parsedResult(parsed),
-        ]
-        if status == "failed", case .object(let parsedObj) = parsed {
-            if let error = parsedObj["error"] { obj["error"] = error }
-            if let detail = parsedObj["detail"] { obj["detail"] = detail }
-        }
-        return .object(obj)
-    }
-
-    private nonisolated static func parsedToolStatus(_ parsed: JSONValue) -> String {
-        guard case .object(let obj) = parsed else { return "ok" }
-        if case .bool(false)? = obj["ok"] { return "failed" }
-        if case .string(let status)? = obj["status"], !status.isEmpty { return status }
-        return "ok"
-    }
-
-    private nonisolated static func parsedResult(_ parsed: JSONValue) -> JSONValue {
-        if case .object(let obj) = parsed, let result = obj["result"] {
-            return result
-        }
-        return parsed
-    }
-}
-
-// MARK: - Her authoring surface
-
-extension SwiftNativeToolExecution {
-    /// `tool.propose`: a tool she wrote, filed as a proposal (manifest,
-    /// tool.swift, tests.json), validated as promote validates it, and listed
-    /// on the Tools page as proposed, where activating it is User's Approve.
-    /// A tool that runs now is changed under a new id or after quarantine, so
-    /// proposing never stops one that works. Proposing over a version keeps
-    /// that one (`tool.rollback`); approval starts over.
     public func propose(id: String, description: String, code: String, tests: [JSONValue],
-                        permissions: [String], inputSchema: JSONValue?) async throws -> ProposalValidationResult {
-        guard id.range(of: #"^[a-z][a-z0-9_]{1,47}$"#, options: .regularExpression) != nil else {
-            throw ToolExecutionError.invalidProposal(
-                "tool_id is 2 to 48 lowercase letters, digits and underscores, starting with a letter")
+                        permissions: [String], inputSchema: JSONValue?, actions: [String] = [],
+                        origin: JSONValue = .string("self"), capture: Bool = false, input: JSONValue? = nil,
+                        converts: JSONValue? = nil) async throws -> ProposalValidationResult {
+        guard id.range(of: #"^[a-z][a-z0-9_]{1,47}$"#, options: .regularExpression) != nil,
+              !description.isEmpty, !code.isEmpty else {
+            throw ToolExecutionError.invalidProposal("tool_id is 2 to 48 lowercase letters, digits and underscores; description and code are required")
         }
-        guard !description.isEmpty, !code.isEmpty else {
-            throw ToolExecutionError.invalidProposal("description and code are both required")
+        guard permissions.count == Set(permissions).count,
+              permissions.allSatisfy(ToolPrimitiveBroker.knownPermission),
+              actions.count == Set(actions).count, actions.count <= OwnedProgramRunner.actionLimit else {
+            throw ToolExecutionError.invalidProposal("Declare known permissions and distinct app actions; omit tests to capture validation")
         }
-        let existing = try await unlessActive(id)
-        try keepVersion(id)
-        var manifest: [String: JSONValue] = [
+        let existing = try await SwiftNativeToolRegistry(root: root).getTool(id: id)
+        let schema = inputSchema ?? .object(["type": .string("object"), "properties": .object([:])])
+        guard case .object = schema else { throw ToolExecutionError.invalidProposal("input_schema must be an object") }
+        let manifest: JSONValue = .object([
             "id": .string(id), "name": .string(id), "description": .string(description), "triggers": .array([]),
-            "permissions": .array(permissions.map(JSONValue.string)), "entrypoint": .string("tool.swift"),
-            "language": .string("swift"),
-        ]
-        if let inputSchema { manifest["inputSchema"] = inputSchema }
-        _ = try await createProposal(.object(manifest))
-        let dir = proposalsDir.appendingPathComponent(id, isDirectory: true)
-        try Data(code.utf8).write(to: dir.appendingPathComponent("tool.swift"), options: .atomic)
-        try JSONValue.array(tests).serializedData(pretty: true).write(to: dir.appendingPathComponent("tests.json"), options: .atomic)
-        var result = try await validateProposal(id: id, promote: false)
-        // Promote activates only permissions that are all app data, or that
-        // include one User acknowledges as risky; say so now, not at Approve.
-        if result.valid, !result.autoPromotable, Set(permissions).isDisjoint(with: ToolPromoteEngine.riskyToolPermissions) {
-            result.valid = false
-            result.errors.append("Approve can't activate these permissions: a tool that reads declares app_data_read, "
-                + "one that changes app state app_data_write; past that, add the one it needs (shell, network_public)")
+            "language": .string("javascript"), "entrypoint": .string("tool.js"), "inputSchema": schema,
+            "permissions": .array(permissions.map(JSONValue.string)), "actions": .array(actions.map(JSONValue.string)), "origin": origin,
+            "converts": try OwnedProgramStore.conversionSources(converts),
+        ])
+        let candidate = try OwnedProgramStore.Candidate(
+            program: OwnedProgram(kind: .tool, id: id, version: "candidate", source: code, entry: .run,
+                                  schema: schema, dependencies: actions, permissions: permissions),
+            manifest: manifest, fixtures: .array(tests), dependencyShapes: dependencyShapes(actions),
+            prior: OwnedProgramStore.selection(existing?.toJSON()))
+        let path = try abilities.path(id: id, slot: .next).path
+        let stamp = Self.isoTimestamp(Date())
+        let candidateStore = store
+        try await ToolRegistryActions.mutate(id: id, dataRoot: root) { current in
+            guard OwnedProgramStore.selection(current.map(JSONValue.object)) == candidate.prior else {
+                throw ToolExecutionError.invalidProposal("The selected tool changed; propose against its current version")
+            }
+            try candidateStore.stage(candidate)
+            var row = current ?? [:]
+            if current == nil {
+                row.merge(Self.fields(manifest)) { $1 }
+                row["status"] = .string("proposed"); row["phase"] = .string("proposed")
+                row["validationStatus"] = .string("invalid")
+            }
+            row["createdAt"] = row["createdAt"] ?? .string(stamp); row["updatedAt"] = .string(stamp)
+            row["candidateDigest"] = .string(candidate.digest); row["candidatePrior"] = candidate.prior
+            row["candidateValidation"] = .string("invalid"); row["proposalPath"] = .string(path)
+            row = try CapabilityLifecycle.preservingOwnerOff(row, before: current)
+            row["candidateSelection"] = OwnedProgramStore.selection(.object(row))
+            return row
         }
-        let stamp = Self.isoTimestamp(clock())
-        var row = manifest
-        row["status"] = .string("proposed")
-        row["phase"] = .string("proposed")
-        row["validationStatus"] = .string(result.valid ? "valid" : "invalid")
-        row["validationErrors"] = .array(result.errors.map(JSONValue.string))
-        row["proposalPath"] = .string(dir.path)
-        row["createdAt"] = .string(existing?.createdAt ?? stamp)
-        row["updatedAt"] = .string(stamp)
-        row["failuresInARow"] = .int(0)
-        try await ToolRegistryActions.upsertProposal(.object(row), dataRoot: root)
+        return try await validateProposal(id: id, capture: capture, input: input)
+    }
+
+    public func validateProposal(id: String, capture: Bool = false, input: JSONValue? = nil) async throws -> ProposalValidationResult {
+        guard let row = try await SwiftNativeToolRegistry(root: root).getTool(id: id),
+              try abilities.read(id: id, slot: .next) != nil,
+              let candidate = try candidate(for: row) else { throw ToolExecutionError.proposalNotFound(id) }
+        let result = try await validate(candidate, capture: capture, input: input)
+        if !result.valid { return result }
+        try await ToolRegistryActions.mutate(id: id, dataRoot: root) { current in
+            guard var fields = current, fields["candidateDigest"] == .string(candidate.digest) else {
+                throw ToolExecutionError.invalidProposal("A newer candidate replaced this validation")
+            }
+            fields["candidateValidation"] = .string(result.valid ? "valid" : "invalid")
+            fields["validationErrors"] = .array(result.errors.map(JSONValue.string))
+            if fields["status"] != .string("active") { fields["validationStatus"] = fields["candidateValidation"] }
+            return fields
+        }
         return result
     }
 
-    /// Its row, refused while active: a tool that runs now is changed under a
-    /// new id or after quarantine.
-    private func unlessActive(_ id: String) async throws -> ToolRecord? {
-        let existing = try await SwiftNativeToolRegistry(root: root, persistence: persistence, clock: clock).getTool(id: id)
-        if existing?.status == "active" {
-            throw ToolExecutionError.invalidProposal(
-                "\(id) is active. Propose the change under a new tool_id, or tool.quarantine \(id) first")
+    @discardableResult public func promote(id: String, allowRisky: Bool, ownerAuthorized: Bool = false) async throws -> ProposalRecord {
+        guard let tool = try await SwiftNativeToolRegistry(root: root).getTool(id: id),
+              let candidate = try candidate(for: tool) else { throw ToolExecutionError.proposalNotFound(id) }
+        if let refusal = ToolApprovalEligibility.refusal(for: tool, ownerAuthorized: ownerAuthorized) { throw ToolExecutionError.invalidProposal(refusal) }
+        guard allowRisky || (!candidate.program.permissions.isEmpty
+            && Set(candidate.program.permissions).isSubset(of: ["app_data_read"])) else {
+            throw ToolExecutionError.invalidProposal("The declared permissions require the existing approval decision")
         }
-        return existing
-    }
-
-    /// `tool.rollback`: the version she wrote before this one (its last clean
-    /// one when kept), proposed again, drafted and waiting for approval; the
-    /// one it replaces is kept in turn. Refused while active, as proposing is.
-    public func rollback(id: String) async throws -> ProposalValidationResult {
-        guard case .object(let version) = try rollbackTarget(id).row, case .string(let code)? = version["code"] else {
-            throw ToolExecutionError.invalidProposal("\(id) has no earlier version to roll back to")
+        try checkDependencies(candidate)
+        let signer = SwiftNativeManifestSigner(dataRoot: root)
+        let key = try await signer.loadOrCreateSigningKey()
+        let proof = try store.proof(candidate, key: key)
+        let admission = try await signer.sign(["id": .string(id), "candidate": .string(candidate.digest), "proof": proof])
+        let path = try abilities.path(id: id).path, stamp = Self.isoTimestamp(Date())
+        try await store.keep(candidate, key: key, ownerAuthorized: ownerAuthorized) { value in
+            guard case .array(var rows) = value,
+                  let index = rows.firstIndex(where: { Self.fields($0)["id"] == .string(id) }),
+                  case .object(var row) = rows[index] else {
+                throw ToolExecutionError.invalidProposal("The candidate, selected version or off-switch changed; propose and validate again")
+            }
+            let matches = row["candidateDigest"] != nil
+                ? row["candidateDigest"] == .string(candidate.digest) && row["candidatePrior"] == candidate.prior
+                    && row["candidateSelection"] == OwnedProgramStore.selection(rows[index]) && row["candidateValidation"] == .string("valid")
+                : row["codeFingerprint"] == .string(candidate.digest)
+                    && OwnedProgramStore.selection(rows[index]) == OwnedProgramStore.selection(tool.toJSON()) && row["validationStatus"] == .string("valid")
+            guard matches else { throw ToolExecutionError.invalidProposal("The candidate, selected version or off-switch changed; propose and validate again") }
+            row.merge(Self.fields(candidate.manifest)) { $1 }
+            row["status"] = .string("active"); row["phase"] = .string("active")
+            row["codeFingerprint"] = .string(candidate.digest); row["activePath"] = .string(path)
+            row["validationStatus"] = .string("valid"); row["admission"] = .object(admission)
+            for field in ["manifestSignature", "signedAt", "signatureVersion"] { row[field] = admission[field] }
+            row["promotedAt"] = .string(stamp); row["updatedAt"] = .string(stamp); row["failuresInARow"] = .int(0)
+            rows[index] = .object(row); value = .array(rows)
         }
-        let manifest: [String: JSONValue] = if case .object(let given)? = version["manifest"] { given } else { [:] }
-        let tests: [JSONValue] = if case .array(let given)? = version["tests"] { given } else { [] }
-        let permissions: [String] = if case .array(let given)? = manifest["permissions"] {
-            given.compactMap { if case .string(let p) = $0 { p } else { nil } }
-        } else { [] }
-        let description = if case .string(let text)? = manifest["description"] { text } else { id }
-        return try await propose(id: id, description: description, code: code, tests: tests, permissions: permissions,
-                                 inputSchema: manifest["inputSchema"])
+        guard let updated = try await SwiftNativeToolRegistry(root: root).getTool(id: id),
+              let record = ProposalRecord(json: updated.toJSON()) else { throw ToolExecutionError.underlying("Published tool did not read back") }
+        return record
     }
 
-    /// `tool.rollback`'s preview: the digest of the version it would land on,
-    /// refused as the rollback would be. Writes nothing.
-    public func rollbackPreview(id: String) async throws -> String {
-        let target = try rollbackTarget(id)
-        _ = try await unlessActive(id)
-        return target.sha
-    }
-
-    /// The version rollback lands on: the last clean earlier one, else the previous.
-    private func rollbackTarget(_ id: String) throws -> (sha: String, row: JSONValue) {
-        let earlier = earlierVersions(id)
-        guard let target = earlier.clean ?? earlier.previous else {
-            throw ToolExecutionError.invalidProposal("\(id) has no earlier version to roll back to")
+    public func runTool(id: String, input: JSONValue, requiredFingerprint: String) async throws -> JSONValue {
+        guard let row = try await SwiftNativeToolRegistry(root: root).getTool(id: id) else { throw ToolExecutionError.proposalNotFound(id) }
+        guard row.status == "active" else { throw SenseFailure(code: "not_active", message: "\(id) is \(row.status); enable its exact JS version before running it.") }
+        let pinned = requiredFingerprint
+        guard !pinned.isEmpty else {
+            throw ToolExecutionError.invalidProposal("Execution requires an admitted exact fingerprint")
         }
-        return target
+        guard row.language == "javascript" else { throw ToolExecutionError.invalidProposal("The tool has no JavaScript executable") }
+        guard row.codeFingerprint == pinned else { throw SenseFailure(code: "state_changed", message: "The tool version changed after admission.") }
+        let candidate: OwnedProgramStore.Candidate
+        do { candidate = try store.load(id: id, digest: pinned) }
+        catch { throw SenseFailure(code: "integrity", message: "The admitted candidate is unreadable: \(error.localizedDescription)") }
+        try await checkAdmission(candidate, row: row)
+        try checkDependencies(candidate)
+        guard let host = OwnedProgramInvocation.host else { throw ToolExecutionError.invalidProposal("Authored execution requires the originating app door") }
+        var fields = Self.fields(input)
+        let primitive = fields.removeValue(forKey: "__authored_primitive")
+        let input = JSONValue.object(fields)
+        try ToolPrimitiveBroker.checkInput(input, schema: candidate.program.schema)
+        if let refused = await host.admitTool(id, input: Self.fields(input)) { return refused }
+        let broker = ToolPrimitiveBroker(root: root, permissions: Set(candidate.program.permissions))
+        let profile = ToolHost(base: host, candidate: candidate, broker: broker, input: Self.fields(input),
+            admission: { try await self.checkSelected(candidate, pinned: pinned) })
+        if let primitive {
+            // The inbox approves one blocked primitive, never a repeat of earlier effects.
+            guard AuthoredToolEffects.approvedCall?.tool == id, case .object(let call) = primitive,
+                  call["fingerprint"] == .string(pinned), call["operation"] == .string("apps.call"),
+                  let arguments = call["arguments"] else {
+                await broker.close()
+                throw SenseFailure(code: "state_changed", message: "The exact primitive and tool version require a verified approval.")
+            }
+            let result = try await profile.primitive("apps.call", arguments: arguments, preview: false)
+            await broker.close()
+            return result
+        }
+        let helper = SenseHostLocator.helperURL, dataRoot = root
+        let runner = OwnedProgramRunner(helperURL: helper, dataRoot: dataRoot) { scratch in
+            try SenseSandboxProfile.build(reach: SenseReach(), helperURL: helper, scratch: scratch,
+                dataRoot: dataRoot, personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
+        }
+        var result = Self.fields(await runner.run(candidate.program, input: input, preview: false, replay: nil, host: profile))
+        await broker.close()
+        result["toolId"] = .string(id); result["version"] = .string(candidate.digest)
+        result["codeFingerprint"] = .string(candidate.digest); result["result"] = result["returned"] ?? .null
+        if result["status"] == .string("stopped") {
+            let stopped = Self.fields(result["stopped"] ?? .null)
+            result["status"] = .string(stopped["not_run_status"] == .string("approval_filed") ? "waiting_approval"
+                : stopped["reason"] == .string("cancelled") ? "cancelled" : "refused")
+            result["reason"] = stopped["reason"]; result["detail"] = stopped["detail"]
+            for key in ["approvalId", "not_run_status", "remedy"] { result[key] = stopped[key] }
+        }
+        if result["status"] == .string("timed_out") { result["detail"] = .string("The tool exceeded its \(Int(candidate.program.seconds))-second deadline.") }
+        try await ToolRegistryActions.recordUse(id: id, version: pinned, receipt: .object(result), codeFault: Self.codeFault(result),
+            cleanCode: result["status"] == .string("ok") ? candidate.program.digest : nil, dataRoot: root)
+        return .object(result)
     }
 
-    /// The code on disk now, and of the kept earlier versions the previous
-    /// and the last clean one; `cleanSha` is the last clean call's code.
-    private func earlierVersions(_ id: String) -> (current: String?, previous: (sha: String, row: JSONValue)?,
-                                                   clean: (sha: String, row: JSONValue)?, cleanSha: String?) {
-        let current = (try? String(contentsOf: proposalsDir.appendingPathComponent("\(id)/tool.swift"), encoding: .utf8)).map(Self.sha)
-        let earlier = keptVersions(id).filter { $0.sha != current }
-        let clean = ToolRegistryActions.lastCleanCode(id: id, dataRoot: root)
-        return (current, earlier.last, earlier.last { $0.sha == clean }, clean)
+    func checkSelected(_ candidate: OwnedProgramStore.Candidate, pinned: String) async throws {
+        guard let row = try await SwiftNativeToolRegistry(root: root).getTool(id: candidate.program.id),
+              row.status == "active", row.codeFingerprint == pinned else {
+            throw SenseFailure(code: "state_changed", message: "The selected tool was stopped or replaced. Nothing more ran.")
+        }
+        try await checkAdmission(candidate, row: row)
+        try checkDependencies(candidate)
     }
 
-    /// A tool's current, previous and last clean versions (`CapabilityLifecycle`),
-    /// each its code's digest (12), when it was made and the status it lands
-    /// in (a rollback lands proposed); null when not kept.
+    public func checkAdmission(_ candidate: OwnedProgramStore.Candidate, row: ToolRecord) async throws {
+        let fields = Self.fields(row.toJSON())
+        guard Self.fields(candidate.manifest).allSatisfy({ fields[$0.key] == $0.value }),
+              row.codeFingerprint == candidate.digest, row.permissions == candidate.program.permissions,
+              fields["inputSchema"] == candidate.program.schema,
+              fields["actions"] == .array(candidate.program.dependencies.map(JSONValue.string)),
+              row.activePath == (try store.directory(id: row.id, digest: candidate.digest).path),
+              case .object(let admission)? = fields["admission"] else {
+            throw SenseFailure(code: "integrity", message: "The selected tool's admission or metadata changed.")
+        }
+        let signer = SwiftNativeManifestSigner(dataRoot: root)
+        let errors = try await signer.verify(admission)
+        guard errors.isEmpty, admission["candidate"] == .string(candidate.digest) else {
+            throw SenseFailure(code: "integrity", message: errors.joined(separator: "; "))
+        }
+        let key = try await signer.loadOrCreateSigningKey()
+        guard admission["proof"] == (try store.proof(candidate, key: key)) else {
+            throw SenseFailure(code: "integrity", message: "The admitted validation proof changed.")
+        }
+    }
+
+    func candidate(for row: ToolRecord) throws -> OwnedProgramStore.Candidate? {
+        let fields = Self.fields(row.toJSON())
+        let selectedProposal = row.status == "proposed" || row.status == "disabled" && fields["admission"] == nil
+        guard let digest = Self.string(fields, "candidateDigest") ?? (selectedProposal ? row.codeFingerprint : nil) else { return nil }
+        return try store.load(id: row.id, digest: digest)
+    }
+
+    func dependencyShapes(_ actions: [String]) throws -> JSONValue {
+        var shapes: [String: JSONValue] = [:]
+        for action in actions {
+            guard let shape = OwnedProgramInvocation.host?.dependencyShape(action) else {
+                throw ToolExecutionError.invalidProposal("Dependency \(action) is unavailable in this app door")
+            }
+            shapes[action] = shape
+        }
+        return .object(shapes)
+    }
+
+    func checkDependencies(_ candidate: OwnedProgramStore.Candidate) throws {
+        guard let host = OwnedProgramInvocation.host, candidate.program.dependencies.allSatisfy({
+            host.dependencyMatches($0, Self.fields(candidate.dependencyShapes)[$0])
+        }) else {
+            throw SenseFailure(code: "stale_dependency", message: "An app-action dependency changed. Propose and validate against its current shape.")
+        }
+    }
+
+    public func rollback(id: String, version: String?) async throws -> ProposalValidationResult {
+        guard let current = try await SwiftNativeToolRegistry(root: root).getTool(id: id) else { throw ToolExecutionError.proposalNotFound(id) }
+        let target = try rollbackTarget(current, version: version)
+        guard var previous = try abilities.read(id: id, slot: .previous),
+              case .object(var selected)? = previous.metadata["record"] else { throw ToolExecutionError.invalidProposal("The previous version's record is unreadable") }
+        let admitted = try await rollbackAdmission(target, file: previous)
+        try AbilityStore.withLock {
+            guard try abilities.read(id: id, slot: .previous) == previous,
+                  case .array(let beforeRows) = try abilities.registry(kind: .tool),
+                  let before = beforeRows.first(where: { Self.fields($0)["id"] == .string(id) }).map(Self.fields),
+                  before["codeFingerprint"] == current.codeFingerprint.map(JSONValue.string) else {
+                throw ToolExecutionError.invalidProposal("The tool changed during rollback; read it again.")
+            }
+            try abilities.swap(id: id)
+            for key in ["status", "phase", "disabledBy"] { selected[key] = before[key] }
+            if !admitted {
+                for key in ["admission", "manifestSignature", "signedAt", "signatureVersion"] { selected.removeValue(forKey: key) }
+                if selected["status"] != .string("disabled") { selected["status"] = .string("proposed"); selected["phase"] = .string("proposed") }
+                selected["validationStatus"] = .string("valid")
+            }
+            selected["updatedAt"] = .string(Self.isoTimestamp(Date()))
+            previous.metadata["record"] = .object(selected)
+            try abilities.write(previous)
+        }
+        return ProposalValidationResult(valid: true, autoPromotable: false, errors: [], candidateDigest: target.digest)
+    }
+
+    public func rollbackPreview(id: String, version: String?) async throws -> (version: String, status: String, ownerOff: Bool) {
+        guard let tool = try await SwiftNativeToolRegistry(root: root).getTool(id: id) else { throw ToolExecutionError.proposalNotFound(id) }
+        let target = try rollbackTarget(tool, version: version)
+        guard let previous = try abilities.read(id: id, slot: .previous) else { throw ToolExecutionError.invalidProposal("No previous version") }
+        let admitted = try await rollbackAdmission(target, file: previous)
+        return (target.digest, admitted || tool.status == "disabled" ? tool.status : "proposed", CapabilityLifecycle.requiresOwnerToEnable(Self.fields(tool.toJSON())))
+    }
+
+    private func rollbackAdmission(_ candidate: OwnedProgramStore.Candidate, file: AbilityStore.File) async throws -> Bool {
+        let key = try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey()
+        _ = try store.proof(candidate, key: key)
+        guard case .object(var fields)? = file.metadata["record"], fields["admission"] != nil else { return false }
+        fields["activePath"] = .string(try store.directory(id: file.id, digest: candidate.digest).path)
+        guard let record = ToolRecord(json: .object(fields)) else { throw ToolExecutionError.invalidProposal("The previous version's record is unreadable") }
+        do { try await checkAdmission(candidate, row: record); return true }
+        catch let failure as SenseFailure where failure.code == "integrity" { return false }
+    }
+
+    private func rollbackTarget(_ row: ToolRecord, version: String?) throws -> OwnedProgramStore.Candidate {
+        guard let digest = ToolRegistryActions.rollbackVersion(row.toJSON()) else {
+            throw ToolExecutionError.invalidProposal("No previous version")
+        }
+        guard version == nil || version == digest else { throw ToolExecutionError.invalidProposal("Only the previous version can be rolled back") }
+        return try store.load(id: row.id, digest: digest)
+    }
+
+    /// Only the current, previous and proposed files can describe conversions.
+    public func convertedVersions(for row: ToolRecord) throws -> JSONValue {
+        let id = row.id
+        return .array(try store.conversions(id: id).map { candidate in
+            var fields: [String: JSONValue] = ["version": .string(candidate.digest),
+                "converts": Self.fields(candidate.manifest)["converts"] ?? .array([])]
+            do {
+                _ = try rollbackTarget(row, version: candidate.digest)
+                fields["rollback_call"] = .object(["action": .string("tool.rollback"),
+                    "args": .object(["tool_id": .string(id), "version": .string(candidate.digest)])])
+            } catch {
+                fields["rollback_unavailable"] = .string(error.localizedDescription)
+            }
+            return .object(fields)
+        })
+    }
+
     public func versions(id: String) async -> JSONValue {
-        let earlier = earlierVersions(id)
-        let row = try? await SwiftNativeToolRegistry(root: root, persistence: persistence, clock: clock).getTool(id: id)
-        func version(_ sha: String?, _ at: String?, _ lands: String) -> JSONValue {
-            guard let sha else { return .null }
-            return .object(["digest": .string(String(sha.prefix(12))), "at": at.map(JSONValue.string) ?? .null,
-                            "lands": .string(lands)])
+        do {
+            guard let row = try await SwiftNativeToolRegistry(root: root).getTool(id: id) else { return .null }
+            return Self.fields(ToolRegistryActions.read(row))["versions"] ?? .null
+        } catch { return .object(["status": .string("unavailable"), "detail": .string(error.localizedDescription)]) }
+    }
+
+    static func codeFault(_ fields: [String: JSONValue]) -> Bool {
+        if fields["status"] == .string("timed_out") {
+            return array(fields["calls"] ?? .array([])).allSatisfy {
+                [JSONValue.string("ok"), .string("preview")].contains(Self.fields($0)["status"] ?? .null)
+            }
         }
-        func kept(_ entry: (sha: String, row: JSONValue)?) -> JSONValue {
-            guard let entry else { return .null }
-            let at: String? = if case .object(let fields) = entry.row, case .string(let text)? = fields["at"] { text } else { nil }
-            return version(entry.sha, at, "proposed")
+        guard case .object(let error)? = fields["error"] else { return false }
+        if error["origin"] == .string("javascript") {
+            if case .int(let n)? = error["n"], n > 0 {
+                let calls = array(fields["calls"] ?? .array([]))
+                if calls.indices.contains(Int(n) - 1), Self.fields(calls[Int(n) - 1])["status"] != .string("ok") { return false }
+            }
+            return true
         }
-        let current = version(earlier.current, row?.updatedAt ?? row?.createdAt, row?.status ?? "proposed")
-        return .object(["current": current, "previous": kept(earlier.previous),
-                        "last_clean": earlier.cleanSha != nil && earlier.cleanSha == earlier.current ? current : kept(earlier.clean)])
+        let reason = string(error, "reason") ?? "javascript"
+        return ["javascript", "script_syntax", "script_name", "bad_output", "output_limit", "unreadable_return"].contains(reason)
     }
 
-    private func historyFile(_ id: String) -> URL {
-        root.appendingPathComponent("tools/history/\(id).json")
-    }
-
-    private func keptVersions(_ id: String) -> [(sha: String, row: JSONValue)] {
-        guard case .array(let rows)? = try? JSONValue.parse(Data(contentsOf: historyFile(id))) else { return [] }
-        return rows.compactMap { row in
-            guard case .object(let fields) = row, case .string(let code)? = fields["code"] else { return nil }
-            return (Self.sha(code), row)
+    static func fields(_ value: JSONValue) -> [String: JSONValue] { if case .object(let fields) = value { fields } else { [:] } }
+    static func array(_ value: JSONValue) -> [JSONValue] { if case .array(let values) = value { values } else { [] } }
+    static func strings(_ value: JSONValue?) -> [String] { array(value ?? .null).compactMap { if case .string(let text) = $0 { text } else { nil } } }
+    public nonisolated static func declaredStrings(_ value: JSONValue?, name: String) throws -> [String] {
+        guard let value else { return [] }
+        guard case .array(let values) = value, values.allSatisfy({ if case .string = $0 { true } else { false } }) else {
+            throw ToolExecutionError.invalidProposal("\(name) must be an array of strings")
         }
+        return strings(value)
     }
-
-    /// The proposal on disk now, kept as a version before a new one replaces
-    /// it. With the one on disk, a tool has its current, previous and last
-    /// clean versions, never more (`CapabilityLifecycle`).
-    private func keepVersion(_ id: String) throws {
-        let dir = proposalsDir.appendingPathComponent(id, isDirectory: true)
-        guard let code = try? String(contentsOf: dir.appendingPathComponent("tool.swift"), encoding: .utf8) else { return }
-        let read = { (name: String) in (try? JSONValue.parse(Data(contentsOf: dir.appendingPathComponent(name)))) ?? .null }
-        let kept = keptVersions(id) + [(Self.sha(code), JSONValue.object([
-            "at": .string(Self.isoTimestamp(clock())), "code": .string(code), "tests": read("tests.json"), "manifest": read("manifest.json"),
-        ]))]
-        let held = CapabilityLifecycle.keptVersions(kept.map { ($0.sha, $0.sha) }, recent: 1,
-                                                    clean: ToolRegistryActions.lastCleanCode(id: id, dataRoot: root))
-        try FileManager.default.createDirectory(at: historyFile(id).deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONValue.array(held.map { kept[$0].row }).serializedData(pretty: true).write(to: historyFile(id), options: .atomic)
-    }
-
-    /// SHA-256 of a tool's code: the key its versions and clean calls share.
-    static func sha(_ code: String) -> String {
-        SHA256.hash(data: Data(code.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-// MARK: - Factory
-
-public func makeToolExecution() -> any ToolExecutionProtocol {
-    return SwiftNativeToolExecution()
+    static func string(_ fields: [String: JSONValue], _ key: String) -> String? { if case .string(let text)? = fields[key] { text } else { nil } }
+    public nonisolated static func isoTimestamp(_ date: Date) -> String { SwiftNativeToolRegistry.isoTimestamp(date) }
 }

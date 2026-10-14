@@ -72,30 +72,28 @@ public struct GrokInboundReply: Sendable {
             if await GrokBotRoute.takenByWaiter(peer: peer.id, messageID: id, dataRoot: dataRoot) {
                 return mark("taken by wait", if: "pending")
             }
-            var why = ""
-            for _ in 0..<20 {
-                do {
-                    _ = try await TurnAdmission.shared.run(sessionID: pending.conversationID) {
-                        // Only a still-pending hand-over starts a turn; a wait later in
-                        // the turn that just finished may have taken it meanwhile.
-                        let claimed = try store.update(id, peer: peer.id) {
-                            if $0.seen == true, $0.handOver == "pending" { $0.handOver = "taken by wait" }
-                            else if $0.handOver == "pending" { $0.handOver = "handing over" }
-                        }
-                        guard claimed.handOver == "handing over" else { throw Taken() }
-                        return try await enqueue(pending, text: text, peer: peer, dataRoot: dataRoot)
+            do {
+                _ = try await TurnAdmission.shared.run(sessionID: pending.conversationID, waitForCapacity: true) {
+                    // Only a still-pending hand-over starts a turn; a wait later in
+                    // the turn that just finished may have taken it meanwhile.
+                    let claimed = try store.update(id, peer: peer.id) {
+                        if $0.seen == true, $0.handOver == "pending" { $0.handOver = "taken by wait" }
+                        else if $0.handOver == "pending" { $0.handOver = "handing over" }
                     }
-                    break
-                } catch is Taken { return } catch {
-                    // Its turn row never got written: pending again, and tried again.
-                    // Once written it went (a failed turn is that turn's own failure).
-                    guard (try? store.read(id, peer: peer.id))?.handOver != "handed over" else { break }
-                    mark("pending", if: "handing over")
-                    why = error.localizedDescription
-                    try? await Task.sleep(for: .seconds(30))
+                    guard claimed.handOver == "handing over" else { throw Taken() }
+                    return try await enqueue(pending, text: text, peer: peer, dataRoot: dataRoot)
+                }
+            } catch is Taken { return } catch is CancellationError {
+                // A claimed hand-over may already have enqueued. Keep its durable
+                // marker so launch recovery cannot repeat ambiguous delivery.
+                return
+            } catch {
+                _ = try? store.update(id, peer: peer.id) {
+                    if ["pending", "handing over"].contains($0.handOver ?? "") {
+                        $0.handOver = "not handed over: " + error.localizedDescription
+                    }
                 }
             }
-            if !why.isEmpty { mark("not handed over: " + why, if: "pending") }
             await MainActor.run { NotificationCenter.default.post(name: .chatTurnCompleted, object: pending.conversationID) }
         }
     }

@@ -13,6 +13,7 @@ import ProviderRouting
 import MacIntegration
 import Context
 import Senses
+import os
 
 extension SwiftNativeTurnEngine {
     /// The one structured tool loop. It builds a tool_use/tool_result
@@ -197,6 +198,7 @@ extension SwiftNativeTurnEngine {
         var providerCallCount = 0
         var replyTextSettled = false
         var retryAttempt = 0
+        var retryingLiveFirstOutputCut = false
 
         if let restarted = TurnCheckpointScope.resuming, restarted.runId == runId,
            restarted.turnId == TurnTraceContext.turnId {
@@ -222,7 +224,7 @@ extension SwiftNativeTurnEngine {
                 throw ChatOrchestrationError.underlying("The resumed turn's saved user message is missing; repair its transcript.")
             }
             let replay = SessionHistoryMessageProjection.project(messages: [user] + receipts,
-                historyLimit: max(1, receipts.count + 1), surface: surface, windowTokens: turnWindowTokens)
+                historyLimit: max(1, receipts.count + 1), windowTokens: turnWindowTokens)
             visibleText = restarted.keptProse
             turnInterstitialProse = String(restarted.keptProse.prefix(restarted.workingCommentaryCharacters))
             retainedAnswerProse = String(restarted.keptProse.dropFirst(restarted.workingCommentaryCharacters))
@@ -276,12 +278,13 @@ extension SwiftNativeTurnEngine {
             )
             try await TurnCheckpointScope.current?.capture(
                 prose: Self.joinedProse(turnInterstitialProse, retainedAnswerProse),
-                commentaryCharacters: turnInterstitialProse.count, conversation: conversation, nextIteration: true)
+                commentaryCharacters: turnInterstitialProse.count, conversation: conversation)
             var iterAccumulated = ""
             var iterEmittedProse = ""
             var streamedCalls: [ParsedToolCall] = []
             var toolBoundaryReason: LLMToolBoundaryReason?
             var pendingProtocolDelta = ""
+            let rawProviderEvents = OSAllocatedUnfairLock<String>(initialState: "")
             let roundBaseVisibleText = visibleText
             let roundBaseRawResponse = lastRawResponse
             let roundStarted = DispatchTime.now().uptimeNanoseconds
@@ -336,7 +339,16 @@ extension SwiftNativeTurnEngine {
                 let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
                 let purpose = LLMCallContext.purpose == "other"
                     ? (dispatches.isEmpty ? "turn" : "tool_round") : LLMCallContext.purpose
+                let captureEvents: @Sendable (SSEEvent) -> Void = { event in
+                    guard providerRoute == "anthropic_oauth_direct" else { return }
+                    rawProviderEvents.withLock { raw in
+                        if let name = event.event { raw += "event: \(name)\n" }
+                        raw += "data: " + event.data.replacingOccurrences(of: "\n", with: "\ndata: ") + "\n\n"
+                    }
+                }
                 let consumeStream: () async throws -> Void = {
+                    try await ProviderStreamContext.$retryingLiveFirstOutputCut.withValue(retryingLiveFirstOutputCut) {
+                    try await ProviderStreamContext.$diagnosticEvent.withValue(captureEvents) {
                     try await LLMCallContext.$purpose.withValue(purpose) {
                     let stream = llm.streamMessages(
                         messages: conversation,
@@ -397,6 +409,8 @@ extension SwiftNativeTurnEngine {
                     if ChatCancelFlag.isRaised(cancelFlagPath) { throw CancellationError() }
                     try await commitDelivery()
                     }
+                    }
+                    }
                 }
                 try await ConversationPrefixBoundary.$currentUserIndex.withValue(prefixSeed.currentUserIndex) {
                 try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
@@ -421,6 +435,10 @@ extension SwiftNativeTurnEngine {
             } catch {
                 if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) || error is CancellationError {
                     throw stopCarryingPartial()
+                }
+                if ProviderFailure.classify(error) == .malformedResponse {
+                    let raw = rawProviderEvents.withLock { $0 }
+                    if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "malformed_stream") }
                 }
                 counters.failedProviderAttemptCount += 1
                 if iterAccumulated.isEmpty, case .outputLengthLimit(let partial) = error as? LLMError {
@@ -451,14 +469,17 @@ extension SwiftNativeTurnEngine {
                         text: IntraTurnContextCompaction.noticeText))
                 } else if case .outputLengthLimit = error as? LLMError {
                     TurnObservation.apply(.lengthLimit(chars: kept.count), kept: kept, to: &conversation, surface: surface)
-                } else if ProviderRecoveryPolicy.isEmptyReply(error) {
-                    counters.emptyReplyRoundCount += 1
-                    TurnObservation.apply(.emptyReply, kept: kept, to: &conversation, surface: surface)
-                } else if ProviderRecoveryPolicy.isRecoverable(error) {
+                } else if ProviderRecoveryPolicy.isEmptyReply(error) || ProviderRecoveryPolicy.isRecoverable(error) {
+                    retryingLiveFirstOutputCut = retryingLiveFirstOutputCut
+                        || (error as? ProviderFailure.Diagnostic)?.liveFirstOutputCut == true
                     retryAttempt += 1
                     let delay = ProviderRecoveryPolicy.retryDelaySeconds(forRetry: retryAttempt, error: error)
                     let elapsed = Int((DispatchTime.now().uptimeNanoseconds &- roundStarted) / 1_000_000_000)
-                    if kept.isEmpty {
+                    let emptyReply = ProviderRecoveryPolicy.isEmptyReply(error)
+                    if emptyReply {
+                        counters.emptyReplyRoundCount += 1
+                        TurnObservation.apply(.emptyReply, kept: kept, to: &conversation, surface: surface)
+                    } else if kept.isEmpty {
                         counters.providerReplayCount += 1
                         // An empty transport cut replays the identical conversation.
                         TurnObservation.record(.cut(seconds: elapsed, keptChars: 0), surface: surface)
@@ -468,11 +489,11 @@ extension SwiftNativeTurnEngine {
                             kept: kept, to: &conversation, surface: surface)
                     }
                     ProviderRetryTrace.emit(error: error, attempt: retryAttempt,
-                        delaySeconds: delay, mode: kept.isEmpty ? "replay" : "continuation",
+                        delaySeconds: delay, mode: kept.isEmpty && !emptyReply ? "replay" : "continuation",
                         turnRecoveries: counters.providerRecoveryCount, surface: surface)
                     await progress?(.notice(kind: "provider_retry",
                         text: ProviderRecoveryPolicy.reconnectStatus(attemptsMade: retryAttempt)))
-                    do { try await providerRecoverySleep(delay) }
+                    do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
                     catch is CancellationError { throw stopCarryingPartial() }
                 } else {
                     switch ProviderFailure.classify(error) {
@@ -489,6 +510,7 @@ extension SwiftNativeTurnEngine {
                 continue
             }
             retryAttempt = 0
+            retryingLiveFirstOutputCut = false
             if toolBoundaryReason == .outputLimit {
                 let kept = await keepPartial()
                 if LLMCallContext.turnTokenBudget?.exhausted == true {
@@ -497,20 +519,47 @@ extension SwiftNativeTurnEngine {
                 TurnObservation.apply(.lengthLimit(chars: kept.count), kept: kept, to: &conversation, surface: surface)
                 continue
             }
+            let iterProse = ToolCallParser.stripProtocolDebris(iterAccumulated)
+            let answerText = iterProse.replacingOccurrences(
+                of: #"</?[\p{L}_][\p{L}\p{N}_.:-]*(?:\s[^<>]*)?/?>|<[!?][^>]*>"#, with: "", options: .regularExpression)
+            func saveSuspiciousReply() {
+                let visible = answerText.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard visible.split(whereSeparator: { $0.isWhitespace }).count < 2
+                    || (visible.count < 12 && iterProse.contains(where: { "<=>".contains($0) })) else { return }
+                let raw = rawProviderEvents.withLock { $0 }
+                if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "suspicious_reply") }
+            }
+            if streamedCalls.isEmpty && !answerText.contains(where: { !$0.isWhitespace }) {
+                saveSuspiciousReply()
+                visibleText = roundBaseVisibleText
+                counters.emptyReplyRoundCount += 1
+                TurnObservation.apply(.emptyReply, to: &conversation, surface: surface)
+                continue
+            }
             let markerCodec = toolCallCodec == .textMarkers
                 ? TextMarkerCodec(schemas: activeToolSchemas,
                     turnActiveTools: LLMCallContext.turnActiveTools ?? [], catalogNames: Set(ctx.toolsAvailable))
                 : nil
-            let violation = markerCodec?.malformedCall(in: iterAccumulated)
-                ?? ToolCallParser.formattedToolCallViolation(in: iterAccumulated, toolNames: Set(ctx.toolsAvailable))
+            var violation = markerCodec?.malformedCall(in: iterProse)
+                ?? ToolCallParser.formattedToolCallViolation(in: iterProse, toolNames: Set(ctx.toolsAvailable))
+            if violation?.traceType == "malformedToolUseMarker", markerCodec != nil, streamedCalls.isEmpty,
+               let repaired = ToolCallParser.repairMalformedRegion(
+                in: iterAccumulated, toolNames: Set(activeToolSchemas.map(\.name))) {
+                iterAccumulated = repaired
+                violation = nil
+            }
             if let violation {
                 counters.protocolViolationRoundCount += 1
                 let rejectedBytes = Data(iterAccumulated.utf8)
-                TurnTraceBus.fireFromContext(kind: "tool.protocol_violation", surface: surface, payload: .object([
+                var diagnostic: [String: JSONValue] = [
                     "type": .string(violation.traceType),
                     "byteSize": .int(Int64(rejectedBytes.count)),
                     "sha256": .string(SHA256.hash(data: rejectedBytes).map { String(format: "%02x", $0) }.joined()),
-                ]))
+                ]
+                do {
+                    diagnostic["path"] = .string(try RunawayOutputDetector.writeDiagnostic(iterAccumulated, reason: violation.traceType).get().path)
+                } catch { diagnostic["file_error"] = .string(error.localizedDescription) }
+                TurnTraceBus.fireFromContext(kind: "tool.protocol_violation", surface: surface, payload: .object(diagnostic))
                 let kept = await keepPartial()
                 TurnObservation.apply(.malformedCall(why: violation.modelFeedback),
                     kept: kept, to: &conversation, surface: surface)
@@ -519,20 +568,16 @@ extension SwiftNativeTurnEngine {
             let providerCalls = toolCallCodec.roundCalls(
                 streamed: streamedCalls, text: iterAccumulated, schemas: activeToolSchemas)
             if providerCalls.isEmpty {
+                saveSuspiciousReply()
                 if let toolBoundaryReason {
                     let kept = await keepPartial()
                     TurnObservation.apply(.boundary(toolBoundaryReason), kept: kept, to: &conversation, surface: surface)
                     continue
                 }
-                if iterAccumulated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    counters.emptyReplyRoundCount += 1
-                    TurnObservation.apply(.emptyReply, to: &conversation, surface: surface)
-                    continue
-                }
-                let promisesWork = (markerCodec?.promisesUnfulfilledWork(iterAccumulated)
-                    ?? (!providerTools.schemas.isEmpty && ToolCallParser.looksLikeUnfulfilledActionPromise(iterAccumulated)))
+                let promisesWork = (markerCodec?.promisesUnfulfilledWork(iterProse)
+                    ?? (!providerTools.schemas.isEmpty && ToolCallParser.looksLikeUnfulfilledActionPromise(iterProse)))
                     || (dispatches.contains(where: { !ChatToolOutcome.neverRan($0.result) })
-                        && ToolCallParser.looksLikeAnnouncedNextToolStep(iterAccumulated))
+                        && ToolCallParser.looksLikeAnnouncedNextToolStep(iterProse))
                 if promisesWork {
                     counters.unfulfilledPromiseRoundCount += 1
                     let kept = await keepPartial()
@@ -544,7 +589,7 @@ extension SwiftNativeTurnEngine {
                 }
                 let completed = await finishCompletedTurn(
                     reply: Self.joinedProse(turnInterstitialProse,
-                        Self.joinedProse(retainedAnswerProse, iterAccumulated)),
+                        Self.joinedProse(retainedAnswerProse, iterProse)),
                     ctx: ctx, dispatches: dispatches, startNs: startNs,
                     rawLLMResponse: lastRawResponse, providerCallCount: providerCallCount,
                     userMessage: userMessage, sessionId: sessionId, surface: surface,

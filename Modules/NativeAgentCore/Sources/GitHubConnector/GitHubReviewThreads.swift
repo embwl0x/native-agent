@@ -169,37 +169,6 @@ extension GitHubConnectorActions {
         GitHubCommandReviewThreadEvidence.mergingFreshest(lhs, rhs) ?? []
     }
 
-    static func testReviewThreadBatchLimit(
-        remaining: Int?,
-        lastCost: Int?,
-        lastBatchCount: Int
-    ) -> Int {
-        reviewThreadBatchLimit(
-            remaining: remaining,
-            lastCost: lastCost,
-            lastBatchCount: lastBatchCount
-        )
-    }
-
-    static func testParseReviewThreadPage(
-        _ root: [String: Any]
-    ) throws -> [GitHubCommandReviewThreadEvidence] {
-        let request = ReviewThreadPageRequest(
-            pullRequest: GitHubTrackedPullRequest(repository: "owner/repo", number: 7),
-            cursor: nil,
-            page: 1
-        )
-        return try parseReviewThreadPage(root, requests: [request]).results[0].threads
-    }
-
-    static func testParseMergeabilityPage(
-        _ root: [String: Any]
-    ) throws -> GitHubPullRequestMergeabilityEvidence {
-        let request = GitHubTrackedPullRequest(repository: "owner/repo", number: 7)
-        return try requireMergeability(
-            parseMergeabilityPage(root, requests: [request]).evidence[request.itemId]
-        )
-    }
 }
 
 private extension GitHubConnectorActions {
@@ -327,15 +296,6 @@ private extension GitHubConnectorActions {
             remaining: remaining,
             resetAt: resetAt
         )
-    }
-
-    static func requireMergeability(
-        _ value: GitHubPullRequestMergeabilityEvidence?
-    ) throws -> GitHubPullRequestMergeabilityEvidence {
-        guard let value else {
-            throw GitHubConnectorError.invalidResponse("GraphQL mergeability test row was absent")
-        }
-        return value
     }
 
     static func reviewThreadBatchLimit(
@@ -518,25 +478,7 @@ private extension GitHubConnectorActions {
         }
         guard http.statusCode < 400 else {
             let message = (parsed?["message"] as? String) ?? "HTTP \(http.statusCode)"
-            let remaining = http.value(forHTTPHeaderField: "X-RateLimit-Remaining").flatMap(Int.init)
-            let reset = http.value(forHTTPHeaderField: "X-RateLimit-Reset")
-                .flatMap(TimeInterval.init)
-                .map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0)) }
-            if let backoff = GitHubConnectorActions.secondaryRateBackoff(
-                status: http.statusCode,
-                message: message,
-                retryAfterHeader: http.value(forHTTPHeaderField: "Retry-After"),
-                rateLimitRemaining: remaining
-            ) {
-                await GitHubRateLimitGate.shared.trip(seconds: backoff)
-                nativeLog("[github] GraphQL secondary rate limit — backing off %ds", Int(backoff))
-            }
-            throw GitHubConnectorError.http(
-                status: http.statusCode,
-                message: message,
-                rateLimitRemaining: remaining,
-                rateLimitReset: reset
-            )
+            throw await httpFailure(http, message: message)
         }
         guard let parsed else {
             throw GitHubConnectorError.invalidResponse("GraphQL reviewThreads returned non-object JSON")

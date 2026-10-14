@@ -20,7 +20,7 @@ public actor CognitiveSubstrate {
     var episodes: [UUID: CognitiveEpisodeReference] = [:]
     var schemaProposals: [UUID: CognitiveSchemaProposal] = [:]
     /// Wave E: proposal-shaped standing views. Every view enters `.proposed`; only
-    /// `resolveStandingView(approved:)` (User) activates one. Persisted one artifact per view
+    /// `resolveStandingViewChecked(approved:)` (User) activates one. Persisted one artifact per view
     /// (kind "standing_view"), restored on boot. See CognitiveSubstrate+StandingViews.swift.
     var standingViews: [UUID: CognitiveStandingView] = [:]
     /// 2026-09-06: the cap repair's artifact deletes used to be swallowed, so a
@@ -161,72 +161,15 @@ public actor CognitiveSubstrate {
     /// simply re-arms and runs once the microcycle finishes.
     var maintenanceCommitInFlight = false
 
-    /// R-F2 test seam. When non-nil the microcycle awaits this immediately
-    /// before its persistence commit — inside the `maintenanceCommitInFlight`
-    /// window — so a test can deterministically drive an interleaving
-    /// maintenance run. nil in production (one optional check on the hot path).
-    var microcycleCommitInterleaveProbe: (@Sendable () async -> Void)?
+    private var maintenanceTransitionWaiters: [CheckedContinuation<Void, Never>] = []
 
-    /// R-F3: parked waiters for the maintenance transition gate. A mutating
-    /// entry point that arrives while a maintenance transaction is suspended in
-    /// the store actor parks on a continuation here instead of busy-spinning
-    /// `Task.yield()`, and is resumed exactly once when the transition ends.
-    private struct MaintenanceTransitionWaiter {
-        let id: UInt64
-        let continuation: CheckedContinuation<Void, Never>
-    }
-    private var maintenanceTransitionWaiters: [MaintenanceTransitionWaiter] = []
-    private var maintenanceTransitionWaiterSeq: UInt64 = 0
-
-    /// Maintenance stages several related families and commits them through one
-    /// SQLite transaction. Actor reentrancy at that database await must not let
-    /// a live mutation observe or persist the staged half-transition. Mutating
-    /// entry points wait here; read-only snapshots remain available.
-    ///
-    /// R-F3: waiters park on a `CheckedContinuation` instead of spinning
-    /// `Task.yield()`. `endMaintenanceTransition()` resumes every parked waiter
-    /// exactly once; a cancelled waiter releases itself without leaking its
-    /// continuation. The array is the single owner of each parked continuation,
-    /// so a resume by the drain and a resume by cancellation can never both fire
-    /// for the same waiter (whichever removes the id first wins; the other
-    /// no-ops).
-    ///
-    /// CANCELLATION CONTRACT (review round 2, BLOCKING): being resumed by the
-    /// cancel handler is NOT permission to pass the gate — a cancelled
-    /// `ingestResident`/`clearTransientState` proceeding while a maintenance
-    /// transaction is suspended mid-commit is exactly the mutate-into-staged-
-    /// half-transition race this gate exists to stop (the pre-R-F3 yield-spin
-    /// held cancelled callers too). The wait is a LOOP: every resume re-checks
-    /// the flag; a cancelled task — which cannot re-park, its cancel handler
-    /// would fire immediately — degrades to the old bounded yield-spin until
-    /// the transition closes.
+    /// Mutations wait for the whole durable transition, even when cancelled.
+    /// Read-only snapshots remain available while the store is suspended.
     func waitForMaintenanceTransition() async {
         while maintenanceRunInFlight {
-            if Task.isCancelled {
-                await Task.yield()
-                continue
+            await withCheckedContinuation { continuation in
+                maintenanceTransitionWaiters.append(continuation)
             }
-            maintenanceTransitionWaiterSeq &+= 1
-            let id = maintenanceTransitionWaiterSeq
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                    // Runs synchronously on the actor before any suspension. The
-                    // transition may have ended between the loop check and here,
-                    // so re-check and resume immediately rather than parking
-                    // forever.
-                    if !maintenanceRunInFlight {
-                        continuation.resume()
-                    } else {
-                        maintenanceTransitionWaiters.append(
-                            MaintenanceTransitionWaiter(id: id, continuation: continuation)
-                        )
-                    }
-                }
-            } onCancel: {
-                Task { await self.releaseCancelledMaintenanceWaiter(id: id) }
-            }
-            // Drain-resume → flag is false → the loop exits. Cancel-resume →
-            // flag may still be true → the loop holds the caller at the gate.
         }
     }
 
@@ -245,31 +188,10 @@ public actor CognitiveSubstrate {
         let released = maintenanceTransitionWaiters
         maintenanceTransitionWaiters.removeAll(keepingCapacity: false)
         for waiter in released {
-            waiter.continuation.resume()
+            waiter.resume()
         }
     }
 
-    /// A cancelled waiter removes itself from the park set and resumes its own
-    /// continuation once. If `endMaintenanceTransition()` already drained it the
-    /// id is gone and this is a no-op — so the continuation resumes exactly once
-    /// either way, and a cancelled waiter never leaks.
-    private func releaseCancelledMaintenanceWaiter(id: UInt64) {
-        guard let index = maintenanceTransitionWaiters.firstIndex(where: { $0.id == id }) else {
-            return
-        }
-        let waiter = maintenanceTransitionWaiters.remove(at: index)
-        waiter.continuation.resume()
-    }
-
-    /// R-F3 test seam: number of parked maintenance-gate waiters.
-    var maintenanceTransitionWaiterCountForTesting: Int {
-        maintenanceTransitionWaiters.count
-    }
-
-    /// R-F2 test seam: install (or clear) the microcycle commit-window probe.
-    func setMicrocycleCommitInterleaveProbeForTesting(_ probe: (@Sendable () async -> Void)?) {
-        microcycleCommitInterleaveProbe = probe
-    }
     var lastUserPresenceAt: Date?
     var lastWarmPresenceAt: Date?
     /// Wave D: when the overnight emotional-consolidation sweep last ran. nil (never run,
@@ -329,7 +251,7 @@ public actor CognitiveSubstrate {
     static let pendingCompletionMaxAge: TimeInterval = 10 * 60
 
     /// W7/P10 — THE LANDING SIGNAL. The echo used to select exemplars by the
-    /// room's temperature and nothing else; the comment above `soundEchoLine`
+    /// room's temperature and nothing else; the comment above `soundEchoSelection`
     /// is explicit that warmth on her turn is the room at encode, not proof the
     /// line landed. `pendingCompletion` + `conversationalAppraisal` were already
     /// built; this is the one number they were missing.
@@ -420,7 +342,7 @@ public actor CognitiveSubstrate {
 
     /// Stamp a bounded landing verdict on the node a completion produced.
     func stampLandingScore(_ score: Double, forNodeId id: UUID, at now: Date) {
-        let bounded = Self.clampSigned(score)
+        let bounded = (score).clampedSigned()
         if bounded == 0 {
             // Neutral is NO evidence on a never-stamped node ("the file is at
             // line 40" says nothing about whether the exemplar landed). But on
@@ -458,9 +380,8 @@ public actor CognitiveSubstrate {
     /// `fingerprintFamilyRepeatLimit` capsules goes quiet until the family
     /// changes or `fingerprintSuppressionWindow` expires.
     ///
-    /// LIVE-PATH ONLY. `compileFrozenCapsule` is a pure rendering of a captured
-    /// read and must never advance this run (its own doc comment already
-    /// promised "no suppress-when-unchanged mutation").
+    /// LIVE-PATH ONLY. `compileFrozenCapsulePresentation` renders a captured
+    /// read and must never advance this run.
     struct FingerprintFamilyRun: Sendable, Equatable {
         var family: String
         /// Consecutive capsules that reported this family, including suppressed ones.
@@ -488,12 +409,6 @@ public actor CognitiveSubstrate {
         let n = dependencies.userName().trimmingCharacters(in: .whitespacesAndNewlines)
         return n.isEmpty ? "you" : n
     }
-    /// Possessive form of `userAddress` ("Bill's", or "your" for the fallback).
-    var userPossessive: String {
-        let a = userAddress
-        return a == "you" ? "your" : "\(a)'s"
-    }
-
     public init(
         configuration: CognitiveConfiguration = .disabled,
         dependencies: CognitiveSubstrateDependencies = .live,
@@ -558,12 +473,12 @@ public actor CognitiveSubstrate {
     }
 
     public func associationSnapshot() async -> [CognitiveAssociationEdge] {
-        guard configuration.enabled, configuration.workspaceEnabled else { return [] }
+        guard configuration.enabled else { return [] }
         return field.associationEdges(at: dependencies.now(), configuration: configuration)
     }
 
     public func doctorAssociationSnapshot(at date: Date) -> [CognitiveAssociationEdge] {
-        guard configuration.enabled, configuration.workspaceEnabled else { return [] }
+        guard configuration.enabled else { return [] }
         var copy = field
         return copy.associationEdges(at: date, configuration: configuration)
     }
@@ -648,19 +563,6 @@ public actor CognitiveSubstrate {
         publishAttentionProjection(at: dependencies.now())
     }
 
-    /// Test hook retained for the destructive-write regression in StoreBoundsTests.
-    func markRestoreFailedForTesting() {
-        persistenceWritesBlocked = true
-        persistenceHealth = CognitivePersistenceHealth(
-            status: .degraded,
-            writesBlocked: true,
-            lastRestoreAttemptAt: dependencies.now(),
-            lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt,
-            failureStage: "test",
-            failureDetail: "simulated restore failure"
-        )
-    }
-
 
 }
 
@@ -669,6 +571,3 @@ extension CognitiveSubstrate: CognitiveEventObserving {
         await ingest(event)
     }
 }
-
-extension CognitiveSubstrate: CognitiveContextProviding {}
-extension CognitiveSubstrate: CognitiveRuntimeProviding {}

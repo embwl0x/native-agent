@@ -110,7 +110,6 @@ enum AgentA2AGRPC {
         return try await client.serverStreaming(request: ClientRequest(message: Input(jsonString: json), metadata: metadata),
             descriptor: descriptor(method), serializer: ProtobufSerializer<Input>(),
             deserializer: ProtobufDeserializer<Lf_A2a_V1_StreamResponse>(), options: options) { response in
-                var events: [JSONValue] = []
                 var bytes = 0
                 var accumulator = AgentA2AStream.Accumulator(interface: interface, requestID: request.requestID,
                     expectedTaskID: request.expectedTaskID, bearerToken: bearerToken)
@@ -122,15 +121,14 @@ enum AgentA2AGRPC {
                         guard data.count <= AgentPeerHTTP.maximumResponseBytes - bytes else { throw AgentPeerHTTP.TransportError.tooLarge }
                         bytes += data.count
                         let event = try JSONValue.parse(data)
-                        events.append(event)
                         let update = try accumulator.receive(event)
                         liveFeed?.yield(update)
                     }
-                } catch let error as RPCError where !events.isEmpty && !Task.isCancelled &&
+                } catch let error as RPCError where bytes > 0 && !Task.isCancelled &&
                     (error.code == .unavailable || error.code == .deadlineExceeded || error.code == .cancelled) {
-                    return AgentPeerHTTP.Response(statusCode: 200, json: nil, events: events, interrupted: true)
+                    return AgentPeerHTTP.Response(statusCode: 200, json: nil, receipt: .success(accumulator.receipt), interrupted: true)
                 }
-                return AgentPeerHTTP.Response(statusCode: 200, json: nil, events: events)
+                return AgentPeerHTTP.Response(statusCode: 200, json: nil, receipt: .success(accumulator.receipt))
             }
     }
 }

@@ -228,7 +228,11 @@ public enum ToolNameAliases {
         "*": ["max_rows": "max_nodes", "max_results": "limit"],
         "agent.swarm": ["prompt": "objective", "timeout_seconds": "timeoutSeconds"],
         "desk.close": ["outcome": "outcome_summary"],
-        "agent.read": ["id": "message_id"], "skill.run": ["input": "args"],
+        "memory.commit": ["content": "text"],
+        "skill.save": ["code": "script.source"],
+        "skill.validate": ["fixtures": "input"],
+        "skill.enable": ["digest": "version"],
+        "agent.read": ["id": "message_id"],
         "x.search": ["max_results": "limit"], "x.timeline": ["max_results": "limit"], "x.user_tweets": ["max_results": "limit"],
     ]
 
@@ -244,7 +248,7 @@ public enum ToolNameAliases {
     public static func argumentName(_ name: String, tool: String, input: [String: JSONValue], known: Set<String>) -> String? {
         let declared = argumentNames(tool, input)
         let aliases = known.contains(name) ? declared : declared.merging(doorArgNames[tool] ?? [:]) { first, _ in first }
-        if let alias = aliases[name] { return known.contains(alias) ? alias : nil }
+        if let alias = aliases[name] { return known.contains(alias.split(separator: ".").first.map(String.init) ?? alias) ? alias : nil }
         guard !known.contains(name) else { return nil }
         if let alias = argAliases["*"]?[name] { return known.contains(alias) ? alias : nil }
         func stem(_ text: String) -> String { text.lowercased().split(separator: "_").map { $0.hasSuffix("s") ? String($0.dropLast()) : String($0) }.joined(separator: "_") }
@@ -278,9 +282,27 @@ public enum ToolNameAliases {
         var result: [String: JSONValue] = [:]
         for key in fields.keys.sorted() {
             let name = names[key] ?? key
+            let path = name.split(separator: ".").map(String.init)
+            if name != key, path.count == 2 {
+                var nested: [String: JSONValue]
+                switch result[path[0]] ?? fields[path[0]] {
+                case .object(let given)?: nested = given
+                case nil, .null?: nested = [:]
+                default: result[key] = fields[key]; continue
+                }
+                if let existing = nested[path[1]], existing != .null, existing != fields[key] {
+                    result[key] = fields[key]; continue
+                }
+                nested[path[1]] = fields[key]
+                result[path[0]] = .object(nested)
+                continue
+            }
             // Keep conflicting spellings visible for validation, never pick one arbitrarily.
             if name != key, let existing = fields[name], names[name] == nil, existing != .null, existing != fields[key] {
                 result[key] = fields[key]
+            } else if names.values.contains(where: { $0.hasPrefix(name + ".") }),
+                      case .object(let nested)? = result[name], case .object(let given)? = fields[key] {
+                result[name] = .object(given.merging(nested) { _, value in value })
             } else if fields[key] != .null || result[name] == nil { result[name] = fields[key] }
         }
         return result
@@ -320,6 +342,28 @@ public enum ToolNameAliases {
 
     /// The action a folded tool is: its registry id, or an MCP tool's generated one.
     public static func appAction(_ tool: String) -> String? { foldedTools[tool] ?? mcpAction(tool) }
+
+    /// Policy lookup also resolves app-executor routes without making them folded tools.
+    public static func appAction(_ tool: String, input: [String: JSONValue]) -> String? {
+        let tool = canonical(tool)
+        if let id = appAction(tool) { return id }
+        let matches = actionRouteLock.withLock { actionRoutes[tool] ?? [] }
+            .filter { route in route.input.allSatisfy { input[$0.key] == $0.value } }
+        guard let mostSpecific = matches.map({ $0.input.count }).max() else { return nil }
+        let selected = matches.filter { $0.input.count == mostSpecific }
+        return selected.count == 1 ? selected[0].id : nil
+    }
+
+    /// Legacy dispatchers resolve from the app's declared routes, not a verb table.
+    public static func registerAppActions(_ actions: [(id: String, tool: String, input: [String: JSONValue])]) {
+        actionRouteLock.withLock {
+            actionRoutes = Dictionary(grouping: actions, by: \.tool).mapValues { routes in
+                routes.map { (id: $0.id, input: $0.input) }
+            }
+        }
+    }
+    private static let actionRouteLock = NSLock()
+    nonisolated(unsafe) private static var actionRoutes: [String: [(id: String, input: [String: JSONValue])]] = [:]
 
     /// Free text in the action slot can only discover, never execute a guessed action.
     public static func appFindQuery(_ input: [String: JSONValue]) -> String? {

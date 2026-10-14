@@ -185,13 +185,6 @@ public struct DeskCadenceStats: Sendable, Equatable {
     }
 }
 
-/// Where a resolved refresh interval came from. Surfaced so the UI can say
-/// "every 6h (you set that)" vs "every 2h (learned)" — a learned number the
-/// user can't attribute reads as the machine being arbitrary.
-public enum DeskCadenceSource: String, Sendable, CaseIterable, Equatable {
-    case explicit, learned, fallback
-}
-
 // MARK: - Pure learner
 
 public enum DeskCadenceLearner {
@@ -282,36 +275,9 @@ public enum DeskCadenceLearner {
         return max(learned, backoff)
     }
 
-    /// Parse the desk's duration vocabulary ("30m", "6h", "2d"). Delegates to
-    /// the ONE parser this module already ships — a second copy would drift.
-    public static func explicitInterval(_ raw: String?) -> Double? {
-        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty,
-              let seconds = DeskProjection.parseDuration(trimmed), seconds > 0 else { return nil }
-        return seconds
-    }
-
-    /// THE precedence point. Explicit configuration outranks everything the
-    /// desk taught itself; learning only fills the silence. `fallbackSeconds`
-    /// is a parameter, not a constant, because the right default differs per
-    /// ref kind and this resolver has no business deciding it.
-    public static func resolvedIntervalSeconds(
-        explicit: String?,
-        stat: DeskRefObservationStat?,
-        now: Date,
-        fallbackSeconds: Double
-    ) -> (seconds: Double, source: DeskCadenceSource) {
-        if let configured = explicitInterval(explicit) {
-            return (configured, .explicit)
-        }
-        if let stat, let learned = effectiveIntervalSeconds(stat, now: now) {
-            return (learned, .learned)
-        }
-        return (fallbackSeconds, .fallback)
-    }
-
     /// How long a whole BATCH of refs fetched together may sit before the batch
-    /// is refetched. `resolvedIntervalSeconds` answers for one ref; a poller that
-    /// pulls a snapshot covering many refs at once needs one number.
+    /// is refetched. A poller that pulls a snapshot covering many refs at once
+    /// needs one number.
     ///
     /// Two rules, both deliberately conservative:
     ///   • `configuredSeconds` is a FLOOR. Learning may only STRETCH the gap,
@@ -400,28 +366,10 @@ public actor DeskCadenceStore {
         }
     }
 
-    /// Record one observation of one ref — built ON TOP of the locked
-    /// transaction, never load/mutate/save. Returns the committed row.
-    @discardableResult
-    public func recordObservation(
-        refKey: String,
-        fingerprint: String,
-        at now: Date = Date()
-    ) async throws -> DeskRefObservationStat {
-        try await updating(at: now) { stats in
-            var next = stats
-            let base = next.refs[refKey] ?? DeskRefObservationStat.seed(refKey: refKey, at: now)
-            let updated = DeskCadenceLearner.record(base, fingerprint: fingerprint, at: now)
-            next.refs[refKey] = updated
-            return (next, updated)
-        }.value
-    }
-
     /// Record a complete observation batch in one locked read-modify-write.
     /// Connector refreshes commonly observe hundreds of refs at the same
-    /// instant; calling `recordObservation` for each one rewrites the entire
-    /// cadence file hundreds of times and turns refresh settlement into a
-    /// visible CPU/disk burst. A dictionary also makes duplicate ref keys
+    /// instant; writing once per ref would rewrite the entire cadence file
+    /// hundreds of times. A dictionary also makes duplicate ref keys
     /// deterministic: the caller's final fingerprint for that key wins once.
     @discardableResult
     public func recordObservations(
@@ -442,20 +390,4 @@ public actor DeskCadenceStore {
         }.value
     }
 
-    /// Convenience read for the refresh loop: what interval should this ref be
-    /// polled at right now, and why.
-    public func resolvedInterval(
-        refKey: String,
-        explicit: String?,
-        now: Date = Date(),
-        fallbackSeconds: Double
-    ) async throws -> (seconds: Double, source: DeskCadenceSource) {
-        let stats = try await load()
-        return DeskCadenceLearner.resolvedIntervalSeconds(
-            explicit: explicit,
-            stat: stats.refs[refKey],
-            now: now,
-            fallbackSeconds: fallbackSeconds
-        )
-    }
 }

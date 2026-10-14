@@ -7,7 +7,6 @@ import Foundation
 struct NativeContextMemoryProvenanceResolution: Sendable, Equatable {
     let requestedMemoryAtomCount: Int
     let resolvedMemoryAtomCount: Int
-    let packetUnchanged: Bool
 
     var unresolvedMemoryAtomCount: Int {
         requestedMemoryAtomCount - resolvedMemoryAtomCount
@@ -23,8 +22,8 @@ enum NativeContextMemoryProvenance {
         to prepared: ContextPreparedTurn,
         index: MemoryAtomRecordIndex
     ) -> NativeContextMemoryProvenanceResolution {
-        let packetBeforeAttachment = prepared.packet
-        let memoryAtomIDs = packetBeforeAttachment.selectedItems.compactMap { item -> ContextAtomID? in
+        let packet = prepared.packet
+        let memoryAtomIDs = packet.selectedItems.compactMap { item -> ContextAtomID? in
             switch item.pointer.kind {
             case .memory, .correction:
                 return item.pointer.atomID
@@ -33,7 +32,7 @@ enum NativeContextMemoryProvenance {
             }
         }
         let mapping = index.recordMap(
-            for: memoryAtomIDs, generationID: packetBeforeAttachment.generationID
+            for: memoryAtomIDs, generationID: packet.generationID
         )
         let recordIDs = Array(mapping.values)
         if !recordIDs.isEmpty {
@@ -41,8 +40,7 @@ enum NativeContextMemoryProvenance {
         }
         return NativeContextMemoryProvenanceResolution(
             requestedMemoryAtomCount: memoryAtomIDs.count,
-            resolvedMemoryAtomCount: recordIDs.count,
-            packetUnchanged: prepared.packet == packetBeforeAttachment
+            resolvedMemoryAtomCount: recordIDs.count
         )
     }
 }

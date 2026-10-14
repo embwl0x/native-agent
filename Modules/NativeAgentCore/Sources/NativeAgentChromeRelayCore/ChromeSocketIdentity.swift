@@ -70,10 +70,6 @@ public enum ChromeSocketIdentity {
         throw ChromeHostIdentity.SigningFailure(check: "SecCodeCheckValidity (socket peer \(identifiers.joined(separator: ", ")))", status: status)
     }
 
-    public static func peerIsNativeAgent(descriptor: Int32) -> Bool {
-        (try? checkNativeAgentPeer(descriptor: descriptor)) != nil
-    }
-
     public static func checkNativeAgentPeer(descriptor: Int32) throws {
         guard let path = ChromeHostIdentity.executablePath(ofProcess: getpid()),
               ChromeHostIdentity.isBundledRelay(executablePath: path) else {

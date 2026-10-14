@@ -21,15 +21,15 @@ import TrustCenter
 /// or hands back is kept (`SkillRunStore`), and `skill.resume` goes on from
 /// there with her answer.
 extension AppToolExecutor {
-    /// Never inside a skill, declared or not, unless it only reads: a run never
+    /// Direct actions a skill never calls unless they only read: a run never
     /// starts or edits a skill, changes what she or anything may do (settings,
     /// Trust, cards, tools, connectors, providers, chat controls), sends, or
-    /// reaches past the app (her authored tools, MCP). By the page word an id
+    /// reaches past the app (MCP). By the page word an id
     /// starts with; gcal's one send; and the passes that stage User's
     /// approvals as they go (dream, REM, self-improvement, consolidation,
     /// hygiene, repair), which swallow a hand-back and report done.
     static let deniedInSkill: Set<String> = [
-        "skill", "tool", "setting", "card", "connector", "telegram", "pairing", "mcp", "authored", "chat", "provider",
+        "skill", "tool", "setting", "card", "connector", "telegram", "pairing", "mcp", "chat", "provider",
         "agent", "codex", "omp", "mail", "agentmail", "messages", "slack", "notify", "phone", "inbox",
         "gcal.send_invitations", "mind.dream", "mind.rem", "mind.self_improvement", "memory.consolidate",
         "memory.hygiene", "doctor.repair",
@@ -58,21 +58,7 @@ extension AppToolExecutor {
         return status != "ok" && skillFaults.contains(reason) ? reason : nil
     }
 
-    /// The upkeep a turn that lists or runs skills does (PR 5), and the weekly
-    /// self-improvement pass, for every kind (`CapabilityLifecycle`): one MY
-    /// QUEUE line for each skill suspended for an action gone, and each skill
-    /// or tool she wrote archived unused. Only with write authority.
-    public static func skillUpkeep(root: URL) async {
-        guard await freshQuietPosture(dataRoot: root)?.changesAllowed == true else { return }
-        await queueSkillLines(((try? await SwiftNativeSkillsClient(root: root).upkeep(missing: { AppActions.action($0) == nil })) ?? [])
-                              + ((try? await ToolRegistryActions.upkeep(dataRoot: root)) ?? []).map { ($0, []) }, root: root)
-        if let registry = SensesHub.shared.registry as? any SenseRegistryManaging {
-            do { _ = try await registry.archiveUnused(now: Date()) }
-            catch { FileHandle.standardError.write(Data("Sense upkeep: \(error)\n".utf8)) }
-        }
-    }
-
-    /// One quiet MY QUEUE line each for what upkeep did to skills and tools,
+    /// One quiet MY QUEUE line each for skill availability changes,
     /// and their upgrade signals (`when: quiet`: shown on her next ordinary
     /// turn, never waking her); whether every line queued.
     @discardableResult
@@ -81,7 +67,7 @@ extension AppToolExecutor {
         let store = SwiftNativeDeskStore(dataRoot: root)
         var queued = true
         // A line naming a peer's or a pack's skill is filed as theirs (masked title, taint latch).
-        for line in lines where (try? await MyQueue.add(DeskStep(words: line.words, when: "quiet", peers: line.peers), store: store)) == nil {
+        for line in lines where (try? await MyQueue.add(DeskStep(words: line.words, when: "quiet", peers: line.peers, origin: "self"), store: store)) == nil {
             queued = false
         }
         return queued
@@ -99,18 +85,18 @@ extension AppToolExecutor {
         return line.isEmpty ? "" : "line " + line
     }
 
-    static func isDeniedInSkill(_ id: String) -> Bool {
+    static func isDeniedInSkill(_ id: String, root: URL = PersistenceCore.defaultDataRoot()) -> Bool {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if ToolNameAliases.authoredTool(key) != nil || ToolNameAliases.mcpTool(key) != nil
+        if ToolNameAliases.mcpTool(key) != nil
             || ToolNameAliases.foldedTools.contains(where: { $0.key.hasPrefix("mcp__") && $0.value == key }) { return true }
-        if AppActions.action(key)?.read == true { return false }
+        if AppActions.action(key, dataRoot: root)?.read == true { return false }
         return deniedInSkill.contains(key) || deniedInSkill.contains(String(key.split(separator: ".").first ?? ""))
     }
 
     /// One call of a skill's run, before it is dispatched: nil runs it.
-    static func skillStep(_ id: String, declared: Set<String>, preview: Bool) -> JSONValue? {
+    static func skillStep(_ id: String, declared: Set<String>, preview: Bool, root: URL = PersistenceCore.defaultDataRoot()) -> JSONValue? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if isDeniedInSkill(key) {
+        if isDeniedInSkill(key, root: root) {
             return doorRefusal("denied_in_skill", "\(key) never runs inside a skill; it was not run.",
                 remedy: "run_alone", "Make that call yourself, outside the skill, if you still want it.")
         }
@@ -119,7 +105,7 @@ extension AppToolExecutor {
                 remedy: "none", "The skill's script calls what its header doesn't declare: fix the skill.")
         }
         // An action no flag marks (none in the registry now) counts as irreversible.
-        let action = AppActions.action(key)
+        let action = AppActions.action(key, dataRoot: root)
         guard action?.irreversible != false || action?.isHis == true else { return nil }
         let why = action?.isHis == true ? "users_step" : "irreversible"
         let detail = why == "users_step"
@@ -133,30 +119,16 @@ extension AppToolExecutor {
                         "effects": .string("none"), "detail": .string(detail)])
     }
 
-    /// One declared action as its pin hashes it: its args and schema, its
-    /// flags and revision, and the tool, input and rename it maps to (its
-    /// words are not its shape).
-    static func actionPin(_ id: String) -> String {
-        guard let action = AppActions.action(id) else { return "missing" }
-        var fields: [String: JSONValue] = [
-            "id": .string(action.id), "page": .string(action.page), "args": .array(action.args.map(JSONValue.string)),
-            "his": .bool(action.isHis), "irreversible": .bool(action.irreversible), "screen": .bool(action.screen),
-            "safe": .bool(action.safe), "scriptable": .bool(action.scriptable), "read": .bool(action.read),
-            "version_exempt": .bool(action.versionExempt), "revision": .int(Int64(action.revision)),
-            "tool": .string(action.tool), "input": .object(action.input),
-            "rename": .object(action.rename.mapValues(JSONValue.string)),
-            "schema": AppActions.foldSchemas[action.tool].flatMap { try? JSONValue.parse($0.parametersJSON) } ?? .null,
-        ]
-        if !action.readWhen.isEmpty { fields["read_when"] = .object(action.readWhen) }
-        return SHA256.hash(data: (try? JSONValue.object(fields).serializedData(pretty: false)) ?? Data())
-            .map { String(format: "%02x", $0) }.joined()
+    /// The declared contract, with frozen identities for admitted pre-cutover pins.
+    static func actionPin(_ id: String, root: URL = PersistenceCore.defaultDataRoot()) -> String {
+        AppScriptRunner.Host(call: { _ in .null }, toolHost: true, dataRoot: root).dependencyPin(id) ?? "missing"
     }
 
     /// Why `args` doesn't fit the header's params, or nil.
     static func paramsMismatch(_ params: [String: JSONValue], _ args: [String: JSONValue]) -> String? {
         if let stray = args.keys.sorted().first(where: { params[$0] == nil }) { return "it takes no \(stray)" }
         for name in params.keys.sorted() {
-            guard case .string(let spelled)? = params[name] else { continue }
+            guard let spelled = SkillScript.parameterType(params[name]) else { continue }
             let type = spelled.hasSuffix("?") ? String(spelled.dropLast()) : spelled
             guard let value = args[name], value != .null else {
                 if spelled.hasSuffix("?") { continue }
@@ -173,9 +145,11 @@ extension AppToolExecutor {
     }
 
     private struct SkillScriptRun {
-        let id: String
-        let name: String
+        let entry: InstalledSkillInventory.Entry
+        var id: String { entry.id }
+        var name: String { entry.name }
         let source: String
+        let program: OwnedProgram
         let params: [String: JSONValue]
         let actions: [String]
         let digest: String
@@ -187,11 +161,18 @@ extension AppToolExecutor {
         var off: String?
     }
 
-    /// `skill.run {name, args}` and `skill.resume {run_id, answer}`.
+    /// `skill.run {name, input}` and `skill.resume {run_id, answer}`.
     @MainActor
     func doorSkill(_ id: String, args: [String: JSONValue], input: [String: JSONValue], surface: String) async -> JSONValue {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let preview = input["preview"] == .bool(true)
+        if id == "skill.validate" {
+            guard !preview else {
+                return Self.doorRefusal("not_previewable", "Validation records proof, so it cannot preview. Nothing was validated or changed.",
+                    remedy: "correct_arguments", "Call skill.validate without preview to validate and retain proof for the exact candidate.")
+            }
+            return await validateSkillRoutine(args, root: root)
+        }
         guard id == "skill.run" else {
             guard !preview else {
                 return Self.doorRefusal("not_previewable", "A resume runs; there is nothing to preview. Nothing ran.",
@@ -199,20 +180,23 @@ extension AppToolExecutor {
             }
             return await doorSkillResume(args, session: input["__session_id"], surface: surface, root: root)
         }
+        if let input = args["input"], let legacy = args["args"], input != legacy {
+            return Self.doorRefusal("invalid_args", "input and args disagree. Nothing ran.",
+                remedy: "correct_arguments", "Pass the skill's input once, as input.")
+        }
         let given: [String: JSONValue]
-        switch args["args"] {
+        switch args["input"] ?? args["args"] {
         case .object(let object)?: given = object
         case nil: given = [:]
         default:
-            return Self.doorRefusal("invalid_args", "args is an object, the skill's params by name. Nothing ran.",
-                remedy: "correct_arguments", "Call skill.run again with args as an object.")
+            return Self.doorRefusal("invalid_args", "input is an object, the skill's params by name. Nothing ran.",
+                remedy: "correct_arguments", "Call skill.run again with input as an object.")
         }
-        if !preview { await Self.skillUpkeep(root: root) }
         let loaded = await loadSkillScript(Self.doorText(args["name"]), preview: preview, root: root)
         guard let skill = loaded.skill else { return loaded.refusal ?? .null }
         if let mismatch = Self.paramsMismatch(skill.params, given) {
-            return Self.doorRefusal("invalid_args", "\(skill.name)'s args don't fit its params: \(mismatch). Nothing ran.",
-                remedy: "correct_arguments", "Pass args as its signature shows (skill.list).")
+            return Self.doorRefusal("invalid_args", "\(skill.name)'s input doesn't fit its params: \(mismatch). Nothing ran.",
+                remedy: "correct_arguments", "Pass input as its signature shows (skill.list).")
         }
         // A Desk item it is given that another conversation works stays theirs: it doesn't run.
         if !preview, let session = Self.inputString(input["__session_id"]) ?? ChatToolSessionContext.verifiedSessionId {
@@ -247,12 +231,21 @@ extension AppToolExecutor {
             return refuse("unknown_skill", "No skill is called \(name.isEmpty ? "(none passed)" : name).",
                           "app skill.list shows the skills by name.")
         }
-        guard case .object(let script)? = entry.row["script"], let digest = SkillScript.digest(entry.row["script"]),
+        guard case .object(let script)? = entry.row["script"],
               case .string(let source)? = script["source"] else {
-            return refuse("not_a_script", "\(entry.name) is guidance with no script, so it doesn't run.",
-                          "Read it with skill.read and follow it yourself.")
+            return refuse("not_a_script", "\(entry.name) has no JS routine, so it doesn't run.",
+                          "Convert the original, then save, validate and enable its JS counterpart.")
         }
         let status = Self.doorText(entry.row["status"]).lowercased()
+        let program: OwnedProgram
+        do {
+            let client = SwiftNativeSkillsClient(root: root)
+            program = preview && !entry.isRunnable ? try client.routineCandidate(entry.row).program
+                : try client.routineProgram(entry.row)
+        } catch {
+            return refuse("integrity", error.localizedDescription, "Save, validate and enable the exact routine again.")
+        }
+        let digest = program.version
         var off: String?
         if !entry.isRunnable {
             let why: String
@@ -277,40 +270,40 @@ extension AppToolExecutor {
         // change suspends it. A preview only compares the existing pins.
         var changed: [String] = []
         if off == nil {
-            let pins = Dictionary(actions.map { ($0, Self.actionPin($0)) }) { first, _ in first }
+            let pins = Dictionary(actions.map { ($0, Self.actionPin($0, root: root)) }) { first, _ in first }
             if preview {
-                if case .object(let pin)? = entry.row["actionPin"], pin["digest"] == .string(digest),
+                if case .object(let pin)? = entry.row["actionPin"], pin["digest"] == entry.row["scriptDigest"],
                    case .object(let held)? = pin["actions"] {
                     let wanted = pins.mapValues(JSONValue.string)
                     changed = Set(held.keys).union(wanted.keys).filter { held[$0] != wanted[$0] }.sorted()
                 }
             } else {
                 do {
-                    changed = try await SwiftNativeSkillsClient(root: root).pinActions(id: entry.id, digest: digest, pins: pins)
+                    changed = try await SwiftNativeSkillsClient(root: root).pinActions(entry, digest: digest, pins: pins)
                 } catch {
-                    return refuse("not_runnable", "\(entry.name) didn't pin its actions (\(error.localizedDescription)).",
+                    return refuse("not_runnable", "\(entry.name)'s action pins did not read (\(error.localizedDescription)).",
                                   "app skill.list shows its state now.")
                 }
             }
         }
         if !changed.isEmpty {
             if preview {
-                return refuse("suspended",
+                return refuse("stale_dependency",
                     "\(entry.name)'s actions changed since its script was admitted: \(changed.joined(separator: ", ")). "
-                        + "A real run would suspend it for review. This preview changed nothing.",
+                        + "A real run would refuse it until its current actions are reviewed. This preview changed nothing.",
                     "Read what changed and check the script still fits before running it.")
             }
-            let queued = await Self.queueSkillLines([("\(entry.name) suspended: \(changed.joined(separator: ", ")) changed; re-review",
+            let queued = await Self.queueSkillLines([("\(entry.name) needs review: \(changed.joined(separator: ", ")) changed; re-review",
                                                       SkillScript.voices(entry.row))],
                                                     root: root)
-            return refuse("suspended",
-                "\(entry.name) is suspended: \(changed.joined(separator: ", ")) changed since its script was admitted, "
-                    + "so it doesn't run. It is drafted until skill.enable admits it again"
+            return refuse("stale_dependency",
+                "\(entry.name) cannot run: \(changed.joined(separator: ", ")) changed since its script was admitted, "
+                    + "so it needs validation and admission against the current actions"
                     + (queued ? "; MY QUEUE says so." : "."),
                 "Read what changed, check the script still fits, then skill.enable admits it again.")
         }
-        for action in actions where Self.isDeniedInSkill(action) || AppActions.action(action)?.scriptable != true {
-            return refuse(Self.isDeniedInSkill(action) ? "denied_in_skill" : "not_scriptable",
+        for action in actions where Self.isDeniedInSkill(action, root: root) || AppActions.action(action, dataRoot: root)?.scriptable != true {
+            return refuse(Self.isDeniedInSkill(action, root: root) ? "denied_in_skill" : "not_scriptable",
                 "\(entry.name) declares \(action), which never runs inside a skill.",
                 "Fix the skill: its script makes that call nowhere, or you make it yourself outside the skill.")
         }
@@ -318,13 +311,13 @@ extension AppToolExecutor {
         // one whose page has no version to check runs only if it is exempt.
         // (A step that is User's or can't be taken back hands back before it runs.)
         for id in actions {
-            guard let action = AppActions.action(id), !action.read, !action.versionExempt, !action.irreversible,
+            guard let action = AppActions.action(id, dataRoot: root), !action.read, !action.versionExempt, !action.irreversible,
                   !action.isHis, action.page == "*" || doorPage(action.page) == nil else { continue }
             return refuse("unversioned_write",
                 "\(entry.name) declares \(action.id), a write with no page version a skill can check.",
                 "Fix the skill: a skill's write goes on the version of its own read, so that step is yours, outside the skill.")
         }
-        return (SkillScriptRun(id: entry.id, name: entry.name, source: source,
+        return (SkillScriptRun(entry: entry, source: source, program: program,
                                params: Self.skillFields(script["params"]), actions: actions, digest: digest,
                                admission: entry.row["admission"], voices: SkillScript.voices(entry.row), off: off), nil)
     }
@@ -341,16 +334,36 @@ extension AppToolExecutor {
                 remedy: "none", "Use app from a chat turn.")
         }
         let declared = Set(skill.actions)
-        let versions = SkillRunVersions(journal: replay?.journal ?? [])
+        let versions = SkillRunVersions(journal: replay?.journal ?? [], root: root)
         let receipt = await SkillRunContext.$handsBack.withValue(true) {
             await DoorNotesSnapshot.$current.withValue(DoorNotesSnapshot()) {
                 await AppScriptRunner.run(source: skill.source, preview: preview, strict: true, input: .object(input),
-                                          replay: replay) { call in
+                                          replay: replay, program: skill.program, dataRoot: root) { call in
                     var call = call
+                    if Task.isCancelled { return Self.failure("cancelled", "The turn stopped; nothing more ran.") }
+                    if !preview {
+                        let program = skill.program
+                        do {
+                            let fields = try InstalledSkillInventory.entries(dataRoot: root)
+                                .first { $0.id == skill.id && $0.row["source"] == skill.entry.row["source"] }?.row ?? [:]
+                            guard SkillScript.isRunnable(fields), fields["admission"] == skill.admission,
+                                  try SwiftNativeSkillsClient(root: root).routineProgram(fields) == program else {
+                                return Self.failure("state_changed", "The routine's selection or admission changed; nothing more ran.")
+                            }
+                            let pins = Dictionary(program.dependencies.map { ($0, Self.actionPin($0, root: root)) }) { first, _ in first }
+                            let changed = try await SwiftNativeSkillsClient(root: root).pinActions(skill.entry, digest: skill.digest, pins: pins)
+                            guard changed.isEmpty else {
+                                return Self.failure("stale_dependency", "Dependencies changed: \(changed.joined(separator: ", ")). Nothing more ran; re-author and validate the routine.")
+                            }
+                        } catch {
+                            return Self.failure("integrity", error.localizedDescription)
+                        }
+                    }
                     if case .string(let id)? = call["action"] {
-                        if let stop = Self.skillStep(id, declared: declared, preview: preview) { return stop }
+                        if let stop = Self.skillStep(id, declared: declared, preview: preview, root: root) { return stop }
                         if let refused = versions.prepare(&call, id: id) { return refused }
                     }
+                    if Task.isCancelled { return Self.failure("cancelled", "The turn stopped; nothing more ran.") }
                     if let session { call["__session_id"] = session }
                     let result: JSONValue
                     do { result = try await perform("app", call) } catch { result = ChatToolOutcome.failure(error: error, tool: "app") }
@@ -363,6 +376,7 @@ extension AppToolExecutor {
         let journal = out.removeValue(forKey: "journal")
         out["skill"] = .string(skill.name)
         out["run_id"] = .string(runID)
+        out["version"] = .string(skill.program.version)
         if let off = skill.off {
             out["not_on"] = .string("A preview of \(skill.name), which isn't on: it is \(off). It shows where a run would stop; "
                 + "a real run is refused until skill.enable turns it on.")
@@ -375,8 +389,7 @@ extension AppToolExecutor {
             })
         }
         let reason = Self.doorText(out["reason"])
-        // What the run says about the skill: a fault of its own (two in a row
-        // retire it), the world's, or clean, a rung on the trust ladder.
+        // What the run says about the skill: its own fault, the world's, or a clean run.
         if !preview {
             out["script_effects"] = out["effects"]
             out["bookkeeping"] = .string("Skill lifecycle and upkeep.")
@@ -385,18 +398,13 @@ extension AppToolExecutor {
             let hash = SHA256.hash(data: (try? JSONValue.object(input).serializedData(pretty: false)) ?? Data())
                 .map { String(format: "%02x", $0) }.joined()
             if let kept = try? await SwiftNativeSkillsClient(root: root).recordRun(
-                id: skill.id, runID: runID, digest: skill.digest, admission: skill.admission, fault: fault,
+                skill.entry, runID: runID, digest: skill.digest, admission: skill.admission, fault: fault,
                 clean: fault == nil && out["status"] == .string("ok"), reason: reason.isEmpty ? Self.doorText(out["status"]) : reason,
                 step: Self.stopPlace(out), inputHash: String(hash.prefix(16))) {
                 if out["script_effects"] == .string("none") { out["effects"] = .string("occurred") }
                 out["ladder"] = .object(["clean": .int(Int64(kept.clean)), "of": .int(3)])
                 await Self.queueSkillLines(kept.signals, root: root)
-                if kept.retired {
-                    let words = "\(skill.name) retired: a fault of its own twice in a row (\(fault ?? reason)); "
-                        + "archived, not deleted. Fix its script, then skill.enable"
-                    let queued = await Self.queueSkillLines([(words, skill.voices)], root: root)
-                    out["retired"] = .string(words + (queued ? "; MY QUEUE says so." : "."))
-                }
+
             }
         }
         // Its own version no longer reads: what was, what is, and where; never a fresh re-read.
@@ -435,6 +443,8 @@ extension AppToolExecutor {
         let kept = await SkillRunStore.save([
             "run_id": .string(runID), "skill": .string(skill.id), "name": .string(skill.name), "digest": .string(skill.digest),
             "input": .object(input), "journal": .array(calls), "question": .string(question), "reason": .string(reason),
+            "version": .string(skill.program.version),
+            "hostRevision": .string(OwnedProgramStore.hostRevision),
             "at": .string(ISO8601DateFormatter().string(from: Date())),
             "steer": PeerDataTaint.carriedRecord(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                                  peerID: ChatToolSessionContext.envelope?.verifiedUserId),
@@ -464,6 +474,76 @@ extension AppToolExecutor {
             ])]),
         ])
         return .object(out)
+    }
+
+    @MainActor
+    private func validateSkillRoutine(_ args: [String: JSONValue], root: URL) async -> JSONValue {
+        do {
+            let key = try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey()
+            return try await SwiftNativeSkillsClient(root: root).validateRoutine(name: Self.doorText(args["name"]), key: key) { candidate in
+                let pins: [String: JSONValue] = candidate.program.dependencies.reduce(into: [:]) {
+                    $0[$1] = .string(Self.actionPin($1, root: root))
+                }
+                guard candidate.dependencyShapes == .object(pins) else {
+                    throw SkillsError.invalidScript("Dependencies changed. Save the routine against the current actions.")
+                }
+                for id in candidate.program.dependencies {
+                    guard !Self.isDeniedInSkill(id, root: root), AppActions.action(id, dataRoot: root)?.scriptable == true else {
+                        throw SkillsError.invalidScript("Dependency \(id) is not scriptable. Save the routine against the current actions.")
+                    }
+                }
+                let params = Self.skillFields(Self.skillFields(Self.skillFields(candidate.manifest)["script"])["params"])
+                return try await OwnedProgramStore(root: root.appendingPathComponent("skills")).validate(candidate,
+                    key: key, capture: args["capture"] == .bool(true), input: args["input"],
+                    runner: AppScriptRunner.runner(dataRoot: root), host: {
+                        let versions = SkillRunVersions(journal: [], root: root)
+                        return AppScriptRunner.Host(call: { _ in .null }, validation: { call, fixture in
+                            var call = call
+                            if let id = Self.inputString(call["action"]) {
+                                guard Self.actionPin(id, root: root) == Self.doorText(pins[id]) else {
+                                    return Self.failure("stale_dependency", "The declared action changed during validation.")
+                                }
+                                if !(await fixture.captured) {
+                                    if let stop = Self.skillStep(id, declared: Set(candidate.program.dependencies), preview: false, root: root) { return stop }
+                                    if let stop = versions.prepare(&call, id: id) { return stop }
+                                }
+                            }
+                            let receipt = await fixture.reply(call)
+                            versions.observe(call, receipt)
+                            return receipt
+                        }, dataRoot: root)
+                }) { input in
+                    guard case .object(let fields) = input, AppScriptRunner.secretPath(input) == nil else {
+                        throw SenseFailure(code: "bad_input", message: "Validation input must be an object matching params and contain no keys or tokens.")
+                    }
+                    if let mismatch = Self.paramsMismatch(params, fields) {
+                        throw SenseFailure(code: "bad_input", message: "Capture validation needs sample input in the input parameter matching params: \(mismatch).")
+                    }
+                }
+            }
+        } catch let error as SenseFailure where error.code == "bad_input" {
+            do {
+                let candidate = try await SwiftNativeSkillsClient(root: root).routineCandidate(name: Self.doorText(args["name"]))
+                guard case .object(let manifest) = candidate.manifest, let script = manifest["script"] else {
+                    throw SkillsError.invalidScript("The routine candidate has no script. Save it again before validation.")
+                }
+                if candidate.fixtures != .array([]) {
+                    return Self.doorRefusal(error.code, error.message, remedy: "correct_arguments",
+                        "Save the routine without invalid fixtures, then validate with sample input matching params.",
+                        next: ["action": .string("skill.save"), "args": .object(manifest.filter {
+                            ["name", "description", "triggers", "script", "overrides", "converts"].contains($0.key)
+                        })])
+                }
+                return Self.doorRefusal(error.code, error.message, remedy: "correct_arguments",
+                    "Pass input as an object matching the skill's params (skill.read).",
+                    next: ["action": .string("skill.validate"), "args": .object([
+                        "name": args["name"] ?? .null, "input": ToolSignature.example(SkillScript.inputSchema(script), name: "input")])])
+            } catch {
+                return Self.failure("validation_failed", error.localizedDescription)
+            }
+        } catch {
+            return Self.failure("validation_failed", error.localizedDescription)
+        }
     }
 
     /// `skill.resume`: claimed once, sealed, the same digest, still runnable
@@ -502,7 +582,9 @@ extension AppToolExecutor {
             return closed(Self.doorText(Self.skillFields(loaded.refusal)["reason"]),
                           Self.doorText(Self.skillFields(loaded.refusal)["detail"]).replacingOccurrences(of: " Nothing ran.", with: ""))
         }
-        guard skill.digest == Self.doorText(run["digest"]), case .array(let journal)? = run["journal"] else {
+        guard skill.digest == Self.doorText(run["digest"]), case .array(let journal)? = run["journal"],
+              (run["version"] == .string(skill.program.version)
+                  && run["hostRevision"] == .string(OwnedProgramStore.hostRevision)) else {
             return closed("script_changed", "\(name)'s script changed since run \(runID) stopped.")
         }
         let input = Self.skillFields(run["input"])
@@ -520,13 +602,13 @@ extension AppToolExecutor {
     /// `skill.read {name, step}` (PR 5): one step of a script skill, its label
     /// and guidance, and its lines when each `app.step` call starts a line of
     /// its own and there is one per step; otherwise its label alone.
-    static func skillStepRead(_ name: String, step: JSONValue?, root: URL) -> JSONValue {
+    static func skillStepRead(_ name: String, step: JSONValue?, source requestedSource: Bool, root: URL) -> JSONValue {
         guard let entry = (try? InstalledSkillInventory.entries(dataRoot: root)).flatMap({ InstalledSkillInventory.match(name, in: $0) }) else {
             return doorRefusal("unknown_skill", "No skill is called \(name.isEmpty ? "(none passed)" : name).",
                                remedy: "none", "app skill.list shows the skills by name.")
         }
         guard case .object(let script)? = entry.row["script"], case .string(let source)? = script["source"] else {
-            return doorRefusal("not_a_script", "\(entry.name) is guidance with no steps.",
+            return doorRefusal("not_a_script", "\(entry.name) has no JS routine steps.",
                                remedy: "correct_arguments", "Read it whole with skill.read {name}.")
         }
         let of = if case .int(let n)? = script["of"] { Int(n) } else { 1 }
@@ -535,6 +617,11 @@ extension AppToolExecutor {
                                remedy: "correct_arguments", "Call skill.read again with a step in range.")
         }
         let at = Int(n) - 1
+        if !requestedSource {
+            let labels: [JSONValue] = if case .array(let labels)? = script["steps"] { labels } else { [] }
+            return .object(["status": .string("ok"), "skill": .string(entry.name), "step": .string("\(n) of \(of)"),
+                "label": labels.indices.contains(at) ? labels[at] : .null])
+        }
         let lines = source.components(separatedBy: "\n")
         let starts = lines.indices.filter { lines[$0].contains("app.step(") }
         let clean = starts.count == of && starts.allSatisfy { lines[$0].components(separatedBy: "app.step(").count == 2 }
@@ -551,7 +638,6 @@ extension AppToolExecutor {
         var out: [String: JSONValue] = ["status": .string("ok"), "skill": .string(entry.name), "step": .string("\(n) of \(of)")]
         let label = labels.indices.contains(at) ? labels[at] : said.first ?? ""
         if !label.isEmpty { out["label"] = .string(label) }
-        if said.count > 1, !said[1].isEmpty { out["guidance"] = .string(said[1]) }
         if clean {
             let end = at + 1 < starts.count ? starts[at + 1] : lines.count
             out["lines"] = .string("\(starts[at] + 1)-\(end)")
@@ -585,11 +671,12 @@ extension AppToolExecutor {
            InlineInteractionNeed.interaction(in: await SwiftToolDispatcher.requestedInteraction(input: call, dataRoot: root)) != nil {
             return true
         }
-        let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
-                                          peerID: ChatToolSessionContext.envelope?.verifiedUserId)
-        guard !(steer.sources + steer.elevated).isEmpty else { return false }
-        return PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities, input: args,
-            fullMac: [.admitted, .untrustedOrigin].contains(envelope.fullMacYoloAuthority))
+        let protectedAction = PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities, input: args,
+            workspaceRoot: NativeAgentWorkspaceRoot.resolve(dataRoot: root),
+            relativeBases: SwiftToolDispatcher.builderSourceRepoRoot(dataRoot: root).map { [$0] } ?? [])
+        return PeerDataTaintDispatcher.peerApproval(tool: tool, capabilities: envelope.capabilities, input: args,
+            surface: surface, fullMac: [.admitted, .untrustedOrigin].contains(envelope.fullMacYoloAuthority),
+            protectedAction: protectedAction).required
     }
 }
 
@@ -602,8 +689,12 @@ final class SkillRunVersions: @unchecked Sendable {
     private var newest: [String: String] = [:]
     private var seen: Set<String> = []
     private var stale: [String: JSONValue]?
+    private let root: URL
 
-    init(journal: [JSONValue]) { AppScriptRunner.ownVersions(journal).forEach(note) }
+    init(journal: [JSONValue], root: URL = PersistenceCore.defaultDataRoot()) {
+        self.root = root
+        AppScriptRunner.ownVersions(journal).forEach(note)
+    }
 
     private func note(_ version: String) {
         lock.withLock {
@@ -615,7 +706,7 @@ final class SkillRunVersions: @unchecked Sendable {
     /// The write with the run's own version, or why it doesn't run.
     func prepare(_ call: inout [String: JSONValue], id: String) -> JSONValue? {
         let args: [String: JSONValue] = if case .object(let args)? = call["args"] { args } else { [:] }
-        guard let action = AppActions.action(id), !action.readOnly(args: args), !action.versionExempt else { return nil }
+        guard let action = AppActions.action(id, dataRoot: root), !action.readOnly(args: args), !action.versionExempt else { return nil }
         let given = AppToolExecutor.doorText(call["expected_version"])
         return lock.withLock { () -> JSONValue? in
             if !given.isEmpty {

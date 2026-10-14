@@ -118,10 +118,6 @@ enum ActivityScreenPresentation {
         ["act", "approve", "open_approvals", "repair"].contains(actionID)
     }
 
-    static func showsOverflow(total: Int, visibleCount: Int = 2) -> Bool {
-        total > visibleCount
-    }
-
     /// Notification-open suppression is consumed once. Leaving the latch set
     /// after a cancelled appearance would otherwise skip the next real refresh.
     static func shouldRefreshOnAppear(skipInitialRefresh: inout Bool) -> Bool {
@@ -200,7 +196,7 @@ struct ActivityView: View {
     @EnvironmentObject private var inboxStore: InboxStore
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @Binding var skipInitialRefresh: Bool
     @Binding var navigationTarget: ActivitySection?
 

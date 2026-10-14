@@ -102,17 +102,6 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         return object["response"] as? String
     }
 
-    /// Retain only reply/identity evidence, so tool chatter cannot crowd out
-    /// the closing result. Live text is consumed separately as it arrives.
-    public func isResultLine(_ line: String) -> Bool {
-        guard let event = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return false }
-        switch stream {
-        case .antigravity: return event["event"] as? String == "result"
-        case .codex: return event["type"] as? String == "thread.started"
-        case nil: return false
-        }
-    }
-
     /// The whole-output envelope, or in stream form the one `result` event's.
     private func resultObject(_ stdout: String) -> [String: Any]? {
         guard let data = stdout.data(using: .utf8), data.count <= 16 * 1024 * 1024 else { return nil }
@@ -154,20 +143,25 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         case activity
     }
 
-    public func streamEvent(line: String) -> StreamEvent? {
-        guard let stream, let event = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return nil }
+    /// Retain only reply/identity evidence, so tool chatter cannot crowd out
+    /// the closing result. Live text is consumed separately as it arrives.
+    public func streamEvent(line: String) -> (retain: Bool, event: StreamEvent?) {
+        guard let stream, let event = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return (false, nil) }
         switch stream {
         case .antigravity:
+            let retain = event["event"] as? String == "result"
             if event["event"] as? String == "step_update",
                let step = event["step_update"] as? [String: Any], step["step_type"] as? String == "agent_response",
-               let text = step["text_delta"] as? String { return .text(text, whole: false) }
+               let text = step["text_delta"] as? String { return (retain, .text(text, whole: false)) }
+            return (retain, .activity)
         case .codex:
-            guard let item = event["item"] as? [String: Any] else { return .activity }
+            let retain = event["type"] as? String == "thread.started"
+            guard let item = event["item"] as? [String: Any] else { return (retain, .activity) }
             if event["type"] as? String == "item.completed", item["type"] as? String == "agent_message",
-               let text = item["text"] as? String { return .text(text, whole: true) }
-            if event["type"] as? String == "item.started", let command = item["command"] as? String { return .note(command) }
+               let text = item["text"] as? String { return (retain, .text(text, whole: true)) }
+            if event["type"] as? String == "item.started", let command = item["command"] as? String { return (retain, .note(command)) }
+            return (retain, .activity)
         }
-        return .activity
     }
 
     /// One argv, with every placeholder replaced as a WHOLE argument. A first

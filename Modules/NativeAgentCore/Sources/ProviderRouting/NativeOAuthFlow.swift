@@ -15,6 +15,34 @@ public struct OAuthFlowResult: Sendable {
 }
 
 public enum NativeOAuthFlow {
+    /// Save a pasted setup token; nil on success, else the reason. Shared with
+    /// the inline provider card, so both write the one shape.
+    public static func saveAnthropicSetupToken(_ raw: String) -> String? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\t", with: "")
+        guard t.hasPrefix("sk-ant-oat") else {
+            return "That isn't a setup token. Setup tokens start with sk-ant-oat."
+        }
+        do {
+            let dataRoot = PersistenceCore.defaultDataRoot()
+            let providersDir = dataRoot.appendingPathComponent("providers", isDirectory: true)
+            let path = providersDir.appendingPathComponent("anthropic_oauth_direct.json")
+            try FileManager.default.createDirectory(at: providersDir, withIntermediateDirectories: true)
+            let now = ISO8601DateFormatter().string(from: Date())
+            let payload: [String: Any] = [
+                "access_token": t,
+                "auth_mode": "setup_token",
+                "saved_at": now,
+            ]
+            try NativeOAuthSupport.writeJSONObject(payload, to: path)
+            return nil
+        } catch {
+            return "Failed to save setup-token: \(error.localizedDescription)"
+        }
+    }
+
     static let signInAttempts = OAuthSignInAttempts()
 
     /// Custom URL scheme registered in Info.plist and against each provider's

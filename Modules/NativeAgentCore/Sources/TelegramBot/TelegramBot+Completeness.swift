@@ -17,16 +17,6 @@ public protocol ProviderRoutingRef: Sendable {
     func saveModelSelection(surface: String, provider: String?, model: String) async throws
 }
 
-public extension ProviderRoutingRef {
-    func modelMenuForSurface(_ surface: String) async -> TelegramModelMenu? {
-        nil
-    }
-
-    func saveModelSelection(surface: String, provider: String?, model: String) async throws {
-        try await saveModelConfig(surface: surface, key: "model", value: model)
-    }
-}
-
 public struct TelegramModelMenu: Sendable, Equatable {
     public let surface: String
     public let currentModel: String
@@ -779,94 +769,11 @@ private func telegramNormalizeProviderId(_ raw: String) -> String {
     }
 }
 
-// MARK: - Actor registry: per-instance token -> deps
-
-public actor TelegramBotCompletenessRegistry {
-    public static let shared = TelegramBotCompletenessRegistry()
-    private struct Entry {
-        weak var bot: SwiftNativeTelegramBot?
-        let identifier: ObjectIdentifier
-        let deps: TelegramBotCompletenessDeps
-    }
-
-    // 2026-09-07: Tokens fence delayed cleanup from bots allocated at reused addresses.
-    // Weak references preserve non-retention and keep legacy address inspection live-only.
-    private var store: [UUID: Entry] = [:]
-    private var unregisterWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
-
-    private init() {}
-
-    public func register(_ deps: TelegramBotCompletenessDeps, for bot: SwiftNativeTelegramBot) {
-        store[bot.completenessRegistryToken] = Entry(
-            bot: bot, identifier: ObjectIdentifier(bot), deps: deps
-        )
-    }
-
-    public func deps(for token: UUID) -> TelegramBotCompletenessDeps? {
-        store[token]?.deps
-    }
-
-    public func unregister(_ id: UUID) {
-        store.removeValue(forKey: id)
-        if let waiters = unregisterWaiters.removeValue(forKey: id) {
-            for waiter in waiters { waiter.resume() }
-        }
-    }
-
-    /// Snapshot of currently registered bot ids. Lets callers assert on the
-    /// ids THEY own instead of a process-global count that other concurrent
-    /// registrants perturb.
-    public func registeredIDs() -> Set<ObjectIdentifier> {
-        Set(store.values.compactMap { entry in
-            entry.bot.map { ObjectIdentifier($0) }
-        })
-    }
-
-    public func deps(for id: ObjectIdentifier) -> TelegramBotCompletenessDeps? {
-        store.values.first { entry in
-            entry.bot.map { ObjectIdentifier($0) == id } ?? false
-        }?.deps
-    }
-
-    /// Event-driven seam for the deinit's detached-Task unregister (mirrors
-    /// the TurnTraceBus.drainForProcessExit drain pattern): suspend until
-    /// `unregister(id)` has run for this id — resumed by `unregister` itself,
-    /// no polling. Immediate resume when the id is not currently registered.
-    /// Callers own the bound (e.g. a test `.timeLimit`); if the unregister
-    /// never fires, that bound fails the wait loudly.
-    public func waitForUnregister(_ id: ObjectIdentifier) async {
-        // Capture generations now; later registrations must not extend this wait.
-        let tokens = store.compactMap { $0.value.identifier == id ? $0.key : nil }
-        for token in tokens {
-            await waitForUnregister(token)
-        }
-    }
-
-    private func waitForUnregister(_ id: UUID) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            guard store[id] != nil else {
-                continuation.resume()
-                return
-            }
-            unregisterWaiters[id, default: []].append(continuation)
-        }
-    }
-}
-
 // MARK: - SwiftNativeTelegramBot: completeness slash commands
 
 extension SwiftNativeTelegramBot {
-    /// Register dependency providers so completeness commands can resolve live data.
-    public func registerCompletenessDeps(_ deps: TelegramBotCompletenessDeps) async {
-        await TelegramBotCompletenessRegistry.shared.register(deps, for: self)
-    }
-
     public func telegramModelMenuForSurface(_ surface: String = "telegram") async -> TelegramModelMenu? {
-        if let routing = completenessDeps?.routing {
-            return await routing.modelMenuForSurface(surface)
-        }
-        let deps = await TelegramBotCompletenessRegistry.shared.deps(for: completenessRegistryToken)
-        return await deps?.routing?.modelMenuForSurface(surface)
+        await completenessDeps?.routing?.modelMenuForSurface(surface)
     }
 
     /// What the CURRENT model can actually be asked for — the same lookup
@@ -875,14 +782,14 @@ extension SwiftNativeTelegramBot {
     public func telegramModelCapabilitiesForSurface(
         _ surface: String = "telegram"
     ) async -> (reasoningEfforts: [String], supportsFast: Bool)? {
-        guard let routing = await telegramRouting() else { return nil }
+        guard let routing = completenessDeps?.routing else { return nil }
         return await telegramModelCapabilities(routing: routing, surface: surface)
     }
 
     /// Current model in plain words ("Claude Opus 5 via anthropic"), for
     /// copy User reads. Nil when routing isn't wired.
     public func telegramPlainModelPhrase(_ surface: String = "telegram") async -> String? {
-        guard let routing = await telegramRouting(),
+        guard let routing = completenessDeps?.routing,
               let info = await routing.modelForSurface(surface) else { return nil }
         var name = info.model
         if let menu = await routing.modelMenuForSurface(surface) {
@@ -897,23 +804,12 @@ extension SwiftNativeTelegramBot {
         return TelegramPollLoop._tgRedactToken("\(name) via \(info.provider)")
     }
 
-    private func telegramRouting() async -> (any ProviderRoutingRef)? {
-        if let routing = completenessDeps?.routing { return routing }
-        return await TelegramBotCompletenessRegistry.shared
-            .deps(for: completenessRegistryToken)?.routing
-    }
-
     public func saveTelegramModelSelection(
         surface: String = "telegram",
         provider: String?,
         model: String
     ) async throws {
-        if let routing = completenessDeps?.routing {
-            try await routing.saveModelSelection(surface: surface, provider: provider, model: model)
-            return
-        }
-        let deps = await TelegramBotCompletenessRegistry.shared.deps(for: completenessRegistryToken)
-        guard let routing = deps?.routing else {
+        guard let routing = completenessDeps?.routing else {
             throw TelegramBotError.notConfigured
         }
         try await routing.saveModelSelection(surface: surface, provider: provider, model: model)
@@ -926,7 +822,6 @@ extension SwiftNativeTelegramBot {
     public func dispatchCompletenessCommandDetailed(
         _ command: String,
         args: [String],
-        depsOverride: TelegramBotCompletenessDeps? = nil,
         chatId: Int? = nil,
         fromUserId: Int? = nil,
         chatType: String? = nil
@@ -936,21 +831,12 @@ extension SwiftNativeTelegramBot {
         if let atIdx = cmd.firstIndex(of: "@") { cmd = String(cmd[..<atIdx]) }
         let lower = TelegramCommandRegistry.canonicalName(for: cmd) ?? cmd.lowercased()
         if lower == "restart" {
-            let deps: TelegramBotCompletenessDeps?
-            if let depsOverride {
-                deps = depsOverride
-            } else {
-                deps = await TelegramBotCompletenessRegistry.shared.deps(for: completenessRegistryToken)
-            }
             return await dispatchRestartCommand(
-                args: args, deps: deps,
+                args: args,
                 chatId: chatId, fromUserId: fromUserId, chatType: chatType
             )
         }
-        let reply = await dispatchCompletenessCommand(
-            lower, args: args, depsOverride: depsOverride,
-            chatId: chatId, fromUserId: fromUserId, chatType: chatType
-        )
+        let reply = await dispatchCompletenessCommand(lower, args: args)
         return TelegramSlashDispatchOutcome(reply: reply)
     }
 
@@ -959,12 +845,11 @@ extension SwiftNativeTelegramBot {
     /// trail, one relauncher) via the injected ref.
     private func dispatchRestartCommand(
         args: [String],
-        deps: TelegramBotCompletenessDeps?,
         chatId: Int?,
         fromUserId: Int?,
         chatType: String?
     ) async -> TelegramSlashDispatchOutcome {
-        guard let restart = deps?.restart else {
+        guard let restart = completenessDeps?.restart else {
             return TelegramSlashDispatchOutcome(
                 reply: "restart is not wired in this build. Restart NativeAgent from the Mac app."
             )
@@ -1011,34 +896,14 @@ extension SwiftNativeTelegramBot {
         )
     }
 
-    /// Dispatch additional slash commands not handled by the base `dispatchSwiftSlashCommand`.
-    /// Returns a reply string, or nil for an unsupported command.
-    /// `chatId` is the verified sender chat — required by owner-gated
-    /// commands (/restart); nil (legacy callers/tests) fails those closed.
-    /// `fromUserId`/`chatType` likewise feed the /restart gate (private
-    /// chat + sender == chat); nil fails it closed.
-    public func dispatchCompletenessCommand(
+    private func dispatchCompletenessCommand(
         _ command: String,
-        args: [String],
-        depsOverride: TelegramBotCompletenessDeps? = nil,
-        chatId: Int? = nil,
-        fromUserId: Int? = nil,
-        chatType: String? = nil
+        args: [String]
     ) async -> String? {
-        var cmd = command
-        if cmd.hasPrefix("/") { cmd.removeFirst() }
-        if let atIdx = cmd.firstIndex(of: "@") { cmd = String(cmd[..<atIdx]) }
-        let lower = TelegramCommandRegistry.canonicalName(for: cmd) ?? cmd.lowercased()
-
-        let deps: TelegramBotCompletenessDeps?
-        if let depsOverride {
-            deps = depsOverride
-        } else {
-            deps = await TelegramBotCompletenessRegistry.shared.deps(for: completenessRegistryToken)
-        }
+        let deps = completenessDeps
         let surface = "telegram"
 
-        switch lower {
+        switch command {
         case "provider":
             guard let routing = deps?.routing else { return nil }
             guard let info = await routing.modelForSurface(surface) else { return nil }
@@ -1115,19 +980,6 @@ extension SwiftNativeTelegramBot {
             guard let info = await routing.modelForSurface(surface) else { return nil }
             return "Brain: \(info.model)@\(info.provider)"
 
-        case "restart":
-            // Legacy single-string path (tests/programmatic callers): the
-            // gate logic lives ONCE in dispatchRestartCommand. This wrapper
-            // can't sequence reply-then-arm, so any followup runs
-            // immediately; the poll loop goes through
-            // dispatchCompletenessCommandDetailed for correct ordering.
-            let outcome = await dispatchRestartCommand(
-                args: args, deps: deps,
-                chatId: chatId, fromUserId: fromUserId, chatType: chatType
-            )
-            outcome.afterReplySent?()
-            return outcome.reply
-
         case "help":
             return TelegramCommandRegistry.helpText()
 
@@ -1158,22 +1010,4 @@ private func telegramModelCapabilities(
         providerID: current.provider
     ) else { return nil }
     return (descriptor.supportedReasoningEfforts, descriptor.supportsFast)
-}
-
-// MARK: - Free dispatch helper (usable from tests without a bot instance)
-
-/// Stateless dispatch helper. Resolves deps via the registry for the given bot,
-/// then falls through to nil for unknown commands. Tests can call this directly.
-public func dispatchSwiftSlashCommand(
-    bot: SwiftNativeTelegramBot,
-    command: String,
-    args: [String],
-    chatId: Int? = nil,
-    fromUserId: Int? = nil,
-    chatType: String? = nil
-) async -> String? {
-    await bot.dispatchCompletenessCommand(
-        command, args: args, chatId: chatId,
-        fromUserId: fromUserId, chatType: chatType
-    )
 }

@@ -70,8 +70,7 @@ import MacIntegration
 //
 // ROLLBACK LEVER: set env NATIVE_AGENT_SERIAL_TOOL_DISPATCH=1 (or
 // true/yes/on) to force the old strictly-serial path. Default is parallel
-// ON. (`forceSerialOverride` is the task-local test hook for the same
-// switch.)
+// ON.
 //
 // FAILURE ISOLATION: each concurrent child catches its own error — a
 // throwing tool becomes that slot's `{"error": ...}` result exactly as the
@@ -101,16 +100,8 @@ public enum ParallelToolDispatch {
         return ["1", "true", "yes", "on"].contains(raw)
     }
 
-    static let serialFallbackForcedFromEnv =
+    static let effectiveForceSerial =
         isSerialFallbackForced(env: ProcessInfo.processInfo.environment)
-
-    /// Test hook: binds over the env flag for the duration of a task tree.
-    /// Production never binds it (nil → env flag decides).
-    @TaskLocal static var forceSerialOverride: Bool?
-
-    static var effectiveForceSerial: Bool {
-        forceSerialOverride ?? serialFallbackForcedFromEnv
-    }
 
     // MARK: Safe-set predicate (rules 1-6 above)
 

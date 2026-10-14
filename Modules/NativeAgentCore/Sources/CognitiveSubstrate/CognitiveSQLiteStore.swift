@@ -160,9 +160,8 @@ public actor CognitiveSQLiteStore {
         return destination
     }
 
-    /// One-way drain of retired cognition machinery. Runs unconditionally at
-    /// store open; because no live path writes these kinds or cue metadata any
-    /// longer, subsequent opens are idempotent no-ops.
+    /// Drain retired cognition rows at open, including rows a downgraded
+    /// pre-retirement binary may have written after newer migrations ran.
     private static func drainRetiredCognitionArtifacts(_ dbQueue: DatabaseQueue) throws {
         try dbQueue.write { db in
             // Artifact rows: the persisted `prediction`/`commitment` records plus the
@@ -956,22 +955,12 @@ public actor CognitiveSQLiteStore {
                     created_at REAL NOT NULL
                 );
                 CREATE INDEX idx_cognitive_receipts_kind ON cognitive_receipts(kind, created_at);
-
-                CREATE TABLE cognitive_schema_markers (
-                    name TEXT PRIMARY KEY NOT NULL,
-                    value TEXT NOT NULL
-                );
-                INSERT INTO cognitive_schema_markers (name, value)
-                VALUES ('schema_version', '2');
                 """)
         }
         // Wave A: per-node emotional tag. Purely ADDITIVE — three REAL columns with a
         // NOT NULL DEFAULT 0 (the neutral tag), so an existing DB from v1/v2 opens clean
         // and every pre-tag node loads as neutral. This ALTER-ADD-COLUMN path is the
         // migration-safety crux; nothing here touches existing rows or wire strings.
-        // GRDB's own grdb_migrations table gates which migrations have run; the
-        // cognitive_schema_markers 'schema_version' row is separate app bookkeeping and is
-        // left untouched here (no reader keys off it), so this migration stays purely additive.
         migrator.registerMigration("v3_cognitive_node_emotional_tags") { db in
             try db.execute(sql: """
                 ALTER TABLE cognitive_nodes ADD COLUMN emotional_valence REAL NOT NULL DEFAULT 0;
@@ -996,10 +985,7 @@ public actor CognitiveSQLiteStore {
 
     private static func motorOwnerTimestamp(_ raw: String?) -> Date? {
         guard let raw else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: raw) { return date }
-        return ISO8601DateFormatter().date(from: raw)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     static func jsonString(_ value: JSONValue) -> String {

@@ -1,3 +1,6 @@
+import EngineRuntime
+import MultimodalTTS
+import Transcripts
 import SwiftUI
 import ImageIO
 import AppKit
@@ -57,7 +60,7 @@ struct ChatTranscriptStack<Content: View>: View {
     }
 }
 
-struct MessageGroup: Identifiable {
+struct MessageGroup: Identifiable, Sendable {
     var id: String
     var messages: [ChatMessage]
     var isToolGroup: Bool
@@ -172,69 +175,6 @@ enum InlineCardMount {
 enum ChatTranscriptPresentation {
     static func hasVisibleText(_ text: some StringProtocol) -> Bool {
         text.contains { !$0.isWhitespace }
-    }
-}
-
-/// The mounted assistant bubble owns the only honest first-render boundary: a
-/// non-empty final assistant bubble has become visible to the person using the
-/// Mac app. The registry supplies correlation and claim-once behavior; this
-/// type keeps eligibility/refusal observable without making a visual render
-/// depend on telemetry delivery.
-enum ChatFirstRenderTelemetry {
-    enum Eligibility: Equatable, Sendable {
-        case eligible(sessionID: String, turnID: String)
-        case notAssistant
-        case notLastAssistant
-        case emptyContent
-        case missingSessionID
-        case missingTurnID
-    }
-
-    enum Outcome: Equatable, Sendable {
-        case emitted(TurnTraceEvent)
-        case ineligible(Eligibility)
-        case noPendingTurn
-    }
-
-    static func eligibility(
-        role: String,
-        content: String,
-        isLastAssistant: Bool,
-        messageSessionID: String?,
-        messageTurnID: String?,
-        activeSessionID: String
-    ) -> Eligibility {
-        guard role == "assistant" else { return .notAssistant }
-        guard isLastAssistant else { return .notLastAssistant }
-        guard ChatTranscriptPresentation.hasVisibleText(content) else {
-            return .emptyContent
-        }
-        // A present-but-blank message session is malformed; do not fall back
-        // to the active tab and attach its first render to the wrong turn.
-        let sessionID = messageSessionID ?? activeSessionID
-        let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanSessionID.isEmpty else { return .missingSessionID }
-        guard let turnID = messageTurnID, !turnID.isEmpty else { return .missingTurnID }
-        return .eligible(sessionID: cleanSessionID, turnID: turnID)
-    }
-
-    static func emit(
-        eligibility: Eligibility,
-        registry: TurnFirstRenderRegistry = .shared,
-        bus: TurnTraceBus = .shared
-    ) async -> Outcome {
-        guard case .eligible(let sessionID, let turnID) = eligibility else {
-            return .ineligible(eligibility)
-        }
-        guard let event = await registry.claimFirstRenderEvent(
-            sessionId: sessionID,
-            turnId: turnID,
-            observedBy: "NativeAgentApp.MessageBubble"
-        ) else {
-            return .noPendingTurn
-        }
-        TurnTraceBus.fire(event, on: bus)
-        return .emitted(event)
     }
 }
 
@@ -413,7 +353,7 @@ enum MessageGrouper {
     /// Historical groups stay shared and immutable while the streaming tail
     /// changes. Materializing a visible page copies at most that page, rather
     /// than triggering a copy of the entire cached array on every delta.
-    struct Projection: RandomAccessCollection {
+    struct Projection: RandomAccessCollection, Sendable {
         let base: [MessageGroup]
         var liveTail: MessageGroup?
 
@@ -548,6 +488,18 @@ struct ChatMessageListView: View {
     @State private var pageAnchorID: String?
     @State private var pagedSearchID: String?
     @State private var revealedSessionId = ""
+    private struct Revision: Equatable, Sendable {
+        let sessionId: String
+        let version: UInt64
+    }
+    @State private var preparedTranscript = (
+        revision: Revision(sessionId: "", version: 0),
+        groups: MessageGrouper.Projection(base: [])
+    )
+
+    private var revision: Revision {
+        Revision(sessionId: sessionId, version: appModel.engine.transcripts.structureVersion(for: sessionId))
+    }
 
     /// Page by stable group identity, so appended replies do not move a reader
     /// browsing history. A new search selection centers its own bounded page.
@@ -617,12 +569,22 @@ struct ChatMessageListView: View {
     }
 
     var body: some View {
+        Group { transcriptRows }
+            .task(id: revision) {
+                let revision = revision
+                let messages = messages
+                let groups = await Task.detached(priority: .userInitiated) {
+                    MessageGrouper.projection(for: messages, sessionId: revision.sessionId, structureVersion: revision.version)
+                }.value
+                guard !Task.isCancelled else { return }
+                preparedTranscript = (revision, groups)
+            }
+    }
+
+    @ViewBuilder private var transcriptRows: some View {
         let lastAssistantId = messages.last(where: { $0.role == "assistant" })?.id
-        let allGroups = MessageGrouper.projection(
-            for: messages,
-            sessionId: sessionId,
-            structureVersion: appModel.engine.transcripts.structureVersion
-        )
+        let allGroups = preparedTranscript.revision.sessionId == sessionId
+            ? preparedTranscript.groups : MessageGrouper.Projection(base: [])
         let range = windowRange(for: allGroups)
         let hidden = range.lowerBound
         let groups = Array(allGroups[range])
@@ -635,7 +597,8 @@ struct ChatMessageListView: View {
         let cardMount = InlineCardMount.map(
             groups: groups,
             sessionId: sessionId,
-            structureVersion: appModel.engine.transcripts.structureVersion
+            // Retained groups must never seed the cache for a newer revision.
+            structureVersion: preparedTranscript.revision.version
         )
         let relocatedRows = cardMount.relocated
         if hidden > 0 {
@@ -661,20 +624,8 @@ struct ChatMessageListView: View {
                                                              interactionID: mirrored.interactionID))
                             .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
-                    } else if PersonaWriteReceiptRow.receipt(
-                                for: msg, exemptTitle: appModel.firstConversationReceiptTitle
-                              ) != nil {
-                        // The first conversation's own line is the one piece of
-                        // tool traffic that is a CONSEQUENCE the person should
-                        // see without asking. It takes the settled receipt
-                        // instead of the collapsed fold (Agent, 2026-09-15).
-                        // Every other persona write keeps the quiet row.
-                        PersonaWriteReceiptRow(
-                            message: msg, exemptTitle: appModel.firstConversationReceiptTitle
-                        )
-                        .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
                     } else {
-                        ShellToolRow(messages: [msg])
+                        ToolCallGroup(messages: [msg])
                             .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
                     }
                     // 0.4.12 cards round: an interaction that blocks this tool
@@ -796,6 +747,12 @@ private struct MacChatTranscriptSearchHighlight: ViewModifier {
 struct ToolCallGroup: View {
     @Environment(AppModel.self) private var appModel
     var messages: [ChatMessage]
+    private struct Revision: Equatable, Sendable {
+        let messages: [ChatMessage]
+        let exemptTitle: String?
+    }
+    @State private var preparedRevision: Revision?
+    @State private var partition = (receipts: [(id: String, outcome: String, meta: String)](), rest: [ChatMessage]())
 
     // An unresolved approval must never be hidden behind a collapsed summary.
     private var hasPendingApproval: Bool {
@@ -809,6 +766,20 @@ struct ToolCallGroup: View {
         // the one live surface (p3-voice, 2026-10-07).
         ChatCrossfadeStack(current: hasPendingApproval ? 0 : 1) {
             phaseBody
+        }
+        .task(id: Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)) {
+            guard !hasPendingApproval else { return }
+            let revision = Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)
+            let prepared = await Task.detached(priority: .userInitiated) {
+                revision.messages.reduce(into: (receipts: [(id: String, outcome: String, meta: String)](), rest: [ChatMessage]())) { result, message in
+                    if let receipt = PersonaWriteReceiptRow.receipt(for: message, exemptTitle: revision.exemptTitle) {
+                        result.receipts.append((message.id, receipt.outcome, receipt.meta))
+                    } else { result.rest.append(message) }
+                }
+            }.value
+            guard !Task.isCancelled else { return }
+            partition = prepared
+            preparedRevision = revision
         }
     }
 
@@ -827,19 +798,14 @@ struct ToolCallGroup: View {
             // than traffic and is lifted out of the fold into its own settled
             // receipt. The remaining traffic keeps the quiet row, and a turn
             // whose only tool call was the write shows the receipt alone.
-            let exemptTitle = appModel.firstConversationReceiptTitle
-            let receipts = messages.filter {
-                PersonaWriteReceiptRow.receipt(for: $0, exemptTitle: exemptTitle) != nil
-            }
-            let rest = messages.filter {
-                PersonaWriteReceiptRow.receipt(for: $0, exemptTitle: exemptTitle) == nil
-            }
+            let current = preparedRevision == Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)
+            let partition = current ? self.partition : (receipts: [], rest: [])
             VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
-                if !rest.isEmpty {
-                    ShellToolRow(messages: rest)
+                if !partition.rest.isEmpty {
+                    ShellToolRow(messages: partition.rest)
                 }
-                ForEach(receipts) { message in
-                    PersonaWriteReceiptRow(message: message, exemptTitle: exemptTitle)
+                ForEach(partition.receipts, id: \.id) { receipt in
+                    PersonaWriteReceiptRow(outcome: receipt.outcome, meta: receipt.meta)
                 }
             }
             .layoutValue(key: ChatCrossfadePhase.self, value: 1)
@@ -860,15 +826,7 @@ struct ToolCallGroup: View {
     }
 }
 
-// PATCH-2026-05-09: chat-ux-polish — polished MessageBubble
-// User: purple→pink gradient, white text, rounded-right corners
-// Assistant: glass-card style, soft border, primary text
-// Hover actions: copy, regenerate (last assistant only), read aloud
-// chat-smoothness phase 1 (2026-06-12): finished bubbles re-parsed their
-// markdown on EVERY body re-evaluation — during streaming that's every
-// visible bubble, every coalesce tick. Parse once per content string;
-// FIFO-evict to bound memory. Thread-safe (bubbles render on main, but the
-// cache shouldn't care).
+// Settled inline Markdown is shared with Copy and streaming paragraphs.
 final class ChatMarkdownCache: @unchecked Sendable {
     static let shared = ChatMarkdownCache()
     private let cache = ChatContentCache<AttributedString>()
@@ -956,27 +914,8 @@ enum ChatParagraphGap {
     }
 }
 
-// Render-cost audit F10 — process-wide attachment image cache.
-//
-// The 2026-07-21 fix (decode cached in `@State`, read detached) is correct but
-// the cache is per-VIEW-INSTANCE: `LazyVStack` recycling (scroll away and back)
-// and tab teardown (`ContentView.swift`'s detail `switch` destroys the Chat
-// tree on leave) both re-read the file from disk and re-decode it. This is the
-// shared tier, mirroring `ChatMarkdownCache`'s shape.
-//
-// BOUNDED BY BYTES, NOT ENTRY COUNT. `NSCache.totalCostLimit` with a cost of
-// decoded pixel bytes — an entry cap would let a handful of large screenshots
-// hold hundreds of MB while a hundred thumbnails held almost nothing.
-//
-// SAME PIXELS. The full-size `NSImage` is cached exactly as decoded; there is
-// no downsample to the 360 pt display size (that would be a visible change and
-// is deliberately out of scope). A hit returns the identical object the miss
-// path would have produced from the same bytes.
-//
-// KEY = FILE IDENTITY, NOT PATH. Keying on path alone would serve stale pixels
-// if a file is rewritten in place. The key carries size + modification time, so
-// changed bytes miss. The stat is one syscall on a hit, versus a full read +
-// decode before.
+// Process-local, pixel-budgeted image storage. File identity invalidates rewrites;
+// read and bounded decode run together off the UI actor.
 final class ChatImageCache: @unchecked Sendable {
     static let shared = ChatImageCache()
 
@@ -1087,25 +1026,8 @@ struct MessageBubble: View {
     /// Whether this is the last assistant message in the list (enables Regenerate action)
     var isLastAssistant: Bool = false
 
-    /// The drawn-field gate for `.equatable()` at the call site.
-    ///
-    /// User, 2026-09-13, "the whole app has to feel snappy": a streamed chunk
-    /// republishes the whole `[ChatMessage]`, so the transcript rebuilds every
-    /// row value per tick. Without an explicit `==` SwiftUI falls back to the
-    /// synthesized whole-struct compare, which walks `ChatMessageMetadata?` —
-    /// forty-odd optional Strings plus the optional's copy/destroy — for every
-    /// settled row, and then re-ran every body anyway. `/usr/bin/sample`
-    /// during one streamed reply: hundreds of main-thread samples in
-    /// `ChatMessage.__derived_struct_equals` and
-    /// `outlined init with copy of ChatMessageMetadata?`, 251 in
-    /// `MessageBubble.body`.
-    ///
-    /// This compares exactly what the row draws. Every field listed here is
-    /// read somewhere in `bubbleBody`, `messageProvenance`, the hover line
-    /// (`brainLine`) or the failure line; the rest of the metadata envelope (tool plumbing, approval
-    /// ids, before/after diffs) belongs to the tool rows, not to this view. A
-    /// field added to the bubble must be added here too, or the row will keep
-    /// drawing the old value.
+    /// Compare every drawn field, including provenance and failure state.
+    /// Tool-only metadata belongs to the tool row and does not redraw prose.
     nonisolated static func drawsTheSame(_ l: ChatMessage, _ r: ChatMessage) -> Bool {
         guard l.id == r.id,
               l.role == r.role,
@@ -1149,6 +1071,7 @@ struct MessageBubble: View {
     /// True in the offscreen copy a quiet page read mounts. Nothing here is on
     /// anybody's screen, so nothing here may claim a render the person made.
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
+    @Environment(\.chatPageIsVisible) private var chatPageIsVisible
     @Environment(\.troubleCardOwnsRetry) private var troubleCardOwnsRetry
     /// Set when a retry of this failed turn could repeat a real action.
     @State private var retryConfirmation: ChatTurnFailure?
@@ -1536,7 +1459,7 @@ struct MessageBubble: View {
         Task {
             await voiceOutput.speak(
                 text: message.content,
-                trust: appModel.engine.trust,
+                policy: appModel.engine.trust.policy, loadPolicy: { try await appModel.engine.trust.load() },
                 ownerID: speechOwnerID
             )
         }
@@ -1547,17 +1470,16 @@ struct MessageBubble: View {
         // offscreen, and claiming the "the person saw it" event from there
         // spends the receipt the window's own first render was going to claim.
         guard !quietOffscreenRead else { return }
-        let eligibility = ChatFirstRenderTelemetry.eligibility(
-            role: message.role,
-            content: message.content,
-            isLastAssistant: isLastAssistant,
-            messageSessionID: message.sessionId,
-            messageTurnID: message.metadata?.turnTraceId,
-            activeSessionID: appModel.activeChatSessionId
-        )
-        guard case .eligible = eligibility else { return }
-        Task {
-            _ = await ChatFirstRenderTelemetry.emit(eligibility: eligibility)
+        Task { [message, isLastAssistant, activeSessionID = appModel.activeChatSessionId] in
+            await TurnFirstRenderRegistry.shared.observeFirstRender(
+                role: message.role,
+                content: message.content,
+                isLastAssistant: isLastAssistant,
+                messageSessionID: message.sessionId,
+                messageTurnID: message.metadata?.turnTraceId,
+                activeSessionID: activeSessionID,
+                observedBy: "NativeAgentApp.MessageBubble"
+            )
         }
     }
 
@@ -1581,23 +1503,8 @@ struct MessageBubble: View {
             let phase = live ? 0 : (split.commentary == nil ? 1 : 2)
             ChatCrossfadeStack(current: phase) {
                 if live {
-                    // Streaming skips the block split and the cache: the
-                    // in-flight bubble changes on every coalesce tick. Each
-                    // paragraph takes the settled reply's inline parse
-                    // (2026-10-07), so `**` never shows and nothing snaps
-                    // to bold at the settle.
-                    //
-                    // User, 2026-09-13 ("still a little bumpy"): and it is
-                    // greedy while it streams. Without this the bubble HUGS
-                    // its text, so the row's WIDTH was re-derived from the
-                    // growing string on every chunk and every stack above it
-                    // re-laid out to match. Greedy inside the enclosing
-                    // `replyMaxWidth` cap pins the width at min(column, cap)
-                    // from the first token — the same width the settled reply
-                    // wraps at — so a chunk changes the height only. Glyphs do
-                    // not move when the box shrinks to hug at settle: the text
-                    // is leading-aligned and there is no bubble fill on a reply.
-                    PacedStreamingText(text: displayContent, inline: ChatInlineMarkdown(ChatMarkdownCache.parse))
+                    // Keep the reply width fixed while its edge grows.
+                    PacedStreamingText(text: displayContent, inline: ChatInlineMarkdown(ChatMarkdownCache.parse), isVisible: chatPageIsVisible)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .layoutValue(key: ChatCrossfadePhase.self, value: 0)
                         .transition(NativeAgentMotion.replyDissolve)
@@ -1674,146 +1581,21 @@ struct MessageBubble: View {
         }
     }
 
-    @ViewBuilder
     private func settledContent(_ content: String) -> some View {
-        Group {
-            // 658.13: one pass over cached blocks. Prose keeps the existing
-            // cached inline-markdown path; fenced code becomes a real code
-            // block instead of the newline-collapsed mangle it used to be.
-            let blocks = ChatRichContentCache.blocks(content)
-            if blocks.count == 1, case .prose(let only) = blocks[0] {
-                // The overwhelmingly common case. Rendering it bare keeps the
-                // pre-658.13 view tree exactly as it was — no extra VStack and
-                // no ForEach per bubble across a long transcript, and the
-                // bubble still HUGS its text instead of being stretched by a
-                // full-width child.
-                proseText(only)
-            } else {
-                VStack(alignment: seatsRight ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
-                    // Positional identity: `blocks` is recomputed atomically
-                    // from one content string, and a message may legitimately
-                    // repeat the same snippet twice.
-                    ForEach(blocks.indices, id: \.self) { index in
-                        switch blocks[index] {
-                        case .prose(let text):
-                            proseText(text)
-                        case .code(let language, let code):
-                            ChatCodeBlockView(language: language, code: code)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Prose runs through the existing cached inline-markdown path. No width
-    /// frame: a `maxWidth: .infinity` child would stretch a short user bubble
-    /// to its full 540 pt cap instead of letting it hug its content.
-    ///
-    /// Prose may also carry a Markdown table. Segmenting is a cached pure function
-    /// with a no-pipe fast path, and the single-segment case renders exactly
-    /// the pre-existing view tree — no extra container on an ordinary bubble.
-    @ViewBuilder
-    private func proseText(_ text: String) -> some View {
-        let segments = ChatMarkdownTableParser.segments(text)
-        if segments.count == 1, case .text(let only) = segments[0] {
-            proseRows(only)
-        } else {
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                ForEach(segments.indices, id: \.self) { index in
-                    switch segments[index] {
-                    case .text(let body): proseRows(body)
-                    case .table(let table): ChatMarkdownTableView(table: table)
-                    }
-                }
-            }
-        }
+        ChatPreparedContent(text: content, lineSpacing: bubbleLineSpacing, seatsRight: seatsRight)
     }
 
     private var bubbleLineSpacing: CGFloat { isUser ? 2 : NativeAgentShellLayout.replyLineSpacing }
 
-    /// Wave 3 (Grok's rhythm): paragraphs sit a line gap plus 10pt apart, not
-    /// a whole blank line apart, at the same breaks the stream splits at. Plain
-    /// prose stays ONE `Text` (the gap is drawn inside it), so a drag still
-    /// selects across paragraphs; prose with a list breaks only at the list,
-    /// each run of plain paragraphs between lists still one `Text`.
-    @ViewBuilder
-    private func proseRows(_ text: String) -> some View {
-        let paragraphs = StreamingParagraphText.paragraphs(text[...])
-        let rows = ChatProseListParser.rows(text)
-        if paragraphs.count > 1, rows.contains(where: { $0.marker != nil }) {
-            // One width for every list in the message, as when it was one block.
-            let markerWidth = CGFloat(rows.compactMap(\.marker).map(\.count).max() ?? 1) * 10
-            let blocks = Self.listBlocks(paragraphs)
-            VStack(alignment: .leading, spacing: bubbleLineSpacing + StreamingParagraphText.paragraphGap) {
-                ForEach(blocks.indices, id: \.self) { index in
-                    proseParagraph(blocks[index], markerWidth: markerWidth)
-                }
-            }
-        } else {
-            let markerWidth = CGFloat(rows.compactMap(\.marker).map(\.count).max() ?? 1) * 10
-            proseParagraph(text.trimmingCharacters(in: .newlines), markerWidth: markerWidth)
-        }
-    }
-
-    /// Paragraphs regrouped at list boundaries: a paragraph holding a list
-    /// stands alone; adjacent plain ones rejoin at their blank lines.
-    private static func listBlocks(_ paragraphs: [Substring]) -> [String] {
-        var blocks: [String] = []
-        var proseRun: [Substring] = []
-        for paragraph in paragraphs {
-            if ChatProseListParser.rows(String(paragraph)).contains(where: { $0.marker != nil }) {
-                if !proseRun.isEmpty { blocks.append(proseRun.joined(separator: "\n\n")) }
-                proseRun = []
-                blocks.append(String(paragraph))
-            } else {
-                proseRun.append(paragraph)
-            }
-        }
-        if !proseRun.isEmpty { blocks.append(proseRun.joined(separator: "\n\n")) }
-        return blocks
-    }
-
-    @ViewBuilder
-    private func proseParagraph(_ text: String, markerWidth: CGFloat) -> some View {
-        let rows = ChatProseListParser.rows(text)
-        if rows.contains(where: { $0.marker != nil }) {
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(rows.indices, id: \.self) { index in
-                    let row = rows[index]
-                    if let marker = row.marker {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(marker)
-                                .monospacedDigit()
-                                .frame(width: max(20, markerWidth), alignment: .trailing)
-                                .fixedSize()
-                            inlineProseText(row.text)
-                                .multilineTextAlignment(.leading)
-                        }
-                        .padding(.leading, CGFloat(row.indent) * 7)
-                    } else if !row.text.isEmpty {
-                        inlineProseText(row.text)
-                    }
-                }
-            }
-        } else {
-            inlineProseText(text)
-        }
-    }
-
-    @ViewBuilder
-    private func inlineProseText(_ text: String) -> some View {
-        Text(ChatParagraphGap.applied(
-            ChatMarkdownCache.attributed(text) ?? AttributedString(text),
-            content: text, lineSpacing: bubbleLineSpacing
-        ))
+    private func proseText(_ text: String) -> some View {
+        ChatPreparedContent(text: text, lineSpacing: bubbleLineSpacing, proseOnly: true)
     }
 
     /// Every retry and Regenerate on this bubble asks the one gate first: a
     /// failed turn that acted, or whose outcome is unknown, is confirmed
     /// before it runs again.
     private func requestRetry() {
-        if let failure = appModel.retryNeedsConfirmation(for: message) {
+        if let failure = ChatTurnFailure.retryNeedsConfirmation(for: message, in: appModel.engine.transcripts.messages(for: message.sessionId ?? appModel.activeChatSessionId)) {
             retryConfirmation = failure
         } else {
             Task { await appModel.regenerateAssistantMessage(message) }
@@ -2017,21 +1799,11 @@ private struct MessageLocalImageAttachmentView: View {
             return
         }
         let url = URL(fileURLWithPath: path)
-        let key = await Task.detached(priority: .userInitiated) {
-            ChatImageCache.identityKey(for: url)
+        let image = await Task.detached(priority: .userInitiated) {
+            ChatLocalImageAttachmentLoader.load(at: url)
         }.value
-        if let cached = ChatLocalImageAttachmentLoader.cachedImage(forKey: key) {
-            loadedImage = cached
-            return
-        }
-        // Keep the real disk read off the render actor. NSImage construction
-        // stays on the view actor so an AppKit object never crosses a detached
-        // task boundary.
-        let imageData = await Task.detached(priority: .userInitiated) {
-            ChatLocalImageAttachmentLoader.readData(at: url)
-        }.value
-        guard let imageData,
-              let image = ChatLocalImageAttachmentLoader.decode(imageData, cacheKey: key) else {
+        guard !Task.isCancelled else { return }
+        guard let image else {
             loadFailed = true
             return
         }
@@ -2108,9 +1880,7 @@ private struct MessageJSONSheet: View {
     let message: ChatMessage
     @Environment(\.dismiss) private var dismiss
 
-    private var jsonText: String {
-        ChatMessageDebugJSON.text(for: message)
-    }
+    @State private var jsonText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -2133,6 +1903,12 @@ private struct MessageJSONSheet: View {
         .padding(NativeAgentSpacing.xl)
         .frame(width: 540, height: 420)
         .houseSheet()
+        .task(id: message) {
+            let text = await Task.detached(priority: .userInitiated) { [message] in
+                ChatMessageDebugJSON.text(for: message)
+            }.value
+            if !Task.isCancelled { jsonText = text }
+        }
     }
 }
 
@@ -2176,5 +1952,200 @@ private struct HoverBarReach: Shape {
     let below: CGFloat
     func path(in rect: CGRect) -> Path {
         Path(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height + max(0, below)))
+    }
+}
+
+// Fence splitting (`ChatRichContentParser`) and link sanitizing
+// (`ChatLinkPolicy`) live in NativeAgentShared so the iPhone uses the same rules.
+
+/// Prose-only list projection: fenced code never reaches this parser. Keep
+/// ordinary prose on its bare Text path and preserve inline Markdown in items.
+enum ChatProseListParser {
+    typealias Row = ChatRichContentParser.ProseRow
+    private static let cache = ChatContentCache<[Row]>()
+
+    static func rows(_ content: String) -> [Row] {
+        if let hit = cache.lookup(content) { return hit }
+        let rows = ChatRichContentParser.listRows(content)
+        cache.insertIfAbsent(rows, for: content)
+        return rows
+    }
+}
+
+/// A settled prose projection is retained by its leaf, so cache eviction cannot
+/// turn a later render into a synchronous parse.
+struct ChatPreparedContent: View {
+    let text: String
+    let lineSpacing: CGFloat
+    var seatsRight = false
+    var proseOnly = false
+    private typealias Row = (marker: String?, indent: Int, text: AttributedString)
+    private enum Segment: Sendable {
+        case text([[Row]], CGFloat)
+        case table(ChatMarkdownTable, [[AttributedString]])
+    }
+    private struct Source: Equatable {
+        let text: String
+        let spacing: CGFloat
+        let proseOnly: Bool
+    }
+    private enum Block: Sendable {
+        case prose([Segment])
+        case code(String?, String)
+    }
+    @State private var blocks: [Block] = []
+    @State private var preparedSource: Source?
+
+    private var source: Source { Source(text: text, spacing: lineSpacing, proseOnly: proseOnly) }
+
+    var body: some View {
+        Group {
+            if preparedSource == source {
+                if blocks.count == 1, case .prose(let segments) = blocks[0] {
+                    proseSegments(segments)
+                } else {
+                    VStack(alignment: seatsRight ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
+                        ForEach(blocks.indices, id: \.self) { index in
+                            switch blocks[index] {
+                            case .prose(let segments): proseSegments(segments)
+                            case .code(let language, let code): ChatCodeBlockView(language: language, code: code)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .task(id: source) {
+            let source = source
+            let prepared = await Task.detached(priority: .userInitiated) {
+                let raw = source.proseOnly ? [.prose(source.text)] : ChatRichContentCache.blocks(source.text)
+                return raw.map { block -> Block in
+                    switch block {
+                    case .prose(let text): return .prose(Self.segments(text, lineSpacing: source.spacing))
+                    case .code(let language, let code): return .code(language, code)
+                    }
+                }
+            }.value
+            guard !Task.isCancelled else { return }
+            blocks = prepared
+            preparedSource = source
+        }
+    }
+
+    @ViewBuilder private func proseSegments(_ segments: [Segment]) -> some View {
+        if segments.count == 1, case .text(let paragraphs, let width) = segments[0] {
+            prose(paragraphs, markerWidth: width)
+        } else {
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                ForEach(segments.indices, id: \.self) { index in
+                    switch segments[index] {
+                    case .text(let paragraphs, let width): prose(paragraphs, markerWidth: width)
+                    case .table(let table, let cells): ChatMarkdownTableView(table: table, cells: cells)
+                    }
+                }
+            }
+        }
+    }
+
+    nonisolated private static func segments(_ text: String, lineSpacing: CGFloat) -> [Segment] {
+        func styled(_ source: String) -> AttributedString {
+            ChatParagraphGap.applied(ChatMarkdownCache.attributed(source) ?? AttributedString(source),
+                                     content: source, lineSpacing: lineSpacing)
+        }
+        return ChatMarkdownTableParser.segments(text).map { segment in
+            switch segment {
+            case .table(let table):
+                let columns = table.columnCount
+                let cells = ([table.header] + table.rows).map { row in
+                    (0..<columns).map { ChatMarkdownCache.attributed(table.cell(row, $0)) ?? AttributedString(table.cell(row, $0)) }
+                }
+                return .table(table, cells)
+            case .text(let text):
+                let rows = ChatProseListParser.rows(text)
+                let width = CGFloat(rows.compactMap(\.marker).map(\.count).max() ?? 1) * 10
+                let paragraphs = StreamingParagraphText.paragraphs(text[...])
+                var blocks: [String] = []
+                if paragraphs.count > 1, rows.contains(where: { $0.marker != nil }) {
+                    var run: [Substring] = []
+                    for paragraph in paragraphs {
+                        if ChatProseListParser.rows(String(paragraph)).contains(where: { $0.marker != nil }) {
+                            if !run.isEmpty { blocks.append(run.joined(separator: "\n\n")) }
+                            run = []
+                            blocks.append(String(paragraph))
+                        } else { run.append(paragraph) }
+                    }
+                    if !run.isEmpty { blocks.append(run.joined(separator: "\n\n")) }
+                } else { blocks = [text.trimmingCharacters(in: .newlines)] }
+                return .text(blocks.map { block in
+                    let rows = ChatProseListParser.rows(block)
+                    if rows.contains(where: { $0.marker != nil }) {
+                        return rows.filter { $0.marker != nil || !$0.text.isEmpty }
+                            .map { ($0.marker, $0.indent, styled($0.text)) }
+                    }
+                    return [(nil, 0, styled(block))]
+                }, width)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func prose(_ paragraphs: [[Row]], markerWidth: CGFloat) -> some View {
+        if paragraphs.count == 1 {
+            paragraph(paragraphs[0], markerWidth: markerWidth)
+        } else {
+            VStack(alignment: .leading, spacing: lineSpacing + StreamingParagraphText.paragraphGap) {
+                ForEach(paragraphs.indices, id: \.self) { paragraph(paragraphs[$0], markerWidth: markerWidth) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func paragraph(_ rows: [Row], markerWidth: CGFloat) -> some View {
+        if rows.count == 1, rows[0].marker == nil {
+            Text(rows[0].text)
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(rows.indices, id: \.self) { index in
+                    let row = rows[index]
+                    if let marker = row.marker {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(marker).monospacedDigit()
+                                .frame(width: max(20, markerWidth), alignment: .trailing).fixedSize()
+                            Text(row.text).multilineTextAlignment(.leading)
+                        }
+                        .padding(.leading, CGFloat(row.indent) * 7)
+                    } else { Text(row.text) }
+                }
+            }
+        }
+    }
+}
+
+// Splitting is cheap but it is NOT free, and `body` re-evaluates on every
+// coalesce tick for every visible bubble. Pay once per distinct content
+// string, exactly like `ChatMarkdownCache` — same bounds, same eviction.
+final class ChatRichContentCache: @unchecked Sendable {
+    static let shared = ChatRichContentCache()
+    private let cache = ChatContentCache<[ChatContentBlock]>()
+
+    static func blocks(_ content: String) -> [ChatContentBlock] {
+        shared._blocks(content)
+    }
+
+    private func _blocks(_ content: String) -> [ChatContentBlock] {
+        if let hit = cache.lookup(content) {
+            return hit
+        }
+
+        // Only fenced content is worth an entry: the fast path already returns
+        // a single prose block without allocating, so caching it would evict
+        // real work to store a wrapper.
+        guard content.contains("```") else { return [.prose(ChatRichContentParser.visibleText(content))] }
+
+        RenderAudit.bump("richcontent.split")
+        let parsed = ChatRichContentParser.blocks(content)
+
+        cache.insertIfAbsent(parsed, for: content)
+        return parsed
     }
 }

@@ -77,28 +77,6 @@ public enum FileLockSidecarLifecycle {
         maximumCandidates: Int = maximumCandidatesPerPass,
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
     ) async throws -> FileLockSidecarReapReport {
-        try await reapOrphanedSidecars(
-            dataRoot: dataRoot,
-            now: now,
-            minimumAge: minimumAge,
-            maximumCandidates: maximumCandidates,
-            persistence: persistence,
-            candidateBeforeAcquire: nil
-        )
-    }
-
-    /// Internal test seam. The production entry point always passes nil, so
-    /// the observer cannot alter its normal lifecycle behavior. It runs after
-    /// a sidecar was selected as an old orphan and immediately before this
-    /// sweep tries to acquire that exact sidecar's flock.
-    static func reapOrphanedSidecars(
-        dataRoot: URL,
-        now: Date,
-        minimumAge: TimeInterval,
-        maximumCandidates: Int,
-        persistence: any PersistenceCoreProtocol,
-        candidateBeforeAcquire: (@Sendable (URL) async -> Void)?
-    ) async throws -> FileLockSidecarReapReport {
         let fm = FileManager.default
         var rootIsDirectory: ObjCBool = false
         guard fm.fileExists(atPath: dataRoot.path, isDirectory: &rootIsDirectory) else {
@@ -127,7 +105,7 @@ public enum FileLockSidecarLifecycle {
         let cutoff = now.addingTimeInterval(-max(0, minimumAge))
         let limit = min(max(1, maximumCandidates), maximumCandidatesPerPass)
         var report = FileLockSidecarReapReport()
-        var candidates: [URL] = []
+        var candidates: [(url: URL, modified: Date)] = []
         let entries = enumerator.allObjects.compactMap { $0 as? URL }
 
         for entry in entries {
@@ -143,7 +121,7 @@ public enum FileLockSidecarLifecycle {
                 report.skippedFresh += 1
                 continue
             }
-            candidates.append(entry)
+            candidates.append((entry, state.modified))
         }
         if let enumerationError = enumerationFailure.value {
             throw PersistenceCoreError.ioFailure(
@@ -154,21 +132,17 @@ public enum FileLockSidecarLifecycle {
         // Deterministic oldest-first reclamation makes a bounded pass fair and
         // lets the report's deferred count describe real remaining residue.
         candidates.sort { lhs, rhs in
-            let lhsDate = sidecarState(at: lhs, cutoff: cutoff)?.modified ?? .distantFuture
-            let rhsDate = sidecarState(at: rhs, cutoff: cutoff)?.modified ?? .distantFuture
-            if lhsDate == rhsDate { return lhs.path < rhs.path }
-            return lhsDate < rhsDate
+            if lhs.modified == rhs.modified { return lhs.url.path < rhs.url.path }
+            return lhs.modified < rhs.modified
         }
         report.candidates = candidates.count
         report.deferred = max(0, candidates.count - limit)
 
-        for sidecar in candidates.prefix(limit) {
+        for candidate in candidates.prefix(limit) {
+            let sidecar = candidate.url
             let guarded = sidecar.deletingPathExtension()
             let auditPath = relativePath(sidecar, from: dataRoot)
             report.attempted += 1
-            if let candidateBeforeAcquire {
-                await candidateBeforeAcquire(sidecar)
-            }
             do {
                 let didReap = try await persistence.withFileLock(guarded, waitingAtMost: 0) { () -> Bool in
                     // We now hold this candidate's flock. Recheck every

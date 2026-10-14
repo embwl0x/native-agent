@@ -126,78 +126,6 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Senda
     }
 }
 
-// MARK: - Active browser run ownership
-
-/// Closes the short interval between canonical `running` persistence and the
-/// WebKit task becoming cancellable. A cancel that arrives before attachment
-/// is remembered and applied immediately when the exact task is installed.
-@MainActor
-final class BrowserRunCancellationLatch {
-    private var cancellationRequested = false
-    private var cancelAction: (@MainActor () -> Void)?
-
-    func install(_ action: @escaping @MainActor () -> Void) {
-        guard !cancellationRequested else {
-            action()
-            return
-        }
-        cancelAction = action
-    }
-
-    func cancel() {
-        cancellationRequested = true
-        let action = cancelAction
-        cancelAction = nil
-        action?()
-    }
-}
-
-/// Process-local owner for live visible-browser work. Canonical lifecycle still
-/// lives in Browser/runs.json; this registry exists only so a persisted cancel
-/// can target the exact in-flight Task and WebKit navigation before a late
-/// capture or success receipt is produced. Tokens prevent stale defer cleanup
-/// from unregistering a newer run that reused the same id.
-@MainActor
-final class BrowserActiveRunRegistry {
-    static let shared = BrowserActiveRunRegistry()
-
-    private struct Entry {
-        var token: UUID
-        var cancel: @MainActor () -> Void
-    }
-
-    private var entries: [String: Entry] = [:]
-
-    @discardableResult
-    func register(runID: String, cancel: @escaping @MainActor () -> Void) -> UUID {
-        let token = UUID()
-        entries[runID] = Entry(token: token, cancel: cancel)
-        return token
-    }
-
-    func unregister(runID: String, token: UUID) {
-        guard entries[runID]?.token == token else { return }
-        entries.removeValue(forKey: runID)
-    }
-
-    @discardableResult
-    func cancel(runID: String?) -> Bool {
-        let key: String?
-        if let runID, !runID.isEmpty {
-            key = entries[runID] == nil ? nil : runID
-        } else {
-            key = entries.keys.sorted().first
-        }
-        guard let key, let entry = entries[key] else { return false }
-        entry.cancel()
-        return true
-    }
-
-    func contains(runID: String) -> Bool {
-        entries[runID] != nil
-    }
-}
-
 // MARK: - BrowserWindowController
 
 @MainActor
@@ -207,7 +135,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
     /// The production controller uses the canonical data root.  Tests may give
     /// the real loopback listener a disposable root so its discovery token can
     /// be exercised without ever touching a resident app's IPC files.
-    init(dataRoot: URL = NativeAgentPaths.dataRoot) {
+    init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot
         super.init()
     }
@@ -215,68 +143,17 @@ final class BrowserWindowController: NSObject, ObservableObject {
     private var window: NSWindow?
     private var webView: WKWebView?
     private let navDelegate = BrowserNavDelegate()
+    fileprivate var navigationInProgress: Bool { navDelegate.onFinish != nil }
     private var activeNavigationID: String?
     private var browserOwnerID: String?
 
-    // IPC server state
-    private let ipcListener = NativeLoopbackListener(
-        port: InstallPaths.current.loopbackPorts().browserIPC,
-        label: "BrowserIPC"
-    )
-    /// Doctor's "Local bridges" row for the browser IPC listener.
-    nonisolated var ipcListenerHealth: NativeLoopbackListener.Health { ipcListener.health }
-    private var connections: [ObjectIdentifier: NWConnection] = [:]
-    private var connectionTimeouts: [ObjectIdentifier: Task<Void, Never>] = [:]
-    private(set) var ipcToken: String = ""
-    private(set) var ipcPort: UInt16 = 0
+    private let ipcTransport = NativeLoopbackListener(port: InstallPaths.current.loopbackPorts().browserIPC, label: "BrowserIPC")
+    private lazy var ipcServer = BrowserIPCServer(dataRoot: dataRoot, transport: ipcTransport, effects: AppBrowserRouteEffects())
     private let dataRoot: URL
-
-    /// Drop a connection that hasn't completed its request/response within this window
-    /// so stalled/half-open peers can't accumulate in `connections` indefinitely.
-    private static let ipcIdleTimeout: Duration = .seconds(15)
-    private static let readRetryDelays: [Duration] = [
-        .milliseconds(250),
-        .milliseconds(500),
-        .seconds(1),
-        .seconds(2),
-    ]
-
-    // MARK: - App support dir + token
-
-    // Phase 11c: use the shared resolver so browser_ipc_token goes to
-    // <repo>/data/ rather than ~/Library/Application Support/NativeAgent/.
-    private var appSupportDir: URL { dataRoot }
-
-    private var tokenFileURL: URL {
-        appSupportDir.appendingPathComponent("browser_ipc_token")
-    }
-
-    private var descriptorFileURL: URL {
-        appSupportDir.appendingPathComponent("browser_ipc.json")
-    }
-
-    private func writeDiscovery(token: String, port: UInt16) {
-        let dir = appSupportDir
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let payload: [String: Any] = [
-            "schemaVersion": 1,
-            "host": "127.0.0.1",
-            "port": Int(port),
-            "url": "http://127.0.0.1:\(port)",
-            "token": token,
-            "processIdentifier": ProcessInfo.processInfo.processIdentifier,
-            "writtenAt": ISO8601DateFormatter().string(from: Date()),
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
-            _ = NativePrivateFile.write(data, to: descriptorFileURL)
-        }
-        _ = NativePrivateFile.write(Data(token.utf8), to: tokenFileURL)
-    }
-
-    private func removeDiscoveryFiles() {
-        try? FileManager.default.removeItem(at: tokenFileURL)
-        try? FileManager.default.removeItem(at: descriptorFileURL)
-    }
+    nonisolated var ipcListenerHealth: NativeLoopbackListener.Health { ipcTransport.health }
+    var ipcPort: UInt16 { ipcServer.ipcPort }
+    func startIPCServer() { ipcServer.start() }
+    func stopIPCServer() { ipcServer.stop() }
 
     // MARK: - Window lifecycle
 
@@ -340,19 +217,6 @@ final class BrowserWindowController: NSObject, ObservableObject {
     }
 
     // MARK: - Browser actions
-
-    /// C7 / N9 fix (R16): check the WebView's current URL scheme before operating on it.
-    /// Returns true only for http and https — the two schemes that can be navigated
-    /// to legitimately.  about:, file:, javascript:, data:, and all other schemes are
-    /// rejected.  The prior code allowed "about" (e.g. about:blank) as a workaround
-    /// for empty-page state, but any bearer-token holder could redirect to about:srcdoc
-    /// or use a JS-injected data: URL to side-step the check.
-    /// If no page is loaded yet (url is nil) we return true to allow the first navigate.
-    private func currentPageSchemeAllowed() -> Bool {
-        guard let current = webView?.url else { return true }  // no page loaded yet — allow
-        let scheme = current.scheme?.lowercased() ?? ""
-        return scheme == "http" || scheme == "https"
-    }
 
     func acquireBrowser(runID: String) throws {
         guard browserOwnerID == nil, navDelegate.onFinish == nil else { throw BrowserError.busy }
@@ -465,136 +329,27 @@ final class BrowserWindowController: NSObject, ObservableObject {
         return box.value
     }
 
-    // N9 fix: JSON-encode every interpolated value so crafted selectors or text
-    // containing quotes, backslashes, or other JS metacharacters cannot inject
-    // arbitrary JavaScript.  JSONSerialization produces a properly escaped JS
-    // string literal including the surrounding double-quotes.
-    private static func jsStringLiteral(_ s: String) -> String {
-        // A JavaScript string literal is a JSON *fragment*, not an object or
-        // array.  Without `.fragmentsAllowed`, Foundation raises an Objective-C
-        // exception for every ordinary selector/text input before the Swift
-        // `try?` can handle it.
-        guard let data = try? JSONSerialization.data(withJSONObject: s, options: [.fragmentsAllowed]),
-              let str = String(data: data, encoding: .utf8) else {
-            // Fallback: escape the string manually (handles cases where JSON
-            // serialisation somehow fails, which shouldn't happen for plain strings).
-            let safe = s
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-            return "\"\(safe)\""
-        }
-        return str
-    }
-
     func click(selector: String) async throws {
-        // N9 fix: use JSON-encoded selector literal to prevent JS injection.
-        let jsSel = Self.jsStringLiteral(selector)
-        _ = try await runJS("document.querySelector(\(jsSel)).click()")
+        try await BrowserActionRoutes.click(selector: selector, runJS: runJS)
     }
 
     func fill(selector: String, text: String) async throws {
-        do {
-            _ = try await runJS(Self.fillScript(selector: selector, text: text))
-        } catch {
-            throw Self.fillFailure(error)
-        }
-    }
-
-    /// WebKit's localized description hides the script's outcome explanation.
-    /// Keep that bounded detail for the caller, without reclassifying transport
-    /// failures or cancellation as a DOM rejection.
-    static func fillFailure(_ error: Error) -> Error {
-        let failure = error as NSError
-        guard failure.domain == WKError.errorDomain,
-              failure.code == WKError.Code.javaScriptExceptionOccurred.rawValue,
-              let message = failure.userInfo["WKJavaScriptExceptionMessage"] as? String,
-              !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return error }
-        return BrowserError.fillFailed(String(message.prefix(1024)))
-    }
-
-    /// The exact script sent to WebKit is also exercised by headless JS
-    /// fixtures. Success means this immediate DOM readback matched, not that
-    /// a framework persisted the edit or a later page update cannot undo it.
-    static func fillScript(selector: String, text: String) -> String {
-        // N9 fix: use JSON-encoded selector and text literals to prevent JS injection.
-        let jsSel = jsStringLiteral(selector)
-        let jsText = jsStringLiteral(text)
-        return """
-        (function(){
-          var el = document.querySelector(\(jsSel));
-          if(!el) throw new Error('Element not found: ' + \(jsSel));
-          var editableContent = el.isContentEditable === true;
-          if(!editableContent && !('value' in el)) {
-            throw new Error('Element has no fillable value or editable content');
-          }
-          var requested = \(jsText);
-          if(editableContent) el.textContent = requested;
-          else el.value = requested;
-          el.dispatchEvent(new Event('input', {bubbles:true}));
-          el.dispatchEvent(new Event('change', {bubbles:true}));
-          var observed = editableContent ? el.textContent : el.value;
-          if(observed !== requested) {
-            throw new Error('Fill outcome mismatch after input/change events; the page did not retain the requested text. Do not blindly retry.');
-          }
-        })()
-        """
+        try await BrowserActionRoutes.fill(selector: selector, text: text, runJS: runJS)
     }
 
     func readText() async throws -> String {
-        var last = ""
-        for index in 0...Self.readRetryDelays.count {
-            let result = try await runJS("""
-            (function(){
-              var body = document.body;
-              var root = document.documentElement;
-              return ((body && (body.innerText || body.textContent)) ||
-                      (root && (root.innerText || root.textContent)) ||
-                      '').trim();
-            })()
-            """)
-            last = result as? String ?? ""
-            if !last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return last
-            }
-            if index < Self.readRetryDelays.count {
-                try? await Task.sleep(for: Self.readRetryDelays[index])
-            }
-        }
-        return last
+        try await BrowserActionRoutes.readText(runJS: runJS)
     }
 
     func readLinks() async throws -> [BrowserLink] {
-        let js = """
-        (function(){
-          return Array.from(document.querySelectorAll('a[href]')).slice(0,200).map(function(a){
-            return {url: a.href, text: (a.innerText || a.textContent || '').trim()};
-          });
-        })()
-        """
-        var links: [BrowserLink] = []
-        for index in 0...Self.readRetryDelays.count {
-            guard let raw = try await runJS(js) else { return [] }
-            links = try decodeBrowserLinks(raw)
-            if !links.isEmpty {
-                return links
-            }
-            if index < Self.readRetryDelays.count {
-                try? await Task.sleep(for: Self.readRetryDelays[index])
-            }
-        }
-        return links
-    }
-
-    private func decodeBrowserLinks(_ raw: Any) throws -> [BrowserLink] {
-        let data = try JSONSerialization.data(withJSONObject: raw)
-        return try JSONDecoder().decode([BrowserLink].self, from: data)
+        try await BrowserActionRoutes.readLinks(runJS: runJS)
     }
 
     func currentURL() -> String? {
         webView?.url?.absoluteString
     }
 
-    private func statusPayload() -> [String: Any] {
+    fileprivate func statusPayload() -> [String: Any] {
         [
             "ok": true,
             "visible": window?.isVisible ?? false,
@@ -608,357 +363,6 @@ final class BrowserWindowController: NSObject, ObservableObject {
         ]
     }
 
-    // MARK: - IPC server
-
-    private static func endpointIsLoopback(_ endpoint: NWEndpoint) -> Bool {
-        guard case let .hostPort(host, _) = endpoint else { return true }
-        let value = "\(host)".lowercased()
-            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        return value == "localhost"
-            || value == "127.0.0.1"
-            || value == "::1"
-            || value.hasPrefix("::1%")
-    }
-
-    func startIPCServer() {
-        guard !ipcListener.isActive, ipcToken.isEmpty else { return }
-
-        var bytes = [UInt8](repeating: 0, count: 24)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            nativeLog("NativeAgent browser IPC failed to generate a secure token")
-            return
-        }
-        let token = Data(bytes).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        ipcToken = token
-        ipcPort = 0
-        removeDiscoveryFiles()
-        let started = ipcListener.start(
-            onReady: { [weak self] port in
-                Task { @MainActor in self?.handleIPCListenerReady(token: token, port: port) }
-            },
-            onConnection: { [weak self] connection in
-                Task { @MainActor in
-                    guard let self else {
-                        connection.cancel()
-                        return
-                    }
-                    self.acceptIPC(connection)
-                }
-            },
-            onTerminated: { [weak self] in
-                Task { @MainActor in self?.handleIPCListenerTerminated(token: token) }
-            }
-        )
-        if !started { handleIPCListenerTerminated(token: token) }
-    }
-
-    private func handleIPCListenerReady(token: String, port: UInt16) {
-        guard ipcToken == token else { return }
-        ipcPort = port
-        writeDiscovery(token: token, port: port)
-        print("[BrowserIPC] listening on 127.0.0.1:\(port)")
-    }
-
-    private func handleIPCListenerTerminated(token: String) {
-        guard ipcToken == token else { return }
-        ipcToken = ""
-        ipcPort = 0
-        for connection in connections.values { connection.cancel() }
-        connections.removeAll()
-        for timeout in connectionTimeouts.values { timeout.cancel() }
-        connectionTimeouts.removeAll()
-        removeDiscoveryFiles()
-    }
-
-    func stopIPCServer() {
-        ipcListener.stop()
-        ipcToken = ""
-        ipcPort = 0
-        for connection in connections.values { connection.cancel() }
-        connections.removeAll()
-        for timeout in connectionTimeouts.values { timeout.cancel() }
-        connectionTimeouts.removeAll()
-        removeDiscoveryFiles()
-    }
-
-    private func acceptIPC(_ conn: NWConnection) {
-        guard ipcListener.isActive, !ipcToken.isEmpty, ipcPort != 0 else {
-            conn.cancel()
-            return
-        }
-        guard Self.endpointIsLoopback(conn.endpoint) else {
-            conn.cancel()
-            return
-        }
-        let key = ObjectIdentifier(conn)
-        connections[key] = conn
-        conn.stateUpdateHandler = { [weak self] state in
-            if case .cancelled = state { Task { @MainActor in self?.dropIPCConnection(key) } }
-            if case .failed = state    { Task { @MainActor in self?.dropIPCConnection(key) } }
-        }
-        conn.start(queue: .global(qos: .userInitiated))
-        // Idle/read timeout: a peer that connects but never completes a request would
-        // otherwise sit in `connections` forever. Cancel it after the timeout; the
-        // connection's .cancelled handler then evicts it from the dict.
-        connectionTimeouts[key] = Task { [weak self, weak conn] in
-            try? await Task.sleep(for: Self.ipcIdleTimeout)
-            guard !Task.isCancelled else { return }
-            conn?.cancel()
-            _ = self
-        }
-        Self.readIPCRequest(conn, buffered: Data(), server: self)
-    }
-
-    /// Evict a connection and tear down its idle-timeout Task. Safe to call multiple times.
-    private func dropIPCConnection(_ key: ObjectIdentifier) {
-        connections.removeValue(forKey: key)
-        connectionTimeouts.removeValue(forKey: key)?.cancel()
-    }
-
-    // MARK: - HTTP parsing (nonisolated)
-
-    nonisolated private static func readIPCRequest(_ conn: NWConnection, buffered: Data, server: BrowserWindowController) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 131072) { [weak server] data, _, isComplete, error in
-            guard let server else { return }
-            if error != nil { conn.cancel(); return }
-            var buf = buffered
-            if let d = data { buf.append(d) }
-
-            guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else {
-                if isComplete || buf.count > BridgeCore.headerByteCap { conn.cancel() }
-                else { Self.readIPCRequest(conn, buffered: buf, server: server) }
-                return
-            }
-            guard headerEnd.lowerBound <= BridgeCore.headerByteCap else { conn.cancel(); return }
-
-            let headerData = buf.subdata(in: 0..<headerEnd.lowerBound)
-            guard let (method, path, headers) = BridgeCore.parseRequestHead(headerData) else { conn.cancel(); return }
-
-            guard let contentLength = BridgeCore.parseContentLength(headers, maxBytes: 2 * 1024 * 1024) else {
-                Self.writeRawJSON(conn, status: 413, obj: ["error": "invalid_content_length"])
-                return
-            }
-            let bodyStart = headerEnd.upperBound
-            let bodyAlready = buf.subdata(in: bodyStart..<buf.count)
-
-            if bodyAlready.count >= contentLength {
-                let body = Data(bodyAlready.prefix(contentLength))
-                Task { @MainActor in
-                    server.routeIPC(conn: conn, method: method, path: path, headers: headers, body: body)
-                }
-            } else {
-                guard !isComplete else { conn.cancel(); return }
-                Self.readIPCBody(conn, have: bodyAlready, need: contentLength, method: method, path: path, headers: headers, server: server)
-            }
-        }
-    }
-
-    nonisolated private static func readIPCBody(_ conn: NWConnection, have: Data, need: Int, method: String, path: String, headers: [String: String], server: BrowserWindowController) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: max(1, need - have.count)) { [weak server] data, _, isComplete, error in
-            guard let server else { return }
-            guard error == nil else { conn.cancel(); return }
-            var acc = have
-            if let d = data { acc.append(d) }
-            if acc.count >= need {
-                let body = Data(acc.prefix(need))
-                Task { @MainActor in
-                    server.routeIPC(conn: conn, method: method, path: path, headers: headers, body: body)
-                }
-            } else {
-                guard !isComplete else { conn.cancel(); return }
-                Self.readIPCBody(conn, have: acc, need: need, method: method, path: path, headers: headers, server: server)
-            }
-        }
-    }
-
-    // MARK: - Routing
-
-    private func routeIPC(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
-        // Request fully read & routed — swap the 15s idle/read deadline for a
-        // generous routed-OPERATION deadline. The 15s would kill a legitimate slow
-        // navigate mid-flight; removing the timeout entirely would leak a connection
-        // wedged on a hung WebKit callback. Re-arm to 120s: long enough for any real
-        // browser op, short enough to reap a wedge. dropIPCConnection cancels it when
-        // the connection ends.
-        let timeoutKey = ObjectIdentifier(conn)
-        connectionTimeouts[timeoutKey]?.cancel()
-        connectionTimeouts[timeoutKey] = Task { [weak self, weak conn] in
-            try? await Task.sleep(for: .seconds(120))
-            guard !Task.isCancelled else { return }
-            conn?.cancel()
-            _ = self
-        }
-        let auth = headers["authorization"] ?? ""
-        guard auth == "Bearer \(ipcToken)" else {
-            writeIPCJSON(conn, status: 401, obj: ["error": "unauthorized"])
-            return
-        }
-
-        Task {
-            do {
-                let response = try await self.handleIPCRoute(method: method, path: path, body: body)
-                self.writeIPCJSON(conn, status: 200, obj: response)
-            } catch {
-                self.writeIPCJSON(conn, status: 500, obj: ["error": error.localizedDescription])
-            }
-        }
-    }
-
-    private func handleIPCRoute(method: String, path: String, body: Data) async throws -> [String: Any] {
-        let json = body.isEmpty ? [:] : ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:])
-
-        switch path {
-        case "/browser/navigate":
-            guard let urlStr = json["url"] as? String, let url = URL(string: urlStr) else {
-                throw BrowserError.badRequest("url required")
-            }
-            // C7 fix: reject non-http/https schemes so bearer-token holders
-            // cannot exfiltrate local files via file:// URLs.
-            let scheme = url.scheme?.lowercased() ?? ""
-            guard scheme == "http" || scheme == "https" else {
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Only http and https URLs are permitted; got '\(scheme)://'"]
-            }
-            // C7 busy rejection: serialise navigation
-            if navDelegate.onFinish != nil {
-                return ["ok": false, "error": "browser_busy",
-                        "detail": "Another navigation is already in progress — retry after it completes"]
-            }
-            let requestedRunID = (json["runId"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let runID = requestedRunID?.isEmpty == false
-                ? requestedRunID!
-                : "ipc-\(UUID().uuidString.lowercased())"
-            let result = try await navigate(url, runID: runID)
-            // httpStatus is Optional after the real-status fix — a bare
-            // `as Any` wraps .none, which JSONSerialization rejects and the
-            // whole response drops exactly on the nil-status path (gpt-5.5
-            // review blocker). NSNull is the JSON-safe absent marker.
-            return ["ok": true, "url": result.url, "title": result.title,
-                    "httpStatus": result.httpStatus.map { $0 as Any } ?? NSNull()]
-
-        case "/browser/screenshot":
-            // N8 fix: check current page scheme before operating — a JS redirect to
-            // file:// after a validated navigate would otherwise let read/screenshot
-            // exfiltrate local files.
-            if !currentPageSchemeAllowed() {
-                let cur = webView?.url?.scheme ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
-            }
-            let png = try await screenshot()
-            return ["ok": true, "png_base64": png.base64EncodedString()]
-
-        case "/browser/click":
-            guard let sel = json["selector"] as? String else { throw BrowserError.badRequest("selector required") }
-            // N8 fix: scheme check before operating
-            if !currentPageSchemeAllowed() {
-                let cur = webView?.url?.scheme ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
-            }
-            try await click(selector: sel)
-            return ["ok": true]
-
-        case "/browser/fill":
-            guard let sel = json["selector"] as? String,
-                  let text = json["text"] as? String else { throw BrowserError.badRequest("selector and text required") }
-            // N8 fix: scheme check before operating
-            if !currentPageSchemeAllowed() {
-                let cur = webView?.url?.scheme ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
-            }
-            try await fill(selector: sel, text: text)
-            return ["ok": true]
-
-        case "/browser/read_text":
-            // N8 fix: scheme check before operating
-            if !currentPageSchemeAllowed() {
-                let cur = webView?.url?.scheme ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
-            }
-            let text = try await readText()
-            return ["ok": true, "text": text]
-
-        case "/browser/read_links":
-            // N8 fix: scheme check before operating
-            if !currentPageSchemeAllowed() {
-                let cur = webView?.url?.scheme ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
-            }
-            let links = try await readLinks()
-            let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(links))
-            return ["ok": true, "links": encoded]
-
-        case "/browser/show":
-            showWindow()
-            return statusPayload()
-
-        case "/browser/hide":
-            hideWindow()
-            return statusPayload()
-
-        case "/browser/status":
-            return statusPayload()
-
-        default:
-            throw BrowserError.badRequest("unknown path: \(path)")
-        }
-    }
-
-    // MARK: - HTTP response helpers
-
-    private func writeIPCJSON(_ conn: NWConnection, status: Int, obj: [String: Any]) {
-        Self.writeRawJSON(conn, status: status, obj: obj)
-    }
-
-    nonisolated private static func writeRawJSON(_ conn: NWConnection, status: Int, obj: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: obj) else { conn.cancel(); return }
-        let statusText: String
-        switch status {
-        case 200: statusText = "OK"
-        case 400: statusText = "Bad Request"
-        case 401: statusText = "Unauthorized"
-        case 413: statusText = "Payload Too Large"
-        default:  statusText = "Internal Server Error"
-        }
-        let header = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
-        var resp = Data(header.utf8)
-        resp.append(data)
-        conn.send(content: resp, completion: .contentProcessed { _ in conn.cancel() })
-    }
-}
-
-// MARK: - Errors
-
-enum BrowserError: LocalizedError {
-    case notReady
-    case screenshotFailed
-    case badRequest(String)
-    case fillFailed(String)
-    /// C7 fix: returned when navigate is called while another navigation is in progress.
-    case busy
-    case timeout
-    /// C7 fix (N8): returned when the current page's URL scheme is not http/https.
-    case unsafeScheme(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .notReady: return "Browser window is not ready"
-        case .screenshotFailed: return "Failed to capture screenshot"
-        case .badRequest(let msg): return "Bad request: \(msg)"
-        case .fillFailed(let detail): return "Browser fill failed: \(detail)"
-        case .busy: return "Browser is busy with another navigation — try again shortly"
-        case .timeout: return "Browser navigation timed out"
-        case .unsafeScheme(let scheme): return "Current page scheme '\(scheme)' is not allowed; only http/https are permitted"
-        }
-    }
 }
 
 // MARK: - Browser route effects
@@ -968,7 +372,18 @@ extension BrowserActionRoutes {
     static var app: BrowserActionRoutes { BrowserActionRoutes(effects: AppBrowserRouteEffects()) }
 }
 
-private struct AppBrowserRouteEffects: BrowserRouteEffects {
+private struct AppBrowserRouteEffects: BrowserIPCWindowEffects {
+    @MainActor var navigationInProgress: Bool { BrowserWindowController.shared.navigationInProgress }
+    @MainActor func navigateFromIPC(_ url: URL, runID: String) async throws -> BrowserNavigationResult {
+        let result = try await BrowserWindowController.shared.navigate(url, runID: runID)
+        return BrowserNavigationResult(url: result.url, title: result.title, httpStatus: result.httpStatus)
+    }
+    @MainActor func click(selector: String) async throws { try await BrowserWindowController.shared.click(selector: selector) }
+    @MainActor func fill(selector: String, text: String) async throws { try await BrowserWindowController.shared.fill(selector: selector, text: text) }
+    @MainActor func showWindow() { BrowserWindowController.shared.showWindow() }
+    @MainActor func hideWindow() { BrowserWindowController.shared.hideWindow() }
+    @MainActor func statusPayload() -> [String: Any] { BrowserWindowController.shared.statusPayload() }
+
     @MainActor
     func acquireBrowser(runID: String) throws {
         try BrowserWindowController.shared.acquireBrowser(runID: runID)
@@ -1001,39 +416,9 @@ private struct AppBrowserRouteEffects: BrowserRouteEffects {
     @MainActor func readLinks() async throws -> [BrowserLink] { try await BrowserWindowController.shared.readLinks() }
     @MainActor func screenshot() async throws -> Data { try await BrowserWindowController.shared.screenshot() }
 
-    func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool, dataRoot: URL) async -> BrowserNavigationTask {
-        let cancellationLatch = BrowserRunCancellationLatch()
-        let activeToken = await BrowserActiveRunRegistry.shared.register(runID: runID) {
-            cancellationLatch.cancel()
-        }
-        let captureTask = await MainActor.run {
-            let task = Task { @MainActor in
-                try await BrowserActionRoutes.app.navigateVisibleBrowser(
-                    url,
-                    runID: runID,
-                    captureSource: captureSource,
-                    captureScreenshot: captureScreenshot,
-                    dataRoot: dataRoot
-                )
-            }
-            // Creating and attaching are one non-suspending MainActor turn, so
-            // WebKit cannot begin between task creation and cancellation hookup.
-            cancellationLatch.install {
-                task.cancel()
-                _ = BrowserWindowController.shared.cancelNavigation(runID: runID)
-            }
-            return task
-        }
-        return BrowserNavigationTask(task: captureTask, token: activeToken)
-    }
-
     @MainActor
-    func finishNavigation(runID: String, token: UUID) {
-        BrowserActiveRunRegistry.shared.unregister(runID: runID, token: token)
-    }
-
-    func cancelNavigation(runID: String) async {
-        _ = await BrowserActiveRunRegistry.shared.cancel(runID: runID)
+    func cancelVisibleNavigation(runID: String) {
+        _ = BrowserWindowController.shared.cancelNavigation(runID: runID)
     }
 
     func observeMotorAction(_ model: MotorActionReadModel) async {
@@ -1041,8 +426,8 @@ private struct AppBrowserRouteEffects: BrowserRouteEffects {
     }
 
     func annotateApprovalExecution(id: String, executedAction: JSONValue, detail: String, dataRoot: URL) async throws {
-        try await ApprovalExecutionAnnotation.annotateApprovalExecution(
-            id: id, executedAction: executedAction, detail: detail, root: dataRoot
+        try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+            id, executedAction: executedAction, detail: detail
         )
     }
 

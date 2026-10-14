@@ -20,6 +20,7 @@ import DeviceSync
 /// Descriptors enter the one lazy catalog through the engine; this executor
 /// owns neither a second catalog nor independent load state.
 public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
+    @TaskLocal static var undoReceipt: JSONValue?
     /// The same Trust gate the wrapper uses, for reads the app makes on her
     /// behalf after a page act (`chromeFollowUpAllowed`).
     public let chrome: @Sendable () -> ChromeControlRuntime
@@ -63,16 +64,13 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     ) {
         AppActionPolicy.register(Dictionary(AppActions.all.map { ($0.id, $0.policy) },
                                             uniquingKeysWith: { first, _ in first }))
+        ToolNameAliases.registerAppActions(AppActions.all.map { (id: $0.id, tool: $0.tool, input: $0.input) })
         // Register a closure, not a static table dependency: app's schema
         // already reads AppActions during descriptor assembly below.
         RunawayOutputDetector.registerAppReadOnlyCalls(Self.doorReadOnly)
         self.securityCenter = securityCenter
         self.enforceAutonomySecurity = enforceAutonomySecurity
         self.browserActionRunner = browserActionRunner
-        self.descriptors = AppToolExecutor.appToolSchemas().compactMap { schema in
-            AppToolExecutor.buckets[schema.name].map { ToolDescriptor(schema: schema, bucket: $0) }
-        }.sorted { $0.name < $1.name }
-
         self.chrome = chrome
         self.macPersonAway = macPersonAway
         self.motorActionObserver = motorActionObserver
@@ -138,7 +136,10 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
 
     /// Built once: the schemas are constant, and Core reads this on every call.
     /// Name order, as the app's own loader always listed them.
-    public let descriptors: [ToolDescriptor]
+    public var descriptors: [ToolDescriptor] { Self.sharedDescriptors }
+    private static let sharedDescriptors = appToolSchemas().compactMap { schema in
+        buckets[schema.name].map { ToolDescriptor(schema: schema, bucket: $0) }
+    }.sorted { $0.name < $1.name }
 
     public var replacesCoreTools: Set<String> { Set(Self.notificationToolNames) }
 
@@ -304,6 +305,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// refuses it unless the entry runs in Safe; the host's own call does the rest.
     @MainActor
     func runFolded(_ action: AppAction, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        try Task.checkCancellation()
         // A folded tool runs as itself: the chain is re-entered under its own
         // name, so its gates, Trust key and cards judge it, and what comes
         // back is its own result. A card it files replays that call, not this one.
@@ -329,8 +331,11 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         if action.id == "setting.set" { return await runAppSettingSet(input: input, surface: surface) }
         if action.isCard { return await runCardAction(input: input, surface: surface) }
         if !action.safe, !action.readOnly(args: input), let refusal = await Self.quietChangesRefusal() { return refusal }
+        try Task.checkCancellation()
         let verb = Self.inputString(action.input["verb"]) ?? ""
         switch action.tool {
+        case "undo":
+            return try await doorUndo(input: input)
         case "read_file" where action.id == "chrome.history":
             return try await runChromeHistory(input: input, surface: surface)
         case "claude_worklog":
@@ -338,23 +343,26 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         case "agent_contacts" where action.id == "agent.recipe":
             return AgentRecipeStore.read(host: Self.inputString(input["host"]))
         case "agent_connect" where action.id == "agent.recipe_write":
-            return AgentRecipeStore.write(host: Self.inputString(input["host"]) ?? "", document: input["recipe"] ?? .null)
+            return AgentRecipeStore.write(host: Self.inputString(input["host"]) ?? "", document: input["recipe"] ?? .null,
+                                          undoing: Self.undoReceipt)
         case "app_page_read" where action.id == "layout.read":
             return SurfaceLayoutStore.read(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         case "app_setting_set" where action.id == "layout.write":
             return SurfaceLayoutStore.write(input["layout"] ?? .null, expectedVersion: Self.inputString(input["layout_version"]) ?? "",
-                                            dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                                            dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(), undoing: Self.undoReceipt)
         case "agent_discovery_dismiss":
             return await AgentDiscoverySession.shared.dismiss(name: Self.inputString(input["name"]) ?? "",
                 dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         case "photos_read":
             return await runPhotosRead(verb: verb, input: input)
         case "weather_forecast":
-            return try await runWeatherForecast(input: input)
+            return try await runWeatherForecast(input: input, surface: surface)
         case "sense_act":
             return await runSenseAct(input: input)
         case "sense_make":
             return await runSenseMake(input: input)
+        case "sense_lifecycle":
+            return try await runSenseLifecycle(input: input)
         case "app_page_screenshot":
             return await presentation.pageScreenshot(input: input)
         case "make_studio":
@@ -363,6 +371,8 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             return Self.healthResult(try await doctorStatusProvider(input["repair"] == .bool(true)), surface: surface)
         case "my_queue":
             return await runMyQueue(verb: verb, input: input, surface: surface)
+        case "house_file":
+            return await runHouseFile(input: input, surface: surface)
         case "workshop_reject":
             let id = Self.inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !id.isEmpty else {
@@ -389,9 +399,9 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             let curation = MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
             return action.tool == "list_memories"
                 ? try await curation.listMemories(input: input, surface: surface,
-                    persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID))
+                    persona: nil)
                 : try await curation.rewriteMemory(input: input, surface: surface,
-                    persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID))
+                    persona: nil)
         default:
             break
         }
@@ -448,12 +458,19 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     func foldedRefusal(_ action: AppAction, input: [String: JSONValue], surface: String) async -> JSONValue? {
         if action.tool == "request_interaction" {
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            if case .object(var refusal) = await SwiftToolDispatcher.requestedInteraction(input: input, dataRoot: root),
-               refusal["status"] == .string("failed") {
-                if case .string(let path)? = refusal["argument_path"] {
-                    refusal["argument_path"] = .string("args" + path.dropFirst())
+            if case .object(var result) = await SwiftToolDispatcher.requestedInteraction(input: input, dataRoot: root) {
+                if result["already_done"] == .bool(true) {
+                    result["status"] = .string("would")
+                    result["would_card"] = .bool(false)
+                    result["detail"] = result["summary"]
+                    return .object(result)
                 }
-                return .object(refusal)
+                if result["status"] == .string("failed") {
+                    if case .string(let path)? = result["argument_path"] {
+                        result["argument_path"] = .string("args" + path.dropFirst())
+                    }
+                    return .object(result)
+                }
             }
         }
         if action.isFold { return await AppDoorReentry.validate?(action.tool, input) }
@@ -465,7 +482,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             do {
                 _ = try await MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
                     .rewriteTarget(input: input, surface: surface,
-                        persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID))
+                        persona: nil)
             } catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
         }
         if action.tool == "mind_run", let verb = Self.inputString(action.input["verb"]),
@@ -478,11 +495,15 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             guard let host = quietHost() else { return Self.unattachedFailure() }
             return await host.upkeepFence(verb: Self.inputString(action.input["verb"]) ?? "", input: input)
         }
-        // Turning a skill or tool on, back or back a version: whose it is turns
+        // Turning an ability on, back or back a version: whose it is turns
         // on the script's origin, the steer and Trust. The real call's own
         // checks, run as a preview, say whose it is and what it would leave
         // (status `would`, for the door to say).
-        if ["skill.enable", "skill.restore", "skill.rollback", "tool.restore", "tool.rollback", "tool.approve"].contains(action.id) {
+        if let lifecycle = action.lifecycle, lifecycle != .drop, lifecycle != .change {
+            if action.tool == "sense_lifecycle" {
+                do { return try await runSenseLifecycle(input: input.merging(["preview": .bool(true)]) { $1 }) }
+                catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
+            }
             guard let host = quietHost() else { return Self.unattachedFailure() }
             let asked = await host.manageSkill(verb: Self.inputString(action.input["verb"]) ?? "",
                                                input: input.merging(["preview": .bool(true)]) { $1 },

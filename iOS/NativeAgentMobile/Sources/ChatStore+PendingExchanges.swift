@@ -114,19 +114,13 @@ extension ChatStore {
 
     func persistPendingExchanges() {
         if pendingExchanges.isEmpty {
-            defaults.removeObject(forKey: Self.pendingExchangesKey)
+            storage.remove(key: Self.pendingExchangesKey)
             return
         }
-        if let data = try? JSONEncoder().encode(Array(pendingExchanges.values)) {
-            defaults.set(data, forKey: Self.pendingExchangesKey)
+        let rows = pendingExchanges
+        storage.save(key: Self.pendingExchangesKey, value: { Array(rows.values) }) { [weak self] error in
+            Task { @MainActor in self?.errorBanner = "Pending chat could not be saved: \(error.localizedDescription)" }
         }
-    }
-
-    static func restoredPendingExchanges(from defaults: UserDefaults) -> [String: ChatPendingExchange] {
-        guard let data = defaults.data(forKey: Self.pendingExchangesKey),
-              let rows = try? JSONDecoder().decode([ChatPendingExchange].self, from: data)
-        else { return [:] }
-        return Dictionary(rows.map { ($0.correlationID, $0) }, uniquingKeysWith: { _, newer in newer })
     }
 
     // MARK: - Lifecycle

@@ -50,8 +50,7 @@ public extension GitHubConnectorActions {
     }
 
     /// Canonicalize the bounded list-read request before any external call.
-    /// This is intentionally shared by the action and hermetic tests: a bad
-    /// repository, implicit state, or dropped pagination must fail here rather
+    /// A bad repository, implicit state, or dropped pagination must fail here rather
     /// than becoming a plausible read from the wrong GitHub entity.
     static func pullRequestReadRequest(input: [String: JSONValue]) throws -> (
         repo: String, path: String, page: Int, perPage: Int, params: [String: String]
@@ -89,10 +88,20 @@ public extension GitHubConnectorActions {
             throw GitHubConnectorError.invalidResponse("pull request was not an object")
         }
         let limit = clamp(int(input["limit"], default: 20), min: 1, max: GitHubToolProjection.collectionLimit)
-        let reviews = try await paginatedArray(
+        async let reviewsRead = paginatedArray(
             path: "repos/\(repo)/pulls/\(number)/reviews", dataRoot: dataRoot
         )
-        let commits = try await call(path: "repos/\(repo)/pulls/\(number)/commits", params: ["per_page": String(limit)], dataRoot: dataRoot)
+        async let commitsRead = call(path: "repos/\(repo)/pulls/\(number)/commits", params: ["per_page": String(limit)], dataRoot: dataRoot)
+        let sha = ((pull["head"] as? [String: Any])?["sha"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        async let checkRuns: Any = {
+            guard let sha else { return ["check_runs": []] }
+            return try await completeCheckRuns(path: "repos/\(repo)/commits/\(sha)/check-runs", dataRoot: dataRoot)
+        }()
+        async let combinedStatus: Any = {
+            guard let sha else { return ["statuses": []] }
+            return try await call(path: "repos/\(repo)/commits/\(sha)/status", dataRoot: dataRoot)
+        }()
+        let (reviews, commits) = try await (reviewsRead, commitsRead)
         let projection = GitHubToolProjection.pullRequest(pull)
         var fields: [String: JSONValue] = [
             "repository": .string(repo), "number": .int(Int64(number)),
@@ -102,9 +111,8 @@ public extension GitHubConnectorActions {
             "commits": JSONValue(fromFoundation: GitHubToolProjection.commits(commits, limit: limit).rows),
             "reviewState": .string(derivedReviewState(reviews)),
         ]
-        if let head = pull["head"] as? [String: Any], let sha = head["sha"] as? String, !sha.isEmpty {
-            let checkRuns = try await completeCheckRuns(path: "repos/\(repo)/commits/\(sha)/check-runs", dataRoot: dataRoot)
-            let combinedStatus = try await call(path: "repos/\(repo)/commits/\(sha)/status", dataRoot: dataRoot)
+        if let sha {
+            let (checkRuns, combinedStatus) = try await (checkRuns, combinedStatus)
             fields["headSHA"] = .string(sha)
             fields["checks"] = boundedChecks(checkRuns, combinedStatus: combinedStatus)
         }
@@ -141,17 +149,18 @@ public extension GitHubConnectorActions {
         let page = clamp(int(input["page"], default: 1), min: 1, max: 1_000)
         let limit = clamp(int(input["limit"] ?? input["per_page"], default: 20), min: 1, max: GitHubToolProjection.activityLimit)
         let params = ["page": String(page), "per_page": String(limit)]
-        let comments = try await call(path: "repos/\(repo)/issues/\(number)/comments", params: params, dataRoot: dataRoot)
-        let reviewComments = try await call(path: "repos/\(repo)/pulls/\(number)/comments", params: params, dataRoot: dataRoot)
-        let reviews = try await call(path: "repos/\(repo)/pulls/\(number)/reviews", params: params, dataRoot: dataRoot)
-        let timeline = try await call(path: "repos/\(repo)/issues/\(number)/timeline", params: params, dataRoot: dataRoot)
+        async let comments = call(path: "repos/\(repo)/issues/\(number)/comments", params: params, dataRoot: dataRoot)
+        async let reviewComments = call(path: "repos/\(repo)/pulls/\(number)/comments", params: params, dataRoot: dataRoot)
+        async let reviews = call(path: "repos/\(repo)/pulls/\(number)/reviews", params: params, dataRoot: dataRoot)
+        async let timeline = call(path: "repos/\(repo)/issues/\(number)/timeline", params: params, dataRoot: dataRoot)
+        let activity = try await (comments: comments, reviewComments: reviewComments, reviews: reviews, timeline: timeline)
         return envelope("github.pull_request_activity", fields: [
             "repository": .string(repo), "number": .int(Int64(number)),
             "page": .int(Int64(page)), "perPage": .int(Int64(limit)),
-            "issueComments": JSONValue(fromFoundation: GitHubToolProjection.comments(comments, limit: limit).rows),
-            "reviewComments": JSONValue(fromFoundation: GitHubToolProjection.comments(reviewComments, limit: limit).rows),
-            "reviews": JSONValue(fromFoundation: GitHubToolProjection.reviews(reviews, limit: limit).rows),
-            "timeline": JSONValue(fromFoundation: GitHubToolProjection.timeline(timeline, limit: limit).rows),
+            "issueComments": JSONValue(fromFoundation: GitHubToolProjection.comments(activity.comments, limit: limit).rows),
+            "reviewComments": JSONValue(fromFoundation: GitHubToolProjection.comments(activity.reviewComments, limit: limit).rows),
+            "reviews": JSONValue(fromFoundation: GitHubToolProjection.reviews(activity.reviews, limit: limit).rows),
+            "timeline": JSONValue(fromFoundation: GitHubToolProjection.timeline(activity.timeline, limit: limit).rows),
         ])
     }
 
@@ -381,243 +390,6 @@ public extension GitHubConnectorActions {
     }
 }
 
-extension GitHubConnectorActions {
-    // Internal pure seams used by focused connector tests; production callers
-    // use the bounded action envelopes above.
-    static func testIssueBody(
-        _ input: [String: JSONValue],
-        requireTitle: Bool
-    ) throws -> [String: Any] {
-        try issueBody(input, requireTitle: requireTitle)
-    }
-
-    static func testBoundFilePatches(_ raw: Any, maxCharacters: Int) -> JSONValue {
-        let value = boundFilePatches(raw, maxCharacters: maxCharacters)
-        return .object([
-            "files": JSONValue(fromFoundation: value.files),
-            "characters": .int(Int64(value.characters)),
-            "truncated": .bool(value.truncated),
-        ])
-    }
-
-    static func testDerivedReviewState(_ raw: Any) -> String { derivedReviewState(raw) }
-
-    static func testCheckSummary(_ runs: Any, combinedStatus: Any) -> String {
-        checkSummary(runs, combinedStatus: combinedStatus)
-    }
-
-    static func testDetailedTrackingEntity(
-        pull: [String: Any],
-        reviews: Any,
-        reviewComments: Any,
-        reviewThreads: [GitHubCommandReviewThreadEvidence]
-    ) -> JSONValue {
-        GitHubProjectTracker.makeDetailedPREntity(
-            repo: "owner/repo",
-            number: pull["number"] as? Int ?? 7,
-            staleHours: 72,
-            actor: "contributor",
-            pull: pull,
-            reviews: reviews,
-            reviewComments: reviewComments,
-            reviewThreads: reviewThreads,
-            checkRuns: ["check_runs": []],
-            combinedStatus: ["statuses": []],
-            checks: "none"
-        ).json
-    }
-
-    /// (signature, observationFingerprint) for one PR row at a given staleness
-    /// window. The seam exists so a test can hold the UPSTREAM row fixed and vary
-    /// only the local-clock-derived `stale` bit.
-    static func testTrackingFingerprints(
-        pullRow: [String: Any],
-        staleHours: Int
-    ) -> (signature: String, observation: String)? {
-        guard let entity = basicPREntity(pullRow, repo: "owner/repo", staleHours: staleHours) else { return nil }
-        return (entity.signature, entity.observationFingerprint)
-    }
-
-    static func testUpsertTrackingEntities(
-        _ rows: [JSONValue],
-        project: String,
-        changedKeys: Set<String>,
-        previousRows: [JSONValue] = [],
-        dataRoot: URL
-    ) async throws -> JSONValue {
-        let entities = rows.compactMap(TrackingEntity.fromJSON)
-        let previous = previousRows.compactMap(TrackingEntity.fromJSON)
-        let config = TrackingConfig(
-            version: 2,
-            project: project,
-            mode: .contributions,
-            contributorLogin: "contributor",
-            discoveryQuery: nil,
-            repositories: [TrackedRepository(fullName: "owner/repo", name: "repo", htmlURL: "https://github.com/owner/repo", defaultBranch: "main")],
-            refreshIntervalMinutes: 15,
-            staleAfterHours: 72,
-            updatedAt: DeskClock.nowISO()
-        )
-        let result = try await GitHubProjectTracker.upsertDesk(
-            entities: entities,
-            previousEntities: previous,
-            previousProject: project,
-            config: config,
-            changed: changedKeys,
-            dataRoot: dataRoot
-        )
-        return .object([
-            "archived": .int(Int64(result.archived)),
-            "created": .int(Int64(result.created)),
-            "updated": .int(Int64(result.updated)),
-        ])
-    }
-
-    /// W6/L4-03 test hook — drives the bounded, per-repo-isolated sweep with an
-    /// injected clock so "a slow repo cannot eat the whole tick" is provable
-    /// without a network or a wall-clock sleep.
-    static func testRepositoryPass(
-        _ repositories: [String],
-        budgetSeconds: TimeInterval,
-        startedAt: Date,
-        clock: @escaping @Sendable () -> Date,
-        body: (String) async throws -> Void
-    ) async -> (completed: [String], failed: [String], skippedForBudget: [String]) {
-        let outcome = await GitHubProjectTracker.runRepositoryPass(
-            repositories,
-            budget: GitHubProjectTracker.RefreshBudget(
-                seconds: budgetSeconds,
-                startedAt: startedAt,
-                clock: clock
-            ),
-            name: { $0 },
-            body: body
-        )
-        return (outcome.completed, outcome.failed.map(\.repo), outcome.skippedForBudget)
-    }
-
-    /// W6/L4-03 test hook — the data-loss guard that pairs with the pass: a
-    /// degraded repo's prior rows must come back, or Desk archives live work.
-    static func testCarryForwardRepositories(
-        _ repositories: [String],
-        previous: [JSONValue]
-    ) -> [String] {
-        let entities = previous.compactMap { TrackingEntity.fromJSON($0) }
-        return GitHubProjectTracker.carryForwardEntities(for: repositories, from: entities).map(\.key)
-    }
-
-    static func testLinkedIssueNumbers(_ body: String, repository: String) -> [Int] {
-        linkedIssueNumbers(in: body, repository: repository).sorted()
-    }
-
-    static func testLinkedIssueNumbersFromContributionRows(_ rows: [JSONValue], repository: String) -> [Int] {
-        let bodies = rows.compactMap { row -> String? in
-            guard case .object(let object) = row,
-                  case .string(let body)? = object["body"] else { return nil }
-            return body
-        }
-        return linkedIssueNumbers(in: bodies, repository: repository).sorted()
-    }
-
-    static func testContributionFilter(_ rows: [JSONValue], login: String) -> [JSONValue] {
-        rows.filter { row in
-            guard case .object(let object) = row,
-                  case .object(let user)? = object["user"],
-                  case .string(let author)? = user["login"],
-                  object["pull_request"] != nil else { return false }
-            return author.caseInsensitiveCompare(login) == .orderedSame
-        }
-    }
-
-    static func testTrackingDigest(
-        _ rows: [JSONValue],
-        changedKeys: [String],
-        newKeys: [String]
-    ) -> JSONValue {
-        TrackingSnapshot(
-            project: "Test project",
-            mode: .contributions,
-            contributorLogin: "contributor",
-            refreshedAt: "2026-07-10T18:00:00Z",
-            entities: rows.compactMap(TrackingEntity.fromJSON),
-            changedKeys: changedKeys,
-            newKeys: newKeys,
-            deskCreated: 0,
-            deskUpdated: 0,
-            deskArchived: 0
-        ).digestEnvelope
-    }
-
-    static func testSaveTrackingConfig(
-        repositories: [String],
-        login: String,
-        project: String,
-        dataRoot: URL
-    ) async throws -> JSONValue {
-        let tracked = repositories.map {
-            TrackedRepository(fullName: $0, name: String($0.split(separator: "/").last ?? "repo"), htmlURL: "https://github.com/\($0)", defaultBranch: "main")
-        }
-        try await GitHubProjectTracker.saveConfig(
-            TrackingConfig(
-                version: 2,
-                project: project,
-                mode: .contributions,
-                contributorLogin: login,
-                discoveryQuery: nil,
-                repositories: tracked,
-                refreshIntervalMinutes: 5,
-                staleAfterHours: 72,
-                updatedAt: DeskClock.nowISO()
-            ),
-            dataRoot: dataRoot
-        )
-        return try GitHubProjectTracker.loadConfig(dataRoot: dataRoot).json
-    }
-
-    static func testDeltaCarryDecision(
-        prior: JSONValue?,
-        searchUpdatedAt: String,
-        staleHours: Int,
-        liveMergeableState: String? = nil,
-        mergeabilityEvidenceMissing: Bool = false
-    ) -> JSONValue {
-        let priorEntity = prior.flatMap(TrackingEntity.fromJSON)
-        if let carried = GitHubProjectTracker.carriedForwardEntity(
-            prior: priorEntity,
-            searchUpdatedAt: searchUpdatedAt,
-            staleHours: staleHours,
-            liveMergeableState: liveMergeableState,
-            mergeabilityEvidenceMissing: mergeabilityEvidenceMissing
-        ) {
-            return .object(["decision": .string("carry"), "entity": carried.json])
-        }
-        return .object(["decision": .string("fetch")])
-    }
-
-    static func testDeltaMissingKeys(
-        previousRows: [JSONValue],
-        freshKeys: [String]
-    ) -> [String] {
-        GitHubProjectTracker.priorOpenKeysMissing(
-            from: previousRows.compactMap(TrackingEntity.fromJSON),
-            freshKeys: Set(freshKeys)
-        ).map(\.key).sorted()
-    }
-
-    static func testLinkedIssueCarryDecision(
-        prior: JSONValue,
-        staleHours: Int,
-        now: Date
-    ) -> String {
-        guard let entity = TrackingEntity.fromJSON(prior) else { return "invalid" }
-        return GitHubProjectTracker.carriedForwardLinkedIssue(
-            prior: entity,
-            staleHours: staleHours,
-            now: now
-        ) == nil ? "fetch" : "carry"
-    }
-}
-
 private extension TrackingSnapshot {
     var digestEnvelope: JSONValue {
         let changed = entities.filter { changedKeys.contains($0.key) }
@@ -769,26 +541,16 @@ private enum GitHubProjectTracker {
     static let defaultRefreshBudgetSeconds: TimeInterval = 300
 
     struct RefreshBudget: Sendable {
-        let deadline: Date
-        private let clock: @Sendable () -> Date
+        let deadline = Date().addingTimeInterval(GitHubProjectTracker.defaultRefreshBudgetSeconds)
 
-        init(
-            seconds: TimeInterval = GitHubProjectTracker.defaultRefreshBudgetSeconds,
-            startedAt: Date = Date(),
-            clock: @escaping @Sendable () -> Date = { Date() }
-        ) {
-            self.deadline = startedAt.addingTimeInterval(seconds)
-            self.clock = clock
-        }
-
-        var isExhausted: Bool { clock() >= deadline }
+        var isExhausted: Bool { Date() >= deadline }
     }
 
     /// Outcome of one bounded, per-repository-isolated pass. `failed` and
     /// `skippedForBudget` are what makes the degradation legible instead of
     /// silent — a partial refresh that logged nothing would read exactly like a
     /// clean one.
-    struct RepositoryPassOutcome: Sendable, Equatable {
+    struct RepositoryPassOutcome: Sendable {
         var completed: [String] = []
         var failed: [(repo: String, error: String)] = []
         var skippedForBudget: [String] = []
@@ -799,14 +561,6 @@ private enum GitHubProjectTracker {
         /// prior entities must be carried forward or the snapshot would report
         /// them as vanished and Desk would archive live work.
         var degraded: [String] { failed.map(\.repo) + skippedForBudget }
-
-        static func == (lhs: RepositoryPassOutcome, rhs: RepositoryPassOutcome) -> Bool {
-            lhs.completed == rhs.completed
-                && lhs.unavailableObservations == rhs.unavailableObservations
-                && lhs.skippedForBudget == rhs.skippedForBudget
-                && lhs.failed.map(\.repo) == rhs.failed.map(\.repo)
-                && lhs.failed.map(\.error) == rhs.failed.map(\.error)
-        }
     }
 
     /// Runs `body` once per repository, isolating BOTH failure modes that
@@ -1453,55 +1207,33 @@ private enum GitHubProjectTracker {
         // Reviews/review-comments paginate (bounded at 3 pages, 2026-07-21
         // audit): page-1-only reads hid a late CHANGES_REQUESTED past the
         // first 100 rows and items settled prematurely.
-        let reviews = try await GitHubConnectorActions.paginatedArray(path: "repos/\(repo)/pulls/\(number)/reviews", dataRoot: dataRoot)
-        let reviewComments = try await GitHubConnectorActions.paginatedArray(path: "repos/\(repo)/pulls/\(number)/comments", dataRoot: dataRoot)
-        var checks = "unknown"
-        var checkRuns: Any = ["check_runs": []]
-        var combinedStatus: Any = ["statuses": []]
-        if let head = pull["head"] as? [String: Any], let sha = head["sha"] as? String {
-            checkRuns = try await GitHubConnectorActions.completeCheckRuns(path: "repos/\(repo)/commits/\(sha)/check-runs", dataRoot: dataRoot)
-            combinedStatus = try await GitHubConnectorActions.call(path: "repos/\(repo)/commits/\(sha)/status", dataRoot: dataRoot)
-            checks = checkSummary(checkRuns, combinedStatus: combinedStatus)
-        }
-        // Decision-delivered rule: only decision-labeled PRs pay for the
-        // newest NON-BOT issue-comment read. The per-issue endpoint lists
-        // ASCENDING and ignores sort/direction, so the newest comments are
-        // the LAST page (count rides on the pull) — read it at per_page=10
-        // and skip bot authors (2026-07-21 audit: a bot reply after the
-        // actor's answer must not re-arm needs_user).
-        var latestIssueCommentAuthor: String? = nil
-        var issueComments: Any = []
+        let sha = (pull["head"] as? [String: Any])?["sha"] as? String
         let issueCommentCount = GitHubCommandObservationBuilder.issueCommentCount(pull: pull)
         let decisionArmed = GitHubCommandObservationBuilder.labelDecisionArmed(
             pull: pull, repository: repo, actor: actor
         )
-        if issueCommentCount > 0,
-           decisionArmed || issueCommentNotBefore != nil || expectedIssueCommentIdentifier != nil {
-            issueComments = try await GitHubConnectorActions.issueCommentsIncludingExpected(
-                repository: repo,
-                number: number,
-                commentCount: issueCommentCount,
-                expectedIdentifier: expectedIssueCommentIdentifier,
-                dataRoot: dataRoot
-            )
-            if decisionArmed {
-                latestIssueCommentAuthor = GitHubCommandObservationBuilder.latestNonBotCommentAuthor(issueComments)
-            }
-        }
+        let detail = try await GitHubConnectorActions.pullRequestDetails(
+            repository: repo, number: number, sha: sha, issueCommentCount: issueCommentCount,
+            includeIssueComments: decisionArmed || issueCommentNotBefore != nil || expectedIssueCommentIdentifier != nil,
+            expectedIssueCommentIdentifier: expectedIssueCommentIdentifier, dataRoot: dataRoot
+        )
+        let checks = sha == nil ? "unknown" : checkSummary(detail.checkRuns, combinedStatus: detail.combinedStatus)
+        let latestIssueCommentAuthor = decisionArmed
+            ? GitHubCommandObservationBuilder.latestNonBotCommentAuthor(detail.issueComments) : nil
         return makeDetailedPREntity(
             repo: repo,
             number: number,
             staleHours: staleHours,
             actor: actor,
             pull: pull,
-            reviews: reviews,
-            reviewComments: reviewComments,
+            reviews: detail.reviews,
+            reviewComments: detail.reviewComments,
             reviewThreads: reviewThreads,
-            checkRuns: checkRuns,
-            combinedStatus: combinedStatus,
+            checkRuns: detail.checkRuns,
+            combinedStatus: detail.combinedStatus,
             checks: checks,
             latestIssueCommentAuthor: latestIssueCommentAuthor,
-            issueComments: issueComments,
+            issueComments: detail.issueComments,
             issueCommentNotBefore: issueCommentNotBefore,
             expectedIssueCommentIdentifier: expectedIssueCommentIdentifier,
             expectedIssueCommentHeadSHA: expectedIssueCommentHeadSHA
@@ -1565,7 +1297,7 @@ private enum GitHubProjectTracker {
             author: (pull["user"] as? [String: Any])?["login"] as? String,
             reviewState: reviewState, checks: checks, mergeable: pull["mergeable_state"] as? String,
             needsUser: observation.humanDecision != nil, blocked: blocking,
-            stale: isStale(updated, hours: staleHours) && state == "open",
+            stale: GitHubCommandObservationBuilder.isStale(updated, hours: staleHours) && state == "open",
             commandObservation: observation,
             detailFetchedAt: DeskClock.nowISO()
         )
@@ -1692,7 +1424,7 @@ private enum GitHubProjectTracker {
         of prior: TrackingEntity,
         staleHours: Int
     ) -> TrackingEntity {
-        let freshStale = isStale(prior.updatedAt, hours: staleHours) && prior.state == "open"
+        let freshStale = GitHubCommandObservationBuilder.isStale(prior.updatedAt, hours: staleHours) && prior.state == "open"
         if freshStale == prior.stale { return prior }
         let refreshedObservation: GitHubCommandObservation? = prior.commandObservation.map { obs in
             GitHubCommandObservation(
@@ -1904,8 +1636,7 @@ private enum GitHubProjectTracker {
 
 private extension GitHubConnectorActions {
     static func authenticatedLogin(dataRoot: URL) async throws -> String {
-        let token = try await requestToken(explicitToken: nil, dataRoot: dataRoot)
-        let user = try await validateToken(token)
+        let user = try await validateStoredToken(dataRoot: dataRoot)
         guard let login = user["login"] as? String, !login.isEmpty else {
             throw GitHubConnectorError.invalidResponse("authenticated GitHub user did not include a login")
         }
@@ -2135,7 +1866,7 @@ private func issueEntity(_ row: [String: Any], repo: String, staleHours: Int, ac
         url: row["html_url"] as? String ?? "https://github.com/\(repo)/issues/\(number)",
         author: (row["user"] as? [String: Any])?["login"] as? String, reviewState: nil, checks: nil, mergeable: nil,
         needsUser: observation?.humanDecision != nil, blocked: false,
-        stale: isStale(updated, hours: staleHours) && state == "open",
+        stale: GitHubCommandObservationBuilder.isStale(updated, hours: staleHours) && state == "open",
         commandObservation: observation,
         detailFetchedAt: DeskClock.nowISO()
     )
@@ -2156,7 +1887,7 @@ private func basicPREntity(_ row: [String: Any], repo: String, staleHours: Int) 
         isMerged: merged,
         observedVersion: "\(updated)|\(state)",
         waitingKind: .maintainer,
-        isStale: isStale(updated, hours: staleHours) && state == "open",
+        isStale: GitHubCommandObservationBuilder.isStale(updated, hours: staleHours) && state == "open",
         finalReceipt: "\(repo) #\(number) \(merged ? "merged" : "closed")."
     ) : nil
     return TrackingEntity(
@@ -2166,7 +1897,7 @@ private func basicPREntity(_ row: [String: Any], repo: String, staleHours: Int) 
         author: (row["user"] as? [String: Any])?["login"] as? String,
         reviewState: closureKnown ? nil : "not_expanded", checks: closureKnown ? nil : "not_expanded", mergeable: nil,
         needsUser: false, blocked: false,
-        stale: isStale(updated, hours: staleHours) && state == "open",
+        stale: GitHubCommandObservationBuilder.isStale(updated, hours: staleHours) && state == "open",
         commandObservation: observation,
         detailFetchedAt: DeskClock.nowISO()
     )
@@ -2179,9 +1910,4 @@ private func deskSummary(_ entity: TrackingEntity) -> String {
     if entity.needsUser { parts.append("needs user") }
     if entity.stale { parts.append("stale") }
     return parts.joined(separator: " · ")
-}
-
-private func isStale(_ timestamp: String, hours: Int) -> Bool {
-    guard let date = DeskClock.parseISO(timestamp) else { return false }
-    return Date().timeIntervalSince(date) >= Double(hours * 3_600)
 }

@@ -1,4 +1,9 @@
+import EngineRuntime
+import SelfImprovement
 import Foundation
+import SystemOps
+import ToolRegistry
+import EngineRuntime
 import Research
 import SwiftUI
 import TrustCenter
@@ -10,10 +15,6 @@ enum CapabilitiesDisclosurePreference {
     static let nextGenKey = "capabilitiesShowNextGen"
     /// The Developer fold the self-checks sit inside.
     static let developerKey = "capabilitiesShowDeveloper"
-
-    static func isNextGenExpanded(in defaults: UserDefaults) -> Bool {
-        defaults.bool(forKey: nextGenKey)
-    }
 
     /// Opening the self-checks opens the Developer fold around them too.
     static func setNextGenExpanded(_ isExpanded: Bool, in defaults: UserDefaults) {
@@ -433,11 +434,11 @@ struct CapabilitiesView: View {
                         }
                     }
 
-                    let listed = CapabilitiesPlainCopy.displayRecords(summary.records)
+                    let listed = CapabilityRecord.displayRecords(summary.records)
                     let query = capabilitySearch.trimmingCharacters(in: .whitespacesAndNewlines)
                     let matches = query.isEmpty ? [] : listed.filter { capability in
-                        CapabilitiesPlainCopy.title(for: capability).localizedCaseInsensitiveContains(query)
-                            || (CapabilitiesPlainCopy.description(for: capability)?
+                        CapabilityRecord.title(for: capability).localizedCaseInsensitiveContains(query)
+                            || (CapabilityRecord.description(for: capability)?
                                 .localizedCaseInsensitiveContains(query) ?? false)
                     }
                     HStack(spacing: 8) {
@@ -506,8 +507,7 @@ struct CapabilitiesView: View {
 
     private var nextGenLoadedPhases: [NextGenPhase] {
         var seen = Set<String>()
-        let combined = appModel.nextGenPhases + (appModel.nextGenSummary?.phases ?? [])
-        return combined
+        return appModel.nextGenPhases
             .filter { seen.insert($0.id).inserted }
             .sorted { lhs, rhs in
                 switch (lhs.phaseNumber, rhs.phaseNumber) {
@@ -546,7 +546,7 @@ struct CapabilitiesView: View {
         let combined =
             (appModel.latestNextGenReceipt.map { [$0] } ?? []) +
             appModel.nextGenReceipts +
-            (appModel.nextGenSummary?.displayReceipts ?? []) +
+            (appModel.nextGenSummary?.latestReceipts ?? []) +
             nextGenLoadedPhases.compactMap(\.latestReceipt)
         return combined.filter { seen.insert($0.id).inserted }
     }
@@ -560,7 +560,7 @@ struct CapabilitiesView: View {
         var seen = Set<String>()
         let combined = (appModel.nextGenSummary?.actions ?? []) + nextGenLoadedPhases.flatMap { $0.actions ?? [] }
         return combined
-            .filter { AppModel.isNextGenActionBacked($0.id) }
+            .filter { NativeAgentEngine.isNextGenActionBacked($0.id) }
             .filter { seen.insert($0.id).inserted }
     }
 
@@ -1344,7 +1344,7 @@ struct CapabilityRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(CapabilitiesPlainCopy.title(for: capability))
+                Text(CapabilityRecord.title(for: capability))
                     .font(compact ? ShellType.labelSemibold : ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
@@ -1375,7 +1375,7 @@ struct CapabilityRow: View {
                     AdvancedMeta("\(useCount) uses")
                 }
             }
-            if !compact, let description = CapabilitiesPlainCopy.description(for: capability), !description.isEmpty {
+            if !compact, let description = CapabilityRecord.description(for: capability), !description.isEmpty {
                 Text(description)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
@@ -1403,7 +1403,7 @@ struct NextGenPhaseRow: View {
             // L3#6: a phase's primaryDryRunActionId comes from the catalog data
             // file and may name an id the read-only executor has no case for.
             // Render the probe only when an executor backs it.
-            if let actionId = phase.primaryDryRunActionId, AppModel.isNextGenActionBacked(actionId) {
+            if let actionId = phase.primaryDryRunActionId, NativeAgentEngine.isNextGenActionBacked(actionId) {
                 Button("Preview") {
                     runProbe(actionId)
                 }
@@ -1666,5 +1666,287 @@ struct CapabilityDetailRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
+    }
+}
+/// Presentation boundary for the native capability-records catalog. A catalog
+/// summary is a receipt: its aggregate counts must agree with the actual rows
+/// before Foundry Index can display it as a useful inventory.
+enum CapabilitiesFoundryIndexPresentation {
+    enum State: Equatable {
+        case unavailable
+        case empty
+        case inconsistent(String)
+        case populated(CapabilitySummaryResponse)
+    }
+
+    static func state(summary: CapabilitySummaryResponse?) -> State {
+        guard let summary else { return .unavailable }
+        guard !summary.records.isEmpty else {
+            guard summary.summary.total == 0,
+                  summary.summary.active == 0,
+                  summary.summary.review == 0,
+                  summary.summary.autoloaded == 0 else {
+                return .inconsistent("the list has no entries but its counts are not zero")
+            }
+            return .empty
+        }
+
+        guard summary.records.allSatisfy({ !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            return .inconsistent("one or more entries have no stable id")
+        }
+        guard Set(summary.records.map(\.id)).count == summary.records.count else {
+            return .inconsistent("the list contains duplicate ids")
+        }
+
+        let counts = summary.summary
+        guard counts.total == summary.records.count else {
+            return .inconsistent("the stated total does not match the entries")
+        }
+        guard counts.active >= 0, counts.review >= 0, counts.autoloaded >= 0,
+              counts.active <= counts.total,
+              counts.review <= counts.total,
+              counts.autoloaded <= counts.total else {
+            return .inconsistent("one or more stated counts are outside what the list holds")
+        }
+
+        let activeStatuses: Set<String> = ["active", "installed", "ready", "configured"]
+        let reviewStatuses: Set<String> = ["review", "proposal", "draft", "drafted", "needs_setup"]
+        let actualActive = summary.records.filter { activeStatuses.contains(($0.status ?? "").lowercased()) }.count
+        let actualReview = summary.records.filter { reviewStatuses.contains(($0.status ?? "").lowercased()) }.count
+        let actualAutoloaded = summary.records.filter { $0.autoload == true }.count
+        guard counts.active == actualActive,
+              counts.review == actualReview,
+              counts.autoloaded == actualAutoloaded else {
+            return .inconsistent("the stated status counts do not match the entries")
+        }
+
+        if let byKind = counts.byKind {
+            var actualByKind: [String: Int] = [:]
+            for record in summary.records {
+                actualByKind[record.kind ?? "", default: 0] += 1
+            }
+            guard byKind == actualByKind else {
+                return .inconsistent("the stated kind counts do not match the entries")
+            }
+        }
+
+        return .populated(summary)
+    }
+
+    static var unavailableDetail: String {
+        "The capability list has not loaded. Refresh to try again."
+    }
+
+    static var emptyDetail: String {
+        "Nothing is listed yet."
+    }
+
+    static func inconsistentDetail(_ reason: String) -> String {
+        "The capability list does not add up (\(reason)). Refresh before relying on it."
+    }
+}
+
+/// Result of sending a Research Lab request through the native research owner.
+/// A returned run can still describe an unavailable connector, so callers must
+/// inspect the receipt rather than treating a non-throwing call as success.
+enum ResearchLabActionOutcome: Equatable {
+    case rejected(String)
+    case recorded(ResearchLabRun)
+    case failed(String)
+}
+
+enum CapabilitiesResearchLabPresentation {
+    enum Tone: Equatable {
+        case neutral
+        case progress
+        case success
+        case warning
+        case failure
+    }
+
+    struct Message: Equatable {
+        let text: String
+        let detail: String?
+        let tone: Tone
+        let systemImage: String
+    }
+
+    enum RunList: Equatable {
+        case loading
+        case empty
+        case loaded([ResearchLabRun])
+        case unavailable(detail: String, retained: [ResearchLabRun])
+    }
+
+    static func message(for outcome: ResearchLabActionOutcome) -> Message {
+        switch outcome {
+        case .rejected(let detail):
+            Message(text: "Research objective required", detail: detail, tone: .warning,
+                    systemImage: "exclamationmark.triangle.fill")
+        case .failed(let detail):
+            Message(text: "Research lab failed", detail: detail, tone: .failure,
+                    systemImage: "exclamationmark.triangle.fill")
+        case .recorded(let run):
+            message(for: run)
+        }
+    }
+
+    static func message(for run: ResearchLabRun) -> Message {
+        let status = run.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let detail = meaningfulDetail(for: run)
+        switch status {
+        case "completed":
+            if let error = nonempty(run.error) {
+                return Message(text: "Research lab reported an error", detail: error, tone: .failure,
+                               systemImage: "exclamationmark.triangle.fill")
+            }
+            return Message(
+                text: "Research run completed",
+                detail: "\(run.sources.count) source\(run.sources.count == 1 ? "" : "s") recorded.",
+                tone: .success,
+                systemImage: "checkmark.circle.fill"
+            )
+        case "needs_connector":
+            return Message(
+                text: "Research needs a connector",
+                detail: detail ?? "Connect a research service before this can return sources.",
+                tone: .warning,
+                systemImage: "exclamationmark.triangle.fill"
+            )
+        case "failed", "error":
+            return Message(
+                text: "Research lab failed",
+                detail: detail ?? "The research run came back failed, with no detail.",
+                tone: .failure,
+                systemImage: "exclamationmark.triangle.fill"
+            )
+        default:
+            return Message(
+                text: "Research result needs review",
+                detail: detail ?? "The research run came back with a status this page does not recognise: \(run.status).",
+                tone: .warning,
+                systemImage: "questionmark.diamond"
+            )
+        }
+    }
+
+    static func list(rows: [ResearchLabRun]) -> RunList {
+        rows.isEmpty ? .empty : .loaded(rows)
+    }
+
+    static func unavailableList(detail: String, retained: [ResearchLabRun]) -> RunList {
+        .unavailable(detail: bounded(detail), retained: retained)
+    }
+
+    private static func meaningfulDetail(for run: ResearchLabRun) -> String? {
+        nonempty(run.error) ?? nonempty(run.brief)
+    }
+
+    private static func nonempty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : bounded(trimmed)
+    }
+
+    private static func bounded(_ text: String) -> String {
+        let limit = 240
+        return text.count > limit ? String(text.prefix(limit)) + "…" : text
+    }
+}
+
+/// Mounted Intent Router state. A successful plan with no matching
+/// capabilities is useful evidence; it must never look like the router did
+/// not run or that it failed before producing a plan.
+enum IntentRoutePresentation: Equatable {
+    case idle
+    case planning
+    case plan(IntentRoutePlan)
+    case failed(String)
+
+    enum CapabilityMatchState: Equatable {
+        case matches([CapabilityRecord])
+        case noMatches
+    }
+
+    var capabilityMatchState: CapabilityMatchState? {
+        guard case let .plan(plan) = self else { return nil }
+        return plan.matchedCapabilities.isEmpty
+            ? .noMatches
+            : .matches(plan.matchedCapabilities)
+    }
+
+    var isPlanning: Bool {
+        if case .planning = self { return true }
+        return false
+    }
+
+    static func boundedFailure(_ error: Error) -> String {
+        UserFacingError.cause(error, action: "plan that route")
+    }
+}
+
+@MainActor
+extension AppModel {
+    @MainActor
+    func routeIntent(_ message: String) async {
+        let didRoute = await routeIntent(message, using: { message in
+            try IntentRoutePlan(await SwiftNativeRouterPlanClient().planRoute(message: message))
+        })
+        guard didRoute else { return }
+        let traceTimeline = EngineRuntime.CapabilityTraceFeed.read(dataRoot: engine.dataRoot)
+        capabilityTraceTimeline = traceTimeline
+        traces = traceTimeline.traces
+    }
+
+    /// The UI owns visible route state while the injected planner remains the
+    /// real router boundary. The overload makes the successful-empty and
+    /// failed paths executable without a source-text proxy.
+    @MainActor
+    @discardableResult
+    func routeIntent(
+        _ message: String,
+        using planner: (String) async throws -> IntentRoutePlan
+    ) async -> Bool {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            routePlan = nil
+            routePresentation = .failed("Enter a task before planning a route.")
+            statusText = "Router needs a task to plan."
+            return false
+        }
+        routePlan = nil
+        routePresentation = .planning
+        do {
+            let plan = try await planner(trimmed)
+            routePlan = plan
+            routePresentation = .plan(plan)
+            statusText = "Route planned: \(plan.goalType)"
+            return true
+        } catch {
+            let failure = IntentRoutePresentation.boundedFailure(error)
+            routePlan = nil
+            routePresentation = .failed(failure)
+            statusText = "Router failed: \(failure)"
+            return false
+        }
+    }
+}
+
+
+extension NextGenReceipt {
+    // 2026-06-07 ui-taste-sweep #83: receipt rows on Capabilities used to
+    // render the raw `detail` string — comma-separated "key: value, key:
+    // value, createdAt: <ISO>" dumps with microsecond timestamps. Users
+    // can't parse that at a glance. `humanized` runs the parser in
+    // UserDisplayFormatters.humanizeReceipt so the row shows
+    // "Archived · stale duplicate · 5 days ago" and the raw kv pairs are
+    // available for an inspector / disclosure. Falls back gracefully when
+    // the detail isn't kv-shaped (free-form text passes through).
+    var humanized: UserDisplayFormatters.HumanizedReceipt {
+        UserDisplayFormatters.humanizeReceipt(
+            name: name,
+            detail: detail ?? output,
+            fallbackTitle: actionId ?? phaseId ?? "Receipt"
+        )
     }
 }

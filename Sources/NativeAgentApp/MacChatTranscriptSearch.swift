@@ -1,151 +1,14 @@
 import Foundation
 import Observation
 import SwiftUI
+import ChatSessionWork
 
-/// A rebuildable, view-local projection over the transcript already loaded by
-/// AppModel. JSONL remains authoritative: this type writes no sidecar index and
-/// owns no session lifecycle.
-struct MacChatTranscriptSearchDocument: Sendable, Equatable {
-    let messageID: String
-    let ordinal: Int
-    let content: String
-}
+typealias MacChatTranscriptSearchDocument = TranscriptSearchDocument
+typealias MacChatTranscriptSearchResult = TranscriptSearchResult
+typealias MacChatTranscriptSearchResponse = TranscriptSearchResponse
+typealias MacChatTranscriptSearch = TranscriptSearch
 
-struct MacChatTranscriptSearchResult: Identifiable, Sendable, Equatable {
-    let messageID: String
-    let ordinal: Int
-
-    var id: String { "\(ordinal):\(messageID)" }
-}
-
-struct MacChatTranscriptSearchResponse: Sendable, Equatable {
-    let query: String
-    let results: [MacChatTranscriptSearchResult]
-    let totalMatchCount: Int
-
-    var isTruncated: Bool { totalMatchCount > results.count }
-}
-
-enum MacChatTranscriptSearch {
-    /// Query work is bounded before Foundation normalization or comparison.
-    static let maximumQueryScalars = 256
-    /// Huge repetitive histories remain searchable without retaining an
-    /// unbounded navigation array. The exact total is still reported.
-    static let maximumNavigableResults = 2_000
-
-    static func documents(from messages: [ChatMessage]) -> [MacChatTranscriptSearchDocument] {
-        messages.enumerated().compactMap { ordinal, message in
-            document(from: message, ordinal: ordinal)
-        }
-    }
-
-    static func document(from message: ChatMessage, ordinal: Int) -> MacChatTranscriptSearchDocument? {
-        let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard role != "tool" else { return nil }
-        guard !(role == "system" && message.content.hasPrefix("[tool:")) else { return nil }
-        let visible = visibleText(of: message)
-        guard !visible.isEmpty else { return nil }
-        return MacChatTranscriptSearchDocument(
-            messageID: message.id,
-            ordinal: ordinal,
-            content: visible
-        )
-    }
-
-    /// 2026-09-06: search used to index the RAW row, so a hit inside a
-    /// completion envelope's routing slip selected a row whose slip the room
-    /// never renders — the transcript folds a bridge receipt into
-    /// `ShellEnvelopeRow`, and even "Show" reveals only the extracted reply.
-    /// The index now carries the substantive text, which is a subset of what
-    /// the bubble displays, so a match is always
-    /// reachable. The bridge-routed fences match the renderer's exactly (see
-    /// `ChatShellConversationRow.isBridgeRouted`).
-    static func visibleText(of message: ChatMessage) -> String {
-        let content = message.content
-        guard ChatShellConversationRow.isBridgeRouted(message.metadata?.origin) else {
-            return content
-        }
-        let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if role == "user", ChatShellEnvelope.isEnvelope(content, envelope: message.metadata?.envelope) {
-            return ChatShellEnvelope.reply(content)
-        }
-        if role == "user", message.metadata?.origin?.surface?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "agent-bridge" {
-            return SimpleViewStore.bridgedText(content)
-        }
-        guard ChatShellConversationRow.hasBridgePrefix(content) else { return content }
-        return ChatShellConversationRow.stripBridgePrefix(content)
-    }
-
-    static func boundedInput(_ raw: String) -> String {
-        var bounded = ""
-        bounded.reserveCapacity(maximumQueryScalars * 2)
-        for scalar in raw.unicodeScalars.prefix(maximumQueryScalars) {
-            bounded.unicodeScalars.append(scalar)
-        }
-        return bounded
-    }
-
-    static func boundedQuery(_ raw: String) -> String {
-        let bounded = boundedInput(raw)
-        return bounded.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    static func search(
-        query rawQuery: String,
-        documents: [MacChatTranscriptSearchDocument],
-        maximumResults: Int = maximumNavigableResults
-    ) -> MacChatTranscriptSearchResponse {
-        searchCancellable(
-            query: rawQuery,
-            documents: documents,
-            maximumResults: maximumResults,
-            shouldCancel: { false }
-        ) ?? MacChatTranscriptSearchResponse(query: boundedQuery(rawQuery), results: [], totalMatchCount: 0)
-    }
-
-    /// The controller uses this form so a superseded query stops consuming CPU
-    /// instead of leaving an unstructured full-history scan behind it.
-    static func searchCancellable(
-        query rawQuery: String,
-        documents: [MacChatTranscriptSearchDocument],
-        maximumResults: Int = maximumNavigableResults,
-        shouldCancel: () -> Bool = { Task.isCancelled }
-    ) -> MacChatTranscriptSearchResponse? {
-        let query = boundedQuery(rawQuery)
-        guard !query.isEmpty, maximumResults > 0 else {
-            return MacChatTranscriptSearchResponse(query: query, results: [], totalMatchCount: 0)
-        }
-
-        var newestFirst: [MacChatTranscriptSearchResult] = []
-        newestFirst.reserveCapacity(min(maximumResults, documents.count))
-        var totalMatchCount = 0
-        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]
-        let locale = Locale(identifier: "en_US_POSIX")
-
-        // Retain the newest bounded results, which are the useful ones in a
-        // conversation, but continue the scan so the total remains exact.
-        for (scanIndex, document) in documents.reversed().enumerated() {
-            if scanIndex.isMultiple(of: 64), shouldCancel() { return nil }
-            guard document.content.range(of: query, options: options, locale: locale) != nil else {
-                continue
-            }
-            totalMatchCount += 1
-            if newestFirst.count < maximumResults {
-                newestFirst.append(MacChatTranscriptSearchResult(
-                    messageID: document.messageID,
-                    ordinal: document.ordinal
-                ))
-            }
-        }
-
-        return MacChatTranscriptSearchResponse(
-            query: query,
-            results: newestFirst.reversed(),
-            totalMatchCount: totalMatchCount
-        )
-    }
-
+extension TranscriptSearch {
     static func scrollTargetID(for messageID: String) -> String {
         "chat-message-\(messageID)"
     }
@@ -197,6 +60,10 @@ final class MacChatTranscriptSearchController {
     private(set) var selectionRevision: UInt = 0
 
     @ObservationIgnored private var documents: [MacChatTranscriptSearchDocument] = []
+    @ObservationIgnored private var sourceMessages: [ChatMessage] = []
+    @ObservationIgnored private var structureVersion: UInt64?
+    @ObservationIgnored private var sourceTask: Task<Void, Never>?
+    @ObservationIgnored private var sourceGeneration: UInt64 = 0
     @ObservationIgnored private var sourceSessionID = ""
     @ObservationIgnored private var sourceRevision: UInt = 0
     @ObservationIgnored private var searchGeneration: UInt = 0
@@ -236,13 +103,33 @@ final class MacChatTranscriptSearchController {
         }
     }
 
-    func replaceSource(messages: [ChatMessage], sessionID: String) {
+    func replaceSource(messages: [ChatMessage], sessionID: String, revision: UInt64) {
         if sourceSessionID != sessionID {
             reset(for: sessionID)
         }
-        documents = MacChatTranscriptSearch.documents(from: messages)
-        sourceRevision &+= 1
-        scheduleSearch()
+        guard structureVersion != revision else { return }
+        structureVersion = revision
+        sourceMessages = messages
+        sourceGeneration &+= 1
+        let generation = sourceGeneration
+        sourceTask?.cancel()
+        sourceTask = Task {
+            var prepared = await Task.detached(priority: .userInitiated) {
+                MacChatTranscriptSearch.documents(from: messages)
+            }.value
+            guard !Task.isCancelled, generation == sourceGeneration else { return }
+            // A token can arrive while the structure is being prepared.
+            let ordinal = sourceMessages.count - 1
+            if prepared.last?.ordinal == ordinal { prepared.removeLast() }
+            if let tail = sourceMessages.last,
+               let document = MacChatTranscriptSearch.document(from: tail, ordinal: ordinal) {
+                prepared.append(document)
+            }
+            documents = prepared
+            sourceTask = nil
+            sourceRevision &+= 1
+            if !query.isEmpty || phase != .results { scheduleSearch() }
+        }
     }
 
     /// Streaming changes only the last row. Updating that projection in O(1)
@@ -250,6 +137,8 @@ final class MacChatTranscriptSearchController {
     /// removals, compaction, and session changes still use `replaceSource`.
     func replaceLastMessage(_ message: ChatMessage?, ordinal: Int, sessionID: String) {
         guard sourceSessionID == sessionID else { return }
+        if let message, sourceMessages.indices.contains(ordinal) { sourceMessages[ordinal] = message }
+        guard sourceTask == nil else { return }
         let previousDocument = documents.last?.ordinal == ordinal ? documents.last : nil
         let replacement = message.flatMap { MacChatTranscriptSearch.document(from: $0, ordinal: ordinal) }
         guard previousDocument != replacement else { return }
@@ -288,7 +177,8 @@ final class MacChatTranscriptSearchController {
     /// transcript pages to it and scrolls there. False when it is not here.
     @discardableResult
     func reveal(messageID: String) -> Bool {
-        guard let document = documents.first(where: { $0.messageID == messageID }) else { return false }
+        guard let ordinal = sourceMessages.firstIndex(where: { $0.id == messageID }),
+              let document = MacChatTranscriptSearch.document(from: sourceMessages[ordinal], ordinal: ordinal) else { return false }
         setQuery("")
         results = [MacChatTranscriptSearchResult(messageID: messageID, ordinal: document.ordinal)]
         totalMatchCount = 1
@@ -300,6 +190,11 @@ final class MacChatTranscriptSearchController {
 
     func reset(for sessionID: String) {
         searchTask?.cancel()
+        sourceTask?.cancel()
+        sourceTask = nil
+        sourceGeneration &+= 1
+        structureVersion = nil
+        sourceMessages = []
         searchTask = nil
         searchGeneration &+= 1
         sourceRevision &+= 1

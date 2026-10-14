@@ -1,3 +1,25 @@
+import Agents
+import ApprovalInbox
+import MacIntegration
+import Transcripts
+import DeviceSync
+import MemoryV2
+import ProviderRouting
+import MacControl
+import TriggerScheduler
+import Privacy
+import SchedulerExecution
+import Foundation
+import AttentionRouting
+import ChromeControl
+import Cognition
+import CognitiveSubstrate
+import Context
+import ContextFlow
+import Desk
+import TrustCenter
+import ApprovalTransactions
+import ActivityWatch
 import AppToolRuntime
 import SwiftUI
 import UserNotifications
@@ -8,70 +30,33 @@ import NativeAgentShared
 // through AppDelegate.nativeAgentRuntime and fail closed when a Swift
 // implementation is not wired.
 import NativeAgentCore
-import ProviderRouting
 import StandingBots
 import WorkshopExecution
 import SelfImprovement
 import ChatOrchestration
 import MCPDispatcher
-import MacControl
 import BackgroundLoops
 import BackgroundWork
-import MemoryV2
 import KnowledgeGraph
 import DreamREMCycle
 import PersistenceCore
 import PersonaEngine
 import TrustPersistence
 import OSLog
-import os
+@_exported import EngineRuntime
+import Connectors
+import DoctorChecks
+import GitHubConnector
+import TelegramBot
 #if canImport(BackgroundTasks)
 import BackgroundTasks
-import DeviceSync
 #endif
-
-final class WakeResetThrottle: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lastFire: Date = .distantPast
-
-    func shouldFire(now: Date = Date(), minimumInterval: TimeInterval = 30) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        // Wall-clock corrections can move backwards. Treat that as a new
-        // epoch instead of permanently throttling sleep recovery until the
-        // clock catches up with a timestamp that no longer exists.
-        if now < lastFire {
-            lastFire = now
-            return true
-        }
-        guard now.timeIntervalSince(lastFire) >= minimumInterval else { return false }
-        lastFire = now
-        return true
-    }
-
-    @discardableResult
-    func handleWake(
-        resetEffect: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void = { completion in
-            URLSession.shared.reset(completionHandler: completion)
-        },
-        resetCompleted: @escaping @Sendable () -> Void = {
-            nativeLog("[wake] URLSession.shared reset after sleep")
-        }
-    ) -> Bool {
-        guard shouldFire() else {
-            nativeLog("[wake] throttled — last fire was <30s ago, skipping URLSession reset")
-            return false
-        }
-        resetEffect(resetCompleted)
-        return true
-    }
-}
 
 @MainActor
 private final class NativeAgentHotkeyBootstrap {
     static let shared = NativeAgentHotkeyBootstrap()
 
-    private let voice = VoiceInputController()
+    private let voice = VoiceInputCapture.forChat()
     private var voiceTurn: GlobalHotkeyVoiceTurn?
     private var wakeObserverToken: NSObjectProtocol?
 
@@ -163,106 +148,112 @@ private final class NativeAgentHotkeyBootstrap {
 enum NativeAgentAppMain {
     @MainActor
     static func main() {
-        // A GUI app starts with a soft limit of 256 open files. Launch opens
-        // stores, transcripts and watchers all at once; when the count touched
-        // 256 as RenderBox opened its Metal library, SwiftUI aborted the launch
-        // (RB::load_library precondition, 2026-10-01). Lift the soft limit first.
-        var files = rlimit()
-        if getrlimit(RLIMIT_NOFILE, &files) == 0, files.rlim_cur < 10_240 {
-            files.rlim_cur = min(files.rlim_max, 10_240)
-            _ = setrlimit(RLIMIT_NOFILE, &files)
-        }
+        NativeAgentEngine.prepareProcessFileLimit()
         guard !NativeAgentLaunchPreflight.shouldSuppressGUIStart() else {
             NativeAgentLaunchPreflight.writeSuppressedLaunchReceipt()
             return
         }
 
-        // Public first-run quarantine must finish before SwiftUI constructs
-        // NativeAgentApp. App.init creates AppModel, which can initialize the
-        // process-wide MemoryV2 SQLite owner. Moving the data root afterward
-        // leaves that actor attached to the backup inode while later lazy
-        // projections open the new root, splitting one memory commit across
-        // two databases. Claim the process first so a second launch can never
-        // move storage beneath an already-running app, then prepare the root
-        // before any state owner exists.
+        NativeAgentEnginePorts.installAppPorts(NativeAgentEnginePorts.mounted)
+
+        // Mark public first launch in place before state owners initialize.
         InlineInteractionResolver.platform = AppInlineInteractionPlatformPort()
         _ = NSApplication.shared
         guard AppDelegate.claimSingleAppInstance() else { return }
-        if case .failed(let error) = NativeAgentPaths.preparePublicReleaseDataRootIfNeeded() {
-            AppDelegate.presentPublicReleaseDataRootError(error)
-            return
-        }
-        do {
-            _ = try TrustBackupPersistence.resumeStagedBackupRestoreAtLaunch(
-                dataRoot: NativeAgentPaths.dataRoot, host: .app
-            )
-        } catch {
-            AppDelegate.presentBackupRestoreError(error.localizedDescription)
-            return
-        }
-        // Before any owner opens or creates state under a root that is not
-        // there. A public first run is blank by design.
-        if !NativeAgentPaths.isPublicReleaseBundle {
-            let missing = PersistenceCore.missingLaunchRoots(dataRoot: NativeAgentPaths.dataRoot)
-            if !missing.isEmpty, !AppDelegate.confirmLaunchWithMissingRoots(missing) {
-                return
-            }
-        }
-        // Recover the entire Mac action store once, before SwiftUI constructs
-        // any owner that can accept in-process actions. Bridge rebinds recover
-        // only bridge_exec so they cannot interrupt live in-process operations.
-        let dataRoot = NativeAgentPaths.dataRoot
-        // Last-gasp diagnostics only: unwinding a damaged process is best effort.
-        // Open once at startup; the handler never opens files or calls Swift.
-        let crashLog = BodyReport.crashBreadcrumbs(dataRoot)
-        do {
-            try FileManager.default.createDirectory(at: crashLog.deletingLastPathComponent(),
-                                                    withIntermediateDirectories: true)
-            CrashBreadcrumbs.install(path: crashLog.path)
-        } catch {
-            nativeLog("[crash-breadcrumbs] unavailable: %@", error.localizedDescription)
-        }
-        let recoveryFinished = DispatchSemaphore(value: 0)
-        let recoveryError = OSAllocatedUnfairLock<String?>(initialState: nil)
-        Task.detached(priority: .userInitiated) {
-            defer { recoveryFinished.signal() }
-            do {
-                let recovered = try await MacControlOperationStore(dataRoot: dataRoot)
-                    .recoverInterruptedOperations()
-                nativeLog("[mac-control] startup recovered interrupted operations: %d", recovered)
-            } catch {
-                recoveryError.withLock { $0 = error.localizedDescription }
-            }
-        }
-        recoveryFinished.wait()
-        if let detail = recoveryError.withLock({ $0 }) {
-            nativeLog("[mac-control] refusing startup after operation recovery failure: %@", detail)
-            NSApp.setActivationPolicy(.regular)
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = "NativeAgent could not recover interrupted Mac actions."
-            alert.informativeText = "NativeAgent stopped before accepting actions. The details are in the log."
-            alert.addButton(withTitle: "Quit")
-            alert.runModal()
-            return
-        }
-        // Before any organ can beat: its pulse lands in the loop-state file.
-        BackgroundLoops.BackgroundLoopsManager.shared.receiveOrganPulses()
-        // memory.sqlite has one owner: the graph reaches its kg_* tables
-        // through MemoryStorage's pool. Installed before any view or loop can
-        // read the graph.
-        KnowledgeGraphPoolCache.installOwner(SwiftNativeMemoryV2.knowledgeGraphPool(at:))
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        NativeAgentEngine.installRuntimeObservationsAtLaunch(dataRoot: dataRoot)
         NativeAgentApp.main()
+    }
+}
+
+private enum NativeAgentLaunchPreflight {
+    static func shouldSuppressGUIStart(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        executablePath: String = CommandLine.arguments.first ?? ""
+    ) -> Bool {
+        guard environment["CODEX_SHELL"] == "1" else { return false }
+        return NSString(string: executablePath).standardizingPath
+            .hasSuffix("/dist/NativeAgent.app/Contents/MacOS/NativeAgentApp")
+    }
+
+    static func writeSuppressedLaunchReceipt() {
+        let message = "NativeAgent: refusing to launch the dist GUI bundle from a Codex shell; use script/install_app.sh and probe the installed app through the authenticated bridge.\n"
+        FileHandle.standardError.write(Data(message.utf8))
+    }
+}
+
+struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
+    var attention: AttentionRouter { .shared }
+    var backupHost: TrustBackupHost { .app }
+    var approvals: ApprovalTransactionCoordinator { .app() }
+    func postMacNotification(title: String, body: String, userInfo: [String: String], soundName: String?) async -> NativeAgentNotificationPostResult {
+        await NativeAgentNotifications.postAndReport(
+            title: title, body: body, userInfo: userInfo, soundName: soundName)
+    }
+
+    func notifyIfAttentionWorthy(dataRoot: URL, itemId: String, title: String, summary: String, source: String, severity: String) async {
+        await AttentionRouter.shared.notifyIfAttentionWorthy(
+            dataRoot: dataRoot, itemId: itemId, title: title, summary: summary,
+            source: source, severity: severity)
+    }
+
+    func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult] {
+        try await AppDoctorPort(dataRoot: dataRoot).runtime.runDoctor(
+            repair: true, repairScope: .automatic, checks: checks).checks
+    }
+
+    func wakeDoctorForPendingTransitions(dataRoot: URL) async {
+        _ = await AppDoctorPort(dataRoot: dataRoot).runtime.wakeDoctorForPendingTransitions()
+    }
+
+    func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue], externalSendIdempotencyKey: String) async throws -> (id: String, status: String) {
+        let receipt = try await ConnectorActions(
+            platform: AppConnectorActionPlatform(dataRoot: PersistenceCore.defaultDataRoot())
+        ).runConnectorAction(id: id, dryRun: dryRun, input: input,
+            externalSendIdempotencyKey: externalSendIdempotencyKey)
+        return (receipt.id, receipt.status)
+    }
+
+    func makeCompletionSender(dataRoot: URL, silentTelegram: Bool, requestedResultDeliveryID: String?, authorizeTelegramReply: @escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending {
+        EngineAgentBridgeCompletionSender(engine: { .live }, router: { .shared }, dataRoot: dataRoot, silentTelegram: silentTelegram,
+            requestedResultDeliveryID: requestedResultDeliveryID, authorizeTelegramReply: authorizeTelegramReply)
+    }
+
+    var speechPermission: SpeechPermissionSnapshot {
+        let status = SystemPermissionPreflight.status(.speechRecognition)
+        return SpeechPermissionSnapshot(rawValue: status.rawValue, isGranted: status == .granted,
+            warningSummary: SystemPermissionPreflight.warningSummary(for:
+                SystemPermissionSnapshot(capability: .speechRecognition, status: status)),
+            settingsLink: SystemPermissionPreflight.settingsURL(for: .speechRecognition)?.absoluteString)
+    }
+
+    var voiceName: String { AgentVoice.live.name }
+    var agentSubject: String { AgentVoice.live.subject }
+
+    func githubRuntime(dataRoot: URL, shared: Bool) -> GitHubCommandRuntime {
+        shared ? .shared : .live(dataRoot: dataRoot)
+    }
+
+    func evaluateGitHubApprovals(dataRoot: URL) async {
+        await GitHubApprovalEdgeNotifier.shared.evaluateSnapshot(dataRoot: dataRoot)
+    }
+
+    var triggerNotifier: TriggerNotifier {
+        { @Sendable note in
+            await TriggerNotificationDelivery.notify(note, delivery: NativeAgentEngine.liveDeviceSync, router: { .shared })
+        }
+    }
+
+    func mirrorTriggerFire(_ result: TriggerFireResult) async -> Bool {
+        await TriggerNotificationInbox.mirrorNonNotifiedFire(result, dataRoot: PersistenceCore.defaultDataRoot(), delivery: NativeAgentEngine.liveDeviceSync)
     }
 }
 
 struct NativeAgentApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var appModel: AppModel
+    @State private var coordinator = NativeAgentAppCoordinator.shared
     // RELEASE-2026-05-06: Sparkle updater controller (Task 4.3)
     @State private var updateController = UpdateController.shared
-    // PATCH-2026-05-06: wkwebview-browser Start IPC server at app launch
-    @State private var browserController = BrowserWindowController.shared
     @AppStorage("nativeagent.darkMode") private var preferDarkAppearance = true
     @State private var appearance = AppearanceController.shared
     /// Her haze colour is the app's tint, so every native control wears it.
@@ -278,46 +269,38 @@ struct NativeAgentApp: App {
         if !UserDefaults.standard.bool(forKey: "CGFontRenderingFontSmoothingDisabled") {
             UserDefaults.standard.set(true, forKey: "CGFontRenderingFontSmoothingDisabled")
         }
-        // Writing to a dead subprocess's stdin pipe (MCP children, builder
-        // tools, invoke_claude) delivers SIGPIPE, which kills the entire
-        // app by default. With SIG_IGN the write fails with EPIPE instead
-        // and surfaces as a normal error. App.init runs before any delegate
-        // callback or subprocess spawn, so this is the earliest hook.
-        signal(SIGPIPE, SIG_IGN)
-        AgentACPProcess.installHost(MacAgentACPProcess())
-        SensesAssembly.install(dataRoot: NativeAgentPaths.dataRoot)
+        NativeAgentEngine.validateProvidersAtLaunch()
+    }
 
-        // User, 2026-09-13: "if you've missed anything, it needs to be up there
-        // on Providers." The three Providers groups and the routed surface list
-        // must cover each other exactly, or some lane resolves a model nobody
-        // can see or change. Say so at launch rather than discovering it as a
-        // lane that quietly follows Chat.
-        // A bot runs on the tuple it was made with, and the check that its route
-        // is connected and still offers that model lives where the catalogs are.
-        // StandingBots owns scheduling, not provider catalogs, so the app hands
-        // it the live check here (2026-09-13 review).
-        // Early for bot_ask from chat; launch installs it again right before
-        // the loops start so a due bot is never skipped on a lost race.
-        Task { await installBotProviderCheck() }
-
-        if let mismatch = ProviderSurfaceGroups.membershipMismatch() {
-            FileHandle.standardError.write(Data(
-                "[providers] surface groups and MODEL_SURFACES disagree — \(mismatch)\n".utf8
-            ))
-            assertionFailure("Providers group membership: \(mismatch)")
-        }
-
+    @MainActor
+    static func prepare() async -> Bool {
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        guard await NativeAgentEngine.prepareStateAtLaunch(
+            dataRoot: dataRoot,
+            currentVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+            resources: Bundle.main.resourceURL, backupHost: .app,
+            publicReleaseUnavailable: AppDelegate.presentPublicReleaseDataRootError,
+            backupRestoreUnavailable: AppDelegate.presentBackupRestoreError,
+            confirmMissingRoots: AppDelegate.confirmLaunchWithMissingRoots,
+            macRecoveryUnavailable: {
+                NSApp.setActivationPolicy(.regular)
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "NativeAgent could not recover interrupted Mac actions."
+                alert.informativeText = "NativeAgent stopped before accepting actions. The details are in the log."
+                alert.addButton(withTitle: "Quit")
+                alert.runModal()
+            }
+        ) else { return false }
+        SensesAssembly.install(dataRoot: dataRoot)
+        await NativeAgentEngine.installBotProviderCheck()
         let appModel = AppModel()
-        _appModel = State(initialValue: appModel)
 
         // The quiet self-administration tools read and set the app's own
         // pages, so they need the SAME model the window is bound to — a second
         // AppModel would read state the visible page never sees. Same handoff
         // DetachedChatWindowController gets below, done here because the tools
         // can be called before any detached chat is restored.
-        QuietSelfAdmin.shared.attach(appModel: appModel)
-        // Every surface draws from this host's layout (ui/layout.json under its root).
-        SurfaceLayoutLive.shared.attach(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
 
         // "Take over" from the phone or Telegram reads where User was the same
         // way the Mac chat does.
@@ -334,7 +317,7 @@ struct NativeAgentApp: App {
         // The acceptance is REPORTED, not discarded: a rejected admission has
         // to reach the resolver, or the durable "resumed" claim stands over a
         // turn that never ran and the card is stranded for good.
-        InlineInteractionResolver.startTurn = { prompt, sessionID, hideUserBubble in
+        NativeAgentEngine.configureInlineInteractionsAtLaunch(startTurn: { prompt, sessionID, hideUserBubble in
             let envelope = ChatToolSessionContext.envelope
             var origin = ChatMessageOrigin(surface: envelope?.surface ?? "chat", agent: envelope?.agent)
             origin.peerSources = PeerDataTaint.current?.checkpointSources ?? []
@@ -350,111 +333,7 @@ struct NativeAgentApp: App {
             case .accepted, .queued: return true
             case .rejected: return false
             }
-        }
-
-        // The blocked call, replayed with the arguments the model originally
-        // wrote, through the ORDINARY gate: the same membrane a first call
-        // passes, with no autonomy bypass and no approval inherited from the
-        // card. Resolving "connect GitHub" is not permission to act as GitHub.
-        //
-        // It is the SAME dispatcher and the SAME approval inbox Mac chat uses.
-        // A bare SwiftToolDispatcher cannot reach the app-owned tools at all,
-        // and a nil filer makes every CONFIRM-tier call fail closed with no
-        // request ever landing in front of the person — a card resolved into
-        // silence.
-        InlineInteractionResolver.replayBlockedTool = { toolName, argumentsJSON, sessionID, origin in
-            guard case .object(let input)? = try? JSONValue.parse(Data(argumentsJSON.utf8))
-            else { return .failed("the blocked call's arguments are no longer readable") }
-            let dataRoot = PersistenceCore.defaultDataRoot()
-            // The ORIGIN surface answers for this call, not the Mac.
-            //
-            // The replay used to build the Mac profile and dispatch under
-            // surface "chat" whatever the card came from, so a card raised from
-            // the phone with remote_from_ios_allowed false — or from a Telegram
-            // chat that is not on the allowlist — replayed as a trusted local
-            // call. The envelope the raising turn wrote on the card's own row is
-            // bound here instead, and the profile comes from ITS surface.
-            // Absent (a card older than the envelope) keeps the Mac default,
-            // which is the only honest reading of a local-only transcript.
-            let originSurface = origin?.surface ?? NativeAgentAppChatSurfaceProfile.mac.rawValue
-            let profile = NativeAgentAppChatSurfaceProfile(rawValue: originSurface.lowercased())
-                ?? NativeAgentAppChatSurfaceProfile.mac
-            let approvalFiler = NativeAgentChatApprovalFiler(dataRoot: dataRoot)
-            let gated = makeGatedToolDispatchClient(
-                tools: NativeAgentEngine.live.toolDispatchClient(
-                    denyExternalMcp: profile.deniesExternalMCP,
-                    // The gate below resolves autonomy once, as it does for an
-                    // ordinary Mac turn; the inner dispatcher must not re-run
-                    // that decision from a reconstructed origin.
-                    enforceAppAutonomy: false,
-                    swarmApprovalFiler: approvalFiler
-                ),
-                fileAccess: "auto",
-                approvalFiler: approvalFiler,
-                dataRoot: dataRoot
-            )
-            // Only the replayed tool is rehydrated: a lazy gate must not answer
-            // `not_loaded` for the one call being replayed, and no sibling tool
-            // gets an accidental capability out of it.
-            do {
-                let result = try await LLMCallContext.$turnActiveTools.withValue([toolName]) {
-                    // The whole origin envelope — verified chat/user ids and
-                    // the reply route included — so the gate resolves trust
-                    // from the same identities the first attempt was judged on.
-                    try await ChatToolSessionContext.$envelope.withValue(origin) {
-                    try await ChatToolSessionContext.$verifiedChatId
-                        .withValue(origin?.verifiedChatId) {
-                    try await ChatToolSessionContext.$verifiedUserId
-                        .withValue(origin?.verifiedUserId) {
-                    try await ChatToolSessionContext.$commandSignatureVerified
-                        .withValue(origin?.commandSignatureVerified) {
-                    try await ChatToolSessionContext.$verifiedSessionId.withValue(sessionID) {
-                        try await ChatToolSessionContext.$replyRoute
-                            .withValue(origin?.deliveryRoute) {
-                                try await gated.dispatch(
-                                    tool: toolName, input: input, surface: originSurface
-                                )
-                            }
-                    }
-                    }
-                    }
-                    }
-                    }
-                }
-                return .dispatched(try? result.serialize(pretty: false))
-            } catch {
-                // A throw means the call never completed. Reported as such so
-                // the resolver does not record a replay that did not happen.
-                return .failed("\(error)")
-            }
-        }
-
-        // The pairing half of the card's signature receipt.
-        //
-        // A card raised by a signed iPhone turn has to be able to replay AS a
-        // signed turn, and the persisted envelope must never carry that
-        // verdict itself. So the continuation carries a MAC over its own row
-        // identity, minted here from the live pairing secret and re-checked
-        // here at replay. A rotated or missing secret simply stops verifying,
-        // and the card says "sign in from the phone again" instead of
-        // replaying with authority it can no longer prove.
-        InlineInteractionSignatureWitness.install(
-            mint: { canonical in
-                guard let secret = try? PairingSecretManager.loadOrGenerateSecret()
-                else { return nil }
-                return BridgeMessage.hmacHex(of: Data(canonical.utf8), secret: secret)
-            },
-            verify: { canonical, receipt in
-                guard let secret = try? PairingSecretManager.loadOrGenerateSecret()
-                else { return false }
-                let expected = BridgeMessage.hmacHex(of: Data(canonical.utf8), secret: secret)
-                let a = Array(receipt.utf8), b = Array(expected.utf8)
-                guard a.count == b.count else { return false }
-                var diff: UInt8 = 0
-                for i in 0..<a.count { diff |= a[i] ^ b[i] }
-                return diff == 0
-            }
-        )
+        })
 
         NativeAgentAppCoordinator.shared.configureProcessBootstrap(.init(
             restoreDetachedChats: {
@@ -469,10 +348,13 @@ struct NativeAgentApp: App {
             },
             warmEmbeddings: {
                 Task.detached(priority: .utility) {
-                    await maybeWarmEmbeddingsForFastMode()
+                    await EmbeddingModelDownloadController.shared.start()
+                    await SwiftNativeMemoryV2.shared.warmUpEmbeddingsAtLaunch()
                 }
             }
         ))
+        NativeAgentAppCoordinator.shared.appModel = appModel
+        return true
     }
 
     var body: some Scene {
@@ -484,14 +366,19 @@ struct NativeAgentApp: App {
             // PATCH-2026-05-29: restart-controls — MainWindowContent wraps
             // ContentView to add the ever-present top toolbar (runtime health dot +
             // Restart App).
-            MainWindowContent()
-                .environment(appModel)
+            Group {
+                if let appModel = coordinator.appModel {
+                    MainWindowContent().environment(appModel)
+                } else {
+                    Color.clear
+                }
+            }
                 // 2026-09-15: the window carries the agent's NAME once it has
                 // one. `Window(_:id:)` takes a static key, so the live title is
                 // set here where `agentDisplayName` can be observed — which is
                 // what makes the first conversation's "the name at the top of
                 // this window" true on the very next frame after the rename.
-                .navigationTitle(appModel.agentAddressName)
+                .navigationTitle(coordinator.appModel?.agentAddressName ?? "NativeAgent")
                 // User, 2026-09-02: never a nil scheme. AppearanceController
                 // answers dark or light for both layers; "off" follows the
                 // system live. See AppearanceController.swift.
@@ -524,7 +411,7 @@ struct NativeAgentApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             ChatFocusedCommands()
-            ShellViewCommands(appModel: appModel)
+            if let appModel = coordinator.appModel { ShellViewCommands(appModel: appModel) }
             // RELEASE-2026-05-06: "Check for Updates…" in app menu (Task 4.3)
             // A2.1 (2026-07-24): the item is always enabled and its TITLE carries the
             // truth. A disabled "Check for Updates…" is a dead affordance that explains
@@ -538,8 +425,9 @@ struct NativeAgentApp: App {
             }
             CommandGroup(after: .appInfo) {
                 Button("Refresh status") {
-                    Task { await appModel.refreshAll() }
+                    Task { await coordinator.appModel?.refreshAll() }
                 }
+                .disabled(coordinator.appModel == nil)
                 .keyboardShortcut("r", modifiers: [.command])
             }
             // One Settings page: Command-comma opens the rail's Settings in
@@ -553,6 +441,7 @@ struct NativeAgentApp: App {
                 Button("Browser") {
                     BrowserWindowController.shared.showWindow()
                 }
+                .disabled(coordinator.appModel == nil)
                 .keyboardShortcut("b", modifiers: [.command, .option])
             }
             CommandMenu("Navigate") {
@@ -588,33 +477,44 @@ struct NativeAgentApp: App {
             // the main window to front (or open it if all instances closed).
             MenuBarOpenButton()
             Button("Refresh status", systemImage: "arrow.clockwise") {
-                Task { await appModel.refreshAll() }
+                Task { await coordinator.appModel?.refreshAll() }
             }
+            .disabled(coordinator.appModel == nil)
             Divider()
             Button("Run health checks", systemImage: "stethoscope") {
                 Task {
+                    guard let appModel = coordinator.appModel else { return }
                     await appModel.runDoctor(repair: false)
                     NativeAgentNotifications.post(title: "NativeAgent health checks", body: appModel.statusText)
                 }
             }
+            .disabled(coordinator.appModel == nil)
             Button("Show browser window", systemImage: "safari") {
                 BrowserWindowController.shared.showWindow()
             }
+            .disabled(coordinator.appModel == nil)
             Divider()
             // PATCH-2026-05-29: restart-controls — mirror the toolbar restart
             // controls in the menu bar so they're reachable when the main window
             // isn't focused (or is closed). Restart App relaunches directly here;
             // the in-window button keeps the confirmation alert.
             Button("Restart app", systemImage: "arrow.triangle.2.circlepath") {
-                AppRelauncher.relaunchApp()
+                AppRestartCoordinator.relaunchApp(
+                    terminate: {
+                        RunLoop.main.perform(inModes: [.common]) {
+                            MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
+                        }
+                    },
+                    onSpawnFailure: {
+                        ModuleLog.app("[relaunch] failed to spawn relaunch helper for %@: %@", Bundle.main.bundlePath, "\($0)")
+                    })
             }
             Divider()
             // D7: ONE truth line — see MenuBarStatusPresentation. The stacked
             // pair could contradict itself ("Ready" over "unavailable").
-            Text(MenuBarStatusPresentation.line(
-                statusText: appModel.statusText,
-                health: appModel.engine.doctor.health
-            ))
+            if let appModel = coordinator.appModel {
+                Text(MenuBarStatusPresentation.line(statusText: appModel.statusText, health: appModel.engine.doctor.health))
+            }
         }
 
         // W8 (2026-08-14) — THE LIVE CAPTURE INDICATOR.
@@ -647,7 +547,7 @@ struct NativeAgentApp: App {
     /// which is precisely the failure this control exists to prevent.
     private var activityCaptureIndicatorBinding: Binding<Bool> {
         Binding(
-            get: { ActivityWatchController.shared.isCapturing },
+            get: { coordinator.appModel != nil && ActivityWatchController.shared.isCapturing },
             set: { _ in }
         )
     }
@@ -665,7 +565,7 @@ private struct ActivityCaptureMenuBarContent: View {
                 ? ", plus window titles." : ", no window titles."))
         Divider()
         Button("Stop recording", systemImage: "stop.circle") {
-            controller.setCaptureEnabled(false)
+            Task { await controller.setCaptureEnabled(false) }
         }
         Button("Activity settings…", systemImage: "gear") {
             NSApp.activate(ignoringOtherApps: true)
@@ -698,6 +598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         didReceive response: UNNotificationResponse
     ) async {
         let action = NativeAgentNotificationActions.Response(response)
+        do { try await NativeAgentAppCoordinator.shared.prepare() } catch { return }
         await NativeAgentNotificationActions.handle(action)
     }
 
@@ -708,13 +609,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     )
 }
 
-/// The bot provider check (see App.init). Idempotent.
-func installBotProviderCheck() async {
-    await BotRunGate.installLiveCheck { bot, dataRoot in
-        await SwiftNativeProviderRouting(dataRoot: dataRoot).botChoiceRejection(
-            provider: bot.provider,
-            model: bot.model,
-            reasoningEffort: bot.reasoningEffort
+// Preserve the app transcript type when ChatOrchestration is also imported.
+typealias ChatMessage = EngineRuntime.ChatMessage
+// NativeAgentShared and Core both ship a `MemoryRecord` (MemoryV2), a
+// `MultimodalAttachment` and a `ChatSession` (ChatOrchestration's wire
+// mirrors); the app's UI and decoding use the NativeAgentShared ones.
+typealias MemoryRecord = NativeAgentShared.MemoryRecord
+typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
+typealias ChatSession = NativeAgentShared.ChatSession
+
+extension NativeAgentEnginePorts {
+    static func mounted(dataRoot: URL) -> Self {
+        Task {
+            await AgentContactHealth.shared.installGrokVerifier(dataRoot: dataRoot) { peer in
+                do { try await NativeAgentEngine.live.agents.desktop.importGrokRoutine(peer: peer, dataRoot: dataRoot, waitForCreation: false) }
+                catch let blocker as GrokRoutineAccessibility.Blocker { throw ToolFailureError(blocker.rawValue, effects: .unknown) }
+            }
+        }
+        return Self(
+            backgroundWork: AppBackgroundWorkHost(),
+            connectorStatus: AppConnectorStatusPlatform(),
+            browserRoutes: .app,
+            cognitionHost: EngineCognitionHost(attention: .shared),
+            deviceSyncHost: EngineDeviceSyncHost(engine: { .live }, router: { .shared }, platform: AppDeviceSyncPlatform()),
+            macIntegration: MacIntegrationDeliveryActions(),
+            agentBridge: AppAgentBridgePort(),
+            completionSender: { EngineAgentBridgeCompletionSender(engine: { .live }, router: { .shared }, dataRoot: $0) },
+            standingBotQueue: BotRunQueue(dataRoot: dataRoot),
+            appTools: { AppToolExecutor(securityCenter: $0, enforceAutonomySecurity: $1) },
+            interactions: AppToolInteractionResolver(),
+            chatPlatform: ChatToolPlatformPort(
+                grok: { await GrokBotConnection.perform(plan: $0, dataRoot: $1, inner: $2, surface: $3,
+                                                       port: NativeAgentEngine.live.agents.desktop) },
+                desktopChat: { await DesktopChatRoute.perform(plan: $0, dataRoot: $1) },
+                desktop: { await NativeAgentEngine.live.agents.desktop.run(plan: $0, inner: $1, surface: $2) }
+            ),
+            connectorActionStatuses: { try await ConnectorActionRecord.checkedStatuses(root: dataRoot, platform: AppConnectorStatusPlatform()) }
         )
     }
+}
+
+private struct AppAgentBridgePort: EngineAgentBridgePort {
+    func a2aPushConfiguration(for peer: AgentPeerContact) async -> JSONValue? {
+        await a2aPushConfiguration(for: peer, activePort: ClaudeBridgeRuntime.shared.activePort)
+    }
+}
+
+private struct AppDeviceSyncPlatform: EngineDeviceSyncPlatform {
+    func memoryProposalRows(_ rows: [ProposalRecord]) -> DeviceSyncSnapshotRows { rows.map(MemoryProposalRecord.init) }
+    func restartTelegram() async -> Bool { await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll").didRestart }
+    var connectorStatus: any ConnectorStatusPlatform { AppConnectorStatusPlatform() }
+    func connectorCanToggle(_ row: ConnectorRecord) -> Bool {
+        ConnectorRowActionPolicy.resolve(id: row.id, authState: row.authState,
+                                         healthStatus: row.healthStatus).showsEnabledMutation
+    }
+    @MainActor func settingsHost() throws -> any QuietSettingsHost {
+        guard let appModel = NativeAgentAppCoordinator.shared.appModel else {
+            throw QuietSettingError.unavailable("The Mac's settings are not loaded yet. Try again in a moment.")
+        }
+        return AppQuietSettingsHost(appModel)
+    }
+    @MainActor var oauthPlatform: any NativeOAuthPlatformPort.Type { NativeOAuthPlatform.self }
+    @MainActor func adoptProvider(_ id: String) async { await NativeAgentAppCoordinator.shared.appModel?.adoptProviderForBlankSurfaces(id) }
+    @MainActor func pinnedChatSessionIDs() -> [String] { ChatSessionRetention.load() }
+    @MainActor func savePinnedChatSessionIDs(_ ids: [String]) throws { try ChatSessionRetention.save(ids) }
+    func submitDeskTask(title: String, objective: String) async throws -> WorkshopDirectedTaskResult {
+        try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
+    }
+    func resolveWorkshopStep(executionId: String, stepId: String, decision: String,
+                             provenance: ApprovalResolutionProvenance) async throws -> WorkshopExecution.WorkshopExecutionRecord {
+        try await ApprovalTransactionCoordinator.resolveWorkshopStep(executionId: executionId, stepId: stepId,
+            decision: decision, provenance: provenance)
+    }
+    func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord {
+        try await ApprovalTransactionCoordinator.app().resolveApproval(id: id, decision: decision, provenance: provenance)
+    }
+    func inboxAction(_ id: String, action: String) async throws {
+        try await InboxCardActions.perform(id, action: action,
+            dataRootOverride: nil, effects: AppInboxCardActionEffects())
+    }
+    @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String] {
+        try await InteractionCardDelivery.answer(payload: payload, actionID: actionID, clientID: clientID,
+                                                dataRoot: PersistenceCore.defaultDataRoot())
+    }
+    @MainActor func runMacControl(path: String, bodyData: Data) async throws -> MacControlRunResult {
+        try await TrustCenterMacControlPolicyProvider.run(path: path, bodyData: bodyData,
+            dataRoot: PersistenceCore.defaultDataRoot(), localWorkbench: false)
+    }
+}
+
+extension ClaudeBridgeRuntime {
+    static let shared: ClaudeBridgeRuntime = NativeAgentEngine.makeAgentBridge(engine: { .live },
+        grpcPort: { Agents.NativeAgentA2AGRPCListener.shared.port }, gitHubCommand: { .shared })
+}
+extension Agents.NativeAgentA2AGRPCListener {
+    static let shared: Agents.NativeAgentA2AGRPCListener = NativeAgentEngine.makeA2AListener(engine: { .live }, bridge: { .shared })
+}
+
+extension AttentionRouter {
+    static let shared = AttentionRouter(delivery: .engineDelivery(phone: { title, body, userInfo in
+        try await NativeAgentEngine.liveDeviceSync.engine.sendNotificationToPairedDevices(
+            title: title, body: body, userInfo: userInfo)
+    }))
 }

@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import MacControl
 
 /// Builds the typed "I need something from you" tool envelope that a dispatch
 /// boundary returns INSTEAD of an error string, and reads it back out.
@@ -26,11 +27,13 @@ import PersistenceCore
 ///    crosses this boundary.
 public enum InlineInteractionNeed {
     public static func blocksTurn(_ interaction: InlineInteraction) -> Bool {
-        ![.connector, .permission, .capability].contains(interaction.kind)
+        (interaction.kind == .permission && interaction.allTargets.contains {
+            SystemAppleScriptAdapter.automationTarget($0) != nil
+        }) || ![.connector, .permission, .capability].contains(interaction.kind)
     }
 
-    /// Setup is skipped without blocking unrelated work; questions still
-    /// carry needs_input. Both retain the typed card for durable persistence.
+    /// Automation needs the owner's tap to ask macOS; other setup skips
+    /// without blocking unrelated work. Both retain the typed card.
     public static func envelope(_ interaction: InlineInteraction) -> JSONValue {
         // A skill's step never raises a card: it hands back to her.
         if SkillRunContext.handsBack { return SkillRunContext.handBack(interaction.title) }
@@ -44,7 +47,10 @@ public enum InlineInteractionNeed {
         // A one-line reason so a surface that knows nothing about cards (a
         // log, a bot transport) still says something true.
         let unavailable = interaction.kind == .connector ? "connected" : "allowed"
-        object["detail"] = .string(blocksTurn(interaction) ? interaction.why
+        object["detail"] = .string(blocksTurn(interaction)
+            ? interaction.kind == .permission
+                ? "Waiting for the owner's Automation consent; allow the permission card to ask macOS."
+                : interaction.why
             : "skipped: \(interaction.target) isn't \(unavailable) — card filed")
         if let encoded = encode(interaction) {
             object[InlineInteractionWire.needsKey] = encoded

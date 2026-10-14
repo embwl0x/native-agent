@@ -1,7 +1,11 @@
+import EngineRuntime
+import PersistenceCore
+import BackgroundWork
 // Self-Improvement tab — the home for the weekly WeeklySelfImprovementLoop.
 // A simple on/off switch + the latest digest + a manual run. The one-tap
 // "apply" proposals surface in Approvals (Today ▸ Approvals and past
 // decisions).
+import AttentionRouting
 import SwiftUI
 import Foundation
 import BackgroundLoops
@@ -130,25 +134,15 @@ struct SelfImprovementView: View {
     /// Nil outcome: the run never started.
     @MainActor
     static func runManually(appModel: AppModel) async -> (outcome: LoopTickOutcome?, note: String) {
-        // Manual run bypasses the weekly idempotency marker so it actually runs.
-        let dataRoot = NativeAgentPaths.dataRoot
-        let requestToken: String
-        do {
-            requestToken = try await WeeklySelfImprovementLoop.requestManualRun(dataRoot: dataRoot)
-        } catch {
+        let result = await WeeklySelfImprovementLoop.runManually(dataRoot: PersistenceCore.defaultDataRoot()) {
+            await NativeAgentEngine.runBackgroundLoopOnce(loopId: "self_improvement_sweep")
+        }
+        guard let outcome = result.outcome else {
             return (nil, "Could not start — the weekly run request is unavailable.")
         }
-        let outcome = await BackgroundLoopsManager.shared.runTickOnce(
-            loopId: "self_improvement_sweep"
-        )
         var note = manualRunNote(for: outcome)
-        do {
-            try await WeeklySelfImprovementLoop.clearManualRunRequest(
-                dataRoot: dataRoot,
-                token: requestToken
-            )
-        } catch {
-            note += " Request cleanup could not be verified: \(AppDoctorPort.safeDetail(error.localizedDescription))."
+        if let error = result.cleanupError {
+            note += " Request cleanup could not be verified: \(EngineDoctorRuntime<AppDoctorPort>.safeDetail(error))."
         }
         // The pass may have staged new candidates; re-read the queues.
         _ = await appModel.refreshForSidebarItem(.activity)
@@ -163,48 +157,14 @@ struct SelfImprovementView: View {
             if outcome.isCoalescedSkip {
                 return "Already running — joined the active pass."
             }
-            return "Not run — \(AppDoctorPort.safeDetail(reason))."
+            return "Not run — \(EngineDoctorRuntime<AppDoctorPort>.safeDetail(reason))."
         case .failed(let error):
-            return "Failed — \(AppDoctorPort.safeDetail(error))."
+            return "Failed — \(EngineDoctorRuntime<AppDoctorPort>.safeDetail(error))."
         }
     }
 
-    /// Newest-wins selection over already-stat'ed candidates. Extracted from
-    /// `loadDigest` so the ordering rule is testable without a filesystem, and
-    /// so each file is stat'ed once instead of twice per `max(by:)` comparison.
-    /// Semantics are unchanged: latest modification date wins; ties keep the
-    /// earlier element in enumeration order (`max(by:)` only replaces on a
-    /// strict increase); an unreadable date is `.distantPast` at the call site.
-    nonisolated static func newestDigest(_ dated: [(url: URL, modified: Date)]) -> URL? {
-        dated.max(by: { $0.modified < $1.modified })?.url
-    }
-
-    /// Render-cost audit F4: this used to be a synchronous MainActor method —
-    /// a directory enumeration, O(n log n) stat syscalls, and a full digest
-    /// read, all blocking the main thread on every appear. Same work, same
-    /// result, now on a utility thread. `digest` already starts empty, so the
-    /// pre-load frame is the one that always rendered first anyway.
     private func loadDigest() async {
-        let dir = NativeAgentPaths.dataRoot
-            .appendingPathComponent("self_improvement", isDirectory: true)
-            .appendingPathComponent("digests", isDirectory: true)
-        let loaded = await Task.detached(priority: .utility) { () -> (text: String, date: String)? in
-            let fm = FileManager.default
-            guard let files = try? fm.contentsOfDirectory(
-                    at: dir, includingPropertiesForKeys: [.contentModificationDateKey])
-            else { return nil }
-            let dated = files
-                .filter { $0.pathExtension == "md" }
-                .map { url -> (url: URL, modified: Date) in
-                    let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
-                        .contentModificationDate ?? .distantPast
-                    return (url, modified)
-                }
-            guard let latest = SelfImprovementView.newestDigest(dated),
-                  let text = try? String(contentsOf: latest, encoding: .utf8)
-            else { return nil }
-            return (text, latest.deletingPathExtension().lastPathComponent)
-        }.value
+        let loaded = await WeeklySelfImprovementLoop.latestDigest(dataRoot: PersistenceCore.defaultDataRoot())
         digest = loaded?.text ?? ""
         digestDate = loaded?.date ?? ""
     }

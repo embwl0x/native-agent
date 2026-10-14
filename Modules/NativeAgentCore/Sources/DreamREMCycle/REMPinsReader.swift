@@ -40,24 +40,6 @@ public enum REMPinsReader {
         let all = index.keys.sorted().flatMap { index[$0] ?? [] }
         return Array(all.sorted { $0.createdAt > $1.createdAt }.prefix(latestN))
     }
-
-    struct CacheStats: Sendable, Equatable {
-        let decodeAttempts: Int
-        let hits: Int
-    }
-
-    /// Deterministic operation-count seam for the turn-speed regression.
-    static func _testCacheStats(dataRoot: URL) -> CacheStats {
-        REMPinsDecodedCache.shared.stats(
-            url: dataRoot.appendingPathComponent("rem_pins.json")
-        )
-    }
-
-    static func _resetCacheForTesting(dataRoot: URL) {
-        REMPinsDecodedCache.shared.reset(
-            url: dataRoot.appendingPathComponent("rem_pins.json")
-        )
-    }
 }
 
 /// Process-local decoded cache keyed by canonical path and file mtime.
@@ -76,8 +58,6 @@ private final class REMPinsDecodedCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var entries: [String: Entry] = [:]
-    private var decodeAttempts: [String: Int] = [:]
-    private var hits: [String: Int] = [:]
     private var loggedReadFailures: Set<String> = []
 
     func read(url: URL) -> [String: [REMPin]] {
@@ -90,12 +70,10 @@ private final class REMPinsDecodedCache: @unchecked Sendable {
             for _ in 0..<2 {
                 let modifiedAt = try modificationDate(url)
                 if let entry = entries[key], entry.modifiedAt == modifiedAt {
-                    hits[key, default: 0] += 1
                     loggedReadFailures.remove(key)
                     return entry.index
                 }
 
-                decodeAttempts[key, default: 0] += 1
                 let data = try Data(contentsOf: url)
                 let decoded = (try? JSONDecoder().decode([String: [REMPin]].self, from: data)) ?? [:]
                 guard try modificationDate(url) == modifiedAt else { continue }
@@ -121,27 +99,6 @@ private final class REMPinsDecodedCache: @unchecked Sendable {
             }
             return entries[key]?.index ?? [:]
         }
-    }
-
-    func stats(url: URL) -> REMPinsReader.CacheStats {
-        let key = url.standardizedFileURL.path
-        lock.lock()
-        let value = REMPinsReader.CacheStats(
-            decodeAttempts: decodeAttempts[key, default: 0],
-            hits: hits[key, default: 0]
-        )
-        lock.unlock()
-        return value
-    }
-
-    func reset(url: URL) {
-        let key = url.standardizedFileURL.path
-        lock.lock()
-        entries.removeValue(forKey: key)
-        decodeAttempts.removeValue(forKey: key)
-        hits.removeValue(forKey: key)
-        loggedReadFailures.remove(key)
-        lock.unlock()
     }
 
     private func modificationDate(_ url: URL) throws -> Date {

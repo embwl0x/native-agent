@@ -143,7 +143,7 @@ struct MemoryUpkeepPanel: View {
     @MainActor
     private func refreshNativeStack() async {
         nativeStack = await MemoryV2NativeStackSnapshot.load(
-            dataRoot: appModel.dataRootOverride ?? NativeAgentPaths.dataRoot
+            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -156,7 +156,7 @@ struct MemoryUpkeepPanel: View {
         defer { isRefreshing = false }
         let refreshed = await MemoryToolbarRefreshOperation.run(
             appModel: appModel,
-            dataRoot: appModel.dataRootOverride ?? NativeAgentPaths.dataRoot
+            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
         nativeStack = refreshed.nativeStack
         await refreshCloudKitStatus()
@@ -167,7 +167,7 @@ struct MemoryUpkeepPanel: View {
     private func reindexSpotlight() async {
         isReindexing = true
         defer { isReindexing = false }
-        let dataRoot = appModel.dataRootOverride ?? NativeAgentPaths.dataRoot
+        let dataRoot = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let outcome = await MemorySpotlightReindexOperation.run(dataRoot: dataRoot)
         spotlightStatus = outcome.userMessage
         // The status line and count must be read after the durable result, not
@@ -177,22 +177,7 @@ struct MemoryUpkeepPanel: View {
 
     @MainActor
     private func refreshCloudKitStatus() async {
-        // CloudKit memory sync is not part of the active launch runtime. Even
-        // the account probe is opt-in because CKContainer init can trap when
-        // the installed profile lacks the CloudKit service grant.
-        if !nativeAgentCloudKitAccountProbeEnabled() {
-            cloudKitStatus = nativeAgentCloudKitDisabledStatus
-            return
-        }
-        #if canImport(CloudKit)
-        let statusText = await withCKTimeout("MemoryUpkeepPanel.refreshCloudKitStatus") {
-            let status = try await CKContainer.default().accountStatus()
-            return UserFacingError.iCloudAccount(status)
-        }
-        cloudKitStatus = statusText ?? UserFacingError.iCloudNoAnswer
-        #else
-        cloudKitStatus = "iCloud isn't available"
-        #endif
+        cloudKitStatus = await nativeAgentCloudKitAccountStatus(label: "MemoryUpkeepPanel.refreshCloudKitStatus")
     }
 
     static func localTimestamp(_ iso: String) -> String {
@@ -327,334 +312,47 @@ enum MemoryAdvancedDiagnosticsIdentifiers: Equatable {
     }
 }
 
-/// Durable owner for the mounted "Reindex Spotlight" control. Its marker is
-/// proof for one exact MemoryV2 projection generation, not a sticky claim that
-/// an index rebuild happened at some unknown point in the past.
+extension SwiftNativeMemoryIndexer.ReindexOutcome {
+    var userMessage: String {
+        switch self {
+        case .indexed(let count):
+            return "Spotlight reindexed \(count) memories"
+        case .changedDuringReindex:
+            return "Memories changed while indexing. Reindex again from the latest saved state."
+        case .failed(let message, _):
+            return "Spotlight reindex failed: \(message)"
+        }
+    }
+
+    /// What the agent's tool result says: the same line plus the raw cause.
+    var agentMessage: String {
+        if case .failed(_, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
+        return userMessage
+    }
+}
+
 struct MemorySpotlightReindexOperation {
-    enum Outcome: Equatable, Sendable {
-        case indexed(count: Int)
-        case changedDuringReindex
-        case failed(message: String, cause: String? = nil)
-
-        var userMessage: String {
-            switch self {
-            case .indexed(let count):
-                return "Spotlight reindexed \(count) memories"
-            case .changedDuringReindex:
-                return "Memories changed while indexing. Reindex again from the latest saved state."
-            case .failed(let message, _):
-                return "Spotlight reindex failed: \(message)"
-            }
-        }
-
-        /// What the agent's tool result says: the same line plus the raw cause.
-        var agentMessage: String {
-            if case .failed(_, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
-            return userMessage
-        }
-    }
-
-    static func run(dataRoot: URL) async -> Outcome {
-        await run(dataRoot: dataRoot, client: liveClient(dataRoot: dataRoot))
-    }
-
-    static func run(
-        dataRoot: URL,
-        client: any SpotlightIndexClient
-    ) async -> Outcome {
-        let marker = markerURL(dataRoot: dataRoot)
+    static func run(dataRoot: URL) async -> SwiftNativeMemoryIndexer.ReindexOutcome {
         do {
-            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            let generation = try await storage.projectionGenerationFingerprint()
-            let memories = try await storage.listMemories(
-                persona: nil,
-                status: "active",
-                limit: nil
+            return try await SwiftNativeMemoryIndexer.reindex(
+                dataRoot: dataRoot, client: SwiftNativeMemoryIndexer.liveClient(dataRoot: dataRoot)
             )
-            let batch = memories.map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
-
-            // Delete the old proof BEFORE clearing the derived index. A crash
-            // or failure after `removeAll()` must read as unconfirmed rather
-            // than reporting the old SQLite count over an empty Spotlight
-            // domain.
-            try clearMarker(at: marker)
-
-            let indexer = SwiftNativeMemoryIndexer(client: client)
-            try await indexer.removeAll()
-            try await indexer.indexBatch(batch)
-
-            let completedGeneration = try await storage.projectionGenerationFingerprint()
-            guard completedGeneration == generation else {
-                // A concurrent canonical write makes this batch stale. There
-                // is intentionally no marker: the next reindex must start
-                // from the new source generation.
-                return .changedDuringReindex
-            }
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                Data((generation + "\n").utf8),
-                to: marker
-            )
-            return .indexed(count: batch.count)
         } catch {
             return .failed(message: UserFacingError.cause(error, action: "reindex Spotlight"), cause: error.localizedDescription)
         }
     }
-
-    static func markerURL(dataRoot: URL) -> URL {
-        dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent(".spotlight_reindexed", isDirectory: false)
-    }
-
-    private static func clearMarker(at marker: URL) throws {
-        guard FileManager.default.fileExists(atPath: marker.path) else { return }
-        try FileManager.default.removeItem(at: marker)
-    }
-
-    private static func liveClient(dataRoot: URL) -> any SpotlightIndexClient {
-        #if canImport(CoreSpotlight) && !os(Linux)
-        if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
-            return SystemSpotlightIndexClient()
-        }
-        #endif
-        // An injected/test root must not replace the user's system Spotlight
-        // domain merely because the UI is hosted in this app process.
-        return MockSpotlightIndexClient()
-    }
 }
 
-// MARK: - MemoryV2 Apple-Native Stack panel
-//
-// Surfaces the four indicators that prove the daemon-era memory backend has
-// been replaced with the Apple-native stack:
-//   * SQLite record count read directly from `<dataRoot>/memory/memory.sqlite`
-//     through MemoryV2's canonical resolved storage owner.
-//   * Core ML MiniLM (Neural Engine) embedder availability — keyed off the
-//     migration marker + the Core ML model URL probe.
-//   * CoreSpotlight indexed count — a current-generation confirmation under
-//     `<dataRoot>/memory/`, never a bare sentinel or inferred SQLite count.
-//   * CloudKit account status when explicitly enabled. CKContainer probes are
-//     skipped by default because this dev profile lacks the CloudKit service
-//     grant and CKContainer can trap synchronously instead of throwing.
-//
-// Designed to be cheap-to-render and safe-when-empty: if any probe fails the
-// row falls back to "unknown" / "0" rather than vanishing — UI presence is the
-// signal the panel is wired even on a fresh install.
-struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
-    var sqliteRecordCount: Int
-    var sqliteProposalCount: Int
-    /// `nil` before the direct store probe, `false` when it could not read.
-    var storageReadable: Bool?
-    var migrated: Bool
-    var coreMLReady: Bool
-    var coreMLModelLabel: String
-    var embedderDimensions: Int
-    // 2026-06-07: runtime truth fields so the UI can distinguish
-    // "file exists" from "actually working." the user asked for a clear
-    // "tell me if it's not working" signal. These come from
-    // SwiftNativeMemoryV2.embeddingRuntimeSnapshot() — the runtime's
-    // own state, not a disk probe.
-    var coreMLLoaded: Bool
-    var coreMLLastLoadError: String?
-    var coreMLLoadCount: Int
-    var embeddingMode: String
-    var requestedEmbeddingBackend: String
-    var effectiveEmbeddingBackend: String
-    var spotlightReindexed: Bool
-    var spotlightIndexedCount: Int
-    var cloudKitAccountStatus: String
-    var dataRootPath: String
-
-    /// Visual + textual status derived from the runtime fields above.
-    /// Distinguishes real-model readiness from disabled or mock search.
-    enum EmbedderHealth {
-        case working(loadCount: Int)   // green
-        case ready                      // orange — resources present, never loaded
-        case broken(reason: String)     // red — lastLoadError set
-        case missing                    // red — bundled resources not reachable
-        case disabled
-        case mock
-
-        var label: String {
-            switch self {
-            case .working(let n): return "working (\(n) load\(n == 1 ? "" : "s"))"
-            case .ready: return "ready, not yet loaded"
-            case .broken(let r): return "BROKEN: \(r)"
-            case .missing: return "MODEL MISSING"
-            case .disabled: return "turned off"
-            case .mock: return "test vectors"
-            }
+extension MemoryV2NativeStackSnapshot.EmbedderHealth {
+    var label: String {
+        switch self {
+        case .working(let n): return "working (\(n) load\(n == 1 ? "" : "s"))"
+        case .ready: return "ready, not yet loaded"
+        case .broken(let r): return "BROKEN: \(r)"
+        case .missing: return "MODEL MISSING"
+        case .disabled: return "turned off"
+        case .mock: return "test vectors"
         }
-        var isHealthy: Bool {
-            if case .working = self { return true }
-            return false
-        }
-        var needsAttention: Bool {
-            switch self {
-            case .broken, .missing: return true
-            default: return false
-            }
-        }
-    }
-
-    /// Derive the at-a-glance health state. Caller decides how to
-    /// render — typical: green for working, orange for ready, red for
-    /// broken/missing.
-    var embedderHealth: EmbedderHealth {
-        if requestedEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
-            return .disabled
-        }
-        if effectiveEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
-            return .mock
-        }
-        if let err = coreMLLastLoadError {
-            return .broken(reason: err)
-        }
-        if coreMLLoaded {
-            return .working(loadCount: coreMLLoadCount)
-        }
-        if coreMLReady {
-            return .ready
-        }
-        return .missing
-    }
-
-    var shouldPollEmbeddingStartup: Bool {
-        embeddingMode == ManagedEmbeddingProvider.performanceMode
-            && effectiveEmbeddingBackend == ManagedEmbeddingProvider.coreMLBackend
-            && coreMLReady
-            && !coreMLLoaded
-            && coreMLLastLoadError == nil
-    }
-
-    static let empty = MemoryV2NativeStackSnapshot(
-        sqliteRecordCount: 0,
-        sqliteProposalCount: 0,
-        storageReadable: nil,
-        migrated: false,
-        coreMLReady: false,
-        coreMLModelLabel: "MiniLM-L6-v2 (pending .mlpackage)",
-        embedderDimensions: 384,
-        coreMLLoaded: false,
-        coreMLLastLoadError: nil,
-        coreMLLoadCount: 0,
-        embeddingMode: "unknown",
-        requestedEmbeddingBackend: "unknown",
-        effectiveEmbeddingBackend: "unknown",
-        spotlightReindexed: false,
-        spotlightIndexedCount: 0,
-        cloudKitAccountStatus: "checking…",
-        dataRootPath: ""
-    )
-
-    static func load(
-        dataRoot: URL = NativeAgentPaths.dataRoot
-    ) async -> MemoryV2NativeStackSnapshot {
-        var snap = MemoryV2NativeStackSnapshot.empty
-        snap.dataRootPath = dataRoot.path
-        var spotlightEligibleCount = 0
-        var storageGeneration: String?
-
-        // SQLite probe — open the same store MemoryV2+Storage.swift uses and
-        // list active rows. A clean empty store is 0; a failed read remains
-        // explicit so the panel cannot present it as an empty memory profile.
-        do {
-            let store = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            let activeMemories = try await store.listMemories(persona: nil, status: "active", limit: nil)
-            snap.storageReadable = true
-            snap.sqliteRecordCount = activeMemories.count
-            spotlightEligibleCount = activeMemories.count
-            storageGeneration = try await store.projectionGenerationFingerprint()
-            if let proposals = try? await store.listProposals(status: "pending") {
-                snap.sqliteProposalCount = proposals.count
-            }
-        } catch {
-            snap.storageReadable = false
-        }
-
-        // Migration marker — written by MemoryV2Migrator on a successful
-        // JSON → SQLite import. Presence proves the new store is the
-        // canonical backend on this data root.
-        let marker = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent(".migrated_to_sqlite_v1", isDirectory: false)
-        snap.migrated = FileManager.default.fileExists(atPath: marker.path)
-
-        // Core ML MiniLM probe. 2026-06-07 task #88: this used to roll its
-        // own `Bundle.main.url(forResource: "MiniLM_L6_v2", ...)` check that
-        // (a) used the wrong filename (the actual SPM resource is
-        // `minilm.mlpackage`) and (b) couldn't traverse into the
-        // NativeAgentCore_MemoryV2.bundle sub-bundle where the runtime
-        // actually looks. Result: page perpetually said "pending .mlpackage"
-        // even with a fully staged model. Now we ask the runtime's own
-        // resolver — single source of truth, both `bundled` and
-        // installedAppFallbackBundle paths covered. An installed model whose
-        // manifest is unusable is NOT ready and never reads as the bundled
-        // MiniLM (S12, 2026-09-26); refreshEmbeddingRuntime() below carries
-        // the reason as the load error.
-        do {
-            if let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
-                snap.coreMLReady = true
-                snap.coreMLModelLabel = installed.modelID + " (installed)"
-                snap.embedderDimensions = installed.dimensions
-            } else if CoreMLEmbeddingProvider.bundledResourcesAvailable() {
-                snap.coreMLReady = true
-                snap.coreMLModelLabel = CoreMLEmbeddingProvider.bundledModelID + " (bundled)"
-            }
-        } catch {
-            snap.coreMLModelLabel = "installed model did not load"
-        }
-
-        // Runtime truth fields — the disk probe above tells us if
-        // resources are reachable, but only the runtime knows whether
-        // the model actually loaded and inference works. Pull
-        // coreMLLoaded / lastLoadError / loadCount from
-        // SwiftNativeMemoryV2's snapshot.
-        await snap.refreshEmbeddingRuntime()
-
-        // Spotlight — the `.spotlight_reindexed` sentinel is written by
-        // MemorySpotlightBootstrap on first launch after the
-        // cutover. Presence alone is not proof: a failed reindex can clear the
-        // domain after a previous marker was written. The marker is valid only
-        // when it names the current canonical projection generation.
-        let spotMarker = MemorySpotlightReindexOperation.markerURL(dataRoot: dataRoot)
-        if let storageGeneration,
-           let markerData = try? Data(contentsOf: spotMarker),
-           String(data: markerData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) == storageGeneration {
-            snap.spotlightReindexed = true
-            snap.spotlightIndexedCount = spotlightEligibleCount
-        }
-
-        // CloudKit memory sync is not an active launch owner. Keep even the
-        // account probe opt-in because CKContainer can trap synchronously when
-        // the installed profile lacks the CloudKit service grant.
-        guard nativeAgentCloudKitAccountProbeEnabled() else {
-            snap.cloudKitAccountStatus = nativeAgentCloudKitDisabledStatus
-            return snap
-        }
-        #if canImport(CloudKit)
-        snap.cloudKitAccountStatus = await withCKTimeout("MemoryV2NativeStackSnapshot.cloudKitAccount") {
-            let status = try await CKContainer.default().accountStatus()
-            return UserFacingError.iCloudAccount(status)
-        } ?? UserFacingError.iCloudNoAnswer
-        #else
-        snap.cloudKitAccountStatus = "iCloud isn't available"
-        #endif
-
-        return snap
-    }
-
-    mutating func refreshEmbeddingRuntime() async {
-        guard let runtime = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot() else {
-            return
-        }
-        embeddingMode = runtime.mode
-        requestedEmbeddingBackend = runtime.requestedBackend
-        effectiveEmbeddingBackend = runtime.effectiveBackend
-        coreMLLoaded = runtime.coreMLLoaded
-        coreMLLastLoadError = runtime.lastLoadError
-        coreMLLoadCount = runtime.loadCount
     }
 }
 

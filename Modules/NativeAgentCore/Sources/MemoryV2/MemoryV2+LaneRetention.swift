@@ -39,25 +39,6 @@ public struct MemoryLaneHandle: Sendable, Equatable {
     }
 }
 
-extension MemoryStorageProtocol {
-    /// Default (fixture) implementation: derive handles from `listMemory`.
-    /// Correct but unbounded — the SQLite bridge overrides it with a real
-    /// query. Kept as a protocol REQUIREMENT (declared in
-    /// `MemoryStorageProtocol`) rather than extension-only for the reason the
-    /// `matchesTombstone` comment already records: through
-    /// `any MemoryStorageProtocol` an extension-only method always dispatches
-    /// to the default and the override goes inert.
-    public func memoryHandles(sourcePrefix: String, limit: Int?) async throws -> [MemoryLaneHandle] {
-        let rows = try await listMemory(kind: nil)
-            .filter { ($0.status ?? "active") == "active" }
-            .filter { ($0.sourceRunId ?? "").hasPrefix(sourcePrefix) }
-            .sorted { $0.createdAt > $1.createdAt }
-        let bounded = limit.map { Array(rows.prefix(max(0, $0))) } ?? rows
-        return bounded.map {
-            MemoryLaneHandle(id: $0.id, createdAt: $0.createdAt, source: $0.sourceRunId)
-        }
-    }
-}
 
 extension SwiftNativeMemoryV2 {
     /// Newest-first identity handles for one lane's rows, ACTIVE only, bounded
@@ -87,7 +68,7 @@ extension MemoryStorage {
     /// (gpt-5.5 review A4). Lifecycle-terminal rows are excluded on the same
     /// grounds `listMemories` excludes them.
     public func laneHandles(sourcePrefix: String, limit: Int?) async throws -> [MemoryLaneHandle] {
-        // GLOB is case-sensitive like the protocol's hasPrefix fallback and
+        // GLOB preserves case-sensitive lane identities and
         // can use the existing BINARY source index. LIKE both widened ASCII
         // lane identities across case and forced an active-memory table scan.
         // Escape pattern characters so every caller-supplied byte is literal.

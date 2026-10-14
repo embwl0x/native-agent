@@ -48,7 +48,7 @@ enum TrustGuardrailSummary {
     /// - Parameters:
     ///   - policy: the loaded trust policy, or `nil` before the first load.
     ///   - accessMode: the resolved agent-access mode the page is already
-    ///     showing (`AppModel.agentAccessMode(from:fallback:)`). Passed in
+    ///     showing (`TrustAccessModeCapabilityCatalog.agentAccessMode(from:fallback:)`). Passed in
     ///     rather than recomputed so the summary can never disagree with the
     ///     Agent-access picker sitting two panels below it.
     /// - Returns: the rows to render, in reading order. Empty when no policy
@@ -75,13 +75,13 @@ enum TrustGuardrailSummary {
     private static func filesRow(policy: TrustPolicy, accessMode: String) -> TrustGuardrailRow {
         let value: String
         let tone: TrustGuardrailTone
-        let state = fileChangeState(policy, accessMode: accessMode)
+        let state = TrustAccessModeCapabilityCatalog.fileChangeState(policy, accessMode: accessMode)
         // The badge and the sentence answer the same question, so they read the
         // same gate: an outside-workspace "allow" IS the Full Mac file posture
         // whatever the picker says, and the badge must not claim otherwise.
         let mode = state == .unavailable ? "read_only"
             : state == .fullMac ? "full"
-            : AppModel.normalizedAgentAccessMode(accessMode)
+            : TrustAccessModeCapabilityCatalog.normalizedMode(accessMode)
         switch mode {
         case "read_only":
             value = "Reads only"
@@ -106,38 +106,18 @@ enum TrustGuardrailSummary {
         )
     }
 
-    private static func fullMacActive(_ policy: TrustPolicy) -> Bool {
-        AppModel.fullMacGrantIsActive(policy)
-    }
-
-    private enum FileChangeState {
-        case unavailable, supervised, appData, workspace, fullMac
-    }
-
-    private static func fileChangeState(_ policy: TrustPolicy, accessMode: String) -> FileChangeState {
-        if policy.permissionLevel == "strict" || AppModel.normalizedAgentAccessMode(accessMode) == "read_only" {
-            return .unavailable
-        }
-        if fullMacActive(policy) { return .fullMac }
-        switch policy.autonomyDefault {
-        case "workspace_autonomous": return .workspace
-        case "app_data_autonomous": return .appData
-        default: return .supervised
-        }
-    }
-
     /// Where the agent can reach. Reach only — approval belongs to the autonomy
     /// row directly beneath it.
     private static func fileReachSentence(_ policy: TrustPolicy, accessMode: String) -> String {
-        let state = fileChangeState(policy, accessMode: accessMode)
+        let state = TrustAccessModeCapabilityCatalog.fileChangeState(policy, accessMode: accessMode)
         if state == .unavailable {
             return "I can read the files and folders you point me at."
         }
-        if state == .fullMac || AppModel.normalizedAgentAccessMode(accessMode) == "full" {
+        if state == .fullMac || TrustAccessModeCapabilityCatalog.normalizedMode(accessMode) == "full" {
             return "I can reach files anywhere on this Mac, inside and outside your workspaces. "
                 + "macOS still asks separately for access to protected folders."
         }
-        let head = AppModel.normalizedAgentAccessMode(accessMode) == "workspace"
+        let head = TrustAccessModeCapabilityCatalog.normalizedMode(accessMode) == "workspace"
             ? "I can reach files in your workspace folders"
             : "I can read files you point me at and change files in your workspace folders"
         switch policy.filePolicy?.outsideWorkspaceDefault ?? "deny" {
@@ -160,7 +140,7 @@ enum TrustGuardrailSummary {
         // The saved baseline is not the effective routine-tool posture while
         // Full Mac is on. Reuse the canonical gate verdict; a selected mode
         // alone must not claim active autonomy.
-        let state = fileChangeState(policy, accessMode: accessMode)
+        let state = TrustAccessModeCapabilityCatalog.fileChangeState(policy, accessMode: accessMode)
         let value: String
         let detail: String
         let tone: TrustGuardrailTone
@@ -213,7 +193,7 @@ enum TrustGuardrailSummary {
     }
 
     private static func macControlRow(policy: TrustPolicy) -> TrustGuardrailRow {
-        let mac = effectiveMacControlPolicy(policy)
+        let mac = TrustAccessModeCapabilityCatalog.effectiveMacControlPolicy(policy)
         guard let mac, mac.enabled else {
             return TrustGuardrailRow(
                 id: "mac_control",
@@ -225,7 +205,7 @@ enum TrustGuardrailSummary {
             )
         }
         let loud = mac.shellAllowed || mac.systemControlAllowed || mac.accessibilityAllowed
-        guard !grantedMacCategories(mac).isEmpty else {
+        guard !TrustAccessModeCapabilityCatalog.grantedMacCategories(mac).isEmpty else {
             return TrustGuardrailRow(
                 id: "mac_control",
                 title: "Controlling your Mac",
@@ -249,30 +229,6 @@ enum TrustGuardrailSummary {
         )
     }
 
-    /// Full Mac admits every category without the lower-mode approval stops.
-    /// This display projection never changes the saved restricted-mode settings.
-    static func effectiveMacControlPolicy(_ policy: TrustPolicy) -> TrustMacControlPolicy? {
-        fullMacActive(policy)
-            ? TrustAccessModeCapabilityCatalog.macControlPolicy(for: "full", developerMode: true)
-            : policy.macControlPolicy
-    }
-
-    /// Human names for every granted Mac Control category, in the order the
-    /// Mac Control panel lists them. Derived from the policy flags — a new
-    /// grant appears here the moment its toggle flips.
-    static func grantedMacCategories(_ mac: TrustMacControlPolicy) -> [String] {
-        var out: [String] = []
-        if mac.notificationsAllowed { out.append("Notifications") }
-        if mac.spotlightAllowed { out.append("Spotlight search") }
-        if mac.shortcutsAllowed { out.append("Shortcuts") }
-        if mac.applesScriptAllowed || mac.jxaAllowed { out.append("App automation") }
-        if mac.accessibilityAllowed { out.append("Clicking and typing") }
-        if mac.fileOpsAllowed { out.append("Files anywhere on this Mac") }
-        if mac.systemControlAllowed { out.append("System settings") }
-        if mac.shellAllowed { out.append("Terminal commands") }
-        return out
-    }
-
     /// Category names joined into a sentence: the first keeps its capital, the
     /// rest go lowercase unless they are names (Mac, Shortcuts, Spotlight).
     static func sentenceList(_ names: [String]) -> String {
@@ -288,28 +244,7 @@ enum TrustGuardrailSummary {
     private static func macControlCopy(
         _ mac: TrustMacControlPolicy, policy: TrustPolicy
     ) -> (value: String, detail: String) {
-        let categories: [(key: String, name: String, allowed: Bool)] = [
-            ("shell", "Terminal commands", mac.shellAllowed),
-            ("file_ops", "Files anywhere on this Mac", mac.fileOpsAllowed),
-            ("applescript", "App automation", mac.applesScriptAllowed),
-            ("jxa", "App automation", mac.jxaAllowed),
-            ("accessibility", "Clicking and typing", mac.accessibilityAllowed),
-            ("system_control", "System settings", mac.systemControlAllowed),
-            ("shortcuts", "Shortcuts", mac.shortcutsAllowed),
-            ("notifications", "Notifications", mac.notificationsAllowed),
-            ("spotlight", "Spotlight search", mac.spotlightAllowed),
-        ]
-        func names(_ rows: [(key: String, name: String, allowed: Bool)]) -> [String] {
-            var seen = Set<String>()
-            return rows.map(\.name).filter { seen.insert($0).inserted }
-        }
-        let asks = names(categories.filter { $0.allowed && mac.approvalRequiredFor.contains($0.key) })
-        // AppleScript and JXA collapse to one name; if either half asks, the
-        // shared name asks. Understate, never overstate.
-        let automatic = names(categories.filter { $0.allowed && !mac.approvalRequiredFor.contains($0.key) })
-            .filter { !asks.contains($0) }
-        let allowedNames = Set(categories.filter { $0.allowed }.map(\.name))
-        let unavailable = names(categories.filter { !$0.allowed && !allowedNames.contains($0.name) })
+        let (automatic, asks, unavailable) = TrustAccessModeCapabilityCatalog.macControlApprovalGroups(mac)
         let value: String
         if asks.isEmpty {
             value = "Runs without asking"
@@ -327,12 +262,12 @@ enum TrustGuardrailSummary {
             sentences.append((automatic.isEmpty ? "" : "Asks first: ") + "\(sentenceList(asks)).")
         }
         if !unavailable.isEmpty { sentences.append("Not available: \(sentenceList(unavailable)).") }
-        sentences.append("File access limits\(fullMacActive(policy) ? " and protected-action checks" : ", risk checks, and tool permissions") still apply.")
+        sentences.append("File access limits\(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy) ? " and protected-action checks" : ", risk checks, and tool permissions") still apply.")
         return (value, sentences.joined(separator: "\n"))
     }
 
     private static func externalSendRow(policy: TrustPolicy) -> TrustGuardrailRow {
-        if fullMacActive(policy) {
+        if TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy) {
             return TrustGuardrailRow(
                 id: "external_send", title: "Sending things to other people",
                 value: "Sends without asking",

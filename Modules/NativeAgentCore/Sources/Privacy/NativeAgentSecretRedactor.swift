@@ -46,6 +46,10 @@ public enum NativeAgentSecretRedactor {
     }()
 
     public static func redactText(_ value: String) -> String {
+        redactText(value, patterns: patterns)
+    }
+
+    static func redactText(_ value: String, patterns: [(String, NSRegularExpression)]) -> String {
         var text = value
         for (kind, expression) in patterns {
             let current = text as NSString

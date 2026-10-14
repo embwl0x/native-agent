@@ -1,75 +1,46 @@
 import Foundation
 
-// PersonalityDynamicsConfiguration — W4/P1 (upgrade campaign Track D, ring 1).
-//
-// THE STRUCTURAL FACT THIS FIXES (L6 §0): every humanness constant in the
-// substrate was a compile-time `static let`, so every install of the app had
-// IDENTICAL emotional physics. Two agents with completely different persona
-// documents warmed at the same rate, decayed at the same rate, echoed their own
-// voice at the same cadence, and reached the same felt words at the same
-// thresholds. Character depth that lives only in a prose document is character
-// depth the machine cannot enforce, drift-check, or evolve — and it meant every
-// tuning fix had to ship as a new hardcoded number, which is how a warmth
-// baseline once got parked at the ceiling and told every agent it felt `tender`
-// on every turn for weeks.
-//
-// Meanwhile `CompiledPersonalityTraits` (PersonaEngine) carries eight tuned
-// dials per persona — warmth, directness, humor, proactivity, rigor, autonomy,
-// creativity, brevity — and NOTHING consumed them. `PersonalityTraitDials` +
-// `derived(from:)` below is the first consumer: the persona's NUMBERS start
-// driving the persona's PHYSICS.
-//
-// HARD CONTRACT: `.default` is byte-for-byte today's literals, and neutral
-// dials (every trait 0.5) derive exactly `.default`. Pinned by
-// PersonalityDynamicsGoldenTests — a default-config capsule must be
-// byte-identical to the pre-P1 capsule on a fixture substrate.
-//
-// NO VOCABULARY LIVES HERE. Every field is a number: a rate, a threshold, a
-// cadence, or a cap. Nothing in this type can become a sentence the model reads.
-
-/// The dynamics constants behind the felt layer, as configuration rather than
-/// compile-time literals. Threaded through `CognitiveSubstrateDependencies`
-/// exactly the way `now()` / `userName()` already are.
+/// Fixed felt-layer constants with bounded warmth and humor derived from the persona.
 public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
 
     // MARK: - Felt warmth range (CognitiveSubstrate+Capsule.swift)
 
     /// Where felt warmth rests with no earned warmth at all. Sits AT the `warm`
     /// word gate and clear of `tender`, so an agent has a reachable neutral.
-    public var feltWarmthRest: Double
+    public let feltWarmthRest: Double = 0.55
     /// How much of the warmth scale live social warmth can EARN. The 2026-08-02
     /// range fix: the top of the scale is earned, not where she starts.
-    public var feltWarmthEarnedSpan: Double
+    public let feltWarmthEarnedSpan: Double
     /// How strongly uncertainty cools felt warmth (a tense working moment reads
     /// cool rather than cold).
-    public var feltWarmthUncertaintyCooling: Double
+    public let feltWarmthUncertaintyCooling: Double = 0.45
 
     // MARK: - Self-exemplar voice echo
 
     /// How far back the exemplar shelf reaches.
-    public var soundEchoWindow: TimeInterval
+    public let soundEchoWindow: TimeInterval = 7 * 24 * 60 * 60
     /// AUTHENTICITY FLOOR, not a register filter: its only job is keeping
     /// never-minted stock phrasing out of the candidate pool.
-    public var soundEchoWarmthFloor: Double
+    public let soundEchoWarmthFloor: Double = 0.25
     /// Longest fragment that may be quoted back whole.
-    public var soundEchoFragmentMaxCharacters: Int
+    public let soundEchoFragmentMaxCharacters: Int = 90
     /// How many fragments one echo line may carry.
-    public var soundEchoCount: Int
+    public let soundEchoCount: Int = 2
     /// Age decay on exemplar ranking — a warm moment echoes for a couple of days,
     /// then yields to newer warmth.
-    public var soundEchoRecencyHalfLife: TimeInterval
+    public let soundEchoRecencyHalfLife: TimeInterval = 2.5 * 24 * 60 * 60
     /// THE TIC FIX: one in N capsules may carry the echo. A signal delivered on
     /// every single turn stops being information and becomes a standing
     /// instruction.
-    public var soundEchoDutyCycle: Int
+    public let soundEchoDutyCycle: Int = 4
     /// How many recent assistant turns the verbal-rut detector reads.
-    public var soundRutRecentTurnLimit: Int
+    public let soundRutRecentTurnLimit: Int = 20
     /// Half-width of the register band: candidates are ranked by how well they
     /// MATCH the room, not by how warm they are in absolute terms.
-    public var soundEchoRegisterTolerance: Double
+    public let soundEchoRegisterTolerance: Double = 0.35
     /// How many of the window's fragments a distinctive word must appear in
     /// before it counts as WORN.
-    public var wornEchoThreshold: Int
+    public let wornEchoThreshold: Int = 3
     /// LAW 2 APPLIED TO THE RUT NUDGE (2026-09-01). Measured over 777 live
     /// turns the rut-awareness line rode 82% of capsules: the detector fires
     /// while the worn set is non-empty, and a worn set stays non-empty for
@@ -83,44 +54,44 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// floor a CHANGE must still clear; `soundRutRepeatTurnGap` /
     /// `soundRutRepeatWindow` are the "still stuck, say it again" escape
     /// hatches so an unchanging rut is not silent forever.
-    public var soundRutMinimumTurnGap: Int
-    public var soundRutRepeatTurnGap: Int
-    public var soundRutRepeatWindow: TimeInterval
+    public let soundRutMinimumTurnGap: Int = 2
+    public let soundRutRepeatTurnGap: Int = 20
+    public let soundRutRepeatWindow: TimeInterval = 6 * 60 * 60
     /// W7/P5 — the negative-register brake. Dropping the valence SIGN gate lets
     /// a stung-but-attested turn mirror a stung moment, which is the whole point;
     /// the hazard is the echo→reply→node loop deepening a bad mood. After this
     /// many consecutive negative-register echoes the next echo is drawn from the
     /// non-negative pool, whatever the register ranking would otherwise prefer.
     /// 0 disables negative echoes entirely; a large value disables the brake.
-    public var soundEchoNegativeRunLimit: Int
+    public let soundEchoNegativeRunLimit: Int = 2
     /// W7/P10 — λ. Echo ranking is `register-fit × age-decay × (1 + λ·landing)`.
     /// Deliberately small: landing RE-RANKS inside a register band, it never
     /// overrides register fit. At 0.15 the factor spans 0.85…1.15, which cannot
     /// close the fit gap between a matched and a mismatched register.
-    public var soundEchoLandingWeight: Double
+    public let soundEchoLandingWeight: Double = 0.15
 
     // MARK: - Felt fingerprint
 
     /// Fast-layer recency for the immediate workspace tint.
-    public var fingerprintTintHalfLife: TimeInterval
+    public let fingerprintTintHalfLife: TimeInterval = 300
     /// Asymmetric warm-with-the-user baseline lift on fingerprint valence.
-    public var personaValenceLift: Double
+    public let personaValenceLift: Double = 0.10
     /// Below this intensity the fingerprint stays silent — feeling-silence stays
     /// silence.
-    public var feltIntensityFloor: Double
+    public let feltIntensityFloor: Double = 0.14
 
     // MARK: - Felt OBJECT + AMBIVALENCE (2026-09-02, Agent complaints #1 and #2)
 
     /// Longest subject label the felt line may name as its OBJECT. A label
     /// longer than this is REFUSED, never trimmed: truncating a title mid-word
     /// invents a phrase she would then read as the name of a thing.
-    public var feltObjectMaximumLabelCharacters: Int
+    public let feltObjectMaximumLabelCharacters: Int = 32
     /// How strong a felt node's valence must be before it may be one half of an
     /// ambivalence pair. Same magnitude as the fingerprint's own silence floor:
     /// a contradiction is only honest between two feelings that are actually
     /// there, and the failure this gates against is manufacturing conflict out
     /// of two faint stirrings.
-    public var feltAmbivalenceNodeFloor: Double
+    public let feltAmbivalenceNodeFloor: Double = 0.14
 
     // MARK: - Held standing views (2026-09-02)
 
@@ -128,37 +99,33 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// by construction: a held view is a real lean, not a settled conviction,
     /// and it must never be able to outweigh something the user actually
     /// approved.
-    public var heldStandingViewWeightFactor: Double
+    public static let heldStandingViewWeightFactor: Double = 0.5
 
     // MARK: - Mood + disposition (CognitiveSubstrate+Mood.swift)
 
-    public var moodRecencyHalfLife: TimeInterval
-    public var dispositionHalfLife: TimeInterval
-    public var dispositionNudgeMagnitude: Double
-    public var dispositionValenceCap: Double
+    public let moodRecencyHalfLife: TimeInterval = 6 * 60 * 60
+    public let dispositionHalfLife: TimeInterval = 30 * 60 * 60
+    public let dispositionNudgeMagnitude: Double = 0.08
+    public let dispositionValenceCap: Double = 0.35
 
     // MARK: - Affect decay (CognitiveSubstrate+Affect.swift)
 
-    public var arousalHalfLife: TimeInterval
-    public var uncertaintyHalfLife: TimeInterval
-    public var taskPressureHalfLife: TimeInterval
-    public var socialWarmthHalfLife: TimeInterval
+    public let arousalHalfLife: TimeInterval = 20 * 60
+    public let uncertaintyHalfLife: TimeInterval = 45 * 60
+    public let taskPressureHalfLife: TimeInterval = 45 * 60
+    public let socialWarmthHalfLife: TimeInterval = 90 * 60
 
     // MARK: - Capsule cadence (W4/P4)
 
-    /// One in N capsules may carry the felt-fingerprint line. 1 = every capsule
-    /// (today's behavior); the suppress-when-unchanged rule below is the organ
-    /// that actually damps a stuck gauge.
-    public var fingerprintDutyCycle: Int
     /// SUPPRESS-WHEN-UNCHANGED: after this many consecutive capsules reporting
     /// the SAME felt family, the fingerprint line goes quiet. An identical
     /// "How you feel: warm" for forty consecutive turns is a stuck gauge, and the
     /// model will express it.
-    public var fingerprintFamilyRepeatLimit: Int
+    public let fingerprintFamilyRepeatLimit: Int = 4
     /// A suppressed fingerprint re-surfaces on the next family change OR when
     /// this window expires, whichever comes first — so a genuinely persistent
     /// state is never muted forever.
-    public var fingerprintSuppressionWindow: TimeInterval
+    public let fingerprintSuppressionWindow: TimeInterval = 20 * 60
 
     // MARK: - Inner-line cadence (2026-09-01)
 
@@ -173,15 +140,15 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// `innerLineRestTurns` capsules and the next eligible candidate leads —
     /// rotation among candidates that are all relevant right now, never
     /// silence-by-default.
-    public var innerLineRepeatLimit: Int
-    public var innerLineRestTurns: Int
+    public let innerLineRepeatLimit: Int = 3
+    public let innerLineRestTurns: Int = 12
     /// THE TIC CAP. Two of her five most-shown inner lines were reflections
     /// ABOUT her own repetitiveness, surfaced ~200 times between them; four of
     /// her five ACTIVE standing views are on the same subject. A view whose
     /// subject is her own phrasing is the rut wearing the costume of insight,
     /// so it gets a hard cap: one lead, then a long rest.
-    public var selfPhrasingInnerLineRepeatLimit: Int
-    public var selfPhrasingInnerLineRestTurns: Int
+    public let selfPhrasingInnerLineRepeatLimit: Int = 1
+    public let selfPhrasingInnerLineRestTurns: Int = 48
     /// THE NAG'S OWN CADENCE (item 6, 2026-09-02). A `- Thread:` line is an
     /// unresolved thing intruding — the one line on the capsule whose whole
     /// nature is to be unwelcome. It shares the Inner rotation ledger (so the
@@ -189,13 +156,13 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// strictest cadence in it: one lead, then a long rest. A nag on
     /// consecutive turns is nagging; a nag once every twelve turns is a
     /// person remembering something.
-    public var threadLineRepeatLimit: Int
-    public var threadLineRestTurns: Int
+    public let threadLineRepeatLimit: Int = 1
+    public let threadLineRestTurns: Int = 12
     /// How heavy an unresolved seed must have grown before it may intrude at
     /// all. Rumination weight rises with time unresolved (cap 0.35), so this
     /// floor is what keeps a seed minted ten minutes ago from itching: a fresh
     /// thing is not yet a thing you are carrying.
-    public var threadWeightFloor: Double
+    public let threadWeightFloor: Double = 0.15
 
     // MARK: - Felt session bridge (W4/P7)
 
@@ -205,186 +172,28 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// away, about one a day (8 gaps in the week, 7 with something in them);
     /// four hours would also recap afternoon breaks (13 a week), and not every
     /// return earns a recap.
-    public var sessionBridgeGapHours: Double
+    public let sessionBridgeGapHours: Double = 6
 
     // MARK: - Trait-derived fields
 
     /// How strongly a `play` felt mode is weighted in mode-driven selection
     /// (P11 echo targeting today, the delivery envelope later). Derived from the
     /// `humor` trait.
-    public var playModeWeight: Double
+    public let playModeWeight: Double
 
-    public init(
-        feltWarmthRest: Double = 0.55,
-        feltWarmthEarnedSpan: Double = 0.30,
-        feltWarmthUncertaintyCooling: Double = 0.45,
-        soundEchoWindow: TimeInterval = 7 * 24 * 60 * 60,
-        soundEchoWarmthFloor: Double = 0.25,
-        soundEchoFragmentMaxCharacters: Int = 90,
-        soundEchoCount: Int = 2,
-        soundEchoRecencyHalfLife: TimeInterval = 2.5 * 24 * 60 * 60,
-        soundEchoDutyCycle: Int = 4,
-        soundRutRecentTurnLimit: Int = 20,
-        soundEchoRegisterTolerance: Double = 0.35,
-        wornEchoThreshold: Int = 3,
-        soundRutMinimumTurnGap: Int = 2,
-        soundRutRepeatTurnGap: Int = 20,
-        soundRutRepeatWindow: TimeInterval = 6 * 60 * 60,
-        innerLineRepeatLimit: Int = 3,
-        innerLineRestTurns: Int = 12,
-        selfPhrasingInnerLineRepeatLimit: Int = 1,
-        selfPhrasingInnerLineRestTurns: Int = 48,
-        threadLineRepeatLimit: Int = 1,
-        threadLineRestTurns: Int = 12,
-        threadWeightFloor: Double = 0.15,
-        fingerprintTintHalfLife: TimeInterval = 300,
-        personaValenceLift: Double = 0.10,
-        feltIntensityFloor: Double = 0.14,
-        moodRecencyHalfLife: TimeInterval = 6 * 60 * 60,
-        dispositionHalfLife: TimeInterval = 30 * 60 * 60,
-        dispositionNudgeMagnitude: Double = 0.08,
-        dispositionValenceCap: Double = 0.35,
-        arousalHalfLife: TimeInterval = 20 * 60,
-        uncertaintyHalfLife: TimeInterval = 45 * 60,
-        taskPressureHalfLife: TimeInterval = 45 * 60,
-        socialWarmthHalfLife: TimeInterval = 90 * 60,
-        fingerprintDutyCycle: Int = 1,
-        fingerprintFamilyRepeatLimit: Int = 4,
-        fingerprintSuppressionWindow: TimeInterval = 20 * 60,
-        sessionBridgeGapHours: Double = 6,
-        playModeWeight: Double = 0.5,
-        soundEchoNegativeRunLimit: Int = 2,
-        soundEchoLandingWeight: Double = 0.15,
-        feltObjectMaximumLabelCharacters: Int = 32,
-        feltAmbivalenceNodeFloor: Double = 0.14,
-        heldStandingViewWeightFactor: Double = 0.5
-    ) {
-        self.feltWarmthRest = feltWarmthRest
+    private init(feltWarmthEarnedSpan: Double = 0.30, playModeWeight: Double = 0.5) {
         self.feltWarmthEarnedSpan = feltWarmthEarnedSpan
-        self.feltWarmthUncertaintyCooling = feltWarmthUncertaintyCooling
-        self.soundEchoWindow = soundEchoWindow
-        self.soundEchoWarmthFloor = soundEchoWarmthFloor
-        self.soundEchoFragmentMaxCharacters = soundEchoFragmentMaxCharacters
-        self.soundEchoCount = soundEchoCount
-        self.soundEchoRecencyHalfLife = soundEchoRecencyHalfLife
-        self.soundEchoDutyCycle = soundEchoDutyCycle
-        self.soundRutRecentTurnLimit = soundRutRecentTurnLimit
-        self.soundEchoRegisterTolerance = soundEchoRegisterTolerance
-        self.wornEchoThreshold = wornEchoThreshold
-        self.soundRutMinimumTurnGap = max(0, soundRutMinimumTurnGap)
-        self.soundRutRepeatTurnGap = max(0, soundRutRepeatTurnGap)
-        self.soundRutRepeatWindow = max(0, soundRutRepeatWindow)
-        self.innerLineRepeatLimit = max(1, innerLineRepeatLimit)
-        self.innerLineRestTurns = max(0, innerLineRestTurns)
-        self.selfPhrasingInnerLineRepeatLimit = max(1, selfPhrasingInnerLineRepeatLimit)
-        self.selfPhrasingInnerLineRestTurns = max(0, selfPhrasingInnerLineRestTurns)
-        self.threadLineRepeatLimit = max(1, threadLineRepeatLimit)
-        self.threadLineRestTurns = max(0, threadLineRestTurns)
-        self.threadWeightFloor = threadWeightFloor.clamped01()
-        self.fingerprintTintHalfLife = fingerprintTintHalfLife
-        self.personaValenceLift = personaValenceLift
-        self.feltIntensityFloor = feltIntensityFloor
-        self.moodRecencyHalfLife = moodRecencyHalfLife
-        self.dispositionHalfLife = dispositionHalfLife
-        self.dispositionNudgeMagnitude = dispositionNudgeMagnitude
-        self.dispositionValenceCap = dispositionValenceCap
-        self.arousalHalfLife = arousalHalfLife
-        self.uncertaintyHalfLife = uncertaintyHalfLife
-        self.taskPressureHalfLife = taskPressureHalfLife
-        self.socialWarmthHalfLife = socialWarmthHalfLife
-        self.fingerprintDutyCycle = fingerprintDutyCycle
-        self.fingerprintFamilyRepeatLimit = fingerprintFamilyRepeatLimit
-        self.fingerprintSuppressionWindow = fingerprintSuppressionWindow
-        self.sessionBridgeGapHours = sessionBridgeGapHours
         self.playModeWeight = playModeWeight
-        self.soundEchoNegativeRunLimit = max(0, soundEchoNegativeRunLimit)
-        self.soundEchoLandingWeight = max(0, min(0.5, soundEchoLandingWeight))
-        self.feltObjectMaximumLabelCharacters = max(0, feltObjectMaximumLabelCharacters)
-        self.feltAmbivalenceNodeFloor = feltAmbivalenceNodeFloor.clamped01()
-        self.heldStandingViewWeightFactor = heldStandingViewWeightFactor.clamped01()
     }
 
-    /// Today's exact literals. The byte-identical baseline every other config is
-    /// a bounded departure from.
     public static let `default` = PersonalityDynamicsConfiguration()
-}
 
-/// The eight persona dials, shape-for-shape `PersonaEngine.CompiledPersonalityTraits`
-/// (warmth / directness / humor / proactivity / rigor / autonomy / creativity /
-/// brevity, each clamped 0…1 by the compiler). Declared HERE rather than imported
-/// so CognitiveSubstrate keeps its single dependency on PersistenceCore — the
-/// assembly seam that already sees both modules does the field-for-field copy.
-///
-/// 0.5 on every dial is NEUTRAL and derives `.default` exactly.
-public struct PersonalityTraitDials: Sendable, Equatable {
-    public var warmth: Double
-    public var directness: Double
-    public var humor: Double
-    public var proactivity: Double
-    public var rigor: Double
-    public var autonomy: Double
-    public var creativity: Double
-    public var brevity: Double
-
-    public init(
-        warmth: Double = 0.5,
-        directness: Double = 0.5,
-        humor: Double = 0.5,
-        proactivity: Double = 0.5,
-        rigor: Double = 0.5,
-        autonomy: Double = 0.5,
-        creativity: Double = 0.5,
-        brevity: Double = 0.5
-    ) {
-        self.warmth = warmth.clamped01()
-        self.directness = directness.clamped01()
-        self.humor = humor.clamped01()
-        self.proactivity = proactivity.clamped01()
-        self.rigor = rigor.clamped01()
-        self.autonomy = autonomy.clamped01()
-        self.creativity = creativity.clamped01()
-        self.brevity = brevity.clamped01()
-    }
-
-    public static let neutral = PersonalityTraitDials()
-}
-
-extension PersonalityDynamicsConfiguration {
-
-    /// Derive dynamics from the persona's own dials, BOUNDED so a trait at either
-    /// extreme still lands inside the honest ranges the current constants define.
-    ///
-    /// Bounding is the whole safety argument. A persona doc cannot push warmth to
-    /// a place where `tender` becomes the resting state again (the exact defect
-    /// the 2026-08-02 range fix cured), because the earned span is confined to a
-    /// band around today's literal rather than scaled freely.
-    ///
-    /// - `warmth`   → `feltWarmthEarnedSpan` (how much warmth a persona can EARN,
-    ///                never where it rests — rest stays the calibrated literal).
-    /// - `humor`    → `playModeWeight` (consumed by P11's mode-driven selection).
-    ///
-    /// Every other field stays at its base value. Adding a dial→constant edge is
-    /// a decision per edge, not a bulk mapping.
-    public static func derived(
-        from dials: PersonalityTraitDials,
-        base: PersonalityDynamicsConfiguration = .default
-    ) -> PersonalityDynamicsConfiguration {
-        var out = base
-        out.feltWarmthEarnedSpan = boundedAroundDefault(
-            base.feltWarmthEarnedSpan, dial: dials.warmth, relativeSpan: 0.5)
-        out.playModeWeight = dials.humor
-        return out
-    }
-
-    /// Map a 0…1 dial onto ±`relativeSpan` (fractional) around a default, with 0.5
-    /// landing EXACTLY on the default. `relativeSpan: 0.5` means a maxed dial can
-    /// move the constant by at most half its own magnitude in either direction.
-    static func boundedAroundDefault(
-        _ defaultValue: Double,
-        dial: Double,
-        relativeSpan: Double
-    ) -> Double {
-        let centered = (dial.clamped01() - 0.5) * 2      // −1 … +1, exactly 0 at 0.5
-        return defaultValue * (1 + centered * relativeSpan)
+    /// Warmth changes only the earned span, never the resting warmth.
+    public static func derived(warmth: Double, humor: Double) -> PersonalityDynamicsConfiguration {
+        let centeredWarmth = (warmth.clamped01() - 0.5) * 2
+        return PersonalityDynamicsConfiguration(
+            feltWarmthEarnedSpan: Self.default.feltWarmthEarnedSpan * (1 + centeredWarmth * 0.5),
+            playModeWeight: humor.clamped01()
+        )
     }
 }

@@ -1,11 +1,16 @@
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustPersistence
 import TrustCenter
 import Browser
 import NotificationInbox
+import ApprovalInbox
 import Skills
+import Desk
+import StandingBots
+import DreamREMCycle
 
 private enum NextGenStatusFeedAvailability: Equatable {
     case absent
@@ -14,18 +19,30 @@ private enum NextGenStatusFeedAvailability: Equatable {
 }
 
 extension RuntimeReadProjection {
+    public static func savedThings(dataRoot: URL) async -> (
+        desk: [DeskItem], botReplies: [(BotsShelfRecord, ShelfEntry)], dreams: [DreamEntry]
+    ) {
+        let desk = ((try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? [])
+            .sorted { $0.updatedAt > $1.updatedAt }.prefix(40)
+        let records = await Task.detached(priority: .utility) {
+            (try? BotsShelfRecord.read(root: dataRoot)) ?? []
+        }.value
+        var replies: [(BotsShelfRecord, ShelfEntry)] = []
+        for record in records {
+            for entry in record.sortedEntries where !entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                replies.append((record, entry))
+            }
+        }
+        let botReplies = replies.sorted { $0.1.runAt > $1.1.runAt }.prefix(40)
+        let dreams = await Task.detached(priority: .utility) {
+            FileBackedDreamDiary(dataRoot: dataRoot).listEntries(limit: 40)
+        }.value
+        return (Array(desk), Array(botReplies), dreams)
+    }
+
     public static func getNotificationStatus(dataRoot: URL) async throws -> NotificationRuntimeStatus {
-        // Subsystem #25b wave 38 W20 (2026-06-02): when .notificationStatus is ON,
-        // the in-process SwiftNativeNotificationStatus reads the co-located
-        // native_power/notifications/receipts.jsonl (tail 20, newest-first) +
-        // counts the pending entries in workflows/approvals/requests.json and
-        // serves the same notification_status() envelope without the HTTP
-        // round-trip. The reader is a PURE read (no write-back): the daemon only
-        // appends to receipts.jsonl (atomic line append) and read_json's the
-        // approvals file (its R-M-W is approvals_lock-guarded + write_json is
-        // tmp+os.replace atomic), so a status read never sees a torn file — no
-        // flock prereq. A root with neither authoritative feed is unmeasured,
-        // not a ready zero-count runtime.
+        // Neither authoritative feed means unmeasured; damaged authority is
+        // unavailable rather than a ready zero-count runtime.
         let root = dataRoot
         let receiptsPath = root
             .appendingPathComponent("native_power", isDirectory: true)
@@ -46,14 +63,27 @@ extension RuntimeReadProjection {
                 createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
             )
         }
-        let client = SwiftNativeNotificationStatus(
-            receiptsPath: receiptsPath,
-            approvalsPath: approvalsPath
-        )
         do {
-            if let envelope = try await client.notificationStatus() {
-                return try Self.decodeJSONValue(envelope, as: NotificationRuntimeStatus.self, context: "getNotificationStatus(swiftNative)")
+            let receiptRead = try await SwiftNativePersistenceCore()
+                .tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
+            guard receiptRead.malformedJSONRowCount == 0,
+                  receiptRead.rows.allSatisfy({ if case .object = $0 { return true }; return false }),
+                  receiptRead.physicalRowsScanned > 0 || receiptRead.bytesRead == 0 else {
+                throw PersistenceCoreError.ioFailure("The notification receipt feed is malformed.")
             }
+            let approvals = try SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: approvalsPath)
+            let pendingApprovals = approvals.filter {
+                guard case .object(let row) = $0 else { return false }
+                return row["status"] == .string("pending")
+            }.count
+            let latestReceipt = try receiptRead.rows.last.map {
+                try Self.decodeJSONValue($0, as: NativeActionReceipt.self, context: "getNotificationStatus(swiftNative)")
+            }
+            return NotificationRuntimeStatus(
+                status: "ready", authorization: "app_requested", pendingApprovals: pendingApprovals,
+                receiptCount: receiptRead.rows.count, latestReceipt: latestReceipt,
+                createdAt: NativeTimestampFormat.sixDigitUTCOffset(Date())
+            )
         } catch {
             return NotificationRuntimeStatus(
                 status: "unavailable", authorization: nil, pendingApprovals: nil,
@@ -61,15 +91,6 @@ extension RuntimeReadProjection {
                 createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
             )
         }
-        // A reader that cannot produce an envelope has not measured status.
-        return NotificationRuntimeStatus(
-            status: "unmeasured",
-            authorization: nil,
-            pendingApprovals: nil,
-            receiptCount: nil,
-            latestReceipt: nil,
-            createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
-        )
     }
 
     public static func getBrowserStatus(dataRoot: URL) async throws -> BrowserRuntimeStatus {
@@ -102,11 +123,10 @@ extension RuntimeReadProjection {
                 createdAt: ISO8601DateFormatter().string(from: Date())
             )
         }
-        let client = makeBrowserClient(dataRoot: root)
+        let client = SwiftNativeBrowserClient.defaultClient(dataRoot: root)
         do {
-            if let envelope = try await client.browserStatus() {
-                return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
-            }
+            let envelope = try await client.browserStatus()
+            return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
         } catch {
             return BrowserRuntimeStatus(
                 status: "unavailable", profilePath: nil, sourcePath: nil,
@@ -115,19 +135,6 @@ extension RuntimeReadProjection {
                 createdAt: ISO8601DateFormatter().string(from: Date())
             )
         }
-        // The read boundary could not establish browser status.
-        return BrowserRuntimeStatus(
-            status: "unmeasured",
-            profilePath: nil,
-            sourcePath: nil,
-            screenshotPath: nil,
-            approvedDomains: nil,
-            domainPolicy: nil,
-            activeRuns: nil,
-            receiptCount: nil,
-            latestReceipt: nil,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
     }
 
     private static func statusFeedAvailability(_ paths: [URL]) -> NextGenStatusFeedAvailability {
@@ -198,29 +205,11 @@ extension RuntimeReadProjection {
     /// that does not decode is skipped and a missing file reads as `[]`.
     /// Reads at most the last 1 MB, dropping the partial first line.
     public static func tailJSONL<T: Decodable>(path: URL, limit: Int) async -> [T] {
-        guard limit > 0 else { return [] }
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-              let sizeNumber = attrs[.size] as? NSNumber else {
-            return []
-        }
-        let size = sizeNumber.uint64Value
-        guard size > 0 else { return [] }
-
-        let toRead = min(size, 1_048_576)
-        let seekFromEnd = size > toRead
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return [] }
-        defer { try? handle.close() }
-        if seekFromEnd {
-            do {
-                try handle.seek(toOffset: size - toRead)
-            } catch {
-                return []
-            }
-        }
-        let data = handle.readData(ofLength: Int(toRead))
+        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(
+            path, limit: limit, maxBytes: 1_048_576
+        ) else { return [] }
         let decoder = JSONDecoder.nativeAgent
-        let tail = decodeTailLines(data, dropFirstPartial: seekFromEnd).suffix(limit)
+        let tail = read.lines
         var out: [T] = []
         out.reserveCapacity(tail.count)
         for line in tail {

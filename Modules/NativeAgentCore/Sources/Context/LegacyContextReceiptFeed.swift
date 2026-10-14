@@ -79,7 +79,7 @@ public enum LegacyContextReceiptFeed {
             return .malformed
         }
         guard case .object(let receipt) = value else { return .nonObject }
-        if let declaredRunID = nonEmptyPythonString(receipt["runId"]),
+        if let declaredRunID = SwiftNativeContextClient.pythonStr(receipt["runId"]),
            declaredRunID != runID {
             return .runIDMismatch
         }
@@ -158,19 +158,6 @@ public enum LegacyContextReceiptFeed {
             }
         }
         return report
-    }
-
-    private static func nonEmptyPythonString(_ value: JSONValue?) -> String? {
-        guard let value else { return nil }
-        switch value {
-        case .null: return nil
-        case .bool(let value): return value ? "True" : "False"
-        case .int(let value): return value == 0 ? nil : String(value)
-        case .double(let value): return value == 0 ? nil : String(value)
-        case .string(let value): return value.isEmpty ? nil : value
-        case .array(let value): return value.isEmpty ? nil : "<array>"
-        case .object(let value): return value.isEmpty ? nil : "<object>"
-        }
     }
 
     private static func isSafeRunID(_ runID: String) -> Bool {

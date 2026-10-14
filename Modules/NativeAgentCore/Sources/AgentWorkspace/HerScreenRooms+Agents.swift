@@ -57,8 +57,8 @@ extension HerScreen {
 
     // MARK: Delegations
 
-    private static func jobs(now: Date) -> [DelegationJobProjection] {
-        DelegationStatusProjector().recentJobs(now: now, limit: 12)
+    private static func jobs(dataRoot: URL, now: Date) -> [DelegationJobProjection] {
+        DelegationStatusProjector(configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot).recentJobs(now: now, limit: DelegationStatusProjector.maxLimit)
     }
 
     /// Handed straight into the agent's live session (Claude): no reply
@@ -67,15 +67,16 @@ extension HerScreen {
         (job.runStatus ?? job.status) == "delivered_live"
     }
 
-    private static func jobState(_ job: DelegationJobProjection, now: Date) -> String {
+    static func jobState(_ job: DelegationJobProjection, now: Date) -> String {
         if deliveredLive(job), let done = job.completedAt.flatMap(date) { return "✓ delivered live " + age(now.timeIntervalSince(done)) }
         guard let done = job.completedAt.flatMap(date) else {
             let started = (job.startedAt ?? job.claimedAt ?? job.createdAt).flatMap(date)
             return (job.stalled ? "✗ stalled" : "⟳ running") + (started.map { " " + age(now.timeIntervalSince($0)) } ?? "")
         }
-        let failed = job.executionError != nil || ["failed", "error", "interrupted", "failed_hung", "stalled", "spawn_failed", "timed_out", "timeout", "cancelled", "canceled"].contains((job.runStatus ?? job.status ?? "").lowercased())
+        let failed = job.executionError != nil || job.deliveryOutcome == "failed_before_answer"
+            || ["failed", "failed_before_answer", "error", "interrupted", "failed_hung", "stalled", "spawn_failed", "timed_out", "timeout", "cancelled", "canceled"].contains((job.runStatus ?? job.status ?? job.state ?? "").lowercased())
         return (job.stalled ? "✗ stalled " : failed ? "✗ failed " : "✓ done ") + age(now.timeIntervalSince(done))
-            + (job.deliveryOutcome == "lost" ? " · reply lost" : job.deliveryOutcome == "unknown" ? " · delivery unconfirmed" : "")
+            + (job.deliveryOutcome == "lost" ? " · reply lost" : ["unknown", "sent_unconfirmed"].contains(job.deliveryOutcome ?? "") ? " · delivery unconfirmed" : "")
     }
 
     private static func jobTitle(_ job: DelegationJobProjection) -> String {
@@ -85,11 +86,12 @@ extension HerScreen {
     /// The newest jobs across the three builder lanes: who, what she asked,
     /// its state. `job.N` opens one; the lane's own room holds the talk.
     static func delegationsRoom(dataRoot: URL, now: Date = Date()) -> String {
-        let list = jobs(now: now)
+        let all = jobs(dataRoot: dataRoot, now: now)
+        let list = all.prefix(12)
         let lines: [String] = withNames(dataRoot) { book in
             list.map { job in
                 let n = book.number("job", id: job.id) {
-                    Set(DelegationStatusProjector().recentJobs(now: now, limit: DelegationStatusProjector.maxLimit).map(\.id))
+                    Set(all.map(\.id))
                 }
                 return pad("job.\(n)", 8) + pad(job.agent, 9) + clip(jobTitle(job), 44) + " · " + jobState(job, now: now)
             }
@@ -123,8 +125,7 @@ extension HerScreen {
     }
 
     static func jobRoom(id: String, name: String, dataRoot: URL, now: Date = Date()) async -> String? {
-        guard let job = jobs(now: now).first(where: { $0.id == id })
-            ?? DelegationStatusProjector().recentJobs(now: now, limit: DelegationStatusProjector.maxLimit).first(where: { $0.id == id }) else { return nil }
+        guard let job = jobs(dataRoot: dataRoot, now: now).first(where: { $0.id == id }) else { return nil }
         let asked = nonEmpty(job.requestTextHead).map { plainLines($0).prefix(3).map { clip($0, 100) } } ?? [clip(jobTitle(job), 100)]
         let replyText = nonEmpty(job.agentReplyText) ?? nonEmpty(job.agentReplyTextHead) ?? nonEmpty(job.completionTextHead)
         if replyText != nil { AgentWorkspacePorts.current.tools.markConsumed(peer: job.agent) }

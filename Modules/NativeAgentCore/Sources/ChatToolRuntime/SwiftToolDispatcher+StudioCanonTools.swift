@@ -45,16 +45,14 @@ import TrustCenter
 /// which made the sole-approver rule a claim rather than a fact: `studio_canon_
 /// resolve` is an ordinary lazy chat tool, so ANY dispatch path could reach it
 /// and mint her seat — the Claude bridge's `/claude/tool` runner, an approval
-/// executor replaying a record, a remote-steered chat turn. The seat has to come
+/// executor replaying a record. The seat has to come
 /// from something a caller cannot supply.
 ///
 /// `ChatTurnRuntimeContext.current` is that thing. The chat tool loop binds it
 /// around each tool dispatch and it is documented as "nil when a tool runs
 /// outside a chat turn (e.g. a direct dispatch)" — so a bridge tool run, an
 /// executor, a replay and a background pass all read nil and are refused before
-/// anything else is consulted. The bridge's *message* lane does run a real tool
-/// loop, so it is caught by the two things it also binds and a local turn never
-/// does: `ChatPersistenceContext.originProvenance` and `TurnEnvelope.agent`.
+/// anything else is consulted. A real turn uses the common peer-trust boundary.
 ///
 /// Every check here reads a task-local or the dispatch surface. Nothing reads
 /// tool input.
@@ -62,10 +60,8 @@ public enum StudioCanonSeatGate {
     public enum Refusal: String, Error, Sendable, Equatable {
         /// No chat turn is running: a direct dispatch, an executor, a replay.
         case notALiveTurn = "not_a_live_turn"
-        /// A bridge lane — the turn is being steered by Claude/codex, not her.
-        case bridgeLane = "bridge_lane"
-        /// Telegram, Slack, iOS. Her museum is not decided from a phone.
-        case remoteSurface = "remote_surface"
+        /// A peer the owner has not trusted is steering this turn.
+        case untrustedPeer = "untrusted_peer"
         /// The dispatch surface and the live turn's surface disagree.
         case surfaceMismatch = "surface_mismatch"
         /// The turn has no identity to record, so the row could not say where
@@ -77,11 +73,8 @@ public enum StudioCanonSeatGate {
             case .notALiveTurn:
                 return "this did not come from a live chat turn — a bridge tool run, an "
                     + "approval replay, or a background pass cannot decide the canon"
-            case .bridgeLane:
-                return "this turn is being steered through an agent bridge; the canon is "
-                    + "yours to decide in your own conversation, not through a bridge lane"
-            case .remoteSurface:
-                return "this turn is on a remote surface; the canon is decided locally"
+            case .untrustedPeer:
+                return "the owner must trust this peer before it can steer a canon decision"
             case .surfaceMismatch:
                 return "the dispatch surface and the running turn disagree about where "
                     + "this call came from"
@@ -90,11 +83,6 @@ public enum StudioCanonSeatGate {
             }
         }
     }
-
-    /// The surfaces a canon decision may be made from. An allowlist on purpose:
-    /// a surface added tomorrow fails closed until someone decides, deliberately,
-    /// that her museum may be tended from it.
-    public static let localLiveSurfaces: Set<String> = ["chat", "mac", "local", "desktop"]
 
     public static func liveTurnProvenance(
         dispatchSurface: String
@@ -108,21 +96,10 @@ public enum StudioCanonSeatGate {
         guard turnProfile == ConversationSurfaceProfile(dispatchSurface) else {
             return .failure(.surfaceMismatch)
         }
-        // 3. Local, and on the allowlist.
-        guard !turnProfile.isRemote, Self.localLiveSurfaces.contains(turnProfile.id) else {
-            return .failure(.remoteSurface)
+        guard PeerDataTaint.abilityWriteCheck() == nil else {
+            return .failure(.untrustedPeer)
         }
-        // 4. Not a bridge lane. The bridge binds BOTH of these around its
-        //    `chat()` call while deliberately keeping `surface: "chat"`, so
-        //    these are the discriminators, not the surface string.
-        let envelope = ChatToolSessionContext.envelope
-        guard ChatPersistenceContext.originProvenance == nil,
-              (envelope?.agent ?? "").isEmpty,
-              envelope?.declaredRemote != true,
-              !turnProfile.id.contains("bridge") else {
-            return .failure(.bridgeLane)
-        }
-        // 5. An identity to record. Task-locals only — never `__session_id`
+        // An identity to record. Task-locals only — never `__session_id`
         //    from the input, which a model can type.
         let turnID = [
             ChatPersistenceContext.pinnedTurnRunID,
@@ -139,8 +116,7 @@ public enum StudioCanonSeatGate {
     ///
     /// Condition 1 — a bound live turn — is what excludes the bridge tool
     /// runner, the approval executors, every replay and every background lane,
-    /// and it is unchanged here; so are the remote and bridge-lane checks, which
-    /// read the turn context and the envelope rather than the dispatch string.
+    /// and it is unchanged here; so is the common peer-trust check.
     /// The only check this cannot make is the wrapper-DISAGREEMENT one, and that
     /// is a seat concern (a forged decision) rather than an evidence one (a
     /// miscounted pull). The canon seat threads the dispatch surface and pays
@@ -157,7 +133,7 @@ public enum StudioCanonSeatGate {
     /// where the pointer is selected.
     ///
     /// No prepared turn means no evidence of production context, and the answer
-    /// is false. Browsing, tending and bridge lanes never reach true.
+    /// is false. Browsing and tending never reach true.
     public static func isProductionTasteJudgment() -> Bool {
         guard let need = FluidContextToolScope.current?.need else { return false }
         if ContextCorrectionScope.isTasteJudgmentTask(need.message) { return true }

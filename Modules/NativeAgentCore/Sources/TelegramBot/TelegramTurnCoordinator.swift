@@ -532,9 +532,7 @@ public actor TelegramTurnCoordinator {
     func requestStop(
         destination: TelegramDestination,
         turnId: UUID? = nil,
-        pauseQueuedTurns: Bool = false,
-        confirmationTimeoutNanoseconds: UInt64,
-        sleeper: @escaping @Sendable (_ nanoseconds: UInt64) async throws -> Void
+        pauseQueuedTurns: Bool = false
     ) async -> StopOutcome {
         if pauseQueuedTurns { pausedQueueDestinations.insert(destination) }
         let commands = turnId == nil ? commandDestinations.compactMap {
@@ -547,11 +545,7 @@ public actor TelegramTurnCoordinator {
         }
         active.task.cancel()
         guard let card = active.card else { return .outcomeUnknown }
-        if let phase = await Self.waitForTerminal(
-            card,
-            timeoutNanoseconds: confirmationTimeoutNanoseconds,
-            sleeper: sleeper
-        ) {
+        if let phase = await Self.waitForTerminal(card) {
             guard phase == .canceled else { return .outcomeUnknown }
             // The card's .canceled phase IS the cooperative-cancellation
             // evidence. Release the chat slot now instead of waiting for the
@@ -568,9 +562,7 @@ public actor TelegramTurnCoordinator {
     }
 
     private static func waitForTerminal(
-        _ card: TelegramTurnProgressCardDriver,
-        timeoutNanoseconds: UInt64,
-        sleeper: @escaping @Sendable (_ nanoseconds: UInt64) async throws -> Void
+        _ card: TelegramTurnProgressCardDriver
     ) async -> TelegramTurnPresentationPhase? {
         await withTaskGroup(of: TelegramTurnPresentationPhase?.self) { group in
             group.addTask {
@@ -578,7 +570,7 @@ public actor TelegramTurnCoordinator {
             }
             group.addTask {
                 do {
-                    try await sleeper(timeoutNanoseconds)
+                    try await Task.sleep(nanoseconds: 1_500_000_000)
                 } catch {
                     return nil
                 }

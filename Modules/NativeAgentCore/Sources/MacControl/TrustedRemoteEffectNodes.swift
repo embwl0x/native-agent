@@ -1,5 +1,4 @@
 import CryptoKit
-import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -162,9 +161,10 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
             executable: executable,
             startedAt: ISO8601DateFormatter().string(from: started),
             finishedAt: ISO8601DateFormatter().string(from: Date()),
-            exitCode: result.status,
+            exitCode: result.exitCode,
             stdout: Self.bounded(result.stdout),
-            stderr: Self.bounded(result.stderr),
+            stderr: Self.bounded(result.stderr + (result.timedOut
+                ? (result.stderr.isEmpty ? "Timed out." : "\nTimed out.") : "")),
             hostKeyFingerprint: node.hostKeyFingerprint ?? "invalid"
         )
         let data = try JSONEncoder().encode(receipt)
@@ -245,28 +245,11 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
         return String(decoding: bytes, as: UTF8.self)
     }
 
-    /// Drain the pipe completely so the child cannot block, while retaining at
-    /// most `limit` bytes. Bounding after `readDataToEndOfFile()` is too late:
-    /// an untrusted remote process could otherwise make this Mac allocate its
-    /// entire output before the receipt truncation ran.
-    private static func drain(_ handle: FileHandle, retaining limit: Int) -> Data {
-        var retained = Data()
-        while true {
-            guard let chunk = try? handle.read(upToCount: 8_192),
-                  !chunk.isEmpty else { break }
-            let remaining = max(0, limit - retained.count)
-            if remaining > 0 { retained.append(chunk.prefix(remaining)) }
-        }
-        return retained
-    }
-
-    private struct ProcessResult: Sendable { let status: Int32; let stdout: String; let stderr: String }
-
     private static func runSSH(
         node: TrustedRemoteEffectNode,
         command: String,
         timeoutSeconds: Int
-    ) async throws -> ProcessResult {
+    ) async throws -> ProcessRunResult {
         try Task.checkCancellation()
         let task = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
@@ -276,11 +259,7 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
             let line = "\(hostToken) \(node.hostKeyAlgorithm) \(node.hostKey)\n"
             try Data(line.utf8).write(to: temp, options: [.atomic])
             defer { try? FileManager.default.removeItem(at: temp) }
-            let out = Pipe()
-            let err = Pipe()
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            process.arguments = [
+            let arguments = [
                 "-o", "BatchMode=yes",
                 "-o", "IdentitiesOnly=no",
                 "-o", "StrictHostKeyChecking=yes",
@@ -296,39 +275,13 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
                 "\(node.user)@\(node.host)",
                 command,
             ]
-            process.standardOutput = out
-            process.standardError = err
             try Task.checkCancellation()
-            do { try process.run() } catch { throw TrustedRemoteEffectError.transport(error.localizedDescription) }
-            async let stdoutData = Task.detached(priority: .utility) {
-                Self.drain(out.fileHandleForReading, retaining: 32_768)
-            }.value
-            async let stderrData = Task.detached(priority: .utility) {
-                Self.drain(err.fileHandleForReading, retaining: 32_768)
-            }.value
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
-            while process.isRunning && clock.now < deadline && !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(50))
-            }
-            var timedOut = false
-            if process.isRunning {
-                timedOut = !Task.isCancelled
-                // Cleanup must retain its grace period even when the caller cancelled.
-                await Task.detached(priority: .utility) {
-                    process.terminate()
-                    let grace = clock.now.advanced(by: .seconds(2))
-                    while process.isRunning && clock.now < grace { try? await Task.sleep(for: .milliseconds(50)) }
-                    if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
-                }.value
-            }
-            process.waitUntilExit()
-            let data = await (stdoutData, stderrData)
-            try Task.checkCancellation()
-            let stdout = String(decoding: data.0, as: UTF8.self)
-            var stderr = String(decoding: data.1, as: UTF8.self)
-            if timedOut { stderr += stderr.isEmpty ? "Timed out." : "\nTimed out." }
-            return ProcessResult(status: process.terminationStatus, stdout: stdout, stderr: stderr)
+            return try await SystemProcessAdapter().run(
+                executable: "/usr/bin/ssh", arguments: arguments,
+                currentDirectory: nil, environment: nil, standardInput: nil,
+                timeoutSeconds: TimeInterval(timeoutSeconds), outputByteLimit: 32_768,
+                launchFailure: { TrustedRemoteEffectError.transport($0.localizedDescription) }
+            )
         }
         return try await withTaskCancellationHandler {
             let result = try await task.value

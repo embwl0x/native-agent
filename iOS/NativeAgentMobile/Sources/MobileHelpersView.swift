@@ -2,7 +2,7 @@ import SwiftUI
 import NativeAgentShared
 
 struct MobileHelpersView: View {
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairing: PairingStore
     @State private var error: String?
 
@@ -41,7 +41,7 @@ struct MobileHelpersView: View {
 
 private struct MobileHelperDetailView: View {
     let id: UUID
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairing: PairingStore
     @State private var helper: MobileHelperEdit?
     @State private var busy = false
@@ -88,7 +88,7 @@ struct MobileHelperEditorView: View {
     let helperID: UUID?
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var pairing: PairingStore
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var edit = MobileHelperEdit()
     @State private var loaded = false
     @State private var busy = false
@@ -130,6 +130,12 @@ struct MobileHelperEditorView: View {
 
     private var modelFields: some View {
         AliveSection("Model") {
+            Picker("Model selection", selection: $edit.modelPinned) {
+                Text("Follow Providers").tag(Optional(false))
+                Text("Pin a model").tag(Optional(true))
+                if edit.modelPinned == nil { Text("Choose how this helper runs").tag(Optional<Bool>.none) }
+            }.aliveRow()
+            if edit.modelPinned != false {
             Picker("Provider", selection: $edit.provider) {
                 Text("Choose").tag("")
                 ForEach(sync.providers.filter { $0.auth_status.state == "ready" }, id: \.provider_id) {
@@ -155,6 +161,7 @@ struct MobileHelperEditorView: View {
                 }
             }.aliveRow()
             if selectedModel?.supports_fast == true { Toggle("Fast", isOn: $edit.fast).aliveRow() }
+            }
         }
     }
 

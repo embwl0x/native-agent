@@ -2,6 +2,118 @@ import ProviderRouting
 import Foundation
 import PersistenceCore
 import XConnector
+import GitHubConnector
+import TelegramBot
+
+extension NativeOAuthFlow {
+    public static func googleClientIDIssue(_ value: String) -> String? {
+        let id = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard id.count <= 512, id.hasSuffix(".apps.googleusercontent.com"),
+              id.count > ".apps.googleusercontent.com".count,
+              !id.unicodeScalars.contains(where: {
+                  CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0)
+              }) else {
+            return "That isn't a Google Client ID. Copy the one ending in .apps.googleusercontent.com from Google Auth Platform › Clients."
+        }
+        return nil
+    }
+
+    @MainActor
+    public static func saveInlineConnector(
+        connector: String, service: @MainActor () -> String, values: [String: String], dataRoot: URL,
+        credentialStore: any GitHubOAuthCredentialPort,
+        slackRequireMention: @MainActor () -> Bool,
+        restartSlack: @MainActor () async -> Void,
+        validateTelegramToken: @MainActor (String) -> String?,
+        configureTelegram: @MainActor (String, [String], [String], Bool) async throws -> Void,
+        refreshTelegram: @MainActor () async -> Void,
+        sendTelegramTestReply: @MainActor (String) async throws -> Void,
+        refresh: @MainActor () async -> Void
+    ) async -> InlineSetupOutcome {
+        func value(_ id: String) -> String {
+            (values[id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        func ids(_ raw: String) -> [String] {
+            raw.split { $0 == "," || $0 == ";" || $0.isWhitespace }.map(String.init)
+        }
+        /// Telegram's page saves a token and an allowlist, then sends a test
+        /// reply. The card does the same, with Telegram's `getMe` first so a token
+        /// Telegram does not know is never saved.
+        func saveTelegram(token: String, chatID: String) async -> InlineSetupOutcome {
+            if let problem = validateTelegramToken(token) {
+                return InlineSetupOutcome(error: problem)
+            }
+            let username: String
+            do {
+                username = try await TelegramPollLoop.defaultFetchBotUsername(token)
+            } catch {
+                return InlineSetupOutcome(error: "Telegram didn't accept that bot token: \(error.localizedDescription)")
+            }
+            // The saved allowlist is kept; the card only ever adds to it.
+            let existing = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot)
+            var chats = (existing?.allowedChatIds ?? []).map(String.init)
+            if !chatID.isEmpty, !chats.contains(chatID) { chats.append(chatID) }
+            let users = (existing?.allowedUserIds ?? []).map(String.init)
+            do {
+                try await configureTelegram(token, chats, users, existing?.requireMention ?? true)
+            } catch {
+                return InlineSetupOutcome(error: error.localizedDescription)
+            }
+            await refreshTelegram()
+            guard let target = chatID.isEmpty ? (chats.first ?? users.first) : chatID else {
+                return InlineSetupOutcome(note: "@\(username) verified; add an allowed chat ID before it can take messages")
+            }
+            do {
+                try await sendTelegramTestReply(target)
+                return InlineSetupOutcome(note: "@\(username) verified, test reply sent")
+            } catch {
+                return InlineSetupOutcome(error: "@\(username) is saved, but the test reply failed: \(error.localizedDescription)")
+            }
+        }
+
+        let token = value("token")
+        var outcome: InlineSetupOutcome
+        switch connector {
+        case "notion":
+            let result = await NativeOAuthFlow.saveNotionToken(token, dataRoot: dataRoot)
+            outcome = result.ok ? InlineSetupOutcome(note: "token checked with Notion")
+                : InlineSetupOutcome(error: result.error ?? "Notion rejected the token.")
+        case "github":
+            let result = await NativeOAuthFlow.saveGitHubToken(token, dataRoot: dataRoot, credentialStore: credentialStore)
+            outcome = result.ok ? InlineSetupOutcome(note: "token checked with GitHub")
+                : InlineSetupOutcome(error: result.error ?? "GitHub rejected the token.")
+        case "slack":
+            let appToken = value("app_token")
+            let result = await NativeOAuthFlow.saveSlackToken(
+                token,
+                appToken: appToken.isEmpty ? nil : appToken,
+                allowedChannelIds: Set(ids(value("allowed_channels"))),
+                allowedUserIds: Set(ids(value("allowed_users"))),
+                requireMention: slackRequireMention(),
+                dataRoot: dataRoot
+            )
+            if result.ok {
+                await restartSlack()
+                outcome = InlineSetupOutcome(note: "token checked with Slack")
+            } else {
+                outcome = InlineSetupOutcome(error: result.error ?? "Slack rejected the token.")
+            }
+        case "telegram":
+            outcome = await saveTelegram(token: token, chatID: value("allowed_chat_id"))
+        default:
+            outcome = InlineSetupOutcome(error: "This card can't set up \(connector). Use Open full setup.")
+        }
+        await refresh()
+        if let raw = outcome.error {
+            outcome.error = inlineSetupFailureReason(
+                raw,
+                service: service(),
+                typed: Array(values.values)
+            )
+        }
+        return outcome
+    }
+}
 
 extension NativeOAuthFlow {
     // MARK: - Connector OAuth (X / Gmail / Calendar)
@@ -117,7 +229,6 @@ extension NativeOAuthFlow {
             if cfg.connectorId != "x", let clientSecret = credentials.clientSecret {
                 body["client_secret"] = clientSecret
             }
-            for (k, v) in cfg.extraTokenParams { body[k] = v }
             var req = URLRequest(url: URL(string: cfg.tokenURL)!)
             req.httpMethod = "POST"
             req.timeoutInterval = 20

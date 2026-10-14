@@ -38,7 +38,7 @@ extension SwiftToolDispatcher {
         let plans = DeskSequencing.compute(state)
         let rows: [DeskItem]
         if let selected { rows = state.children(of: selected.handle) }
-        else if query?.isEmpty == false || input["updated_on"] != nil { rows = matches }
+        else if handle?.isEmpty == false || query?.isEmpty == false || input["updated_on"] != nil { rows = matches }
         else { rows = state.topLevel }
         let sorted = rows.sorted {
             if $0.status.isTerminal != $1.status.isTerminal { return !$0.status.isTerminal }
@@ -65,6 +65,8 @@ extension SwiftToolDispatcher {
             "source": .string("canonical_current_desk"), "as_of": .string(state.generatedTs),
             "request": .object(base), "liveItemCount": .int(Int64(state.items.count)),
             "topLevelItemCount": .int(Int64(state.topLevel.count)), "matched_count": .int(Int64(sorted.count)),
+            "count_scope": .string("liveItemCount includes parts and MY QUEUE; topLevelItemCount excludes parts but includes MY QUEUE; both include closed items and exclude archives"),
+            "board_counts": .string(state.boardCountSummary),
             "offset": .int(Int64(rowOffset)), "has_more": .bool(rowOffset + pageSize < sorted.count),
             "items": .array(shown.map {
                 workContextDeskItem($0, state: state, plan: plans.byHandle[$0.handle])

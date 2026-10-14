@@ -14,8 +14,6 @@ enum ChatSessionTabPresentation {
 /// view makes an iPhone selection an explicit, testable value before it is
 /// sent to the signed Mac route.
 enum ChatRuntimeControlPresentation {
-    static let fileAccessIDs = ICloudChatFileAccessPolicy.acceptedIDs
-
     static func processingModeTitle(fastMode: Bool) -> String {
         fastMode ? "Fast" : "Normal"
     }
@@ -65,60 +63,6 @@ enum ChatRuntimeControlPresentation {
             ? selectedEffort
             : (allowed.contains(preferred) ? preferred : (allowed.first ?? "high"))
         return (model, effort, modelInfo?.supports_fast == true ? selectedFastMode : false)
-    }
-
-    static func modelForProvider(
-        currentModel: String,
-        provider: ProviderInfo?,
-        preferredModels: [String]
-    ) -> String {
-        guard let provider else { return currentModel }
-        let modelIDs = provider.models.map(\.id).filter { !$0.isEmpty }
-        guard !modelIDs.isEmpty, !modelIDs.contains(currentModel) else { return currentModel }
-        return preferredModels.first(where: modelIDs.contains) ?? modelIDs[0]
-    }
-
-    static func selectionForProvider(
-        providerID: String,
-        current: Selection,
-        providers: [ProviderInfo],
-        preferredModels: [String]
-    ) -> Selection? {
-        guard let provider = providers.first(where: {
-            $0.provider_id == providerID && $0.auth_status.state == "ready"
-        }) else { return nil }
-        let model = modelForProvider(
-            currentModel: current.model,
-            provider: provider,
-            preferredModels: preferredModels
-        )
-        let controls = reconciled(
-            model: model,
-            provider: provider,
-            selectedEffort: current.reasoningEffort,
-            selectedFastMode: current.fastMode
-        )
-        return Selection(
-            providerID: providerID,
-            model: controls.model,
-            reasoningEffort: controls.effort,
-            fastMode: controls.fastMode
-        )
-    }
-
-    static func seededProviderID(
-        selectedProviderID: String,
-        activeProviderID: String?,
-        model: String,
-        readyProviders: [ProviderInfo]
-    ) -> String? {
-        guard !readyProviders.isEmpty else { return nil }
-        if readyProviders.contains(where: { $0.provider_id == selectedProviderID }) { return selectedProviderID }
-        if let activeProviderID, readyProviders.contains(where: { $0.provider_id == activeProviderID }) {
-            return activeProviderID
-        }
-        return readyProviders.first(where: { $0.models.contains(where: { $0.id == model }) })?.provider_id
-            ?? readyProviders[0].provider_id
     }
 
     static func shouldRollback(selectionGeneration: Int, requestGeneration: Int) -> Bool {
@@ -283,20 +227,28 @@ struct ChatScrollScheduler: Equatable {
     }
 }
 
-enum ChatAttachmentPresentation {
-    static func hasRenderableImage(_ attachment: ChatAttachmentSummary) -> Bool {
-        guard attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image",
-              let raw = attachment.base64?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let data = Data(base64Encoded: raw), !data.isEmpty else { return false }
-        return UIImage(data: data) != nil
-    }
+actor ChatAttachmentPresentation {
+    static let shared = ChatAttachmentPresentation()
+    private var entries: [String: (summary: ChatAttachmentSummary, image: UIImage?)] = [:]
+    private var recency: [String] = []
 
-    static func previewableImages(in attachments: [ChatAttachmentSummary]) -> [ChatAttachmentSummary] {
-        attachments.filter(hasRenderableImage)
-    }
-
-    static func fallbackCount(in attachments: [ChatAttachmentSummary]) -> Int {
-        max(0, attachments.count - previewableImages(in: attachments).count)
+    func images(in attachments: [ChatAttachmentSummary]) -> [(summary: ChatAttachmentSummary, image: UIImage)] {
+        attachments.compactMap { attachment in
+            recency.removeAll { $0 == attachment.id }
+            recency.append(attachment.id)
+            if entries[attachment.id]?.summary != attachment {
+                let image: UIImage?
+                if attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image",
+                   let raw = attachment.base64?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   let data = Data(base64Encoded: raw) {
+                    image = MobileChatAttachmentPreparation.thumbnail(from: data, maxDimension: 780)
+                } else { image = nil }
+                entries[attachment.id] = (attachment, image)
+            }
+            let image = entries[attachment.id]?.image
+            if recency.count > 128 { entries.removeValue(forKey: recency.removeFirst()) }
+            return image.map { (attachment, $0) }
+        }
     }
 }
 

@@ -91,7 +91,7 @@ public struct AgentConversationStore: Sendable {
         try locked {
             var rows = try load()
             if try reconcileDeniedApprovals(&rows) { try save(rows) }
-            try? AgentConversationLiveStore(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()).merge([])
+            try? AgentConversationLiveStore(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()).merge([], records: rows)
             return rows
         }
     }
@@ -604,12 +604,17 @@ public struct AgentConversationStore: Sendable {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         let data = try Data(contentsOf: fileURL)
         guard data.count <= 50 * 1024 * 1024 else { throw Failure(message: "Saved conversations are too large to read safely.") }
-        var rows = try JSONDecoder().decode([AgentConversationRecord].self, from: data)
+        let rows = try JSONDecoder().decode([AgentConversationRecord].self, from: data)
         guard rows.count <= 512, Set(rows.map(\.id)).count == rows.count,
               rows.allSatisfy({ UUID(uuidString: $0.id) != nil && UUID(uuidString: $0.operationID) != nil && !$0.scopeSessionID.isEmpty }) else {
             throw Failure(message: "Saved conversations are unavailable; existing records were preserved.")
         }
         for row in rows { try AgentConversationExchange.validate(row.exchanges) }
+        return try reconcilingExpiredReplies(rows)
+    }
+
+    func reconcilingExpiredReplies(_ records: [AgentConversationRecord]) throws -> [AgentConversationRecord] {
+        var rows = records
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         let requests = GrokRequestStore(dataRoot: root)
         for i in rows.indices where ["sending", "waiting", "attention"].contains(rows[i].phase) {
@@ -643,7 +648,7 @@ public struct AgentConversationStore: Sendable {
             let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
             Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
         }
-        try? AgentConversationLiveStore(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()).merge([])
+        try? AgentConversationLiveStore(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()).merge([], records: rows)
         AgentConversationRunning.shared.changed() // wakes queued follow-ups
     }
 }

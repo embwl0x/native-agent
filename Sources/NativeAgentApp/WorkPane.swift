@@ -1,6 +1,7 @@
 import AppToolRuntime
 import ChatOrchestration
 import SwiftUI
+import ApprovalTransactions
 import ApprovalInbox
 import CoreGraphics
 import NativeAgentCore
@@ -285,7 +286,7 @@ struct WorkPaneSteps: View {
         appModel.engine.approvals.records.filter {
             $0.status == "pending" && !$0.isAgentsOwnDecision
                 && ($0.chatOriginSessionId == sessionId || $0.chatCardSessionId == sessionId)
-                && ApprovalPayloadPreviewPresentation.canResolve($0)
+                && ApprovalChatCards.canResolve($0)
         }
     }
 
@@ -295,7 +296,7 @@ struct WorkPaneSteps: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(pendingApprovals) { approval in
-                    InlineApprovalCard(message: InlineApprovalCard.message(for: approval))
+                    InlineApprovalCard(message: ChatMessage(approval: approval))
                 }
                 if let turn, !turn.isTerminal {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -452,7 +453,7 @@ struct WorkPaneAutoOpen: View {
     /// The newest Make version seen; `.none` until the studio is first read,
     /// so a first artifact in an empty studio still counts as new.
     @State private var lastMake: String?? = .none
-    @State private var makeRefs: [String] = []
+    @State private var makeShelf = MakeStudio.Shelf.shared
 
     var body: some View {
         let turns = appModel.engine.turns
@@ -471,23 +472,17 @@ struct WorkPaneAutoOpen: View {
                 WorkPaneState.shared.autoOpen(turnID: turnID, running: turns.activeTurnIDsBySession.values)
             }
             // A new Make version while this chat's turn runs pops up in the pane.
-            // Every ref's meta is watched; a new ref restarts this with its meta too.
-            .task(id: makeRefs) {
-                let studio = MakeStudio(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-                try? FileManager.default.createDirectory(at: studio.root, withIntermediateDirectories: true)
-                await ViewFileRefreshTask.run(paths: [studio.root] + makeRefs.map { studio.folder($0).appendingPathComponent("meta.json") }) {
-                    let refs = ((try? FileManager.default.contentsOfDirectory(atPath: studio.root.path)) ?? [])
-                        .filter(MakeStudio.isRef).sorted()
-                    let newest = studio.newestRef().flatMap(studio.meta).map { "\($0.ref) \($0.versions.count)" }
-                    defer {
-                        lastMake = .some(newest)
-                        if refs != makeRefs { makeRefs = refs }
-                    }
-                    guard let lastMake, newest != lastMake,
-                          let turnID = appModel.engine.turns.activeTurnIDsBySession[appModel.activeChatSessionId]
-                    else { return }
-                    WorkPaneState.shared.autoOpenMake(turnID: turnID)
-                }
+            .task {
+                makeShelf.open(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            }
+            .onChange(of: makeShelf.loaded ? makeShelf.newest.map { "\($0.ref) \($0.versions.count)" } ?? "" : nil, initial: true) { _, signal in
+                guard let signal else { return }
+                let newest = signal.isEmpty ? nil : signal
+                defer { lastMake = .some(newest) }
+                guard let lastMake, newest != lastMake,
+                      let turnID = appModel.engine.turns.activeTurnIDsBySession[appModel.activeChatSessionId]
+                else { return }
+                WorkPaneState.shared.autoOpenMake(turnID: turnID)
             }
     }
 }

@@ -1,3 +1,4 @@
+import Cognition
 import Foundation
 import Observation
 import SwiftUI
@@ -138,7 +139,7 @@ struct NativeSecurityCenterPanel: View {
     private let modeTitle: String?
 
     init(
-        statusReader: @escaping SecurityCenterStatusReader = Self.liveStatus,
+        statusReader: @escaping SecurityCenterStatusReader,
         loadsOnAppear: Bool = true,
         modeTitle: String? = nil
     ) {
@@ -272,7 +273,7 @@ struct NativeSecurityCenterPanel: View {
         }
         .task {
             guard loadsOnAppear else { return }
-            await ViewFileRefreshTask.run(paths: [
+            await EventDeadlinePhysiology.refreshOnChanges(paths: [
                 appModel.engine.trust.dataRoot.appendingPathComponent("trust/policy.json")
             ]) {
                 await refreshModel.loadOnAppearance()
@@ -302,10 +303,6 @@ struct NativeSecurityCenterPanel: View {
         span.maximumUnitCount = 1
         span.allowedUnits = [.minute, .hour, .day]
         return "Past " + (span.string(from: oldest, to: max(Date(), oldest.addingTimeInterval(60))) ?? "")
-    }
-
-    private static func liveStatus(limit: Int) async throws -> SecurityCenterStatus {
-        try await SwiftNativeSecurityCenter().status(limit: limit)
     }
 }
 

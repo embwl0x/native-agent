@@ -398,7 +398,7 @@ extension SwiftNativeTurnEngine {
                         "status": .string("skipped"),
                         "outcome": .string("unmet"), "effects": .string("none"),
                         "detail": .string("\(connector) is not connected. This action did not run."),
-                        "fix": .string("The owner must sign in to \(connector) in Settings > Connectors."),
+                        "fix": .string("The owner can sign in to \(connector) by requesting a setup card in chat or opening Connectors in Advanced view."),
                     ]), tool: ran[idx])
                     await onOutcome(p, result, true)
                     slots.append(DispatchedSlot(index: idx, prepared: p,

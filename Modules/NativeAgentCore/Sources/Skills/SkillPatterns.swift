@@ -5,7 +5,7 @@ import PersistenceCore
 /// Repeated work, noticed (skills-as-code 4b, User 10-03: "she and anyone's
 /// agent should notice repeated work"). Each turn's landed app calls, minus
 /// scaffolding, become shapes: every contiguous 2–5 call window as its action
-/// ids and sorted argument NAMES, never values. A shape done on 3 distinct
+/// ids and sorted argument NAMES, never values. A shape with a write on 3 distinct
 /// turns that no on or drafted skill's script covers is offered once, as one
 /// quiet MY QUEUE line of hers; a skill run usually followed by the same
 /// calls offers to take them in. Nothing is created here; she writes the
@@ -61,12 +61,13 @@ public enum SkillPatterns {
     /// `name` is how a line names an agent other than her (nil for her).
     public static func observe(turn: String, agent: String, name: String?, calls: [Call],
                                root: URL, session: String? = nil, now: Date = Date()) -> [Line] {
-        guard !calls.isEmpty else { return [] }
+        let work = Set(calls.filter { !$0.readOnly }.map(\.step))
+        guard !work.isEmpty else { return [] }
         return update(root) { file in
             var mind = file.agents[agent] ?? Agent()
             let cutoff = now.addingTimeInterval(-keptDays * 86_400)
             mind.shapes = mind.shapes.filter {
-                $0.value.last >= cutoff && ($0.value.meaningful ?? $0.value.steps.contains { !navigationAction(action($0)) })
+                $0.value.last >= cutoff
             }
             mind.followups = mind.followups.filter { $0.value.last >= cutoff }
             for start in calls.indices {
@@ -74,11 +75,10 @@ public enum SkillPatterns {
                     let window = Array(calls[start..<start + length])
                     // One call repeated is not a workflow.
                     guard Set(window.map(\.action)).count > 1,
-                          window.contains(where: { !($0.readOnly && navigationAction($0.action)) }) else { continue }
+                          window.contains(where: { !$0.readOnly }) else { continue }
                     let steps = window.map(\.step)
                     var shape = mind.shapes[key(steps)] ?? Shape(steps: steps, turns: [], first: now, last: now)
                     if !shape.turns.contains(turn) { shape.turns = Array((shape.turns + [turn]).suffix(keptTurns)) }
-                    shape.meaningful = true
                     if let session { shape.sessions = (shape.sessions ?? [:]).merging([turn: session]) { $1 } }
                     shape.sessions = shape.sessions?.filter { shape.turns.contains($0.key) }
                     shape.last = now
@@ -91,19 +91,27 @@ public enum SkillPatterns {
             }
             var lines: [Line] = []
             let who = name.map { "\($0.prefix(30)) has" } ?? "You've"
+            let routines = (try? InstalledSkillInventory.entries(dataRoot: root)) ?? []
             // Follow-ups: the calls after each skill.run, up to the next one.
             for (index, call) in calls.enumerated() where call.action == "skill.run" {
                 guard let skill = call.skill else { continue }
                 let after = calls[(index + 1)...].prefix { $0.action != "skill.run" }.prefix(3).map(\.step)
+                guard after.contains(where: work.contains) else {
+                    mind.followups.removeValue(forKey: skill)
+                    continue
+                }
                 var follow = mind.followups[skill] ?? Followup(runs: [], raised: nil, last: now)
+                let digest = SkillMutation.pyStrOptional(InstalledSkillInventory.match(skill, in: routines)?.row["codeFingerprint"])
+                if follow.digest != digest { follow = Followup(runs: [], raised: nil, last: now) }
+                follow.digest = digest
                 follow.runs = Array((follow.runs + [after]).suffix(3))
                 follow.turns = Array(((follow.turns ?? []) + [turn]).suffix(3))
                 if let session { follow.sessions = (follow.sessions ?? [:]).merging([turn: session]) { $1 } }
                 follow.sessions = follow.sessions?.filter { follow.turns?.contains($0.key) == true }
                 follow.last = now
-                if let usual = usual(follow.runs), usual.contains(where: { !navigationAction(action($0)) }), key(usual) != follow.raised {
+                if let usual = usual(follow.runs), usual.contains(where: work.contains), key(usual) != follow.raised {
                     follow.raised = key(usual)
-                    lines.append(Line(words: fit(usual) { "\(skill.prefix(40)) is usually followed by \($0); add them to it?" },
+                    lines.append(Line(words: fit(usual) { "\(skill.prefix(40)) is usually followed by \($0); revise its run(input)?" },
                                       agent: agent, shape: nil, skill: skill,
                                       examples: references(follow.turns ?? [], sessions: follow.sessions)))
                 }
@@ -116,10 +124,10 @@ public enum SkillPatterns {
             // The notice: the longest shape on 3 turns, none it overlaps already offered.
             let today = mind.noticedAt.map { Calendar.current.isDate($0, inSameDayAs: now) } ?? false
             if !today {
-                let offered = mind.shapes.values.filter { $0.state != nil }.map(\.steps)
+                let offered = mind.shapes.values.filter { $0.state != nil && $0.steps.contains(where: work.contains) }.map(\.steps)
                 let ready = mind.shapes.filter { _, shape in
                     shape.state != "noticed" && shape.turns.count >= turnsToNotice
-                        && (shape.meaningful ?? shape.steps.contains { !navigationAction(action($0)) })
+                        && shape.steps.contains(where: work.contains)
                         && !offered.contains { $0 != shape.steps && (contains($0, shape.steps) || contains(shape.steps, $0)) }
                 }.sorted { ($1.value.steps.count, $1.value.turns.count, $0.key) < ($0.value.steps.count, $0.value.turns.count, $1.key) }
                 let scripts = ready.isEmpty ? [] : coveringScripts(root)
@@ -130,7 +138,7 @@ public enum SkillPatterns {
                     mind.shapes[pick.key]?.state = "noticed"
                     mind.shapes[pick.key]?.item = nil
                     mind.noticedAt = now
-                    lines.append(Line(words: fit(pick.value.steps) { "\(who) done \($0) in \(pick.value.turns.count) turns; worth a skill?" },
+                    lines.append(Line(words: fit(pick.value.steps) { "\(who) done \($0) in \(pick.value.turns.count) turns; author run(input)?" },
                                       agent: agent, shape: pick.key,
                                       examples: references(pick.value.turns, sessions: pick.value.sessions)))
                 }
@@ -190,7 +198,6 @@ public enum SkillPatterns {
         /// nil, "noticed" (its line is open) or "dismissed".
         var state: String?
         var item: String?
-        var meaningful: Bool?
         var sessions: [String: String]?
     }
     struct Followup: Codable {
@@ -199,6 +206,7 @@ public enum SkillPatterns {
         var last: Date
         var turns: [String]?
         var sessions: [String: String]?
+        var digest: String?
     }
 
     private static let lock = NSLock()

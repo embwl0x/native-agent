@@ -3,7 +3,7 @@ import Foundation
 import PersistenceCore
 
 /// P2 launches the helper with /usr/bin/sandbox-exec -p <profile>. The app
-/// supplies source and material over the plug; only compiler scratch is writable.
+/// supplies source and material over the plug; source arrives over the supervised plug.
 public enum SenseSandboxProfile {
     /// The app's byte delivery obeys the same exclusions as helper reach.
     public static func requirePublicPath(_ path: String, dataRoot: URL, personaRoot: URL) throws {
@@ -24,8 +24,7 @@ public enum SenseSandboxProfile {
     }
 
     public static func build(reach: SenseReach, helperURL: URL, scratch: URL,
-                             dataRoot: URL, personaRoot: URL,
-                             language: SenseLanguage = .javascript) throws -> String {
+                             dataRoot: URL, personaRoot: URL) throws -> String {
         func quote(_ path: String) -> String {
             "\"" + path.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"") + "\""
@@ -96,16 +95,6 @@ public enum SenseSandboxProfile {
         }
         if !reach.hosts.isEmpty {
             rules.append("(allow mach-lookup (global-name \"com.apple.mDNSResponder\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\"))")
-        }
-        if language == .swift {
-            rules += [
-                "(allow process-fork)",
-                "(allow file-read-data (subpath \"/usr\") (subpath \"/Library/Developer\") (subpath \"/Applications/Xcode.app\") (subpath \(path(scratch))))",
-                "(allow file-write* (subpath \(path(scratch))))",
-                "(allow process-exec (literal \"/usr/bin/swift\") (literal \"/usr/bin/xcrun\") (subpath \"/Library/Developer\") (subpath \"/Applications/Xcode.app\"))",
-                "(allow file-map-executable (subpath \"/usr\") (subpath \"/Library/Developer\") (subpath \"/Applications/Xcode.app\") (subpath \(path(scratch))))",
-                "(allow mach-lookup (global-name \"com.apple.xcode.Selector\"))",
-            ]
         }
         // These denies win even over a declared '/' read grant. The resolved
         // persona root may live outside dataRoot in development installations.

@@ -2,16 +2,29 @@ import Foundation
 
 enum TelegramAssistantDeliveryOutcome: Sendable, Equatable {
     case delivered(messageId: Int?)
+    case held
     case failed(reason: String)
     case outcomeUnknown(reason: String)
 }
 
 struct TelegramAssistantDeliveryState: Sendable, Equatable, Codable {
+    struct Rejection: Sendable, Equatable, Codable {
+        let reason: String
+        let reply: String
+        let imagePaths: [String]?
+    }
+
     let reply: String
     var confirmedMessageIds: [Int] = []
     var outcomeUnknown = false
     var imagePaths: [String]? = nil
     var confirmedImageCount: Int? = nil
+    var silent: Bool? = nil
+    var lastRejection: Rejection? = nil
+
+    var rejectionReason: String? {
+        lastRejection?.reply == reply && lastRejection?.imagePaths == imagePaths ? lastRejection?.reason : nil
+    }
 
     var isDelivered: Bool {
         confirmedMessageIds.count == TelegramRichMessageRenderer.render(reply).count
@@ -33,20 +46,19 @@ actor TelegramAssistantDeliveryDriver {
         _ destination: TelegramDestination,
         _ richMessage: TelegramInputRichMessage
     ) async throws -> Int
-    typealias Clock = @Sendable () -> Date
     typealias FailureRecorder = @Sendable (_ redactedError: String) async -> Void
     typealias PersistDelivery = @Sendable (TelegramAssistantDeliveryState) async throws -> Void
 
     private let token: String
     private let destination: TelegramDestination
     private let draftId: Int
-    private let sendRichDraft: SendRichDraft?
-    private let sendRichFinal: SendRichFinal?
-    private let clock: Clock
-    private let richDraftInterval: TimeInterval
+    private let sendRichDraft: SendRichDraft
+    private let sendRichFinal: SendRichFinal
+    private let richDraftInterval: TimeInterval = 1.0 // Telegram allows ~1 edit/s per chat.
     private let recordFailure: FailureRecorder
     private let persistDelivery: PersistDelivery
-    private let sendGeneratedImage: @Sendable (String) async throws -> Void
+    private let sendGeneratedImage: @Sendable (String, Data) async throws -> Void
+    private let holdDelivery: @Sendable () async throws -> Bool
 
     private var terminal = false
     private var draftsUnavailable = false
@@ -58,23 +70,21 @@ actor TelegramAssistantDeliveryDriver {
         token: String,
         destination: TelegramDestination,
         turnId: UUID,
-        sendRichDraft: SendRichDraft?,
-        sendRichFinal: SendRichFinal?,
-        richDraftInterval: TimeInterval = 2,
-        clock: @escaping Clock = Date.init,
+        sendRichDraft: @escaping SendRichDraft,
+        sendRichFinal: @escaping SendRichFinal,
         recordFailure: @escaping FailureRecorder = { _ in },
         persistDelivery: @escaping PersistDelivery,
-        sendGeneratedImage: @escaping @Sendable (String) async throws -> Void
+        holdDelivery: @escaping @Sendable () async throws -> Bool,
+        sendGeneratedImage: @escaping @Sendable (String, Data) async throws -> Void
     ) {
         self.token = token
         self.destination = destination
         self.draftId = Self.draftId(for: turnId)
         self.sendRichDraft = sendRichDraft
         self.sendRichFinal = sendRichFinal
-        self.richDraftInterval = max(0, richDraftInterval)
-        self.clock = clock
         self.recordFailure = recordFailure
         self.persistDelivery = persistDelivery
+        self.holdDelivery = holdDelivery
         self.sendGeneratedImage = sendGeneratedImage
     }
 
@@ -99,7 +109,7 @@ actor TelegramAssistantDeliveryDriver {
 
     private func flushRichDrafts() async {
         while pendingRichText != nil, !terminal, !draftsUnavailable {
-            let wait = richDraftInterval - clock().timeIntervalSince(lastRichDraftAt)
+            let wait = richDraftInterval - Date().timeIntervalSince(lastRichDraftAt)
             if wait > 0 {
                 do {
                     try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
@@ -110,17 +120,13 @@ actor TelegramAssistantDeliveryDriver {
             }
             guard let text = pendingRichText else { break }
             pendingRichText = nil
-            guard let sendRichDraft else {
-                draftsUnavailable = true
-                await recordFailure("Telegram native draft delivery is unavailable for chat \(destination.chatId)")
-                break
-            }
             // An opening code fence alone has no visible block yet. The next
             // delta can complete it without disabling the native preview.
             guard let rich = TelegramRichMessageRenderer.render(text).last else { continue }
             // One task owns the wire and claims this window before the send.
-            lastRichDraftAt = clock()
+            lastRichDraftAt = Date()
             do {
+                if try await holdDelivery() { draftsUnavailable = true; break }
                 try await sendRichDraft(token, destination, draftId, rich)
             } catch {
                 guard !terminal, !Task.isCancelled else { break }
@@ -155,10 +161,11 @@ actor TelegramAssistantDeliveryDriver {
             TelegramRichMessageRenderer.stripBoldMarkers(reply)
         )
         let messages = TelegramRichMessageRenderer.render(safeReply)
-        guard !messages.isEmpty else {
+        guard !messages.isEmpty || !(savedDelivery?.imagePaths ?? imagePaths).isEmpty else {
             return .failed(reason: "reply contained no safe user-visible content")
         }
         var delivery = savedDelivery ?? TelegramAssistantDeliveryState(reply: safeReply, imagePaths: imagePaths)
+        if !resendUnknown, let reason = delivery.rejectionReason { return .failed(reason: reason) }
         guard !delivery.outcomeUnknown || resendUnknown else {
             return .outcomeUnknown(reason: "use /retry resend to resend the unconfirmed part; it may arrive twice")
         }
@@ -167,25 +174,36 @@ actor TelegramAssistantDeliveryDriver {
             return .failed(reason: "saved reply delivery is inconsistent; check the Mac error log")
         }
         do {
-            try await persistDelivery(delivery)
-            guard let sendRichFinal else {
-                return .failed(reason: "native Telegram reply delivery is unavailable; use /retry after fixing the connection")
+            if resendUnknown, delivery.outcomeUnknown || delivery.lastRejection != nil {
+                delivery.outcomeUnknown = false
+                delivery.lastRejection = nil
+                try await persistDelivery(delivery)
             }
+            if try await holdDelivery() { return .held }
+            var preparedImages: [Data] = []
+            for path in (delivery.imagePaths ?? []).dropFirst(delivery.confirmedImageCount ?? 0) {
+                let bytes = try Data(contentsOf: URL(fileURLWithPath: path))
+                guard !bytes.isEmpty else {
+                    return .failed(reason: "Saved Telegram image is empty; restore it before delivering the answer.")
+                }
+                preparedImages.append(bytes)
+            }
+            if messages.isEmpty { return try await deliverGeneratedImages(&delivery, preparedImages: preparedImages) }
             for message in messages.dropFirst(delivery.confirmedMessageIds.count) {
                 // A crash after acceptance but before confirmation is uncertain,
                 // too. Persist that boundary before touching the wire.
                 delivery.outcomeUnknown = true
                 try await persistDelivery(delivery)
+                if try await holdDelivery() {
+                    delivery.outcomeUnknown = false
+                    try await persistDelivery(delivery)
+                    return .held
+                }
                 let messageId: Int
                 do {
                     messageId = try await sendRichFinal(token, destination, message)
                 } catch {
-                    if Self.isKnownNotDelivered(error) {
-                        var rejected = delivery
-                        rejected.outcomeUnknown = false
-                        try await persistDelivery(rejected)
-                        delivery = rejected
-                    }
+                    try await recordRejection(error, delivery: &delivery)
                     throw error
                 }
                 var confirmed = delivery
@@ -194,9 +212,10 @@ actor TelegramAssistantDeliveryDriver {
                 try await persistDelivery(confirmed)
                 delivery = confirmed
             }
-            return try await deliverGeneratedImages(&delivery)
+            return try await deliverGeneratedImages(&delivery, preparedImages: preparedImages)
         } catch {
             await reportFailure(step: "rich final", error: error)
+            if let reason = delivery.rejectionReason { return .failed(reason: reason) }
             if !delivery.outcomeUnknown {
                 return .failed(reason: "reply delivery failed; use /retry to deliver the saved answer")
             }
@@ -204,19 +223,19 @@ actor TelegramAssistantDeliveryDriver {
         }
     }
 
-    private func deliverGeneratedImages(_ delivery: inout TelegramAssistantDeliveryState) async throws -> TelegramAssistantDeliveryOutcome {
-        for path in (delivery.imagePaths ?? []).dropFirst(delivery.confirmedImageCount ?? 0) {
+    private func deliverGeneratedImages(_ delivery: inout TelegramAssistantDeliveryState, preparedImages: [Data]) async throws -> TelegramAssistantDeliveryOutcome {
+        for (path, bytes) in zip((delivery.imagePaths ?? []).dropFirst(delivery.confirmedImageCount ?? 0), preparedImages) {
             delivery.outcomeUnknown = true
             try await persistDelivery(delivery)
+            if try await holdDelivery() {
+                delivery.outcomeUnknown = false
+                try await persistDelivery(delivery)
+                return .held
+            }
             do {
-                try await sendGeneratedImage(path)
+                try await sendGeneratedImage(path, bytes)
             } catch {
-                if Self.isKnownNotDelivered(error) {
-                    var rejected = delivery
-                    rejected.outcomeUnknown = false
-                    try await persistDelivery(rejected)
-                    delivery = rejected
-                }
+                try await recordRejection(error, delivery: &delivery)
                 throw error
             }
             var confirmed = delivery
@@ -226,6 +245,22 @@ actor TelegramAssistantDeliveryDriver {
             delivery = confirmed
         }
         return .delivered(messageId: delivery.confirmedMessageIds.last)
+    }
+
+    private func recordRejection(_ error: Error, delivery: inout TelegramAssistantDeliveryState) async throws {
+        guard Self.isKnownNotDelivered(error) else { return }
+        var rejected = delivery
+        rejected.outcomeUnknown = false
+        if let failure = error as? TelegramAPIFailure,
+           failure.httpStatus != 429, failure.errorCode != 429,
+           (failure.httpStatus ?? 0) < 500, (failure.errorCode ?? 0) < 500 {
+            let reason = TelegramTurnPresentationReducer.sanitized(String(describing: failure)) ?? "delivery failed"
+            rejected.lastRejection = .init(
+                reason: "Reply rejected before acceptance: \(reason). Use /retry resend to deliver the saved answer.",
+                reply: rejected.reply, imagePaths: rejected.imagePaths)
+        }
+        try await persistDelivery(rejected)
+        delivery = rejected
     }
 
     func stop() async {

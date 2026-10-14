@@ -202,6 +202,7 @@ extension ChatStore {
                     messageID: correlationID,
                     preparedMessage: preparedMessage,
                     onPrepared: { [self] message in
+                        try await storage.flush()
                         guard let queuedSendID else { return }
                         guard let index = queuedSends.firstIndex(where: { $0.id == queuedSendID }) else {
                             throw CancellationError()
@@ -209,7 +210,7 @@ extension ChatStore {
                         queuedSends[index].preparedMessage = message
                         queuedSends[index].placeholderID = placeholderId
                         // Flush the exact envelope before the transport may accept it.
-                        try checkpointQueuedSend(queuedSendID)
+                        try await checkpointQueuedSend(queuedSendID)
                     }
                 )
                 if let queuedSendID { queuedSends.removeAll { $0.id == queuedSendID } }

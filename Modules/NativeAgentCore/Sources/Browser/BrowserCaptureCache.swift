@@ -9,22 +9,11 @@ public actor BrowserCaptureCache {
     public static let shared = BrowserCaptureCache()
 
     public struct Policy: Sendable {
-        public let maxBytes: Int
-        public let maxGroups: Int
-        public let maxAge: TimeInterval
-        public let maxArtifactBytes: Int
-        public let maxGroupBytes: Int
-
-        public init(maxBytes: Int = 128 * 1_024 * 1_024, maxGroups: Int = 256,
-                    maxAge: TimeInterval = 7 * 86_400,
-                    maxArtifactBytes: Int = 16 * 1_024 * 1_024,
-                    maxGroupBytes: Int = 32 * 1_024 * 1_024) {
-            self.maxBytes = maxBytes
-            self.maxGroups = maxGroups
-            self.maxAge = maxAge
-            self.maxArtifactBytes = maxArtifactBytes
-            self.maxGroupBytes = maxGroupBytes
-        }
+        public let maxBytes = 128 * 1_024 * 1_024
+        public let maxGroups = 256
+        public let maxAge: TimeInterval = 7 * 86_400
+        public let maxArtifactBytes = 16 * 1_024 * 1_024
+        public let maxGroupBytes = 32 * 1_024 * 1_024
 
         public var receipt: JSONValue {
             .object([
@@ -53,8 +42,7 @@ public actor BrowserCaptureCache {
         let date: Date
     }
 
-    public nonisolated let policy: Policy
-    public init(policy: Policy = Policy()) { self.policy = policy }
+    public nonisolated let policy = Policy()
 
     /// One serialized admission point for every canonical perception writer.
     /// Matching text/links/screenshots are evicted together; adding a later
@@ -122,11 +110,10 @@ public actor BrowserCaptureCache {
 
         var bytes = groups.values.flatMap { $0 }.reduce(0) { $0 + $1.bytes } + incomingBytes
         var count = groups.count + (groups[id] == nil ? 1 : 0)
-        let oldest = groups.filter { $0.key != id }.sorted {
-            ($0.value.map(\.date).max() ?? .distantPast) < ($1.value.map(\.date).max() ?? .distantPast)
-        }
-        for (_, entries) in oldest {
-            let date = entries.map(\.date).max() ?? .distantPast
+        let oldest = groups.filter { $0.key != id }.map { (_, entries) in
+            (entries: entries, date: entries.lazy.map(\.date).max() ?? .distantPast)
+        }.sorted { $0.date < $1.date }
+        for (entries, date) in oldest {
             guard now.timeIntervalSince(date) > policy.maxAge || bytes > policy.maxBytes || count > policy.maxGroups else { continue }
             for entry in entries {
                 // No recursive deletion or symlink following. Directory changes

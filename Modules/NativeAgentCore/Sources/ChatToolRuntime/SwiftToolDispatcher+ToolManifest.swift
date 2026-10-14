@@ -26,11 +26,12 @@ extension SwiftToolDispatcher {
     public func toolManifest(detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
         let fullDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "full"
         let access = await fullMacToolAccess(surface: surface)
-        let names = try await modelVisibleToolNames().sorted()
+        if fullDetail { MCPToolCatalogWarmer.shared.kickDetached(dataRoot: dataRoot) }
+        let catalog = await catalogSnapshot(includeSchemas: false)
+        let names = catalog.names.filter { !catalog.hiddenMCPNames.contains($0) && !Self.isModelHidden($0) }.sorted()
         let trustedRoots = await trustedWorkspaceRoots()
-        let schemas = try await (fullDetail ? listAvailableToolSchemas() : [])
-            .sorted { $0.name < $1.name }
         let modelNameSet = Self.modelVisibleCatalogToolNames(Set(names))
+        let schemas = fullDetail ? try await listAvailableToolSchemas(named: modelNameSet).sorted { $0.name < $1.name } : []
         let currentlyLoaded = Self.alwaysOnCoreNames.intersection(modelNameSet).sorted()
         let loadedSet = Set(currentlyLoaded)
         let contributedBuckets = Dictionary((appTools?.descriptors ?? []).map { ($0.name, $0.bucket) }) { first, _ in first }
@@ -61,7 +62,7 @@ extension SwiftToolDispatcher {
         }
         // Folded into app: listed as the actions they are, available by the
         // whole catalog rather than the model-visible names.
-        let listed = Set(try await listAvailableTools())
+        let listed = Set(catalog.names)
         let swiftBuilderTools = (Self.fullMacFileToolNames + Self.fullMacSystemToolNames + Self.fullMacBuilderToolNames + Self.fullMacRestartToolNames).sorted()
         let availableBuilderTools = swiftBuilderTools.filter { listed.contains($0) }.map { ToolNameAliases.appAction($0) ?? $0 }
         let lockedBuilderTools = swiftBuilderTools.filter { !listed.contains($0) }.map { ToolNameAliases.appAction($0) ?? $0 }
@@ -106,7 +107,7 @@ extension SwiftToolDispatcher {
             "outside_workspace_default": .string(access.outsideWorkspaceDefault),
             "file_ops_allowed": .bool(access.fileOpsAllowed),
             "system_allowed": .bool(access.systemAllowed),
-            "app_control_allowed": .bool(access.appControlAllowed),
+            "app_control_allowed": .bool(access.accessibilityAllowed),
             "builder_mode": .string(access.fileOpsAllowed ? "available" : "policy_locked"),
             "builder_mode_detail": .string(access.fileOpsAllowed
                 ? "Trust Center Full Mac file access is active. app's files.*, git.*, shell.run/shell.bash, files.patch, swift.build/swift.test and app.install/app.restart actions are all available (autonomy-gated)."

@@ -11,25 +11,6 @@ private struct AnyKey: CodingKey, Hashable {
     init?(intValue: Int) { return nil }
 }
 
-private extension KeyedDecodingContainer where Key == AnyKey {
-    func optional<T: Decodable>(_ name: String) -> T? {
-        try? decodeIfPresent(T.self, forKey: AnyKey(name))
-    }
-
-    func extras(excluding knownKeys: Set<String>) -> JSONValue? {
-        var unknown: [String: JSONValue] = [:]
-        for key in allKeys where !knownKeys.contains(key.stringValue) {
-            if let value = try? decode(JSONValue.self, forKey: key) {
-                unknown[key.stringValue] = value
-            }
-        }
-        if case .object(let explicit)? = optional("extras") as JSONValue? {
-            for (key, value) in explicit { unknown[key] = value }
-        }
-        return unknown.isEmpty ? nil : .object(unknown)
-    }
-}
-
 // MARK: - Background loop inspection and control
 //
 // BackgroundLoopsManager owns live workers and watchdog state in NativeAgent.app.
@@ -38,38 +19,29 @@ private extension KeyedDecodingContainer where Key == AnyKey {
 
 // MARK: - WatchdogStatus
 
-public struct WatchdogStatus: Sendable, Codable, Equatable {
-    public var daemon: String?
-    public var uptimeSeconds: Double?
-    public var daemonLifecycleStatus: String?
-    public var daemonLifecycleDetail: String?
-    public var launchAgentStatus: String?
-    public var launchAgentDetail: String?
-    public var runningImprovements: Int?
-    public var runningExecutions: Int?
+public struct WatchdogStatus: Sendable, Encodable, Equatable {
+    public var uptimeSeconds: Double
+    public var runtimeLifecycleStatus: String
+    public var runtimeLifecycleDetail: String
+    public var runningImprovements: Int
+    public var runningExecutions: Int
     public var lastActivity: JSONValue?
-    public var repairAvailable: Bool?
+    public var repairAvailable: Bool
     public var extras: JSONValue?
 
     public init(
-        daemon: String? = nil,
-        uptimeSeconds: Double? = nil,
-        daemonLifecycleStatus: String? = nil,
-        daemonLifecycleDetail: String? = nil,
-        launchAgentStatus: String? = nil,
-        launchAgentDetail: String? = nil,
-        runningImprovements: Int? = nil,
-        runningExecutions: Int? = nil,
+        uptimeSeconds: Double,
+        runtimeLifecycleStatus: String,
+        runtimeLifecycleDetail: String,
+        runningImprovements: Int,
+        runningExecutions: Int,
         lastActivity: JSONValue? = nil,
-        repairAvailable: Bool? = nil,
+        repairAvailable: Bool,
         extras: JSONValue? = nil
     ) {
-        self.daemon = daemon
         self.uptimeSeconds = uptimeSeconds
-        self.daemonLifecycleStatus = daemonLifecycleStatus
-        self.daemonLifecycleDetail = daemonLifecycleDetail
-        self.launchAgentStatus = launchAgentStatus
-        self.launchAgentDetail = launchAgentDetail
+        self.runtimeLifecycleStatus = runtimeLifecycleStatus
+        self.runtimeLifecycleDetail = runtimeLifecycleDetail
         self.runningImprovements = runningImprovements
         self.runningExecutions = runningExecutions
         self.lastActivity = lastActivity
@@ -88,35 +60,18 @@ public struct WatchdogStatus: Sendable, Codable, Equatable {
         "extras",
     ]
 
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: AnyKey.self)
-
-        self.daemon = c.optional("daemon")
-        self.uptimeSeconds = c.optional("uptimeSeconds")
-        self.daemonLifecycleStatus = c.optional("daemonLifecycleStatus")
-        self.daemonLifecycleDetail = c.optional("daemonLifecycleDetail")
-        self.launchAgentStatus = c.optional("launchAgentStatus")
-        self.launchAgentDetail = c.optional("launchAgentDetail")
-        self.runningImprovements = c.optional("runningImprovements")
-        self.runningExecutions = c.optional("runningMissions")
-        self.lastActivity = c.optional("lastActivity")
-        self.repairAvailable = c.optional("repairAvailable")
-
-        self.extras = c.extras(excluding: Self.knownKeys)
-    }
-
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: AnyKey.self)
-        try c.encodeIfPresent(daemon, forKey: AnyKey("daemon"))
-        try c.encodeIfPresent(uptimeSeconds, forKey: AnyKey("uptimeSeconds"))
-        try c.encodeIfPresent(daemonLifecycleStatus, forKey: AnyKey("daemonLifecycleStatus"))
-        try c.encodeIfPresent(daemonLifecycleDetail, forKey: AnyKey("daemonLifecycleDetail"))
-        try c.encodeIfPresent(launchAgentStatus, forKey: AnyKey("launchAgentStatus"))
-        try c.encodeIfPresent(launchAgentDetail, forKey: AnyKey("launchAgentDetail"))
-        try c.encodeIfPresent(runningImprovements, forKey: AnyKey("runningImprovements"))
-        try c.encodeIfPresent(runningExecutions, forKey: AnyKey("runningMissions"))
+        try c.encode("swift", forKey: AnyKey("daemon"))
+        try c.encode(uptimeSeconds, forKey: AnyKey("uptimeSeconds"))
+        try c.encode(runtimeLifecycleStatus, forKey: AnyKey("daemonLifecycleStatus"))
+        try c.encode(runtimeLifecycleDetail, forKey: AnyKey("daemonLifecycleDetail"))
+        try c.encode("not_applicable", forKey: AnyKey("launchAgentStatus"))
+        try c.encode("NativeAgent.app owns background loops; legacy daemon launch agents are retired.", forKey: AnyKey("launchAgentDetail"))
+        try c.encode(runningImprovements, forKey: AnyKey("runningImprovements"))
+        try c.encode(runningExecutions, forKey: AnyKey("runningMissions"))
         try c.encodeIfPresent(lastActivity, forKey: AnyKey("lastActivity"))
-        try c.encodeIfPresent(repairAvailable, forKey: AnyKey("repairAvailable"))
+        try c.encode(repairAvailable, forKey: AnyKey("repairAvailable"))
         if case .object(let obj)? = extras {
             for (k, v) in obj where !Self.knownKeys.contains(k) {
                 try c.encode(v, forKey: AnyKey(k))
@@ -255,26 +210,6 @@ private struct FailureReceiptIncident: Sendable {
         self.occurrences = max(1, occurrences)
     }
 
-    init?(row: JSONValue) {
-        guard case .object(let object) = row,
-              case .string("background_loop.failure")? = object["kind"],
-              case .string(let loopId)? = object["loopId"],
-              case .string(let error)? = object["error"] else {
-            return nil
-        }
-        let createdAt = Self.timestamp(from: object["createdAt"])
-        let firstAt = Self.timestamp(from: object["firstAt"]) ?? createdAt
-        let lastAt = Self.timestamp(from: object["lastAt"]) ?? createdAt
-        guard let firstAt, let lastAt else { return nil }
-        self.init(
-            loopId: loopId,
-            error: error,
-            firstAt: firstAt,
-            lastAt: lastAt,
-            occurrences: Self.occurrences(from: object["occurrences"])
-        )
-    }
-
     func toJSON(id: String) -> JSONValue {
         .object([
             "id": .string(id),
@@ -299,18 +234,6 @@ private struct FailureReceiptIncident: Sendable {
         )
     }
 
-    private static func timestamp(from value: JSONValue?) -> String? {
-        guard case .string(let raw)? = value else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func occurrences(from value: JSONValue?) -> Int {
-        guard case .int(let raw)? = value,
-              let exact = Int(exactly: raw),
-              exact > 0 else { return 1 }
-        return exact
-    }
 }
 
 /// A single periodic worker the scheduler drives. Neither entry point may
@@ -328,7 +251,7 @@ private struct FailureReceiptIncident: Sendable {
 /// observed. Swift cancellation is cooperative — a tick body that ignores
 /// it will keep running after `stop()` and the wrapping scheduler Task will
 /// leak even though it is marked cancelled. For callers that need a hard
-/// upper bound on a single tick, use `tickWithTimeout(_:timeout:)`.
+/// upper bound on a single tick, use `tickWithTimeoutOutcome(_:timeout:)`.
 public protocol LoopRunner: Sendable {
     var loopId: String { get }
     var interval: TimeInterval { get }
@@ -340,11 +263,6 @@ public protocol LoopRunner: Sendable {
     /// trace (audit 2026-06-09). Requirement (not extension-only) so the
     /// override dispatches dynamically through `any LoopRunner`.
     var tickTimeoutOverride: TimeInterval? { get }
-    /// Per-loop override for the scheduler's failure-backoff curve. nil → the
-    /// scheduler's default policy. A requirement (not extension-only) so the
-    /// override dispatches dynamically through `any LoopRunner`, exactly like
-    /// `tickTimeoutOverride`.
-    var failureBackoffPolicy: LoopFailureBackoffPolicy? { get }
     /// The honest per-tick outcome. Required — there is no default, so every
     /// loop implements it and the scheduler always records a real outcome
     /// rather than a swallowed `.completed`.
@@ -359,13 +277,30 @@ public protocol LoopRunner: Sendable {
 
 public extension LoopRunner {
     var tickTimeoutOverride: TimeInterval? { nil }
-    var failureBackoffPolicy: LoopFailureBackoffPolicy? { nil }
 
     func tick() async {
         _ = await tickOutcome()
     }
 
     func shutdown() async {}
+}
+
+/// A configured worker or a visible lane with no work to schedule.
+public enum LoopRegistration: Sendable {
+    case enabled(any LoopRunner)
+    case disabled(loopId: String, reason: String)
+
+    public var loopId: String {
+        switch self {
+        case .enabled(let runner): runner.loopId
+        case .disabled(let loopId, _): loopId
+        }
+    }
+
+    public var runner: (any LoopRunner)? {
+        if case .enabled(let runner) = self { return runner }
+        return nil
+    }
 }
 
 /// An event-first background worker with one optional exact persisted deadline.
@@ -392,7 +327,7 @@ public extension EventDeadlineLoopRunner {
     var eventCoalescingDelay: TimeInterval { 0.25 }
 }
 
-/// Thrown by `tickWithTimeout` when a tick exceeds its allotted budget.
+/// Thrown by `tickWithTimeoutOutcome` when a tick exceeds its allotted budget.
 public struct TickTimeoutError: Error, Equatable {
     public init() {}
 }
@@ -443,11 +378,6 @@ public func tickWithTimeoutOutcome(
     }
 }
 
-/// Compatibility wrapper for callers that only need deadline enforcement.
-public func tickWithTimeout(_ loop: any LoopRunner, timeout: TimeInterval) async throws {
-    _ = try await tickWithTimeoutOutcome(loop, timeout: timeout)
-}
-
 private enum TickRaceResult: Sendable {
     case finished(LoopTickOutcome)
     case timedOut
@@ -481,9 +411,7 @@ private func timeoutNanoseconds(_ seconds: TimeInterval) -> UInt64 {
     return UInt64(clamped * 1_000_000_000)
 }
 
-/// Snapshot of a registered loop's run state. All fields are last-write-wins
-/// from the scheduler's per-tick update; consumers should treat as
-/// point-in-time observations.
+/// Snapshot of the manager's settled outcomes and the scheduler's next wake.
 public struct LoopState: Sendable, Equatable {
     public var loopId: String
     public var lastTickAt: Date?
@@ -547,24 +475,23 @@ actor LoopTickAccounting {
     }
 }
 
-/// In-process scheduler that runs one Task per registered loop. start()
+/// In-process wake scheduler with one Task per configured loop. start()
 /// is idempotent at the per-loop level — calling start() twice will not
 /// double-spawn a tick task for any single loop. stop() cancels every
 /// outstanding task and clears them; loops remain registered and a fresh
 /// start() will reactivate them.
 public actor SwiftNativeLoopScheduler {
     /// A per-registration record. `registrationId` is the generation token
-    /// used to detect "tick finished AFTER its loop was unregistered" — see
-    /// `runOneTick`.
+    /// used to keep a retired wake from rescheduling a replacement.
     private struct Registration {
         let loop: any LoopRunner
         let registrationId: UUID
+        let wake: @Sendable () async -> Void
     }
     private var loops: [String: Registration] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var states: [String: LoopState] = [:]
     private let clock: @Sendable () -> Date
-    private let tickTimeout: TimeInterval
     private let failureReceiptsPath: URL?
     private let persistence = SwiftNativePersistenceCore()
     private var running: Bool = false
@@ -607,36 +534,25 @@ public actor SwiftNativeLoopScheduler {
     /// The last `OrganPulse` per organ, flushed under the "pulses" key.
     private var persistedPulses: [String: OrganPulse] = [:]
     package typealias PersistedLoopState = (
-        runs: [String: Date], completions: [String: Date], firstSeen: [String: Date], pulses: [String: OrganPulse]
+        runs: [String: Date], completions: [String: Date], firstSeen: [String: Date], pulses: [String: OrganPulse], available: Bool
     )
     private var persistedStateLoaded = false
     private var persistedStateLoad: Task<PersistedLoopState, Never>?
     public static let healthCheckpointInterval: TimeInterval = 60
     private let durableFlushImmediateInterval: TimeInterval
     private var lastDurableFlushAt: Date?
-    private var durableFlushCount = 0
     /// Slot counter used to fan overdue startup ticks out instead of firing
     /// every starved loop in the same instant. Reset on each `start()`.
     private var overdueStartupSlots = 0
 
-    // A4.2: loop failures are receipt-strong but push-silent (the github_tracking
-    // 633-receipts-unseen incident). Fire ONE push when a loop ENTERS a failure
-    // streak — never per-failure (the streak check below suppresses the
-    // steady-fail case; the cooldown bounds a flapping loop). App-injected so
-    // Core gains no MacSyncEngine/APNS dependency; nil in tests / headless.
-    // A4.8: push on the SECOND consecutive failure, not the first — a single
-    // transient blip (upstream 502, brief network drop) that recovers on the
-    // next tick must not page (the 03:17 double-page incident: one network
-    // blip failed telegram_poll + github_tracking once each, two pushes).
-    // Receipts still land on every failure regardless.
-    private var failureTransitionPush: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
-    /// App-injected inverse of `failureTransitionPush`. The scheduler asks it
-    /// to resolve a matching durable card after the first proven-healthy tick
-    /// on launch and after every surfaced failure episode.
+    /// Every failure files or refreshes the loop's one finding. Salience owns
+    /// attention; the scheduler keeps its receipts and execution backoff.
+    private var failureOutcome: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
+    /// Resolve the finding after the first proven-healthy tick on launch and
+    /// after every recorded failure episode.
     private var failureRecoveryPush:
         (@Sendable (_ loopId: String, _ healthyAt: Date) async -> Bool)?
     private var failureRecoveryProbePending: Set<String> = []
-    private var lastFailurePushAt: [String: Date] = [:]
     private var consecutiveFailures: [String: Int] = [:]
     /// FIX-13: the receipt row this process appended last. Coalescing a repeat
     /// failure is decided from this plus `consecutiveFailures`, so the feed is
@@ -653,25 +569,12 @@ public actor SwiftNativeLoopScheduler {
     /// Below it the cap is not evaluated at all, so an append costs one write
     /// rather than a full read + rewrite of the accumulated receipts.
     private static let failureReceiptTrimTriggerBytes = 1024 * 1024
-    private var failureStreakStartedAt: [String: Date] = [:]
-    private let failurePushCooldown: TimeInterval = 6 * 60 * 60
-    private let failurePushConsecutiveThreshold = 2
-    // A4.8 round 2 (User paged at 14:43 by a 6-second network blip): a
-    // consecutive-failure COUNT is a duration proxy that breaks on
-    // short-interval loops — slack retries every 2s, so "2 consecutive"
-    // spanned 4 seconds. The streak must also SPAN this long before it can
-    // knock. github (300s cadence) is unaffected: its 2-failure streak
-    // already spans 5 minutes.
-    private let failurePushMinStreakDuration: TimeInterval = 120
 
     /// `loopStatePath` holds the durable per-loop last-run map. When nil it is
     /// derived as a sibling of `failureReceiptsPath` — durable run state lives
-    /// beside the durable failure receipts, so the process-wide scheduler
-    /// (which already injects a receipts path) gets persistence automatically
-    /// while a bare in-test scheduler stays entirely in memory.
+    /// beside the durable failure receipts.
     public init(
         clock: @escaping @Sendable () -> Date = { Date() },
-        tickTimeout: TimeInterval = 300,
         failureReceiptsPath: URL? = nil,
         loopStatePath: URL? = nil,
         startupStagger: TimeInterval = 5,
@@ -682,7 +585,6 @@ public actor SwiftNativeLoopScheduler {
     ) {
         self.durableFlushImmediateInterval = max(0, durableFlushImmediateInterval)
         self.clock = clock
-        self.tickTimeout = tickTimeout
         self.failureReceiptsPath = failureReceiptsPath
         self.loopStatePath = loopStatePath ?? failureReceiptsPath?
             .deletingLastPathComponent()
@@ -775,13 +677,10 @@ public actor SwiftNativeLoopScheduler {
         return min(remaining, period)
     }
 
-    /// Inject the app-side failure-transition push. Called once at startup after
-    /// the app assembles the notification lane. Setting nil (default) keeps the
-    /// scheduler push-silent — receipts still land regardless.
-    public func setFailureTransitionPush(
-        _ push: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
+    public func setFailureOutcome(
+        _ outcome: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
     ) {
-        self.failureTransitionPush = push
+        self.failureOutcome = outcome
     }
 
     public func setFailureRecoveryPush(
@@ -790,7 +689,7 @@ public actor SwiftNativeLoopScheduler {
         self.failureRecoveryPush = push
     }
 
-    public func register(_ loop: any LoopRunner) async {
+    func register(_ loop: any LoopRunner, wake: @escaping @Sendable () async -> Void) async {
         let id = loop.loopId
         // Load durable last-run BEFORE any spawn so the first sleep can be the
         // remainder of the period rather than a fresh full interval.
@@ -827,7 +726,7 @@ public actor SwiftNativeLoopScheduler {
             tasks.removeValue(forKey: id)?.cancel()
             await previous.loop.shutdown()
         }
-        let reg = Registration(loop: loop, registrationId: UUID())
+        let reg = Registration(loop: loop, registrationId: UUID(), wake: wake)
         loops[id] = reg
         // One launch/replacement probe repairs a card left active by a prior
         // process. It resolves only after this registration proves health.
@@ -856,26 +755,13 @@ public actor SwiftNativeLoopScheduler {
         let removed = loops.removeValue(forKey: loopId)
         await removed?.loop.shutdown()
         states.removeValue(forKey: loopId)
-        // gpt-5.5 BLOCKING (A4.8 round 2): the transient streak state must
-        // die with the registration — a replacement loop inheriting a stale
-        // count + old streak stamp would page on its FIRST failure.
-        // `lastFailurePushAt` deliberately survives: that's cooldown state,
-        // and a reload must not reset the knock clock.
+        // A replacement loop starts its own execution backoff.
         consecutiveFailures.removeValue(forKey: loopId)
-        failureStreakStartedAt.removeValue(forKey: loopId)
         failureRecoveryProbePending.remove(loopId)
     }
 
     public func start() async {
         await loadPersistedStateIfNeeded()
-        if !hasStarted {
-            hasStarted = true
-            // Registration is complete at launch; hot reloads retain their clocks.
-            persistedLastRun = persistedLastRun.filter { loops[$0.key] != nil }
-            persistedLastCompleted = persistedLastCompleted.filter { loops[$0.key] != nil }
-            persistedFirstSeen = persistedFirstSeen.filter { loops[$0.key] != nil }
-            await flushLoopState()
-        }
         running = true
         overdueStartupSlots = 0
         for (_, reg) in loops {
@@ -893,10 +779,6 @@ public actor SwiftNativeLoopScheduler {
             await registration.loop.shutdown()
         }
         await flushLoopState()
-    }
-
-    public func loopState(loopId: String) async -> LoopState? {
-        states[loopId].map(withDurableCompletion)
     }
 
     public func allLoopStates() async -> [LoopState] {
@@ -940,7 +822,7 @@ public actor SwiftNativeLoopScheduler {
         let streak = consecutiveFailures[loopId] ?? 0
         let spacing: TimeInterval
         if streak > 0 {
-            let policy = registration.loop.failureBackoffPolicy ?? defaultFailureBackoff
+            let policy = defaultFailureBackoff
             spacing = max(
                 minimumTickSpacing,
                 policy.delay(forConsecutiveFailures: streak, jitter: jitter)
@@ -994,7 +876,7 @@ public actor SwiftNativeLoopScheduler {
                 }
                 if Task.isCancelled { return }
                 let tickStartedAt = await self.currentClock()
-                await self.runOneTick(loop: capturedLoop, registrationId: capturedRegId)
+                await reg.wake()
                 // Cooperative cancellation check immediately after tick
                 // returns — a tick that suspended a long time may have been
                 // raced by stop(); exit the loop before sleeping again.
@@ -1004,7 +886,10 @@ public actor SwiftNativeLoopScheduler {
                 // (see nextDelay: `interval` measured from tick end is what
                 // turned a 6h loop with a 25-minute tick into a 6h25m loop,
                 // permanently, across restarts).
-                delay = await self.nextDelay(for: capturedLoop, tickStartedAt: tickStartedAt)
+                guard let next = await self.nextDelay(
+                    for: capturedLoop, registrationId: capturedRegId, tickStartedAt: tickStartedAt
+                ) else { return }
+                delay = next
             }
         }
         tasks[id] = task
@@ -1036,14 +921,17 @@ public actor SwiftNativeLoopScheduler {
     ///
     /// Both branches are floored at `minimumTickSpacing` so a tick that
     /// outruns its own interval cannot become a busy spin.
-    private func nextDelay(for loop: any LoopRunner, tickStartedAt: Date) -> TimeInterval {
+    private func nextDelay(
+        for loop: any LoopRunner, registrationId: UUID, tickStartedAt: Date
+    ) -> TimeInterval? {
         let id = loop.loopId
+        guard loops[id]?.registrationId == registrationId else { return nil }
         let interval = max(0, loop.interval)
         let now = clock()
         let streak = consecutiveFailures[id] ?? 0
         let delay: TimeInterval
         if streak > 0 {
-            let policy = loop.failureBackoffPolicy ?? defaultFailureBackoff
+            let policy = defaultFailureBackoff
             let backoff = policy.delay(forConsecutiveFailures: streak, jitter: jitter)
             delay = max(minimumTickSpacing, max(interval, backoff))
         } else {
@@ -1066,12 +954,6 @@ public actor SwiftNativeLoopScheduler {
             states[id] = st
         }
         return delay
-    }
-
-    /// Test seam: the delay the periodic task would sleep next.
-    internal func _testNextDelay(loopId: String, tickStartedAt: Date) -> TimeInterval? {
-        guard let reg = loops[loopId] else { return nil }
-        return nextDelay(for: reg.loop, tickStartedAt: tickStartedAt)
     }
 
     // MARK: durable per-loop run state (LOOPS-4)
@@ -1112,7 +994,6 @@ public actor SwiftNativeLoopScheduler {
         }
     }
 
-    private var hasStarted = false
 
     /// A missing file yields no persisted history. A corrupt one is reported
     /// (readJSON keeps its bytes beside it) and also yields none, which
@@ -1120,15 +1001,19 @@ public actor SwiftNativeLoopScheduler {
     package static func readLoopState(
         _ path: URL?
     ) async -> PersistedLoopState {
-        guard let path else { return ([:], [:], [:], [:]) }
+        guard let path else { return ([:], [:], [:], [:], true) }
         let value: JSONValue
         do {
             value = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
         } catch {
             nativeLog("BackgroundLoops: loop state unreadable, starting with no run history: %@", "\(error)")
-            return ([:], [:], [:], [:])
+            return ([:], [:], [:], [:], false)
         }
-        guard case .object(let root) = value else { return ([:], [:], [:], [:]) }
+        return decodeLoopState(value)
+    }
+
+    package static func decodeLoopState(_ value: JSONValue) -> PersistedLoopState {
+        guard case .object(let root) = value else { return ([:], [:], [:], [:], false) }
         let iso = ISO8601DateFormatter()
         func stamps(_ key: String) -> [String: Date] {
             guard case .object(let rows)? = root[key] else { return [:] }
@@ -1155,7 +1040,7 @@ public actor SwiftNativeLoopScheduler {
                 pulses[organ] = OrganPulse(organ: organ, at: at, outcome: outcome, note: note, cadence: cadence)
             }
         }
-        return (stamps("loops"), stamps("completions"), stamps("firstSeen"), pulses)
+        return (stamps("loops"), stamps("completions"), stamps("firstSeen"), pulses, true)
     }
 
     /// Serializes the whole (small — one entry per loop id ever registered)
@@ -1164,7 +1049,6 @@ public actor SwiftNativeLoopScheduler {
     private func flushLoopState() async {
         guard let loopStatePath else { return }
         lastDurableFlushAt = clock()
-        durableFlushCount += 1
         let iso = ISO8601DateFormatter()
         var loops: [String: JSONValue] = [:]
         for (id, date) in persistedLastRun {
@@ -1236,128 +1120,6 @@ public actor SwiftNativeLoopScheduler {
         return Array(persistedPulses.values)
     }
 
-    private func runOneTick(loop: any LoopRunner, registrationId: UUID) async {
-        let accounting = LoopTickAccounting()
-        await LoopTickAccounting.$current.withValue(accounting) {
-            await runAndRecordTick(loop: loop, registrationId: registrationId)
-        }
-        await accounting.didRecord()
-    }
-
-    private func runAndRecordTick(loop: any LoopRunner, registrationId: UUID) async {
-        let id = loop.loopId
-        let effectiveTimeout = loop.tickTimeoutOverride ?? tickTimeout
-        do {
-            let outcome = try await tickWithTimeoutOutcome(loop, timeout: effectiveTimeout)
-            if Task.isCancelled { return }
-            guard loops[id]?.registrationId == registrationId else { return }
-            await record(outcome: outcome, loop: loop)
-            return
-        } catch is CancellationError {
-            return
-        } catch is TickTimeoutError {
-            if Task.isCancelled { return }
-            guard loops[id]?.registrationId == registrationId else { return }
-            let now = clock()
-            var st = states[id] ?? LoopState(loopId: id)
-            st.lastTickAt = now
-            st.nextTickAt = now.addingTimeInterval(loop.interval)
-            st.lastError = "timeout after \(formatTimeout(effectiveTimeout))"
-            st.lastResult = "failed"
-            st.tickCount += 1
-            states[id] = st
-            // A TIMED-OUT tick did not complete its body, so — exactly like the
-            // coalesced skip below — it must NOT advance the durable due clock.
-            // It previously did, which meant a weekly loop that always times
-            // out booked a fresh durable stamp every attempt and therefore
-            // never read as overdue: the starvation was invisible to Doctor and
-            // to the startup catch-up path (audit 2026-08-02).
-            let err = st.lastError ?? "timeout"
-            await appendFailureReceipt(loopId: id, error: err)
-            await maybePushFailureStreak(loopId: id, error: err, now: now)
-            return
-        } catch {
-            if Task.isCancelled { return }
-            guard loops[id]?.registrationId == registrationId else { return }
-            let now = clock()
-            var st = states[id] ?? LoopState(loopId: id)
-            st.lastTickAt = now
-            st.nextTickAt = now.addingTimeInterval(loop.interval)
-            st.lastError = String(describing: error)
-            st.lastResult = "failed"
-            st.tickCount += 1
-            states[id] = st
-            await recordDurableRun(loopId: id, at: now)
-            let err = st.lastError ?? "unknown error"
-            await appendFailureReceipt(loopId: id, error: err)
-            await maybePushFailureStreak(loopId: id, error: err, now: now)
-            return
-        }
-    }
-
-    private func record(outcome: LoopTickOutcome, loop: any LoopRunner) async {
-        let id = loop.loopId
-        let now = clock()
-        var st = states[id] ?? LoopState(loopId: id)
-        st.lastTickAt = now
-        st.nextTickAt = now.addingTimeInterval(loop.interval)
-        st.tickCount += 1
-        switch outcome {
-        case .completed(let result):
-            st.lastResult = result ?? "completed"
-            st.lastError = nil
-            st.lastCompletedAt = now
-            persistedLastCompleted[id] = now
-        case .skipped(let reason, _):
-            st.lastResult = "skipped: \(reason)"
-            // A HEALTH-NEUTRAL skip proves nothing about the loop's health, so
-            // it must not erase the standing failure. Clearing `lastError` on a
-            // `.backingOff` skip left `consecutiveFailures` nonzero while the
-            // error slot read nil, and Doctor's no-error path then reported the
-            // loop Healthy in the middle of its own failure-backoff window
-            // (gpt-5.5 NEEDS_FIX, audit 2026-08-02). Only a skip that IS
-            // evidence of health ("nothing due") clears it.
-            if !outcome.isHealthNeutralSkip { st.lastError = nil }
-        case .failed(let error):
-            st.lastResult = "failed"
-            st.lastError = error
-        }
-        states[id] = st
-        // A health-neutral skip did not actually execute the loop body, so it
-        // must not advance the durable due clock — otherwise overlapping wake
-        // traffic (coalesce) or a loop sitting in its own backoff window
-        // (.backingOff) would keep pushing a starved loop's next due time
-        // forward and the starvation would be invisible to restart catch-up.
-        if !outcome.isHealthNeutralSkip {
-            await recordDurableRun(loopId: id, at: now)
-        }
-        switch outcome {
-        case .failed(let error):
-            await appendFailureReceipt(loopId: id, error: error)
-            await maybePushFailureStreak(loopId: id, error: error, now: now)
-        case .skipped where outcome.isHealthNeutralSkip:
-            // Two shapes land here, neither of which is evidence of health:
-            //   * the coalesced skip — a periodic tick that joined an active
-            //     execution which may be failing right now (gpt-5.5 BLOCKING:
-            //     resetting here could hold a genuinely failing loop below the
-            //     push threshold under overlapping wake traffic);
-            //   * a loop-declared health-neutral skip — "I am backing off
-            //     BECAUSE I am failing" (TelegramPollLoop). Resetting on this
-            //     one meant the streak was cleared between every real failure
-            //     at the 0.25-2s tick cadence, so maybePushFailureStreak could
-            //     never reach its threshold and a revoked token / offline Mac
-            //     stayed silent forever (audit 2026-08-02, HIGH).
-            break
-        case .completed, .skipped:
-            consecutiveFailures[id] = 0
-            failureStreakStartedAt[id] = nil
-            if failureRecoveryProbePending.contains(id),
-               let recovery = failureRecoveryPush,
-               await recovery(id, now) {
-                failureRecoveryProbePending.remove(id)
-            }
-        }
-    }
 
     /// W1(b) upgrade campaign (L4-02): a closed lid is not a broken agent.
     /// 556 of 2,064 failure receipts over 32 days were literally "the
@@ -1387,24 +1149,15 @@ public actor SwiftNativeLoopScheduler {
         return false
     }
 
-    /// Network weather the loop's own cadence already retries: offline (above),
-    /// a timeout, an unreachable host, or the server's 5xx. It still counts
-    /// toward the streak and lands a receipt, but never files a card — there is
-    /// nothing for User to do (User, 2026-10-07: 139 telegram_poll blips).
-    /// Loops report either `String(describing:)` (domain + code) or only
-    /// `localizedDescription` (URLSession's own sentence), so both are matched.
+    /// Network weather belongs to the loop's retry cadence, not a finding.
     static func isRetriedNetworkError(_ error: String) -> Bool {
         if isOfflineError(error) { return true }
         let e = error.lowercased()
         if e.contains("nsurlerrordomain"), ["-1001", "-1003", "-1004", "-1005", "-1009"].contains(where: {
             e.contains("code=\($0)") || e.contains("code \($0)") || e.contains("error \($0)")
-        }) {
-            return true
-        }
+        }) { return true }
         if ["the request timed out", "could not connect to the server",
-            "a server with the specified hostname could not be found"].contains(where: e.contains) {
-            return true
-        }
+            "a server with the specified hostname could not be found"].contains(where: e.contains) { return true }
         return e.range(of: #"(server status|http) 5\d\d"#, options: .regularExpression) != nil
     }
 
@@ -1414,7 +1167,7 @@ public actor SwiftNativeLoopScheduler {
     /// that says nothing. Loops should build strings via
     /// `Self.describeLoopError(_:)`; this guard is the backstop for any string
     /// that arrives empty anyway.
-    static func describeLoopError(_ error: any Error) -> String {
+    package static func describeLoopError(_ error: any Error) -> String {
         let described = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         if !described.isEmpty { return described }
         let ns = error as NSError
@@ -1433,8 +1186,7 @@ public actor SwiftNativeLoopScheduler {
     ///   * a new row goes through the shared capped append, whose line cap is
     ///     amortized behind the same byte trigger `activity/events.jsonl` and
     ///     `traces/events.jsonl` already use.
-    /// The on-disk shape is unchanged, so `durableLastPushAt` and every other
-    /// reader still see one coalesced row per incident.
+    /// The on-disk shape is unchanged: one coalesced row per incident.
     private func appendFailureReceipt(loopId: String, error: String) async {
         guard let failureReceiptsPath else { return }
         guard !Self.isOfflineError(error) else { return }
@@ -1533,123 +1285,18 @@ public actor SwiftNativeLoopScheduler {
         return true
     }
 
-    /// A4.2/A4.8: count this failure into the loop's consecutive-failure
-    /// streak and fire the app-injected push once the streak has reached the
-    /// threshold (2) AND the per-loop 6h cooldown has elapsed. A single
-    /// transient blip that recovers on the next tick never pushes at all;
-    /// past the threshold the cooldown is what paces the knocking, so a
-    /// steady-failing loop pushes at most once per 6h for as long as it
-    /// keeps failing (gpt-5.5 BLOCKING: gating on streak == threshold let a
-    /// cooldown-suppressed streak stay push-silent for the rest of the
-    /// outage). The counter resets on real success/non-coalesced skip.
-    /// Receipts are unaffected — they always land.
-    private func maybePushFailureStreak(
-        loopId: String, error: String, now: Date
+    private func recordFailureOutcome(
+        loopId: String, error: String
     ) async {
-        // W1(b): offline blips neither count toward the streak nor push —
-        // and they don't RESET it either, so a real outage bracketed by
-        // wifi flaps keeps its accumulated evidence.
-        guard !Self.isOfflineError(error) else { return }
-        let streak = (consecutiveFailures[loopId] ?? 0) + 1
-        consecutiveFailures[loopId] = streak
-        if streak == 1 { failureStreakStartedAt[loopId] = now }
-        guard !Self.isRetriedNetworkError(error),
-              let push = failureTransitionPush else { return }
-        // Below threshold: could still be a self-healing blip.
-        guard streak >= failurePushConsecutiveThreshold else { return }
-        // Too brief: a short-interval loop can rack up "consecutive"
-        // failures within one network hiccup (the 2026-07-24 14:43 page:
-        // two slack failures 2s apart, recovered 4s later). Only a streak
-        // that has PERSISTED for the minimum duration is a real outage.
-        let streakStart = failureStreakStartedAt[loopId] ?? now
-        guard now.timeIntervalSince(streakStart) >= failurePushMinStreakDuration else { return }
-        // Cooldown gate: a recovered-then-failed flap can't knock more than once
-        // per 6h per loop. The in-memory map is backed by a durable push stamp
-        // in the failure-receipts feed so a relaunch can't reset the clock.
-        var lastPush = lastFailurePushAt[loopId]
-        if lastPush == nil {
-            lastPush = await durableLastPushAt(loopId: loopId)
-            if let lastPush { lastFailurePushAt[loopId] = lastPush }
+        if !Self.isOfflineError(error) {
+            consecutiveFailures[loopId, default: 0] += 1
         }
-        if let lastPush, now.timeIntervalSince(lastPush) < failurePushCooldown {
-            return
-        }
-        lastFailurePushAt[loopId] = now
-        await recordPushStamp(loopId: loopId, at: now)
         failureRecoveryProbePending.insert(loopId)
-        await push(loopId, error)
+        if !Self.isRetriedNetworkError(error) { await failureOutcome?(loopId, error) }
     }
 
-    /// Durable cooldown floor: the newest `failure_push` stamp for this loop in
-    /// the capped failure-receipts feed. Consulted only when the in-memory map
-    /// has no entry (fresh process); nil when no stamp or no feed.
-    private func durableLastPushAt(loopId: String) async -> Date? {
-        guard let failureReceiptsPath else { return nil }
-        let persistence = SwiftNativePersistenceCore()
-        let rows = (try? await persistence.readJSONL(failureReceiptsPath)) ?? []
-        let iso = ISO8601DateFormatter()
-        for row in rows.reversed() {
-            guard case .object(let o) = row,
-                  case .string("failure_push")? = o["kind"],
-                  case .string(let id)? = o["loopId"], id == loopId,
-                  case .string(let stamp)? = o["pushedAt"] else { continue }
-            return iso.date(from: stamp)
-        }
-        return nil
-    }
-
-    private func recordPushStamp(loopId: String, at now: Date) async {
-        guard let failureReceiptsPath else { return }
-        let persistence = SwiftNativePersistenceCore()
-        let row: JSONValue = .object([
-            "kind": .string("failure_push"),
-            "loopId": .string(loopId),
-            "pushedAt": .string(ISO8601DateFormatter().string(from: now)),
-        ])
-        try? await appendJSONLCapped(
-            row, to: failureReceiptsPath, using: persistence,
-            maxLines: JSONLLineCaps.backgroundLoopFailures,
-            logLabel: "BackgroundLoops.pushStamp"
-        )
-    }
-
-    private nonisolated func formatTimeout(_ seconds: TimeInterval) -> String {
-        if seconds.rounded() == seconds {
-            return "\(Int(seconds))s"
-        }
-        return "\(seconds)s"
-    }
-
-    /// Test hook: return the underlying Task for a registered loop so a
-    /// test can assert `isCancelled` AFTER `stop()` has removed it from
-    /// the dict. Cancellation state lives on the Task itself and survives
-    /// the dict eviction.
-    internal func _testTaskHandle(loopId: String) -> Task<Void, Never>? {
-        tasks[loopId]
-    }
-
-    /// Test hook: synchronously run one tick for the current registration.
-    /// This exercises the same generation and state-update path as the
-    /// background task without depending on wall-clock scheduler wakeups.
-    internal func _testRunOneTick(loopId: String) async {
-        guard let reg = loops[loopId] else { return }
-        await runOneTick(loop: reg.loop, registrationId: reg.registrationId)
-    }
-
-    /// Test hook: record a tick failure into the loop's state. tick() itself
-    /// is non-throwing by protocol contract, but DoctorAutoRunLoop and future
-    /// loops may want to surface failures they catch internally. They do that
-    /// by calling this from their tick body (via a SchedulerHandle pattern in
-    /// a future iteration) — for Phase B we expose it on the actor so tests
-    /// can verify the lastError slot wires correctly.
-    ///
-    /// `advanceDurableRun: false` records the failure WITHOUT booking a fresh
-    /// durable last-run stamp. The out-of-band timeout path passes false so it
-    /// agrees with the periodic path (`runOneTick`'s TickTimeoutError catch): a
-    /// tick that never finished its body is not a run, and a weekly loop that
-    /// always times out must keep reading as overdue across restarts instead of
-    /// re-arming a week-long sleep every attempt (gpt-5.5 BLOCKING, 2026-08-02).
-    public func recordFailure(
+    /// A timeout records failure without advancing the durable due clock.
+    func recordFailure(
         loopId: String, error: String, advanceDurableRun: Bool = true
     ) async {
         var st = states[loopId] ?? LoopState(loopId: loopId)
@@ -1658,18 +1305,21 @@ public actor SwiftNativeLoopScheduler {
         st.lastTickAt = now
         st.tickCount += 1
         st.lastResult = "failed"
+        if let reg = loops[loopId] {
+            st.nextTickAt = now.addingTimeInterval(reg.loop.interval)
+        }
         states[loopId] = st
         if advanceDurableRun {
             await recordDurableRun(loopId: loopId, at: now)
         }
         await appendFailureReceipt(loopId: loopId, error: error)
-        await maybePushFailureStreak(loopId: loopId, error: error, now: now)
+        await recordFailureOutcome(loopId: loopId, error: error)
     }
 
     /// `completedWork: false` records the tick without advancing the durable
     /// last-COMPLETED stamp — the out-of-band `.skipped` path passes it so a
     /// lane that only ever skips cannot masquerade as productive (C8).
-    public func recordResult(
+    func recordResult(
         loopId: String, result: String, completedWork: Bool = true
     ) async {
         var st = states[loopId] ?? LoopState(loopId: loopId)
@@ -1680,114 +1330,18 @@ public actor SwiftNativeLoopScheduler {
             st.lastCompletedAt = now
             persistedLastCompleted[loopId] = now
         }
-        // A manual/event-driven run is a real tick for LIVE health too, not
-        // just the durable clock: without these stamps Doctor keeps reading
-        // the old overdue nextTickAt until the periodic task happens to fire
-        // (gpt-5.5 review MEDIUM). If the periodic task is scheduled sooner
-        // than now+interval it will fire and re-stamp — a forward claim here
-        // can only make Doctor less alarmist, never hide a missed tick.
         st.lastTickAt = now
+        st.tickCount += 1
         if let reg = loops[loopId] {
             st.nextTickAt = now.addingTimeInterval(reg.loop.interval)
         }
         states[loopId] = st
-        // An out-of-band execution (manager.runTickOnce) is still a real run:
-        // it must advance the durable due clock or a manual/event-driven tick
-        // would leave the loop looking permanently overdue across restarts.
         await recordDurableRun(loopId: loopId, at: now)
         consecutiveFailures[loopId] = 0
-        failureStreakStartedAt[loopId] = nil
         if failureRecoveryProbePending.contains(loopId),
            let recovery = failureRecoveryPush,
            await recovery(loopId, now) {
             failureRecoveryProbePending.remove(loopId)
         }
     }
-
-    /// Test seam: the loop's live consecutive-failure streak.
-    internal func _testConsecutiveFailures(loopId: String) -> Int {
-        consecutiveFailures[loopId] ?? 0
-    }
-
-    /// Test seam: the durable last-run stamp the scheduler would restart from.
-    internal func _testPersistedLastRun(loopId: String) -> Date? {
-        persistedLastRun[loopId]
-    }
-
-    /// Test seam: how many whole-file serialize + atomic-rename writes of the
-    /// durable loop-state map have actually happened (A1/FIX-3).
-    internal func _testDurableFlushCount() -> Int { durableFlushCount }
-
-    internal func _testFailureReceiptRows() async -> [JSONValue] {
-        guard let failureReceiptsPath else { return [] }
-        return (try? await persistence.readJSONL(failureReceiptsPath)) ?? []
-    }
-}
-
-// MARK: - DoctorAutoRunLoop
-
-import DoctorChecks
-
-/// Periodically calls the app's bounded Doctor run and
-/// serializes the result to `<dataRoot>/doctor/latest.json` atomically via
-/// SwiftNativePersistenceCore.writeJSON.
-///
-/// tick() remains non-throwing, but doctor or storage failure is a typed failed
-/// outcome. A transient error may recover next tick; hiding it as success would
-/// make the health owner lie about the body it is meant to inspect.
-public struct DoctorAutoRunLoop: LoopRunner {
-    public let loopId: String = "doctor_auto_run"
-    public let interval: TimeInterval
-    private let runChecks: @Sendable () async throws -> [CheckResult]
-    private let storage: @Sendable () async throws -> URL
-
-    /// `storage` returns the directory that will hold `latest.json`. Default
-    /// resolves to `<defaultDataRoot()>/doctor`. The closure is async/throws
-    /// so callers can plug in env-derived roots or mkdir-on-demand logic
-    /// without forcing the work onto every callsite.
-    public init(
-        interval: TimeInterval,
-        runChecks: @escaping @Sendable () async throws -> [CheckResult],
-        storage: @escaping @Sendable () async throws -> URL = { defaultDoctorStorageDir() }
-    ) {
-        self.interval = interval
-        self.runChecks = runChecks
-        self.storage = storage
-    }
-
-    public func tickOutcome() async -> LoopTickOutcome {
-        do {
-            // Astra audit 2026-09-11 finding 6: the snapshot carried ONE clock,
-            // stamped when the JSON was encoded, and every reader treated it as
-            // the age of the measurement. Take the measurement clock here,
-            // before a single check runs, and let `runAt` go on meaning exactly
-            // what it always meant — when this file was written.
-            let measuredAt = Date()
-            let results = try await runChecks()
-            // No checks ran ⇒ nothing was inspected. Persisting `{"checks":[]}`
-            // would be worse than useless: every reader derives "healthy" from
-            // "no check has status fail", so an empty snapshot reads as a clean
-            // bill of health for a body nobody examined.
-            guard !results.isEmpty else {
-                return .skipped(reason: "doctor produced no check results")
-            }
-            let dir = try await storage()
-            // Two clocks, never one: `runAt` is when this file was written,
-            // `measuredAt` when the checks were asked — the age of the findings.
-            let formatter = ISO8601DateFormatter()
-            try await DoctorStatusProjection.persistDoctorSnapshot(
-                results, to: dir.appendingPathComponent("latest.json"),
-                runAt: formatter.string(from: Date()), measuredAt: formatter.string(from: measuredAt))
-            return .completed(result: "doctor snapshot persisted (\(results.count) check(s))")
-        } catch {
-            FileHandle.standardError.write(Data("DoctorAutoRunLoop: tick failed: \(error)\n".utf8))
-            return .failed(error: String(describing: error))
-        }
-    }
-}
-
-/// Default storage directory for DoctorAutoRunLoop's latest.json output.
-/// Exposed at file scope so tests can compute the expected path.
-public func defaultDoctorStorageDir() -> URL {
-    defaultDataRoot().appendingPathComponent("doctor", isDirectory: true)
 }

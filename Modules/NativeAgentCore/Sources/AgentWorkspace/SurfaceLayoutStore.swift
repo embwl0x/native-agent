@@ -58,7 +58,7 @@ public enum SurfaceLayoutStore {
     /// was read, which a hand edit since moves as a write does. The write
     /// bumps layoutVersion and keeps the replaced file as
     /// layout.previous.json; writing that back, at whatever version, undoes it.
-    public static func write(_ document: JSONValue, expectedVersion: String, dataRoot: URL) -> JSONValue {
+    public static func write(_ document: JSONValue, expectedVersion: String, dataRoot: URL, undoing receipt: JSONValue? = nil) -> JSONValue {
         guard case .object(let parts) = document else {
             return refused("invalid_layout", "layout is an object: layout.read's layout, or only the surfaces, profiles or phone it changes.")
         }
@@ -69,6 +69,9 @@ public enum SurfaceLayoutStore {
                     refresh(&state)
                     // A file that does not read is fixed by hand, never written over.
                     if let problem = state.problem { return refused("invalid_file", problem) }
+                    if case .object(let receipt) = receipt, receipt["version"] != .string(version(state.layout)) {
+                        return refused("stale_layout", "The layout changed after that receipt. Read it again with layout.read.")
+                    }
                     guard case .object(var merged)? = try? JSONValue.fromEncodable(state.layout) else { return refused("write_failed", "The layout could not be read.") }
                     for (key, value) in parts {
                         if case .object(let named) = value, case .object(var current)? = merged[key] {
@@ -96,7 +99,7 @@ public enum SurfaceLayoutStore {
                         "previous": .string(previous(state.root).path),
                         "detail": .string((restored.map { "Restored layout version \($0) as version \(saved.layoutVersion). " }
                             ?? "The layout is version \(saved.layoutVersion) now. ")
-                            + "The window shows it now. Writing the previous one back with layout.write undoes it.")]
+                            + "The window shows it now. One call undoes it: app {action: undo}.")]
                     if let restored { receipt["restored_version"] = .int(Int64(restored)) }
                     return .object(receipt)
                 }
@@ -279,9 +282,9 @@ public final class SurfaceLayoutLive {
     private init() {}
 
     /// At launch, before a window draws: the host's root and its layout.
-    public func attach(dataRoot: URL) {
+    public func attach(dataRoot: URL) async {
         root = dataRoot
-        layout = SurfaceLayoutStore.layout(dataRoot: dataRoot)
+        layout = await Task.detached { SurfaceLayoutStore.layout(dataRoot: dataRoot) }.value
     }
 
     /// The window's one watch, for as long as it is up (`ContentView`).

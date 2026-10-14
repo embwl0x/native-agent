@@ -8,9 +8,6 @@ public enum ContextFlowMode: String, Codable, CaseIterable, Sendable {
 
 public protocol ContextRequiredDocumentMirrorProviding: Sendable {
     func requiredDocumentMirrors() async throws -> [RequiredDocumentMirror]
-}
-
-public protocol ContextSourceRegistrationRefreshing: Sendable {
     func refreshContextSources(in registry: ContextSourceRegistry) async throws
 }
 
@@ -24,11 +21,6 @@ public protocol ContextMarkdownCompiling: Sendable {
 }
 
 extension ContextMarkdownCompiler: ContextMarkdownCompiling {}
-
-public struct EmptyContextRequiredDocumentMirrorProvider: ContextRequiredDocumentMirrorProviding {
-    public init() {}
-    public func requiredDocumentMirrors() async throws -> [RequiredDocumentMirror] { [] }
-}
 
 public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
     public let mode: ContextFlowMode
@@ -144,9 +136,14 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private var lastVacuumAt: Date?
     private let vacuumInterval: TimeInterval = 24 * 3_600
     private var activeStoredGeneration: ContextStoredGeneration?
+    private var activeCompiledSources: [ContextSourceID: ContextCompiledSource] = [:]
     private let feedbackReducer = ContextFeedbackReducer()
     private var feedbackEvents: [ContextFeedbackEvent] = []
     private var feedbackOrdinal: UInt64 = 0
+    private var cachedFeedback: (
+        generationID: Int64, feedbackOrdinal: UInt64, timeBucket: Int64,
+        snapshot: ContextFeedbackSnapshot
+    )?
     /// Bounded USER.md precoverage outcome reporting — one line per distinct
     /// state (success, non-application, failure) instead of one per turn.
     private var precoverageReporter = PrecoverageOutcomeReporter()
@@ -172,9 +169,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     /// from walking every source and atom merely to rebuild the same authority
     /// sets. Turn-local feedback and all live-only side effects stay outside.
     private var generationDerivedCache: [GenerationDerivedCacheKey: GenerationDerivedTurnState] = [:]
-    private var generationDerivedCacheHitCount = 0
-    private var generationDerivedComputationCount = 0
-    private var generationDerivedInvalidationCount = 0
     /// Error-level diagnostic sink. Injected so tests can prove the dead-lane
     /// alarm actually fires; production keeps nativeLog (Console.app / the app's
     /// log stream), matching the provenance-MISS line added in 218fb021.
@@ -257,13 +251,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
     }
 
-    struct GenerationDerivedCacheMetrics: Equatable, Sendable {
-        let hitCount: Int
-        let computationCount: Int
-        let invalidationCount: Int
-        let entryCount: Int
-    }
-
     private struct GenerationDerivedTurnState: Sendable {
         let allowedSourceIDs: Set<ContextSourceID>
         let precoveredSourceIDs: Set<ContextSourceID>
@@ -279,7 +266,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         arena: ContextArena,
         registry: ContextSourceRegistry,
         compiler: any ContextMarkdownCompiling,
-        mirrorProvider: any ContextRequiredDocumentMirrorProviding = EmptyContextRequiredDocumentMirrorProvider(),
+        mirrorProvider: any ContextRequiredDocumentMirrorProviding,
         compiledProjectionProviders: [any ContextCompiledProjectionProvider] = [],
         selector: ContextSelector = ContextSelector(),
         diagnostics: @escaping @Sendable (String) -> Void = { nativeLog("%@", $0) }
@@ -322,6 +309,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         monitor = nil
         started = false
         activeStoredGeneration = nil
+        activeCompiledSources.removeAll()
+        cachedFeedback = nil
         prewarmPlans.removeAll()
         invalidateGenerationDerivedCache()
     }
@@ -329,7 +318,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     public func reconcileAfterWake() async {
         guard mode != .off else { return }
         _ = try? arena.applyMemoryPressure(.normal)
-        _ = await prewarmPlanner.setResourcePressure(.normal)
+        await prewarmPlanner.setResourcePressure(.normal)
         await reconcileAll(reason: "wake")
         await refreshWatchedDirectories()
     }
@@ -411,7 +400,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
 
     public func applyMemoryPressure(_ pressure: ContextArenaPressure) async throws -> ContextArenaTrimReceipt {
         let receipt = try arena.applyMemoryPressure(pressure)
-        _ = await prewarmPlanner.setResourcePressure(pressure)
+        await prewarmPlanner.setResourcePressure(pressure)
         if pressure != .normal { prewarmPlans.removeAll() }
         try? await store.recordReceipt(ContextStoreReceipt(
             kind: .pressure,
@@ -434,52 +423,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         try arena.acquireSnapshot()
     }
 
-    private enum TurnPreparationPolicy {
-        case live
-        case frozen
-
-        var recordsSideEffects: Bool {
-            switch self {
-            case .live: true
-            case .frozen: false
-            }
-        }
-    }
-
-    public func prepareTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
-        try await prepareTurn(request, policy: .live)
-    }
-
-    /// Pin and select from the already-published generation without recovery,
-    /// feedback mutation, prewarm continuity, or store receipts. The returned
-    /// lease remains valid until the prepared turn is released.
-    public func prepareFrozenTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
-        try await prepareTurn(request, policy: .frozen)
-    }
-
-    /// Pure revision read for before/after epoch coherence checks.
-    public func frozenRevision() -> ContextFrozenRevision? {
-        guard let generation = activeStoredGeneration,
-              let arenaGenerationID = arena.currentSnapshot()?.generationID
-        else { return nil }
-        return ContextFrozenRevision(
-            generationID: generation.generation.id,
-            sourceFingerprint: generation.generation.sourceFingerprint,
-            arenaGenerationID: arenaGenerationID
-        )
-    }
-
-    /// Deterministic operation-count evidence for the generation-derived turn
-    /// cache. Kept internal so tests can prove reuse without timing the host.
-    func generationDerivedCacheMetrics() -> GenerationDerivedCacheMetrics {
-        GenerationDerivedCacheMetrics(
-            hitCount: generationDerivedCacheHitCount,
-            computationCount: generationDerivedComputationCount,
-            invalidationCount: generationDerivedInvalidationCount,
-            entryCount: generationDerivedCache.count
-        )
-    }
-
     private func generationDerivedTurnState(
         generation: ContextStoredGeneration,
         request: ContextTurnRequest,
@@ -495,11 +438,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             excludedSourceOwners: excludedSourceOwners
         )
         if let cached = generationDerivedCache[key] {
-            generationDerivedCacheHitCount += 1
             return cached
         }
 
-        generationDerivedComputationCount += 1
         let personaPrefix = ContextPersonaSourceNaming.locatorPrefix(for: mirror.personaID)
         let normalizedPersonaID = mirror.personaID.rawValue
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -612,10 +553,12 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private func invalidateGenerationDerivedCache() {
         guard !generationDerivedCache.isEmpty else { return }
         generationDerivedCache.removeAll(keepingCapacity: true)
-        generationDerivedInvalidationCount += 1
     }
 
     private func activateStoredGeneration(_ stored: ContextStoredGeneration) {
+        if activeStoredGeneration?.generation.id != stored.generation.id {
+            activeCompiledSources = Self.previousCompiledSources(stored)
+        }
         if let activeStoredGeneration,
            activeStoredGeneration.generation.id != stored.generation.id
                 || activeStoredGeneration.generation.sourceFingerprint
@@ -626,24 +569,19 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         activeStoredGeneration = stored
     }
 
-    private func prepareTurn(
-        _ request: ContextTurnRequest,
-        policy: TurnPreparationPolicy
-    ) async throws -> ContextPreparedTurn {
+    public func prepareTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
         guard started, mode != .off else {
             throw ContextTurnPreparationError.coordinatorNotStarted
         }
-        if activeStoredGeneration == nil, policy.recordsSideEffects {
+        if activeStoredGeneration == nil {
             await reconcileAll(reason: "turn_generation_recovery")
         }
-        if policy.recordsSideEffects {
-            let live = Set(compiledProjectionProviders.filter(\.refreshesBeforeTurn).map(\.projectionIdentifier))
-            if !live.isEmpty {
-                let reconciled = await reconcileLiveSources(live)
-                try Task.checkCancellation()
-                guard started, mode != .off else { throw ContextTurnPreparationError.coordinatorNotStarted }
-                guard reconciled else { throw ContextTurnPreparationError.generationUnavailable }
-            }
+        let live = Set(compiledProjectionProviders.filter(\.refreshesBeforeTurn).map(\.projectionIdentifier))
+        if !live.isEmpty {
+            let reconciled = await reconcileLiveSources(live)
+            try Task.checkCancellation()
+            guard started, mode != .off else { throw ContextTurnPreparationError.coordinatorNotStarted }
+            guard reconciled else { throw ContextTurnPreparationError.generationUnavailable }
         }
         guard let generation = activeStoredGeneration else {
             throw ContextTurnPreparationError.generationUnavailable
@@ -724,18 +662,16 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             // agent (a configured-name slot) makes the two digests
             // collide. That overlap is itself worth a look, so it is not
             // special-cased away.
-            if policy.recordsSideEffects {
-                if generationDerived.slotScopedMemorySourceCount > 0 {
-                    diagnostics(
-                        "[context-flow] ERROR memory-scope vocabulary drift: "
-                        + "\(generationDerived.slotScopedMemorySourceCount) live memory source(s) are scoped by "
-                        + "persona SLOT id \"\(mirror.personaID.rawValue)\" (prefix "
-                        + "\(generationDerived.memoryPersonaPrefix)). MemoryV2 record persona ids are AGENT NAMES; "
-                        + "a slot-id-scoped record means the two vocabularies merged. Memory is "
-                        + "deliberately shared across persona slots — re-review that decision "
-                        + "before shipping a per-slot memory shard."
-                    )
-                }
+            if generationDerived.slotScopedMemorySourceCount > 0 {
+                diagnostics(
+                    "[context-flow] ERROR memory-scope vocabulary drift: "
+                    + "\(generationDerived.slotScopedMemorySourceCount) live memory source(s) are scoped by "
+                    + "persona SLOT id \"\(mirror.personaID.rawValue)\" (prefix "
+                    + "\(generationDerived.memoryPersonaPrefix)). MemoryV2 record persona ids are AGENT NAMES; "
+                    + "a slot-id-scoped record means the two vocabularies merged. Memory is "
+                    + "deliberately shared across persona slots — re-review that decision "
+                    + "before shipping a per-slot memory shard."
+                )
             }
             // SCOPE, stated once so it stops being re-discovered: precoverage
             // decides whether the USER.md CONTEXT SOURCE's atoms enter this
@@ -753,8 +689,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             // `persona.docChars` counts the mirror's documents, NOT the bytes
             // sent; `system.stableChars` is what ships. A successful precoverage
             // leaves both unchanged by design — that is not evidence it failed.
-            if policy.recordsSideEffects,
-               let line = precoverageReporter.message(for: generationDerived.userPrecoverage) {
+            if let line = precoverageReporter.message(for: generationDerived.userPrecoverage) {
                 diagnostics(line)
             }
             if request.queryEmbedding != nil, let model = request.queryEmbeddingModelID,
@@ -857,56 +792,53 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     measureLatency: true
                 )
             }
-            let recordsFeedback = policy.recordsSideEffects
-                && !Self.isTestSession(request.sessionID)
-            if policy.recordsSideEffects {
-                if recordsFeedback {
-                    await recordFeedback(
-                        signal: .selection,
-                        atomIDs: packet.receipt.selectedAtomIDs,
-                        evidenceIDs: [packet.receipt.id],
-                        generationID: generation.generation.id
-                    )
-                }
-                Task { [weak self] in
-                    await self?.observePrewarmContinuity(
-                        request: request,
-                        packet: packet,
-                        generation: generation,
-                        snapshot: lease.snapshot
-                    )
-                }
-                let store = self.store
-                let selectionReceipt = ContextStoreReceipt(
-                    kind: .selection,
-                    generationID: packet.generationID,
-                    summary: "context selection",
-                    details: [
-                        "receipt_id": packet.receipt.id,
-                        "surface": request.surface.rawValue,
-                        "selected": String(packet.selectedItems.count),
-                        "pointers": String(packet.expandablePointers.count),
-                        "mandatory_coverage": String(packet.receipt.mandatoryCoverage),
-                        "characters": String(packet.characterCount),
-                        "budget_expanded": budgetExpansion.map { _ in "true" } ?? "false",
-                        "requested_character_budget": String(request.characterBudget),
-                        "effective_character_budget": String(need.characterBudget),
-                        "maximum_character_budget": String(request.maximumCharacterBudget),
-                        "granted_post_mandatory_reserve": String(
-                            budgetExpansion?.grantedPostMandatoryReserve ?? 0
-                        ),
-                        // Absence is evidence. Do not serialize it as 0:
-                        // a missing/non-monotonic latency sample is not a
-                        // fast selection and must stay out of live windows.
-                        "selection_microseconds": packet.receipt.measuredSelectionMicroseconds
-                            .map { String($0) } ?? "absent",
-                        "selection_latency_provenance": packet.receipt.selectionLatencyProvenance?
-                            .rawValue ?? ContextSelectionLatencyProvenance.unavailable.rawValue,
-                    ]
+            let recordsFeedback = !Self.isTestSession(request.sessionID)
+            if recordsFeedback {
+                await recordFeedback(
+                    signal: .selection,
+                    atomIDs: packet.receipt.selectedAtomIDs,
+                    evidenceIDs: [packet.receipt.id],
+                    generationID: generation.generation.id
                 )
-                Task.detached(priority: .background) {
-                    try? await store.recordReceipt(selectionReceipt)
-                }
+            }
+            Task { [weak self] in
+                await self?.observePrewarmContinuity(
+                    request: request,
+                    packet: packet,
+                    generation: generation,
+                    snapshot: lease.snapshot
+                )
+            }
+            let store = self.store
+            let selectionReceipt = ContextStoreReceipt(
+                kind: .selection,
+                generationID: packet.generationID,
+                summary: "context selection",
+                details: [
+                    "receipt_id": packet.receipt.id,
+                    "surface": request.surface.rawValue,
+                    "selected": String(packet.selectedItems.count),
+                    "pointers": String(packet.expandablePointers.count),
+                    "mandatory_coverage": String(packet.receipt.mandatoryCoverage),
+                    "characters": String(packet.characterCount),
+                    "budget_expanded": budgetExpansion.map { _ in "true" } ?? "false",
+                    "requested_character_budget": String(request.characterBudget),
+                    "effective_character_budget": String(need.characterBudget),
+                    "maximum_character_budget": String(request.maximumCharacterBudget),
+                    "granted_post_mandatory_reserve": String(
+                        budgetExpansion?.grantedPostMandatoryReserve ?? 0
+                    ),
+                    // Absence is evidence. Do not serialize it as 0:
+                    // a missing/non-monotonic latency sample is not a
+                    // fast selection and must stay out of live windows.
+                    "selection_microseconds": packet.receipt.measuredSelectionMicroseconds
+                        .map { String($0) } ?? "absent",
+                    "selection_latency_provenance": packet.receipt.selectionLatencyProvenance?
+                        .rawValue ?? ContextSelectionLatencyProvenance.unavailable.rawValue,
+                ]
+            )
+            Task.detached(priority: .background) {
+                try? await store.recordReceipt(selectionReceipt)
             }
             let feedbackHandler: (@Sendable (
                 ContextFeedbackSignal,
@@ -925,14 +857,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             } else {
                 feedbackHandler = nil
             }
-            let deliveryHandler: (@Sendable ([ContextPacketItem]) async -> Void)?
-            if policy.recordsSideEffects {
-                let providers = compiledProjectionProviders
-                deliveryHandler = { items in
-                    for provider in providers { await provider.didDeliver(items) }
-                }
-            } else {
-                deliveryHandler = nil
+            let providers = compiledProjectionProviders
+            let deliveryHandler: @Sendable ([ContextPacketItem]) async -> Void = { items in
+                for provider in providers { await provider.didDeliver(items) }
             }
             return ContextPreparedTurn(
                 mode: mode,
@@ -965,7 +892,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             arenaMetrics: metrics,
             pendingPrewarmHints: await prewarmPlanner.pendingHintCount(),
             trackedPrewarmPlanCount: prewarmPlans.count,
-            prewarmUsefulnessReceipts: await prewarmPlanner.recentUsefulnessReceipts().count,
+            prewarmUsefulnessReceipts: await prewarmPlanner.usefulnessReceiptCount(),
             feedbackEventCount: feedbackEvents.count,
             newestFeedbackEventID: feedbackEvents.last?.id,
             lastReconciledAt: lastReconciledAt,
@@ -988,7 +915,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             generationID: planning.plan?.items.first?.candidate.generationID,
             summary: "context prewarm planning",
             details: [
-                "submission": String(describing: submission.outcome),
+                "submission": String(describing: submission),
                 "outcome": String(describing: planning.outcome),
                 "considered": String(planning.consideredAtomCount),
                 "dropped": String(planning.droppedAtomCount),
@@ -1074,39 +1001,12 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             normalizedID,
             String(revision),
         ] + candidates.map { $0.atomID.rawValue })
-        let event: ContextPrewarmEvent
-        switch kind {
-        case .session:
-            event = .session(ContextSessionPrewarmHint(
-                sessionID: normalizedID,
-                eventID: eventID,
-                revision: revision,
-                candidates: candidates
-            ))
-        case .workshopExecution:
-            event = .workshopExecution(ContextWorkshopPrewarmHint(
-                executionID: normalizedID,
-                eventID: eventID,
-                revision: revision,
-                candidates: candidates
-            ))
-        case .cognitive:
-            event = .cognitive(ContextCognitivePrewarmHint(
-                workspaceID: normalizedID,
-                activationID: eventID,
-                eventID: eventID,
-                revision: revision,
-                candidates: candidates
-            ))
-        case .organism:
-            event = .organism(ContextOrganismPrewarmHint(
-                predictionID: normalizedID,
-                eventID: eventID,
-                revision: revision,
-                candidates: candidates
-            ))
-        }
-        return await submitPrewarm(event)
+        return await submitPrewarm(.hint(ContextPrewarmHintMetadata(
+            scope: ContextPrewarmScope(kind: kind, id: normalizedID),
+            eventID: eventID,
+            revision: revision,
+            candidates: candidates
+        )))
     }
 
     private func observePrewarmContinuity(
@@ -1119,15 +1019,14 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         // A somatic signal's plan has no turn scope of its own; any turn may use it.
         let organismScopes = prewarmPlans.keys.filter { $0.kind == .organism }
         let relevantScopes = Array(Set(prewarmScopes(for: request) + organismScopes)).sorted()
+        guard relevantScopes.contains(where: { prewarmPlans[$0] != nil }) else { return }
+        let residentIDs = Set([snapshot.hotEntries, snapshot.warmEntries].joined().map { $0.key.id })
         for scope in relevantScopes {
             guard let plan = prewarmPlans.removeValue(forKey: scope) else { continue }
             let validation = await prewarmPlanner.validate(plan)
-            let warmed = Set(validation.validItems.compactMap { item -> ContextAtomID? in
+            let warmed = Set(validation.compactMap { item -> ContextAtomID? in
                 let atomID = item.candidate.atomID
-                return snapshot.hotEntries.contains { $0.key.id == atomID.rawValue }
-                    || snapshot.warmEntries.contains { $0.key.id == atomID.rawValue }
-                    ? atomID
-                    : nil
+                return residentIDs.contains(atomID.rawValue) ? atomID : nil
             })
             let usefulness = await prewarmPlanner.recordUsefulness(
                 for: plan,
@@ -1140,11 +1039,11 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 summary: "context prewarm usefulness",
                 details: [
                     "scope": "\(scope.kind.rawValue):\(scope.id)",
-                    "requested": String(usefulness.requestedAtomIDs.count),
-                    "warmed": String(usefulness.warmedAtomIDs.count),
-                    "useful": String(usefulness.usefulAtomIDs.count),
+                    "requested": String(usefulness.requestedAtomCount),
+                    "warmed": String(usefulness.warmedAtomCount),
+                    "useful": String(usefulness.usefulAtomCount),
                     "usefulness": String(usefulness.usefulness),
-                    "authority_granted": String(usefulness.authorityGranted),
+                    "authority_granted": "false",
                 ]
             )
             let store = self.store
@@ -1180,34 +1079,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 packet.receipt.id,
                 String(prewarmRevision),
             ])
-            let event: ContextPrewarmEvent
-            switch scope.kind {
-            case .session:
-                event = .session(ContextSessionPrewarmHint(
-                    sessionID: scope.id,
-                    eventID: eventID,
-                    revision: prewarmRevision,
-                    candidates: candidates
-                ))
-            case .workshopExecution:
-                event = .workshopExecution(ContextWorkshopPrewarmHint(
-                    executionID: scope.id,
-                    eventID: eventID,
-                    revision: prewarmRevision,
-                    candidates: candidates
-                ))
-            case .cognitive:
-                event = .cognitive(ContextCognitivePrewarmHint(
-                    workspaceID: scope.id,
-                    activationID: eventID,
-                    eventID: eventID,
-                    revision: prewarmRevision,
-                    candidates: candidates
-                ))
-            default:
-                continue
-            }
-            _ = await submitPrewarm(event)
+            guard scope.kind != .organism else { continue }
+            _ = await submitPrewarm(.hint(ContextPrewarmHintMetadata(
+                scope: scope,
+                eventID: eventID,
+                revision: prewarmRevision,
+                candidates: candidates
+            )))
         }
     }
 
@@ -1233,6 +1111,12 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private func feedbackSnapshot(
         for generation: ContextStoredGeneration
     ) -> ContextFeedbackSnapshot {
+        let bucket = Self.feedbackTimeBucket()
+        if let cachedFeedback, cachedFeedback.generationID == generation.generation.id,
+           cachedFeedback.feedbackOrdinal == feedbackOrdinal,
+           cachedFeedback.timeBucket == bucket {
+            return cachedFeedback.snapshot
+        }
         // One seed per atom id: the reducer rejects a duplicate seed, and a
         // generation carrying the same atom twice must not be able to throw
         // on the rebuild — let alone on the fallback rebuild below.
@@ -1241,8 +1125,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             guard seenSeedIDs.insert(atom.draft.id).inserted else { return nil }
             return ContextFeedbackSeed(
                 atomID: atom.draft.id,
-                authority: atom.draft.authority,
-                privacy: atom.draft.privacy,
                 baseUtility: atom.draft.recentUsefulness,
                 baseActivation: atom.draft.activation,
                 baseDecay: atom.draft.decayState
@@ -1260,12 +1142,14 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 evidenceIDs: event.evidenceIDs
             )
         }
-        return (try? feedbackReducer.rebuild(
+        let snapshot = (try? feedbackReducer.rebuild(
             seeds: seeds,
             events: applicable,
-            through: Self.feedbackTimeBucket()
+            through: bucket
         )) ?? (try? feedbackReducer.rebuild(seeds: seeds, events: []))
-            ?? ContextFeedbackSnapshot(states: [], appliedEventIDs: [], throughTimeBucket: nil)
+            ?? ContextFeedbackSnapshot(states: [])
+        cachedFeedback = (generation.generation.id, feedbackOrdinal, bucket, snapshot)
+        return snapshot
     }
 
     private func recordFeedback(
@@ -1293,6 +1177,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         do {
             try await store.recordFeedbackEvent(event)
             feedbackEvents.append(event)
+            cachedFeedback = nil
             if feedbackEvents.count > 4_096 {
                 feedbackEvents.removeFirst(feedbackEvents.count - 4_096)
             }
@@ -1321,12 +1206,15 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     private func restoreFeedbackEvents() async {
+        cachedFeedback = nil
         do {
             let restored = try await store.recentFeedbackEvents(limit: 4_096)
             feedbackEvents = restored
+            cachedFeedback = nil
             // Event IDs are ordinal-scoped. Retaining the current high-water
             // mark prevents a relaunch from overwriting a retained event.
             feedbackOrdinal = try await store.feedbackEventOrdinalHighWaterMark()
+            cachedFeedback = nil
         } catch {
             lastError = "context feedback restore failed: \(error)"
             diagnostics("[context-flow] \(lastError ?? "context feedback restore failed")")
@@ -1459,20 +1347,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     /// genuinely in the stable prompt for THIS surface. This is a property of
     /// the mirror/kernel build, not of per-turn state, so it cannot make the
     /// stable prefix vary from turn to turn.
-    static func generatedUserProjectionPrecoverage(
-        mirror: RequiredDocumentMirror,
-        kernel: StablePromptKernel,
-        selectedSources: [ContextStoredSource],
-        generation: ContextStoredGeneration
-    ) -> Set<ContextSourceID> {
-        generatedUserProjectionOutcome(
-            mirror: mirror,
-            kernel: kernel,
-            selectedSources: selectedSources,
-            generation: generation
-        ).precoveredSourceIDs
-    }
-
     static func generatedUserProjectionOutcome(
         mirror: RequiredDocumentMirror,
         kernel: StablePromptKernel,
@@ -1831,8 +1705,21 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         compileFailures: inout [ContextSourceID: String],
         stopWhenSuperseded: Bool = false
     ) async throws -> ReconciliationCandidate {
-        let active = try await store.loadActiveGeneration()
-        let previousBySource = Self.previousCompiledSources(active)
+        // A failed arena publication can leave SQLite ahead of the resident body.
+        let durableGeneration = try await store.activeGeneration()
+        let active: ContextStoredGeneration?
+        let previousBySource: [ContextSourceID: ContextCompiledSource]
+        if let retained = activeStoredGeneration, retained.generation.id == durableGeneration?.id {
+            active = retained
+            previousBySource = activeCompiledSources
+        } else {
+            if let durableGeneration {
+                active = try await store.loadGeneration(id: durableGeneration.id)
+            } else {
+                active = nil
+            }
+            previousBySource = Self.previousCompiledSources(active)
+        }
         let authoritativeSources = await registry.authoritativeSourceIDsByOwner()
         var changedSources: [ContextCompiledSource] = []
         // Discovery can remove a registration before this loop sees it.
@@ -1939,8 +1826,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 var compileFailures: [ContextSourceID: String] = [:]
                 candidate = try await makeCandidate(for: candidate.batch, compileFailures: &compileFailures)
             }
-            let persistedDegradedCount = (try? await store.healthSnapshot().degradedSources) ?? 0
-            let hasUnknownPersistedDegradation = persistedDegradedCount > degradedSourceIDs.count
+            let persistedDegradedCount = try? await store.healthSnapshot().degradedSources
+            let hasUnknownPersistedDegradation = (persistedDegradedCount ?? 0) > degradedSourceIDs.count
             for (sourceID, error) in candidate.compileFailures.sorted(by: { $0.key < $1.key }) {
                 await markSourceDegraded(sourceID, error: error)
             }
@@ -1977,12 +1864,29 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 return false
             }
 
-            guard let stored = try await store.loadActiveGeneration() else {
-                throw ContextFlowCoordinatorError.activeGenerationUnavailable
+            let stored: ContextStoredGeneration
+            if let retained = activeStoredGeneration,
+               persistedDegradedCount == retained.sources.filter({ $0.health == .degraded }).count,
+               try await store.activeGeneration()?.id == retained.generation.id {
+                stored = retained
+            } else {
+                guard let loaded = try await store.loadActiveGeneration() else {
+                    throw ContextFlowCoordinatorError.activeGenerationUnavailable
+                }
+                stored = loaded
             }
             let mirrors = try await mirrorProvider.requiredDocumentMirrors()
-            let snapshot = try Self.makeArenaSnapshot(stored: stored, mirrors: mirrors)
             let currentSnapshot = arena.currentSnapshot()
+            let snapshot: ContextGenerationSnapshot
+            if let currentSnapshot,
+               currentSnapshot.generationID == stored.generation.id,
+               currentSnapshot.sourceFingerprint == stored.generation.sourceFingerprint,
+               currentSnapshot.requiredDocumentMirrors == mirrors.sorted(by: { $0.personaID < $1.personaID }),
+               currentSnapshot.hotEntries.count + currentSnapshot.warmEntries.count == stored.atoms.count {
+                snapshot = currentSnapshot
+            } else {
+                snapshot = try Self.makeArenaSnapshot(stored: stored, mirrors: mirrors)
+            }
             let outcome: ContextArenaPublicationOutcome?
             if currentSnapshot == snapshot {
                 outcome = nil
@@ -2142,11 +2046,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     /// for a new picker value and cause the app-side ordering fence to consider
     /// that value reconciled. The last good generation remains active instead.
     private func refreshDiscoveredSources() async -> Bool {
-        guard let refresher = mirrorProvider as? any ContextSourceRegistrationRefreshing else {
-            return true
-        }
         do {
-            try await refresher.refreshContextSources(in: registry)
+            try await mirrorProvider.refreshContextSources(in: registry)
             return true
         } catch is CancellationError {
             return false
@@ -2163,16 +2064,22 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     ) -> [ContextSourceID: ContextCompiledSource] {
         guard let stored else { return [:] }
         let atomsBySource = Dictionary(grouping: stored.atoms.map(\.draft), by: \.sourceID)
-        let relationships = stored.relationships.map(\.draft)
+        let sourcesByAtom = Dictionary(grouping: stored.atoms, by: \.draft.id)
+            .mapValues { Set($0.map(\.draft.sourceID)) }
+        var relationshipsBySource: [ContextSourceID: [ContextRelationshipDraft]] = [:]
+        for relationship in stored.relationships {
+            for sourceID in sourcesByAtom[relationship.draft.sourceAtomID] ?? [] {
+                relationshipsBySource[sourceID, default: []].append(relationship.draft)
+            }
+        }
         var result: [ContextSourceID: ContextCompiledSource] = [:]
         for source in stored.sources {
             let sourceAtoms = atomsBySource[source.descriptor.id] ?? []
-            let atomIDs = Set(sourceAtoms.map(\.id))
             result[source.descriptor.id] = ContextCompiledSource(
                 descriptor: source.descriptor,
                 sourceHash: source.sourceHash,
                 atoms: sourceAtoms,
-                relationships: relationships.filter { atomIDs.contains($0.sourceAtomID) }
+                relationships: relationshipsBySource[source.descriptor.id] ?? []
             )
         }
         return result
@@ -2208,8 +2115,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 summary: atom.deterministicSummary,
                 metadata: metadata,
                 vector: atom.embedding?.values ?? [],
-                retentionPriority: atom.authority.rank,
-                lastAccessOrdinal: 0
+                retentionPriority: atom.authority.rank
             )
             if tier == .hot { hot.append(entry) } else { warm.append(entry) }
         }

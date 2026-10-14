@@ -150,7 +150,7 @@ struct AdvancedView: View {
         }
         .macSyncErrorBanner()
         // Each snapshot pass that carries the layout redraws More's order.
-        .onReceive(iCloudSyncEngine.shared.$surfaceLayout) { if let next = $0 { layout = next } }
+        .onChange(of: iCloudSyncEngine.shared.surfaceLayout, initial: true) { _, next in if let next { layout = next } }
     }
 
     private func link<Destination: View>(_ title: String, _ detail: String,
@@ -367,7 +367,7 @@ final class AdvancedStore: ObservableObject {
 
 struct StatusDetailView: View {
     @ObservedObject var store: AdvancedStore
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @ObservedObject private var cloudReplies = iCloudBridge.shared
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
@@ -603,7 +603,7 @@ struct StatusDetailView: View {
 
 struct RunsLogView: View {
     @ObservedObject var store: AdvancedStore
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
 
     var body: some View {
         List {

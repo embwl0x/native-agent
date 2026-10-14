@@ -1,4 +1,5 @@
 import SwiftUI
+import Observation
 import UIKit
 import NativeAgentShared
 
@@ -8,7 +9,145 @@ enum ChatSendDisposition: Equatable {
     case rejected
 }
 
-struct QueuedChatSend: Identifiable, Codable {
+/// Local payloads share one serial IO owner; callers retain their existing keys.
+final class MobileLocalStorage: @unchecked Sendable {
+    private let defaults: UserDefaults
+    private let queue = DispatchQueue(label: "nativeagent.mobile.defaults", qos: .utility)
+    private var errors: [String: Error] = [:]
+    private var transcripts: [String: ChatStore.CachedTranscript] = [:]
+    private var transcriptRecency: [String] = []
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    private let lock = NSLock()
+    private var writes: [String: @Sendable () -> Void] = [:]
+
+    private func submit(key: String, operation: @escaping @Sendable () -> Void) {
+        lock.lock()
+        let scheduled = writes[key] != nil
+        writes[key] = operation
+        lock.unlock()
+        guard !scheduled else { return }
+        queue.async { [self] in
+            lock.lock()
+            let write = writes.removeValue(forKey: key)
+            lock.unlock()
+            write?()
+        }
+    }
+
+    func save<Value: Encodable & Sendable>(key: String, value: @escaping @Sendable () -> Value,
+                                         onError: @escaping @Sendable (Error) -> Void) {
+        submit(key: key) { [self] in
+            do {
+                let payload = value()
+                defaults.set(try JSONEncoder().encode(payload), forKey: key)
+                if let transcript = payload as? ChatStore.CachedTranscript { cache(transcript, key: key) }
+                errors[key] = nil
+            } catch { errors[key] = error; onError(error) }
+        }
+    }
+
+    func remove(key: String) {
+        submit(key: key) { [self] in defaults.removeObject(forKey: key); errors[key] = nil }
+    }
+
+    @MainActor func flush() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                do {
+                    if let error = errors.values.first { throw error }
+                    guard defaults.synchronize() else { throw DeviceSyncError.underlying(message: "Could not save queued send") }
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    @MainActor func checkpoint<Value: Encodable & Sendable>(_ value: Value, to file: URL) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                do {
+                    try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try JSONEncoder().encode(value).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    @MainActor func checkpointReply(_ reply: ChatMessage, key: String, legacyKey: String, sessionID: String?) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                do {
+                    let saved = try loadTranscript(key: key, legacyKey: legacyKey, sessionID: sessionID)
+                    var rows = saved?.messages ?? []
+                    if let index = rows.firstIndex(where: { $0.id == reply.id }) { rows[index] = reply }
+                    else { rows.append(reply) }
+                    let envelope = ChatStore.CachedTranscript(schemaVersion: 2, sessionID: sessionID,
+                        messages: ChatStore.cachedTranscriptRows(rows),
+                        appliedTranscriptGeneration: saved?.appliedTranscriptGeneration)
+                    defaults.set(try JSONEncoder().encode(envelope), forKey: key)
+                    cache(envelope, key: key)
+                    errors[key] = nil
+                    guard defaults.synchronize() else { throw DeviceSyncError.underlying(message: "Could not save chat reply") }
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    private func cache(_ transcript: ChatStore.CachedTranscript, key: String) {
+        transcripts[key] = transcript
+        transcriptRecency.removeAll { $0 == key }
+        transcriptRecency.append(key)
+        if transcriptRecency.count > 4 { transcripts.removeValue(forKey: transcriptRecency.removeFirst()) }
+    }
+
+    @MainActor func readTranscript(key: String, legacyKey: String, sessionID: String?) async throws -> ChatStore.CachedTranscript? {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                do { continuation.resume(returning: try loadTranscript(key: key, legacyKey: legacyKey, sessionID: sessionID)) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    private func loadTranscript(key: String, legacyKey: String, sessionID: String?) throws -> ChatStore.CachedTranscript? {
+        if let hit = transcripts[key] { cache(hit, key: key); return hit }
+        let exact = defaults.data(forKey: key)
+        guard let data = exact ?? defaults.data(forKey: legacyKey) else { return nil }
+        let decoder = JSONDecoder()
+        let envelope: ChatStore.CachedTranscript
+        if let saved = try? decoder.decode(ChatStore.CachedTranscript.self, from: data),
+           saved.schemaVersion == 2, ChatStore.cleanSessionID(saved.sessionID) == sessionID {
+            envelope = saved
+        } else if exact != nil, key != legacyKey || sessionID == nil {
+            envelope = ChatStore.CachedTranscript(schemaVersion: 2, sessionID: sessionID,
+                messages: try decoder.decode([ChatMessage].self, from: data))
+        } else if exact == nil { return nil }
+        else { throw CocoaError(.coderReadCorrupt) }
+        let normalized = ChatStore.CachedTranscript(schemaVersion: 2, sessionID: sessionID,
+            messages: envelope.messages.map { var row = $0; row.isStreaming = false; return row },
+            appliedTranscriptGeneration: envelope.appliedTranscriptGeneration)
+        if exact == nil { defaults.set(try JSONEncoder().encode(normalized), forKey: key) }
+        cache(normalized, key: key)
+        return normalized
+    }
+
+    @MainActor func read<Value: Decodable & Sendable>(_ type: Value.Type, key: String) async throws -> Value? {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                do {
+                    let value = try defaults.data(forKey: key).map { try JSONDecoder().decode(type, from: $0) }
+                    continuation.resume(returning: value)
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+}
+
+struct QueuedChatSend: Identifiable, Codable, Sendable {
     static let maxPerSession = 20
     let id: UUID
     var sessionID: String?
@@ -31,10 +170,11 @@ struct QueuedChatSend: Identifiable, Codable {
 // MARK: - Store
 
 @MainActor
-final class ChatStore: ObservableObject {
+@Observable
+final class ChatStore {
     /// The scene and cold App Intents must settle the same durable exchanges.
     static let shared = ChatStore()
-    struct CachedTranscript: Codable {
+    struct CachedTranscript: Codable, Sendable {
         let schemaVersion: Int
         let sessionID: String?
         let messages: [ChatMessage]
@@ -47,13 +187,13 @@ final class ChatStore: ObservableObject {
         var appliedTranscriptGeneration: Int? = nil
     }
 
-    @Published var messages: [ChatMessage] = [] {
+    var messages: [ChatMessage] = [] {
         didSet {
             noteMessageArrivals(previous: oldValue, current: messages)
             persistMessages()
         }
     }
-    @Published var isLoading = false {
+    var isLoading = false {
         didSet {
             if !isLoading { loadingPlaceholderID = nil }
             if oldValue && !isLoading {
@@ -67,9 +207,9 @@ final class ChatStore: ObservableObject {
         guard loadingPlaceholderID == placeholderID else { return }
         isLoading = false
     }
-    @Published var isSwitchingSession = false
-    @Published var isPollingFallback = false   // true after 10s waiting — drives "still waiting…" hint
-    @Published var errorBanner: String?
+    var isSwitchingSession = false
+    var isPollingFallback = false   // true after 10s waiting — drives "still waiting…" hint
+    var errorBanner: String?
     /// Signature rejections already shown once (see receiveICloudRejection).
     var surfacedSignatureRejectionIDs: Set<String> = []
 
@@ -78,17 +218,19 @@ final class ChatStore: ObservableObject {
     func dismissErrorBanner() {
         errorBanner = nil
     }
-    @Published var streamingHintsByMessageId: [UUID: String] = [:]
+    var streamingHintsByMessageId: [UUID: String] = [:]
     /// 2026-09-13: unfinished exchanges, by correlation. Durable so closing the
     /// app (or opening another conversation) does not erase the fact that a
     /// request is still outstanding. Observation state only — never a resend
     /// queue; see ChatStore+PendingExchanges.swift.
-    @Published var pendingExchanges: [String: ChatPendingExchange] = [:] {
+    var pendingExchanges: [String: ChatPendingExchange] = [:] {
         didSet { persistPendingExchanges() }
     }
     static let pendingExchangesKey = "NativeAgentMobile.chatPendingExchanges.v1"
     var sharedInboxControls: ChatRuntimeControls?
-    @Published var queuedSends: [QueuedChatSend] = [] {
+    @ObservationIgnored var sharedInboxReadTask: Task<(items: [(URL, SharedChatItem)], errors: [String]), Error>?
+    @ObservationIgnored var sharedInboxImportTask: Task<Void, Never>?
+    var queuedSends: [QueuedChatSend] = [] {
         didSet {
             persistQueuedSends()
             if queuedSends.count < oldValue.count { scheduleSharedInboxRetry() }
@@ -100,31 +242,31 @@ final class ChatStore: ObservableObject {
     /// Production has one app-owned store, so queue restoration has one owner.
     /// Tests inject an isolated defaults suite and may opt out of restoration.
     let defaults: UserDefaults
+    let storage: MobileLocalStorage
 
     private func persistQueuedSends() {
         if queuedSends.isEmpty {
-            defaults.removeObject(forKey: queuedSendsKey)
+            storage.remove(key: queuedSendsKey)
             return
         }
-        if let data = try? JSONEncoder().encode(queuedSends) {
-            defaults.set(data, forKey: queuedSendsKey)
+        let rows = queuedSends
+        storage.save(key: queuedSendsKey, value: { rows }) { [weak self] error in
+            Task { @MainActor in self?.errorBanner = "Queued chat could not be saved: \(error.localizedDescription)" }
         }
     }
 
-    func checkpointQueuedSend(_ id: UUID) throws {
+    func checkpointQueuedSend(_ id: UUID) async throws {
         guard queuedSends.contains(where: { $0.id == id }) else {
             throw DeviceSyncError.underlying(message: "Queued send is no longer available")
         }
-        defaults.set(try JSONEncoder().encode(queuedSends), forKey: queuedSendsKey)
-        guard defaults.synchronize() else {
-            throw DeviceSyncError.underlying(message: "Could not save queued send")
-        }
+        persistQueuedSends()
+        try await storage.flush()
     }
-    @Published var pausedQueueSessionKeys: Set<String> = [] {
+    var pausedQueueSessionKeys: Set<String> = [] {
         didSet { persistPausedQueueSessionKeys() }
     }
     /// Transport failures wait for recovery; user pauses survive it and launch.
-    @Published var transportPausedQueueSessionKeys: Set<String> = []
+    var transportPausedQueueSessionKeys: Set<String> = []
     /// 2026-09-06: the pause set was in-memory while the queue it pauses is
     /// persisted, so a relaunch drained (and sent) messages the user had
     /// explicitly stopped. Persist it alongside the queue.
@@ -150,8 +292,8 @@ final class ChatStore: ObservableObject {
     // path; once a correlation is in resolvedICloudReplyIds, late deltas
     // are dropped on the dispatcher.
     var maxDeltaSeqByCorrelation: [String: Int] = [:]
-    @Published private(set) var selectedSessionID: String?
-    @Published private(set) var mainSessionID: String?
+    private(set) var selectedSessionID: String?
+    private(set) var mainSessionID: String?
     /// A phone-created main session remains locally authoritative until the
     /// Mac publishes that exact identity. Session-list snapshots can lag the
     /// first send, so treating absence as removal can otherwise roll the UI
@@ -170,6 +312,8 @@ final class ChatStore: ObservableObject {
     /// cancelled/late history read from releasing a newer switch.
     var sessionSwitchGeneration: UInt64 = 0
     var sessionSwitchTask: Task<Void, Never>?
+    var sessionCacheLoadTask: Task<Void, Never>?
+    @ObservationIgnored var restorationTask: Task<Void, Never>?
 
     init(
         defaults: UserDefaults = .standard,
@@ -177,6 +321,7 @@ final class ChatStore: ObservableObject {
         iCloudReplyTimeoutSeconds: UInt64 = 180
     ) {
         self.defaults = defaults
+        storage = MobileLocalStorage(defaults: defaults)
         self.iCloudReplyTimeoutSeconds = iCloudReplyTimeoutSeconds
         if !defaults.bool(forKey: "NativeAgent.unifiedSession.v1") {
             defaults.removeObject(forKey: Self.selectedSessionIDKey)
@@ -196,36 +341,38 @@ final class ChatStore: ObservableObject {
             locallyCreatedSessionID = nil
             defaults.removeObject(forKey: Self.locallyCreatedSessionIDKey)
         }
-        // 2026-07-21 audit fix: restore persisted queued sends (were in-memory
-        // only; a relaunch silently discarded user-composed messages). ChatStore
-        // is owned once at the App boundary, so no process-global restore latch
-        // can strand the queue when a view/store is recreated.
-        if restoreQueuedSends,
-           let queueData = defaults.data(forKey: queuedSendsKey),
-           let restoredQueue = try? JSONDecoder().decode([QueuedChatSend].self, from: queueData) {
-            queuedSends = restoredQueue
-        }
-        // 2026-09-06: restore the pause set with the queue. Without it a
-        // relaunch resumed a queue the user had stopped.
-        if restoreQueuedSends,
-           let restoredPaused = defaults.array(forKey: pausedQueueSessionKeysKey) as? [String] {
+        if restoreQueuedSends, let restoredPaused = defaults.array(forKey: pausedQueueSessionKeysKey) as? [String] {
             pausedQueueSessionKeys = Set(restoredPaused)
         }
-        if let savedMain, defaults.string(forKey: Self.mainSessionIDKey) == nil {
-            defaults.set(savedMain, forKey: Self.mainSessionIDKey)
-        }
-        messages = loadCachedMessages(for: savedSelected ?? savedMain)
-        // 2026-09-13: an exchange that never reached a terminal result comes
-        // back as the same unfinished exchange — same bubble, same partial
-        // answer, same correlation to keep observing. Restoration re-attaches
-        // it; it never re-sends it.
-        if restoreQueuedSends {
-            pendingExchanges = Self.restoredPendingExchanges(from: defaults)
+        isSwitchingSession = true
+        restorationTask = Task { [self] in
+            defer {
+                restorationTask = nil
+                if sessionSwitchGeneration == 0 { isSwitchingSession = false }
+                scheduleSharedInboxRetry()
+                scheduleQueuedSendDrain()
+            }
+            var failures: [String] = []
+            if restoreQueuedSends {
+                do { queuedSends = try await storage.read([QueuedChatSend].self, key: queuedSendsKey) ?? [] }
+                catch { failures.append(error.localizedDescription) }
+                do {
+                    let exchanges = try await storage.read([ChatPendingExchange].self, key: Self.pendingExchangesKey) ?? []
+                    pendingExchanges = Dictionary(exchanges.map { ($0.correlationID, $0) }, uniquingKeysWith: { _, newer in newer })
+                } catch { failures.append(error.localizedDescription) }
+            }
+            let cached = await loadCachedMessages(for: savedSelected ?? savedMain)
+            guard sessionSwitchGeneration == 0 else { return }
+            suppressMessagePersistence = true
+            messages = cached
+            suppressMessagePersistence = false
+            for row in cached { localArrivalDates[row.id] = .distantPast }
             restorePendingExchanges(for: savedSelected ?? savedMain)
+            if !failures.isEmpty { errorBanner = "Chat could not be restored: " + failures.joined(separator: "\n") }
         }
     }
 
-    static func cleanSessionID(_ value: String?) -> String? {
+    nonisolated static func cleanSessionID(_ value: String?) -> String? {
         let clean = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return clean.isEmpty ? nil : clean
     }
@@ -276,53 +423,22 @@ final class ChatStore: ObservableObject {
         defaults.set(clean, forKey: Self.mainSessionIDKey)
     }
 
-    func adoptMainSessionIDIfNeeded(_ value: String?) {
-        guard mainSessionID == nil, let clean = Self.cleanSessionID(value) else { return }
-        mainSessionID = clean
-        defaults.set(clean, forKey: Self.mainSessionIDKey)
-    }
-
     func transcriptStorageKey(for sessionID: String?) -> String {
         guard let clean = Self.cleanSessionID(sessionID) else { return transcriptKey }
         return transcriptPrefix + clean
     }
 
-    func loadCachedMessages(for sessionID: String?, fallback: [ChatMessage]? = nil) -> [ChatMessage] {
-        let cleanSessionID = Self.cleanSessionID(sessionID)
-        let exactKey = transcriptStorageKey(for: cleanSessionID)
-        if let data = defaults.data(forKey: exactKey) {
-            guard let saved = decodeCachedTranscript(
-                data,
-                expectedSessionID: cleanSessionID,
-                permitsLegacyArray: exactKey != transcriptKey || cleanSessionID == nil
-            ) else {
-                errorBanner = "The cached transcript for this chat was unreadable. Refreshing from the Mac."
-                return fallback ?? []
-            }
-            noteCachedTranscriptGeneration(saved.generation, for: cleanSessionID)
-            return normalizedCachedMessages(saved.messages)
+    func loadCachedMessages(for sessionID: String?, fallback: [ChatMessage]? = nil) async -> [ChatMessage] {
+        let session = Self.cleanSessionID(sessionID)
+        let key = transcriptStorageKey(for: session)
+        do {
+            let saved = try await storage.readTranscript(key: key, legacyKey: transcriptKey, sessionID: session)
+            noteCachedTranscriptGeneration(saved?.appliedTranscriptGeneration, for: session)
+            return saved?.messages ?? fallback ?? []
+        } catch {
+            errorBanner = "The cached transcript for this chat was unreadable. Refreshing from the Mac."
+            return fallback ?? []
         }
-
-        // The old global key has no session identity. It is safe only for an
-        // unresolved main session, or when a v2 envelope proves the exact owner.
-        guard exactKey != transcriptKey,
-              let legacyData = defaults.data(forKey: transcriptKey),
-              let saved = decodeCachedTranscript(
-                legacyData,
-                expectedSessionID: cleanSessionID,
-                permitsLegacyArray: false
-              ) else { return fallback ?? [] }
-        noteCachedTranscriptGeneration(saved.generation, for: cleanSessionID)
-        let normalized = normalizedCachedMessages(saved.messages)
-        if let envelope = try? JSONEncoder().encode(CachedTranscript(
-            schemaVersion: 2,
-            sessionID: cleanSessionID,
-            messages: normalized,
-            appliedTranscriptGeneration: saved.generation
-        )) {
-            defaults.set(envelope, forKey: exactKey)
-        }
-        return normalized
     }
 
     /// 2026-09-06: restore the persisted clear-watermark for a session as its
@@ -335,29 +451,6 @@ final class ChatStore: ObservableObject {
         appliedTranscriptGenerations[sessionID] = generation
     }
 
-    private func decodeCachedTranscript(
-        _ data: Data,
-        expectedSessionID: String?,
-        permitsLegacyArray: Bool
-    ) -> (messages: [ChatMessage], generation: Int?)? {
-        let decoder = JSONDecoder()
-        if let envelope = try? decoder.decode(CachedTranscript.self, from: data),
-           envelope.schemaVersion == 2,
-           Self.cleanSessionID(envelope.sessionID) == expectedSessionID {
-            return (envelope.messages, envelope.appliedTranscriptGeneration)
-        }
-        guard permitsLegacyArray else { return nil }
-        guard let legacy = try? decoder.decode([ChatMessage].self, from: data) else { return nil }
-        return (legacy, nil)
-    }
-
-    private func normalizedCachedMessages(_ saved: [ChatMessage]) -> [ChatMessage] {
-        saved.map { msg in
-            var copy = msg
-            copy.isStreaming = false
-            return copy
-        }
-    }
 
     /// Set by ChatView after init; called with each assistant reply text so
     /// VoiceOutputController can speak it without the store importing AVFoundation.
@@ -419,12 +512,12 @@ final class ChatStore: ObservableObject {
     var regeneratedAwayAssistantIDs: Set<UUID> = []
     /// Turns another door started in this conversation, by run id, and the
     /// bubble each one streams into (`receiveLiveTurn`).
-    @Published var liveTurnBubbles: [String: UUID] = [:]
+    var liveTurnBubbles: [String: UUID] = [:]
     /// Rows fetched from the Mac above the snapshot's window. The merge keeps
     /// them: the snapshot never carries them.
     var pagedHistoryIDs: Set<UUID> = []
-    @Published var isLoadingHistory = false
-    @Published var historyExhaustedSessionIDs: Set<String> = []
+    var isLoadingHistory = false
+    var historyExhaustedSessionIDs: Set<String> = []
     /// Sessions opened from a Mac page (no published transcript) whose page
     /// said there is more before it.
     var pagedSessionsWithOlder: Set<String> = []
@@ -504,7 +597,7 @@ final class ChatStore: ObservableObject {
 
     /// B2: bumped when a straggler reply lands after its bubble already timed
     /// out, so ChatView force-scrolls to it even if the user had scrolled away.
-    @Published var scrollToBottomTick = 0
+    var scrollToBottomTick = 0
     func requestScrollToBottom() { scrollToBottomTick &+= 1 }
 
     /// True for an assistant bubble that was retired locally and can resume

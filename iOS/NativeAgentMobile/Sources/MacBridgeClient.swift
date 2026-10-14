@@ -364,7 +364,7 @@ final class MacBridgeClient: ObservableObject {
         /// run in a Stop issued before this call returns.
         messageID: String = UUID().uuidString,
         preparedMessage: BridgeMessage? = nil,
-        onPrepared: ((BridgeMessage) throws -> Void)? = nil
+        onPrepared: ((BridgeMessage) async throws -> Void)? = nil
     ) async throws -> ChatSendResult {
         let metadata = Self.chatSendMetadata(
             controls: controls,
@@ -593,7 +593,7 @@ final class MacBridgeClient: ObservableObject {
         return engine.transcriptRead(for: sid)
     }
 
-    static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {
+    nonisolated static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {
         // eval3/T3 data-flow:
         // iOS send → BridgeMessage.attachments → Mac Swift runtime forwarding
         //   → ChatOrchestrationClient.appendMessage writes
@@ -607,10 +607,10 @@ final class MacBridgeClient: ObservableObject {
         //     [ChatMessageRecord] (carries `metadata.attachments`)
         //   → here: project metadata.attachments → [ChatAttachmentSummary]
         //     so the rebuilt ChatMessage on refresh preserves attachments.
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
         return records.compactMap { rec in
             let roleStr = rec.role
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
             let interaction = rec.interactionJSON.flatMap { try? decoder.decode(InlineInteraction.self, from: Data($0.utf8)) }
             let descriptor = rec.interactionDescriptorJSON.flatMap { try? decoder.decode(InlineInteractionDescriptor.self, from: Data($0.utf8)) }
             guard roleStr == "user" || roleStr == "assistant" || interaction != nil else { return nil }

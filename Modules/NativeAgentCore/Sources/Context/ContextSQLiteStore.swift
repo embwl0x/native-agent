@@ -125,50 +125,24 @@ public actor ContextSQLiteStore {
                 try db.execute(
                     sql: """
                     UPDATE context_sources
-                    SET health = 'removed', last_error = NULL, updated_at = ?
+                    SET health = 'removed'
                     WHERE id = ?
                     """,
-                    arguments: [createdAt, sourceID.rawValue]
+                    arguments: [sourceID.rawValue]
                 )
             }
 
             for source in draft.changedSources.sorted(by: { $0.descriptor.id < $1.descriptor.id }) {
                 let descriptorJSON = try Self.encodeJSON(source.descriptor)
-                let surfaceJSON = try Self.encodeJSON(source.descriptor.permittedSurfaces.sorted())
                 try db.execute(
                     sql: """
-                    INSERT INTO context_sources (
-                        id, descriptor_json, owner, kind, canonical_locator,
-                        authority, privacy, permitted_surfaces_json,
-                        injection_policy, source_hash, health, last_error, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'healthy', NULL, ?)
+                    INSERT INTO context_sources (id, source_hash, health)
+                    VALUES (?, ?, 'healthy')
                     ON CONFLICT(id) DO UPDATE SET
-                        descriptor_json = excluded.descriptor_json,
-                        owner = excluded.owner,
-                        kind = excluded.kind,
-                        canonical_locator = excluded.canonical_locator,
-                        authority = excluded.authority,
-                        privacy = excluded.privacy,
-                        permitted_surfaces_json = excluded.permitted_surfaces_json,
-                        injection_policy = excluded.injection_policy,
                         source_hash = excluded.source_hash,
-                        health = 'healthy',
-                        last_error = NULL,
-                        updated_at = excluded.updated_at
+                        health = 'healthy'
                     """,
-                    arguments: [
-                        source.descriptor.id.rawValue,
-                        descriptorJSON,
-                        source.descriptor.owner,
-                        source.descriptor.kind.rawValue,
-                        source.descriptor.canonicalLocator,
-                        source.descriptor.authority.rawValue,
-                        source.descriptor.privacy.rawValue,
-                        surfaceJSON,
-                        source.descriptor.injectionPolicy.rawValue,
-                        source.sourceHash,
-                        createdAt,
-                    ]
+                    arguments: [source.descriptor.id.rawValue, source.sourceHash]
                 )
 
                 let sourceVersionKey = Self.versionKey(
@@ -211,29 +185,19 @@ public actor ContextSQLiteStore {
                     )
                     let payload = PersistedAtomPayload(atom: atom)
                     let payloadJSON = try Self.encodeJSON(payload)
-                    let expiresAt = atom.freshness.expiresAt?.timeIntervalSince1970
                     try db.execute(
                         sql: """
                         INSERT INTO context_atom_versions (
                             version_key, atom_id, source_id,
                             valid_from_generation, valid_to_generation,
-                            kind, source_hash, authority, privacy,
-                            injection_policy, content_role, expires_at,
                             body, summary, payload_json
-                        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
                         """,
                         arguments: [
                             versionKey,
                             atom.id.rawValue,
                             atom.sourceID.rawValue,
                             generationID,
-                            atom.kind.rawValue,
-                            atom.sourceHash,
-                            atom.authority.rawValue,
-                            atom.privacy.rawValue,
-                            atom.injectionPolicy.rawValue,
-                            atom.contentRole.rawValue,
-                            expiresAt,
                             atom.body,
                             atom.deterministicSummary,
                             payloadJSON,
@@ -279,18 +243,14 @@ public actor ContextSQLiteStore {
                         sql: """
                         INSERT INTO context_relationship_versions (
                             version_key, relationship_id, source_atom_id,
-                            target_atom_id, kind, weight, provenance,
-                            valid_from_generation, valid_to_generation, payload_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                            target_atom_id, valid_from_generation, valid_to_generation, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, NULL, ?)
                         """,
                         arguments: [
                             versionKey,
                             relationship.id.rawValue,
                             relationship.sourceAtomID.rawValue,
                             relationship.targetAtomID.rawValue,
-                            relationship.kind,
-                            relationship.weight,
-                            relationship.provenance,
                             generationID,
                             try Self.encodeJSON(relationship),
                         ]
@@ -316,13 +276,6 @@ public actor ContextSQLiteStore {
                 WHERE id = ?
                 """,
                 arguments: [sourceFingerprint, atomCount, sourceCount, generationID]
-            )
-            try db.execute(
-                sql: """
-                INSERT INTO context_meta (key, value) VALUES ('active_generation', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                arguments: [String(generationID)]
             )
 
             let receipt = ContextStoreReceipt(
@@ -440,10 +393,10 @@ public actor ContextSQLiteStore {
             try db.execute(
                 sql: """
                 UPDATE context_sources
-                SET health = 'degraded', last_error = ?, updated_at = ?
+                SET health = 'degraded'
                 WHERE id = ? AND health != 'removed'
                 """,
-                arguments: [boundedError, date.timeIntervalSince1970, sourceID.rawValue]
+                arguments: [sourceID.rawValue]
             )
             try db.execute(
                 sql: """
@@ -453,14 +406,6 @@ public actor ContextSQLiteStore {
                 """,
                 arguments: [boundedError, sourceID.rawValue]
             )
-            try db.execute(
-                sql: """
-                INSERT INTO context_compile_failures (source_id, error, created_at)
-                VALUES (?, ?, ?)
-                """,
-                arguments: [sourceID.rawValue, boundedError, date.timeIntervalSince1970]
-            )
-            try Self.pruneCompileFailures(db, sourceID: sourceID.rawValue)
             try Self.insertReceipt(
                 ContextStoreReceipt(
                     kind: .degraded,
@@ -580,22 +525,7 @@ public actor ContextSQLiteStore {
         }
     }
 
-    // MARK: - Rebuild and retention
-
-    public func resetDerivedState() async throws {
-        try await dbPool.write { db in
-            try db.execute(sql: "DELETE FROM context_feedback_events")
-            try db.execute(sql: "DELETE FROM context_embeddings")
-            try db.execute(sql: "DELETE FROM context_relationship_versions")
-            try db.execute(sql: "DELETE FROM context_atom_versions")
-            try db.execute(sql: "DELETE FROM context_source_versions")
-            try db.execute(sql: "DELETE FROM context_receipts")
-            try db.execute(sql: "DELETE FROM context_compile_failures")
-            try db.execute(sql: "DELETE FROM context_sources")
-            try db.execute(sql: "DELETE FROM context_generations")
-            try db.execute(sql: "DELETE FROM context_meta")
-        }
-    }
+    // MARK: - Retention
 
     public func prune(
         retainingLatest generationLimit: Int = 8,
@@ -696,18 +626,6 @@ public actor ContextSQLiteStore {
                   )
                 """)
 
-            // Compile failures for a source that no longer exists cannot aid a
-            // retry and otherwise grow forever with churned sources.
-            try db.execute(sql: """
-                DELETE FROM context_compile_failures
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM context_sources
-                    WHERE context_sources.id = context_compile_failures.source_id
-                  )
-                """)
-
-            try Self.pruneCompileFailures(db)
-
             return ContextStorePruneResult(
                 deletedGenerations: deadGenerations.count,
                 deletedAtomVersions: deadAtomKeys.count,
@@ -716,25 +634,6 @@ public actor ContextSQLiteStore {
                 deletedReceipts: receiptIDs.count
             )
         }
-    }
-
-    /// Keep the newest 64 failures per source, including recovered sources.
-    private static func pruneCompileFailures(_ db: Database, sourceID: String? = nil) throws {
-        try db.execute(
-            sql: """
-            DELETE FROM context_compile_failures
-            WHERE id IN (
-                SELECT id FROM (
-                    SELECT id, ROW_NUMBER() OVER (
-                        PARTITION BY source_id ORDER BY created_at DESC, id DESC
-                    ) AS ordinal
-                    FROM context_compile_failures
-                    WHERE ? IS NULL OR source_id = ?
-                ) WHERE ordinal > 64
-            )
-            """,
-            arguments: [sourceID, sourceID]
-        )
     }
 
     /// A5.5(b): reclaim the disk that `prune()`'s DELETEs freed. SQLite keeps
@@ -949,6 +848,39 @@ public actor ContextSQLiteStore {
             try db.execute(sql: """
                 CREATE INDEX IF NOT EXISTS idx_context_receipts_kind_created_id
                     ON context_receipts(kind, created_at DESC, id ASC);
+                """)
+        }
+        // Version payloads own source policy, atom eligibility and relationships.
+        // Keep the queried source hash/health; source-version errors and receipts
+        // retain diagnostics without the unread failure history.
+        migrator.registerMigration("context_payload_ownership_v4") { db in
+            try db.execute(sql: """
+                DROP TABLE context_meta;
+                DROP TABLE context_compile_failures;
+                DROP TABLE context_conflicts;
+                DROP INDEX idx_context_sources_health;
+                DROP INDEX idx_context_atom_versions_eligibility;
+                ALTER TABLE context_sources DROP COLUMN descriptor_json;
+                ALTER TABLE context_sources DROP COLUMN owner;
+                ALTER TABLE context_sources DROP COLUMN kind;
+                ALTER TABLE context_sources DROP COLUMN canonical_locator;
+                ALTER TABLE context_sources DROP COLUMN authority;
+                ALTER TABLE context_sources DROP COLUMN privacy;
+                ALTER TABLE context_sources DROP COLUMN permitted_surfaces_json;
+                ALTER TABLE context_sources DROP COLUMN injection_policy;
+                ALTER TABLE context_sources DROP COLUMN last_error;
+                ALTER TABLE context_sources DROP COLUMN updated_at;
+                CREATE INDEX idx_context_sources_health ON context_sources(health);
+                ALTER TABLE context_atom_versions DROP COLUMN kind;
+                ALTER TABLE context_atom_versions DROP COLUMN source_hash;
+                ALTER TABLE context_atom_versions DROP COLUMN authority;
+                ALTER TABLE context_atom_versions DROP COLUMN privacy;
+                ALTER TABLE context_atom_versions DROP COLUMN injection_policy;
+                ALTER TABLE context_atom_versions DROP COLUMN content_role;
+                ALTER TABLE context_atom_versions DROP COLUMN expires_at;
+                ALTER TABLE context_relationship_versions DROP COLUMN kind;
+                ALTER TABLE context_relationship_versions DROP COLUMN weight;
+                ALTER TABLE context_relationship_versions DROP COLUMN provenance;
                 """)
         }
         return migrator

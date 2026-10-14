@@ -1,205 +1,109 @@
 # NativeAgent Skill Manifest Spec
 
-This describes the procedure-skill interface and the registry formats the
-current Swift Skills owner reads. A skill is reusable guidance with an optional
-script; authored tools and connectors have their own owners.
+Skills are JavaScript routines behind the existing app door. A matching routine
+arrives through recall or discovery; its description and signature lead to
+`skill.run`. No skill grants authority or adds an always-on tool schema.
 
-## Production conversational procedure contract
+## Authoring and review
 
-Use the single `app` tool:
+| Action | Contract |
+|---|---|
+| `skill.list` | Descriptions, signatures, status, runnable state and run calls. |
+| `skill.read` | Metadata by default: digest, admission, selected version and retained versions. `source:true` reads exact code and fixtures for authoring/review; `step` selects a labelled code step. |
+| `skill.save` | Stable name, one-line description and script. Optional triggers, fixtures, converts and restrictive overrides:built_in metadata. Stages a candidate; a pending revision leaves the working version selected. |
+| `skill.validate` | Validates the exact candidate using the shared helper with intercepted replies; optional input and capture. Does not admit it or execute live app effects. |
+| `skill.enable` | Publishes the validated candidate under existing origin and owner policy. Owner review binds the complete candidate, including code, fixtures and dependency shapes. |
+| `skill.run` | Name and args matching its signature. Each call passes the ordinary turn's gates. |
+| `skill.resume` | A stopped run_id and bounded answer. Rechecks selection, host revision, admission and prior reads; claims once. |
+| `skill.quarantine`, `skill.drop`, `skill.rollback`, `skill.restore` | Explicit lifecycle changes; source remains retained. Rollback proposes retained JS for validation and admission; optional version selects an exact historical conversion. skill.read exposes converted_versions and their rollback calls. |
 
-| Action | Inputs | Result |
-| --- | --- | --- |
-| `skill.list` | none | Compact names, descriptions, triggers, status and source where available; no bodies. |
-| `skill.read` | `name`; optional `step` | One body, resolved by registered name or id; scripted skills also return their script, admission and versions. `step` selects a 1-based script step and its label/guidance; source lines are included when each `app.step` starts its own line, one per step. |
-| `skill.save` | `name`, `description`, `content`; optional `triggers`, `script` | Create or update a procedure through the locked Skills owner. New or changed scripts land drafted. |
-| `skill.enable`, `skill.disable`, `skill.delete`, `skill.restore` | `name`; disable/delete also accept `reason` | Manage the skill through the app's authority checks. Delete moves it to the skill trash. |
-| `skill.run` | `name`, `args`; `preview:true` | Run a runnable script skill strictly: only its declared actions, args checked against its params; a step that can't be taken back, is User's or would card them hands back before it runs. Preview says where each step would hand back or card. |
-| `skill.resume` | `run_id`, `answer` | Claim a stopped run once and replay its saved path under the same admitted script; eligible reads are rechecked and the stopped call returns `answer`, without executing that call. See recovery below. |
-| `skill.rollback` | `name`; optional `preview:true` | Restore the last clean earlier script, or the previous script if none is kept; it lands drafted and needs activation again. On them version of a built-in with no earlier script, drop theirs so the built-in shows again. |
-
-For example:
-
-```text
-app {action:"skill.list"}
-app {action:"skill.read", args:{name:"review-notes"}}
-app {action:"skill.save", args:{
-  name:"review-notes",
-  description:"Review notes against their source before sharing.",
-  triggers:["review notes"],
-  content:"# Review notes\n\nRead the source, check each claim, and mark uncertainty."
-}}
-```
-
-Read only the body relevant to the work. Skill content cannot grant tools,
-permissions or approval bypasses. Facts and preferences belong in memory;
-skills describe reusable methods.
-
-The conversational writer requires nonempty name, description and content,
-adds a heading if needed, and limits the resulting body to 65,536 UTF-8 bytes.
-It trims string triggers and clips each to 160 characters; the Skills owner
-uses the name when no triggers remain. A case-insensitive name match updates
-the existing skill, retaining its safe stable id. New guidance-only skills
-are active and marked agent-authored. A new or changed script lands drafted;
-an unchanged script can retain its activation for the same digest.
-
-## Script input and activation
-
-The optional `script` object accepts only these keys:
-
-| Key | Shape |
-| --- | --- |
-| `source` | Required nonempty JavaScript, at most 8,192 UTF-8 bytes. |
-| `params` | Optional object mapping input names to `string`, `int`, `number`, `bool`, `list` or `object`; a trailing `?` makes a parameter optional. Names match `[A-Za-z_][A-Za-z0-9_]{0,63}`. |
-| `actions` | Required list of 1–50 app action IDs. IDs are trimmed, lowercased and deduplicated; calls remain subject to action eligibility and authority checks. |
-| `steps` | Optional labels, one per declared step, each nonempty and at most 160 characters. |
-| `of` | Step count, 1–50; defaults to the label count, or 1 without labels. |
-
-For example, add this field to a `skill.save` call:
-
-```json
-{
-  "script": {
-    "source": "return app.memory.recall({query: input.query});",
-    "params": {"query": "string"},
-    "actions": ["memory.recall"],
-    "steps": ["Recall the requested topic"]
-  }
+```javascript
+function run(input) {
+  app.step("Read");
+  const result = app.read("skills", input.name);
+  const answer = app.decide("Continue?", {result});
+  return {result, answer};
 }
 ```
 
-Parameters arrive as frozen `input`; `args` is the same object. A runnable
-script must be active and have an admission bound to the SHA-256 digest of its
-normalized script object, including the header. `skill.enable` activates
-Agent's own script on them own turn under Full Mac. Peer-steered, pack-supplied
-or unattested scripts, and activation below Full Mac, require the owner to review
-and install the exact script on the Skills page or approve its exact-script
-install card in chat on the Mac or paired iPhone. Authenticated agents enabled
-in Trust carry User's authority rather than adding peer steering. A changed
-digest clears admission and returns the script to draft; a stale review cannot
-activate it. Scripts cannot activate other scripts or bypass ordinary Trust
-and domain checks.
+The script header supplies source, params, actions and optional steps/of.
+Params map input names to string, int, number, bool, list or object; a trailing
+? marks an optional input. A param may also be `{type, description}` with that
+same type spelling and a nonempty description. Save retains these declarations;
+find/read expose their descriptions and requiredness in the input schema.
+No declared params means read the source before running the routine.
+Actions list app action IDs, not helper names.
+app.read, find, log, expect, expect_fail, decide and step are built in.
+Source is limited to 8,192 bytes; steps and dependencies to 50 each.
+Tools and skills are sync-only: define function run(input), use synchronous
+host/app calls and return plain JSON. Async functions and Promises are refused.
+Ad hoc app scripts keep their function-body contract on the same JS executor.
 
-## Strict execution and recovery
+Omitted fixtures record one bounded validation with supplied input (default {}).
+Every app call, including reads and decisions, gets a visible placeholder. Only
+tool host.files.list/count/read/info may read live through declared reach and
+ordinary admission. The sealed capture is replayed on later validation.
+Hand-written fixtures use input, calls:[{operation,args,result}], answers and
+expected; expected is the complete returned JSON. Validation cannot enable code.
 
-A script skill runs in confined JavaScriptCore through the app's policy gates.
-Every action must be declared and registry-scriptable. Reads are generally
-eligible; `provider.test` is an explicit read-like exception. Skills cannot
-mutate skills, tools, settings, Trust, approvals, connectors, providers or chat
-controls; send messages; or invoke authored or MCP tools. Dream, REM,
-self-improvement, memory consolidation/hygiene and Doctor repair passes are
-also excluded. A declared irreversible or owner-only step hands back before
-execution, as does a step that would raise an approval or permission prompt.
-A run does not file those cards itself.
+## Execution and ownership
 
-For each nonexempt write, first read its page with `app.read`. The run supplies
-the version from its own latest read or successful write. If you explicitly
-pass `expected_version`, it must be one the run observed; a version supplied
-in input is not an own read. Writes without a versioned page are ineligible
-unless the registry exempts them.
+A skill receives frozen input and only its declared action dependencies. A
+dependency pin binds the action ID, argument and result schemas (excluding
+descriptions and other prose), behavioral flags and revision. Wording changes
+do not suspend admitted routines. Contract changes do; result semantics without
+a schema change require a revision bump. Frozen exact-contract aliases preserve
+admitted pre-cutover pin identities without modifying candidates or admissions.
+A write uses the version of its own read. Irreversible actions, owner-only steps
+and a step that would need a card hand back before dispatch. app.decide saves
+a bounded checkpoint. Resume returns saved receipts for landed writes; it never
+repeats them. Changed code, admission, dependency shapes, host revision or reads
+close/refuse the old run visibly, preserving its journal and held work.
 
-For example, save this script with `skill.save` alongside its name,
-description and guidance, then enable it before running it:
+Origins ratchet across revisions, restores, quarantine and rollback. A peer,
+pack or unrecorded origin cannot become the resident's own code by saving it.
+Owner off/trash marks remain owner-controlled. Converted persona procedures
+retain their stable identities and built-in override protections. The census
+requires overrides:built_in for the same-identity persona counterpart; save
+ratchets this restrictive marker. Rolling back
+an override selects retained JS; it never rediscovers the original markdown.
+Unused routines may archive through the existing lifecycle, with explicit
+restore. DROP retains selected code; rollback never undoes prior host effects.
 
-```json
-{
-  "script": {
-    "source": "app.step('Read Desk', 'Read before changing it.', {of: 2});\nconst page = app.read('desk');\napp.expect(!!page.version, 'Desk has a checked version');\napp.step('Add note', 'Append only the requested note.');\nreturn app.desk.note({handle: input.handle, text: input.text}, {expected_version: page.version});",
-    "params": {"handle": "string", "text": "string"},
-    "actions": ["desk.note"],
-    "steps": ["Read Desk", "Add note"],
-    "of": 2
-  }
-}
-```
+## Conversion census and cutover
 
-`skill.run {name, args:{handle:"desk.4", text:"Source review complete."}}`
-uses the requested existing item; `preview:true` dispatches no writes.
-The strict-only APIs are:
+Read `app {page:"tools", item:"census"}` (also Skills) for registered and loose
+authored tools, registered scripts/guidance, persona procedures, orphan
+proposals, immutable JS candidates, historical rollback sources and senses.
+Each entry names language, status, counterpart and blocks_cutover. complete
+means no entries have cutover blockers. Unreadable/corrupt evidence is an error.
+Read it on the installed final revision: changed action/discovery shapes require
+re-saving, validation and exact review of affected routines before cutover.
 
-- `app.step(label, guidance?, {of:n}?)` labels progress and the hand-back.
-- `app.expect(condition, explanation)` stops on a false condition.
-- `app.expect_fail(code, function)` wraps exactly one synchronous app call.
-  It continues only when that call fails with the named code and no effects.
-  A success may already have taken effect and stops the run; nested or async
-  expectations are refused.
-- `app.decide(question, data?)` stops for a decision. On resume it returns
-  the supplied `answer`.
+Optional converts on skill.save and tool.propose lists original source SHA-256
+digests from this census. The common candidate identity and validation seal bind
+these links. Current active capabilities require an accepted JS counterpart;
+inactive originals need validated counterparts without being activated. A
+retained legacy rollback version needs an explicit digest link. Conversion
+candidates stay retained with their originals. Native fixed Swift senses remain
+native; historical authored Swift senses remain readable but cannot run.
 
-Other failures stop strict runs even if JavaScript catches the error. Check
-the receipt's `changed`, effects and hand-back before continuing: earlier
-effects stay done. For a handed-back action, make the separate app call only
-if it is still wanted and authorized, then supply its answer to `skill.resume`.
-Resume never performs that stopped action for you.
+Cutover is a merge decision after the installed census reads complete. There
+is no runtime census guard or auto-conversion. Markdown and Swift originals
+remain history. Failures never try an original body, another language, another
+executor or an earlier version. Version rollback is an explicit action.
+Skill-specific persona read/write aliases are removed; ordinary persona
+documents retain their owners.
 
-Resume claims and closes the retained run **before** checking that the script
-is unchanged, still runnable and compatible with its input. A failed attempt
-consumes that checkpoint. Replay must follow the same app-call sequence;
-completed writes return saved results instead of executing again. Reads and
-finds are rechecked, except reads superseded by that run's own later writes,
-which replay their saved results. Changed reads or a different path stop
-continuation. A new hand-back can retain another checkpoint; otherwise a
-closed run requires starting again. Inspect already landed effects first to
-avoid repeating them.
+## Storage and package metadata
 
-Only the newest 50 stopped runs are retained, each at most 256 KiB including
-its sealed journal. An oversized run cannot resume. `skill.rollback` changes
-the script version; it does not undo effects from a run.
-
-Source owners: [AppToolExecutor+SkillRun.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppToolExecutor+SkillRun.swift)
-and [AppScriptRunner.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppScriptRunner.swift).
-
-## Archive, versions and rollback
-
-Skills and authored tools share `CapabilityLifecycle`: active capabilities
-unused for 30 days are archived, retained and findable, rather than deleted.
-A skill run or `skill.read` records use; turning it on restarts the unused
-clock. `skill.restore` brings an archived skill back through activation,
-including a fresh admission for its script. This differs from `skill.delete`,
-which keeps the body and entry in trash; restoring from trash leaves it off
-or drafted, needing `skill.enable`.
-
-The Skills owner keeps the two newest distinct versions and the last clean
-script version when available. `skill.read` shows current, previous and
-last-clean script digests and timestamps. `skill.rollback` prefers the last
-clean earlier script, otherwise the previous one, and retains origin history.
-The restored script lands drafted and needs admission again; `preview:true`
-reports the result without changing it. Missing declared actions also suspend
-a script into draft, clearing admission until it is fixed and enabled again.
-
-## Built-in skills and their versions of them
-
-Built-in skills ship in `persona/skills/bodies/` and have no registry row:
-they are never archived for disuse, and switching one off or deleting it is
-User's. Saving a skill under a built-in's name makes their version of it, under
-the built-in's id, in `<data_root>/skills/bodies/`; it keeps the built-in's
-status (a script still lands drafted), and saved without a description it
-keeps the built-in's. While it is on it replaces the built-in for them; while
-it is drafted, off or archived the built-in stays in use. The built-in's file
-stays as it ships. `skill.list`, `skill.read` (with its `status`) and the save
-receipt mark it `overrides: built_in`. Their version follows the lifecycle like
-their other skills: unused for 30 days it is archived and the built-in is in use
-again (`skill.restore` brings theirs back). Switching it off or deleting it
-stays User's, as for the built-in it stands in for; `skill.rollback` drops theirs
-instead.
-
-## Storage and source ownership
-
-These paths are implementation details for maintainers. Agents author through
-`skill.save`, not by reconstructing registry rows or body paths.
-
-- `<data root>/skills/registry.json`: procedure records, written as a JSON
-  array. Records include `id`, `name`, `description`, `triggers`, `kind`,
-  `status`, `autoCreated`, `bodyPath` and timestamps.
-- `<data root>/skills/bodies/<id>.md`: runtime procedure bodies.
-- `<resolved persona root>/skills/bodies/`: the persona's procedure shelf.
-
-[InstalledSkillInventory.swift](../Modules/NativeAgentCore/Sources/Skills/InstalledSkillInventory.swift)
-merges runtime records and body shelves for discovery.
-[Skills.swift](../Modules/NativeAgentCore/Sources/Skills/Skills.swift)
-owns locked mutations, body-path confinement, hygiene checks and versions.
-[SwiftToolDispatcher+SkillTools.swift](../Modules/NativeAgentCore/Sources/ChatToolRuntime/SwiftToolDispatcher+SkillTools.swift)
-owns the conversational list/read/save operations.
+InstalledSkillInventory reads canonical registry metadata only. SwiftNativeSkillsClient
+adapts origin, admission, selection and off ownership to OwnedProgramStore's
+immutable candidates, sealed validation and publication. Historical bodies and
+history files are census material, not execution or ordinary discovery sources.
+Pack skill installs stage JS candidates through this same lifecycle; pack removal
+trashes their registry rows while retaining sources. Pack/connector inventories
+retain their manifest metadata, permission and OAuth ownership.
 
 ## Manifest registry compatibility
 
@@ -244,11 +148,3 @@ defines the merge and list projection;
 [AppModel+SkillsIntegrations.swift](../Sources/NativeAgentApp/AppModel+SkillsIntegrations.swift)
 and [ConfigProviderDoctorModels.swift](../Sources/NativeAgentApp/Models/ConfigProviderDoctorModels.swift)
 own the Mac reader and decoded fields.
-
-## Executable capabilities
-
-For code Agent authors, use `app` actions `tool.propose`, then
-`tool.approve`; an approved tool is exposed as `authored.<id>`. Mounted MCP
-tools appear as `mcp.<server>.<tool>`. Their action metadata and authority come
-from [AppActionRegistry.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppActionRegistry.swift),
-not from a procedure body.

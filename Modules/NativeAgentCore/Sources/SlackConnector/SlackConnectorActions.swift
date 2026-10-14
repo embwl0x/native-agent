@@ -1,10 +1,17 @@
 import Foundation
+import FeedPolicy
 import NativeAgentCore
 import PersistenceCore
 
 public enum SlackConnectorActions {
     public static let credentialKeys = ["access_token", "oauth_token", "token", "bot_token"]
-    private static let baseURL = URL(string: "https://slack.com/api")!
+    public static func apiURL(_ method: String) -> URL {
+        if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_SLACK_LOOPBACK_API"],
+           let url = URL(string: raw), ["127.0.0.1", "localhost"].contains(url.host ?? "") {
+            return url.appendingPathComponent(method)
+        }
+        return URL(string: "https://slack.com/api/\(method)")!
+    }
     static let jsonContentType = "application/json; charset=utf-8"
 
     /// Validate local Slack authentication without making a network request.
@@ -17,13 +24,12 @@ public enum SlackConnectorActions {
         _ = try loadToken(dataRoot: dataRoot)
     }
 
-    public static func status(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func status(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
         _ = input
-        let response = try await call(method: "auth.test", httpMethod: "POST")
+        let response = try await call(method: "auth.test", httpMethod: "POST", dataRoot: dataRoot)
         return envelope(
             action: "slack.status",
-            response: response,
-            successStatus: "completed"
+            response: response
         )
     }
 
@@ -66,8 +72,7 @@ public enum SlackConnectorActions {
         }
         return envelope(
             action: "slack.list_channels",
-            response: compact,
-            successStatus: "completed"
+            response: compact
         )
     }
 
@@ -116,8 +121,7 @@ public enum SlackConnectorActions {
         }
         return envelope(
             action: "slack.search_messages",
-            response: compact,
-            successStatus: "completed"
+            response: compact
         )
     }
 
@@ -154,7 +158,7 @@ public enum SlackConnectorActions {
         if let metadata = try messageMetadata(input: input) {
             body["metadata"] = metadata
         }
-        if let idempotencyKey = idempotencyKey?
+        if let idempotencyKey = (idempotencyKey ?? string(input["client_msg_id"]))?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !idempotencyKey.isEmpty {
             body["client_msg_id"] = idempotencyKey
@@ -168,8 +172,7 @@ public enum SlackConnectorActions {
         )
         return envelope(
             action: "slack.post_message",
-            response: response,
-            successStatus: "completed"
+            response: response
         )
     }
 
@@ -229,15 +232,13 @@ public enum SlackConnectorActions {
               !fileId.isEmpty else {
             return envelope(
                 action: "slack.upload_file",
-                response: uploadURLResponse,
-                successStatus: "completed"
+                response: uploadURLResponse
             )
         }
         guard let uploadURL = trustedExternalUploadURL(rawUploadURL) else {
             return envelope(
                 action: "slack.upload_file",
-                response: ["ok": false, "error": "unsafe_upload_url"],
-                successStatus: "completed"
+                response: ["ok": false, "error": "unsafe_upload_url"]
             )
         }
 
@@ -255,8 +256,7 @@ public enum SlackConnectorActions {
                     "ok": false,
                     "error": "upload_http_\(uploadStatus)",
                     "rawPreview": String(data: uploadData.prefix(300), encoding: .utf8) ?? "",
-                ],
-                successStatus: "completed"
+                ]
             )
         }
 
@@ -279,8 +279,7 @@ public enum SlackConnectorActions {
         )
         return envelope(
             action: "slack.upload_file",
-            response: completeResponse,
-            successStatus: "completed"
+            response: completeResponse
         )
     }
 
@@ -325,7 +324,7 @@ public enum SlackConnectorActions {
             req.httpBody = try JSONSerialization.data(withJSONObject: bodyObject)
         }
 
-        return try await response(for: req)
+        return try await response(for: req, dataRoot: dataRoot)
     }
 
     private static func callForm(
@@ -343,12 +342,17 @@ public enum SlackConnectorActions {
         req.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
         req.httpBody = formURLEncoded(form)
 
-        return try await response(for: req)
+        return try await response(for: req, dataRoot: dataRoot)
     }
 
-    private static func response(for request: URLRequest) async throws -> [String: Any] {
-        let (data, resp) = try await URLSession.shared.data(for: request)
-        let parsed: [String: Any]
+    private static func response(for request: URLRequest, dataRoot: URL) async throws -> [String: Any] {
+        let data: Data, resp: URLResponse
+        do { (data, resp) = try await URLSession.shared.data(for: request) }
+        catch {
+            await recordConnectionProof(["ok": false, "error": "transport_failed"], dataRoot: dataRoot)
+            throw error
+        }
+        var parsed: [String: Any]
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             parsed = object
         } else {
@@ -359,20 +363,38 @@ public enum SlackConnectorActions {
             ]
         }
 
-        guard let http = resp as? HTTPURLResponse else { return parsed }
-        guard http.statusCode < 400 else {
-            var failed = parsed
-            failed["ok"] = false
-            failed["error"] = (parsed["error"] as? String) ?? "http_\(http.statusCode)"
-            failed["httpStatus"] = http.statusCode
-            return failed
+        if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
+            parsed["ok"] = false
+            parsed["error"] = (parsed["error"] as? String) ?? "http_\(http.statusCode)"
+            parsed["httpStatus"] = http.statusCode
         }
+        await recordConnectionProof(parsed, dataRoot: dataRoot)
         return parsed
+    }
+
+    private static func recordConnectionProof(_ response: [String: Any], dataRoot: URL) async {
+        let proof: JSONValue = .object([
+            "id": .string(UUID().uuidString.lowercased()),
+            "actionId": .string("slack.http"), "connectorId": .string("slack"),
+            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
+            "status": .string(response["ok"] as? Bool == true ? "completed" : "failed"),
+            "dryRun": .bool(false),
+            "output": .object([
+                "error": .string(response["error"] as? String ?? ""),
+                "httpStatus": (response["httpStatus"] as? Int).map { .int(Int64($0)) } ?? .null,
+            ]),
+        ])
+        do {
+            try await appendJSONLCapped(proof, to: dataRoot.appendingPathComponent("connectors/actions/receipts.jsonl"),
+                using: SwiftNativePersistenceCore(), maxLines: JSONLLineCaps.actionReceipts, logLabel: "Slack.connection")
+        } catch {
+            ModuleLog(category: "SlackConnector")("Could not record transport proof: %@", error.localizedDescription)
+        }
     }
 
     private static func requestURL(method: String, params: [String: String]) throws -> URL {
         var comps = URLComponents(
-            url: baseURL.appendingPathComponent(method),
+            url: apiURL(method),
             resolvingAgainstBaseURL: false
         )!
         if !params.isEmpty {
@@ -419,24 +441,23 @@ public enum SlackConnectorActions {
 
     static func envelope(
         action: String,
-        response: [String: Any],
-        successStatus: String
+        response: [String: Any]
     ) -> JSONValue {
         let ok = (response["ok"] as? Bool) == true
         var obj: [String: JSONValue] = [
             "actionId": .string(action),
             "connectorId": .string("slack"),
             "ok": .bool(ok),
-            "status": .string(ok ? successStatus : "failed"),
+            "status": .string(ok ? "completed" : "failed"),
             "response": JSONValue(fromFoundation: response),
         ]
         if let error = response["error"] as? String, !error.isEmpty {
             obj["error"] = .string(error)
             // What to do next, in words, for the codes that have one.
             let fix: String? = switch error {
-            case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The owner must sign in to Slack in Settings > Connectors."
-            case "missing_scope": "The owner must add \((response["needed"] as? String) ?? "the required scope") in the Slack app settings, then sign in to Slack in Settings > Connectors."
-            case "not_allowed_token_type": "Slack search needs a user token with search:read. The owner must sign in to Slack in Settings > Connectors."
+            case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
+            case "missing_scope": "The owner must add \((response["needed"] as? String) ?? "the required scope") in the Slack app settings, then sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
+            case "not_allowed_token_type": "Slack search needs a user token with search:read. The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
             case "channel_not_found": "No channel by that name or id; app {action:\"slack.channels\"} shows them."
             case "not_in_channel": "The bot isn't in that channel; invite it there with /invite first."
             case "ratelimited": "Slack is rate limiting; wait a minute before trying again."

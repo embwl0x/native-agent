@@ -189,15 +189,12 @@ public struct DeskDrift: Sendable, Equatable {
 /// An item reality says is finished, with the proof required to close it.
 public struct DeskAutoResolve: Sendable, Equatable {
     public var handle: String
-    /// CAS token — the item's `updatedAt` at evaluation time. The close is
-    /// abandoned if the item moved underneath us.
-    public var expectedUpdatedAt: String
     public var refKeys: [String]
     /// Receipt lines, one per ref, verbatim from the source.
     public var evidence: [String]
     public var observedAt: String
     /// Everything about the item this verdict actually depends on, EXCLUDING
-    /// notes and `updatedAt`. `expectedUpdatedAt` alone cannot distinguish "the
+    /// notes and `updatedAt`. A timestamp alone cannot distinguish "the
     /// applier's own receipt note moved this item" from "User retitled it while
     /// we were mid-pass" — both just bump the stamp. The applier compares this
     /// instead, so its own annotations are transparent while any real edit to
@@ -206,14 +203,12 @@ public struct DeskAutoResolve: Sendable, Equatable {
 
     public init(
         handle: String,
-        expectedUpdatedAt: String,
         refKeys: [String],
         evidence: [String],
         observedAt: String,
         materialFingerprint: String
     ) {
         self.handle = handle
-        self.expectedUpdatedAt = expectedUpdatedAt
         self.refKeys = refKeys
         self.evidence = evidence
         self.observedAt = observedAt
@@ -552,7 +547,6 @@ public enum DeskObservationEvaluator {
 
             autoResolves.append(DeskAutoResolve(
                 handle: item.handle,
-                expectedUpdatedAt: item.updatedAt,
                 refKeys: keys,
                 evidence: evidence,
                 observedAt: observedAt,

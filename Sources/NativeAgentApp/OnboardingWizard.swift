@@ -1,6 +1,7 @@
 import ProviderRouting
 import AppToolRuntime
 import Onboarding
+import EngineRuntime
 // PATCH-2026-05-07: onboarding-2 Generic onboarding wizard — name + persona type
 import SwiftUI
 import AppKit
@@ -99,7 +100,7 @@ final class OnboardingWizardState {
     // (NSFullUserName): a public user's Mac account isn't their answer to
     // "your name," and it leaked the host account into onboarding (User, 2026-07-05).
     var userName: String = ""
-    var abilities: [AbilityOverviewEntry] = OnboardingWizardState.defaultAbilities
+    var abilities: [AbilityOverviewEntry] = SwiftNativeOnboardingClient.abilityOverview
     var showsAbilityOverview = false
     var errorMessage: String?
     var pendingRecoveryNeedsReset = false
@@ -179,14 +180,6 @@ final class OnboardingWizardState {
         step = previous
     }
 
-    static let defaultAbilities: [AbilityOverviewEntry] = [
-        AbilityOverviewEntry(id: "chat", title: "Chat with memory", detail: "Long-running conversations, recall, corrections, and personality growth.", systemImage: "message"),
-        AbilityOverviewEntry(id: "projects", title: "Build with you", detail: "Read approved projects, edit files, run tests, and show results and keep an activity record when access allows.", systemImage: "hammer"),
-        AbilityOverviewEntry(id: "mac", title: "Use Mac actions", detail: "Notifications, Spotlight, Shortcuts, files, shell, and app control with your permission, managed in Trust.", systemImage: "macbook"),
-        AbilityOverviewEntry(id: "connectors", title: "Connect services", detail: "Optional providers and connectors for chat models, Telegram, GitHub, email, calendar, and more.", systemImage: "point.3.connected.trianglepath.dotted"),
-        AbilityOverviewEntry(id: "mobile", title: "Work from iPhone", detail: "Pair the mobile app for chat, approvals, push notifications, inbox, activity, and remote actions.", systemImage: "iphone"),
-        AbilityOverviewEntry(id: "improve", title: "The agent improves with use", detail: "Work is checked and kept in a record you can read.", systemImage: "checkmark.shield"),
-    ]
 }
 
 // MARK: - OnboardingWizard
@@ -315,7 +308,8 @@ struct OnboardingWizard: View {
             state.step = .error
             return
         }
-        if resp.pendingRecovery {
+        let disposition = resp.disposition(buildFailed: state.buildFailed)
+        if disposition == .resume {
             state.step = .building
             do {
                 let resumed = try await appModel.resumePendingOnboarding()
@@ -343,7 +337,7 @@ struct OnboardingWizard: View {
         // default profile — the configured names silently gone. Reset is the
         // wrong remedy (it would back out good persona documents over one
         // missing file), so this state gets its own two-field repair lane.
-        if resp.profileRepairRequired {
+        if disposition == .repairProfile {
             // User, 2026-09-06: blank the fields only on FIRST entry. A re-read
             // from inside the lane (the refusal recheck below) must not throw
             // away the names the person just typed.
@@ -360,17 +354,16 @@ struct OnboardingWizard: View {
         }
         state.profileRepairRecheckOffered = false
         state.profileRepairOnly = false
-        if resp.resetRequired {
+        if disposition == .reset {
             state.pendingRecoveryNeedsReset = true
             state.errorMessage = "Incomplete persona documents were found. Reset will back them up before onboarding starts again."
             state.step = .error
             return
         }
-        if resp.hasExisting {
-            switch Self.existingPersonaDisposition(buildFailed: state.buildFailed) {
-            case .alreadyOnboarded:
+        if disposition == .alreadyOnboarded || disposition == .blockedNeedsReset {
+            if disposition == .alreadyOnboarded {
                 onComplete()
-            case .blockedNeedsReset:
+            } else {
                 state.pendingRecoveryNeedsReset = true
                 state.errorMessage = state.errorMessage
                     ?? Self.buildFailureMessage(error: "persona_already_exists", detail: nil)
@@ -381,7 +374,7 @@ struct OnboardingWizard: View {
         state.pendingRecoveryNeedsReset = false
         // Persona-type picker removed 2026-07-04 (single AI persona) — only the
         // ability overview is still consumed from the start response.
-        state.abilities = resp.abilityOverview.isEmpty ? OnboardingWizardState.defaultAbilities : resp.abilityOverview
+        state.abilities = resp.abilityOverview.isEmpty ? SwiftNativeOnboardingClient.abilityOverview : resp.abilityOverview
         if state.step == .error {
             state.step = state.trimmedUserName.isEmpty || state.trimmedAgentName.isEmpty
                 ? .identity : .provider
@@ -443,7 +436,7 @@ struct OnboardingWizard: View {
                 // and the step offered only Save, so they were stuck. Re-read
                 // the start state instead: it completes the wizard when the
                 // profile is now there, and otherwise leaves a Check again.
-                if resp.error == "profile_already_present" || resp.error == "onboarding_in_progress" {
+                if resp.requiresProfileRepairRecheck {
                     await loadOnboardingState()
                     if state.step == .profileRepair {
                         state.profileRepairRecheckOffered = true
@@ -511,7 +504,7 @@ struct OnboardingWizard: View {
                 // the way. That is precisely what reset (which BACKS UP before
                 // clearing) exists for, so surface the affordance instead of
                 // showing a raw error code with no way forward.
-                if resp.error == "persona_already_exists" {
+                if resp.requiresPersonaReset {
                     state.pendingRecoveryNeedsReset = true
                 }
                 state.step = .error
@@ -521,22 +514,6 @@ struct OnboardingWizard: View {
             state.errorMessage = UserFacingError.message(error, action: "finish setup")
             state.step = .error
         }
-    }
-
-    /// What pre-existing persona state means to a wizard that is currently open.
-    enum ExistingPersonaDisposition: Equatable {
-        /// Someone else already onboarded this Mac — close the wizard.
-        case alreadyOnboarded
-        /// This wizard's own Build failed against that state; it is an
-        /// obstacle, not a success. Offer the backup-preserving reset.
-        case blockedNeedsReset
-    }
-
-    /// fix-blank-install-onboarding (2026-08-02): `hasExisting` alone used to
-    /// mean "done" on every path, so a Build that died on
-    /// `persona_already_exists` dismissed the wizard as if it had succeeded.
-    static func existingPersonaDisposition(buildFailed: Bool) -> ExistingPersonaDisposition {
-        buildFailed ? .blockedNeedsReset : .alreadyOnboarded
     }
 
     /// Raw backend error codes are not user-facing copy.
@@ -595,7 +572,7 @@ struct OnboardingWizard: View {
     /// Honest, actionable copy for a scaffold repair that did not succeed.
     /// Says what DID land (identity docs) so the user is not told their work was
     /// lost, names the failing check, and points at the one action that helps.
-    static func scaffoldRepairFailureMessage(_ outcome: AppModel.DoctorRunOutcome) -> String {
+    static func scaffoldRepairFailureMessage(_ outcome: DoctorFacade.RunOutcome) -> String {
         let detail = outcome.failureDetail.trimmingCharacters(in: .whitespacesAndNewlines)
         return [
             "Your identity documents were written, but setting up the app's local files did not finish, so this install is not ready yet.",
@@ -901,10 +878,9 @@ private struct ProviderConnectStep: View {
     }
 
     private func updateModelReadiness() {
-        state.chatModelReady = state.providers.contains { provider in
-            provider.provider_id == appModel.chatProvider && provider.auth_status.state == "ready"
-                && provider.models.contains { $0.id == appModel.chatModel && !$0.id.isEmpty }
-        }
+        state.chatModelReady = ProvidersFacade.chatModelIsReady(
+            providers: state.providers, providerID: appModel.chatProvider, model: appModel.chatModel
+        )
     }
 }
 

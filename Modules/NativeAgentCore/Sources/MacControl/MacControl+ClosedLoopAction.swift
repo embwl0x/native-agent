@@ -853,8 +853,7 @@ var effect: [String: JSONValue] = [
                 action: "act",
                 output: .object(output),
                 error: performed.error,
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                viaSwift: true
+                durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
 
@@ -1018,8 +1017,7 @@ var effect: [String: JSONValue] = [
             action: "act",
             output: .object(output),
             error: performed.error,
-            durationMs: Int(now().timeIntervalSince(started) * 1000),
-            viaSwift: true
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }
 

@@ -292,6 +292,9 @@ extension TelegramPollLoop {
         }
     }
 
+    private static let botTokenExpression = try? NSRegularExpression(pattern: #"bot\d+(?::|%3[Aa])[A-Za-z0-9_\-]+"#)
+    private static let bareTokenExpression = try? NSRegularExpression(pattern: #"\b\d{6,}(?::|%3[Aa])[A-Za-z0-9_\-]+"#)
+
     /// Strip the bot token from any string headed for logs/state/UI.
     /// URLSession errors embed the failing URL — which contains
     /// /bot<TOKEN>/ — and recordError rows render verbatim in the Mac
@@ -300,13 +303,9 @@ extension TelegramPollLoop {
         // Both the raw form (bot123:secret) and the percent-encoded form a
         // URLSession error can carry (bot123%3Asecret) — the encoded colon
         // slipped the original pattern (gpt-5.5 review, telegram-vision-in).
-        guard let botRegex = try? NSRegularExpression(pattern: #"bot\d+(?::|%3[Aa])[A-Za-z0-9_\-]+"#),
-              let bareRegex = try? NSRegularExpression(pattern: #"\b\d{6,}(?::|%3[Aa])[A-Za-z0-9_\-]+"#)
+        guard let botRegex = botTokenExpression,
+              let bareRegex = bareTokenExpression
         else { return s }
-        // ONE redaction vocabulary across every layer that scrubs a Telegram
-        // token (this upstream scrub fires before TelegramRichMessage.sanitize's
-        // typed regex, so an ad-hoc "<redacted>" here would shadow the typed
-        // marker downstream and make evidence undiagnosable — 0.4.3 gauntlet).
         let botRedacted = botRegex.stringByReplacingMatches(
             in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "[REDACTED_TELEGRAM_TOKEN]"
         )

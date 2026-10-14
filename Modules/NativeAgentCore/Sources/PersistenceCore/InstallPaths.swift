@@ -74,10 +74,7 @@ public struct InstallPaths: Sendable {
     }
     public func bridgeDiscoveryDirectory(dataRoot: URL, defaultRoot: URL? = nil,
                                          secondary: Bool = UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall")) -> URL {
-        let root = bridgeConfigRoot(dataRoot: dataRoot, defaultRoot: defaultRoot, secondary: secondary)
-        // 2026-09-18: relocated shipped installs published directly under their
-        // data root; their readers' bridge-config directory is a separate path.
-        return (usesLegacyPaths && root != bridgeConfigRoot ? dataRoot.standardizedFileURL : root)
+        bridgeConfigRoot(dataRoot: dataRoot, defaultRoot: defaultRoot, secondary: secondary)
             .appendingPathComponent("claude-bridge", isDirectory: true)
     }
     public func ownsChromeManifest(_ manifest: [String: Any], relay: URL) -> Bool {
@@ -107,4 +104,85 @@ public struct InstallPaths: Sendable {
             "NATIVE_AGENT_OMP_BRIDGE_DIR": configRoot.appendingPathComponent("omp-bridge").path,
         ]
     }
+
+    public static let publicReleaseDataMarker = "public_release_data_root.json"
+
+    public static func allowsLoginItem(bundlePath: String, homeDirectory: String = NSHomeDirectory()) -> Bool {
+        let path = URL(fileURLWithPath: bundlePath).standardizedFileURL.path
+        let userApplications = URL(fileURLWithPath: homeDirectory, isDirectory: true)
+            .appendingPathComponent("Applications", isDirectory: true).standardizedFileURL.path
+        return path.hasPrefix("/Applications/") || path.hasPrefix(userApplications + "/")
+    }
+
+    public enum PublicReleaseDataRootPreparationResult: Sendable {
+        case notNeeded
+        case prepared(String)
+        case failed(String)
+    }
+
+    /// Mark the public release in place, preserving all existing user data.
+    @discardableResult
+    public static func preparePublicReleaseDataRootIfNeeded() -> PublicReleaseDataRootPreparationResult {
+        let fm = FileManager.default
+        // Round 3: empty env = unset (Core resolver parity).
+        guard (ProcessInfo.processInfo.environment["NATIVE_AGENT_DATA_ROOT"] ?? "").isEmpty else { return .notNeeded }
+        guard isPublicReleaseBundle else { return .notNeeded }
+
+        let support = libraryAppSupportFallback().standardizedFileURL
+        let root = defaultDataRoot().standardizedFileURL
+        guard root.path == support.path else { return .notNeeded }
+
+        let marker = root
+            .appendingPathComponent("install", isDirectory: true)
+            .appendingPathComponent(publicReleaseDataMarker)
+        if fm.fileExists(atPath: marker.path) {
+            return .notNeeded
+        }
+
+        do {
+            try fm.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+            var payload: [String: Any] = [
+                "markerVersion": 1,
+                "channel": "public-release",
+                "createdAt": ISO8601DateFormatter().string(from: Date()),
+                "reason": "public_release_marker_written_in_place",
+                "bundleIdentifier": Bundle.main.bundleIdentifier ?? "",
+                "bundleVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
+                "bundleShortVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+            ]
+            if let resourcesURL = Bundle.main.resourceURL,
+               let buildSHA = try? String(
+                contentsOf: resourcesURL.appendingPathComponent("VERSION_SHA"),
+                encoding: .utf8
+               ).trimmingCharacters(in: .whitespacesAndNewlines),
+               !buildSHA.isEmpty {
+                payload["buildSHA"] = buildSHA
+            }
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: marker, options: [.atomic])
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: marker.path)
+
+            let message = "[paths] public release marker written in place at \(root.path); existing data retained"
+            print(message)
+            return .prepared(message)
+        } catch {
+            let message = "[paths] public release marker could not be written: \(error.localizedDescription)"
+            print(message)
+            return .failed(message)
+        }
+    }
+
+    /// True only for a distributed public build: no REPO_PATH dev stamp, a real
+    /// .app bundle, and a VERSION resource. Dev installs from install_app.sh are
+    /// always stamped, so they can never read as public-release. Gates the
+    /// data-root marker and the first-run welcome greeting.
+    public static let isPublicReleaseBundle: Bool = {
+        let fm = FileManager.default
+        guard let resourcesURL = Bundle.main.resourceURL else { return false }
+        if fm.fileExists(atPath: resourcesURL.appendingPathComponent("REPO_PATH").path) {
+            return false
+        }
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return false }
+        return fm.fileExists(atPath: resourcesURL.appendingPathComponent("VERSION").path)
+    }()
 }

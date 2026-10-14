@@ -32,10 +32,6 @@ import PersistenceCore
 // the projection actually replayed this turn, so when the window cursor drops
 // a turn its archived block goes with it. A block outside the replayed window
 // is not merely dead weight — replaying one would corrupt the prefix.
-//
-// File shape, actor discipline, per-file lock and hourly orphan sweep mirror
-// `HistoryWindowCursorStore` / `ActiveToolsStore` deliberately: one pattern to
-// reason about across all three sidecars.
 
 /// One mid-conversation system message a past turn sent, held so later turns
 /// can re-send it byte-for-byte.
@@ -131,14 +127,8 @@ public actor TurnVolatileArchive {
     private static let ttlSeconds: TimeInterval = 24 * 60 * 60
     private static let sweepIntervalSeconds: TimeInterval = 60 * 60
 
-    private static func makeISO8601() -> ISO8601DateFormatter {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }
-
     nonisolated private static func iso8601Now() -> String {
-        makeISO8601().string(from: Date())
+        NativeTimestampFormat.fractionalZulu(Date())
     }
 
     private let persistence = SwiftNativePersistenceCore()
@@ -280,8 +270,7 @@ public actor TurnVolatileArchive {
             // lock sidecar and the per-session directory behind — one empty
             // directory and one lock file per session ever created, kept
             // forever. Lock sidecars are reapable by design (the acquire path
-            // in PersistenceCore+FileLock validates the inode it locked), which
-            // is what HistoryWindowCursor's sweep already relies on.
+            // in PersistenceCore+FileLock validates the inode it locked).
             let reaped = (try? await persistence.withFileLock(file) { () -> Bool in
                 guard let recheck = try? file.resourceValues(
                     forKeys: [.contentModificationDateKey]

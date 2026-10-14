@@ -43,7 +43,7 @@ extension CognitiveSubstrate {
         // inside the actor's await-free transition and owns no state: it only
         // prevents affect, semantic appraisal, and retrospective landing from
         // rescanning the same already-loaded text and standing views.
-        let buildsAffectBundle = configuration.affectEnabled
+        let buildsAffectBundle = configuration.enabled
             && event.turnKind.contributesToLivedState
         // Item 8 (2026-09-02) — OTHERS MOVE HER. This used to read
         // `isUserAuthored(event.kind) ? conversationalAppraisal(…) : empty`,
@@ -136,7 +136,7 @@ extension CognitiveSubstrate {
             : affect
         // Stamp the tag from the affect this event just produced ("how she feels having
         // just experienced it", Wave A). Gated on affect: no affect, no live feeling.
-        if contributesToLivedState, configuration.affectEnabled, let ingestOutcome {
+        if contributesToLivedState, configuration.enabled, let ingestOutcome {
             // R2-A/B: appraise the event's MEANING (pure, no suspension — stays inside
             // this await-free segment) so the stamped feeling is about what happened,
             // not the fact that something happened.
@@ -178,7 +178,7 @@ extension CognitiveSubstrate {
         // re-stamp reads the remembered node's tag and writes it back, so a
         // reentrant ingest suspending in between could evict/recreate that node
         // or swap the slot underneath us. Pure, synchronous, no suspension.
-        if contributesToLivedState, configuration.affectEnabled, !defersInterpretation {
+        if contributesToLivedState, configuration.enabled, !defersInterpretation {
             reconsolidatePendingCompletion(
                 with: event,
                 outcome: ingestOutcome,
@@ -207,7 +207,7 @@ extension CognitiveSubstrate {
             }
             return true
         }
-        if contributesToLivedState, configuration.enabled, configuration.affectEnabled {
+        if contributesToLivedState, configuration.enabled {
             await persistArtifact(
                 kind: "affect",
                 id: stableArtifactID("affect"),
@@ -322,7 +322,7 @@ extension CognitiveSubstrate {
                 field.stampEmotionTag(
                     key: pending.nodeKey,
                     tag: (
-                        valence: Self.clampSigned(current.valence + reaction),
+                        valence: (current.valence + reaction).clampedSigned(),
                         arousal: current.arousal,
                         warmth: current.warmth
                     ),

@@ -23,9 +23,9 @@ public struct WorkshopDirectedTaskResult: Sendable, Equatable {
 /// time without breaking the proven executor.
 public struct WorkshopDirectedTaskSubmitter: Sendable {
     public let dataRoot: URL
-    public let runner: any WorkshopRunnerClient
+    public let runner: SwiftNativeWorkshopRunner
 
-    public init(dataRoot: URL, runner: any WorkshopRunnerClient) {
+    public init(dataRoot: URL, runner: SwiftNativeWorkshopRunner) {
         self.dataRoot = dataRoot
         self.runner = runner
     }

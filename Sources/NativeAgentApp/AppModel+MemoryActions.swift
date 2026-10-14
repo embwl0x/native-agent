@@ -176,64 +176,11 @@ extension AppModel {
         }
     }
 
-    // Dry runs preview active memories and pending proposals; commit requests
-    // use the consolidator's approval-gated path.
-    nonisolated static func runMemoryConsolidation(dataRoot: URL, dryRun: Bool) async throws -> [String: Any] {
-        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        if dryRun {
-            let active = (try? await storage.listMemories(persona: nil, status: "active", limit: nil).count) ?? 0
-            let pending = (try? await storage.listProposals(status: "pending").count) ?? 0
-            return [
-                "ok": true,
-                "dry_run": true,
-                "processed": pending,
-                "active_memories": active,
-                "pending_proposals": pending,
-                "detail": "Preview only; no memory records were changed.",
-            ]
-        }
-        let consolidator = MemoryConsolidator(storage: storage)
-        // Honest-status fix (2026-07-24): consolidation is gated — it stages
-        // an approval card and never mutates the live store here. Surface the
-        // real outcome so the UI can say "queued for approval" instead of
-        // reporting planned counters as applied work.
-        let outcome = try await consolidator.consolidateGated()
-        let report: MemoryV2.ConsolidationReport
-        var extra: [String: Any] = [:]
-        switch outcome {
-        case .staged(let approvalId, _, _, let plan):
-            report = plan
-            extra["status"] = "pending_approval"
-            extra["approval_id"] = approvalId
-        case .alreadyStaged(let approvalId):
-            report = MemoryV2.ConsolidationReport(
-                processed: 0, duplicatesMerged: 0,
-                pendingForReview: 0, staleArchived: 0, errors: [])
-            extra["status"] = "pending_approval"
-            extra["approval_id"] = approvalId
-        case .refusedRegression(_, let plan):
-            report = plan
-            extra["status"] = "refused"
-        case .noChanges(let plan):
-            report = plan
-        }
-        var envelope: [String: Any] = [
-            "ok": true,
-            "processed": report.processed,
-            "duplicates_merged": report.duplicatesMerged,
-            "pending_for_review": report.pendingForReview,
-            "stale_archived": report.staleArchived,
-            "errors": report.errors,
-        ]
-        envelope.merge(extra) { _, new in new }
-        return envelope
-    }
-
     @MainActor
     @discardableResult
     func consolidateMemory() async -> MemoryMenuActionFeedback {
         do {
-            let result = try await Self.runMemoryConsolidation(dataRoot: engine.dataRoot, dryRun: false)
+            let result = try await MemoryConsolidationHygiene.runConsolidation(dataRoot: engine.dataRoot, dryRun: false)
             return await applyMemoryConsolidationResult(result)
         } catch let err as NSError where (err.userInfo["code"] as? String) == "not_implemented" {
             let reason = (err.userInfo["reason"] as? String) ?? "feature not yet available"
@@ -260,52 +207,11 @@ extension AppModel {
         return presentation.feedback
     }
 
-    /// The manual hygiene path: the Swift MemoryV2 consolidator handles
-    /// tombstones, duplicate proposal merges, high-durability auto-accepts,
-    /// and stale active-memory archive. A dry run previews counts only.
-    nonisolated static func memoryHygieneReport(dataRoot root: URL, dryRun: Bool) async throws -> MemoryHygieneReport {
-
-        if dryRun {
-            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: root)
-            let before = (try? await storage.listMemories(persona: nil, status: nil, limit: nil).count) ?? 0
-            let pending = (try? await storage.listProposals(status: "pending").count) ?? 0
-            let now = Date()
-            let nowISO = SwiftNativeManifestSigner.isoTimestamp(now)
-            let nextISO = SwiftNativeManifestSigner.isoTimestamp(now.addingTimeInterval(7 * 24 * 3600))
-            return MemoryHygieneReport(
-                id: "hygiene-preview-\(UUID().uuidString.lowercased())",
-                status: "dry_run",
-                reason: "Preview only; no memory records were changed.",
-                version: "swift-memory-v2-consolidator",
-                createdAt: nowISO,
-                beforeCount: before,
-                afterCount: before,
-                normalized: pending,
-                archivedDuplicates: nil,
-                archivedReflections: nil,
-                distilledFactsAdded: nil,
-                decayedMemories: nil,
-                proposalHygiene: MemoryProposalHygiene(rejectedLowValue: nil, nearDuplicates: nil),
-                consolidationRunId: nil,
-                nextScheduled: nextISO
-            )
-        }
-
-        // U3 wave-1 item 6 + review blocker (2026-06-10): this is the ONLY
-        // direct-consolidate entry point, and both of its callers carry an
-        // explicit approval — the Memories upkeep "Run hygiene" button (manual
-        // human action) and applyApprovedSelfImprovement's approved
-        // run_memory_hygiene op. The weekly tick calls runOnce itself
-        // (MemoryConsolidationHygieneRunner, 2026-09-22).
-        return try await MemoryConsolidationHygiene.runOnce(
-            dataRoot: root, approvedDirectRun: true)
-    }
-
     @MainActor
     @discardableResult
     func runMemoryHygiene(dryRun: Bool = false) async -> MemoryMenuActionFeedback {
         do {
-            let result = try await Self.memoryHygieneReport(dataRoot: engine.dataRoot, dryRun: dryRun)
+            let result = try await MemoryConsolidationHygiene.report(dataRoot: engine.dataRoot, dryRun: dryRun, approvedDirectRun: true)
             latestMemoryHygiene = result
             memoryFeatureDisabledMessage = nil
             let summary = Self.memoryHygieneRunSummary(result, dryRun: dryRun)

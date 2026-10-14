@@ -13,6 +13,7 @@ import TrustCenter
 import WorkshopExecution
 import StandingBots
 import ToolRegistry
+import Senses
 
 /// Core's composed gate in front of the tool router on chat surfaces.
 ///
@@ -121,11 +122,40 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         if let taskSession {
             canonicalInput["__session_id"] = .string(taskSession)
         }
-        let result = try await dispatchWithoutOrganismPosture(
+        let host = AppToolExecutor.authoredProgramHost(dataRoot: securityCenter.dataRoot) { id, arguments in
+            if arguments["__authored_primitive"] != nil {
+                guard let reentry = AppDoorReentry.perform else {
+                    return .object(["status": .string("refused"), "effects": .string("none"),
+                                    "reason": .string("door_unavailable"), "detail": .string("A primitive needs the originating turn's gate chain.")])
+                }
+                return await AuthoredToolEffects.$admissionOnly.withValue(true) {
+                    do {
+                        let result = try await reentry(id, arguments)
+                        if case .object(let fields) = result, fields["status"] == .string("ok") { return nil }
+                        return result
+                    } catch { return ChatToolOutcome.failure(error: error, tool: id) }
+                }
+            }
+            let envelope = await self.securityCenter.evaluateTool(tool: id, input: arguments,
+                origin: Self.securityOrigin(input: arguments, surface: surface), enforceAutonomy: self.enforceAutonomySecurity)
+            guard envelope.decision != .block, !self.enforceAutonomySecurity || !envelope.requiresApproval else {
+                return Self.securityGateResponse(envelope)
+            }
+            // The authored dispatcher owns file_ops admission. Full Mac may
+            // still be active on a peer's approved turn without a YOLO origin.
+            guard [.admitted, .untrustedOrigin].contains(envelope.fullMacYoloAuthority) else {
+                return .object(["status": .string("refused"), "effects": .string("none"),
+                                "reason": .string("full_mac_required"), "detail": .string("Authored execution requires Full Mac file access.")])
+            }
+            return nil
+        }
+        let result = try await OwnedProgramInvocation.$host.withValue(host) {
+            try await dispatchWithoutOrganismPosture(
             tool: tool,
             input: canonicalInput,
             surface: surface
-        )
+            )
+        }
         await observeMotorOutcomeIfNeeded(tool: tool, result: result)
         return result
     }
@@ -138,6 +168,10 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
     }
 
     private func dispatchWithoutOrganismPosture(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if AuthoredToolEffects.admissionOnly {
+            return .object(["status": .string("refused"), "effects": .string("none"),
+                            "reason": .string("door_unavailable"), "detail": .string("Primitive admission requires the turn's autonomy gate.")])
+        }
         let envelope = await securityCenter.evaluateTool(
             tool: tool,
             input: input,
@@ -151,6 +185,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
               !enforceAutonomySecurity || !envelope.requiresApproval else {
             return Self.securityGateResponse(envelope)
         }
+        try Task.checkCancellation()
         let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
         // An ask for something already set up raises no card: a card that
         // reads as its receipt from the start would leave the turn waiting on
@@ -158,12 +193,14 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         if includeAppOwnedTools, tool == InlineInteractionWire.toolName,
            let need = InlineInteractionNeed.interaction(in: result),
            let done = await interactions.liveOutcomeSummary(need, dataRoot: PersistenceCore.defaultDataRoot()) {
-            return .object([
+            var settled: [String: JSONValue] = [
                 "status": .string("ok"),
                 "already_done": .bool(true),
                 "summary": .string(done),
                 "note": .string("Already set up, so no card was shown. Carry on."),
-            ])
+            ]
+            if case .object(let fields) = result { settled["automation"] = fields["automation"] }
+            return .object(settled)
         }
         if includeAppOwnedTools, ["agent_connect", "agent_message"].contains(tool),
            case .object(let plan) = result,

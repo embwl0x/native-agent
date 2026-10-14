@@ -96,7 +96,7 @@ struct CognitionProposalsView: View {
                             Text(view.body)
                                 .font(.caption)
                                 .textSelection(.enabled)
-                            Text(CognitionObservatoryPresentation.standingViewStatus(view))
+                            Text(CognitionProposalPresentation.standingViewStatus(view))
                                 .font(.caption2)
                                 .foregroundStyle(view.status == .active ? Color.purple : .secondary)
                         }
@@ -112,9 +112,8 @@ struct CognitionProposalsView: View {
                                 Task {
                                     guard let runtime = cognition.runtime else { return }
                                     let result = action == .retire
-                                        ? await CognitionProposalActions.retireWithOutcome(runtime: runtime, id: view.id)
-                                        : await CognitionProposalActions.resolveWithOutcome(
-                                            runtime: runtime,
+                                        ? await runtime.retireStandingViewWithOutcome(id: view.id)
+                                        : await runtime.resolveStandingViewWithOutcome(
                                             id: view.id,
                                             approved: action.approved
                                         )
@@ -165,7 +164,7 @@ struct CognitionProposalsView: View {
         }
     }
 
-    private func reportReview(_ status: CognitionProposalActions.ResolveStatus, action: String) {
+    private func reportReview(_ status: NativeCognitionRuntime.StandingViewReviewStatus, action: String) {
         switch status {
         case .applied:
             reviewError = nil
@@ -177,5 +176,66 @@ struct CognitionProposalsView: View {
             reviewError = "\(action) was not saved: \(detail)"
             appModel.systemToasts.push(error: reviewError ?? detail)
         }
+    }
+}
+
+enum CognitionProposalPresentation {
+    static func standingViewStatus(_ view: CognitiveStandingView) -> String {
+        switch view.status {
+        case .active:
+            // Phase 5 D: independent occurrences, not nodes re-reading dragged along.
+            return "active lens since \(view.updatedAt.formatted(date: .abbreviated, time: .omitted)) — \(view.independentOccurrenceCount) independent occurrence(s)"
+        case .held:
+            // Named for what it IS: the agent's, unsigned, and yours to end.
+            return "held by \(AgentVoice.live.object) since \(view.updatedAt.formatted(date: .abbreviated, time: .omitted)) — no signature needed, retire any time"
+        case .retired:
+            return "retired"
+        case .proposed:
+            return "proposed — waiting for your call"
+        case .opinion:
+            // Phase 5 D1: formed on independent recurrence, with its reasons. Hers.
+            return "\(AgentVoice.live.possessive) opinion — because \(view.because)"
+        case .interest:
+            return "\(AgentVoice.live.possessive) interest — fades unless revisited"
+        }
+    }
+
+}
+
+enum CognitionSurfaceDispositionPresentation {
+    enum StandingViewAction: String, CaseIterable, Hashable, Sendable {
+        case approve
+        case reject
+        /// The way OUT of a view she is already leaning on — active or held.
+        /// Not `reject`: rejecting is a verdict on a proposal, retiring is
+        /// ending something she has been living with, and the timeline records
+        /// them as the different facts they are.
+        case retire
+
+        var title: String {
+            switch self {
+            case .approve: "Approve"
+            case .reject: "Reject"
+            case .retire: "Retire"
+            }
+        }
+
+        var approved: Bool { self == .approve }
+
+        var systemImage: String {
+            switch self {
+            case .approve: "checkmark"
+            case .reject: "xmark"
+            case .retire: "archivebox"
+            }
+        }
+    }
+
+
+    /// Pending views get the review pair; a view she is already leaning on
+    /// (active or held) gets the one control that was missing until 2026-09-02.
+    static func standingViewActions(isPending: Bool, isLeaning: Bool = false) -> [StandingViewAction] {
+        if isPending { return [.approve, .reject] }
+        return isLeaning ? [.retire] : []
     }
 }

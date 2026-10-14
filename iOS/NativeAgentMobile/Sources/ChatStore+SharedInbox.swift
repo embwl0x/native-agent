@@ -6,62 +6,65 @@ extension ChatStore {
     /// handoff. Receipts cover a crash between checkpoint and file deletion.
     func importSharedItems(controls: ChatRuntimeControls) {
         sharedInboxControls = controls
-        guard !isSwitchingSession else { return }
-        var unreadableFiles: [String] = []
-        defer {
-            if !unreadableFiles.isEmpty {
-                errorBanner = unreadableFiles.joined(separator: "\n")
+        guard !isSwitchingSession, sharedInboxImportTask == nil else { return }
+        let generation = sessionSwitchGeneration
+        sharedInboxImportTask = Task { [self] in
+            defer {
+                sharedInboxImportTask = nil
+                sharedInboxReadTask = nil
+                scheduleQueuedSendDrain()
             }
-            scheduleQueuedSendDrain()
+            do {
+                let batch = try await readSharedInbox()
+                guard generation == sessionSwitchGeneration else { return }
+                if !batch.errors.isEmpty { errorBanner = batch.errors.joined(separator: "\n") }
+                let receiptKey = "NativeAgentMobile.importedShareIDs"
+                var receipts = Set(defaults.stringArray(forKey: receiptKey) ?? [])
+                for (url, item) in batch.items {
+                    guard generation == sessionSwitchGeneration else { return }
+                    let retainedReceipt = receipts.contains(item.id.uuidString)
+                    if !retainedReceipt {
+                        if !queuedSends.contains(where: { $0.id == item.id }) {
+                            guard enqueueSend(QueuedChatSend(id: item.id, sessionID: selectedSessionID,
+                                text: item.text, controls: controls, attachments: item.attachments,
+                                createdAt: item.createdAt)) else { return }
+                        }
+                        receipts.insert(item.id.uuidString)
+                        let savedReceipts = Array(receipts)
+                        storage.save(key: receiptKey, value: { savedReceipts }) { [weak self] error in
+                            Task { @MainActor in self?.errorBanner = error.localizedDescription }
+                        }
+                        do {
+                            try await checkpointQueuedSend(item.id)
+                        } catch {
+                            pausedQueueSessionKeys.insert(queueSessionKey(selectedSessionID))
+                            throw error
+                        }
+                    }
+                    // A previous checkpoint may have reported a disk failure.
+                    // Keep both receipt and queue, and require a successful flush
+                    // before consuming its still-present handoff on a later entry.
+                    if retainedReceipt { try await storage.flush() }
+                    try await Task.detached(priority: .utility) { try FileManager.default.removeItem(at: url) }.value
+                    receipts.remove(item.id.uuidString)
+                    let savedReceipts = Array(receipts)
+                    storage.save(key: receiptKey, value: { savedReceipts }) { [weak self] error in
+                        Task { @MainActor in self?.errorBanner = error.localizedDescription }
+                    }
+                }
+            } catch { errorBanner = "Shared item is still waiting: \(error.localizedDescription)" }
         }
-        let receiptKey = "NativeAgentMobile.importedShareIDs"
-        var receipts = Set(defaults.stringArray(forKey: receiptKey) ?? [])
+    }
+
+    func readSharedInbox() async throws -> (items: [(URL, SharedChatItem)], errors: [String]) {
+        if let sharedInboxReadTask { return try await sharedInboxReadTask.value }
+        let task = Task.detached(priority: .utility) { try SharedChatInbox.readPendingItems() }
+        sharedInboxReadTask = task
         do {
-            var items: [(URL, SharedChatItem)] = []
-            for url in try SharedChatInbox.pendingFiles() {
-                do {
-                    items.append((url, try JSONDecoder().decode(SharedChatItem.self, from: Data(contentsOf: url))))
-                } catch {
-                    do {
-                        let directory = url.deletingLastPathComponent().appendingPathComponent("Unreadable", isDirectory: true)
-                        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                        try FileManager.default.moveItem(at: url, to: directory.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
-                        unreadableFiles.append("A shared item could not be read. Its original file was kept in ChatShareInbox/Unreadable: \(url.lastPathComponent)")
-                    } catch {
-                        unreadableFiles.append("A shared item could not be moved aside and is still waiting: \(url.lastPathComponent) — \(error.localizedDescription)")
-                    }
-                }
-            }
-            for (url, item) in items.sorted(by: { $0.1.createdAt < $1.1.createdAt }) {
-                if !receipts.contains(item.id.uuidString) {
-                    if !queuedSends.contains(where: { $0.id == item.id }) {
-                        guard enqueueSend(QueuedChatSend(id: item.id, sessionID: selectedSessionID,
-                            text: item.text, controls: controls, attachments: item.attachments,
-                            createdAt: item.createdAt)) else { return }
-                    }
-                    receipts.insert(item.id.uuidString)
-                    defaults.set(Array(receipts), forKey: receiptKey)
-                    do {
-                        try checkpointQueuedSend(item.id)
-                    } catch {
-                        pausedQueueSessionKeys.insert(queueSessionKey(selectedSessionID))
-                        throw error
-                    }
-                }
-                // A previous checkpoint may have reported a disk failure.
-                // Keep both receipt and queue, and require a successful flush
-                // before consuming its still-present handoff on a later entry.
-                guard defaults.synchronize() else {
-                    pausedQueueSessionKeys.insert(queueSessionKey(selectedSessionID))
-                    throw SharedChatInbox.failure("Could not save the chat queue.")
-                }
-                try FileManager.default.removeItem(at: url)
-                receipts.remove(item.id.uuidString)
-                defaults.set(Array(receipts), forKey: receiptKey)
-            }
-        } catch {
-            errorBanner = "Shared item is still waiting: \(error.localizedDescription)"
-        }
+            let batch = try await task.value
+            if batch.items.isEmpty { sharedInboxReadTask = nil }
+            return batch
+        } catch { sharedInboxReadTask = nil; throw error }
     }
 
     func scheduleSharedInboxRetry() {

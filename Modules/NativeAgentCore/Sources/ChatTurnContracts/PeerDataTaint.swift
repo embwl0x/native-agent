@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// TASK-LOCAL PROVENANCE FOR A PEER'S WORDS.
@@ -30,10 +31,12 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     public convenience init(restoring sources: [String]) {
         self.init()
-        // These peers already latched. Persisted labels do not attest identity,
-        // and a later trust change must not clear the original steer.
-        self.sources = Array(Set(sources)).sorted()
-        restored = !self.sources.isEmpty
+        let peers = Array(Set(sources)).sorted()
+        for peer in peers {
+            if Self.ownerTrusts(peer) { self.elevated.append(peer) }
+            else { self.sources.append(peer) }
+        }
+        restored = !peers.isEmpty
     }
 
     /// A steer an earlier turn carried in, not one this turn latched itself.
@@ -42,8 +45,7 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     /// A later turn under the steer an earlier one carried (`carried`).
     public convenience init(restoring sources: [String], elevated: [String]) {
-        self.init(restoring: sources)
-        self.elevated = Array(elevated.filter { Self.isAgent($0) && !Self.ownerTrusts($0) }.prefix(8))
+        self.init(restoring: sources + elevated)
     }
 
     /// The steer this turn leaves on work it hands to a later one, a card or
@@ -92,8 +94,8 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     /// Latch: this turn has now read a remote peer's words. `line` is the
     /// newest of them, kept so the person's card can quote it.
-    public static func markConsumed(peer: String, line: String = "", attested: Bool = true) {
-        current?.mark(peer: peer, line: line, attested: attested)
+    public static func markConsumed(peer: String, line: String = "") {
+        current?.mark(peer: peer, line: line)
     }
 
     /// The peer's words without latching a source: a bridge turn is the
@@ -110,19 +112,43 @@ public final class PeerDataTaint: @unchecked Sendable {
     }
 
     /// Whether a steer this app attested is the person's own (`PeerTrust`,
-    /// User 10-03), installed by the engine; unset, nothing is. Judged when the
-    /// latch happens: switching a peer off holds from its next latch on.
+    /// User 10-03), installed by the engine; unset, nothing is.
     public static var ownerTrusts: @Sendable (String) -> Bool {
-        get { hookLock.withLock { hook } }
-        set { hookLock.withLock { hook = newValue } }
+        get { CapabilityLifecycle.ownerTrusts }
+        set { CapabilityLifecycle.ownerTrusts = newValue }
     }
     private static let hookLock = NSLock()
-    nonisolated(unsafe) private static var hook: @Sendable (String) -> Bool = { _ in false }
 
     public static var trustedTurn: Bool {
         let turn = TurnEnvelope.current(surface: "")
         return [turn.agent, ChatPersistenceContext.originProvenance?.agent, turn.verifiedUserId.map { "peer:" + $0 }]
             .compactMap { $0 }.contains(where: ownerTrusts)
+    }
+
+    public static var abilityWriteCheck: @Sendable () -> String? {
+        let origin = ChatPersistenceContext.originProvenance
+        var sources = (current?.checkpointSources ?? [])
+            + (origin?.peerSources ?? []) + (origin?.elevatedPeerSources ?? [])
+        let turn = TurnEnvelope.current(surface: "")
+        if ChatPersistenceContext.originPrincipal.hasPrefix("agent:") || turn.surface == "agent-bridge" {
+            let agent = origin?.agent ?? turn.agent ?? "another agent"
+            if agent != "self", !agent.hasPrefix("bot:") {
+                sources.append(turn.verifiedUserId.map { "peer:" + $0 }
+                    ?? (["agent", "peer"].contains(agent) ? "another agent" : agent))
+            }
+        }
+        let peers = Set(sources.filter { $0 != "self" && !$0.hasPrefix("bot:") && isAgent($0) })
+        return {
+            let untrusted = peers.filter { !ownerTrusts($0) }.sorted()
+            return untrusted.isEmpty ? nil : CapabilityLifecycle.peerRefusal(untrusted.joined(separator: ", "))
+        }
+    }
+
+    public static var ownerAuthorized: Bool {
+        let envelope = ChatToolSessionContext.envelope
+        return envelope?.agent == "peer"
+            && (envelope?.verifiedUserId.map { ownerTrusts("peer:" + $0) } ?? false)
+            && current?.isTainted != true
     }
 
     /// User 10-08: only an agent bridge he has not trusted can latch a turn.
@@ -137,54 +163,47 @@ public final class PeerDataTaint: @unchecked Sendable {
         $0.lowercased().hasPrefix("peer:") || $0.lowercased() == "another agent" // an unidentified bridge peer stays untrusted
     }
 
-    /// A peer the person elevated latches nothing: its steer is his own. Only
-    /// an `attested` identity (the turn's own lane or envelope, provenance this
-    /// app stored) can be; a label a tool result supplies never is.
-    public func mark(peer: String, line: String = "", attested: Bool = true) {
+    /// A peer the person elevated retains its identity without taint.
+    public func mark(peer: String, line: String = "") {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let name = trimmed
-        if Self.ownerTrusts(name) { return } // User 10-08: a trusted agent never cards, however it is named
         guard Self.isAgent(name) else { return }
         keep(line: line)
+        let trusted = Self.ownerTrusts(name)
         lock.lock(); defer { lock.unlock() }
-        guard !sources.contains(name), sources.count < 8 else { return }
+        if trusted {
+            if !elevated.contains(name) { elevated.append(name) }
+            return
+        }
+        guard !sources.contains(name) else { return }
         sources.append(name)
     }
 
-    /// A peer the person elevated steered this turn: it does not taint, but
-    /// the three floor acts still card (Agent, 10-02: "every peer").
-    public static func markElevated(peer: String, line: String = "", attested: Bool = true) {
-        current?.markElevated(peer: peer, line: line, attested: attested)
+    /// Carried elevation is an identity record, not a saved permission grant.
+    public static func markElevated(peer: String, line: String = "") {
+        current?.markElevated(peer: peer, line: line)
     }
 
-    public func markElevated(peer: String, line: String = "", attested: Bool = true) {
-        let name = peer.trimmingCharacters(in: .whitespacesAndNewlines)
-        if Self.ownerTrusts(name) { return } // User 10-08: a trusted agent never cards, however it is named
-        guard Self.isAgent(name) else { return }
-        keep(line: line)
-        lock.lock(); defer { lock.unlock() }
-        guard !name.isEmpty, !elevated.contains(name), elevated.count < 8 else { return }
-        elevated.append(name)
+    public func markElevated(peer: String, line: String = "") {
+        mark(peer: peer, line: line)
     }
 
     public var elevatedSources: [String] {
-        lock.lock(); defer { lock.unlock() }
-        return elevated
+        lock.withLock { elevated }.filter { !Self.ownerTrusts($0) }
     }
 
     public var isTainted: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return !sources.isEmpty
+        checkpointSources.contains { !Self.ownerTrusts($0) }
     }
 
+    /// Every steering principal survives carry and resume; trust is never saved.
     public var checkpointSources: [String] {
         lock.lock(); defer { lock.unlock() }
-        return sources
+        return Array(Set(sources + elevated)).sorted()
     }
 
     public var sourceDescription: String {
-        lock.lock(); defer { lock.unlock() }
-        return sources.joined(separator: ", ")
+        checkpointSources.filter { !Self.ownerTrusts($0) }.joined(separator: ", ")
     }
 }

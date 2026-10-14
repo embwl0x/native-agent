@@ -110,7 +110,11 @@ enum AgentWorkspaceActionReadback {
             if let source, case .record(let reader, let arguments, _) = source {
                 do {
                     let current = try await perform(reader, arguments)
-                    return .init(location: source, result: attaching(current, receipt: receipt))
+                    let location = reader == "desk_read"
+                        ? AgentWorkspaceLocation.record(tool: reader, input: arguments,
+                            title: AgentWorkspaceWork.desk(input: arguments, result: current).title)
+                        : source
+                    return .init(location: location, result: attaching(current, receipt: receipt))
                 } catch is CancellationError { throw CancellationError() }
                 catch {
                     return .init(location: source, result: unavailable(receipt: receipt,

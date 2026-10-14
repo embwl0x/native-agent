@@ -216,13 +216,18 @@ public struct RunawayOutputDetector: Sendable {
 
     private static let diagnosticLock = OSAllocatedUnfairLock(initialState: ())
 
-    static func writeDiagnostic(_ raw: String, reason: String) {
+    @discardableResult
+    public static func writeDiagnostic(_ raw: String, reason: String) -> Result<URL, Error> {
         diagnosticLock.withLock { _ in
-            writeDiagnosticLocked(raw, reason: reason)
+            do { return .success(try writeDiagnosticLocked(raw, reason: reason)) }
+            catch {
+                Logger(subsystem: "NativeAgent", category: "Cutoff").error("Could not save cutoff: \(error.localizedDescription, privacy: .public)")
+                return .failure(error)
+            }
         }
     }
 
-    private static func writeDiagnosticLocked(_ raw: String, reason: String) {
+    private static func writeDiagnosticLocked(_ raw: String, reason: String) throws -> URL {
         let dir = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("diagnostics/cutoffs", isDirectory: true)
         let stamp = Int(Date().timeIntervalSince1970 * 1000)
@@ -232,11 +237,11 @@ public struct RunawayOutputDetector: Sendable {
         // must not overwrite the first (turn d48a7f96: 6 trips, 1 file).
         var file = dir.appendingPathComponent("\(name).txt")
         if FileManager.default.fileExists(atPath: file.path) {
-            file = dir.appendingPathComponent("\(name)-\(stamp).txt")
+            file = dir.appendingPathComponent("\(name)-\(UUID().uuidString).txt")
         }
-        let body = "reason: \(reason)\nchars: \(raw.count)\n\n" + String(decoding: raw.utf8.prefix(200_000), as: UTF8.self)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try? Data(body.utf8).write(to: file, options: .atomic)
+        let body = "reason: \(reason)\nchars: \(raw.count)\n\n" + raw
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data(body.utf8).write(to: file, options: .atomic)
         if let files = try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]
         ) {
@@ -252,5 +257,6 @@ public struct RunawayOutputDetector: Sendable {
         }
         Logger(subsystem: "NativeAgent", category: "Cutoff")
             .error("cutoff \(reason, privacy: .public) chars=\(raw.count, privacy: .public) raw=\(file.path, privacy: .public)")
+        return file
     }
 }

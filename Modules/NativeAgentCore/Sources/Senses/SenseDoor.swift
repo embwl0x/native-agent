@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// The door's read adapter. The original reader still clears its own fences;
@@ -38,9 +39,7 @@ public enum SenseDoor {
         }
         let record: SenseRecord?
         do {
-            if case .fileKind = corner, fileAlreadyReadable {
-                record = try await SensesHub.shared.registry?.sense(for: nativeCorner ?? BuiltInSenses.fallbackCorner(for: corner) ?? corner)
-            } else { record = try await selectedRecord(for: corner, nativeCorner: nativeCorner) }
+            record = try await selectedRecord(for: corner, nativeCorner: nativeCorner)
         } catch {
             return signedRaw(try await $readingRaw.withValue(true) { try await raw() },
                 line: "raw view · \(error.localizedDescription)")
@@ -100,7 +99,8 @@ public enum SenseDoor {
             var provenance = SenseProvenance(record: record); provenance.uses += 1
             SensesHub.shared.didServe(provenance)
             SenseDoorViews.shared.remember(page, record: record, source: served.source, scope: scope,
-                materialRef: served.materialRef, readInput: served.readInput, capturedMaterial: served.capturedMaterial, fullPage: fullPage)
+                materialRef: served.materialRef, readInput: served.readInput, capturedMaterial: served.capturedMaterial,
+                fullPage: fullPage, growthCheck: served.growthCheck)
             return .string(render(page, provenance: provenance))
         }
         if record?.status != .on { SenseDoorViews.shared.forget(corner: corner, scope: scope) }
@@ -109,21 +109,41 @@ public enum SenseDoor {
                 record: record, address: address,
                 source: DoorSource(corner: corner, input: input, address: address, raw: raw, material: material))
         }
-        if input["raw"] != .bool(true), input["wrong"] != .bool(true),
-           !nativeReadSupported, case .fileKind(let ext) = corner,
-           record == nil || record?.language == .native {
-            SenseDoorViews.shared.forget(corner: corner, scope: scope)
-            let result = try await $readingRaw.withValue(true) { try await raw() }
-            return rawView(result, reason: "no sense for .\(ext) yet")
-        }
+        let source = DoorSource(corner: corner, input: input, address: address, raw: raw, material: material)
         guard input["raw"] != .bool(true), input["wrong"] != .bool(true),
-              let record, record.status == .on else {
-            let result = try await $readingRaw.withValue(true) { try await raw() }
+              let record, record.status == .on, nativeReadSupported || record.language != .native else {
+            let result = try await source.rawResult()
+            if case .fileKind = corner, case .object(let fields) = result,
+               fields["error_code"] == .string("binary_file"),
+               case .object(let next)? = fields["next_call"], case .object(let call)? = next["input"],
+               call["action"] == .string("sense.make") {
+                let captured = try await source.material(for: corner, address: address)
+                let page = try await source.page(for: corner, address: address)
+                let reader = SenseRecord(id: "raw", corner: corner, status: .draft, language: .native, origin: .builtIn, entry: nil, createdAt: Date())
+                SenseDoorViews.shared.remember(page, record: reader, source: source, scope: scope,
+                    materialRef: address, readInput: input, capturedMaterial: captured)
+            }
+            if input["raw"] == .bool(true), isSuccessfulRaw(result) {
+                if case .fileKind = corner {
+                    guard case .object(let fields) = result, fields["ok"] == .bool(true),
+                          case .string? = fields["path"], case .string? = fields["content"] else { return result }
+                }
+                let captured = try await source.material(for: corner, address: address)
+                let page = try await source.page(for: corner, address: address)
+                let reader = SenseRecord(id: "raw", corner: corner, status: .draft, language: .native, origin: .builtIn, entry: nil, createdAt: Date())
+                SenseDoorViews.shared.remember(page, record: reader, source: source, scope: scope,
+                    materialRef: address, readInput: input, capturedMaterial: captured)
+            }
             if case .fileKind = corner {
                 let reason = input["wrong"] == .bool(true) ? "view marked wrong"
                     : input["raw"] == .bool(true) ? "requested"
                     : "no enabled sense for \(corner.key)"
-                return rawView(result, reason: reason, reader: input["__sense_reader"] == .string("read") ? "builtin-document" : "builtin-files")
+                var served = rawView(result, reason: reason, reader: input["__sense_reader"] == .string("read") ? "builtin-document" : "builtin-files")
+                if isSuccessfulRaw(result), case .object(var fields) = served {
+                    fields["sense_place"] = .string(address ?? corner.key)
+                    served = .object(fields)
+                }
+                return served
             }
             let reason = input["wrong"] == .bool(true) ? "view reported wrong"
                 : input["raw"] == .bool(true) ? "requested" : "sense unavailable or switched off"
@@ -137,7 +157,6 @@ public enum SenseDoor {
             }
             return signedRaw(result, line: "raw view · \(reader) · \(reason)")
         }
-        let source = DoorSource(corner: corner, input: input, address: address, raw: raw, material: material)
         if record.language == .native {
             // Day-one wrappers retain the existing raw representation and
             // presentation; provenance is outside that payload.
@@ -280,7 +299,7 @@ public enum SenseDoor {
         if let exact = records.first(where: { $0.corner == corner && $0.status == .on }) { return exact }
         if let unavailable = records.first(where: { $0.corner == corner && $0.status == .unavailable }) { return unavailable }
         // An explicit off-switch for the concrete corner also disables fallback.
-        if records.contains(where: { $0.corner == corner && $0.status == .archived }) { return nil }
+        if records.contains(where: { $0.corner == corner && $0.status == .off }) { return nil }
         guard let generic = nativeCorner ?? BuiltInSenses.fallbackCorner(for: corner), generic != corner else { return nil }
         return records.first { $0.corner == generic && ($0.status == .on || $0.status == .unavailable) }
     }
@@ -387,8 +406,9 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
 
     nonisolated func fresh() -> DoorSource { DoorSource(corner: corner, input: input, address: address, raw: raw, material: convert) }
 
-    func didReadFile(path: String, bytes: Int, version: String) {
+    func didReadFile(path: String, bytes: Int, version: String, data: Data) {
         guard fileRead == nil else { return }
+        captured = .file(path: path, bytes: bytes, data: data)
         fileRead = ["ok": .bool(true), "status": .string("ok"), "path": .string(path),
             "bytes": .int(Int64(bytes)), "version": .string(version), "offset": .int(0), "returned_bytes": .int(Int64(bytes))]
     }
@@ -475,7 +495,9 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
         // app or tab. The converter retains this call's authorized material.
         if let captured { return captured }
         let material: SenseMaterial
-        if case .fileKind = corner {
+        if input["raw"] == .bool(true) {
+            material = try await convert(rawResult())
+        } else if case .fileKind = corner {
             guard let provider = SensesHub.shared.source else {
                 throw SenseFailure(code: "source_unavailable", message: "The admitted file source is unavailable.")
             }
@@ -504,11 +526,22 @@ public final class SenseDoorViews: @unchecked Sendable {
         public let materialRef: String?
         public let readInput: [String: JSONValue]
         public let capturedMaterial: SenseMaterial?
+        fileprivate let growthCheck: @Sendable () -> String?
+        public var growthRefusal: String? { growthCheck() }
         public let fullPage: NativePage?
     }
     private var views: [View] = []
 
     public var latest: [View] { lock.withLock { views } }
+
+    public static func placeIdentity(_ value: String) -> String {
+        var path = value
+        if path.hasPrefix("file:"), let base = path.dropFirst(5).split(separator: "#", maxSplits: 1).first,
+           let decoded = String(base).removingPercentEncoding {
+            path = decoded
+        }
+        return path.hasPrefix("/") ? URL(fileURLWithPath: path).standardizedFileURL.path : value
+    }
 
     public func forget(senseID: String, scope: String) {
         lock.withLock { views.removeAll { $0.record.id == senseID && $0.scope == scope } }
@@ -523,14 +556,17 @@ public final class SenseDoorViews: @unchecked Sendable {
     }
 
     public func remember(_ page: NativePage, record: SenseRecord, source: any SenseSourceProvider, scope: String,
-                         materialRef: String?, readInput: [String: JSONValue], capturedMaterial: SenseMaterial? = nil, fullPage: NativePage? = nil) {
+                         materialRef: String?, readInput: [String: JSONValue], capturedMaterial: SenseMaterial? = nil,
+                         fullPage: NativePage? = nil, growthCheck: (@Sendable () -> String?)? = nil) {
+        let turnCheck = CapabilityLifecycle.turnWriteCheck()
+        let source: any SenseSourceProvider = (source as? DoorSource)?.fresh() ?? source
         let makeSource: @Sendable () -> any SenseSourceProvider = {
             if let door = source as? DoorSource { return door.fresh() }
             return source
         }
         lock.withLock {
             views.removeAll { $0.page.address == page.address && $0.record.id == record.id && $0.scope == scope }
-            views.append(View(page: page, record: record, makeSource: makeSource, scope: scope, materialRef: materialRef, readInput: readInput, capturedMaterial: capturedMaterial, fullPage: fullPage))
+            views.append(View(page: page, record: record, makeSource: makeSource, scope: scope, materialRef: materialRef, readInput: readInput, capturedMaterial: capturedMaterial, growthCheck: { turnCheck() ?? growthCheck?() }, fullPage: fullPage))
             if views.count > 32 { views.removeFirst(views.count - 32) }
         }
     }

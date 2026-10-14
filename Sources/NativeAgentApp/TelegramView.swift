@@ -1,3 +1,5 @@
+import MacIntegration
+import EngineRuntime
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -5,6 +7,7 @@ import ScreenCaptureKit
 import ScreenVision
 import Speech
 import TelegramBot
+import EngineRuntime
 import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
@@ -115,46 +118,21 @@ enum TelegramBotTokenPresentation {
         let tokenStatus: String
     }
 
-    /// A Telegram token is a numeric bot identifier followed by an opaque,
-    /// URL-safe secret.  This is intentionally local syntax validation only:
-    /// Telegram remains the authority that can prove a credential works.
-    static func validationMessage(for draft: String) -> String? {
-        let token = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { return nil }
-        let pieces = token.split(separator: ":", omittingEmptySubsequences: false)
-        guard pieces.count == 2,
-              !pieces[0].isEmpty,
-              !pieces[1].isEmpty,
-              pieces[0].allSatisfy(\.isNumber),
-              pieces[1].allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") })
-        else {
-            return "Enter a BotFather token in numeric-bot-ID:secret form. The token was not saved."
-        }
-        return nil
-    }
-
     static func canSave(draft: String, tokenConfigured: Bool) -> Bool {
-        validationMessage(for: draft) == nil && (tokenConfigured || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        TelegramFacade.tokenValidationMessage(for: draft) == nil && (tokenConfigured || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     static func fieldState(draft: String, tokenConfigured: Bool) -> FieldState {
         FieldState(
             accessibilityIdentifier: accessibilityIdentifier,
             canSave: canSave(draft: draft, tokenConfigured: tokenConfigured),
-            validationMessage: validationMessage(for: draft),
+            validationMessage: TelegramFacade.tokenValidationMessage(for: draft),
             helperText: tokenConfigured
                 ? "Paste a new token only when replacing the saved bot token. The field clears after saving."
                 : "Paste a BotFather token here. The field clears after saving.",
             tokenStatus: TelegramSettingsPresentation.tokenStatusLabel(tokenConfigured: tokenConfigured)
         )
     }
-}
-
-struct TelegramDiagnosticsClearReceipt: Equatable {
-    let clearedAt: String
-    let removedFileCount: Int
-    let removedRowCount: Int
-    let status: TelegramPresentationSnapshot
 }
 
 enum TelegramClearLogsPresentation {
@@ -227,7 +205,7 @@ struct TelegramView: View {
     }
 
     private var telegramModelOptions: [ModelCatalogItem] {
-        modelOptions(from: appModel.engine.providers.catalog, current: appModel.telegramModel, limit: 40)
+        ProvidersFacade.modelOptions(from: appModel.engine.providers.catalog, current: appModel.telegramModel, limit: 40)
     }
 
     private var botTokenFieldState: TelegramBotTokenPresentation.FieldState {
@@ -369,7 +347,7 @@ struct TelegramView: View {
                                         switch permission {
                                         case .granted:
                                             voicePermissionMessage = "Speech recognition is ready for Telegram voice messages."
-                                            await BackgroundLoopsAssembly.retireSystemPermissionCardIfGranted(dataRoot: NativeAgentPaths.dataRoot)
+                                            await NativeAgentEngine.retireSystemPermissionCardIfGranted(dataRoot: PersistenceCore.defaultDataRoot())
                                         case .denied:
                                             voicePermissionMessage = "Enable NativeAgent in System Settings → Privacy & Security → Speech Recognition."
                                         case .restricted:
@@ -455,7 +433,7 @@ struct TelegramView: View {
                         Task {
                             defer { checkingSender = false }
                             do {
-                                let count = try await appModel.discoverTelegramSenders(token: appModel.telegramToken)
+                                let count = try await appModel.engine.telegram.discoverTelegramSenders(token: appModel.telegramToken)
                                 await appModel.refreshTelegram()
                                 senderCheckMessage = count == 0 ? "No messages found. Send your bot a message, then check again." : "Sender IDs are in Blocked and ignored below. Choose your chat ID and save to admit it."
                             } catch {
@@ -509,7 +487,7 @@ struct TelegramView: View {
                     )
                     TelegramField(title: "How hard it thinks") {
                         Picker("Think level", selection: Bindable(appModel).telegramReasoningEffort) {
-                            ForEach(reasoningOptions(from: appModel.engine.providers.catalog, model: appModel.telegramModel)) { effort in
+                            ForEach(ProvidersFacade.reasoningOptions(from: appModel.engine.providers.catalog, model: appModel.telegramModel)) { effort in
                                 Text(effort.label).tag(effort.id)
                             }
                         }
@@ -518,7 +496,7 @@ struct TelegramView: View {
                         .labelsHidden()
                         .fixedSize()
                         .onChange(of: appModel.telegramModel) { _, model in
-                            appModel.telegramReasoningEffort = normalizedReasoningEffort(
+                            appModel.telegramReasoningEffort = ProvidersFacade.normalizedReasoningEffort(
                                 from: appModel.engine.providers.catalog,
                                 model: model,
                                 selected: appModel.telegramReasoningEffort

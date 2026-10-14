@@ -105,10 +105,6 @@ public struct MacControlBridgeAuditAppendReceipt: Sendable, Equatable {
     let retainedRowsDropped: Int
     let error: String?
 
-    /// Compatibility shorthand for the physical append fact. A retention
-    /// failure after append remains stored evidence with unenforced retention.
-    var isStored: Bool { lineStored }
-
     func responseObject() -> [String: Any] {
         [
             "state": state.rawValue,
@@ -176,10 +172,6 @@ enum MacControlBridgeAuditStore {
             )
         }
         do {
-            // `enforceJSONLLineCap` correctly refuses to guess at malformed
-            // bytes. Surface that condition here before calling it: otherwise
-            // a successfully appended line could receive an ordinary receipt
-            // even though the requested bounded-retention step was skipped.
             let raw = try Data(contentsOf: auditPath)
             guard let text = String(data: raw, encoding: .utf8) else {
                 return MacControlBridgeAuditAppendReceipt(
@@ -203,7 +195,11 @@ enum MacControlBridgeAuditStore {
                     error: "bridge audit contains malformed JSON; retention was not enforced"
                 )
             }
-            let dropped = try enforceJSONLLineCap(at: auditPath, maxLines: retentionLimit)
+            let dropped = max(0, lines.count - retentionLimit)
+            if dropped > 0 {
+                let retained = lines.suffix(retentionLimit).joined(separator: "\n") + "\n"
+                try SwiftNativePersistenceCore.atomicWrite(Data(retained.utf8), to: auditPath)
+            }
             return MacControlBridgeAuditAppendReceipt(
                 state: .appended,
                 path: auditPath.path,

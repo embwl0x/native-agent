@@ -7,7 +7,6 @@ import Foundation
 public enum NativeAgentICloudBridgeConstants {
     public static let defaultContainerID = "iCloud.io.github.embwl0x.nativeagent"
     public static let defaultMobileSourceKey = "mobile_app"
-    public static let defaultMacBundleID = "io.github.embwl0x.nativeagent.mac"
     public static let defaultBackgroundTaskIDPrefix = "io.github.embwl0x.nativeagent"
 
     public static var containerID: String {
@@ -26,24 +25,12 @@ public enum NativeAgentICloudBridgeConstants {
         )
     }
 
-    public static var macBundleID: String {
-        configuredValue(
-            infoKey: "NativeAgentMacBundleID",
-            envKey: "NATIVEAGENT_MAC_BUNDLE_ID",
-            defaultValue: defaultMacBundleID
-        )
-    }
-
     public static var backgroundTaskIDPrefix: String {
         configuredValue(
             infoKey: "NativeAgentBackgroundTaskIDPrefix",
             envKey: "NATIVEAGENT_BACKGROUND_TASK_PREFIX",
             defaultValue: defaultBackgroundTaskIDPrefix
         )
-    }
-
-    public static var mobileDocumentsFolderName: String {
-        containerID.replacingOccurrences(of: ".", with: "~")
     }
 
     public static func isMobileSourceKey(_ sourceKey: String?) -> Bool {
@@ -74,10 +61,6 @@ public enum NativeAgentICloudBridgeConstants {
     }
 
     public enum KVSKey {
-        public static let macToIosPrefix = "mac_to_ios:"
-        public static let iosToMacPrefix = "ios_to_mac:"
-        public static let macStatus = "mac_status"
-        public static let iosStatus = "ios_status"
         public static let newMessageInDrive = "new_msg_in_drive"
         public static let chatProgressLatest = "chat_progress_latest"
         /// 2026-09-06: in-turn NOTICES (provider reconnects, context

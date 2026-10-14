@@ -1,6 +1,5 @@
 import PersistenceCore
 import Foundation
-import CryptoKit
 import NativeAgentCore
 
 public enum NativeAppSecretRedactor {
@@ -21,23 +20,9 @@ public enum NativeAppSecretRedactor {
     }()
 
     public static func redactText(_ value: String) -> String {
-        var text = NativeAgentSecretRedactor.redactText(value)
-        for (kind, re) in appOnlyPatterns {
-            let ns = text as NSString
-            let matches = re.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
-            for match in matches.reversed() {
-                let matched = ns.substring(with: match.range)
-                let digest = SHA256.hash(data: Data(matched.utf8))
-                    .map { String(format: "%02x", $0) }
-                    .joined()
-                    .prefix(12)
-                text = (text as NSString).replacingCharacters(
-                    in: match.range,
-                    with: "[REDACTED_\(kind):\(digest)]"
-                )
-            }
-        }
-        return text
+        NativeAgentSecretRedactor.redactText(
+            NativeAgentSecretRedactor.redactText(value), patterns: appOnlyPatterns
+        )
     }
 
     /// Argument names whose value an approval card never shows (the Mac
@@ -68,19 +53,6 @@ public enum NativeAppSecretRedactor {
     }
 
     public static func redactValue(_ value: JSONValue) -> JSONValue {
-        switch value {
-        case .string(let s):
-            return .string(redactText(s))
-        case .array(let items):
-            return .array(items.map { redactValue($0) })
-        case .object(let obj):
-            var out: [String: JSONValue] = [:]
-            for (key, raw) in obj {
-                out[key] = redactValue(raw)
-            }
-            return .object(out)
-        default:
-            return value
-        }
+        value.mapStrings(redactText)
     }
 }

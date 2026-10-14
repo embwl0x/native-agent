@@ -1,15 +1,10 @@
 import Privacy
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
+import Senses
 
-// Local skills registry reads and mutations. Reads preserve stored field
-// shapes, sorting, and manifest merge precedence. Mutations serialize registry
-// and manifest changes with their path-specific file locks.
-// Update/delete operations append activity records; create does not.
-// Callers own transport authentication and authorization. Mobile lifecycle
-// calls use the Mac owner rather than a second file-backed implementation.
+// Skills project the shared ability files; transport callers own authorization.
 
 /// A quiet MY QUEUE line about a skill, and whose words its name is
 /// (`SkillScript.voices`): none for her own.
@@ -31,11 +26,7 @@ public struct SkillRecord: Identifiable, Codable, Hashable, Sendable {
     public var updatedAt: String?
     public var useCount: Int?
     public var lastUsedAt: String?
-    /// "runtime_registry" (default for in-registry rows), "runtime_body" (a
-    /// markdown body under data/skills/bodies/ with no registry entry yet),
-    /// or "persona_body" (a markdown body under persona/skills/bodies/). UI
-    /// uses this to gate destructive actions — Disable/Delete only make sense
-    /// for registry rows; body-only rows have no entry to mutate.
+    /// Ordinary discovery projects canonical registry rows only.
     public var source: String?
     /// A repeatable skill's script and the line generated from its header.
     public var script: Script?
@@ -94,10 +85,6 @@ public protocol SkillsClient: Sendable {
     /// GET /v1/skills — the learned-skills registry, sorted by
     /// (updatedAt | createdAt | "") DESC. Pure read (no write-back).
     func listSkills() async throws -> [JSONValue]
-    /// GET /v1/skills/manifest — the merged CLI manifest registry reshaped into
-    /// a list of `{"name": k, **v}` entries.
-    func listManifestSkills() async throws -> [JSONValue]
-
     // MARK: - Mutations (wave 32 W15) — see SkillsError for the failure modes
 
     /// POST /v1/skills/update — patch name/description/triggers/kind/status on
@@ -106,26 +93,13 @@ public protocol SkillsClient: Sendable {
     /// Throws `SkillsError.unknownSkill` if no skill matches (Python ValueError).
     func updateSkill(body: JSONValue) async throws -> JSONValue
 
-    /// POST /v1/skills/delete — remove the skill matched by id-or-name from
-    /// registry.json, unlink its body file (path-confined), fire
-    /// record_activity, and return `{id, deleted:true}`. If not found in the
-    /// legacy registry, falls back to the manifest registry (mirrors the route
-    /// handler at the retired daemon): pops the named entry from
-    /// manifest_registry.json and returns `{id, deleted:true, source:"manifest"}`.
-    /// Throws `SkillsError.unknownSkill` only if found in NEITHER registry.
-    func deleteSkill(id: String) async throws -> JSONValue
+    /// Permanently remove the selected ability and its run state.
+    func deleteSkill(id: String, ownerAuthorized: Bool) async throws -> JSONValue
 
-    /// POST /v1/skills/{name}/enable — mirrors the route handler
-    ///: first try update_skill(id:name,
-    /// status:"active"); on unknown-skill fall back to the manifest state
-    /// machine (drafted|dormant|installed → installed). Returns the mutated
-    /// record (legacy skill object, or the manifest entry merged with
-    /// {name, state}).
+    /// Enable the selected runtime row or install the selected manifest entry.
     func enableSkill(name: String) async throws -> JSONValue
 
-    /// POST /v1/skills/{name}/disable — mirrors L52452-52476: try
-    /// update_skill(id:name, status:"disabled"); on unknown-skill fall back to
-    /// the manifest state machine (installed|active → dormant).
+    /// Disable the selected runtime row or make the selected manifest dormant.
     func disableSkill(name: String) async throws -> JSONValue
 
     /// POST /v1/skills — create_skill: name-dedup (case-insensitive on name),
@@ -135,36 +109,11 @@ public protocol SkillsClient: Sendable {
     /// completeness + smoke parity.
     func createSkill(body: JSONValue) async throws -> JSONValue
 
-    /// Read newest-first reversible versions owned by the Skills subsystem.
-    func listSkillVersions(id: String) async throws -> [JSONValue]
-
-    /// Archive without deleting the registry row or body.
+    /// Permanently remove the selected ability.
     func archiveSkill(id: String) async throws -> JSONValue
 
-    /// Restore one exact recorded version into the canonical registry/body.
-    func restoreSkill(id: String, versionId: String) async throws -> JSONValue
-
-    /// The agent's skill_manage lifecycle (User 10-01): set one skill's status
-    /// (the legacy row's `status`, or the manifest entry's `state`) and stamp
-    /// `marks` on it (`disabledBy`, `trashedAt`). Any status change clears the
-    /// earlier marks first, so a mark lives exactly as long as the change that
-    /// made it. The row and body stay; nothing is removed.
-    func markSkill(name: String, legacyStatus: String, manifestState: String, marks: [String: JSONValue]) async throws -> JSONValue
-}
-
-public extension SkillsClient {
-    /// The merged manifest registry as entries; a malformed row fails the read.
-    func listManifestSkillEntries() async throws -> [SkillRegistryEntry] {
-        try await listManifestSkills().map(SkillRegistryEntry.init(row:))
-    }
-
-    func listSkillVersions(id: String) async throws -> [JSONValue] { [] }
-    func archiveSkill(id: String) async throws -> JSONValue {
-        throw SkillsError.historyUnavailable("skill archive is unavailable")
-    }
-    func restoreSkill(id: String, versionId: String) async throws -> JSONValue {
-        throw SkillsError.historyUnavailable("skill restore is unavailable")
-    }
+    /// The common ability store preserves the owner's off state.
+    func markSkill(name: String, legacyStatus: String, manifestState: String, marks: [String: JSONValue], restoring: Bool) async throws -> JSONValue
 }
 
 /// Mutation failure modes. `unknownSkill` mirrors the daemon's
@@ -178,7 +127,6 @@ public enum SkillsError: Error, Equatable, Sendable {
     case stateNotAllowed(name: String, state: String, requirement: String)
     case invalidSkillBody(String)
     case invalidRegistry(String)
-    case historyUnavailable(String)
     case unknownVersion(String)
     /// A save's `script` that is malformed or has no attested origin (`SkillScript`).
     case invalidScript(String)
@@ -191,10 +139,10 @@ extension SkillsError: LocalizedError {
             return "No skill matches \(name). Use app {action:\"skill.list\"} to see the available skills."
         case .stateNotAllowed(let name, let state, let requirement):
             return "\(name) is \(state); this change requires \(requirement)."
-        case .invalidSkillBody(let why), .invalidRegistry(let why), .historyUnavailable(let why), .invalidScript(let why):
+        case .invalidSkillBody(let why), .invalidRegistry(let why), .invalidScript(let why):
             return why
         case .unknownVersion(let version):
-            return "No saved skill version matches \(version). Choose a version from the skill's history."
+            return "No saved skill version matches \(version). Only the previous version is retained."
         }
     }
 }
@@ -204,182 +152,83 @@ extension SkillsError: LocalizedError {
 public final class SwiftNativeSkillsClient: SkillsClient {
     private let root: URL
     private let persistence: SwiftNativePersistenceCore
-    /// The legacy Application Support manifest path (first in the merge order).
-    private let legacyManifestPath: URL
     /// Injectable clock for deterministic updatedAt/createdAt stamps in tests.
     private let now: @Sendable () -> Date
 
-    /// - Parameters:
-    ///   - root: the daemon data root (the dir that contains `skills/`).
-    ///   - legacyManifestPath: the legacy
-    ///     `~/Library/Application Support/NativeAgent/skills/manifest_registry.json`
-    ///     path. Injectable for tests; production callers omit it and get the
-    ///     real home-relative path (mirrors the daemon's hard-coded
-    ///     `Path.home() / "Library" / "Application Support" / ...`).
-    ///   - now: clock for mutation timestamps. Defaults to `Date()`.
     public init(
         root: URL,
         persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
-        legacyManifestPath: URL? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.root = root
         self.persistence = persistence
-        self.legacyManifestPath = legacyManifestPath ?? Self.defaultLegacyManifestPath()
         self.now = now
     }
 
-    /// Mirrors the daemon's hard-coded legacy path:
-    ///   Path.home() / "Library" / "Application Support" / "NativeAgent" / "skills" / "manifest_registry.json"
-    public static func defaultLegacyManifestPath() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("NativeAgent", isDirectory: true)
-            .appendingPathComponent("skills", isDirectory: true)
-            .appendingPathComponent("manifest_registry.json")
-    }
+    private var abilities: AbilityStore { AbilityStore(dataRoot: root) }
 
-    private var registryPath: URL {
-        root.appendingPathComponent("skills/registry.json")
-    }
-    /// The data-root manifest (`self.manifest_skills_path` in the daemon).
-    private var dataRootManifestPath: URL {
-        root.appendingPathComponent("skills/manifest_registry.json")
-    }
-    private var historyDir: URL {
-        root.appendingPathComponent("skills/history", isDirectory: true)
-    }
 
     public func listSkills() async throws -> [JSONValue] {
         SkillsRegistry.sortedDescending(try InstalledSkillInventory.entries(dataRoot: root).map { .object($0.row) })
     }
 
-    public func listManifestSkills() async throws -> [JSONValue] {
-        // Read both files in the daemon's iteration order: [legacy, dataRoot].
-        // A missing file → the read returns the default object, whose `skills`
-        // sub-object is absent → SkillManifestRegistry.merge skips it (matching
-        // the daemon's read_json(path, {"schemaVersion":1,"skills":{}}) +
-        // `if not isinstance(data.get("skills"), dict): continue`).
-        let legacyRaw = try readManifest(legacyManifestPath)
-        let dataRootRaw = try readManifest(dataRootManifestPath)
-        let merged = SkillManifestRegistry.merge(entries: [
-            (raw: legacyRaw,
-             parentPath: legacyManifestPath.deletingLastPathComponent().path,
-             filePath: legacyManifestPath.path),
-            (raw: dataRootRaw,
-             parentPath: dataRootManifestPath.deletingLastPathComponent().path,
-             filePath: dataRootManifestPath.path),
-        ])
-        return SkillManifestRegistry.reshapeToList(merged)
+    private func lifecycleRecords() async throws -> [JSONValue] {
+        try InstalledSkillInventory.entries(dataRoot: root).map { .object($0.row) }
     }
 
-    // MARK: - Mutations (wave 32 W15)
-    //
-    // Every legacy-registry R-M-W is wrapped in withFileLock(registryPath) and
-    // every manifest-registry R-M-W in withFileLock(dataRootManifestPath) —
-    // matching the Python side's `with file_lock(self.skills_path)` /
-    // `with file_lock(self.manifest_skills_path)` this wave adds. The manifest
-    // file is the WRITE target for the fallback branches (mirroring the route's
-    // `write_json(self.runtime.manifest_skills_path, _mreg)`), so the manifest
-    // lock guards the SAME path on both sides.
-
-    /// Build the merged manifest registry exactly as the daemon's
-    /// `manifest_registered_skills()` does (legacy then data-root; data-root
-    /// wins; sourceRoot/registryPath setdefault), returned as the daemon's
-    /// `{schemaVersion, skills: {name: entry}}` dict shape. Used by the
-    /// enable/disable/delete manifest-fallback branches whose write target is
-    /// `dataRootManifestPath` — they read the MERGED view but write the merged
-    /// dict back to the data-root file, exactly as the route does (this
-    /// collapses the legacy file's entries into the data-root file; preserved
-    /// for behavior parity, NOT corrected here).
-    private func readManifest(_ path: URL) throws -> JSONValue {
-        guard FileManager.default.fileExists(atPath: path.path) else {
-            return .object(["schemaVersion": .int(1), "skills": .object([:])])
+    private func lifecycleEntry(_ name: String) async throws -> InstalledSkillInventory.Entry {
+        let name = SkillMutation.unquote(name).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let entry = InstalledSkillInventory.match(name, in: try await lifecycleRecords()) else {
+            throw SkillsError.unknownSkill(name)
         }
-        let raw = try JSONValue.parse(Data(contentsOf: path))
-        guard case .object(let object) = raw, case .object(let skills)? = object["skills"],
-              skills.values.allSatisfy({ $0.objectValue != nil }) else {
-            throw SkillsError.invalidRegistry("Skill manifest registry is not a skills object.")
-        }
-        return raw
+        return entry
     }
 
-    private func manifestRegisteredSkillsObject() async throws -> JSONValue {
-        let legacyRaw = try readManifest(legacyManifestPath)
-        let dataRootRaw = try readManifest(dataRootManifestPath)
-        var skillsByName: [String: JSONValue] = [:]
-        for (raw, path) in [(legacyRaw, legacyManifestPath), (dataRootRaw, dataRootManifestPath)] {
-            guard case .object(let root) = raw,
-                  case .object(let skills)? = root["skills"] else { continue }
-            for name in skills.keys.sorted() {
-                guard case .object(var entry) = skills[name]! else { continue }
-                if entry["sourceRoot"] == nil { entry["sourceRoot"] = .string(path.deletingLastPathComponent().path) }
-                if entry["registryPath"] == nil { entry["registryPath"] = .string(path.path) }
-                skillsByName[name] = .object(entry)
-            }
-        }
-        var skillsObj: [String: JSONValue] = [:]
-        for (k, v) in skillsByName { skillsObj[k] = v }
-        return .object(["schemaVersion": .int(1), "skills": .object(skillsObj)])
-    }
+    // MARK: - Mutations
 
     public func updateSkill(body: JSONValue) async throws -> JSONValue {
-        try await updateSkill(body: body, admittedBy: nil, reviewedDigest: nil)
+        let name = SkillMutation.unquote(SkillMutation.string(body, "id")).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let entry = InstalledSkillInventory.match(name, in: try InstalledSkillInventory.entries(dataRoot: root)
+            .filter { $0.row["source"] == .string("runtime_registry") }) else { throw SkillsError.unknownSkill(name) }
+        return try await updateSkill(entry, body: body, admittedBy: nil, reviewedDigest: nil)
     }
 
     /// `admittedBy` (user or agent) admits a script skill it turns on, bound
     /// to `reviewedDigest`, the digest of the script the admitter read; one
     /// that changed since is refused here, inside the lock. Turning one on
     /// without a standing admission for its exact digest is refused.
-    private func updateSkill(body: JSONValue, admittedBy: String?, reviewedDigest: String?) async throws -> JSONValue {
-        let skillId = SkillMutation.unquote(SkillMutation.string(body, "id")).trimmingCharacters(in: .whitespacesAndNewlines)
-        let result = try await withRegistryLock { () throws -> JSONValue in
-            var skills = try self.loadRegistryForMutation()
-            for index in skills.indices {
-                guard case .object(var skill) = skills[index] else { continue }
-                let sid = SkillMutation.pyStr(skill["id"] ?? .null)
-                let sname = SkillMutation.pyStr(skill["name"] ?? .null)
-                if sid != skillId && sname != skillId { continue }
-                let before = skill
-                // Patch only the allowed keys present in the body.
-                if case .object(let bodyObj) = body {
-                    if bodyObj["status"] != nil {
-                        for mark in SkillMutation.agentMarks { skill.removeValue(forKey: mark) }
-                    }
-                    for key in ["name", "description", "triggers", "kind", "status"] + SkillMutation.agentMarks
-                    where bodyObj[key] != nil {
-                        skill[key] = bodyObj[key]
-                    }
-                    // Turned on now: upkeep's 30 days count from here at the earliest.
-                    if case .string(let status)? = bodyObj["status"], ["active", "installed"].contains(status.lowercased()) {
-                        skill["enabledAt"] = .string(SkillMutation.nowISO(self.now))
-                    }
-                }
-                skill["updatedAt"] = .string(SkillMutation.nowISO(self.now))
-                if let script = skill["script"], InstalledSkillInventory.isAvailable(skill) {
-                    // An admitter always names the digest it reviewed, admitted
-                    // before or not: a stale review never turns on a newer script.
-                    if let admittedBy {
-                        guard let reviewedDigest, reviewedDigest == SkillScript.digest(script) else {
-                            throw SkillsError.invalidScript(
-                                "\(sname)'s script changed since you looked, or was never shown; nothing was turned on. Review it again.")
-                        }
-                        skill["admission"] = SkillScript.admission(script, by: admittedBy, at: SkillMutation.nowISO(self.now))
-                    }
-                    guard SkillScript.isRunnable(skill) else {
-                        throw SkillsError.stateNotAllowed(name: sname, state: "drafted",
-                                                          requirement: "an admission for its script's exact digest")
-                    }
-                }
-                try await self.recordSkillVersion(.object(before), reason: "before-update")
-                let updated = JSONValue.object(skill)
-                skills[index] = updated
-                try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-                try? await self.recordSkillVersion(updated, reason: "updated")
-                return updated
+    private func updateSkill(_ entry: InstalledSkillInventory.Entry, body: JSONValue, admittedBy: String?, reviewedDigest: String?, ownerAuthorized: Bool = false, restoring: Bool = false) async throws -> JSONValue {
+        let skillId = entry.id
+        if ["active", "installed"].contains(SkillMutation.string(body, "status")), entry.row["script"] != nil || entry.row["candidateDigest"] != nil {
+            let row = entry.row
+            guard row["candidateDigest"] != nil || row["script"]?.objectValue?["entry"] == .string("run") else {
+                throw SkillsError.invalidScript("The original is historical. Save, validate and enable its JS counterpart; Tools census lists conversion blockers.")
             }
-            throw SkillsError.unknownSkill(skillId)
+            return try await keepRoutine(row, admittedBy: admittedBy, reviewedDigest: reviewedDigest, ownerAuthorized: ownerAuthorized)
+        }
+        let result = try await mutateRoutine(entry, ownerAuthorized: ownerAuthorized) { skill -> JSONValue in
+            let before = skill
+            let sname = SkillMutation.pyStr(skill["name"] ?? .null)
+            // Patch only the allowed keys present in the body.
+            if case .object(let bodyObj) = body {
+                if bodyObj["status"] != nil {
+                    for mark in SkillMutation.agentMarks { skill.removeValue(forKey: mark) }
+                }
+                for key in ["name", "description", "triggers", "kind", "status"] + SkillMutation.agentMarks
+                where bodyObj[key] != nil {
+                    skill[key] = bodyObj[key]
+                }
+            }
+            skill["updatedAt"] = .string(SkillMutation.nowISO(self.now))
+            if skill["script"] != nil, InstalledSkillInventory.isAvailable(skill) {
+                guard SkillScript.isRunnable(skill) else {
+                    throw SkillsError.stateNotAllowed(name: sname, state: "drafted",
+                                                      requirement: "an admission for its script's exact digest")
+                }
+            }
+            skill = try CapabilityLifecycle.preservingOwnerOff(skill, before: before,
+                ownerAuthorized: ownerAuthorized, enabling: restoring || ["active", "installed"].contains(SkillMutation.pyStrOptional(skill["status"]) ?? ""))
+            return .object(skill)
         }
         // record_activity("skill", "Skill updated", name|id, "ok",
         //   payload={"skillId": skillId}) — fired OUTSIDE the registry lock,
@@ -393,67 +242,14 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         return result
     }
 
-    public func deleteSkill(id rawId: String) async throws -> JSONValue {
-        let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
-        // First: try the legacy registry (delete_skill). Returns nil if not found
-        // there, signalling the manifest fallback.
-        let legacy: (result: JSONValue, displayName: String)? = try await withRegistryLock {
-            () throws -> (JSONValue, String)? in
-            let skills = try self.loadRegistryForMutation()
-            var kept: [JSONValue] = []
-            var removed: JSONValue? = nil
-            for skill in skills {
-                let sid = SkillMutation.pyStr((skill.objectValue?["id"]) ?? .null)
-                let sname = SkillMutation.pyStr((skill.objectValue?["name"]) ?? .null)
-                if sid == skillId || sname == skillId { removed = skill } else { kept.append(skill) }
-            }
-            guard let removedSkill = removed else { return nil }
-            try await self.recordSkillVersion(removedSkill, reason: "before-delete")
-            // Keep an inactive row until cleanup succeeds, so a leftover body
-            // cannot be rediscovered as active loose guidance.
-            var tombstone = removedSkill.objectValue ?? [:]
-            tombstone["status"] = .string("trashed")
-            try await self.persistence.writeJSON(.array(kept + [.object(tombstone)]), to: self.registryPath)
-            let bodyPathRaw = SkillMutation.pyStrOptional(tombstone["bodyPath"]).flatMap { $0.isEmpty ? nil : $0 }
-                ?? self.skillBodiesDir.appendingPathComponent("\(SkillMutation.pyStrTruthyOr(tombstone["id"], skillId)).md").path
-            let bodyRemoved = await self.cleanupBodyFile(bodyPathRaw, skillId: skillId,
-                displayName: SkillMutation.pyStrTruthyOr(tombstone["name"], skillId))
-            if bodyRemoved {
-                try await self.persistence.writeJSON(.array(kept), to: self.registryPath)
-            }
-            let displayName = SkillMutation.pyStrTruthyOr(removedSkill.objectValue?["name"], skillId)
-            return (.object(["id": .string(skillId), "deleted": .bool(true)]), displayName)
+    public func deleteSkill(id rawId: String, ownerAuthorized: Bool = false) async throws -> JSONValue {
+        let entry = try await lifecycleEntry(rawId)
+        guard entry.row["source"] == .string("runtime_registry") else {
+            throw SkillsError.stateNotAllowed(name: entry.name, state: "built in", requirement: "an owner override")
         }
-        if let hit = legacy {
-            try await activity.record(kind: "skill", title: "Skill deleted", detail: hit.displayName,
-                                      status: "ok", payload: .object(["skillId": .string(skillId)]))
-            return hit.result
-        }
-        // Remove the legacy source too, so merging cannot resurrect the entry.
-        return try await withManifestLock { () throws -> JSONValue in
-            var mreg = try await self.manifestRegisteredSkillsObject()
-            guard case .object(var mregObj) = mreg, case .object(var skills)? = mregObj["skills"],
-                  let entry = skills[skillId] else {
-                throw SkillsError.unknownSkill(skillId)
-            }
-            skills.removeValue(forKey: skillId)
-            mregObj["skills"] = .object(skills)
-            mreg = .object(mregObj)
-            if self.legacyManifestPath.standardizedFileURL != self.dataRootManifestPath.standardizedFileURL {
-                try await self.persistence.withFileLock(self.legacyManifestPath) {
-                    let raw = try self.readManifest(self.legacyManifestPath)
-                    guard case .object(var legacy) = raw, case .object(var entries)? = legacy["skills"],
-                          entries.removeValue(forKey: skillId) != nil else { return }
-                    legacy["skills"] = .object(entries)
-                    try await self.persistence.writeJSON(.object(legacy), to: self.legacyManifestPath)
-                }
-            }
-            try await self.persistence.writeJSON(mreg, to: self.dataRootManifestPath)
-            let displayName = SkillMutation.pyStrTruthyOr(entry.objectValue?["name"], skillId)
-            try await self.activity.record(kind: "skill", title: "Manifest skill deleted", detail: displayName,
-                                           status: "ok", payload: .object(["skillId": .string(skillId)]))
-            return .object(["id": .string(skillId), "deleted": .bool(true), "source": .string("manifest")])
-        }
+        try CapabilityLifecycle.requireWrite()
+        try abilities.remove(id: entry.id, ownerAuthorized: ownerAuthorized)
+        return .object(["id": .string(entry.id), "dropped": .bool(true)])
     }
 
     /// Turns on what needs no new admission: a script skill is admitted only
@@ -463,447 +259,352 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     }
 
     /// `admittedBy` nil turns on only what needs no new admission.
-    public func enableSkill(name rawName: String, admittedBy: String?, reviewedDigest: String?) async throws -> JSONValue {
-        try await flipStatus(name: rawName, legacyStatus: "active", admittedBy: admittedBy, reviewedDigest: reviewedDigest,
-                             allowedManifestStates: ["drafted", "dormant", "installed"],
-                             targetManifestState: "installed",
-                             requirement: "drafted, dormant, or installed")
+    public func enableSkill(name rawName: String, admittedBy: String?, reviewedDigest: String?, ownerAuthorized: Bool = false) async throws -> JSONValue {
+        try await flipStatus(lifecycleEntry(rawName), legacyStatus: "active", admittedBy: admittedBy, reviewedDigest: reviewedDigest,
+                             ownerAuthorized: ownerAuthorized)
     }
 
     public func disableSkill(name rawName: String) async throws -> JSONValue {
-        try await flipStatus(name: rawName, legacyStatus: "disabled", admittedBy: nil, reviewedDigest: nil,
-                             allowedManifestStates: ["installed", "active"],
-                             targetManifestState: "dormant",
-                             requirement: "installed or active")
+        try await flipStatus(lifecycleEntry(rawName), legacyStatus: "disabled", admittedBy: nil, reviewedDigest: nil,
+                             ownerAuthorized: true)
     }
 
-    /// Shared enable/disable body. Mirrors the two near-identical route handlers
-    /// (L52426-52476): try the legacy update_skill status flip first; on
-    /// unknown-skill, fall through to the manifest state machine.
+    /// Mutate the selected registry, without resolving its name again.
     private func flipStatus(
-        name rawName: String,
+        _ entry: InstalledSkillInventory.Entry,
         legacyStatus: String,
         admittedBy: String?,
         reviewedDigest: String?,
-        allowedManifestStates: Set<String>,
-        targetManifestState: String,
-        requirement: String
+        ownerAuthorized: Bool
     ) async throws -> JSONValue {
-        let name = SkillMutation.unquote(rawName)
-        do {
-            return try await updateSkill(body: .object(["id": .string(name), "status": .string(legacyStatus)]),
-                                         admittedBy: admittedBy, reviewedDigest: reviewedDigest)
-        } catch SkillsError.unknownSkill {
-            // Manifest fallback.
-            return try await withManifestLock { () throws -> JSONValue in
-                var mreg = try await self.manifestRegisteredSkillsObject()
-                guard case .object(var mregObj) = mreg, case .object(var skills)? = mregObj["skills"] else {
-                    throw SkillsError.unknownSkill(name)
-                }
-                guard case .object(var entry)? = skills[name] else {
-                    throw SkillsError.unknownSkill(name)
-                }
-                let state = SkillMutation.pyStrOptional(entry["state"])  // .get("state") -> may be None
-                guard let st = state, allowedManifestStates.contains(st) else {
-                    throw SkillsError.stateNotAllowed(name: name, state: state ?? "None", requirement: requirement)
-                }
-                entry["state"] = .string(targetManifestState)
-                for mark in SkillMutation.agentMarks { entry.removeValue(forKey: mark) }
-                entry["updatedAt"] = .string(SkillMutation.nowISO(self.now))
-                skills[name] = .object(entry)
-                mregObj["skills"] = .object(skills)
-                mreg = .object(mregObj)
-                try await self.persistence.writeJSON(mreg, to: self.dataRootManifestPath)
-                // Route returns {"name": _name, "state": target, **_entry}.
-                // The `**_entry` spread is LAST, so a `name`/`state` ALREADY in
-                // the entry WINS over the leading literals (gpt-5.5 review
-                // finding, wave 32 W15 — the prior code force-overwrote name).
-                // entry already carries state=target (set above), and normally
-                // has no own `name` key (manifest entries are keyed BY name), so
-                // we only fill name/state when the entry omits them.
-                var out = entry
-                if out["name"] == nil { out["name"] = .string(name) }
-                if out["state"] == nil { out["state"] = .string(targetManifestState) }
-                return .object(out)
-            }
-        }
+        try await updateSkill(entry, body: .object(["status": .string(legacyStatus)]),
+                              admittedBy: admittedBy, reviewedDigest: reviewedDigest, ownerAuthorized: ownerAuthorized)
     }
 
     public func markSkill(
-        name rawName: String, legacyStatus: String, manifestState: String, marks: [String: JSONValue]
+        name rawName: String, legacyStatus: String, manifestState: String, marks: [String: JSONValue], restoring: Bool = false
     ) async throws -> JSONValue {
-        let name = SkillMutation.unquote(rawName)
-        var body: [String: JSONValue] = ["id": .string(name), "status": .string(legacyStatus)]
+        try await markSkill(lifecycleEntry(rawName), legacyStatus: legacyStatus, manifestState: manifestState, marks: marks, restoring: restoring)
+    }
+
+    private func markSkill(
+        _ entry: InstalledSkillInventory.Entry, legacyStatus: String, manifestState: String, marks: [String: JSONValue], restoring: Bool = false
+    ) async throws -> JSONValue {
+        if ["archived", "trashed", "retired"].contains(legacyStatus) { return try await deleteSkill(id: entry.id) }
+        var body: [String: JSONValue] = ["status": .string(legacyStatus)]
         body.merge(marks.filter { SkillMutation.agentMarks.contains($0.key) }) { $1 }
-        do {
-            return try await updateSkill(body: .object(body))
-        } catch SkillsError.unknownSkill {
-            return try await withManifestLock { () throws -> JSONValue in
-                guard case .object(var mregObj) = try await self.manifestRegisteredSkillsObject(),
-                      case .object(var skills)? = mregObj["skills"],
-                      case .object(var entry)? = skills[name] else {
-                    throw SkillsError.unknownSkill(name)
-                }
-                entry["state"] = .string(manifestState)
-                for mark in SkillMutation.agentMarks { entry.removeValue(forKey: mark) }
-                for (key, value) in marks where SkillMutation.agentMarks.contains(key) { entry[key] = value }
-                entry["updatedAt"] = .string(SkillMutation.nowISO(self.now))
-                skills[name] = .object(entry)
-                mregObj["skills"] = .object(skills)
-                try await self.persistence.writeJSON(.object(mregObj), to: self.dataRootManifestPath)
-                var out = entry
-                if out["name"] == nil { out["name"] = .string(name) }
-                return .object(out)
-            }
-        }
+        return try await updateSkill(entry, body: .object(body), admittedBy: nil, reviewedDigest: nil, restoring: restoring)
     }
 
     public func createSkill(body: JSONValue) async throws -> JSONValue {
         try await createSkill(body: body, steer: nil)
     }
 
-    /// `steer` is the attested origin of the turn that wrote it
-    /// (`SkillScript.origin`); a script is saved, or a script skill edited,
-    /// only with one. The body's own `origin` or `admission` is never read.
     public func createSkill(body: JSONValue, steer: JSONValue?) async throws -> JSONValue {
-        let obj = body.objectValue ?? [:]
-        let script = try obj["script"].flatMap { $0 == .null ? nil : try SkillScript.normalized($0) }
-        if let missing = script.map(SkillScript.undeclared), !missing.isEmpty {
-            throw SkillsError.invalidScript("Its source calls \(missing.joined(separator: ", ")), which its header's actions "
-                + "don't declare: an action is app.<page>.<action>(…) and goes in actions; app.read, find, log, expect, "
-                + "expect_fail, decide and step are the runner's own. Declare it or fix the call.")
-        }
-        let name = String(SkillMutation.pyStrTruthyOr(obj["name"], "Untitled Skill").trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
-        // Normalize to IMMUTABLE finals before the @Sendable lock closure so
-        // nothing mutable is captured.
-        let rawDescription = String(SkillMutation.pyStrTruthyOr(obj["description"], "").trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
-        var collectedTriggers: [String] = []
-        if case .array(let arr)? = obj["triggers"] {
-            for t in arr {
-                let s = SkillMutation.pyStr(t).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !s.isEmpty { collectedTriggers.append(s) }
-            }
-        }
-        let rawContent = SkillMutation.pyStrTruthyOr(obj["content"], SkillMutation.pyStrTruthyOr(obj["body"], "")).trimmingCharacters(in: .whitespacesAndNewlines)
-        let autoCreated = SkillMutation.boolValue(obj["autoCreated"])
-        let description = rawDescription.isEmpty ? "Reusable procedure for \(name)." : rawDescription
-        let triggers: [String] = collectedTriggers.isEmpty ? [name] : collectedTriggers
-        let content = rawContent.isEmpty ? "# \(name)\n\n\(description)\n" : rawContent
-        let hygieneViolations = SkillBodyHygiene.violations(in: content)
-        if !hygieneViolations.isEmpty {
-            throw SkillsError.invalidSkillBody(SkillBodyHygiene.failureMessage(for: hygieneViolations))
-        }
+        let fields = body.objectValue ?? [:]
+        let script = try SkillScript.normalized(fields["script"])
+        return try await saveRoutine(fields, script: script, steer: steer)
+    }
 
-        return try await withRegistryLock { () throws -> JSONValue in
-            var skills = try self.loadRegistryForMutation()
-            let now = SkillMutation.nowISO(self.now)
+    private var routineStore: OwnedProgramStore { OwnedProgramStore(root: CapabilityLifecycle.Store.skills.directory(in: root)) }
+
+    private static func routineSelection(_ row: [String: JSONValue]) -> JSONValue {
+        .object(row.filter { ["status", "codeFingerprint", "scriptDigest", "origin", "candidateOrigin", "admission", "disabledBy", "candidateDigest"].contains($0.key) })
+    }
+
+    private func routineKey() throws -> Data {
+        guard let key = try CheckedFixedSizeSecretFile.peekExisting(
+            at: root.appendingPathComponent("tools/.manifest_signing_key"), byteCount: 32) else {
+            throw SkillsError.invalidScript("Validation authority is missing. Validate the routine in the installed app.")
+        }
+        return key
+    }
+
+    private func saveRoutine(_ fields: [String: JSONValue], script: JSONValue, steer: JSONValue?) async throws -> JSONValue {
+        guard let steer, SkillScript.originKind(steer) != nil,
+              case .string(let name)? = fields["name"], !name.isEmpty, name.count <= 120,
+              case .string(let description)? = fields["description"], !description.isEmpty,
+              description.count <= 500, description.rangeOfCharacter(from: .newlines) == nil,
+              case .array(let fixtures) = fields["fixtures"] ?? .array([]), fixtures.count <= 16,
+              try JSONValue.array(fixtures).serializedData(pretty: false).count <= 256 * 1024,
+              fields["overrides"] == nil || fields["overrides"] == .null || fields["overrides"] == .string("built_in"),
+              case .object(let pins)? = fields["dependencyShapes"] else {
+            throw SkillsError.invalidScript("Save requires a name, one-line description, run(input) and checked dependencies with an attested origin; omit fixtures to capture during validation.")
+        }
+        let missing = SkillScript.undeclared(script)
+        guard missing.isEmpty else { throw SkillsError.invalidScript("Declare the calls in actions: \(missing.joined(separator: ", ")).") }
+        return try await mutateRegistry { rows in
             let inventory = try InstalledSkillInventory.entries(dataRoot: self.root)
-            if !skills.contains(where: {
-                SkillMutation.pyStrTruthyOr($0.objectValue?["name"], "").lowercased() == name.lowercased()
-            }), let loose = inventory.first(where: {
-                $0.row["source"] == .string("runtime_body") && $0.name.caseInsensitiveCompare(name) == .orderedSame
-            }) {
-                guard let bodyURL = loose.bodyURL, try Data(contentsOf: bodyURL).count <= 65_536 else {
-                    throw SkillsError.historyUnavailable("The existing skill body is too large to preserve before updating.")
-                }
-                var row = loose.row
-                row.removeValue(forKey: "source")
-                skills.append(.object(row))
+            // Filenames preserve persona identity without exposing legacy guidance.
+            let bodies = defaultPersonaRoot(dataRoot: self.root).appendingPathComponent("skills/bodies")
+            let builtIn = FileManager.default.fileExists(atPath: bodies.path)
+                ? try FileManager.default.contentsOfDirectory(at: bodies, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                    .first { $0.pathExtension.lowercased() == "md" && $0.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame } : nil
+            if let builtIn { try VerifiedPath.confirmNoSymlink(builtIn) }
+            let builtInID = builtIn?.deletingPathExtension().lastPathComponent
+            let index = if let id = SkillMutation.pyStrOptional(fields["id"]) {
+                rows.firstIndex { $0.objectValue?["id"] == .string(id) }
+            } else {
+                InstalledSkillInventory.match(builtInID ?? name, in: rows).flatMap { rows.firstIndex(of: .object($0.row)) }
             }
-            let bodyIDs = try FileManager.default.fileExists(atPath: self.skillBodiesDir.path)
-                ? FileManager.default.contentsOfDirectory(at: self.skillBodiesDir, includingPropertiesForKeys: nil)
-                    .filter { $0.pathExtension.lowercased() == "md" }.map { $0.deletingPathExtension().lastPathComponent }
-                : []
-            let registryIDs = skills.map { SkillMutation.pyStr($0.objectValue?["id"] ?? .null) }
-            let existingIds = Set(registryIDs + inventory.map(\.id) + bodyIDs)
-            // case-insensitive name dedup (Python: next(... lower() == name.lower()))
-            if let idx = skills.firstIndex(where: {
-                SkillMutation.pyStrTruthyOr($0.objectValue?["name"], "").lowercased() == name.lowercased()
-            }), case .object(var existing) = skills[idx] {
-                // Normalize early/hand-authored registry rows that predate the
-                // canonical writer and have no id. `str(null)` used to produce
-                // a literal "None.md", disconnecting the manifest name from
-                // the body read path. A deduplicated NAME may still slugify
-                // to another row's ID, so repair uses the same allocation as
-                // a new skill. An existing explicit id remains unchanged.
-                // 2026-09-06: an existing row's id was preserved VERBATIM into
-                // `skills/bodies/<id>.md`, and nothing validated it — a row
-                // whose id carried path separators (a hand-edited or imported
-                // registry) wrote the caller's body outside the bodies dir.
-                // An id that is not a single safe path segment is not an
-                // identity worth keeping; it is reallocated like a new skill's.
-                let before = existing
-                if script != nil || existing["script"] != nil, steer == nil {
-                    throw SkillsError.invalidScript("A script skill is saved only with the origin of the turn that wrote it.")
-                }
-                let existingId = SkillMutation.pyTruthyStrOptional(existing["id"])
-                    .flatMap { SkillMutation.isSafeSkillID($0) ? $0 : nil }
-                let skillId = existingId ?? SkillMutation.availableID(
-                    for: SkillMutation.pyStrTruthyOr(existing["name"], name), existingIDs: existingIds
-                )
-                let bodyPath = self.skillBodiesDir.appendingPathComponent("\(skillId).md")
-                existing["id"] = .string(skillId)
-                // Version under the allocated identity, not a name-derived
-                // slug that may belong to another skill. Keep the prior body
-                // path until this before-image has been captured.
-                try await self.recordSkillVersion(.object(existing), reason: "before-create-update")
-                existing["bodyPath"] = .string(bodyPath.path)
-                if obj["description"] != nil { existing["description"] = .string(description) }
-                if obj["triggers"] != nil { existing["triggers"] = .array(triggers.map { .string($0) }) }
-                existing["updatedAt"] = .string(now)
-                // body.get("status") or existing.get("status") or "active"
-                // (truthiness: a present-but-empty status falls through).
-                let bodyStatus = SkillMutation.pyTruthyStrOptional(obj["status"])
-                let existingStatus = SkillMutation.pyTruthyStrOptional(existing["status"])
-                existing["status"] = .string(bodyStatus ?? existingStatus ?? "active")
-                if let script { existing["script"] = script }
-                // A save never turns a script on: its status stays its own.
-                if existing["script"] != nil { existing["status"] = before["status"] ?? .string("draft") }
-                SkillScript.settle(&existing, before: before, origins: [steer] + SkillScript.recorded(before))
-                try await self.writeBody(content, to: bodyPath)
-                let updated = JSONValue.object(existing)
-                skills[idx] = updated
-                try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-                try? await self.recordSkillVersion(updated, reason: "created-update")
-                return updated
+            var before = index.flatMap { rows[$0].objectValue }
+            // Persist persona protection before its name moves to the canonical row.
+            if builtIn != nil { before?["overrides"] = .string("built_in") }
+            let id = builtInID ?? before.flatMap { SkillMutation.pyStrOptional($0["id"]) }
+                ?? SkillMutation.pyStrOptional(fields["id"])
+                ?? SkillMutation.availableID(for: name, existingIDs: Set(inventory.map(\.id)))
+            guard SkillMutation.isSafeSkillID(id) else { throw SkillsError.invalidScript("The skill identity is not a safe path component.") }
+            guard before == nil || before?["id"] == .string(id) else {
+                throw SkillsError.invalidScript("A built-in override must use the built-in skill's identity.")
             }
-            // Her version of a built-in overrides it under the built-in's own
-            // id and keeps its status; the built-in's file is left as it ships.
-            let builtIn = inventory.first {
-                $0.row["source"] == .string("persona_body") && $0.name.caseInsensitiveCompare(name) == .orderedSame
+            let origin = SkillScript.merged([steer] + SkillScript.recorded(before))
+            let manifest: JSONValue = .object(["id": .string(id), "name": .string(name), "description": .string(description),
+                "triggers": fields["triggers"] ?? .array([]), "script": script, "origin": origin,
+                "overrides": builtIn != nil || before?["overrides"] == .string("built_in") || fields["overrides"] == .string("built_in") ? .string("built_in") : .null,
+                "converts": try OwnedProgramStore.conversionSources(fields["converts"])])
+            let candidate = try OwnedProgramStore.Candidate(program: OwnedProgram(kind: .skill, id: id, version: "candidate",
+                source: SkillMutation.string(script, "source"), entry: .run, schema: SkillScript.inputSchema(script),
+                dependencies: (script.objectValue?["actions"]?.arrayValue ?? []).compactMap(SkillMutation.pyStrOptional)),
+                manifest: manifest, fixtures: .array(fixtures), dependencyShapes: .object(pins),
+                prior: before.map(Self.routineSelection) ?? .null)
+            try self.routineStore.stage(candidate)
+            let at = SkillMutation.nowISO(self.now)
+            var row = before ?? ["id": .string(id), "name": .string(name), "description": .string(description),
+                "triggers": fields["triggers"] ?? .array([]), "status": fields["status"] == .string("disabled") ? .string("disabled") : .string("draft"), "kind": .string("skill"),
+                "createdAt": .string(at), "useCount": .int(0)]
+            if row["script"] == nil, !InstalledSkillInventory.isAvailable(row) || before == nil {
+                row["script"] = script; row["signature"] = .string(SkillScript.signature(script))
+                row["scriptDigest"] = SkillScript.sourceChecksum(script).map(JSONValue.string)
             }
-            let skillId = builtIn?.id ?? SkillMutation.availableID(for: name, existingIDs: existingIds)
-            let bodyPath = self.skillBodiesDir.appendingPathComponent("\(skillId).md")
-            try await self.writeBody(content, to: bodyPath)
-            // body.get("status") or ("draft" if autoCreated else "active")
-            let status = builtIn.flatMap { SkillMutation.pyTruthyStrOptional($0.row["status"]) }
-                ?? SkillMutation.pyTruthyStrOptional(obj["status"]) ?? (autoCreated ? "draft" : "active")
-            var record: [String: JSONValue] = [
-                "id": .string(skillId),
-                "name": .string(name),
-                // Saved without one, her version of a built-in keeps the built-in's.
-                "description": .string(rawDescription.isEmpty
-                    ? builtIn.flatMap { SkillMutation.pyTruthyStrOptional($0.row["description"]) } ?? description : description),
-                "triggers": .array(triggers.map { .string($0) }),
-                // body.get("kind") or "skill" (truthiness fall-through).
-                "kind": .string(SkillMutation.pyTruthyStrOptional(obj["kind"]) ?? "skill"),
-                "status": .string(status),
-                "autoCreated": .bool(autoCreated),
-                "sourceRunId": obj["sourceRunId"] ?? .null,
-                "bodyPath": .string(bodyPath.path),
-                "createdAt": .string(now),
-                "updatedAt": .string(now),
-                "useCount": .int(Int64(SkillMutation.intValue(obj["useCount"]) ?? 0)),
-                "lastUsedAt": .null,
-            ]
-            if let script {
-                record["script"] = script
-                SkillScript.settle(&record, before: nil, origins: [steer])
-            }
-            try await self.recordSkillVersion(.object(record), reason: "created")
-            skills.append(.object(record))
-            try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-            return .object(record)
+            for key in ["installedByPack", "capabilityPackInstallId"] where fields[key] != nil { row[key] = fields[key] }
+            if builtIn != nil || fields["overrides"] == .string("built_in") { row["overrides"] = .string("built_in") }
+            if row["origin"] == nil { row["origin"] = origin }
+            row["candidateOrigin"] = origin
+            row["candidateDigest"] = .string(candidate.digest)
+            row["candidateValidation"] = .string("invalid")
+            row["updatedAt"] = .string(at)
+            row = try CapabilityLifecycle.preservingOwnerOff(row, before: before)
+            row["candidateSelection"] = Self.routineSelection(row)
+            let saved = JSONValue.object(row)
+            if let index { rows[index] = saved } else { rows.append(saved) }
+            return saved
         }
     }
 
-    public func listSkillVersions(id rawId: String) async throws -> [JSONValue] {
-        let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !skillId.isEmpty else { throw SkillsError.unknownSkill(skillId) }
-        let path = historyPath(for: skillId)
-        return try await persistence.withFileLock(path) {
-            let rows = try self.loadSkillHistory(skillId: skillId)
-            return Array(rows.reversed())
+    public func routineCandidate(name: String) async throws -> OwnedProgramStore.Candidate {
+        guard let row = try InstalledSkillInventory.match(name, in: InstalledSkillInventory.entries(dataRoot: root)
+                .filter { $0.row["source"] == .string("runtime_registry") })?.row else {
+            throw SkillsError.unknownSkill(name)
         }
+        return try routineCandidate(row)
+    }
+
+    public func routineCandidate(_ row: [String: JSONValue]) throws -> OwnedProgramStore.Candidate {
+        guard let id = SkillMutation.pyStrOptional(row["id"]),
+              let digest = SkillMutation.pyStrOptional(row["candidateDigest"] ?? row["codeFingerprint"]) else {
+            throw SkillsError.unknownSkill(SkillMutation.pyStr(row["id"] ?? .null))
+        }
+        return try routineStore.load(id: id, digest: digest)
+    }
+
+    /// The app adapter executes with intercepted calls; no model-supplied receipt can bind a proof.
+    public func validateRoutine(name: String, key: Data,
+        execute: @Sendable (OwnedProgramStore.Candidate) async throws -> JSONValue) async throws -> JSONValue {
+        let candidate = try await routineCandidate(name: name)
+        let proof: JSONValue
+        do {
+            proof = try await execute(candidate)
+            guard try routineStore.proof(candidate, key: key) == proof else { throw SkillsError.invalidScript("Validation proof changed.") }
+            guard !(proof.objectValue?["receipts"]?.arrayValue ?? []).isEmpty else { throw SkillsError.invalidScript("Validation returned no runtime receipts.") }
+        }
+        catch {
+            try AbilityStore.withLock {
+                if let next = try abilities.read(id: candidate.id, slot: .next),
+                   next.metadata["candidate"]?.objectValue?["program"]?.objectValue?["version"] == .string(candidate.digest) {
+                    try abilities.remove(id: candidate.id, slot: .next)
+                }
+            }
+            throw error
+        }
+        let receipts = proof.objectValue?["receipts"]?.arrayValue ?? []
+        return try await mutateRegistry { rows in
+            guard let index = rows.firstIndex(where: { $0.objectValue?["id"] == .string(candidate.id) }),
+                  case .object(var row) = rows[index],
+                  (row["candidateDigest"] ?? row["codeFingerprint"]) == .string(candidate.digest) else {
+                throw SkillsError.invalidScript("A newer revision replaced this validation. Validate that candidate.")
+            }
+            row["candidateValidation"] = .string("valid")
+            rows[index] = .object(row)
+            return .object(["status": .string("ok"), "digest": .string(candidate.digest), "validation": .string("valid"),
+                            "capture": proof.objectValue?["capture"] ?? .null,
+                            "effects": .string("none"), "receipts": .array(receipts.map { .object(($0.objectValue ?? [:]).filter { $0.key != "journal" }) })])
+        }
+    }
+
+    public func routineProgram(_ row: [String: JSONValue]) throws -> OwnedProgram {
+        guard SkillMutation.pyStrOptional(row["id"]) != nil, let digest = SkillMutation.pyStrOptional(row["codeFingerprint"]) else {
+            throw SkillsError.invalidScript("No executable version is selected. Validate and enable this routine.")
+        }
+        let candidate = try routineStore.load(id: SkillMutation.pyStr(row["id"] ?? .null), digest: digest)
+        guard candidate.manifest.objectValue?["script"] == row["script"] else {
+            throw SkillsError.invalidScript("Selected code changed. Save, validate and enable it again.")
+        }
+        if let admitted = row["admission"]?.objectValue?["candidate"], admitted != .string(digest) {
+            throw SkillsError.invalidScript("Admission binds another candidate. Review and enable this exact version.")
+        }
+        _ = try routineStore.proof(candidate, key: routineKey())
+        return candidate.program
+    }
+
+    private func keepRoutine(_ current: [String: JSONValue], admittedBy: String?, reviewedDigest: String?, ownerAuthorized: Bool) async throws -> JSONValue {
+        let id = SkillMutation.pyStr(current["id"] ?? .null)
+        guard ownerAuthorized || current["overrides"] != .string("built_in") else {
+            throw SkillsError.invalidScript("Turning on an override of a built-in skill is the owner's.")
+        }
+        let candidate = try routineCandidate(current)
+        let manifest = candidate.manifest.objectValue ?? [:]
+        for id in candidate.program.dependencies {
+            guard OwnedProgramInvocation.host?.dependencyMatches(id, candidate.dependencyShapes.objectValue?[id]) == true else {
+                throw SkillsError.invalidScript("Dependency \(id) changed or its app door is unavailable. Validate against its current shape.")
+            }
+        }
+        guard let script = manifest["script"], current["candidateValidation"] == .string("valid") else {
+            throw SkillsError.invalidScript("Validate the exact routine candidate before enabling it.")
+        }
+        var admitted = current
+        admitted["script"] = script
+        admitted["codeFingerprint"] = .string(candidate.digest)
+        admitted["origin"] = SkillScript.merged([manifest["origin"]] + SkillScript.recorded(current))
+        if let admittedBy {
+            guard reviewedDigest == candidate.digest else { throw SkillsError.invalidScript("The reviewed candidate changed, including source, fixtures or dependencies. Review it again.") }
+            admitted["admission"] = .object(["digest": .string(candidate.digest), "candidate": .string(candidate.digest),
+                "by": .string(admittedBy), "at": .string(SkillMutation.nowISO(now))])
+        }
+        guard SkillScript.admitted(admitted) else { throw SkillsError.invalidScript("Enable requires admission for the exact code and its origin.") }
+        let admission = admitted["admission"], origin = admitted["origin"], stamp = SkillMutation.nowISO(now)
+        let expected = Self.routineSelection(current)
+        try await routineStore.keep(candidate, key: routineKey(), ownerAuthorized: ownerAuthorized) { value in
+            for id in candidate.program.dependencies {
+                guard OwnedProgramInvocation.host?.dependencyMatches(id, candidate.dependencyShapes.objectValue?[id]) == true else {
+                    throw SkillsError.invalidScript("Dependency \(id) changed before publication. Save and validate it again.")
+                }
+            }
+            var rows = try SkillsRegistry.decode(value)
+            let before = rows
+            guard let index = rows.firstIndex(where: { $0.objectValue?["id"] == .string(id) }),
+                  case .object(var row) = rows[index], Self.routineSelection(row) == expected,
+                  row["candidateDigest"] == nil || row["candidateSelection"] == expected else {
+                throw SkillsError.invalidScript("The selected version or off-switch changed. Save and validate against its current state.")
+            }
+            for key in ["name", "description", "triggers", "script"] { row[key] = manifest[key] }
+            row["origin"] = origin; row["admission"] = admission
+            if row["codeFingerprint"] != .string(candidate.digest) { row["previousVersion"] = row["codeFingerprint"] ?? row["previousVersion"] }
+            row["codeFingerprint"] = .string(candidate.digest)
+            row["scriptDigest"] = SkillScript.sourceChecksum(script).map(JSONValue.string)
+            row["signature"] = .string(SkillScript.signature(script))
+            row["actionPin"] = .object(["digest": row["scriptDigest"] ?? .null, "actions": candidate.dependencyShapes,
+                "interpreter": .int(Int64(SkillScript.interpreterRevision))])
+            row["status"] = .string("active"); row["updatedAt"] = .string(stamp)
+            for key in ["candidateDigest", "candidateSelection", "candidateOrigin"] { row.removeValue(forKey: key) }
+            rows[index] = .object(row); value = try self.registryForPersistence(rows, before: before, ownerAuthorized: ownerAuthorized)
+        }
+        let saved = try await listSkills().first {
+            $0.objectValue?["id"] == .string(id) && $0.objectValue?["source"] == .string("runtime_registry")
+        } ?? .null
+        return saved
+    }
+
+    public func readSkill(name: String, source: Bool = false) throws -> JSONValue {
+        let entries = try InstalledSkillInventory.entries(dataRoot: root)
+        let reviewEntries = entries
+        guard let entry = InstalledSkillInventory.match(name, in: reviewEntries)
+            ?? (name.hasSuffix(".md") ? InstalledSkillInventory.match(String(name.dropLast(3)), in: reviewEntries) : nil) else {
+            throw SkillsError.unknownSkill(name)
+        }
+        let row = entry.row
+        var result = row.filter { ["id", "name", "description", "triggers", "signature", "origin", "admission", "overrides", "suspended"].contains($0.key) }
+        result["status"] = .string("ok"); result["skill_status"] = row["status"] ?? .null
+        result["runnable"] = .bool(entry.isRunnable)
+        result["digest"] = row["codeFingerprint"] ?? .null
+        let converted = try routineStore.conversions(id: entry.id).map { candidate in
+            JSONValue.object(["version": .string(candidate.digest), "converts": candidate.manifest.objectValue?["converts"] ?? .array([]),
+                "rollback_call": .object(["action": .string("skill.rollback"), "args": .object(["name": .string(entry.name), "version": .string(candidate.digest)])])])
+        }
+        result["converted_versions"] = .array(converted)
+        if let script = row["script"] {
+            result["params"] = script.objectValue?["params"] ?? .object([:])
+            result["input_schema"] = SkillScript.inputSchema(script)
+            if result["params"] == .object([:]) { result["input_note"] = .string("No inputs are declared. Read the routine with skill.read {source:true} before running it.") }
+            var metadata = script.objectValue ?? [:]
+            result["signature"] = .string(SkillScript.signature(script))
+            metadata["actions"] = .array(SkillScript.actions(script).map(JSONValue.string))
+            if !source { metadata.removeValue(forKey: "source") }
+            metadata["digest"] = result["digest"]; metadata["runnable"] = result["runnable"]
+            metadata["admission"] = row["admission"] ?? .null; metadata["status"] = row["status"] ?? .null
+            result["script"] = .object(metadata)
+            result["versions"] = Self.scriptVersionMetadata(row)
+        }
+        if let selected = row["codeFingerprint"] {
+            result["selected_version"] = selected
+            if row["candidateDigest"] == nil { result["validation"] = row["candidateValidation"] ?? .null }
+        }
+        if let candidateDigest = row["candidateDigest"] {
+            let candidate = try routineStore.load(id: entry.id, digest: SkillMutation.pyStr(candidateDigest))
+            var pending = candidate.manifest.objectValue ?? [:]
+            if !source, case .object(var script)? = pending["script"] {
+                script.removeValue(forKey: "source"); pending["script"] = .object(script)
+            }
+            pending["digest"] = candidateDigest; pending["validation"] = row["candidateValidation"] ?? .null
+            if source { pending["fixtures"] = candidate.fixtures }
+            result["candidate"] = .object(pending)
+        }
+        if source, let selected = SkillMutation.pyStrOptional(row["codeFingerprint"]), row["script"] != nil {
+            result["fixtures"] = try routineStore.load(id: entry.id, digest: selected).fixtures
+        }
+        if row["script"] == nil {
+            if row["source"] == .string("persona_body"), let path = SkillMutation.pyStrOptional(row["bodyPath"]) {
+                result["body"] = .string(try String(contentsOfFile: path, encoding: .utf8))
+            } else if let file = try abilities.read(id: entry.id) {
+                result["body"] = .string(file.body)
+            }
+        }
+        return .object(result)
     }
 
     public func archiveSkill(id rawId: String) async throws -> JSONValue {
-        let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
-        return try await updateSkill(body: .object([
-            "id": .string(skillId),
-            "status": .string("archived"),
-        ]))
+        try await deleteSkill(id: rawId)
     }
 
-    public func restoreSkill(id rawId: String, versionId rawVersionId: String) async throws -> JSONValue {
-        try await restoreSkill(id: rawId, versionId: rawVersionId, steer: nil)
-    }
-
-    /// `steer` is the restoring turn's origin; nil is User's own restore.
-    public func restoreSkill(id rawId: String, versionId rawVersionId: String, steer: JSONValue?, guidanceOnly: Bool = false) async throws -> JSONValue {
-        let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
-        let versionId = SkillMutation.unquote(rawVersionId).trimmingCharacters(in: .whitespacesAndNewlines)
-        let versions = try await listSkillVersions(id: skillId)
-        guard let version = versions.first(where: {
-            guard case .object(let row) = $0, case .string(let id)? = row["versionId"] else { return false }
-            return id == versionId
-        }), case .object(let versionObject) = version,
-              case .object(let recordedSkill)? = versionObject["skill"] else {
-            throw SkillsError.unknownVersion(versionId)
+    /// Compare the kept action contracts without changing the ability.
+    public func pinActions(_ entry: InstalledSkillInventory.Entry, digest: String, pins: [String: String]) async throws -> [String] {
+        guard let row = try SkillsRegistry.decode(abilities.registry(kind: .skill))
+            .first(where: { $0.objectValue?["id"] == .string(entry.id) })?.objectValue,
+              SkillScript.isRunnable(row), row["codeFingerprint"] == .string(digest) else {
+            throw SkillsError.stateNotAllowed(name: entry.id, state: "not runnable", requirement: "an admitted script")
         }
-        let restoredId = SkillMutation.pyStrTruthyOr(recordedSkill["id"], skillId)
-        guard restoredId == skillId else {
-            throw SkillsError.historyUnavailable("Recorded version does not belong to this skill.")
-        }
-        let restoredBody: String?
-        if case .string(let body)? = versionObject["body"] { restoredBody = body } else { restoredBody = nil }
-        if let restoredBody {
-            let violations = SkillBodyHygiene.violations(in: restoredBody)
-            if !violations.isEmpty {
-                throw SkillsError.invalidSkillBody(SkillBodyHygiene.failureMessage(for: violations))
-            }
-        }
-        let capturedSkill = recordedSkill
-        let capturedBody = restoredBody
-        return try await withRegistryLock {
-            var skills = try self.loadRegistryForMutation()
-            guard let index = skills.firstIndex(where: {
-                let object = $0.objectValue
-                return SkillMutation.pyStr(object?["id"] ?? .null) == skillId
-                    || SkillMutation.pyStr(object?["name"] ?? .null) == skillId
-            }) else { throw SkillsError.unknownSkill(skillId) }
-            var restored = capturedSkill
-            SkillScript.normalizeInterpreter(&restored)
-            let before = skills[index].objectValue ?? [:]
-            if guidanceOnly {
-                guard before["script"] == nil, restored["script"] == nil else {
-                    throw SkillsError.historyUnavailable("The skill changed since the guidance version was read. Read it again before rollback.")
-                }
-                for key in ["permissions", "tools", "oauth", "admission", "origin", "status", "enabledAt"] + SkillMutation.agentMarks {
-                    restored[key] = before[key]
-                }
-            }
-            // Restoring prose or code does not undo evidence of use.
-            restored["useCount"] = before["useCount"]
-            restored["lastUsedAt"] = before["lastUsedAt"]
-            try await self.recordSkillVersion(skills[index], reason: "before-restore")
-            SkillScript.settle(&restored, before: before,
-                origins: SkillScript.recorded(capturedSkill) + SkillScript.recorded(before) + (steer.map { [$0] } ?? []))
-            let bodyPath = self.skillBodiesDir.appendingPathComponent("\(skillId).md")
-            let priorBody = try? Data(contentsOf: bodyPath)
-            let bodyExisted = FileManager.default.fileExists(atPath: bodyPath.path)
-            if let capturedBody {
-                try await self.writeBody(capturedBody, to: bodyPath)
-                restored["bodyPath"] = .string(bodyPath.path)
-            }
-            restored["updatedAt"] = .string(SkillMutation.nowISO(self.now))
-            if !guidanceOnly, InstalledSkillInventory.isAvailable(restored) {
-                restored["enabledAt"] = .string(SkillMutation.nowISO(self.now))
-            }
-            let restoredValue = JSONValue.object(restored)
-            skills[index] = restoredValue
-            do {
-                try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-            } catch {
-                if let priorBody { try? priorBody.write(to: bodyPath, options: .atomic) }
-                else if !bodyExisted { try? FileManager.default.removeItem(at: bodyPath) }
-                throw error
-            }
-            try? await self.recordSkillVersion(restoredValue, reason: "restored")
-            return restoredValue
-        }
-    }
-
-    /// The pin on the actions a runnable script declares (skills-as-code PR 3):
-    /// its first run under the digest records each action's hash (`pins`); a
-    /// later run whose hashes differ suspends it, drafted with its admission
-    /// and action hashes gone, so it runs again only on a new admission of its exact
-    /// digest. Returns the actions that changed; none when it may run.
-    public func pinActions(id rawId: String, digest: String, pins: [String: String]) async throws -> [String] {
-        try await withRegistryLock {
-            var skills = try self.loadRegistryForMutation()
-            guard let index = skills.firstIndex(where: {
-                [$0.objectValue?["id"], $0.objectValue?["name"]].contains(.string(rawId))
-            }), case .object(var row) = skills[index], SkillScript.isRunnable(row),
-                  SkillScript.digest(row["script"]) == digest else {
-                throw SkillsError.stateNotAllowed(name: rawId, state: "not runnable", requirement: "an admitted script")
-            }
-            let held: [String: JSONValue]? = if case .object(let pin)? = row["actionPin"], pin["digest"] == .string(digest),
-                case .object(let actions)? = pin["actions"] { actions } else { nil }
-            let wanted = pins.mapValues(JSONValue.string)
-            if held == wanted { return [] }
-            if let held {
-                let changed = Set(held.keys).union(wanted.keys).filter { held[$0] != wanted[$0] }.sorted()
-                try await self.recordSkillVersion(.object(row), reason: "before-suspend")
-                self.suspend(&row, actions: changed)
-                skills[index] = .object(row)
-                try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-                return changed
-            }
-            row["actionPin"] = .object(["digest": .string(digest), "actions": .object(wanted),
-                "interpreter": .int(Int64(SkillScript.interpreterRevision))])
-            row.removeValue(forKey: "suspended")
-            skills[index] = .object(row)
-            try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-            return []
-        }
-    }
-
-    /// Suspended: drafted, its admission and action hashes gone, naming the actions
-    /// that changed; it runs again only on a new admission of its exact digest.
-    private func suspend(_ row: inout [String: JSONValue], actions: [String]) {
-        row["status"] = .string("draft")
-        row.removeValue(forKey: "admission")
-        row["actionPin"] = .object(["digest": .string(SkillScript.digest(row["script"]) ?? ""),
-            "interpreter": .int(Int64(SkillScript.interpreterRevision))])
-        row["suspended"] = .object(["actions": .array(actions.map(JSONValue.string)),
-                                    "at": .string(SkillMutation.nowISO(now))])
-        row["updatedAt"] = .string(SkillMutation.nowISO(now))
-    }
-
-    /// Grammar changes use the same lock, versions and exact-digest admission as edits.
-    public func migrateScriptInterpreter() async throws {
-        try await withRegistryLock {
-            var skills = try self.loadRegistryForMutation()
-            var changed = false
-            for index in skills.indices {
-                guard case .object(var row) = skills[index], case .string? = row["script"]?.objectValue?["source"],
-                      row["actionPin"]?.objectValue?["interpreter"] != .int(Int64(SkillScript.interpreterRevision)) else { continue }
-                let before = row
-                if SkillScript.normalizeInterpreter(&row) {
-                    try await self.recordSkillVersion(.object(before), reason: "before-interpreter-migration")
-                    SkillScript.settle(&row, before: before, origins: SkillScript.recorded(before))
-                    self.suspend(&row, actions: ["script interpreter"])
-                }
-                skills[index] = .object(row)
-                changed = true
-            }
-            if changed { try await self.persistence.writeJSON(.array(skills), to: self.registryPath) }
-        }
-    }
-
-    /// Retired (skills-as-code PR 5): archived, never deleted, and hers to
-    /// turn back on; the faults that retired it are spent.
-    private func retire(_ row: inout [String: JSONValue], why: String) {
-        row["status"] = .string("archived")
-        // Never over whoever else turned it off.
-        if row["disabledBy"] == nil { row["disabledBy"] = .string("agent") }
-        row["retired"] = .object(["why": .string(why), "at": .string(SkillMutation.nowISO(now))])
-        row["updatedAt"] = .string(SkillMutation.nowISO(now))
-        if case .object(var runs)? = row["runs"] { runs["faults"] = .int(0); row["runs"] = .object(runs) }
+        let held: [String: JSONValue] = if case .object(let pin)? = row["actionPin"], pin["digest"] == row["scriptDigest"],
+            case .object(let actions)? = pin["actions"] { actions } else { [:] }
+        let wanted = pins.mapValues(JSONValue.string)
+        return Set(held.keys).union(wanted.keys).filter { held[$0] != wanted[$0] }.sorted()
     }
 
     /// What a finished run of a script skill says about it (skills-as-code
-    /// PR 5), kept on its row under `runs`: its own faults in a row, the last
+    /// PR 5), kept in state.json under `runs`: its own faults in a row, the last
     /// result, and the trust ladder, the distinct inputs of its clean runs
     /// under this admission of this digest (a new digest, admission or pin
     /// starts it over). `fault` is the skill's own; a run with none that isn't
-    /// `clean` was the world's and counts neither way. Two of its own in a row
-    /// retire it. Returns its clean runs on the ladder, whether it retired,
+    /// `clean` was the world's and counts neither way. Returns its clean runs,
     /// and its upgrade signals (`CapabilityLifecycle`), each one MY QUEUE line
     /// at most once until it changes: the same world stop at the same step in
     /// 2 of its last 3 runs, and a new digest's fault, offering the last clean one.
     /// `runs.last` keeps the run's id, end time, reason and stop `step`.
     /// `admission` is the one the run started under: a row turned off,
-    /// changed or admitted again since (by User or anything else) records nothing.
-    public func recordRun(id rawId: String, runID: String = "", digest: String, admission: JSONValue?, fault: String?, clean: Bool,
-                          reason: String, step: String = "", inputHash: String) async throws -> (clean: Int, retired: Bool, signals: [SkillLine]) {
-        try await withRegistryLock {
-            var skills = try self.loadRegistryForMutation()
-            guard let index = skills.firstIndex(where: {
-                [$0.objectValue?["id"], $0.objectValue?["name"]].contains(.string(rawId))
-            }), case .object(var row) = skills[index], SkillScript.isRunnable(row), SkillScript.digest(row["script"]) == digest,
-                  row["admission"] == admission else { return (0, false, []) }
+    /// changed or admitted again since (by User or anything else) returns nil.
+    public func recordRun(_ entry: InstalledSkillInventory.Entry, runID: String = "", digest: String, admission: JSONValue?, fault: String?, clean: Bool,
+                          reason: String, step: String = "", inputHash: String) async throws -> (clean: Int, signals: [SkillLine])? {
+        try await mutateRoutine(entry) { row in
+            guard SkillScript.isRunnable(row), row["codeFingerprint"] == .string(digest),
+                  row["admission"] == admission else { return nil }
             let at = SkillMutation.nowISO(self.now)
             let runs = row["runs"]?.objectValue ?? [:]
             let key = JSONValue.string(digest + "@" + (SkillMutation.pyStrOptional(row["admission"]?.objectValue?["at"]) ?? ""))
@@ -923,8 +624,9 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                     inputs = Array((inputs + [.string(inputHash)]).suffix(CapabilityLifecycle.inputLimit))
                 }
                 row["lastCleanDigest"] = .string(digest)
+                row["lastCleanVersion"] = row["codeFingerprint"]
             }
-            let name = SkillMutation.pyStrTruthyOr(row["name"], rawId)
+            let name = SkillMutation.pyStrTruthyOr(row["name"], entry.id)
             var signals: [SkillLine] = []
             let voices = SkillScript.voices(row)
             if let repeated = CapabilityLifecycle.repeatedStop(stops.compactMap(SkillMutation.pyStrOptional)),
@@ -934,11 +636,11 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 signals.append(("\(name) stopped on \(parts[0])\(parts.count > 1 && !parts[1].isEmpty ? " at \(parts[1])" : "") "
                     + "in 2 of its last 3 runs; upgrade it?", voices))
             }
-            let lastClean = SkillMutation.pyStrOptional(row["lastCleanDigest"])
+            let lastClean = SkillMutation.pyStrOptional(row["previousVersion"])
             if CapabilityLifecycle.offersRollback(digest: digest, faulted: fault != nil, lastClean: lastClean),
                noted["fault"] != .string(digest), let lastClean {
                 noted["fault"] = .string(digest)
-                signals.append(("\(name)'s new script faulted (\(fault ?? reason)); skill.rollback returns its last clean one "
+                signals.append(("\(name)'s new script faulted (\(fault ?? reason)); skill.rollback returns its previous version "
                     + "(\(lastClean.prefix(8)))", voices))
             }
             var last: [String: JSONValue] = ["at": .string(at), "result": .string(fault != nil ? "skill_fault" : clean ? "clean" : "world"),
@@ -950,214 +652,56 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             ])
             row["lastUsedAt"] = .string(at)
             row["useCount"] = .int(Int64((SkillMutation.intValue(row["useCount"]) ?? 0) + 1))
-            let retired = faults >= 2
-            if retired {
-                try await self.recordSkillVersion(skills[index], reason: "before-retire")
-                self.retire(&row, why: "a fault of its own twice in a row (last: \(fault ?? reason))")
+            return (inputs.count, signals)
+        }
+    }
+
+    /// Swap the current and previous files, preserving origin and owner off.
+    public func rollbackScript(_ entry: InstalledSkillInventory.Entry, version: String?, steer: JSONValue, preview: Bool = false) async throws -> JSONValue {
+        let row = entry.row
+        return try AbilityStore.withLock {
+            guard row["source"] == .string("runtime_registry"),
+                  let previous = try abilities.read(id: entry.id, slot: .previous),
+                  var fields = previous.metadata["record"]?.objectValue else { throw SkillsError.unknownVersion("no earlier routine") }
+            let digest = SkillMutation.pyStrOptional(fields["codeFingerprint"]) ?? previous.bodyDigest
+            guard version == nil || version == digest else { throw SkillsError.unknownVersion(version!) }
+            let current = try SkillsRegistry.decode(abilities.registry(kind: .skill))
+            guard let index = current.firstIndex(where: { $0.objectValue?["id"] == row["id"] }),
+                  current[index].objectValue.map(Self.routineSelection) == Self.routineSelection(row) else {
+                throw SkillsError.invalidScript("The selected routine or off-switch changed during rollback.")
             }
-            skills[index] = .object(row)
-            try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-            return (inputs.count, retired, signals)
-        }
-    }
-
-    /// Upkeep on a turn that lists or runs skills (skills-as-code PR 5) and on
-    /// the weekly self-improvement pass, no timer of its own: a script
-    /// declaring an action `missing` says the app no longer has is suspended,
-    /// and any skill that is on but unused for 30 days is archived, never
-    /// deleted (`CapabilityLifecycle`).
-    /// Returns one MY QUEUE line per skill it changed.
-    public func upkeep(missing: @escaping @Sendable (String) -> Bool,
-                       unusedDays: Int = CapabilityLifecycle.unusedDays) async throws -> [SkillLine] {
-        try await withRegistryLock {
-            var skills = try self.loadRegistryForMutation()
-            var lines: [SkillLine] = []
-            // Her version of a built-in archives like her others, and the built-in
-            // shows again; the built-in itself has no row, so no clock.
-            let overrides = Set(try InstalledSkillInventory.entries(dataRoot: self.root)
-                .filter { $0.row["overrides"] == .string("built_in") }.map(\.id))
-            for index in skills.indices {
-                guard case .object(var row) = skills[index] else { continue }
-                let name = SkillMutation.pyStrTruthyOr(row["name"], SkillMutation.pyStr(row["id"] ?? .null))
-                let status = (SkillMutation.pyStrOptional(row["status"]) ?? "").lowercased()
-                // Plain lookups: the optimizer miscompiles (ownership crash) the chained optional/lazy form here.
-                let script = row["script"]?.objectValue ?? [:]
-                let declared: [JSONValue]
-                if case .array(let ids)? = script["actions"] { declared = ids } else { declared = [] }
-                let gone = declared.compactMap(SkillMutation.pyStrOptional).filter(missing)
-                let admittedAt = row["admission"]?.objectValue?["at"] ?? .null
-                var used: String?
-                for value in [row["lastUsedAt"] ?? .null, admittedAt, row["updatedAt"] ?? .null, row["createdAt"] ?? .null] where used == nil {
-                    used = SkillMutation.pyStrOptional(value)
-                }
-                // Only one that is on or drafted: a skill someone turned off stays theirs.
-                if !gone.isEmpty, InstalledSkillInventory.isAvailable(row) || status == "draft",
-                   row["suspended"]?.objectValue?["actions"] != .array(gone.map(JSONValue.string)) {
-                    try await self.recordSkillVersion(skills[index], reason: "before-suspend")
-                    self.suspend(&row, actions: gone)
-                    lines.append(("\(name) suspended: \(gone.joined(separator: ", ")) no longer in the app; fix its script, then skill.enable",
-                                  SkillScript.voices(row)))
-                } else if gone.isEmpty, InstalledSkillInventory.isAvailable(row),
-                          CapabilityLifecycle.isUnused(used: used, enabled: [SkillMutation.pyStrOptional(row["enabledAt"])],
-                                                       now: self.now(), days: unusedDays) {
-                    try await self.recordSkillVersion(skills[index], reason: "before-retire")
-                    self.retire(&row, why: "unused for \(unusedDays) days")
-                    lines.append((overrides.contains(SkillMutation.pyStrTruthyOr(row["id"], name))
-                        ? "your version of the built-in \(name) archived: unused for \(unusedDays) days, not deleted; "
-                            + "the built-in shows again, and skill.restore brings yours back"
-                        : "\(name) archived: unused for \(unusedDays) days, not deleted; skill.restore brings it back",
-                                  SkillScript.voices(row)))
-                } else { continue }
-                skills[index] = .object(row)
+            if var script = fields["script"]?.objectValue { script["source"] = .string(previous.body); fields["script"] = .object(script) }
+            fields["origin"] = SkillScript.merged([fields["origin"], steer] + SkillScript.recorded(row))
+            if fields["script"] != nil, !SkillScript.admitted(fields) {
+                fields["status"] = .string("draft")
+                fields.removeValue(forKey: "admission")
             }
-            if !lines.isEmpty { try await self.persistence.writeJSON(.array(skills), to: self.registryPath) }
-            return lines
+            fields.merge(try abilities.states()[entry.id]?.objectValue ?? [:]) { _, statistic in statistic }
+            fields = try CapabilityLifecycle.preservingOwnerOff(fields, before: row, preview: preview)
+            if preview { return .object(fields) }
+            try CapabilityLifecycle.requireWrite()
+            try abilities.swap(id: entry.id)
+            var rows = try SkillsRegistry.decode(abilities.registry(kind: .skill))
+            rows[index] = .object(fields)
+            try abilities.saveRegistry(.array(rows), kind: .skill)
+            return .object(fields)
         }
     }
 
-    /// A use that isn't a run (`skill.read`): its clock starts over. Only a
-    /// registry row keeps one; a body with no row has no clock.
-    public func recordUse(id rawId: String) async throws {
-        try await withRegistryLock {
-            var skills = try self.loadRegistryForMutation()
-            guard let index = skills.firstIndex(where: { [$0.objectValue?["id"], $0.objectValue?["name"]].contains(.string(rawId)) }),
-                  case .object(var row) = skills[index] else { return }
-            row["lastUsedAt"] = .string(SkillMutation.nowISO(self.now))
-            row["useCount"] = .int(Int64((SkillMutation.intValue(row["useCount"]) ?? 0) + 1))
-            skills[index] = .object(row)
-            try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-        }
+    private static func scriptVersionMetadata(_ row: [String: JSONValue]) -> JSONValue {
+        .object(["current": row["codeFingerprint"] ?? .null, "previous": row["previousVersion"] ?? .null,
+                 "retained": row["versions"] ?? .array([])])
     }
 
-    /// Archived through the lifecycle, never deleted: a body with no registry
-    /// row gets its row first. Already archived changes nothing.
-    public func archive(name: String, why: String) async throws {
-        guard let entry = InstalledSkillInventory.match(name, in: try InstalledSkillInventory.entries(dataRoot: root)) else {
-            throw SkillsError.unknownSkill(name)
-        }
-        if entry.row["source"] == .string("runtime_body") { try await registerSkillBody(entry.row) }
-        try await withRegistryLock {
-            var skills = try self.loadRegistryForMutation()
-            guard let index = skills.firstIndex(where: { [$0.objectValue?["id"], $0.objectValue?["name"]].contains(.string(entry.id)) }),
-                  case .object(var row) = skills[index], row["status"] != .string(CapabilityLifecycle.archived) else { return }
-            try await self.recordSkillVersion(skills[index], reason: "before-retire")
-            self.retire(&row, why: why)
-            skills[index] = .object(row)
-            try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-        }
-    }
-
-    /// Bring back the script (and header) the skill had before this one, from
-    /// its version history: its last clean one when the history has it. It
-    /// lands drafted; its origin keeps every hand, the restored version's and
-    /// `steer`'s too. `preview` returns the row it would write and writes nothing.
-    public func rollbackScript(id rawId: String, steer: JSONValue, preview: Bool = false) async throws -> JSONValue {
-        let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
-        let history = try await listSkillVersions(id: skillId)
-        return try await withRegistryLock {
-            var skills = try self.loadRegistryForMutation()
-            guard let index = skills.firstIndex(where: {
-                [$0.objectValue?["id"], $0.objectValue?["name"]].contains(.string(skillId))
-            }), case .object(var row) = skills[index] else { throw SkillsError.unknownSkill(skillId) }
-            let before = row
-            let earlier = Self.earlierScripts(row, history)
-            guard let record = earlier.clean ?? earlier.previous else { throw SkillsError.unknownVersion("no earlier script") }
-            var version = record["skill"]?.objectValue ?? [:]
-            SkillScript.normalizeInterpreter(&version)
-            row["script"] = version["script"]
-            SkillScript.settle(&row, before: before, origins: [version["origin"], steer] + SkillScript.recorded(before))
-            row["updatedAt"] = .string(SkillMutation.nowISO(self.now))
-            if preview { return .object(row) }
-            try await self.recordSkillVersion(.object(before), reason: "before-rollback")
-            skills[index] = .object(row)
-            try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
-            try? await self.recordSkillVersion(.object(row), reason: "rolled-back")
-            return .object(row)
-        }
-    }
-
-    /// The previous complete guidance revision, ignoring usage bookkeeping.
-    public func previousGuidanceVersion(_ row: [String: JSONValue]) async throws -> [String: JSONValue]? {
-        let id = SkillMutation.pyStrTruthyOr(row["id"], SkillMutation.pyStr(row["name"] ?? .null))
-        let history = try await listSkillVersions(id: id)
-        guard let path = confinedBodyPath(for: row, skillId: id) else {
-            throw SkillsError.historyUnavailable("The guidance body is unavailable. Read the skill again before rollback.")
-        }
-        let body = try String(contentsOf: path, encoding: .utf8)
-        let keys = ["name", "description", "triggers", "kind"]
-        let header = row.filter { keys.contains($0.key) }
-        for case .object(let version) in history {
-            guard case .object(let saved)? = version["skill"], saved["script"] == nil,
-                  case .string(let savedBody)? = version["body"] else { continue }
-            if savedBody != body || saved.filter({ keys.contains($0.key) }) != header { return version }
-        }
-        return nil
-    }
-
-    public func guidanceVersions(_ row: [String: JSONValue]) async throws -> JSONValue {
-        guard let previous = try await previousGuidanceVersion(row) else {
-            return .object(["previous": .null])
-        }
-        let id = SkillMutation.pyStr(previous["versionId"] ?? .null)
-        let at = SkillMutation.pyStr(previous["createdAt"] ?? .null)
-        return .object(["previous": .object([
-            "version_id": .string(id), "at": .string(at),
-            "detail": .string("Previous guidance version: \(id), saved \(at). skill.rollback restores that body and header."),
-        ])])
-    }
-
-    /// The earlier scripts rollback weighs in `history` (newest first, as
-    /// `listSkillVersions` gives it), each its history record: the previous
-    /// one and the last clean one. Rollback lands on the clean, else the previous.
-    static func earlierScripts(_ row: [String: JSONValue], _ history: [JSONValue])
-        -> (previous: [String: JSONValue]?, clean: [String: JSONValue]?) {
-        let current = SkillScript.digest(row["script"])
-        let cleanDigest = SkillMutation.pyStrOptional(row["lastCleanDigest"])
-        var previous: [String: JSONValue]?
-        var clean: [String: JSONValue]?
-        for case .object(let record) in history {
-            let skill = record["skill"]?.objectValue ?? [:]
-            guard let script = skill["script"], SkillScript.digest(script) != current,
-                  (try? SkillScript.normalized(script)) == script else { continue }
-            if previous == nil { previous = record }
-            if clean == nil, SkillScript.digest(script) == cleanDigest { clean = record }
-        }
-        return (previous, clean)
-    }
-
-    /// `skill.read`'s versions (`CapabilityLifecycle`): current, previous and
-    /// last clean, each its script's digest (12), when it was made and the
-    /// status it lands in (a rollback lands drafted); null when not kept.
-    public func scriptVersions(_ row: [String: JSONValue]) async -> JSONValue {
-        let id = SkillMutation.pyStrTruthyOr(row["id"], SkillMutation.pyStr(row["name"] ?? .null))
-        let earlier = Self.earlierScripts(row, (try? await listSkillVersions(id: id)) ?? [])
-        func version(_ script: JSONValue?, _ at: JSONValue?, _ lands: String) -> JSONValue {
-            guard let digest = SkillScript.digest(script) else { return .null }
-            return .object(["digest": .string(String(digest.prefix(12))), "at": at ?? .null, "lands": .string(lands)])
-        }
-        func kept(_ record: [String: JSONValue]?) -> JSONValue {
-            guard let record else { return .null }
-            let skill = record["skill"]?.objectValue ?? [:]
-            return version(skill["script"], record["createdAt"], "drafted")
-        }
-        let status = (SkillMutation.pyStrOptional(row["status"]) ?? "active").lowercased()
-        let current = version(row["script"], row["updatedAt"], status == "draft" ? "drafted" : status)
-        let clean = SkillMutation.pyStrOptional(row["lastCleanDigest"])
-        return .object(["current": current, "previous": kept(earlier.previous),
-                        "last_clean": clean != nil && clean == SkillScript.digest(row["script"]) ? current : kept(earlier.clean)])
-    }
-
-    /// Why turning `row`'s script on is User's, or nil when it is hers to
-    /// admit: the steer on this turn, the script's origin and Trust (`fullMac`).
-    static func usersAdmission(_ row: [String: JSONValue], skill: String, steer: [String], fullMac: Bool,
-                              ownerAuthorized: Bool) -> String? {
+    static func usersAdmission(_ row: [String: JSONValue], skill: String, steer: [String], fullMac: Bool) -> String? {
         let origin = row["origin"].flatMap { $0.objectValue } ?? [:]
         let kind = SkillScript.originKind(row["origin"])
         let peers = (origin["peers"].flatMap { if case .array(let peers) = $0 { peers } else { nil } } ?? [])
             .map { SkillMutation.pyStr($0) }
-        let users: String? = if !ownerAuthorized, !steer.isEmpty {
-            "This turn was steered by \(steer.joined(separator: ", ")), so turning \(skill)'s script on is the owner's"
-        } else if kind == "peer", !ownerAuthorized {
+        let untrusted = steer.filter { !CapabilityLifecycle.ownerTrusts($0) }
+        let users: String? = if !untrusted.isEmpty {
+            "This turn was steered by \(untrusted.joined(separator: ", ")), so turning \(skill)'s script on is the owner's"
+        } else if kind == "peer", !SkillScript.agentMayAdmit(row["origin"]) {
             "\(skill)'s script was steered by "
                 + peers.joined(separator: ", ")
                 + ", so turning it on is the owner's"
@@ -1176,7 +720,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     /// `fullMac` is the posture now; `steer` the peers steering this turn.
     /// `preview` (enable, restore, rollback) makes every check the real call makes, writes nothing and says what it would leave.
     public func manageSkill(
-        verb asked: String, name: String, personaRoot: URL, retry: String, fullMac: Bool, steer: [String],
+        verb asked: String, name: String, version: String?, personaRoot: URL, retry: String, fullMac: Bool, steer: [String],
         preview: Bool = false, ownerAuthorized: Bool = false
     ) async -> (ok: Bool, text: String, fields: [String: JSONValue]) {
         if preview, !["enable", "restore", "rollback"].contains(asked) {
@@ -1184,148 +728,115 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         }
         let records: [JSONValue]
         do {
-            records = try await InstalledSkillInventory.entries(dataRoot: root, personaRoot: personaRoot)
-                .map { .object($0.row) } + listManifestSkills()
+            records = try await lifecycleRecords()
         } catch {
             return (false, "The skill registry didn't read (\(error.localizedDescription))." + retry, [:])
         }
-        let key = name.lowercased()
-        var selected: (row: [String: JSONValue], manifest: [String: JSONValue])?
-        // Her version of a built-in that is not on shares the built-in's name:
-        // a verb on that name means hers.
-        let ordered = records.filter { $0.objectValue?["source"] != .string("persona_body") }
-            + records.filter { $0.objectValue?["source"] == .string("persona_body") }
-        for case .object(let row) in ordered {
-            let manifest: [String: JSONValue]
-            if row["state"] != nil {
-                guard let value = try? JSONValue.parse(Data(contentsOf: manifestDirectory(for: row).appendingPathComponent("manifest.json"))),
-                      case .object(let object) = value else { continue }
-                manifest = object
-            } else { manifest = [:] }
-            if [row["id"], row["name"], manifest["name"]].contains(where: {
-                SkillMutation.pyStrOptional($0)?.lowercased() == key
-            }) { selected = (row, manifest); break }
-        }
-        guard !key.isEmpty, let selected else {
+        guard !name.isEmpty, let matched = InstalledSkillInventory.match(name, in: records) else {
             return (false, "No skill is called \(name.isEmpty ? "(none passed)" : name). app skill.list shows the names.", [:])
         }
-        let row = selected.row
+        var row = matched.row
+        if row["candidateDigest"] != nil {
+            do {
+                let candidate = try routineCandidate(row)
+                let manifest = candidate.manifest.objectValue ?? [:]
+                row["script"] = manifest["script"]
+                row["fixtures"] = candidate.fixtures
+                row["origin"] = SkillScript.merged([manifest["origin"]] + SkillScript.recorded(row))
+            } catch { return (false, "The routine candidate is unreadable: \(error.localizedDescription)", [:]) }
+        }
         let registeredName = SkillMutation.pyStrTruthyOr(row["id"], SkillMutation.pyStrTruthyOr(row["name"], name))
-        let skill = SkillMutation.pyStrTruthyOr(selected.manifest["name"], SkillMutation.pyStrTruthyOr(row["name"], name))
+        let skill = SkillMutation.pyStrTruthyOr(row["name"], name)
         let rawState = SkillMutation.pyStrTruthyOr(row["state"], SkillMutation.pyStrTruthyOr(row["status"], "active")).lowercased()
         let state = rawState == "draft" ? "drafted" : rawState == "disabled" ? "dormant" : rawState
-        // Archived (`CapabilityLifecycle`): restore is turning it back on.
-        let archived = state == CapabilityLifecycle.archived
-        let verb = asked == "restore" && archived ? "enable" : asked
+        let verb = asked == "restore" ? "enable" : ["drop", "archive", "trash", "retire"].contains(asked) ? "delete" : asked
         let on = InstalledSkillInventory.isAvailable(["status": .string(state)])
-        let hers = row["disabledBy"] == .string("agent")
         let fields: [String: JSONValue] = ["name": .string(skill), "state_before": .string(state)]
-        // A preview says what the real call would leave (`CapabilityLifecycle`):
-        // the status, whose turning it on is (hers, User's card, or User's own),
-        // and when its 30-day unused clock restarts.
-        func would(_ status: String, _ admit: String, now: Bool) -> [String: JSONValue] {
+        func would(_ status: String, _ admit: String) -> [String: JSONValue] {
             guard preview else { return [:] }
-            return ["would_status": .string(status), "would_admit": .string(admit),
-                    "would_clock": .string(now ? "restarts now" : "restarts when it is turned on")]
+            return ["would_status": .string(status), "would_admit": .string(admit)]
         }
         func mark(_ legacy: String, _ manifest: String, _ marks: [String: JSONValue], _ done: String,
                   admit: String = "") async -> (ok: Bool, text: String, fields: [String: JSONValue]) {
-            if preview { return (true, "Without preview: " + done, fields.merging(would(manifest, admit, now: false)) { $1 }) }
+            if preview { return (true, "Without preview: " + done, fields.merging(would(manifest, admit)) { $1 }) }
             do {
-                _ = try await markSkill(
-                    name: registeredName, legacyStatus: legacy, manifestState: manifest, marks: marks)
+                _ = try await updateSkill(matched, body: .object(["status": .string(legacy)]),
+                    admittedBy: nil, reviewedDigest: nil, ownerAuthorized: ownerAuthorized)
             } catch {
                 return (false, "\(verb) failed: \(error.localizedDescription)." + retry, fields)
             }
             return (true, done, fields)
         }
         let source = SkillMutation.pyStrTruthyOr(row["source"], "")
+        if ["enable", "restore"].contains(verb) {
+            do {
+                if source == "runtime_registry" {
+                    try await mutateRegistry { rows in
+                        guard let current = rows.first(where: { $0.objectValue?["id"] == .string(registeredName) })?.objectValue else {
+                            throw SkillsError.unknownSkill(registeredName)
+                        }
+                        _ = try CapabilityLifecycle.preservingOwnerOff(current, before: current, ownerAuthorized: ownerAuthorized, enabling: true)
+                    }
+                }
+            } catch let error as NSError where error.domain == "CapabilityLifecycle" {
+                return (false, error.localizedDescription, fields.merging(["reason": .string("owners_call")]) { $1 })
+            } catch { return (false, error.localizedDescription + retry, fields) }
+        }
         let personaBodies = personaRoot.appendingPathComponent("skills/bodies").standardizedFileURL.path + "/"
         let builtIn = source == "persona_body"
             || (SkillMutation.pyStrOptional(row["bodyPath"])?.hasPrefix(personaBodies) ?? false)
-        if verb != "enable", builtIn {
+        if verb != "enable", builtIn, !ownerAuthorized {
             return (false, "\(skill) is built in: it ships with the app in persona/skills, so switching it off or deleting it is the owner's. Ask them.", fields)
         }
-        // Her version of a built-in stands in for it, so switching it off or
-        // trashing it stays User's; rollback drops hers and the built-in shows again.
         let override = row["overrides"] == .string("built_in")
-        if override, ["disable", "delete"].contains(verb) {
+        if override, ["enable", "disable", "delete", "quarantine", "rollback"].contains(verb), !ownerAuthorized {
             return (false, "\(skill) is your version of a built-in, so switching it off or deleting it is the owner's. Ask them. "
-                + "skill.rollback drops your version and the built-in shows again.", fields)
-        }
-        func dropOverride() async -> (ok: Bool, text: String, fields: [String: JSONValue]) {
-            if preview {
-                return (true, "Would drop your version of \(skill); the built-in shows again, as it ships.",
-                        fields.merging(["would_drop": .bool(true)]) { $1 })
-            }
-            do {
-                _ = try await deleteSkill(id: registeredName)
-                // A body that didn't delete leaves its row trashed, still hiding the built-in.
-                if try InstalledSkillInventory.entries(dataRoot: root, personaRoot: personaRoot).contains(where: {
-                    $0.row["source"] == .string("runtime_registry") && $0.id == registeredName
-                }) {
-                    return (false, "Dropping your version did not finish: its body did not delete, so it stays in the trash "
-                        + "(skill.restore brings it back). The built-in is in use again." + retry, fields)
-                }
-            } catch {
-                return (false, "Dropping your version failed: \(error.localizedDescription)." + retry, fields)
-            }
-            return (true, "Dropped your version of \(skill); the built-in shows again. Its version history keeps your text.",
-                    fields.merging(["dropped": .bool(true)]) { $1 })
-        }
-        if ["disable", "delete"].contains(verb), source == "runtime_body" {
-            // Hers: a body in the data root, not one the app ships. It gets
-            // its registry row now, so her switch has somewhere to live.
-            do { try await registerSkillBody(row) } catch {
-                return (false, "\(skill) had no registry row, and registering it failed (\(error.localizedDescription))."
-                    + retry, fields)
-            }
+                + "Changing its active version is the owner's too.", fields)
         }
         switch verb {
         case "enable":
-            if on { return (true, "\(skill) is already on (\(state)).", fields.merging(["changed": .bool(false)]) { $1 }) }
-            if state == "trashed" {
-                return (false, "\(skill) is in the trash. skill.restore brings it back (off); then skill.enable turns it on.", fields)
+            if let version, (row["candidateDigest"] ?? row["codeFingerprint"]) != .string(version) {
+                return (false, "version must be the current candidate digest from skill.read. Nothing changed.",
+                        fields.merging(["reason": .string("bad_input"), "next_call": .object([
+                            "action": .string("skill.enable"), "args": .object(["name": .string(name),
+                                "version": row["candidateDigest"] ?? row["codeFingerprint"] ?? .null])])]) { $1 })
             }
-            if state != "drafted", !hers {
-                return (false, "The owner turned \(skill) off; they turn it back on. Ask them.",
-                        fields.merging(["reason": .string("owners_call")]) { $1 })
+            if on, row["candidateDigest"] == nil, row["script"] == nil || SkillScript.admitted(row) {
+                return (true, "\(skill) is already on (\(state)).", fields.merging(["changed": .bool(false)]) { $1 })
             }
-            if let reach = Self.reachPastGuidance(selected.manifest) {
-                return (false, "\(skill) declares \(reach), which reaches past guidance. Installing it is the owner's: ask them to Install it on the Skills page.",
-                        fields.merging(["reason": .string("owners_call")]) { $1 })
-            }
-            // A script runs only under an admission of its exact digest: hers
-            // to give for her own script under Full Mac on her own turn, and
-            // otherwise User's, on the Skills page where he reads the script.
-            // An archived one is admitted again as it comes back.
+            // Trusted peer origins use her own admission rule; other origins
+            // ask the owner to review the exact candidate.
             var admit: String?
             var reviewed: String?
             var fields = fields
-            if let script = row["script"], !SkillScript.admitted(row) || archived {
-                let digest = SkillScript.digest(script) ?? ""
-                if let users = Self.usersAdmission(row, skill: skill, steer: steer, fullMac: fullMac, ownerAuthorized: ownerAuthorized) {
+            if row["candidateDigest"] != nil || row["script"]?.objectValue?["entry"] == .string("run"),
+               row["candidateValidation"] != .string("valid") {
+                return (false, "Validate \(skill)'s exact candidate with skill.validate before enabling it.", fields)
+            }
+            if let script = row["script"], !SkillScript.admitted(row)
+                || row["candidateDigest"] != nil && row["candidateDigest"] != row["codeFingerprint"] {
+                let digest = SkillMutation.pyStr(row["candidateDigest"] ?? row["codeFingerprint"] ?? .null)
+                if let users = Self.usersAdmission(row, skill: skill, steer: steer, fullMac: fullMac) {
                     // `skill_id` and `script` are for the host's card; it strips the script.
                     return (false, users + ": they read the script and install it. Nothing changed.",
                             fields.merging(["needs_owner": .bool(true), "reason": .string("owners_call"),
                                            "script_digest": .string(digest), "skill_id": .string(registeredName),
-                                           "script": script]) { $1 }.merging(would("active", "owners_card", now: false)) { $1 })
+                                           "candidate_digest": row["candidateDigest"] ?? row["codeFingerprint"] ?? .null,
+                                           "fixtures": row["fixtures"] ?? .array([]),
+                                           "script": script]) { $1 }.merging(would("active", "owners_card")) { $1 })
                 }
                 admit = "agent"
-                reviewed = digest
+                reviewed = SkillMutation.pyStrOptional(row["candidateDigest"] ?? row["codeFingerprint"])
                 fields["script_digest"] = .string(digest)
-                fields["admitted_by"] = .string("agent")
+                fields["admitted_by"] = admit.map(JSONValue.string)
             }
             if preview {
                 return (true, "Would turn \(skill) on, active, " + (admit == nil ? "yours to turn on" : "its script admitted as yours")
-                    + "; its 30-day unused clock restarts.", fields.merging(would("active", "hers", now: true)) { $1 })
+                    + ".", fields.merging(would("active", "hers")) { $1 })
             }
             do {
-                _ = try await enableSkill(name: registeredName, admittedBy: admit, reviewedDigest: reviewed)
-                let refreshed = try await listSkills() + listManifestSkills()
-                let saved = refreshed.first {
-                    [$0.objectValue?["id"], $0.objectValue?["name"]].contains(.string(registeredName))
-                } ?? .null
+                let saved = try await flipStatus(matched, legacyStatus: "active", admittedBy: admit, reviewedDigest: reviewed,
+                    ownerAuthorized: ownerAuthorized)
                 let confirmed = SkillMutation.string(saved, "status").isEmpty
                     ? SkillMutation.string(saved, "state") : SkillMutation.string(saved, "status")
                 guard ["active", "installed"].contains(confirmed.lowercased()) else {
@@ -1339,130 +850,52 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             guard on else {
                 return (true, "\(skill) is not on (\(state)); nothing to disable.", fields.merging(["changed": .bool(false)]) { $1 })
             }
-            return await mark("disabled", "dormant", ["disabledBy": .string("agent")],
+            return await mark("disabled", "dormant", [:],
                               "Disabled \(skill); it is out of find, and skill.enable turns it back on.")
-        case "delete":
-            if state == "trashed" {
-                return (true, "\(skill) is already in the trash.", fields.merging(["changed": .bool(false)]) { $1 })
-            }
-            // Her trash keeps whose "off" it was, so restore can't launder User's disable.
-            var marks: [String: JSONValue] = ["trashedAt": .string(ISO8601DateFormatter().string(from: Date()))]
-            if on || state == "drafted" || hers { marks["disabledBy"] = .string("agent") }
-            return await mark("trashed", "trashed", marks,
-                              "Moved \(skill) to the trash: it is off and out of find, body and entry kept. "
-                              + "skill.restore brings it back. Nothing empties the trash; erasing for good is the owner's.")
-        case "rollback":
-            guard row["state"] == nil else {
-                return (false, "\(skill) is a manifest skill; it carries no script to roll back.", fields)
-            }
-            // Before her first version of a built-in is the built-in itself.
-            if override, row["script"] == nil { return await dropOverride() }
-            if row["script"] == nil {
-                do {
-                    guard let previous = try await previousGuidanceVersion(row),
-                          case .string(let versionId)? = previous["versionId"] else {
-                        return (false, "\(skill) has no earlier guidance version to roll back to. skill.read shows its saved versions; nothing changed.", fields)
-                    }
-                    let resultFields = fields.merging(["version_id": .string(versionId)]) { $1 }
-                    if preview {
-                        return (true, "Would restore \(skill) to its previous guidance version. Its permissions would not change.", resultFields)
-                    }
-                    let restored = try await restoreSkill(id: registeredName, versionId: versionId,
-                        steer: SkillScript.origin(steeredBy: steer), guidanceOnly: true)
-                    return (true, "Restored \(skill) to its previous guidance version. Its permissions did not change.",
-                            resultFields.merging(["state": restored.objectValue?["status"] ?? .null]) { $1 })
-                } catch {
-                    return (false, "Rollback failed: \(error.localizedDescription)." + retry, fields)
-                }
-            }
+        case "quarantine":
             do {
-                let rolled = try await rollbackScript(id: registeredName, steer: SkillScript.origin(steeredBy: steer), preview: preview)
+                _ = try await updateSkill(matched, body: .object(["status": .string("disabled")]),
+                    admittedBy: nil, reviewedDigest: nil, ownerAuthorized: ownerAuthorized)
+                return (true, "Switched \(skill) off. skill.enable turns it back on.", fields)
+            } catch { return (false, "Quarantine failed: \(error.localizedDescription)", fields) }
+        case "delete":
+            do {
+                _ = try await deleteSkill(id: registeredName, ownerAuthorized: ownerAuthorized)
+                return (true, "Dropped \(skill) permanently: its ability files and run state are removed.", fields)
+            } catch {
+                return (false, "Drop failed: \(error.localizedDescription)." + retry, fields)
+            }
+        case "rollback":
+            do {
+                let rolled = try await rollbackScript(matched, version: version, steer: SkillScript.origin(steeredBy: steer), preview: preview)
+                let lands = SkillMutation.string(rolled, "status")
+                let ownerOff = CapabilityLifecycle.requiresOwnerToEnable(rolled.objectValue ?? [:])
                 if preview {
-                    let digest = String((SkillScript.digest(rolled.objectValue?["script"]) ?? "").prefix(12))
-                    let users = Self.usersAdmission(rolled.objectValue ?? [:], skill: skill, steer: steer, fullMac: fullMac, ownerAuthorized: ownerAuthorized)
-                    return (true, "Would roll \(skill) back to script \(digest), drafted: turning it on is "
-                        + (users.map { "the owner's card (\($0))" } ?? "yours, by skill.enable")
-                        + "; its 30-day unused clock restarts when it is turned on.",
+                    let digest = String(SkillMutation.pyStr(rolled.objectValue?["candidateDigest"] ?? rolled.objectValue?["codeFingerprint"] ?? .null).prefix(12))
+                    let users = Self.usersAdmission(rolled.objectValue ?? [:], skill: skill, steer: steer, fullMac: fullMac)
+                    let state = lands == "draft" ? "drafted" : lands
+                    return (true, "Would roll \(skill) back to script \(digest), \(state): turning it on is "
+                        + (ownerOff ? "the owner's; their off-switch remains" : users.map { "the owner's card (\($0))" } ?? "yours, by skill.enable")
+                        + ".",
                         fields.merging(["would_land_on": .string(digest)]) { $1 }
-                            .merging(would("drafted", users == nil ? "hers" : "owners_card", now: false)) { $1 })
+                            .merging(would(state, ownerOff ? "owners" : users == nil ? "hers" : "owners_card")) { $1 })
                 }
-                let digest = SkillScript.digest(rolled.objectValue?["script"]) ?? ""
+                let digest = SkillMutation.pyStr(rolled.objectValue?["candidateDigest"] ?? rolled.objectValue?["codeFingerprint"] ?? .null)
                 return (true, "Rolled \(skill) back to the script it had before this one (digest \(digest.prefix(12))). "
-                    + "It is drafted: it runs again only once skill.enable turns it on.",
-                    fields.merging(["script_digest": .string(digest), "state": .string("drafted")]) { $1 })
+                    + (ownerOff ? "The owner's off-switch remains; they turn it back on."
+                        : ["active", "installed"].contains(lands) ? "It is on under its existing admission."
+                        : "It is drafted: skill.enable turns it on."),
+                    fields.merging(["script_digest": .string(digest), "state": .string(lands == "draft" ? "drafted" : lands)]) { $1 })
             } catch SkillsError.unknownVersion {
-                if override { return await dropOverride() }
                 return (false, "\(skill) has no earlier script to roll back to; nothing changed.", fields)
             } catch {
                 return (false, "Rollback failed: \(error.localizedDescription)." + retry, fields)
             }
-        case "restore":
-            guard state == "trashed" else {
-                return (false, "\(skill) is not in the trash (\(state)). enable or disable it instead.", fields)
-            }
-            // A script never admitted comes back drafted, so Review and Install apply.
-            if row["script"] != nil, !SkillScript.admitted(row) {
-                return await mark("draft", "drafted", hers ? ["disabledBy": .string("agent")] : [:],
-                                  "Restored \(skill) from the trash as a draft: its script was never turned on. skill.enable asks for it.",
-                                  admit: Self.usersAdmission(row, skill: skill, steer: steer, fullMac: fullMac, ownerAuthorized: ownerAuthorized) == nil ? "hers" : "owners_card")
-            }
-            return await mark("disabled", "dormant", hers ? ["disabledBy": .string("agent")] : [:],
-                              "Restored \(skill) from the trash, switched off. "
-                              + (hers ? "skill.enable turns it on." : "The owner had turned it off, so turning it on is theirs."),
-                              admit: hers ? "hers" : "owners")
         default:
             return (false, "No skill_manage verb is called \(verb).", [:])
         }
     }
 
-    /// Skills are guidance: a body, triggers and a description, granting no
-    /// tool, permission or approval (save_skill's contract). A manifest that
-    /// declares permissions, tools or a sign-in, or is a tool or connector
-    /// pack, could reach past that, so installing one stays User's.
-    private static func reachPastGuidance(_ manifest: [String: JSONValue]) -> String? {
-        var reach: [String] = []
-        if case .array(let permissions)? = manifest["permissions"], !permissions.isEmpty {
-            reach.append("permissions (\(permissions.map { SkillMutation.pyStr($0) }.joined(separator: ", ")))")
-        }
-        if case .array(let tools)? = manifest["tools"], !tools.isEmpty { reach.append("tools") }
-        if let oauth = manifest["oauth"], oauth != .null { reach.append("a sign-in") }
-        let type = SkillMutation.pyStrTruthyOr(manifest["type"], "").lowercased()
-        if ["tool", "connector"].contains(type) { reach.append("a \(type) pack") }
-        return reach.isEmpty ? nil : reach.joined(separator: ", ")
-    }
-
-    public func manifestDirectory(for entry: [String: JSONValue]) -> URL {
-        let name = SkillMutation.pyStrTruthyOr(entry["name"], "")
-        let fallback = root.appendingPathComponent("skills/\(name)")
-        let raw = SkillMutation.pyStrTruthyOr(entry["path"], "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return fallback }
-        let candidate = URL(fileURLWithPath: raw).standardizedFileURL
-        let allowedRoots = [root.appendingPathComponent("skills").standardizedFileURL,
-                            legacyManifestPath.deletingLastPathComponent().standardizedFileURL]
-        if allowedRoots.contains(where: { candidate.path == $0.path || candidate.path.hasPrefix($0.path + "/") }),
-           FileManager.default.fileExists(atPath: candidate.appendingPathComponent("manifest.json").path) { return candidate }
-        return fallback
-    }
-
-    private func registerSkillBody(_ row: [String: JSONValue]) async throws {
-        guard case .string(let name)? = row["name"], case .string(let path)? = row["bodyPath"] else {
-            throw SkillsError.unknownSkill(String(describing: row["name"]))
-        }
-        try await withRegistryLock { [self] in
-            var rows = try loadRegistryForMutation()
-            guard !rows.contains(where: { $0.objectValue?["id"] == .string(name) || $0.objectValue?["name"] == .string(name) }) else { return }
-            var registered = row
-            registered.removeValue(forKey: "source")
-            registered["bodyPath"] = .string(path)
-            registered["createdAt"] = .string(SkillMutation.nowISO(now))
-            registered["updatedAt"] = registered["createdAt"]
-            try await recordSkillVersion(.object(registered), reason: "registered-body")
-            rows.append(.object(registered))
-            try await persistence.writeJSON(.array(rows), to: registryPath)
-        }
-    }
-
-    /// Read-only admission for the whole batch, before the pack host writes anything.
     public func preflightPackSkills(
         _ items: [[String: JSONValue]], installID: String, packID: String
     ) throws {
@@ -1479,96 +912,35 @@ public final class SwiftNativeSkillsClient: SkillsClient {
               !inventory.contains(where: { ids.contains($0.id.lowercased()) || names.contains($0.name.lowercased()) }) else {
             throw SkillsError.invalidRegistry("Capability pack skills collide with existing skills or have invalid IDs.")
         }
+        for item in items { _ = try SkillScript.normalized(item["script"]) }
+    }
+
+    public func installPackSkills(_ items: [[String: JSONValue]], installID: String, packID: String) async throws {
+        try preflightPackSkills(items, installID: installID, packID: packID)
         for item in items {
-            let violations = SkillBodyHygiene.violations(in: Self.packSkillBody(item, packID: packID).content)
-            guard violations.isEmpty else {
-                throw SkillsError.invalidSkillBody(SkillBodyHygiene.failureMessage(for: violations))
+            let script = try SkillScript.normalized(item["script"])
+            var pins: [String: JSONValue] = [:]
+            for case .string(let id) in script.objectValue?["actions"]?.arrayValue ?? [] {
+                guard let pin = OwnedProgramInvocation.host?.dependencyPin(id) else {
+                    throw SkillsError.invalidScript("Pack routine dependency \(id) is unavailable. Install through the app's Skills lifecycle.")
+                }
+                pins[id] = .string(pin)
             }
-            if let script = item["script"], script != .null { _ = try SkillScript.normalized(script) }
+            var fields = item
+            fields["id"] = .string(Self.packSkillID(item))
+            fields["dependencyShapes"] = .object(pins)
+            fields["installedByPack"] = .string(packID); fields["capabilityPackInstallId"] = .string(installID)
+            _ = try await saveRoutine(fields, script: script, steer: SkillScript.origin(pack: packID))
         }
     }
 
-    public func installPackSkills(
-        _ items: [[String: JSONValue]],
-        installID: String,
-        packID: String,
-        nowISO: String
-    ) async throws {
-        guard !items.isEmpty else { return }
-        let path = root.appendingPathComponent("skills/registry.json")
-        let bodiesDir = root.appendingPathComponent("skills/bodies", isDirectory: true)
-        try await withRegistryLock { [self] in
-            try preflightPackSkills(items, installID: installID, packID: packID)
-            var rows = try loadRegistryForMutation().compactMap { $0.objectValue }
-            let ids = Set(items.map { Self.packSkillID($0).lowercased() })
-            rows.removeAll {
-                Self.packString($0, "capabilityPackInstallId") == installID
-                    && ids.contains(Self.packString($0, "id").lowercased())
-            }
-            try FileManager.default.createDirectory(at: bodiesDir, withIntermediateDirectories: true)
-            for item in items {
-                let skillID = Self.packSkillID(item)
-                let (name, description, content) = Self.packSkillBody(item, packID: packID)
-                let bodyPath = bodiesDir.appendingPathComponent("\(skillID).md")
-                try await writeBody(content, to: bodyPath)
-                var triggers: [JSONValue] = [.string(name)]
-                if case .array(let rawTriggers)? = item["triggers"], !rawTriggers.isEmpty {
-                    triggers = rawTriggers
-                }
-                var row: [String: JSONValue] = [
-                    "id": .string(skillID),
-                    "name": .string(name),
-                    "description": .string(description),
-                    "triggers": .array(triggers),
-                    "kind": .string(Self.packString(item, "kind").isEmpty ? "skill" : Self.packString(item, "kind")),
-                    "status": .string(Self.packString(item, "status").isEmpty ? "active" : Self.packString(item, "status")),
-                    "autoCreated": .bool(false),
-                    "sourceRunId": .null,
-                    "bodyPath": .string(bodyPath.path),
-                    "createdAt": .string(nowISO),
-                    "updatedAt": .string(nowISO),
-                    "useCount": .int(0),
-                    "lastUsedAt": .null,
-                    "installedByPack": .string(packID),
-                    "capabilityPackInstallId": .string(installID),
-                    "origin": SkillScript.origin(pack: packID),
-                ]
-                if let script = item["script"], script != .null {
-                    row["script"] = try SkillScript.normalized(script)
-                    SkillScript.settle(&row, before: nil, origins: [row["origin"]])
-                }
-                rows.append(row)
-            }
-            try await persistence.writeJSON(.array(rows.map { .object($0) }), to: path)
-        }
-    }
-
-    public func removePackSkills(
-        _ ids: [String],
-        installID: String,
-        packID: String
-    ) async throws {
-        let path = root.appendingPathComponent("skills/registry.json")
-        let bodiesDir = root.appendingPathComponent("skills/bodies", isDirectory: true).standardizedFileURL
-        try await withRegistryLock { [self] in
-            var rows = try loadRegistryForMutation().compactMap { $0.objectValue }
-            var removedBodyPaths: [URL] = []
-            rows.removeAll { row in
-                let marked = Self.packString(row, "capabilityPackInstallId") == installID || Self.packString(row, "installedByPack") == packID
-                let matches = ids.isEmpty || ids.contains(Self.packString(row, "id"))
-                guard marked && matches else { return false }
-                let body = Self.packString(row, "bodyPath")
-                if !body.isEmpty {
-                    let bodyURL = URL(fileURLWithPath: body).standardizedFileURL
-                    if bodyURL.path == bodiesDir.path || bodyURL.path.hasPrefix(bodiesDir.path + "/") {
-                        removedBodyPaths.append(bodyURL)
-                    }
-                }
-                return true
-            }
-            try await persistence.writeJSON(.array(rows.map { .object($0) }), to: path)
-            for bodyPath in removedBodyPaths {
-                try? FileManager.default.removeItem(at: bodyPath)
+    public func removePackSkills(_ skillIDs: [String], installID: String, packID: String) async throws {
+        let ids = Set(skillIDs.map { $0.lowercased() })
+        try await mutateRegistry(ownerAuthorized: true) { rows in
+            rows.removeAll { value in
+                guard case .object(let row) = value else { return false }
+                return row["capabilityPackInstallId"] == .string(installID)
+                    && row["installedByPack"] == .string(packID) && ids.contains(Self.packString(row, "id").lowercased())
             }
         }
     }
@@ -1581,121 +953,16 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             .trimmingCharacters(in: CharacterSet(charactersIn: "-")).prefix(80).description
     }
 
-    private static func packSkillBody(
-        _ item: [String: JSONValue], packID: String
-    ) -> (name: String, description: String, content: String) {
-        let name = packString(item, "name").isEmpty ? packSkillID(item) : packString(item, "name")
-        let description = packString(item, "description").isEmpty
-            ? "Installed by capability pack \(packID)." : packString(item, "description")
-        let content = packString(item, "content").isEmpty
-            ? "# \(name)\n\n\(description)\n" : packString(item, "content")
-        return (name, description, content)
-    }
-
     private static func packString(_ row: [String: JSONValue], _ key: String) -> String {
         SkillMutation.pyStrOptional(row[key]) ?? ""
     }
 
     // MARK: - Mutation helpers
 
-    private var skillBodiesDir: URL { root.appendingPathComponent("skills/bodies", isDirectory: true) }
 
-    private func historyPath(for id: String) -> URL {
-        let identity = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
-        return historyDir.appendingPathComponent("by-id", isDirectory: true).appendingPathComponent("\(identity).json")
-    }
-
-    private func loadSkillHistory(skillId: String) throws -> [JSONValue] {
-        let path = historyPath(for: skillId)
-        let canonical = FileManager.default.fileExists(atPath: path.path)
-        // Read pre-identity history only for migration, selecting this owner's rows.
-        let source = canonical ? path : historyDir.appendingPathComponent("\(SkillMutation.slugify(skillId)).json")
-        return try loadHistoryStrict(source).filter { value in
-            guard case .object(let row) = value, row["skillId"] == .string(skillId),
-                  case .object(let skill)? = row["skill"],
-                  SkillMutation.pyStrTruthyOr(skill["id"], SkillMutation.pyStrTruthyOr(skill["name"], "")) == skillId else {
-                if canonical { throw SkillsError.historyUnavailable("Recorded version does not belong to this skill.") }
-                return false
-            }
-            return true
-        }
-    }
-
-    /// Additive, bounded evidence owned by Skills. Nothing consults this data
-    /// during chat or background cognition; only an explicit restore reads it.
-    private func recordSkillVersion(_ skill: JSONValue, reason: String) async throws {
-        guard case .object(let object) = skill else {
-            throw SkillsError.historyUnavailable("Cannot version a malformed skill row.")
-        }
-        let skillId = SkillMutation.pyStrTruthyOr(
-            object["id"],
-            SkillMutation.pyStrTruthyOr(object["name"], "")
-        )
-        guard !skillId.isEmpty else {
-            throw SkillsError.historyUnavailable("Cannot version a skill without an identifier.")
-        }
-        var bodyText: String?
-        if let path = confinedBodyPath(for: object, skillId: skillId),
-           let data = try? Data(contentsOf: path), data.count <= 65_536 {
-            bodyText = String(data: data, encoding: .utf8)
-        }
-        let bodyHash = bodyText.map {
-            SHA256.hash(data: Data($0.utf8)).map { String(format: "%02x", $0) }.joined()
-        } ?? ""
-        let path = historyPath(for: skillId)
-        let capturedBody = bodyText
-        let capturedSkill = skill
-        try await persistence.withFileLock(path) {
-            var rows = try self.loadSkillHistory(skillId: skillId)
-            var row: [String: JSONValue] = [
-                "versionId": .string(UUID().uuidString.lowercased()),
-                "skillId": .string(skillId),
-                "reason": .string(String(reason.prefix(80))),
-                "createdAt": .string(SkillMutation.nowISO(self.now)),
-                "bodySHA256": .string(bodyHash),
-                "skill": capturedSkill,
-            ]
-            if let capturedBody { row["body"] = .string(capturedBody) }
-            if let digest = SkillScript.digest(object["script"]) { row["scriptDigest"] = .string(digest) }
-            rows.append(.object(row))
-            // Registry edits are reversible versions too. Keep current,
-            // previous and last clean only (`CapabilityLifecycle`).
-            let kept = CapabilityLifecycle.keptVersions(try rows.map {
-                let digest = SkillMutation.pyStrOptional($0.objectValue?["scriptDigest"])
-                let fields = ["id", "name", "description", "triggers", "kind", "status", "bodyPath", "origin", "admission"]
-                    + SkillMutation.agentMarks
-                let metadata = JSONValue.object(($0.objectValue?["skill"]?.objectValue ?? [:]).filter { fields.contains($0.key) })
-                let identity = try metadata.serialize(pretty: false)
-                return ((digest ?? "") + "|" + (SkillMutation.pyStrOptional($0.objectValue?["bodySHA256"]) ?? "") + "|" + identity, digest)
-            }, recent: 2, clean: SkillMutation.pyStrOptional(object["lastCleanDigest"]))
-            rows = kept.map { rows[$0] }
-            try await self.persistence.writeJSON(.array(rows), to: path)
-        }
-    }
-
-    private func loadHistoryStrict(_ path: URL) throws -> [JSONValue] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        do {
-            guard case .array(let rows) = try JSONValue.parse(Data(contentsOf: path)) else {
-                throw SkillsError.historyUnavailable("Skill history is not a JSON array.")
-            }
-            return rows
-        } catch let error as SkillsError {
-            throw error
-        } catch {
-            throw SkillsError.historyUnavailable("Skill history is unreadable; mutation was refused.")
-        }
-    }
-
-    /// Mutation reads distinguish a genuinely absent registry (fresh install)
-    /// from an existing registry whose bytes or root shape are unusable. The
-    /// tolerant read path is appropriate for display, but using its empty
-    /// fallback inside a read-modify-write can replace every registered skill
-    /// after one malformed/truncated read.
     private func loadRegistryForMutation() throws -> [JSONValue] {
-        guard FileManager.default.fileExists(atPath: registryPath.path) else { return [] }
         do {
-            return try SkillsRegistry.decode(JSONValue.parse(Data(contentsOf: registryPath)))
+            return try SkillsRegistry.decode(abilities.registry(kind: .skill))
         } catch let error as SkillsError {
             throw error
         } catch {
@@ -1705,81 +972,62 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         }
     }
 
-    private func confinedBodyPath(for skill: [String: JSONValue], skillId: String) -> URL? {
-        let candidate: URL
-        if case .string(let raw)? = skill["bodyPath"], !raw.isEmpty {
-            candidate = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
-        } else {
-            candidate = skillBodiesDir.appendingPathComponent("\(skillId).md")
-        }
-        let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
-        let bodiesRoot = skillBodiesDir.standardizedFileURL.resolvingSymlinksInPath()
-        guard resolved.path.hasPrefix(bodiesRoot.path + "/") else { return nil }
-        return resolved
-    }
-
     private var activity: SkillActivityEmitter {
-        SkillActivityEmitter(persistence: persistence,
-                             activityPath: root.appendingPathComponent("activity/events.jsonl"),
-                             now: now)
+        SkillActivityEmitter(persistence: persistence, activityPath: root.appendingPathComponent("activity/events.jsonl"), now: now)
     }
 
-    /// flock the legacy registry path around an async R-M-W. `persistence` is
-    /// concretely `SwiftNativePersistenceCore`, which exposes withFileLock; the
-    /// flock target (`<registryPath>.lock`) is the SAME path the Python
-    /// `with file_lock(self.skills_path)` locks.
-    private func withRegistryLock<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
-        try await persistence.withFileLock(registryPath, body)
+    private func registryForPersistence(_ rows: [JSONValue], before: [JSONValue], ownerAuthorized: Bool = false) throws -> JSONValue {
+        let protected = try CapabilityLifecycle.preservingOwnerOff(.array(rows), before: .array(before), ownerAuthorized: ownerAuthorized)
+        return .array(try (protected.arrayValue ?? []).map { value in
+            guard case .object(var row) = value else { throw SkillsError.invalidRegistry("skill registry contains a non-object row") }
+            let previous = before.first { $0.objectValue?["id"] == row["id"] }?.objectValue
+            if previous == row { return value }
+            if previous?["overrides"] == .string("built_in") { row["overrides"] = .string("built_in") }
+            return .object(row)
+        })
     }
 
-    private func withManifestLock<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
-        try await persistence.withFileLock(dataRootManifestPath, body)
-    }
-
-    /// Write a skill body .md, creating the bodies dir. Mirrors
-    /// `body_path.write_text(content)` (chmod left to FileManager defaults; the
-    /// daemon does not chmod body files).
-    private func writeBody(_ content: String, to path: URL) async throws {
-        let hygieneViolations = SkillBodyHygiene.violations(in: content)
-        if !hygieneViolations.isEmpty {
-            throw SkillsError.invalidSkillBody(SkillBodyHygiene.failureMessage(for: hygieneViolations))
-        }
-        // 2026-09-06: the reader (`confinedBodyPath`) has always refused a body
-        // outside the bodies dir; the WRITER created parents and wrote wherever
-        // the composed path pointed. Every caller builds that path from an id
-        // or a caller-supplied name, so this is the last stop before an escape
-        // becomes a file. Resolve the PARENT — the body itself need not exist.
-        let parent = path.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
-        let bodiesRoot = skillBodiesDir.standardizedFileURL.resolvingSymlinksInPath()
-        guard parent.path == bodiesRoot.path,
-              SkillMutation.isSafeSkillID(path.deletingPathExtension().lastPathComponent) else {
-            throw SkillsError.invalidSkillBody(
-                "Skill body path escapes the skill bodies directory; the write was refused."
-            )
-        }
-        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try content.data(using: .utf8)?.write(to: path, options: .atomic)
-    }
-
-    /// Path-confined body unlink. Failed cleanup leaves an inactive registry row.
-    private func cleanupBodyFile(_ bodyPathRaw: String, skillId: String, displayName: String) async -> Bool {
-        let bodyPath = URL(fileURLWithPath: (bodyPathRaw as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath()
-        let bodiesRoot = skillBodiesDir.standardizedFileURL.resolvingSymlinksInPath()
-        do {
-            let isInside = bodyPath.path == bodiesRoot.path || bodyPath.path.hasPrefix(bodiesRoot.path + "/")
-            var isDir: ObjCBool = false
-            let exists = FileManager.default.fileExists(atPath: bodyPath.path, isDirectory: &isDir)
-            guard exists else { return true }
-            guard !isDir.boolValue, isInside else { return false }
-            try FileManager.default.removeItem(at: bodyPath)
-            return true
-        } catch {
-            try? await activity.record(kind: "skill", title: "Skill body cleanup skipped", detail: displayName,
-                                       status: "warn",
-                                       payload: .object(["skillId": .string(skillId), "error": .string(String(describing: error))]))
-            return false
+    private func mutateRoutine<T: Sendable>(_ entry: InstalledSkillInventory.Entry, ownerAuthorized: Bool = false,
+        _ body: @Sendable (inout [String: JSONValue]) throws -> T) async throws -> T {
+        try await mutateRegistry(ownerAuthorized: ownerAuthorized) { rows in
+            if entry.row["source"] == .string("persona_body") {
+                guard ownerAuthorized, let path = SkillMutation.pyStrOptional(entry.row["bodyPath"]),
+                      !rows.contains(where: { $0.objectValue?["id"] == .string(entry.id) }) else {
+                    throw SkillsError.stateNotAllowed(name: entry.name, state: "built in", requirement: "the owner")
+                }
+                var row = entry.row
+                row["source"] = .string("runtime_registry")
+                row["body"] = .string(try String(contentsOfFile: path, encoding: .utf8))
+                let result = try body(&row)
+                rows.append(.object(row))
+                return result
+            }
+            for index in rows.indices {
+                guard var row = rows[index].objectValue else { continue }
+                if entry.row["source"] == .string("runtime_registry"), row["id"] == .string(entry.id) {
+                    let result = try body(&row)
+                    rows[index] = .object(row)
+                    return result
+                }
+            }
+            throw SkillsError.unknownSkill(entry.id)
         }
     }
+
+    private func mutateRegistry<T: Sendable>(ownerAuthorized: Bool = false, _ body: @Sendable (inout [JSONValue]) throws -> T) async throws -> T {
+        try AbilityStore.withLock {
+            let before = try self.loadRegistryForMutation()
+            var rows = before
+            let result = try body(&rows)
+            if rows != before {
+                let saved = try self.registryForPersistence(rows, before: before, ownerAuthorized: ownerAuthorized)
+                try self.abilities.saveRegistry(saved, kind: .skill, ownerAuthorized: ownerAuthorized)
+            }
+            return result
+        }
+    }
+
+
 }
 
 // MARK: - Activity emitter (record_activity parity)
@@ -1819,47 +1067,6 @@ struct SkillActivityEmitter: Sendable {
         )
     }
 
-}
-
-// MARK: - One-time registry repairs
-
-/// One-time skill registry repairs, run at launch the house way: a
-/// version-stamped marker under skills/migrations, written only once the pass
-/// is done, so a failed one runs again.
-public enum SkillRegistryMigration {
-    /// The old auto-learner is retired (skills-as-code 4b): every learned-*
-    /// skill it left is archived through the lifecycle, never deleted.
-    public static func runIfNeeded(dataRoot: URL) async {
-        let marker = dataRoot.appendingPathComponent("skills/migrations/archive-learned-v2.done")
-        guard !FileManager.default.fileExists(atPath: marker.path),
-              let entries = try? InstalledSkillInventory.entries(dataRoot: dataRoot) else { return }
-        let client = SwiftNativeSkillsClient(root: dataRoot)
-        for entry in entries where entry.id.hasPrefix("learned-") && entry.row["source"] != .string("persona_body") {
-            do { try await client.archive(name: entry.id, why: "the old auto-learner that made it is retired") } catch { return }
-        }
-        try? FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? Data().write(to: marker)
-    }
-}
-
-extension SkillRegistryMigration {
-    /// Her versions of built-ins saved before they kept the built-in's
-    /// description carry the placeholder; they take the built-in's first
-    /// useful line, as its inventory row reads. Idempotent: only a placeholder changes.
-    public static func inheritBuiltInDescriptions(dataRoot: URL) async {
-        guard let entries = try? InstalledSkillInventory.entries(dataRoot: dataRoot) else { return }
-        let bodies = defaultPersonaRoot(dataRoot: dataRoot).appendingPathComponent("skills/bodies", isDirectory: true)
-        let client = SwiftNativeSkillsClient(root: dataRoot)
-        for entry in entries where entry.row["overrides"] == .string("built_in")
-            && entry.row["description"] == .string("Reusable procedure for \(entry.name).") {
-            let line = [entry.name, entry.id].lazy.filter { !$0.contains("/") }.compactMap {
-                (try? String(contentsOf: bodies.appendingPathComponent("\($0).md"), encoding: .utf8))
-                    .flatMap(SkillBodyHygiene.firstUsefulLine)
-            }.first
-            guard let line else { continue }
-            _ = try? await client.updateSkill(body: .object(["id": .string(entry.id), "description": .string(String(line.prefix(240)))]))
-        }
-    }
 }
 
 // MARK: - Factory

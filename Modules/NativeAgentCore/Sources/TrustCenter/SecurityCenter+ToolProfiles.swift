@@ -4,6 +4,37 @@ import PersistenceCore
 import ToolRegistry
 import os
 
+/// Primitive effects retain the authored envelope and the turn's ordinary gates.
+public enum AuthoredToolEffects {
+    @TaskLocal public static var admissionOnly = false
+    @TaskLocal public static var approvedCall: (tool: String, input: [String: JSONValue])?
+
+    public static let primitiveCapabilities: [String: Set<String>] = [
+        "files.list": ["safe_read", "filesystem_read"], "files.count": ["safe_read", "filesystem_read"],
+        "files.read": ["safe_read", "filesystem_read"], "files.info": ["safe_read", "filesystem_read"],
+        "files.write": ["filesystem_write"], "files.mkdir": ["filesystem_write"],
+        "files.copy": ["filesystem_write"], "files.move": ["filesystem_write"],
+        "files.remove": ["filesystem_delete", "destructive"],
+        "network.receive": ["safe_read", "network_read"],
+        "network.connect": ["network_write"], "network.listen": ["network_write"],
+        "network.accept": ["network_write"], "network.close": ["network_write"],
+        "network.send": ["network_write", "external_send"],
+        "apps.call": ["applescript", "system_control"],
+    ]
+
+    public static func appReadOnly(_ args: [String: JSONValue]) -> Bool {
+        args["script"] == nil && (args["dictionary"] == .bool(true) || args["event_class"] == .string("core")
+            && [.string("getd"), .string("cnte"), .string("doex")].contains(args["event_id"] ?? .null))
+    }
+
+    public static func primitiveEffects(_ operation: String, arguments: JSONValue?) -> Set<String> {
+        if operation == "apps.call", case .object(let args)? = arguments, appReadOnly(args) {
+            return ["safe_read", "applescript"]
+        }
+        return primitiveCapabilities[operation] ?? ["destructive"]
+    }
+}
+
 /// Registry flags supplied by the app door, without a dependency on its executor.
 public struct AppActionPolicy: Sendable {
     public let isHis: Bool
@@ -11,10 +42,13 @@ public struct AppActionPolicy: Sendable {
     public let read: Bool
     public let readWhen: [String: JSONValue]
     public let secretArgs: [String]
+    public let lifecycle: CapabilityLifecycle.Action?
 
-    public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:]) {
+    public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
+                lifecycle: CapabilityLifecycle.Action? = nil) {
         self.isHis = isHis; self.irreversible = irreversible; self.read = read
         self.secretArgs = secretArgs; self.readWhen = readWhen
+        self.lifecycle = lifecycle
     }
 
     public func readOnly(args: [String: JSONValue]) -> Bool {
@@ -32,7 +66,7 @@ public struct AppActionPolicy: Sendable {
     public static func action(tool: String = "app", input: [String: JSONValue]) -> AppActionPolicy? {
         let id: String
         if tool == "app", case .string(let action)? = input["action"] { id = action }
-        else if let action = ToolNameAliases.appAction(tool) { id = action }
+        else if let action = ToolNameAliases.appAction(tool, input: input) { id = action }
         else { return nil }
         guard let policy = registry.withLock({ $0[id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] }) else {
             return tool == "app" && ToolNameAliases.appFindQuery(input) != nil
@@ -40,7 +74,8 @@ public struct AppActionPolicy: Sendable {
         }
         let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
         return AppActionPolicy(isHis: policy.isHis, irreversible: policy.irreversible,
-                               read: policy.readOnly(args: args), secretArgs: policy.secretArgs, readWhen: policy.readWhen)
+                               read: policy.readOnly(args: args), secretArgs: policy.secretArgs, readWhen: policy.readWhen,
+                               lifecycle: policy.lifecycle)
     }
 
     /// Whether the table is installed yet: before assembly nothing is known.
@@ -448,6 +483,20 @@ extension SwiftNativeSecurityCenter {
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
     ) -> ToolProfile {
+        if case .object(let primitive)? = input["__authored_primitive"],
+           case .string(let operation)? = primitive["operation"] {
+            var authored = input
+            authored.removeValue(forKey: "__authored_primitive")
+            var result = profile(tool: tool, input: authored, dataRoot: dataRoot, trustedWorkspaceRoots: trustedWorkspaceRoots)
+            let effects = AuthoredToolEffects.primitiveEffects(operation, arguments: primitive["arguments"])
+            if operation == "apps.call", effects.contains("safe_read") {
+                // The enclosing tool is already admitted; this event's tier is a read.
+                return ToolProfile(capabilities: effects.union(["tool_call"]), risk: .low)
+            }
+            result.capabilities.formUnion(effects)
+            result.risk = max(result.risk, effects.contains("destructive") || effects.contains("system_control") ? .critical : effects.contains("safe_read") ? .low : .high)
+            return result
+        }
         // These mutate the same app-owned jobs as create. In particular,
         // delete is cancellation, not a filesystem-delete capability.
         if ["scheduler_cancel_job", "scheduler_delete_job", "scheduler_pause_job",
@@ -504,8 +553,15 @@ extension SwiftNativeSecurityCenter {
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "agent_message" {
-            add("external_send", .high)
-            add("network_write", .high)
+            if input["dry_run"] == .bool(true) {
+                // A dry run sends nothing: the card or handshake it reads and
+                // the recipe it learns. A command-line host still runs below.
+                add("network_read", .medium)
+                add("app_data_write", .medium)
+            } else {
+                add("external_send", .high)
+                add("network_write", .high)
+            }
             // A message to an agent host is delivered by running its command
             // line, so it carries exactly the capabilities `shell` carries. No
             // new authority and no quieter door: the same posture decides.

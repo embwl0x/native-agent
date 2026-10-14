@@ -20,22 +20,20 @@ enum JSONValueBounding {
     static func bounded(
         _ value: JSONValue,
         bounds: OrganismMetadataBounds,
-        redactSecrets: Bool = true,
         keyPath: String = "",
         depth: Int = 0
     ) -> JSONValue {
         guard depth < bounds.maximumDepth else { return .string("[bounded]") }
-        if redactSecrets, containsSecretMarker(keyPath) { return .string("[redacted]") }
+        if containsSecretMarker(keyPath) { return .string("[redacted]") }
         switch value {
         case .string(let string):
-            if redactSecrets, containsSecretLikeValue(string) { return .string("[redacted]") }
+            if containsSecretLikeValue(string) { return .string("[redacted]") }
             return .string(String(string.prefix(bounds.maximumStringCharacters)))
         case .array(let values):
             return .array(values.prefix(bounds.maximumArrayItems).map {
                 bounded(
                     $0,
                     bounds: bounds,
-                    redactSecrets: redactSecrets,
                     keyPath: keyPath,
                     depth: depth + 1
                 )
@@ -48,7 +46,6 @@ enum JSONValueBounding {
                 out[cleanKey] = bounded(
                     object[key] ?? .null,
                     bounds: bounds,
-                    redactSecrets: redactSecrets,
                     keyPath: keyPath.isEmpty ? cleanKey.lowercased() : "\(keyPath).\(cleanKey.lowercased())",
                     depth: depth + 1
                 )

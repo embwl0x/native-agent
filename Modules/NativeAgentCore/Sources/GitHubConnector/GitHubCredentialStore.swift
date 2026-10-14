@@ -5,12 +5,6 @@ import NativeAgentCore
 import PersistenceCore
 import Security
 
-public protocol GitHubCredentialVault: Sendable {
-    func read(service: String, account: String) throws -> String?
-    func write(_ token: String, service: String, account: String) throws
-    func delete(service: String, account: String) throws
-}
-
 public enum GitHubCredentialVaultError: Error, Sendable, LocalizedError {
     case keychain(OSStatus)
     case invalidStoredValue
@@ -38,7 +32,7 @@ public enum GitHubCredentialVaultError: Error, Sendable, LocalizedError {
     }
 }
 
-public struct SystemGitHubCredentialVault: GitHubCredentialVault {
+public struct SystemGitHubCredentialVault: Sendable {
     public init() {}
 
     static func nonInteractiveIdentityQuery(service: String, account: String) -> [String: Any] {
@@ -143,8 +137,8 @@ public actor GitHubCredentialStore {
     public static let oauthKeychainService = "com.nativeagent.connector.github.oauth.v1"
 
     private static let secretKeys = ["access_token", "token", "pat"]
-    private let vault: any GitHubCredentialVault
-    private let persistence: any PersistenceCoreProtocol
+    private let vault = SystemGitHubCredentialVault()
+    private let persistence = SwiftNativePersistenceCore()
     /// One refresh at a time per data root: GitHub rotates the refresh token,
     /// so a second concurrent refresh would spend a dead one.
     private var refreshInFlight: [String: Task<GitHubOAuthDeviceFlow.Token?, any Error>] = [:]
@@ -155,13 +149,7 @@ public actor GitHubCredentialStore {
     /// finishes after one of those must not write or clear anything.
     private var generation: [String: Int] = [:]
 
-    public init(
-        vault: any GitHubCredentialVault = SystemGitHubCredentialVault(),
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-    ) {
-        self.vault = vault
-        self.persistence = persistence
-    }
+    private init() {}
 
     public nonisolated static func credentialAccount(dataRoot: URL) -> String {
         let canonicalPath = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
@@ -427,6 +415,12 @@ public actor GitHubCredentialStore {
                 nativeLog("[github] OAuth refresh rejected (%@); clearing the sign-in", code)
                 try self.vault.delete(service: Self.oauthKeychainService, account: account)
                 return nil
+            } catch let error as GitHubOAuthDeviceFlow.FlowError {
+                if case .transport = error {
+                    // Refresh can fail before an API request reaches its proof recorder.
+                    await GitHubConnectorActions.recordConnectionProof(statusCode: nil, dataRoot: dataRoot)
+                }
+                throw error
             }
         }
         refreshInFlight[account] = task

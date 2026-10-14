@@ -8,6 +8,7 @@ import PersistenceCore
 import ToolRegistry
 import ToolExecution
 import MCPDispatcher
+import Senses
 
 /// `NativeAgentEngine.tools` (S10): the tool catalog and the authored-tool
 /// registry for one data root, in core types. The Tools page renders
@@ -18,6 +19,37 @@ import MCPDispatcher
 @MainActor
 @Observable
 public final class ToolsFacade {
+    public private(set) var slashCatalog: [ToolCapability] = []
+    public private(set) var slashTools: [ToolCapability] = []
+    public private(set) var slashCommandNames: Set<String> = []
+    private var slashCatalogFetchedAt: Date?
+    private var isFetchingSlashCatalog = false
+
+    public func refreshSlashCatalog() async {
+        if let last = slashCatalogFetchedAt, Date().timeIntervalSince(last) < 30 { return }
+        guard !isFetchingSlashCatalog else { return }
+        isFetchingSlashCatalog = true
+        defer { isFetchingSlashCatalog = false }
+        do {
+            let envelope = try await loadManifest()
+            let (sorted, eligible, names) = try await Task.detached(priority: .userInitiated) {
+                let data = try envelope.serializedData(pretty: false)
+                let manifest = try JSONDecoder().decode(ToolCapabilityManifest.self, from: data)
+                let sorted = manifest.tools.sorted { $0.name < $1.name }
+                let eligible = sorted.filter { !$0.sideEffects && $0.effectiveAutonomy == "auto" && $0.availableNow }
+                return (sorted, eligible, Set(eligible.map(\.name)))
+            }.value
+            slashCatalog = sorted
+            slashTools = eligible
+            slashCommandNames = names
+            slashCatalogFetchedAt = Date()
+        } catch {
+            slashCatalog = []
+            slashTools = []
+            slashCommandNames = []
+            slashCatalogFetchedAt = nil
+        }
+    }
     public nonisolated let dataRoot: URL
     nonisolated private let ports: NativeAgentEnginePorts
 
@@ -71,23 +103,20 @@ public final class ToolsFacade {
         return snapshot
     }
 
-    /// Every authored tool in `tools/registry.json`. An absent registry is
-    /// empty; bytes that are not a JSON array are unreadable, not empty.
+    /// Every authored tool in the ability files; malformed files fail the read.
     public nonisolated func listAuthored() async throws -> [ToolRecord] {
-        let registryPath = dataRoot.appendingPathComponent("tools/registry.json")
-        if FileManager.default.fileExists(atPath: registryPath.path) {
-            let parsed = try JSONValue.parse(Data(contentsOf: registryPath))
-            guard case .array = parsed else {
-                throw ToolRegistryError.registryUnreadable(
-                    reason: "tools registry must be a JSON array"
-                )
-            }
-        }
         let records = try await SwiftNativeToolRegistry(root: dataRoot).listTools(filter: .all)
         for record in records {
             try Self.checkAuthored(record)
         }
         return records
+    }
+
+    public func refreshAuthored(confirming id: String, status: String) async throws -> Bool {
+        let records = try await listAuthored()
+        guard records.first(where: { $0.id == id })?.status == status else { return false }
+        authored = records
+        return true
     }
 
     /// A record whose authored fields do not read fails the whole read, so a
@@ -103,9 +132,13 @@ public final class ToolsFacade {
     /// Promote a proposal. The promoted record carries the registry's typed
     /// slots plus every extras key the promote engine merges in, and reads
     /// back through the same authored-field check as the list.
-    public nonisolated func promote(id: String, allowRisky: Bool) async throws -> ToolRecord {
-        let proposal = try await SwiftNativeToolExecution(root: dataRoot)
-            .promote(id: id, allowRisky: allowRisky).toJSON()
+    public nonisolated func promote(id: String, allowRisky: Bool, ownerAuthorized: Bool = false) async throws -> ToolRecord {
+        let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot) { _, _ in
+            .object(["status": .string("refused"), "effects": .string("none"), "reason": .string("door_unavailable")])
+        }
+        let proposal = try await OwnedProgramInvocation.$host.withValue(host) {
+            try await SwiftNativeToolExecution(root: dataRoot).promote(id: id, allowRisky: allowRisky, ownerAuthorized: ownerAuthorized).toJSON()
+        }
         if let field = ToolRecord.stringFieldProblem(in: proposal) {
             throw ToolRegistryError.registryUnreadable(reason: "promoted tool \(id) has no valid \(field)")
         }
@@ -116,8 +149,8 @@ public final class ToolsFacade {
         return record
     }
 
-    public nonisolated func quarantine(id: String, reason: String) async throws -> ToolRecord {
-        let record = try await SwiftNativeToolRegistry(root: dataRoot).quarantine(id: id, reason: reason)
+    public nonisolated func quarantine(id: String, reason: String, ownerAuthorized: Bool = false) async throws -> ToolRecord {
+        let record = try await SwiftNativeToolRegistry(root: dataRoot).quarantine(id: id, reason: reason, ownerAuthorized: ownerAuthorized)
         try Self.checkAuthored(record)
         return record
     }
@@ -140,5 +173,44 @@ public final class ToolsFacade {
             catalogLoadError = error.localizedDescription
             return false
         }
+    }
+}
+extension ToolsFacade {
+    /// Resolve how to dispatch `toolName` given raw free-text args from the slash command.
+    /// Returns nil if no tool with that name exists.
+    public func planDispatch(toolName: String, freeText: String) -> DispatchArgPlan? {
+        guard let tool = slashCatalog.first(where: { $0.name == toolName }) else { return nil }
+
+        let schema = tool.inputSchema
+        let required = schema?.required ?? []
+        let props = schema?.properties ?? [:]
+
+        // Zero required args → fire immediately.
+        if required.isEmpty {
+            return DispatchArgPlan(tool: tool, mode: .zeroArgs, prefilled: [:])
+        }
+
+        // Single required field that is a string → shortcut.
+        if required.count == 1,
+           let fieldName = required.first,
+           let prop = props[fieldName],
+           (prop.type == "string" || prop.type == nil) {
+            let trimmed = freeText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let prefilled: [String: Any] = trimmed.isEmpty ? [:] : [fieldName: trimmed]
+            return DispatchArgPlan(tool: tool, mode: .singleStringArg(field: fieldName), prefilled: prefilled)
+        }
+
+        // Anything else → show a form.
+        return DispatchArgPlan(tool: tool, mode: .formNeeded, prefilled: [:])
+    }
+}
+
+private struct ToolCapabilityManifest: Decodable, Sendable {
+    let tools: [ToolCapability]
+}
+
+extension ToolsFacade {
+    public nonisolated convenience init(dataRoot: URL) {
+        self.init(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot))
     }
 }

@@ -1,3 +1,4 @@
+import Connectors
 import TrustCenter
 // PATCH-2026-06-07: mac-integration-tab — per-integration READ/WRITE permission
 // toggles for Calendar, Reminders, Contacts, Mail, Messages, Notes, Music,
@@ -6,6 +7,7 @@ import TrustCenter
 // <dataRoot>/security/mac_integration_permissions.json.
 import SwiftUI
 import MacIntegration
+import MacControl
 import AVFoundation
 import DeviceSync
 
@@ -161,50 +163,6 @@ private struct MacIntegrationPermissionLoadErrorPanel: View {
             .help("Check saved permissions again without changing them.")
         }
         .accessibilityIdentifier("mac-integration.permissions.load-error")
-    }
-}
-
-enum MacIntegrationFrameworkPermission: String, CaseIterable {
-    case calendar
-    case reminders
-    case contacts
-    // Speech Recognition and Microphone share the framework-row grant path,
-    // so failure copy must name them as specifically as Calendar et al.
-    case speechRecognition = "speech_recognition"
-    case microphone
-
-    var label: String {
-        switch self {
-        case .speechRecognition: return "Speech Recognition"
-        case .microphone: return "Microphone"
-        default: return rawValue.capitalized
-        }
-    }
-
-    var purpose: String {
-        switch self {
-        case .speechRecognition: return "Turn voice messages and dictation into text."
-        case .microphone: return "Record your voice when you use the microphone."
-        case .calendar: return "Read and manage events in Mac Calendar."
-        case .reminders: return "Read and manage your reminders."
-        case .contacts: return "Find people in your address book."
-        }
-    }
-
-    /// Single source of truth for the pane anchors: the shared capability
-    /// vocabulary, not a second hand-maintained copy.
-    var capability: SystemPermissionCapability {
-        switch self {
-        case .calendar: return .calendars
-        case .reminders: return .reminders
-        case .contacts: return .contacts
-        case .speechRecognition: return .speechRecognition
-        case .microphone: return .microphone
-        }
-    }
-
-    var settingsAnchor: String {
-        capability.settingsAnchor ?? "Privacy_AllFiles"
     }
 }
 
@@ -717,9 +675,9 @@ struct MacIntegrationView: View {
                     SystemPermissionPreflight.status(.speechRecognition)),
                 MacIntegrationSystemPermissionPresentation.microphoneKey: Self.badgeKey(
                     SystemPermissionPreflight.status(.microphone)),
-                MacIntegrationSystemPermissionPresentation.calendarKey: MacPIMConnectorActions.currentCalendarAuthorizationStatus(),
-                MacIntegrationSystemPermissionPresentation.remindersKey: MacPIMConnectorActions.currentReminderAuthorizationStatus(),
-                MacIntegrationSystemPermissionPresentation.contactsKey: MacContactsAdapter.currentAuthorizationStatus(),
+                MacIntegrationSystemPermissionPresentation.calendarKey: LocalPIMConnectorActions.currentCalendarAuthorizationStatus(),
+                MacIntegrationSystemPermissionPresentation.remindersKey: LocalPIMConnectorActions.currentReminderAuthorizationStatus(),
+                MacIntegrationSystemPermissionPresentation.contactsKey: MacContactsExecutor.currentAuthorizationStatus(),
             ]
         }.value
         tccStatuses.merge(frameworks) { _, read in read }
@@ -732,9 +690,9 @@ struct MacIntegrationView: View {
         // / unknown for apps not installed) every time. No more "unknown
         // until you click Grant All."
         var probedAppleEvents: [String: String] = [:]
-        for app in Self.appleEventsTargetApps {
+        for app in SystemAppleScriptAdapter.automationTargetApps {
             let key = "apple_events_\(app.lowercased())"
-            probedAppleEvents[key] = await Self.probeAppleEventApp(app)
+            probedAppleEvents[key] = await SystemAppleScriptAdapter.automationStatus(app: app, ask: false)
         }
         tccStatuses.merge(
             MacIntegrationSystemPermissionPresentation.mergingCachedAppleEvents(
@@ -755,11 +713,11 @@ struct MacIntegrationView: View {
         let status: String
         switch permission {
         case .calendar:
-            status = await MacPIMConnectorActions.requestCalendarAccess()
+            status = await LocalPIMConnectorActions.requestCalendarAccess()
         case .reminders:
-            status = await MacPIMConnectorActions.requestReminderAccess()
+            status = await LocalPIMConnectorActions.requestReminderAccess()
         case .contacts:
-            status = await MacContactsAdapter.requestAccess()
+            status = await MacContactsExecutor.requestAccess()
         case .speechRecognition:
             // This is the acquisition path the headless Telegram voice pipeline
             // never had. The call is a no-op unless the grant is still
@@ -819,15 +777,15 @@ struct MacIntegrationView: View {
         tccStatuses["microphone"] = mic
 
         // Calendar
-        let cal = await MacPIMConnectorActions.requestCalendarAccess()
+        let cal = await LocalPIMConnectorActions.requestCalendarAccess()
         tccStatuses["calendar"] = cal
 
         // Reminders
-        let rem = await MacPIMConnectorActions.requestReminderAccess()
+        let rem = await LocalPIMConnectorActions.requestReminderAccess()
         tccStatuses["reminders"] = rem
 
         // Contacts
-        let con = await MacContactsAdapter.requestAccess()
+        let con = await MacContactsExecutor.requestAccess()
         tccStatuses["contacts"] = con
 
         let unresolvedFrameworks = [
@@ -847,7 +805,7 @@ struct MacIntegrationView: View {
         // the real Automation rows for NativeAgent. The passive probe cannot
         // repair a nuked TCC table because it deliberately does not prompt.
         var aeStatuses: [String: String] = [:]
-        for app in Self.appleEventsTargetApps {
+        for app in SystemAppleScriptAdapter.automationTargetApps {
             await ensureAppleEventsTargetLaunched(app)
             let s = await Self.requestAppleEventApp(app)
             aeStatuses[app] = s
@@ -932,7 +890,7 @@ struct MacIntegrationView: View {
     }
 
     private func ensureAppleEventsTargetLaunched(_ app: String) async {
-        if let bundleID = Self.appleEventsTargetBundleIDs[app],
+        if let bundleID = SystemAppleScriptAdapter.automationTargetBundleIDs[app],
            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
             let cfg = NSWorkspace.OpenConfiguration()
             cfg.activates = false
@@ -946,37 +904,7 @@ struct MacIntegrationView: View {
     /// user answers. A previously-denied grant won't re-prompt (TCC respects
     /// the recorded "no"); use the row's Open Settings deep-link for that.
     private static func requestAppleEventApp(_ app: String) async -> String {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                guard let bundleID = appleEventsTargetBundleIDs[app] else {
-                    continuation.resume(returning: "unknown")
-                    return
-                }
-                let target = NSAppleEventDescriptor(bundleIdentifier: bundleID)
-                guard var desc = target.aeDesc?.pointee else {
-                    continuation.resume(returning: "unknown")
-                    return
-                }
-                let result: OSStatus = withUnsafePointer(to: &desc) { ptr in
-                    AEDeterminePermissionToAutomateTarget(
-                        ptr,
-                        AEEventClass(typeWildCard),
-                        AEEventID(typeWildCard),
-                        true  // askUserIfNeeded — FIRE the consent prompt
-                    )
-                }
-                switch result {
-                case 0:
-                    continuation.resume(returning: "granted")
-                case OSStatus(-1743):
-                    continuation.resume(returning: "denied")
-                case OSStatus(-1744):
-                    continuation.resume(returning: "not_determined")
-                default:
-                    continuation.resume(returning: "unknown")
-                }
-            }
-        }
+        await SystemAppleScriptAdapter.automationStatus(app: app, ask: true)
     }
 
     private static func statusBadgeColor(_ status: String) -> Color {
@@ -998,79 +926,6 @@ struct MacIntegrationView: View {
         case "not_determined": return "Not set"
         case "unknown": return "Unknown"
         default: return status.capitalized
-        }
-    }
-
-    /// Automation consent is per target application.
-    nonisolated private static let appleEventsTargetApps = ["Mail", "Messages", "Notes", "Music"]
-
-    /// Bundle IDs for the four target apps Agent drives via AppleScript.
-    /// Used by `AEDeterminePermissionToAutomateTarget` — it identifies the
-    /// target by bundle ID, not human-readable name.
-    nonisolated private static let appleEventsTargetBundleIDs: [String: String] = [
-        "Mail":     "com.apple.mail",
-        "Messages": "com.apple.MobileSMS",
-        "Notes":    "com.apple.Notes",
-        "Music":    "com.apple.Music",
-    ]
-
-    /// 2026-06-07 the user was right: "It should show the true state this isn't
-    /// hard." Was using `NSAppleScript` to probe, which doubles as the TCC
-    /// prompt for never-asked apps — so we couldn't probe passively at
-    /// launch without surprising the user with prompts. App-not-running
-    /// returned "unknown" which was uninformative.
-    ///
-    /// The correct API is `AEDeterminePermissionToAutomateTarget` with
-    /// `askUserIfNeeded: false`. It checks the Automation TCC grant
-    /// state for a target bundle ID and returns:
-    ///   noErr (0)                              → granted
-    ///   errAEEventNotPermitted (-1743)         → denied
-    ///   errAEEventWouldRequireUserConsent (-1744) → not_determined
-    ///   procNotFound / other                   → unknown (app not installed)
-    ///
-    /// Critically: it does NOT trigger a prompt. Safe to call on every
-    /// view appear and during the auto-refresh poll. App doesn't need to
-    /// be running — TCC state is per-bundle, not per-process.
-    static func probeAppleEventApp(_ app: String) async -> String {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                guard let bundleID = appleEventsTargetBundleIDs[app] else {
-                    continuation.resume(returning: "unknown")
-                    return
-                }
-                let target = NSAppleEventDescriptor(bundleIdentifier: bundleID)
-                let aeDesc = target.aeDesc?.pointee
-                guard var desc = aeDesc else {
-                    continuation.resume(returning: "unknown")
-                    return
-                }
-                let result: OSStatus = withUnsafePointer(to: &desc) { ptr in
-                    AEDeterminePermissionToAutomateTarget(
-                        ptr,
-                        AEEventClass(typeWildCard),
-                        AEEventID(typeWildCard),
-                        false  // askUserIfNeeded — DO NOT prompt
-                    )
-                }
-                let status: String
-                switch result {
-                case 0:
-                    status = "granted"
-                case OSStatus(-1743):
-                    // errAEEventNotPermitted
-                    status = "denied"
-                case OSStatus(-1744):
-                    // errAEEventWouldRequireUserConsent — never asked
-                    status = "not_determined"
-                case OSStatus(-600):
-                    // procNotFound cannot establish consent without a live target.
-                    status = "app_not_running"
-                default:
-                    status = "unknown"
-                }
-                nativeLog("[mac-integration] AE probe \(app) bundle=\(bundleID) result=\(result) status=\(status)")
-                continuation.resume(returning: status)
-            }
         }
     }
 

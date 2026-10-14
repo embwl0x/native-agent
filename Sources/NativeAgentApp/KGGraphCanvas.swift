@@ -25,8 +25,6 @@ struct KGGraphCanvas: View {
     @Binding var selectedId: String?
 
     @State private var positions: [String: CGPoint] = [:]
-    @State private var lastSignature: String = ""
-    @State private var lastSize: CGSize = .zero
 
     private let nodeRadius: CGFloat = 14
     private let hitRadius: CGFloat = 22
@@ -126,14 +124,22 @@ struct KGGraphCanvas: View {
                     )
                 }
             }
-            .onAppear {
-                computeLayoutIfNeeded(in: geo.size)
-            }
-            .onChange(of: geo.size) { _, new in
-                computeLayoutIfNeeded(in: new)
-            }
-            .onChange(of: graphSignature) { _, _ in
-                computeLayoutIfNeeded(in: geo.size, force: true)
+            .task(id: "\(graphSignature):\(geo.size)") {
+                let size = geo.size
+                guard size.width > 1, size.height > 1 else { return }
+                let nodes = visibleEntities
+                let links = visibleEdges
+                let radius = nodeRadius
+                let worker = Task.detached(priority: .userInitiated) {
+                    KGGraphCanvasLayout.positions(entities: nodes, edges: links, in: size, nodeRadius: radius)
+                }
+                let layout = await withTaskCancellationHandler {
+                    await worker.value
+                } onCancel: {
+                    worker.cancel()
+                }
+                guard !Task.isCancelled else { return }
+                positions = layout
             }
         }
     }
@@ -171,20 +177,6 @@ struct KGGraphCanvas: View {
         if let hit = best {
             selectedId = hit.id
         }
-    }
-
-    private func computeLayoutIfNeeded(in size: CGSize, force: Bool = false) {
-        guard size.width > 1, size.height > 1 else { return }
-        let sig = graphSignature
-        if !force, sig == lastSignature, size == lastSize, !positions.isEmpty { return }
-        lastSignature = sig
-        lastSize = size
-        positions = KGGraphCanvasLayout.positions(
-            entities: visibleEntities,
-            edges: visibleEdges,
-            in: size,
-            nodeRadius: nodeRadius
-        )
     }
 
     /// `String.hashValue` is deliberately seeded per process, so it cannot
@@ -314,6 +306,7 @@ enum KGGraphCanvasLayout {
                 uniqueKeysWithValues: ids.map { ($0, .zero) }
             )
             for index in 0..<ids.count {
+                guard !Task.isCancelled else { return [:] }
                 let firstID = ids[index]
                 let first = positions[firstID]!
                 for otherIndex in (index + 1)..<ids.count {

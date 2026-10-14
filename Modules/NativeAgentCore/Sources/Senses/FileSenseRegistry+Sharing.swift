@@ -15,14 +15,7 @@ extension FileSenseRegistry {
             let version = store.senses[i].versions[j]
             guard version.record.language != .native else { throw Self.failure("Built-in native code cannot be shared as a portable sense.") }
             guard userApproved else { return (false, .approvalNeeded(senseID: id)) }
-            let folder = try Self.safeURL("\(id)/v\(version.record.version)", under: self.root)
-            var files: [String: Data] = [:]
-            for name in version.files {
-                let path = try Self.safeURL(name, under: folder)
-                let bytes = try Self.readCode(at: path)
-                try Self.validateCode(name, bytes: bytes)
-                files[name] = bytes
-            }
+            let files = try self.sourceFiles(version.record).filter { version.files.contains($0.key) }
             var record = version.record
             // Local paths and usage history do not travel with code.
             record.reach.readPaths = []
@@ -32,6 +25,8 @@ extension FileSenseRegistry {
             record.enabledAt = nil
             record.grownBecause = nil
             record.unavailableReason = nil
+            record.candidateDigest = nil
+            record.disabledBy = nil
             let bytes = try Self.encode(Bundle(record: record, codeFiles: files))
             guard bytes.count <= Self.maximumBundleBytes else { throw Self.failure("Sense bundle exceeds the size limit.") }
             let target = destination.standardizedFileURL
@@ -73,24 +68,10 @@ extension FileSenseRegistry {
         let imported = try JSONDecoder().decode(Bundle.self, from: bytes)
         guard imported.format == 1, imported.record.language != .native else { throw Self.failure("Unsupported portable sense bundle.") }
         try Self.validate(Version(record: imported.record, files: imported.codeFiles.keys.sorted()))
-        return try await withStore { store in
-            if let i = store.senses.firstIndex(where: { $0.id == imported.record.id }) {
-                let j = store.senses[i].versions.firstIndex { $0.record.version == store.senses[i].currentVersion }!
-                guard store.senses[i].versions[j].record.origin == .shared,
-                      store.senses[i].versions[j].record.corner.key == imported.record.corner.key else {
-                    throw Self.failure("Import would replace a locally owned sense or a different corner.")
-                }
-            }
-            var record = imported.record
-            record.origin = .shared
-            record.status = .on
-            record.unavailableReason = nil
-            record.createdAt = Date()
-            record.reach.readPaths = []
-            record.grownBecause = nil
-            // insert clears the imported usage claims. Verbs remain disabled
-            // until the runner records this version's first successful local read.
-            return (true, try self.insert(record, files: imported.codeFiles, into: &store))
-        }
+        var record = imported.record
+        record.origin = .shared; record.status = .on; record.unavailableReason = nil
+        record.createdAt = Date(); record.reach.readPaths = []; record.grownBecause = nil
+        record.version = 1; record.candidateDigest = nil; record.disabledBy = nil
+        return try await upsert(record, codeFiles: imported.codeFiles)
     }
 }

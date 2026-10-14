@@ -7,9 +7,8 @@ import PersistenceCore
 /// per script digest, its `lastRequestedAt` stamped when asked again.
 extension SwiftNativeApprovalInbox {
     public static let skillScriptInstallAction = "skill.script_install"
-    /// The card's preview carries the whole script (8 KB at most) and its
-    /// header; one that would not fit is never filed.
-    public static let skillScriptPreviewLimit = 12_000
+    /// The card carries exact source, header and bounded fixtures.
+    public static let skillScriptPreviewLimit = 300_000
 
     @discardableResult
     public func askUserToInstallScript(
@@ -20,7 +19,7 @@ extension SwiftNativeApprovalInbox {
             "title": .string("Install \(skill)'s script?"),
             "action": .string(Self.skillScriptInstallAction),
             "risk": .string("medium"),
-            "reason": .string(why + " Approve installs this exact script (digest \(short)); if it changed since, "
+            "reason": .string(why + " Approve installs this exact candidate, including code, fixtures and dependencies (digest \(short)); if it changed since, "
                 + "approving installs nothing. Deny leaves it drafted."),
             "payloadPreview": .string(script),
             "payload": .object(["skill": .string(skillID), "name": .string(skill), "digest": .string(digest)]),

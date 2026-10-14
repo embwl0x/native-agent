@@ -31,10 +31,6 @@ public struct WorkshopExecutorDrainRunner: EventDeadlineLoopRunner {
         await executor.nextMeaningfulDeadline(after: now)
     }
 
-    public func tick() async {
-        _ = await tickOutcome()
-    }
-
     public func tickOutcome() async -> LoopTickOutcome {
         let ran = await executor.drainOnce()
         if Task.isCancelled { return .skipped(reason: "Desk executor canceled") }

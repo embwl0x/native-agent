@@ -15,58 +15,6 @@ import CoreGraphics
 // reaching for a CoreML detector. The detector stays contingent on MEASURED
 // misses; it does not get to arrive on a hunch.
 
-public struct VisionColorRegionConfig: Sendable, Equatable {
-    /// Target sample count along the long axis. The scan is a COARSE GRID —
-    /// this is what keeps it at ~1 ms on a 2560px frame.
-    public let gridLongAxisSamples: Int
-    /// Two colours within this squared RGB distance (channels 0…1) are "the
-    /// same fill".
-    public let colorTolerance: Double
-    /// A region must differ from the background by at least this squared RGB
-    /// distance to be a candidate at all.
-    public let backgroundTolerance: Double
-    /// Smallest candidate, as a fraction of frame area.
-    public let minAreaFraction: Double
-    /// Largest candidate, as a fraction of frame area — above this it is the
-    /// window's own background or a full-bleed panel, not a control.
-    public let maxAreaFraction: Double
-    /// Smallest candidate in pixels on either axis.
-    public let minSidePixels: Double
-    /// Fraction of a candidate row/column that must match the seed colour for
-    /// the region to absorb it. Below 1.0 on purpose — see the growth loop.
-    public let growMatchFraction: Double
-    /// Two candidates overlapping by at least this IoU are one candidate.
-    public let dedupeIoU: Double
-    /// Cap on emitted candidates; a texture-heavy frame (a game, a photo) can
-    /// otherwise produce thousands. Reported when it bites — a silent cap
-    /// reads as "that's all there was".
-    public let maxCandidates: Int
-
-    public init(
-        gridLongAxisSamples: Int = 320,
-        colorTolerance: Double = 0.02,
-        backgroundTolerance: Double = 0.006,
-        minAreaFraction: Double = 0.00015,
-        maxAreaFraction: Double = 0.5,
-        minSidePixels: Double = 8,
-        growMatchFraction: Double = 0.65,
-        dedupeIoU: Double = 0.55,
-        maxCandidates: Int = 200
-    ) {
-        self.growMatchFraction = growMatchFraction
-        self.gridLongAxisSamples = gridLongAxisSamples
-        self.colorTolerance = colorTolerance
-        self.backgroundTolerance = backgroundTolerance
-        self.minAreaFraction = minAreaFraction
-        self.maxAreaFraction = maxAreaFraction
-        self.minSidePixels = minSidePixels
-        self.dedupeIoU = dedupeIoU
-        self.maxCandidates = maxCandidates
-    }
-
-    public static let `default` = VisionColorRegionConfig()
-}
-
 public struct VisionColorRegionResult: Sendable, Equatable {
     public let candidates: [VisionCandidate]
     /// The frame's dominant colour — the "background" every candidate differs
@@ -228,6 +176,32 @@ public struct VisionPixelGrid: Sendable {
 }
 
 public enum VisionColorRegionLayer {
+    /// Target sample count along the long axis. The scan is a COARSE GRID —
+    /// this is what keeps it at ~1 ms on a 2560px frame.
+    static let gridLongAxisSamples: Int = 320
+    /// Two colours within this squared RGB distance (channels 0…1) are "the
+    /// same fill".
+    private static let colorTolerance: Double = 0.02
+    /// A region must differ from the background by at least this squared RGB
+    /// distance to be a candidate at all.
+    private static let backgroundTolerance: Double = 0.006
+    /// Smallest candidate, as a fraction of frame area.
+    private static let minAreaFraction: Double = 0.00015
+    /// Largest candidate, as a fraction of frame area — above this it is the
+    /// window's own background or a full-bleed panel, not a control.
+    private static let maxAreaFraction: Double = 0.5
+    /// Smallest candidate in pixels on either axis.
+    private static let minSidePixels: Double = 8
+    /// Fraction of a candidate row/column that must match the seed colour for
+    /// the region to absorb it. Below 1.0 on purpose — see the growth loop.
+    private static let growMatchFraction: Double = 0.65
+    /// Two candidates overlapping by at least this IoU are one candidate.
+    private static let dedupeIoU: Double = 0.55
+    /// Cap on emitted candidates; a texture-heavy frame (a game, a photo) can
+    /// otherwise produce thousands. Reported when it bites — a silent cap
+    /// reads as "that's all there was".
+    static let maxCandidates: Int = 200
+
     static func distanceSquared(_ lhs: SIMD3<Double>, _ rhs: SIMD3<Double>) -> Double {
         // Spell out the fixed three channels: generic SIMD reduction spends
         // substantial time in element access in installed development builds.
@@ -240,8 +214,7 @@ public enum VisionColorRegionLayer {
     /// Coarse-grid scan → similar-colour box growth → dedupe. The spike's
     /// approach, ported properly.
     public static func candidates(
-        grid: VisionPixelGrid,
-        config: VisionColorRegionConfig = .default
+        grid: VisionPixelGrid
     ) -> VisionColorRegionResult {
         let frameArea = grid.imageSize.width * grid.imageSize.height
         guard frameArea > 0 else {
@@ -287,7 +260,7 @@ public enum VisionColorRegionLayer {
                 let index = row * grid.columns + column
                 if visited[index] { continue }
                 let seed = grid.color(column: column, row: row)
-                guard backgroundDistances[index] > config.backgroundTolerance else {
+                guard backgroundDistances[index] > backgroundTolerance else {
                     visited[index] = true
                     continue
                 }
@@ -319,7 +292,7 @@ public enum VisionColorRegionLayer {
                     let cellIndex = row * grid.columns + column
                     let cell = grid.samples[cellIndex]
                     let toSeed = distanceSquared(cell, seed)
-                    guard toSeed <= config.colorTolerance else { return false }
+                    guard toSeed <= colorTolerance else { return false }
                     return toSeed < backgroundDistances[cellIndex]
                 }
                 func matchFraction(rowIndex r: Int, from a: Int, to b: Int) -> Double {
@@ -334,11 +307,11 @@ public enum VisionColorRegionLayer {
                 }
                 func rowMatches(_ r: Int, from a: Int, to b: Int) -> Bool {
                     guard r >= 0, r < grid.rows else { return false }
-                    return matchFraction(rowIndex: r, from: a, to: b) >= config.growMatchFraction
+                    return matchFraction(rowIndex: r, from: a, to: b) >= growMatchFraction
                 }
                 func columnMatches(_ c: Int, from a: Int, to b: Int) -> Bool {
                     guard c >= 0, c < grid.columns else { return false }
-                    return matchFraction(columnIndex: c, from: a, to: b) >= config.growMatchFraction
+                    return matchFraction(columnIndex: c, from: a, to: b) >= growMatchFraction
                 }
                 var growing = true
                 while growing {
@@ -353,10 +326,10 @@ public enum VisionColorRegionLayer {
                 }
 
                 let rect = grid.rect(fromColumn: c0, toColumn: c1, fromRow: r0, toRow: r1)
-                guard rect.w >= config.minSidePixels, rect.h >= config.minSidePixels else { continue }
+                guard rect.w >= minSidePixels, rect.h >= minSidePixels else { continue }
                 let areaFraction = rect.area / frameArea
-                guard areaFraction >= config.minAreaFraction,
-                      areaFraction <= config.maxAreaFraction else { continue }
+                guard areaFraction >= minAreaFraction,
+                      areaFraction <= maxAreaFraction else { continue }
 
                 // BOUNDS CONFIDENCE: a region that stopped growing well inside
                 // the frame, on all four sides, has real edges. One that ran
@@ -431,11 +404,11 @@ public enum VisionColorRegionLayer {
         var kept: [VisionCandidate] = []
         for candidate in raw.sorted(by: { $0.rect.area > $1.rect.area }) {
             let duplicate = kept.contains { existing in
-                existing.rect.iou(candidate.rect) >= config.dedupeIoU
+                existing.rect.iou(candidate.rect) >= dedupeIoU
                     || candidate.rect.coverage(by: existing.rect) >= 0.9
             }
             if duplicate { continue }
-            if kept.count >= config.maxCandidates { capped = true; break }
+            if kept.count >= maxCandidates { capped = true; break }
             kept.append(candidate)
         }
 

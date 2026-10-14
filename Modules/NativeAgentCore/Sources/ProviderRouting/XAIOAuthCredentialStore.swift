@@ -11,16 +11,14 @@ enum XAIOAuthCredentialStore {
     static func read(at path: URL) throws -> [String: Any] {
         try CredentialFileLock.withLock(path) {
             guard let data = try ProviderStateValidation.dataIfPresent(at: path) else { return [:] }
-            var object = try ProviderStateValidation.credential(data: data)
-            if secretFields.contains(where: { object[$0] != nil }) {
-                try write(object, to: path)
-                object = try ProviderStateValidation.credential(data: Data(contentsOf: path))
-            }
-            return try resolve(object)
+            return try resolve(ProviderStateValidation.credential(data: data), at: path)
         }
     }
 
-    static func resolve(_ object: [String: Any]) throws -> [String: Any] {
+    /// The caller validates and locks this metadata generation before resolving it.
+    static func resolve(_ object: [String: Any], at path: URL) throws -> [String: Any] {
+        let object = secretFields.contains(where: { object[$0] != nil })
+            ? try write(object, to: path) : object
         guard let reference = object[referenceField] as? String else { return object }
         guard UUID(uuidString: reference) != nil,
               let data = try DeviceSecretKeychain.read(service: service, account: reference) else {
@@ -32,7 +30,8 @@ enum XAIOAuthCredentialStore {
         return resolved
     }
 
-    static func write(_ object: [String: Any], to path: URL) throws {
+    @discardableResult
+    static func write(_ object: [String: Any], to path: URL) throws -> [String: Any] {
         try CredentialFileLock.withLock(path) {
             try ProviderStateValidation.credential(object)
             let previous = try ProviderStateValidation.dataIfPresent(at: path)
@@ -62,6 +61,7 @@ enum XAIOAuthCredentialStore {
                 do { try DeviceSecretKeychain.delete(service: service, account: oldReference) }
                 catch { nativeLog("[xAI] Credentials saved; previous Keychain item cleanup failed: %@", error.localizedDescription) }
             }
+            return metadata
         }
     }
 

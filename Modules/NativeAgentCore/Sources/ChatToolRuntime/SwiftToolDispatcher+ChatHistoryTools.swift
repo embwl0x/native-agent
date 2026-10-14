@@ -120,7 +120,7 @@ extension SwiftToolDispatcher {
         workContextQuery: WorkContextQuery? = nil,
         excludingRunID: String? = nil
     ) async throws -> JSONValue {
-        let input = input.filter { $0.value != .string("") }
+        var input = input.filter { $0.value != .string("") }
         let requestedScope = (jsonString(input["scope"]) ?? "all_sessions")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -152,7 +152,7 @@ extension SwiftToolDispatcher {
         // the sort falls through to recency, i.e. the tail of that session.
         let wholeSession = scope == "previous_session"
         // Likewise a session or time window with no query lists that window.
-        let window = wholeSession || ["session_id", "after", "before"].contains {
+        let window = wholeSession || ["session_id", "after", "before", "since"].contains {
             !(jsonString(input[$0]) ?? "").trimmingCharacters(in: .whitespaces).isEmpty
         }
         let rawQuery = window
@@ -162,12 +162,12 @@ extension SwiftToolDispatcher {
         guard !query.isEmpty || window else {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty chat-history search query")
         }
-        let requestedLimit = optionalInt(input, "limit") ?? 8
+        let requestedLimit = Self.jsonInt(input["limit"]) ?? 8
         // A 25-snippet response regularly exceeded 18 KB in live turns and
         // encouraged a second broad search before the model had digested the
         // first one. Keep a compact page while preserving complete recall via
         // offset pagination.
-        let offset = max(0, optionalInt(input, "offset") ?? 0)
+        let offset = max(0, Self.jsonInt(input["offset"]) ?? 0)
         let mode = (jsonString(input["mode"]) ?? "hybrid")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -201,6 +201,13 @@ extension SwiftToolDispatcher {
             }
             let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
+            if key == "since", let unit = text.lowercased().last,
+               let seconds = ["d": 86_400.0, "h": 3_600.0, "m": 60.0][String(unit)] {
+                guard let amount = Double(text.dropLast()), amount > 0, (amount * seconds).isFinite else {
+                    throw AutonomyGateError.toolDenied(reason: "Chat history 'since' needs a positive duration such as 1d, 7d or 2h.")
+                }
+                return Date().addingTimeInterval(-amount * seconds)
+            }
             // A bare day ("2026-09-22") means its local midnight.
             let day = ISO8601DateFormatter()
             day.formatOptions = [.withFullDate]
@@ -211,7 +218,9 @@ extension SwiftToolDispatcher {
             return date
         }
         let before = try bound("before")
-        let after = try bound("after")
+        let after = try [bound("after"), bound("since")].compactMap { $0 }.max()
+        input.removeValue(forKey: "since")
+        if let after { input["after"] = .string(fractionalTimestamp.string(from: after)) }
         if let before, let after, after >= before {
             throw AutonomyGateError.toolDenied(reason: "Chat history 'after' must precede 'before'.")
         }
@@ -821,15 +830,15 @@ extension SwiftToolDispatcher {
                 let result: JSONValue?
                 if case .string(let text)? = stored { result = try? JSONValue.parse(Data(text.utf8)) }
                 else { result = stored }
-                if let result, PeerDataTaintDispatcher.remoteProvenance(in: result, depth: 0) != nil {
-                    return "a remote peer"
+                if let result, let peer = PeerDataTaintDispatcher.remoteProvenance(in: result, depth: 0) {
+                    return peer
                 }
             }
             if let peer = PeerDataTaintDispatcher.routedContact(tool: tool, input: input) { return peer }
             // Clipped routing cannot attest a trusted contact. Keep peer
             // receipts subject to the approval floor when that identity is lost.
             if ["agent_message", "agent_read"].contains(ToolNameAliases.ranTool(tool, input: input)) {
-                return "a remote peer"
+                return "peer:unknown"
             }
             if ["read_page", "browser.chrome_snapshot", "browser.read_text", "browser.read_links"]
                 .contains(ToolNameAliases.ranTool(tool, input: input)) { return "web content" }
@@ -890,7 +899,7 @@ extension SwiftToolDispatcher {
             if case .bool(true)? = fields["untrusted_remote_data"],
                case .string(let peer)? = fields["agent"] {
                 let line = HumanConversationReader.string(fields["preview"] ?? fields["excerpt"] ?? fields["text"]) ?? ""
-                PeerDataTaint.markConsumed(peer: peer, line: line, attested: fields["source_boundary"] == nil)
+                PeerDataTaint.markConsumed(peer: peer, line: line)
             }
             for child in fields.values { consumePersistedHistoryEvidence(child) }
         case .array(let values):
@@ -1065,11 +1074,11 @@ extension SwiftToolDispatcher {
                 reason: "SwiftToolDispatcher: read_chat_message needs the 'message_id' search_chat_history returned"
             )
         }
-        let offset = max(0, optionalInt(input, "offset") ?? 0)
+        let offset = max(0, Self.jsonInt(input["offset"]) ?? 0)
         let limit = max(
             1,
             min(
-                optionalInt(input, "limit") ?? Self.readChatMessageDefaultPageCharacters,
+                Self.jsonInt(input["limit"]) ?? Self.readChatMessageDefaultPageCharacters,
                 Self.readChatMessageMaximumPageCharacters
             )
         )

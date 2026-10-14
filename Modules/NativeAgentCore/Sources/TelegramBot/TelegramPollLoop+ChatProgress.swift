@@ -1,8 +1,10 @@
 import Foundation
+import ChatOrchestration
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
+import ChatSessionWork
 
 private actor TelegramTypingHeartbeat {
     let start: @Sendable () -> Task<Void, Never>
@@ -34,7 +36,6 @@ extension TelegramPollLoop {
     private func startTypingHeartbeat(destination: TelegramDestination) async -> TelegramTypingHeartbeat {
         let token = self.token
         let sendChatAction = self.sendChatAction
-        let delay = typingRefreshNanoseconds
         // Presence must never delay starting the actual conversation.
         let heartbeat = TelegramTypingHeartbeat { Task {
             while !Task.isCancelled {
@@ -46,8 +47,7 @@ extension TelegramPollLoop {
                         Data("TelegramPollLoop: sendChatAction failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8)
                     )
                 }
-                guard delay > 0 else { break }
-                do { try await Task.sleep(nanoseconds: delay) }
+                do { try await Task.sleep(nanoseconds: 4_000_000_000) }
                 catch { break }
             }
         } }
@@ -67,11 +67,6 @@ extension TelegramPollLoop {
             token: token,
             destination: destination,
             turnId: turnId,
-            minimumEditInterval: turnCardMinimumEditIntervalSeconds,
-            heartbeatNanoseconds: turnCardHeartbeatNanoseconds,
-            stalledAfter: turnCardStalledAfterSeconds,
-            clock: turnCardClock,
-            sleeper: turnCardSleeper,
             sendCard: sendMessageWithReplyMarkupReturningId,
             editCard: { token, chatId, messageId, text, replyMarkup in
                 try await editMessageTextWithReplyMarkup(
@@ -108,15 +103,15 @@ extension TelegramPollLoop {
         update: TelegramUpdate?,
         message: TelegramMessage?,
         text: String?,
-        approvalId: String? = nil
+        approvalId: String? = nil,
+        silent: Bool = false
     ) -> TelegramAssistantDeliveryDriver {
         return TelegramAssistantDeliveryDriver(
             token: token,
             destination: destination,
             turnId: turnId,
             sendRichDraft: sendRichMessageDraft,
-            sendRichFinal: sendRichMessage,
-            richDraftInterval: draftEditIntervalSeconds,
+            sendRichFinal: silent ? Self.defaultSendSilentRichMessage : sendRichMessage,
             recordFailure: { redactedError in
                 await recordError(
                     context: errorContext,
@@ -140,12 +135,32 @@ extension TelegramPollLoop {
                     throw TelegramBotError.underlying("Assistant answer has no durable delivery owner.")
                 }
             },
-            sendGeneratedImage: { path in
+            holdDelivery: {
+                let session: String?
+                let run: String?
+                if let update {
+                    let claim = try TelegramUpdateInbox(offsetURL: offsetURL).claim(updateId: update.updateId)
+                    session = claim.assistantSessionId
+                    run = claim.assistantRunId
+                } else if let approvalId {
+                    let approval = try await approvalInbox.get(approvalId)
+                    guard case .object(let state)? = approval.chatContinuation, let raw = state["delivery"] else {
+                        throw TelegramBotError.underlying("Approval answer has no retained conversation.")
+                    }
+                    session = try JSONDecoder().decode(TelegramPendingApprovalContinuation.self,
+                        from: raw.serializedData(pretty: false)).sessionId
+                    run = nil
+                } else { throw TelegramBotError.underlying("Assistant answer has no durable delivery owner.") }
+                return try !CodexCompletionLifecycleProjection.permitsDelivery(sessionId: session, runId: run,
+                    configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
+                    || TurnQuietHoursWindow.holdsResidentWake(session: session, dataRoot: dataRoot)
+            },
+            sendGeneratedImage: { path, bytes in
                 do { try await sendChatAction(token, destination, "upload_photo") }
                 catch {
                     FileHandle.standardError.write(Data("TelegramPollLoop: upload_photo action failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8))
                 }
-                try await sendPhoto(token, destination, path, nil)
+                try await sendPhoto(token, destination, path, bytes, nil)
             }
         )
     }
@@ -163,17 +178,30 @@ extension TelegramPollLoop {
     }
 
     func retainedAssistantDelivery(for claim: TelegramUpdateClaim) async throws -> TelegramAssistantDeliveryState? {
-        if claim.noRecoverableAnswer { return nil }
         if let delivery = claim.assistantDelivery, delivery.imagePaths != nil { return delivery }
         guard let sessionId = claim.assistantSessionId, let runId = claim.assistantRunId else { return claim.assistantDelivery }
-        let saved = try await TelegramSessionStore(dataRoot: dataRoot).savedReply(sessionId: sessionId, runId: runId)
+        var saved: TelegramAssistantDeliveryState?
+        if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: sessionId, runId: runId) {
+            saved = TelegramAssistantDeliveryState(reply: TelegramRichMessageRenderer.sanitize(
+                TelegramRichMessageRenderer.stripBoldMarkers(response.output)), imagePaths: replyImagePaths(response))
+        }
         var delivery = claim.assistantDelivery ?? saved
         if delivery?.imagePaths == nil { delivery?.imagePaths = saved?.imagePaths }
+        guard delivery != nil else { return nil }
         // No wire attempt can precede the delivery row. This canonical reply
         // survived a stop or restart between model settlement and that handoff.
         return try await TelegramUpdateInbox(offsetURL: offsetURL).recordAssistantDelivery(
             updateId: claim.updateId, delivery: delivery, recovering: true
         )
+    }
+
+    func replyImagePaths(_ response: ChatResponse) -> [String] {
+        let root = dataRoot.appendingPathComponent("generated_images").standardizedFileURL.path + "/"
+        return (response.attachments ?? []).compactMap { image in
+            guard image.type == "image", let path = image.path,
+                  URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(root) else { return nil }
+            return path
+        }
     }
 
     func repairInterruptedTurnCardsIfNeeded() async {
@@ -295,17 +323,9 @@ extension TelegramPollLoop {
             runId: runId,
             threadId: destination.threadId
         )
-        // Prefer the attachment-aware handler when staged images exist
-        // (telegram-vision-in) so the bytes reach the model. The
-        // attachment handler is also used for plain text when it's the
-        // only handler wired.
         if let attachmentChatHandler {
             return try await attachmentChatHandler(destination.chatId, text, attachments, progress, context)
         }
-        // A staged image must NEVER silently fall through to a
-        // text-only handler — the model would answer the caption
-        // blind, exactly the failure the vision-in port removes
-        // (gpt-5.5 review). Tripwire + honest reply instead.
         if !attachments.isEmpty {
             await emitAttachmentDroppedTrace(
                 kind: "image",
@@ -315,22 +335,11 @@ extension TelegramPollLoop {
                 + "has no vision-capable handler wired — the image was "
                 + "not processed.)"
         }
-        if let progressChatHandler {
-            return try await progressChatHandler(destination.chatId, text, progress, context)
-        }
-        if let chatHandler {
-            return try await chatHandler(destination.chatId, text)
-        }
         throw TelegramBotError.unavailable
     }
 
     static func chatErrorNotice(for error: Error) -> String {
         ProviderRecoveryPolicy.personMessage(error)
             ?? "The reply could not be completed; try again."
-    }
-
-    static func providerUsageNotice(for error: Error) -> String? {
-        guard case .rateLimited = ProviderFailure.classify(error) else { return nil }
-        return ProviderFailure.classify(error)?.errorDescription
     }
 }

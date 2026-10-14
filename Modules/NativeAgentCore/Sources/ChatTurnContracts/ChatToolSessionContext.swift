@@ -33,6 +33,7 @@ public enum ChatToolSessionContext {
         public let sourceKey: String?
         public let replyTo: String?
         public let correlationId: String?
+        public let requesterUserId: String?
 
         public init(
             surface: String,
@@ -40,7 +41,8 @@ public enum ChatToolSessionContext {
             threadId: String? = nil,
             sourceKey: String? = nil,
             replyTo: String? = nil,
-            correlationId: String? = nil
+            correlationId: String? = nil,
+            requesterUserId: String? = nil
         ) {
             self.surface = surface
             self.destinationId = destinationId
@@ -48,6 +50,7 @@ public enum ChatToolSessionContext {
             self.sourceKey = sourceKey
             self.replyTo = replyTo
             self.correlationId = correlationId
+            self.requesterUserId = requesterUserId
         }
 
         /// Whether this route ends at a surface that can DRAW an inline card.
@@ -251,6 +254,8 @@ public struct TurnEnvelope: Sendable, Equatable {
     public let declaredRemote: Bool?
     /// Request-time AX evidence, process-local and never restored from history.
     public let macContinuation: MacWorkContinuation?
+    /// Work attribution only; it grants no authority.
+    public let workIdentity: String?
 
     public init(
         surface: String,
@@ -260,7 +265,8 @@ public struct TurnEnvelope: Sendable, Equatable {
         commandSignatureVerified: Bool? = nil,
         deliveryRoute: DeliveryRoute? = nil,
         declaredRemote: Bool? = nil,
-        macContinuation: MacWorkContinuation? = nil
+        macContinuation: MacWorkContinuation? = nil,
+        workIdentity: String? = nil
     ) {
         self.surface = surface
         self.agent = agent
@@ -270,12 +276,13 @@ public struct TurnEnvelope: Sendable, Equatable {
         self.deliveryRoute = deliveryRoute
         self.declaredRemote = declaredRemote
         self.macContinuation = macContinuation
+        self.workIdentity = workIdentity
     }
 
     public func withMacContinuation(_ continuation: MacWorkContinuation) -> TurnEnvelope {
         TurnEnvelope(surface: surface, agent: agent, verifiedChatId: verifiedChatId,
             verifiedUserId: verifiedUserId, commandSignatureVerified: commandSignatureVerified,
-            deliveryRoute: deliveryRoute, declaredRemote: declaredRemote, macContinuation: continuation)
+            deliveryRoute: deliveryRoute, declaredRemote: declaredRemote, macContinuation: continuation, workIdentity: workIdentity)
     }
 
     /// The delivery projection. `ReplyRoute` predates the envelope and has
@@ -300,8 +307,10 @@ public struct TurnEnvelope: Sendable, Equatable {
             object[key] = .string(value)
         }
         put("agent", Self.cleaned(agent))
+        put("workIdentity", workIdentity)
         put("chatId", verifiedChatId)
         put("userId", verifiedUserId)
+        put("requesterUserId", Self.cleaned(deliveryRoute?.requesterUserId))
         put("destinationId", Self.cleaned(deliveryRoute?.destinationId))
         put("threadId", Self.cleaned(deliveryRoute?.threadId))
         put("sourceKey", Self.cleaned(deliveryRoute?.sourceKey))
@@ -325,14 +334,16 @@ public struct TurnEnvelope: Sendable, Equatable {
             threadId: read("threadId"),
             sourceKey: read("sourceKey"),
             replyTo: read("replyTo"),
-            correlationId: read("correlationId")
+            correlationId: read("correlationId"),
+            requesterUserId: read("requesterUserId") ?? read("userId")
         )
         return TurnEnvelope(
             surface: surface,
             agent: read("agent"),
             verifiedChatId: read("chatId"),
             verifiedUserId: read("userId"),
-            deliveryRoute: route
+            deliveryRoute: route,
+            workIdentity: read("workIdentity")
         )
     }
 

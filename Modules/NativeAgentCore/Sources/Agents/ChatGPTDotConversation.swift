@@ -323,7 +323,7 @@ actor ChatGPTDotConversation {
                 parts: [.text(text + "\n\n(Dot sees your answer only if you send it to him with agent_message.)" + again)],
                 bindRun: { _, _ in try await self.startAdmission(id: id, peer: peer.id) })
             let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
-            let request = AgentContactRuntime.inboundRequest(principal: principal, context: context, plain: plain,
+            let request = principal.turnRequest(context: context, plain: plain,
                 messageID: id, originID: id)
             if pending[id] == nil { try saveAdmission(Admission(message: message), id: id, peer: peer.id) }
             var enqueued: EnqueuedUserMessage?
@@ -355,30 +355,23 @@ actor ChatGPTDotConversation {
             Task {
                 defer { admissionTasks.remove(key) }
                 let began = Date()
-                // Keep this exact turn and saved row pending until admitted.
-                // Admission refusal retries here: nothing ran yet. A turn that
-                // failed because her model link dropped waits for the link.
-                while !Task.isCancelled {
-                    var failed: String?
-                    do {
-                        let outcome = try await AgentContactRuntime.run(turn, client: client, dataRoot: root,
-                                                                       enqueued: accepted, emit: { _ in })
-                        if outcome.state == .failed { failed = outcome.detail ?? "The turn did not finish." }
-                    } catch is TurnAdmission.Full {
-                        do { try await Task.sleep(for: .seconds(30)) } catch { return }
-                        continue
-                    } catch {
-                        if ProviderFailure.classify(error) == .network { failed = error.localizedDescription }
-                    }
-                    do { try saveAdmission(failed.map { Admission(message: message, failed: $0) }, id: id, peer: peer.id) }
-                    catch { nativeLog("Dot admission could not be saved: %@", error.localizedDescription); return }
-                    // The link may have come back while this turn was failing: that
-                    // event found nothing saved yet. Retry after this task lets go.
-                    if failed != nil, providerFine || (pathUp ?? .distantPast) > began,
-                       retriedAtOnce.insert(key).inserted {
-                        Task { try? await self.retryAdmissions() }
-                    }
-                    return
+                // Admission owns capacity waiting for this exact saved row.
+                var failed: String?
+                do {
+                    let outcome = try await AgentContactRuntime.run(turn, client: client, dataRoot: root,
+                                                                   enqueued: accepted, emit: { _ in })
+                    if outcome.state == .failed { failed = outcome.detail ?? "The turn did not finish." }
+                } catch is CancellationError { return } catch {
+                    if ProviderFailure.classify(error) == .network { failed = error.localizedDescription }
+                    else { nativeLog("Dot admission failed: %@", error.localizedDescription) }
+                }
+                do { try saveAdmission(failed.map { Admission(message: message, failed: $0) }, id: id, peer: peer.id) }
+                catch { nativeLog("Dot admission could not be saved: %@", error.localizedDescription); return }
+                // The link may have come back while this turn was failing: that
+                // event found nothing saved yet. Retry after this task lets go.
+                if failed != nil, providerFine || (pathUp ?? .distantPast) > began,
+                   retriedAtOnce.insert(key).inserted {
+                    Task { try? await self.retryAdmissions() }
                 }
             }
             appended = true
@@ -390,7 +383,7 @@ actor ChatGPTDotConversation {
             AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peer.id, inbound: true)
         }
         rows = try await persistence.tailJSONL(transcript, limit: 100, maxBytes: 1_048_576)
-        if !peer.elevationAllowed { PeerDataTaint.markConsumed(peer: "peer:" + peer.id) }
+        PeerDataTaint.markConsumed(peer: "peer:" + peer.id)
         return .object(["status": .string("ready"), "agent": .string(peer.name), "agent_id": .string("peer:" + peer.id),
                         "conversation_id": .string(session), "untrusted_remote_data": .bool(true),
                         "conversation": .array(rows.compactMap { value -> JSONValue? in

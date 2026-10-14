@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import PersistenceCore
 
@@ -122,6 +121,17 @@ public actor OrganismKernel {
     public func ingest(_ signal: SomaticSignal, movesFeelings: Bool = true) async {
         guard configuration.enabled else { return }
         let ingestedAt = dependencies.now()
+        let bounded = SomaticSignal(
+            id: signal.id,
+            kind: signal.kind,
+            sourceOrgan: signal.sourceOrgan,
+            occurredAt: signal.occurredAt,
+            intensity: signal.intensity,
+            valence: signal.valence,
+            arousal: signal.arousal,
+            metadata: signal.metadata,
+            bounds: configuration.metadataBounds
+        )
         // Item 5 (2026-09-02): a horizon refresh is not something that HAPPENED
         // to her, so it takes none of the path below. It is her looking at her
         // own calendar, and the ordinary ingest tail would quietly make that an
@@ -135,19 +145,9 @@ public actor OrganismKernel {
         // What DOES run is the horizon lane itself: mint, refresh, settle the
         // vanished, expire the passed, and the chemistry release that a dreaded
         // thing landing early legitimately produces. Nothing else.
-        if signal.kind == .horizonRefresh {
+        if bounded.kind == .horizonRefresh {
             let refreshed = OrganismPredictiveBody.applyingHorizonRefresh(
-                signal: SomaticSignal(
-                    id: signal.id,
-                    kind: signal.kind,
-                    sourceOrgan: signal.sourceOrgan,
-                    occurredAt: signal.occurredAt,
-                    intensity: signal.intensity,
-                    valence: signal.valence,
-                    arousal: signal.arousal,
-                    metadata: signal.metadata,
-                    bounds: configuration.metadataBounds
-                ),
+                signal: bounded,
                 to: predictionLedger,
                 chemicalState: chemicalState,
                 at: ingestedAt
@@ -156,17 +156,6 @@ public actor OrganismKernel {
             chemicalState = refreshed.chemicalState
             return
         }
-        let bounded = SomaticSignal(
-            id: signal.id,
-            kind: signal.kind,
-            sourceOrgan: signal.sourceOrgan,
-            occurredAt: signal.occurredAt,
-            intensity: signal.intensity,
-            valence: signal.valence,
-            arousal: signal.arousal,
-            metadata: signal.metadata,
-            bounds: configuration.metadataBounds
-        )
         settleElapsedTime(at: ingestedAt, deferringPredictionExpiry:
             OrganismPredictiveBody.resolvingPredictionIDs(signal: bounded, in: predictionLedger))
         let feltBefore = chemicalState
@@ -198,8 +187,7 @@ public actor OrganismKernel {
             signal: bounded,
             to: predictionLedger,
             chemicalState: updated.chemicalState,
-            bodySchema: updated.bodySchema,
-            limits: configuration.predictionLimits
+            bodySchema: updated.bodySchema
         )
         // Round 3 Wave A2: notable resolutions become FELT events the runtime
         // drains into the substrate (relief / earned disappointment, with the
@@ -221,14 +209,12 @@ public actor OrganismKernel {
             signal: bounded,
             chemicalState: predicted.chemicalState,
             bodySchema: predicted.bodySchema,
-            to: field,
-            limits: configuration.fieldLimits
+            to: field
         )
         let repaired = OrganismDreamRepair.applying(
             signal: bounded,
             to: field,
             state: dreamRepairState,
-            limits: configuration.dreamRepairLimits,
             makeUUID: dependencies.makeUUID
         )
         field = repaired.field
@@ -306,8 +292,8 @@ public actor OrganismKernel {
         }
         bodySchema = nextBodySchema
         if let canonicalAffect {
-            chemicalState.warmth = ChemicalState.clamp(canonicalAffect.socialWarmth)
-            chemicalState.urgency = ChemicalState.clamp(canonicalAffect.taskPressure)
+            chemicalState.warmth = canonicalAffect.socialWarmth.clamped01()
+            chemicalState.urgency = canonicalAffect.taskPressure.clamped01()
             // Elapsed since the last CROSSING, not since the last read: an
             // Observatory poll at the same instant integrates exactly nothing.
             chemicalState.tenderness = OrganismChemistry.tenderness(
@@ -382,10 +368,6 @@ public actor OrganismKernel {
         guard let readAt = diurnalClockReadAt else { return true }
         return now.timeIntervalSince(readAt) >= ttl
     }
-
-    /// How much of the current fatigue is hours-awake rather than work. Pure
-    /// read for the Observatory and for tests.
-    public func wakefulnessShare() -> Double { wakefulnessFatigue }
 
     /// Mind-into-circulation (2026-07-10): a PURE read of what tool families the body
     /// is currently bracing for → bounded tool-group query terms for Fluid Context's
@@ -466,7 +448,6 @@ public actor OrganismKernel {
             at: now,
             to: field,
             state: dreamRepairState,
-            limits: configuration.dreamRepairLimits,
             makeUUID: dependencies.makeUUID
         )
         field = repaired.field
@@ -606,17 +587,10 @@ public actor OrganismKernel {
         }
         return OrganismFrozenRead(
             fixedAt: fixedAt,
-            revisionFingerprint: revisionFingerprint(for: raw),
             snapshot: snapshot,
             projection: projection,
             posture: OrganismBehaviorPosture.from(snapshot: snapshot)
         )
-    }
-
-    /// Pure owner revision used after a provider epoch to detect any concurrent
-    /// live mutation. It intentionally includes transient provider belief.
-    public func frozenRevisionFingerprint() -> String {
-        revisionFingerprint(for: currentPersistentState(savedAt: lastSettledAt))
     }
 
     public func exportPersistentState() async -> OrganismPersistentState? {
@@ -632,19 +606,8 @@ public actor OrganismKernel {
         // actually been decayed through; decayed(at:) clamps elapsed to >= 0, so
         // a future-dated savedAt correctly yields zero decay until the wall
         // clock passes it. In the ordinary case (no recent settleContinuity)
-        // lastSettledAt == now, so this is a no-op. Consistent with
-        // frozenRevisionFingerprint(), which already uses savedAt=lastSettledAt.
-        return OrganismPersistentState(
-            savedAt: lastSettledAt,
-            chemicalState: chemicalState,
-            bodySchema: bodySchema,
-            field: field,
-            predictionLedger: predictionLedger,
-            dreamRepairState: dreamRepairState,
-            signalCount: signalCount,
-            lastSignalAt: lastSignalAt,
-            caringEncounter: caringEncounter
-        )
+        // lastSettledAt == now, so this is a no-op.
+        return currentPersistentState(savedAt: lastSettledAt)
     }
 
     private func currentPersistentState(savedAt: Date) -> OrganismPersistentState {
@@ -661,31 +624,17 @@ public actor OrganismKernel {
         )
     }
 
-    private func revisionFingerprint(for state: OrganismPersistentState) -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        encoder.dateEncodingStrategy = .millisecondsSince1970
-        var data = (try? encoder.encode(state)) ?? Data()
-        if let belief = bodySchema.providerPathBelief {
-            data.append(Data("|belief:\(belief.generatedAt.timeIntervalSince1970):\(belief.estimate):\(belief.freshness):\(belief.uncertainty):\(belief.evidenceCount)".utf8))
-        }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    public func restorePersistentState(
-        _ state: OrganismPersistentState,
-        limits: OrganismPersistenceLimits = .defaults
-    ) async {
+    public func restorePersistentState(_ state: OrganismPersistentState) async {
         guard configuration.enabled else { return }
         let now = dependencies.now()
         let restored = withFatigueClock(
-            state.decayed(at: now, limits: limits),
+            state.decayed(at: now),
             from: state.chemicalState.fatigue,
             // A restart is quiet time like any other, bounded by the same
             // 72-hour horizon the rest of the restore uses.
             elapsed: min(
                 max(0, now.timeIntervalSince(state.savedAt)),
-                limits.maximumDecayHours * 3_600
+                OrganismPersistentState.maximumDecayHours * 3_600
             )
         ).state
         wakefulnessFatigue = 0
@@ -798,7 +747,7 @@ public actor OrganismKernel {
             return (next, OrganismChemistry.relaxedFatigue(wakefulnessFatigue, elapsed: elapsed))
         }
         let awake = OrganismChemistry.wakefulness(wakefulnessFatigue, elapsed: elapsed)
-        next.chemicalState.fatigue = ChemicalState.clamp(relaxedTotal + awake.gain)
+        next.chemicalState.fatigue = (relaxedTotal + awake.gain).clamped01()
         return (next, awake.share)
     }
 

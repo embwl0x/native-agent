@@ -1,10 +1,6 @@
 import SwiftUI
 import NativeAgentShared
 
-struct MobileDeskTasksLabel: View {
-    var body: some View { Label("Desk tasks", systemImage: "checklist") }
-}
-
 struct MobileLoadedRecordsDisclosure: View {
     let title: String
     let remaining: Int
@@ -107,7 +103,7 @@ enum MobileDeskEmptyStatePresentation: Equatable {
 struct MobileDeskView: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var selectedItem: MobileDeskItem?
     @State private var showingNewItem = false
     @State private var showingTasks = false
@@ -272,7 +268,8 @@ struct MobileDeskView: View {
         Button { selectedItem = item } label: {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
-                    DeskStatusMark(status: item.status)
+                    DeskStatusMark(status: item.status,
+                        movementAt: item.executionEvidence?.status == "running" ? item.executionEvidence?.lastMovementAt : nil)
                     Text(item.activity(at: Date()).label)
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(AlivePalette.text)
@@ -483,8 +480,8 @@ struct MobileDeskItemDetail: View {
     let item: MobileDeskItem
     @Binding var errorMessage: String?
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject private var outbox = MobileDeskNoteOutbox.shared
-    @ObservedObject private var sync = iCloudSyncEngine.shared
+    private let outbox = MobileDeskNoteOutbox.shared
+    private let sync = iCloudSyncEngine.shared
     @State private var note = ""
     @State private var isWorking = false
 
@@ -641,6 +638,7 @@ struct MobileDeskItemDetail: View {
             }
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
             .onAppear { note = outbox.draft(for: item.handle) }
+            .onDisappear { outbox.flushDrafts() }
         }
     }
 
@@ -772,12 +770,18 @@ private struct NewMobileDeskItemSheet: View {
 /// carries the meaning; the mark is never coloured.
 struct DeskStatusMark: View {
     let status: String
+    var movementAt: String? = nil
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        Group {
+        let movement = movementAt.flatMap(UserDisplayFormatters.parseISOTimestamp)
+        let expiry = movement?.addingTimeInterval(DeskActivityState.movementWindow)
+        return TimelineView(.explicit(expiry.map { [$0] } ?? [])) { context in
             switch status.lowercased() {
             case "now", "running", "active":
-                PulsingDot(color: AlivePalette.text, size: 7)
+                let active = scenePhase == .active && movement.map { $0 <= context.date } == true
+                    && expiry.map { context.date < $0 } == true
+                PulsingDot(color: AlivePalette.text, size: 7, isActive: active)
             case "done", "completed", "succeeded":
                 Image(systemName: "checkmark")
                     .font(.system(size: 9, weight: .bold))

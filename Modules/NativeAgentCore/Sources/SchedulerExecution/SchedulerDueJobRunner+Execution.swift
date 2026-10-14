@@ -14,9 +14,6 @@ extension SchedulerDueJobRunner {
                 NSLocalizedDescriptionKey: "Unsupported scheduled job kind: \(job.kind)"
             ])
         }
-        if let executionOverride {
-            return try await executionOverride(kind, job, now)
-        }
         guard isLiveDataRoot else {
             throw NSError(domain: "NativeAgentScheduler", code: -403, userInfo: [
                 NSLocalizedDescriptionKey:

@@ -359,24 +359,4 @@ public enum MacInjectionToolNames {
     public static func action(forTool toolName: String) -> String? {
         canonical[toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
     }
-
-    /// Legacy floor value; the compatibility clamp below is disabled.
-    public static let minimumAutonomyLevel = "send_approval"
-
-    /// Legacy unattended-level vocabulary retained for existing consumers.
-    public static let unattendedAutonomyLevels: Set<String> = [
-        "auto", "app_data_autonomous", "workspace_autonomous",
-    ]
-
-    /// Compatibility entry point: returns the resolved autonomy unchanged.
-    ///
-    /// USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
-    /// Nothing." The floor is DISABLED at his explicit direction. His machine,
-    /// his agent: the Full-Mac grant + accessibility category + the macOS TCC
-    /// grant are the gates, and per-call approval made every motor tool dead on
-    /// non-interactive surfaces (the bridge, while he is away) — precisely when
-    /// he needs her to act.
-    public static func clampedAutonomyLevel(toolName: String, resolved: String) -> String {
-        return resolved
-    }
 }

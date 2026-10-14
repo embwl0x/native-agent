@@ -106,16 +106,14 @@ public struct SlackSocketModeLoop: LoopRunner {
     // (hourly failure receipts + pushes since Jul 12). The loop now recycles
     // its own session below the watchdog and reports that as success; the
     // 3900s watchdog remains a genuine hang backstop. Must stay < the
-    // tickTimeoutOverride above (pinned in SlackSocketModeLoopTests).
-    let sessionRecycleInterval: TimeInterval
+    // tickTimeoutOverride above.
+    let sessionRecycleInterval: TimeInterval = 3_600
 
     private let config: SlackSocketModeConfig
     private let dataRoot: URL
-    private let chatHandler: SlackSocketModeChatHandler?
     private let progressChatHandler: SlackSocketModeProgressChatHandler?
     private let botEventIntake: SlackBotEventIntake
     private let session: URLSession
-    private let deduper = SlackEventDeduper()
     private let deliveryJournal: SlackInboundDeliveryJournal
     private let historyPollState = SlackHistoryPollState()
     private let conversationCache = SlackConversationCache()
@@ -124,9 +122,7 @@ public struct SlackSocketModeLoop: LoopRunner {
     private let inFlight = SlackInFlightHandlers()
     // LOOPS-5: shared socket-liveness signal that gates history polling.
     private let socketHealth = SlackSocketHealth()
-    private let outbound: SlackSocketModeOutbound
-    private let socketConnectionFactory: @Sendable (URL) -> SlackSocketConnection
-    private let feedRetention: SlackReceiptErrorFeed.Retention
+    private let feedRetention: SlackReceiptErrorFeed.Retention = .production
 
     /// A socket that has said `hello` and has produced a frame or a successful
     /// ping inside this window counts as healthy. Pings run every 25s, so 90s
@@ -162,24 +158,14 @@ public struct SlackSocketModeLoop: LoopRunner {
         config: SlackSocketModeConfig,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         interval: TimeInterval = SlackSocketModeLoop.defaultReconnectInterval,
-        sessionRecycleInterval: TimeInterval = 3_600,
         session: URLSession = .shared,
-        outbound: SlackSocketModeOutbound? = nil,
-        socketConnectionFactory: (@Sendable (URL) -> SlackSocketConnection)? = nil,
-        feedRetention: SlackReceiptErrorFeed.Retention = .production,
         botEventIntake: @escaping SlackBotEventIntake,
-        chatHandler: SlackSocketModeChatHandler? = nil,
         progressChatHandler: SlackSocketModeProgressChatHandler? = nil
     ) {
         self.config = config
         self.dataRoot = dataRoot
         self.interval = interval
-        self.sessionRecycleInterval = sessionRecycleInterval
         self.session = session
-        self.outbound = outbound ?? .live(dataRoot: dataRoot, botToken: config.botToken)
-        self.socketConnectionFactory = socketConnectionFactory ?? { .live(session.webSocketTask(with: $0)) }
-        self.feedRetention = feedRetention
-        self.chatHandler = chatHandler
         self.progressChatHandler = progressChatHandler
         self.botEventIntake = botEventIntake
         self.deliveryJournal = SlackInboundDeliveryJournal(dataRoot: dataRoot)
@@ -198,7 +184,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         let recoveryId = UUID()
         let recovery = Task(priority: .userInitiated) {
             do {
-                try await recoverDurableInboundDeliveries()
+                try await reconcileSavedReplies()
             } catch is CancellationError {
                 // The canonical tick is stopping.
             } catch {
@@ -228,7 +214,7 @@ public struct SlackSocketModeLoop: LoopRunner {
             await writeState([
                 "socketUrlOpenedAt": .string(Self.nowString()),
             ])
-            let socket = socketConnectionFactory(socketURL)
+            let socket = session.webSocketTask(with: socketURL)
             socket.resume()
             // A4.8(a): planned session recycle. When the deadline fires it
             // closes the socket, which surfaces in receiveLoop as a receive
@@ -240,12 +226,12 @@ public struct SlackSocketModeLoop: LoopRunner {
                 try? await Task.sleep(nanoseconds: UInt64(max(1, sessionRecycleInterval) * 1_000_000_000))
                 guard !Task.isCancelled else { return }
                 recycleFlag.fire()
-                socket.cancel()
+                socket.cancel(with: .goingAway, reason: nil)
             }
             defer { recycleTask.cancel() }
             do {
                 try await receiveLoop(socket: socket, recycleFlag: recycleFlag)
-                socket.cancel()
+                socket.cancel(with: .goingAway, reason: nil)
                 if Task.isCancelled {
                     await writeState([
                         "connected": .bool(false),
@@ -276,7 +262,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                     return outcome
                 }
             } catch let closure as SlackSocketSessionClosure {
-                socket.cancel()
+                socket.cancel(with: .goingAway, reason: nil)
                 let outcome = Self.classifySessionClosure(
                     closure,
                     sessionDuration: max(0, Date().timeIntervalSince(sessionStartedAt)),
@@ -297,7 +283,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                     return outcome
                 }
             } catch {
-                socket.cancel()
+                socket.cancel(with: .goingAway, reason: nil)
                 if recycleFlag.didFire {
                     await writeState([
                         "connected": .bool(false),
@@ -353,7 +339,7 @@ public struct SlackSocketModeLoop: LoopRunner {
     }
 
     private func openSocketURL() async throws -> URL {
-        var req = URLRequest(url: URL(string: "https://slack.com/api/apps.connections.open")!)
+        var req = URLRequest(url: Self.apiURL("apps.connections.open"))
         req.httpMethod = "POST"
         req.timeoutInterval = 30
         req.setValue("Bearer \(config.appToken)", forHTTPHeaderField: "Authorization")
@@ -377,7 +363,7 @@ public struct SlackSocketModeLoop: LoopRunner {
     }
 
     private func receiveLoop(
-        socket: SlackSocketConnection,
+        socket: URLSessionWebSocketTask,
         recycleFlag: SlackSessionRecycleFlag
     ) async throws {
         let pingTask = Task {
@@ -443,7 +429,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         await inFlight.cancelAndWaitAll()
     }
 
-    private func receiveLoopBody(socket: SlackSocketConnection) async throws {
+    private func receiveLoopBody(socket: URLSessionWebSocketTask) async throws {
         while !Task.isCancelled {
             let message = try await socket.receive()
             let json: JSONValue
@@ -501,8 +487,6 @@ public struct SlackSocketModeLoop: LoopRunner {
                     }
                 }
                 if claim == .alreadyDelivered { continue }
-                let shouldProcess = await deduper.markIfNew(inbound.eventId)
-                guard shouldProcess else { continue }
                 // Socket handling stays concurrent (the receive loop must keep
                 // acking envelopes), but it is tracked — see spawnInboundHandling.
                 await spawnInboundHandling(inbound)
@@ -517,9 +501,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         }
     }
 
-    /// LOOPS-2: spawn handling into the tracked set, and unmark the deduper if
-    /// delivery failed so the message is retryable instead of permanently
-    /// swallowed by a "seen" entry that never produced a reply.
+    /// Handling stays tracked while the journal owns admission and settlement.
     func spawnInboundHandling(_ inbound: SlackInboundMessage) async {
         let id = UUID()
         // Socket receipt is background transport work; handling an accepted
@@ -527,12 +509,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         // but do not let the chat turn inherit the utility-priority socket
         // loop and starve behind unrelated local builds.
         let task = Task(priority: .userInitiated) {
-            let delivered = await handleDurableInbound(inbound)
-            if delivered {
-                await deduper.confirmDelivered(inbound.eventId)
-            } else {
-                await deduper.unmark(inbound.eventId)
-            }
+            _ = await handleDurableInbound(inbound)
             await inFlight.finish(id)
         }
         await inFlight.register(task, id: id)
@@ -545,15 +522,6 @@ public struct SlackSocketModeLoop: LoopRunner {
         let claim = try await deliveryJournal.claim(inbound)
         try await acknowledge()
         return claim
-    }
-
-    /// Test/lifecycle seam: cancel and await everything the loop spawned.
-    func cancelAndWaitInFlightHandling() async {
-        await inFlight.cancelAndWaitAll()
-    }
-
-    var inFlightHandlingCount: Int {
-        get async { await inFlight.count }
     }
 
     private func historyPollUntilCancelled() async {
@@ -892,10 +860,8 @@ public struct SlackSocketModeLoop: LoopRunner {
         }
         // History delivery joins the session's tracked work so planned teardown
         // gives accepted turns the same grace as socket delivery. Awaiting the
-        // result also lets the channel cursor advance only
-        // past messages that actually got delivered: a failed delivery unmarks
-        // the deduper AND stops the watermark, so the next poll re-fetches and
-        // retries it rather than losing it forever.
+        // result also lets the channel cursor advance only past messages the
+        // journal has settled. Active or failed delivery stops the watermark.
         var watermark: String?
         var stalledOnFailure = false
         for message in ordered {
@@ -904,21 +870,6 @@ public struct SlackSocketModeLoop: LoopRunner {
                 // Nothing to deliver (bot / subtype / empty) — safe to skip past.
                 if let ts = Self.string(message["ts"]) { watermark = Self.laterTs(watermark, ts) }
                 continue
-            }
-            let shouldProcess = await deduper.markIfNew(inbound.eventId)
-            guard shouldProcess else {
-                // Dedupe hit. Only a CONFIRMED delivery justifies moving the
-                // watermark past this message — an in-flight socket delivery
-                // can still fail and unmark, and a watermark already past it
-                // would skip the message forever (gpt-5.5 review BLOCKING).
-                // In-flight: stop here and let the next poll re-check; by then
-                // the mark has either been confirmed or released.
-                if await deduper.isDelivered(inbound.eventId) {
-                    watermark = Self.laterTs(watermark, inbound.ts)
-                    continue
-                }
-                stalledOnFailure = true
-                break
             }
             await writeState([
                 "lastHistoryPollMessageAt": .string(Self.nowString()),
@@ -929,8 +880,6 @@ public struct SlackSocketModeLoop: LoopRunner {
             let (results, completion) = AsyncStream<Bool>.makeStream()
             let handling = Task(priority: .userInitiated) {
                 let delivered = await handleDurableInbound(inbound)
-                if delivered { await deduper.confirmDelivered(inbound.eventId) }
-                else { await deduper.unmark(inbound.eventId) }
                 completion.yield(delivered)
                 completion.finish()
                 await inFlight.finish(id)
@@ -1003,7 +952,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         )
     }
 
-    private func pingUntilCancelled(socket: SlackSocketConnection) async {
+    private func pingUntilCancelled(socket: URLSessionWebSocketTask) async {
         while !Task.isCancelled {
             do {
                 try await Task.sleep(nanoseconds: 25_000_000_000)
@@ -1022,7 +971,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                     "lastPingErrorAt": .string(Self.nowString()),
                     "lastPingError": .string(Self.redact(String(describing: error))),
                 ])
-                socket.cancel()
+                socket.cancel(with: .goingAway, reason: nil)
                 return
             }
         }
@@ -1035,7 +984,7 @@ public struct SlackSocketModeLoop: LoopRunner {
     /// held teardown, and therefore reconnection, open forever. Three things
     /// can now finish the wait — the handler, task cancellation, and a bounded
     /// deadline — and the gate keeps the first, discarding the rest.
-    private func sendPing(socket: SlackSocketConnection) async throws {
+    private func sendPing(socket: URLSessionWebSocketTask) async throws {
         let gate = SlackPingContinuationGate()
         let deadline = Task {
             try? await Task.sleep(for: .seconds(Self.pingResponseDeadline))
@@ -1067,7 +1016,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         params: [String: String]
     ) async throws -> [String: JSONValue] {
         var components = URLComponents(
-            url: URL(string: "https://slack.com/api/\(method)")!,
+            url: Self.apiURL(method),
             resolvingAgainstBaseURL: false
         )!
         if httpMethod == "GET" {
@@ -1096,7 +1045,94 @@ public struct SlackSocketModeLoop: LoopRunner {
         return obj
     }
 
-    private func acknowledge(envelopeId: String, socket: SlackSocketConnection) async throws {
+    static func apiURL(_ method: String) -> URL {
+        SlackConnectorActions.apiURL(method)
+    }
+
+    public func recoverReply(_ response: ChatResponse, originRunId: String,
+                             route: AgentBridgeCompletionRoute? = nil, priorVerdict: String? = nil) async throws -> String {
+        var indexed = try await deliveryJournal.answerRecord(runId: response.runId, originRunId: originRunId)
+        if indexed == nil, let route, let session = response.sessionId, let channel = route.destinationId, !channel.isEmpty {
+            let inbound = SlackInboundMessage(eventId: "answer:" + response.runId, teamId: config.teamId ?? "",
+                channelId: channel, userId: route.requesterUserId ?? "", eventType: "answer", text: "",
+                ts: "", threadTs: route.threadId, channelType: nil,
+                isDirectMessage: channel.hasPrefix("D"), files: [], opensReplyThread: false)
+            indexed = try await deliveryJournal.reserveReply(inbound, reply: Self.preparedReply(response),
+                runId: response.runId, sessionId: session, priorVerdict: priorVerdict)
+        }
+        guard let indexed else {
+            throw SlackInboundJournalError.missingClaim(response.runId)
+        }
+        guard route == nil || indexed.inbound.channelId == route?.destinationId
+            && indexed.inbound.inbound.replyThreadTs == route?.threadId else { throw SlackInboundJournalError.malformed }
+        let eventId = indexed.inbound.eventId
+        guard await deliveryJournal.acquireHandler(eventId: eventId) else { return "owed" }
+        do {
+            let verdict = try await recoverClaimedReply(response, eventId: eventId, priorVerdict: priorVerdict)
+            await deliveryJournal.releaseHandler(eventId: eventId)
+            return verdict
+        } catch {
+            await deliveryJournal.releaseHandler(eventId: eventId)
+            throw error
+        }
+    }
+
+    private func recoverClaimedReply(_ response: ChatResponse, eventId: String, priorVerdict: String?) async throws -> String {
+        guard let record = try await deliveryJournal.record(eventId: eventId),
+              let session = response.sessionId, record.assistantSessionId == session else {
+            throw SlackInboundJournalError.missingClaim(response.runId)
+        }
+        let inbound = record.inbound.inbound
+        guard config.teamId == nil || config.teamId == inbound.teamId,
+              inbound.eventType == "answer" || config.allowedChannelIds.contains(inbound.channelId) || config.allowedUserIds.contains(inbound.userId) else {
+            throw SlackSocketModeError.api("Recovery paused: current Slack workspace or admission policy no longer matches the accepted message")
+        }
+        if let phase = record.settledAssistantRuns?[response.runId] {
+            guard ["delivered", "sent_unconfirmed", "failed_before_answer"].contains(phase) else { throw SlackInboundJournalError.malformed }
+            try SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: response.runId)
+            return phase == "delivered" ? "completed" : phase
+        }
+        if record.assistantRunId == response.runId, record.phase.isTerminal {
+            try settleCheckpoint(record)
+            return record.phase == .failedBeforeAnswer ? "failed_before_answer"
+                : record.phase == .sentUnconfirmed ? "sent_unconfirmed" : "completed"
+        }
+        if record.assistantRunId != response.runId {
+            guard record.phase.isTerminal else { return "owed" }
+            try await deliveryJournal.prepareSuccessor(eventId: record.inbound.eventId,
+                response: Self.preparedReply(response), runId: response.runId, sessionId: session)
+        }
+        if record.assistantRunId == response.runId, record.phase == .generating || record.phase == .claimed {
+            _ = try await deliveryJournal.prepare(eventId: record.inbound.eventId, reply: Self.preparedReply(response))
+        }
+        if let priorVerdict {
+            let migrated = priorVerdict == "completed"
+                ? try await deliveryJournal.markDelivered(eventId: eventId)
+                : try await deliveryJournal.settleUnconfirmed(eventId: eventId)
+            try settleCheckpoint(migrated)
+            return priorVerdict
+        }
+        guard await processDurableInbound(inbound) else { return "owed" }
+        let settled = try await deliveryJournal.record(eventId: record.inbound.eventId)
+        return settled?.phase == .failedBeforeAnswer ? "failed_before_answer"
+            : settled?.phase == .sentUnconfirmed ? "sent_unconfirmed" : "completed"
+    }
+
+    private static func preparedReply(_ response: ChatResponse) -> SlackPreparedReply {
+        let uploads = uploadableImageAttachments(response.attachments ?? []).map {
+            SlackPreparedUpload(path: $0.path ?? "", name: $0.name ?? URL(fileURLWithPath: $0.path ?? "").lastPathComponent, mime: $0.mime)
+        }
+        return .make(text: response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !uploads.isEmpty
+            ? "Generated image" : response.output, uploads: uploads)
+    }
+
+    private func settleCheckpoint(_ record: SlackInboundDeliveryRecord) throws {
+        if let session = record.assistantSessionId, let run = record.assistantRunId {
+            try SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run)
+        }
+    }
+
+    private func acknowledge(envelopeId: String, socket: URLSessionWebSocketTask) async throws {
         let payload = try JSONValue.object([
             "envelope_id": .string(envelopeId),
         ]).serialize(pretty: false)
@@ -1174,14 +1210,14 @@ public struct SlackSocketModeLoop: LoopRunner {
         return channelId.hasPrefix("D") || channelId.hasPrefix("C") || channelId.hasPrefix("G")
     }
 
-    private func recoverDurableInboundDeliveries() async throws {
+    public func reconcileSavedReplies() async throws {
         for record in try await deliveryJournal.unresolved() {
             guard !Task.isCancelled else { throw CancellationError() }
             let inbound = record.inbound.inbound
             // A credential/workspace change must not replay old workspace
             // work into the newly selected Slack installation.
             guard config.teamId == nil || config.teamId == inbound.teamId,
-                  config.allowedChannelIds.contains(inbound.channelId)
+                  inbound.eventType == "answer" || config.allowedChannelIds.contains(inbound.channelId)
                     || config.allowedUserIds.contains(inbound.userId) else {
                 await recordError(
                     context: "inbound_recovery_policy_mismatch",
@@ -1190,13 +1226,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 )
                 continue
             }
-            guard await deduper.markIfNew(inbound.eventId) else { continue }
-            let delivered = await handleDurableInbound(inbound)
-            if delivered {
-                await deduper.confirmDelivered(inbound.eventId)
-            } else {
-                await deduper.unmark(inbound.eventId)
-            }
+            _ = await handleDurableInbound(inbound)
         }
         if Task.isCancelled { throw CancellationError() }
     }
@@ -1220,13 +1250,6 @@ public struct SlackSocketModeLoop: LoopRunner {
 
     private func performDurableInbound(_ inbound: SlackInboundMessage) async -> Bool {
         guard await deliveryJournal.acquireHandler(eventId: inbound.eventId) else { return false }
-        // A bot may wake on this message (0.4.12). The claim is PERSISTED in the
-        // delivery journal before any bot is woken, so a retry or a recovery
-        // pass over this row cannot wake the same bot twice; a claim that
-        // cannot be written skips the fan-out rather than risk a repeat.
-        if (try? await deliveryJournal.claimBotEvent(eventId: inbound.eventId)) == true {
-            await botEventIntake(inbound.channelId, inbound.text, inbound.userId)
-        }
         let delivered = await processDurableInbound(inbound)
         await deliveryJournal.releaseHandler(eventId: inbound.eventId)
         return delivered
@@ -1237,20 +1260,51 @@ public struct SlackSocketModeLoop: LoopRunner {
             let claim = try await deliveryJournal.claim(received)
             guard case .claimed(var record) = claim else { return true }
             let inbound = record.inbound.inbound
+            // Only unresolved messages can wake bots; the durable claim keeps
+            // socket, history and recovery from repeating the same fan-out.
+            if (try? await deliveryJournal.claimBotEvent(eventId: inbound.eventId)) == true {
+                await botEventIntake(inbound.channelId, inbound.text, inbound.userId)
+            }
+            if record.phase == .claimed, inbound.text.trimmingCharacters(in: .whitespacesAndNewlines) == "/retry resend" {
+                if let rejected = try await deliveryJournal.retryRejectedReply(for: inbound) {
+                    return await handleDurableInbound(rejected.inbound.inbound)
+                }
+                let saved = try await deliveryJournal.savedUnconfirmedReply(for: inbound)
+                if let saved, let reply = saved.prepared, let session = saved.assistantSessionId {
+                    try await deliveryJournal.prepareSuccessor(eventId: saved.inbound.eventId,
+                        response: reply, runId: "resend:" + inbound.eventId, sessionId: session)
+                    _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
+                    return await handleDurableInbound(saved.inbound.inbound)
+                }
+                record = try await deliveryJournal.prepare(eventId: inbound.eventId,
+                    reply: .make(text: "There's no saved answer waiting to be delivered.", uploads: []))
+            }
             if record.phase == .generating {
-                // Chat turns may themselves use tools. A restart cannot
-                // blindly regenerate a turn that began but did not durably
-                // publish its prepared reply, or those effects can duplicate.
-                _ = try await deliveryJournal.markInterrupted(eventId: inbound.eventId)
-                // Not replaying is right; saying nothing was not. The sender's
-                // message was consumed and only the error log knew (fable51 #9).
-                await notifyLostTurn(inbound)
-                return true
+                if let session = record.assistantSessionId, let run = record.assistantRunId {
+                    if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: session, runId: run) {
+                        record = try await deliveryJournal.prepare(eventId: inbound.eventId, reply: Self.preparedReply(response))
+                    } else {
+                        // The checkpoint owns an unfinished turn; do not run the inbound again.
+                        if try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run) { return false }
+                        record = try await deliveryJournal.prepare(eventId: inbound.eventId,
+                            reply: .make(text: "Couldn't finish the reply.", uploads: []), failedBeforeAnswer: true)
+                    }
+                } else {
+                    record = try await deliveryJournal.prepare(eventId: inbound.eventId,
+                        reply: .make(text: "Couldn't finish the reply.", uploads: []), failedBeforeAnswer: true)
+                }
+            }
+            if record.phase == .outcomeUnknown && record.prepared == nil {
+                if let session = record.assistantSessionId, let run = record.assistantRunId {
+                    if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: session, runId: run) {
+                        record = try await deliveryJournal.prepare(eventId: inbound.eventId, reply: Self.preparedReply(response))
+                    } else if try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run) { return false }
+                }
             }
             if record.phase == .outcomeUnknown && record.prepared == nil {
                 // Older interrupted turns already attempted their once-only
                 // notice. Keep the no-replay evidence without a pending slot.
-                _ = try await deliveryJournal.markInterrupted(eventId: inbound.eventId)
+                _ = try await deliveryJournal.settleUnconfirmed(eventId: inbound.eventId, failedBeforeAnswer: true)
                 return true
             }
             if record.phase == .dispatching || record.phase == .outcomeUnknown {
@@ -1265,18 +1319,24 @@ public struct SlackSocketModeLoop: LoopRunner {
                     return false
                 }
                 guard !Task.isCancelled else { return false }
-                _ = try await deliveryJournal.beginGeneration(eventId: inbound.eventId)
+                let sessionId = try await SlackSessionStore(dataRoot: dataRoot).activeSessionId(for: inbound)
+                let runId = UUID().uuidString
+                record = try await deliveryJournal.beginGeneration(eventId: inbound.eventId, runId: runId, sessionId: sessionId)
                 let reply: SlackSocketModeReply
+                var failedBeforeAnswer = false
                 do {
-                    reply = try await attachmentAwareReply(hydration, original: inbound)
+                    reply = try await ChatPersistenceContext.$pinnedTurnRunID.withValue(runId) {
+                        try await attachmentAwareReply(hydration, original: inbound)
+                    }
                 } catch {
                     guard !Task.isCancelled else { return false }
+                    failedBeforeAnswer = true
                     await recordError(context: "chat_handler", error: error, inbound: inbound)
                     // Prepare the error notice too. Its delivery is a real
                     // external effect and must not multiply on retry.
                     let detail = error is SlackSessionStorageError
                         ? "Slack conversation storage needs repair before this message can be answered. Existing conversation bindings were preserved."
-                        : ProviderRecoveryPolicy.personMessage(error) ?? "Couldn’t finish the reply."
+                        : ProviderRecoveryPolicy.personMessage(error) ?? "Couldn't finish the reply."
                     reply = SlackSocketModeReply(text: (hydration.notice.map { $0 + "\n\n" } ?? "") + detail)
                 }
                 let uploads = Self.uploadableImageAttachments(reply.attachments).map {
@@ -1293,42 +1353,63 @@ public struct SlackSocketModeLoop: LoopRunner {
                 }
                 record = try await deliveryJournal.prepare(
                     eventId: inbound.eventId,
-                    reply: .make(text: text.isEmpty ? "Generated image" : text, uploads: uploads)
+                    reply: .make(text: text.isEmpty ? "Generated image" : text, uploads: uploads),
+                    failedBeforeAnswer: failedBeforeAnswer
                 )
             }
             guard let prepared = record.prepared else { throw SlackInboundJournalError.malformed }
+            guard !TurnQuietHoursWindow.holdsResidentWake(session: record.assistantSessionId, dataRoot: dataRoot) else { return false }
+            guard record.lastRejection?.preparedFingerprint != prepared.fingerprint else { return false }
             guard !Task.isCancelled else { return false }
             // Missing local artifacts are a pre-dispatch failure. Preserve the
             // prepared reply and do not rerun the chat/tool turn to recreate it.
             guard prepared.uploads.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
+                _ = try await deliveryJournal.retryPrepared(eventId: inbound.eventId, detail: "prepared Slack image is no longer available")
                 await recordError(context: "prepared_reply_artifact_missing", error: SlackSocketModeError.api("prepared Slack image is no longer available"), inbound: inbound)
                 return false
             }
-            _ = try await deliveryJournal.beginDispatch(eventId: inbound.eventId)
-            var input: [String: JSONValue] = [
-                "channel": .string(inbound.channelId),
-                "text": .string(prepared.text),
-                "metadata": Self.deliveryMetadata(eventId: inbound.eventId, fingerprint: prepared.fingerprint),
-            ]
-            if let threadTs = inbound.replyThreadTs { input["thread_ts"] = .string(threadTs) }
-            let posted: JSONValue
-            do {
-                posted = try await outbound.postMessage(input)
-            } catch {
-                return await recordUnknownDelivery(inbound, detail: "Reply dispatch outcome is unknown: \(Self.redact(String(describing: error)))")
-            }
-            guard Self.envelopeOK(posted) else {
-                if Self.isProvenSlackRejection(posted) {
-                    _ = try await deliveryJournal.retryPrepared(eventId: inbound.eventId, detail: "Slack rejected reply before acceptance")
-                    await recordError(context: "post_reply", error: SlackSocketModeError.api(String(describing: posted)), inbound: inbound)
-                    return false
+            guard !config.botToken.isEmpty else { throw SlackSocketModeError.api("Slack reply token is unavailable") }
+            for upload in prepared.uploads {
+                guard !(try Data(contentsOf: URL(fileURLWithPath: upload.path))).isEmpty else {
+                    throw SlackSocketModeError.api("Prepared Slack image is empty")
                 }
-                return await recordUnknownDelivery(inbound, detail: "Slack returned an ambiguous reply failure")
+            }
+            if record.confirmedText != true {
+                _ = try await deliveryJournal.beginDispatch(eventId: inbound.eventId)
+                var input: [String: JSONValue] = [
+                    "channel": .string(inbound.channelId),
+                    "text": .string(prepared.text),
+                    "metadata": Self.deliveryMetadata(eventId: inbound.eventId, fingerprint: prepared.fingerprint),
+                ]
+                if let run = record.assistantRunId, let id = UUID(uuidString: run) { input["client_msg_id"] = .string(id.uuidString) }
+                if let threadTs = inbound.replyThreadTs { input["thread_ts"] = .string(threadTs) }
+                guard try CodexCompletionLifecycleProjection.permitsDelivery(sessionId: record.assistantSessionId,
+                    runId: record.assistantRunId, configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
+                    dataRoot: dataRoot) else { return false }
+                let posted: JSONValue
+                do {
+                    posted = try await SlackConnectorActions.postMessage(input: input, dataRoot: dataRoot, tokenOverride: config.botToken)
+                } catch {
+                    return await recordUnknownDelivery(inbound, detail: "Reply dispatch outcome is unknown: \(Self.redact(String(describing: error)))")
+                }
+                guard Self.envelopeOK(posted) else {
+                    if Self.isProvenSlackRejection(posted) {
+                        let fields = Self.object(posted)
+                        let reason = Self.string(fields?["error"]) ?? Self.string(Self.object(fields?["response"])?["error"]) ?? ""
+                        _ = try await deliveryJournal.retryPrepared(eventId: inbound.eventId,
+                            detail: "Reply rejected before acceptance: \(reason). Use /retry resend to deliver the saved answer.",
+                            rejectionReason: reason)
+                        await recordError(context: "post_reply", error: SlackSocketModeError.api(String(describing: posted)), inbound: inbound)
+                        return false
+                    }
+                    return await recordUnknownDelivery(inbound, detail: "Slack returned an ambiguous reply failure")
+                }
+                record = try await deliveryJournal.confirmReplyPart(eventId: inbound.eventId, isText: true)
             }
             // File completion has no message-metadata hook. Once any upload
             // begins, a failed/crashed attempt is explicitly ambiguous; it is
             // never replayed merely because the text marker is visible.
-            for upload in prepared.uploads {
+            for upload in prepared.uploads.dropFirst(record.confirmedUploadCount ?? 0) {
                 var uploadInput: [String: JSONValue] = [
                     "channel": .string(inbound.channelId),
                     "file_path": .string(upload.path),
@@ -1336,15 +1417,21 @@ public struct SlackSocketModeLoop: LoopRunner {
                     "title": .string(upload.name),
                 ]
                 if let threadTs = inbound.replyThreadTs { uploadInput["thread_ts"] = .string(threadTs) }
+                _ = try await deliveryJournal.beginDispatch(eventId: inbound.eventId)
+                guard try CodexCompletionLifecycleProjection.permitsDelivery(sessionId: record.assistantSessionId,
+                    runId: record.assistantRunId, configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
+                    dataRoot: dataRoot) else { return false }
                 do {
-                    guard Self.envelopeOK(try await outbound.uploadFile(uploadInput)) else {
+                    guard Self.envelopeOK(try await SlackConnectorActions.uploadFile(input: uploadInput, dataRoot: dataRoot, tokenOverride: config.botToken)) else {
                         return await recordUnknownDelivery(inbound, detail: "Text reply accepted; image completion is unconfirmed")
                     }
                 } catch {
                     return await recordUnknownDelivery(inbound, detail: "Text reply accepted; image dispatch outcome is unknown")
                 }
+                record = try await deliveryJournal.confirmReplyPart(eventId: inbound.eventId, isText: false)
             }
             _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
+            try settleCheckpoint(record)
             await recordReceipt(kind: "reply", inbound: inbound, reply: prepared.text)
             await writeState([
                 "lastDeliveryOutcome": .string("delivered"),
@@ -1370,15 +1457,14 @@ public struct SlackSocketModeLoop: LoopRunner {
         if let progressChatHandler {
             return try await progressChatHandler(inbound, sink)
         }
-        if let chatHandler {
-            return try await chatHandler(inbound)
-        }
         throw SlackSocketModeError.api("no Slack chat handler configured")
     }
 
     private func noticeSink(for inbound: SlackInboundMessage) -> SlackChatProgressSink {
         let memory = SlackTurnNoticeMemory()
-        let outbound = self.outbound
+        // Notices use the same captured credential snapshot as reply delivery.
+        let botToken = config.botToken
+        let dataRoot = self.dataRoot
         let channelId = inbound.channelId
         let threadTs = inbound.replyThreadTs
         return { kind, text in
@@ -1389,42 +1475,8 @@ public struct SlackSocketModeLoop: LoopRunner {
                 "text": .string(trimmed),
             ]
             if let threadTs { input["thread_ts"] = .string(threadTs) }
-            let posted = (try? await outbound.postMessage(input)).map(Self.envelopeOK) ?? false
+            let posted = (try? await SlackConnectorActions.postMessage(input: input, dataRoot: dataRoot, tokenOverride: botToken)).map(Self.envelopeOK) ?? false
             if !posted { await memory.release(kind) }
-        }
-    }
-
-    /// The exact words a lost turn gets. One sentence: what happened, and what
-    /// the sender can do about it. It promises no replay, because there is
-    /// none — the turn's tool effects may already have landed.
-    static let lostTurnNotice =
-        "I lost my answer to your last message when I restarted — say it again and I'll pick it up."
-
-    /// Tell the sender, at most once, that their turn died mid-generation
-    /// (fable51 #9).
-    ///
-    /// The terminal interrupted phase is persisted before sending. A failed
-    /// send or crash cannot authorize another notice or replay the chat turn.
-    private func notifyLostTurn(_ inbound: SlackInboundMessage) async {
-        guard let stored = try? await deliveryJournal.record(eventId: inbound.eventId),
-              stored.phase == .interrupted else { return }
-        var input: [String: JSONValue] = [
-            "channel": .string(inbound.channelId),
-            "text": .string(Self.lostTurnNotice),
-        ]
-        if let threadTs = inbound.replyThreadTs { input["thread_ts"] = .string(threadTs) }
-        do {
-            guard Self.envelopeOK(try await outbound.postMessage(input)) else {
-                await recordError(
-                    context: "recover_lost_turn_notice",
-                    error: SlackSocketModeError.api("Slack rejected the interrupted-turn notice"),
-                    inbound: inbound)
-                return
-            }
-        } catch {
-            // The notice failing is itself worth a receipt — the sender is now
-            // silently short one answer AND one explanation.
-            await recordError(context: "recover_lost_turn_notice", error: error, inbound: inbound)
         }
     }
 
@@ -1440,13 +1492,16 @@ public struct SlackSocketModeLoop: LoopRunner {
             "lastDeliveryOutcomeDetail": .string(detail),
         ])
         await recordError(context: "reply_outcome_unknown", error: SlackSocketModeError.api(detail), inbound: inbound)
-        return false
+        do {
+            guard let record = try await deliveryJournal.record(eventId: inbound.eventId) else { return false }
+            return await reconcileDurableReply(record)
+        } catch { return false }
     }
 
     private func reconcileDurableReply(_ record: SlackInboundDeliveryRecord) async -> Bool {
         let inbound = record.inbound.inbound
         guard let prepared = record.prepared, let botUserId = config.botUserId, !botUserId.isEmpty else {
-            return await recordUnknownDelivery(inbound, detail: "Cannot reconcile reply without its prepared artifact and bot identity")
+            return await settleUnconfirmedReply(record, detail: "Cannot reconcile reply without its prepared artifact and bot identity")
         }
         var params: [String: String] = [
             "channel": inbound.channelId,
@@ -1470,12 +1525,13 @@ public struct SlackSocketModeLoop: LoopRunner {
                 fingerprint: prepared.fingerprint,
                 botUserId: botUserId
             ) else {
-                return await recordUnknownDelivery(inbound, detail: "Slack history does not prove one uniquely accepted reply; automatic resend suppressed")
+                return await settleUnconfirmedReply(record, detail: "Slack history does not uniquely prove acceptance")
             }
             guard prepared.uploads.isEmpty else {
-                return await recordUnknownDelivery(inbound, detail: "Text reply reconciled; image completion cannot be uniquely proven from Slack history")
+                return await settleUnconfirmedReply(record, detail: "Text reply accepted; image completion is unconfirmed")
             }
             _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
+            try settleCheckpoint(record)
             await recordReceipt(kind: "reply_reconciled", inbound: inbound, reply: prepared.text)
             await writeState([
                 "lastDeliveryOutcome": .string("delivered"),
@@ -1484,7 +1540,20 @@ public struct SlackSocketModeLoop: LoopRunner {
             ])
             return true
         } catch {
-            return await recordUnknownDelivery(inbound, detail: "Slack reply reconciliation unavailable: \(Self.redact(String(describing: error)))")
+            return await settleUnconfirmedReply(record, detail: "Slack reply reconciliation unavailable: \(Self.redact(String(describing: error)))")
+        }
+    }
+
+    private func settleUnconfirmedReply(_ record: SlackInboundDeliveryRecord, detail: String) async -> Bool {
+        do {
+            _ = try await deliveryJournal.markOutcomeUnknown(eventId: record.inbound.eventId, detail: detail)
+            _ = try await deliveryJournal.settleUnconfirmed(eventId: record.inbound.eventId)
+            try settleCheckpoint(record)
+            await recordError(context: "reply_sent_unconfirmed", error: SlackSocketModeError.api(detail), inbound: record.inbound.inbound)
+            return true
+        } catch {
+            await recordError(context: "inbound_delivery_journal", error: error, inbound: record.inbound.inbound)
+            return false
         }
     }
 
@@ -1536,7 +1605,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         guard let value = object(envelope), bool(value["ok"]) == false,
               let error = string(value["error"]) ?? string(object(value["response"])?["error"]) else { return false }
         // Slack documents internal_error/fatal_error as potentially partially
-        // successful. Only explicit pre-acceptance rejection classes retry.
+        // successful. Only these explicit classes prove non-acceptance.
         return Set([
             "invalid_auth", "not_authed", "token_expired", "token_revoked",
             "missing_scope", "no_permission", "not_in_channel", "channel_not_found",
@@ -1685,8 +1754,6 @@ public struct SlackSocketModeLoop: LoopRunner {
     ) -> [ChatOrchestration.MultimodalAttachment] {
         attachments.filter { attachment in
             attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
-                && attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                && FileManager.default.fileExists(atPath: attachment.path ?? "")
         }
     }
 
@@ -1755,26 +1822,6 @@ public struct SlackSocketModeLoop: LoopRunner {
 
     private func recordIgnoredEnvelope(_ envelope: [String: JSONValue]) async {
         let detail = ignoredEnvelopeDetail(envelope)
-        var row: [String: JSONValue] = [
-            "id": .string(UUID().uuidString),
-            "at": .string(Self.nowString()),
-            "reason": .string(detail.reason),
-            "envelopeType": .string(detail.envelopeType),
-        ]
-        if let value = detail.payloadType { row["payloadType"] = .string(value) }
-        if let value = detail.eventType { row["eventType"] = .string(value) }
-        if let value = detail.subtype { row["subtype"] = .string(value) }
-        if let value = detail.channelType { row["channelType"] = .string(value) }
-        if let value = detail.channel { row["channelId"] = .string(value) }
-        if let value = detail.user { row["userId"] = .string(value) }
-        if let value = detail.textPreview { row["textPreview"] = .string(value) }
-        try? await SlackReceiptErrorFeed.append(
-            .object(row),
-            to: slackDir.appendingPathComponent("ignored.jsonl"),
-            using: SlackSocketModeLoop.persistence,
-            retention: feedRetention,
-            label: "SlackSocketModeLoop.ignored"
-        )
         var statePatch: [String: JSONValue] = [
             "lastIgnoredAt": .string(Self.nowString()),
             "lastIgnoredReason": .string(detail.reason),
@@ -1789,60 +1836,47 @@ public struct SlackSocketModeLoop: LoopRunner {
     private func ignoredEnvelopeDetail(_ envelope: [String: JSONValue]) -> (
         reason: String,
         envelopeType: String,
-        payloadType: String?,
         eventType: String?,
-        subtype: String?,
         channelType: String?,
-        channel: String?,
-        user: String?,
-        textPreview: String?
+        channel: String?
     ) {
         let envelopeType = Self.string(envelope["type"]) ?? "unknown"
         guard envelopeType == "events_api" else {
-            return ("unsupported_envelope_type", envelopeType, nil, nil, nil, nil, nil, nil, nil)
+            return ("unsupported_envelope_type", envelopeType, nil, nil, nil)
         }
         guard let payload = Self.object(envelope["payload"]) else {
-            return ("missing_payload", envelopeType, nil, nil, nil, nil, nil, nil, nil)
+            return ("missing_payload", envelopeType, nil, nil, nil)
         }
         let payloadType = Self.string(payload["type"])
         guard payloadType == "event_callback" else {
-            return ("unsupported_payload_type", envelopeType, payloadType, nil, nil, nil, nil, nil, nil)
+            return ("unsupported_payload_type", envelopeType, nil, nil, nil)
         }
         guard let event = Self.object(payload["event"]) else {
-            return ("missing_event", envelopeType, payloadType, nil, nil, nil, nil, nil, nil)
+            return ("missing_event", envelopeType, nil, nil, nil)
         }
         let eventType = Self.string(event["type"])
         let subtype = Self.string(event["subtype"])
         let channelType = Self.string(event["channel_type"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let channel = Self.string(event["channel"])
         let user = Self.string(event["user"])
-        let textPreview: String? = {
-            guard let channel, let user,
-                  config.ingressPolicy.denial(
-                      channelId: channel, userId: user,
-                      eventType: eventType ?? "", channelType: channelType,
-                      rawText: Self.string(event["text"]) ?? ""
-                  ) == nil else { return nil }
-            return Self.string(event["text"]).map { Self.preview($0) }
-        }()
 
         if eventType != "app_mention" && eventType != "message" {
-            return ("unsupported_event_type", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+            return ("unsupported_event_type", envelopeType, eventType, channelType, channel)
         }
         if Self.string(event["bot_id"]) != nil {
-            return ("bot_message", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+            return ("bot_message", envelopeType, eventType, channelType, channel)
         }
         if let subtype, !subtype.isEmpty {
-            return ("message_subtype_\(subtype)", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+            return ("message_subtype_\(subtype)", envelopeType, eventType, channelType, channel)
         }
         if let botUserId = config.botUserId, user == botUserId {
-            return ("self_message", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+            return ("self_message", envelopeType, eventType, channelType, channel)
         }
         if eventType == "message" && !Self.isSupportedConversationChannel(channelId: channel ?? "", channelType: channelType) {
-            return ("unsupported_message_channel", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+            return ("unsupported_message_channel", envelopeType, eventType, channelType, channel)
         }
         if user?.isEmpty ?? true {
-            return ("missing_user", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+            return ("missing_user", envelopeType, eventType, channelType, channel)
         }
         if let channel, let user,
            let denial = config.ingressPolicy.denial(
@@ -1852,18 +1886,18 @@ public struct SlackSocketModeLoop: LoopRunner {
                channelType: channelType,
                rawText: Self.string(event["text"]) ?? ""
            ) {
-            return (denial.rawValue, envelopeType, payloadType, eventType, subtype, channelType, channel, user, nil)
+            return (denial.rawValue, envelopeType, eventType, channelType, channel)
         }
         let text = Self.stripBotMention(Self.string(event["text"]) ?? "", botUserId: config.botUserId)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty {
-            return ("empty_text", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+            return ("empty_text", envelopeType, eventType, channelType, channel)
         }
         let ts = Self.string(event["ts"]) ?? Self.string(event["event_ts"]) ?? ""
         if channel?.isEmpty ?? true || ts.isEmpty {
-            return ("missing_channel_or_ts", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+            return ("missing_channel_or_ts", envelopeType, eventType, channelType, channel)
         }
-        return ("unknown_filtered", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+        return ("unknown_filtered", envelopeType, eventType, channelType, channel)
     }
 
     private func recordError(context: String, error: Error, inbound: SlackInboundMessage? = nil) async {
@@ -1964,20 +1998,19 @@ public struct SlackSocketModeLoop: LoopRunner {
     }
 
     static func nowString(_ date: Date = Date()) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
+
+    private static let redactingExpressions = [
+        #"(?i)\b(?:wss?|https?)://[^\s\"<>?#]+[?#][^\s\"<>]*"#,
+        #"\bxox[baprs]-[A-Za-z0-9-]{20,}|\bxapp-[A-Za-z0-9-]{20,}\b"#,
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
 
     static func redact(_ raw: String) -> String {
         // Socket errors embed authenticated URLs (sometimes more than once).
         // Retain the endpoint for diagnosis, never its query or fragment.
         var safe = TurnSecretRedactor.redactText(raw)
-        for pattern in [
-            #"(?i)\b(?:wss?|https?)://[^\s\"<>?#]+[?#][^\s\"<>]*"#,
-            #"\bxox[baprs]-[A-Za-z0-9-]{20,}|\bxapp-[A-Za-z0-9-]{20,}\b"#,
-        ] {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+        for regex in redactingExpressions {
             let matches = regex.matches(in: safe, range: NSRange(safe.startIndex..., in: safe))
             for match in matches.reversed() {
                 guard let range = Range(match.range, in: safe) else { continue }

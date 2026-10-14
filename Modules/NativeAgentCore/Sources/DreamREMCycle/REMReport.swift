@@ -95,3 +95,64 @@ public struct REMRunReportPayload: Sendable, Codable, Equatable {
         self.report = report
     }
 }
+
+extension REMRunReportPayload {
+    public static func validatedManualCompletion(
+        response: [String: Any]
+    ) -> Result<(proposals: Int, archivedEntries: Int, nothingToConsolidate: Bool), NSError> {
+        guard let ok = bool(response["ok"]), ok else {
+            return .failure(NSError(domain: "NativeAgent.REMCompletion", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "REM consolidation did not report a successful completion."
+            ]))
+        }
+        guard let proposals = nonnegativeInt(response["proposalsGenerated"]),
+              let archivedEntries = nonnegativeInt(response["archivedEntries"]) else {
+            return .failure(NSError(domain: "NativeAgent.REMCompletion", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "REM consolidation returned an incomplete completion record."
+            ]))
+        }
+        return .success((proposals, archivedEntries, response["skipReason"] as? String == "nothing_to_consolidate"))
+    }
+
+    private static func bool(_ value: Any?) -> Bool? {
+        if let value = value as? Bool { return value }
+        if let value = value as? String {
+            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1": return true
+            case "false", "0": return false
+            default: return nil
+            }
+        }
+        return nil
+    }
+
+    private static func nonnegativeInt(_ rawValue: Any?) -> Int? {
+        // 2026-09-17: `is Bool` is not a boolean test on a decoded JSON value.
+        // JSONSerialization hands back an NSNumber, and Swift bridges an
+        // NSNumber holding 0 or 1 to Bool as readily as it bridges a real
+        // boolean — so this guard rejected every record whose counts were 0,
+        // and a young root's nothing-to-consolidate pass (proposals 0,
+        // archived 0) read as an incomplete completion record before the
+        // skipReason below was ever consulted. Reject only a true boolean.
+        if isBoolean(rawValue) { return nil }
+        let value: Int?
+        if let integer = rawValue as? Int {
+            value = integer
+        } else if let number = rawValue as? NSNumber {
+            value = number.intValue
+        } else if let text = rawValue as? String {
+            value = Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        } else {
+            value = nil
+        }
+        guard let value, value >= 0 else { return nil }
+        return value
+    }
+
+    /// True only for a genuine boolean — a JSON `true`/`false` or a Swift
+    /// `Bool` — never for a number that merely happens to be 0 or 1.
+    private static func isBoolean(_ rawValue: Any?) -> Bool {
+        guard let number = rawValue as? NSNumber else { return false }
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
+    }
+}

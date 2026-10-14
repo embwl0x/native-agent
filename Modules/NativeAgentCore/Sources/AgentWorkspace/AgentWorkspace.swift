@@ -205,6 +205,8 @@ package actor AgentWorkspaceNavigation {
         var workLinkNotice: String?
         var focusedWork: Bool = false
         var lastWorkAction: AgentWorkspaceWorkReceipt?
+        var lastUndoReceipt: JSONValue?
+        var lastDoorPage: String?
         var placeActions: [String: AgentWorkspaceWorkReceipt] = [:]
         var store: AgentWorkspaceDesktopStore?
         var persistenceIssue: String?
@@ -236,6 +238,16 @@ package actor AgentWorkspaceNavigation {
         if sessions[key]?.operation != nil {
             throw AgentWorkspaceFailure(message: "This workspace is already handling an action. No second action was started.")
         }
+        var session = try session(key: key, dataRoot: dataRoot, scope: scope)
+        let operation = UUID()
+        session.operation = operation
+        session.touched = Date()
+        session.actedJustNow = false
+        sessions[key] = session
+        return operation
+    }
+
+    private func session(key: String, dataRoot: URL?, scope: String?) throws -> Session {
         if sessions[key] == nil, sessions.count >= capacity {
             guard let oldest = sessions.filter({ $0.value.operation == nil && canEvict($0.value) }).min(by: { $0.value.touched < $1.value.touched }) else {
                 throw AgentWorkspaceFailure(message: "Resident workspaces contain unsaved or temporary drafts. Return to an existing chat to finish or discard a draft before opening another. Nothing was evicted.")
@@ -244,13 +256,36 @@ package actor AgentWorkspaceNavigation {
             HerNamed.shared.removeSession(oldest.key)
             HerItemPages.shared.removeSession(oldest.key)
         }
-        let operation = UUID()
-        var session = sessions[key] ?? restoredSession(dataRoot: persistenceEnabled ? dataRoot : nil, scope: scope)
-        session.operation = operation
+        return sessions[key] ?? restoredSession(dataRoot: persistenceEnabled ? dataRoot : nil, scope: scope)
+    }
+
+    package func undoReceipt(dataRoot: URL, scope: String) -> JSONValue? {
+        sessions[dataRoot.standardizedFileURL.path + "\u{0}" + scope]?.lastUndoReceipt
+    }
+
+    package func lastDoorPage(dataRoot: URL, scope: String) -> String? {
+        sessions[dataRoot.standardizedFileURL.path + "\u{0}" + scope]?.lastDoorPage
+    }
+
+    package func rememberDoorPage(_ page: String?, dataRoot: URL, scope: String) throws {
+        let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
+        var session = try session(key: key, dataRoot: dataRoot, scope: scope)
+        session.lastDoorPage = page
         session.touched = Date()
-        session.actedJustNow = false
         sessions[key] = session
-        return operation
+    }
+
+    package func rememberUndo(_ receipt: JSONValue, dataRoot: URL, scope: String) throws {
+        let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
+        var session = try session(key: key, dataRoot: dataRoot, scope: scope)
+        session.lastUndoReceipt = receipt
+        session.touched = Date()
+        sessions[key] = session
+    }
+
+    package func clearUndo(_ receipt: JSONValue, dataRoot: URL, scope: String) {
+        let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
+        if sessions[key]?.lastUndoReceipt == receipt { sessions[key]?.lastUndoReceipt = nil }
     }
 
     func end(key: String, operation: UUID) {
@@ -710,6 +745,13 @@ package enum AgentWorkspace {
     package typealias Perform = @Sendable (String, [String: JSONValue]) async throws -> JSONValue
     package typealias Catalog = @Sendable () async throws -> [LLMToolSchema]
 
+    package static func resolvedRead(_ result: JSONValue, as name: String) -> JSONValue {
+        let result = if case .string = result { JSONValue.object(["content": result]) } else { result }
+        guard case .object(var fields) = result else { return result }
+        if fields["resolved"] == nil { fields["resolved"] = .string(name) }
+        return .object(fields)
+    }
+
     package static func dispatch(input: [String: JSONValue], scope: String, dataRoot: URL,
                          navigation: AgentWorkspaceNavigation = .shared,
                          catalog: Catalog = { [] }, perform: Perform) async throws -> JSONValue {
@@ -721,8 +763,9 @@ package enum AgentWorkspace {
             // Her tool list as she last read it, for User's Agent view.
             let catalog: Catalog = { let schemas = try await catalog(); AgentWorkspaceScreenPreview.keep(catalog: schemas, dataRoot: dataRoot); return schemas }
             var sent: JSONValue?
+            var resolved: String?
             var result = try await run(input: input, key: key, scope: scope, dataRoot: dataRoot, navigation: navigation,
-                                       catalog: catalog, perform: perform, sent: &sent)
+                                       catalog: catalog, perform: perform, sent: &sent, resolved: &resolved)
             // Arrival invalidations replace unrelated conversation reads on
             // every navigation. Explicit conversation views still read owners.
             let persistedDesktop = await navigation.persistDesktop(key: key)
@@ -734,6 +777,7 @@ package enum AgentWorkspace {
             // room it left her in after it, under view.
             if case .object(var receipt)? = sent { receipt["view"] = result; result = .object(receipt) }
             else if let sent { result = .object(["receipt": sent, "view": result]) }
+            if let resolved { result = resolvedRead(result, as: resolved) }
             await navigation.end(key: key, operation: operation)
             return result
         } catch {
@@ -751,7 +795,7 @@ package enum AgentWorkspace {
     }
 
     private static func run(input: [String: JSONValue], key: String, scope: String, dataRoot: URL, navigation: AgentWorkspaceNavigation,
-                            catalog: Catalog, perform: Perform, sent: inout JSONValue?) async throws -> JSONValue {
+                            catalog: Catalog, perform: Perform, sent: inout JSONValue?, resolved: inout String?) async throws -> JSONValue {
         let query = try text(input["query"])
         var action = try text(input["action"])
         // 2026-09-22: Agent's first instinct was action "open" + a window name;
@@ -802,11 +846,8 @@ package enum AgentWorkspace {
                 default: break
                 }
             }
-            // Existing names first (a contact called "Health" is theirs); an
-            // alias or a family only for a name nothing else claims.
+            // Existing names first (a contact called "Health" is theirs).
             if let target = await resolve(raw) { return target }
-            let alias = HerScreen.familyAliases[raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
-            if let alias, let target = await resolve(alias) { return target }
             // A room's own verb (`status.doctor`, `research.read`) is known once
             // that room has been drawn this app run. Drawn unseen here, by the
             // renderer opening it uses, so it works from any view (desk recheck
@@ -837,7 +878,7 @@ package enum AgentWorkspace {
                 }
                 return .action(.open(.record(tool: call, input: [:], title: call)))
             }
-            return try await HerScreen.familyRoom(alias ?? raw, catalog: catalog).map(HerScreen.Target.page)
+            return try await HerScreen.familyRoom(raw, catalog: catalog).map(HerScreen.Target.page)
         }
         if let query {
             // Her screen's names first (they open the current room), then an
@@ -966,6 +1007,7 @@ package enum AgentWorkspace {
             case .open(let target):
                 guard suppliedText == nil else { throw AgentWorkspaceFailure(message: "Opening this item does not take text.") }
                 location = target
+                if case .area = target { resolved = HerScreen.textRoomName(target) }
             case .window:
                 throw AgentWorkspaceFailure(message: "That window reference was not unwrapped. Nothing was run.")
             case .back:
@@ -1132,7 +1174,7 @@ package enum AgentWorkspace {
                 if let conversation { target["conversation"] = .string(conversation) }
                 var observationTarget = target
                 if case .bool? = input["expects_reply"] { target["expects_reply"] = input["expects_reply"] }
-                if conversation == nil, !agent.hasPrefix("bot:"), let existing = try? AgentWorkspaceConversationReader(dataRoot: dataRoot).find(
+                if conversation == nil, !agent.hasPrefix("bot:"), let existing = try? AgentWorkspacePorts.current.conversations.find(dataRoot: dataRoot,
                     scopeSessionID: scope, agent: agent, label: nil) {
                     observationTarget["conversation"] = .string(existing.label)
                 }
@@ -1159,7 +1201,7 @@ package enum AgentWorkspace {
                     // Admission may already have saved an uncertain send. Keep
                     // its exact return route without interpreting it as delivery.
                     if let sharedWorkSource {
-                        if !agent.hasPrefix("bot:"), let row = try? AgentWorkspaceConversationReader(dataRoot: dataRoot).find(
+                        if !agent.hasPrefix("bot:"), let row = try? AgentWorkspacePorts.current.conversations.find(dataRoot: dataRoot,
                             scopeSessionID: scope, agent: agent, label: conversation) {
                             let bound = AgentWorkspaceLocation.record(tool: "agent_read",
                                 input: ["agent": .string(agent), "conversation": .string(row.label)], title: name ?? agent)
@@ -1202,12 +1244,14 @@ package enum AgentWorkspace {
         func shown(_ projection: AgentWorkspaceProjection, key: String, outcome: JSONValue) async -> JSONValue {
             let projection = AgentWorkspaceReadiness.filter(projection)
             let frame = await navigation.present(projection, key: key, outcome: outcome)
-            if let life = HerScreen.lifeRoom(place, projection: projection, frame: frame, dataRoot: dataRoot) { return .string(life) }
+            if let life = HerScreen.lifeRoom(place, projection: projection, frame: frame, dataRoot: dataRoot) {
+                return .object(["status": outcome, "content": .string(life)])
+            }
             guard let room = HerScreen.textRoomName(place) else { return frame }
             let text = HerScreen.textRoom(room, place: place, projection: projection, frame: frame, dataRoot: dataRoot, scope: scope)
             // A place opened by its owner's read: User's Agent view shows this copy.
             if case .area = place { AgentWorkspaceScreenPreview.keep(room: room, text: text, dataRoot: dataRoot) }
-            return .string(text)
+            return .object(["status": outcome, "content": .string(text)])
         }
         // Her own rooms that need no owner read first: desk, mac, helpers, people, conversations.
         if [.area("ongoing"), .area("computer"), .area("helpers"), .area("browser"), .people(page: 0), .conversations(page: 0),
@@ -1327,7 +1371,7 @@ package enum AgentWorkspace {
         }
         if case .record(let tool, var arguments, let title) = location, tool == "agent_read",
            case .string(let agent)? = arguments["agent"], !agent.hasPrefix("bot:"),
-           let row = try? AgentWorkspaceConversationReader(dataRoot: dataRoot).find(scopeSessionID: scope, agent: agent,
+           let row = try? AgentWorkspacePorts.current.conversations.find(dataRoot: dataRoot, scopeSessionID: scope, agent: agent,
                label: { if case .string(let label)? = arguments["conversation"] { return label }; return nil }()) {
             arguments["conversation"] = .string(row.label)
             let bound = AgentWorkspaceLocation.record(tool: tool, input: arguments, title: title)
@@ -1381,10 +1425,12 @@ package enum AgentWorkspace {
             let row: [String: JSONValue] = if case .object(let row) = value { row } else { [:] }
             return [row["detail"], row["error"], row["message"]].compactMap { if case .string(let text)? = $0 { text } else { nil } }.first ?? "The read did not complete."
         }()
-        if let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope, issue: issue, value: value) {
+        var roomObservation: (world: HerWorld, at: Date)?
+        if let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope, issue: issue, value: value,
+                                           observed: { roomObservation = ($0, $1) }) {
             _ = await navigation.observe(location: location, result: value, key: key)
-            await HerScreen.markRoomSeen(location, dataRoot: dataRoot, scope: scope)
-            return .string(room)
+            await HerScreen.markRoomSeen(location, dataRoot: dataRoot, scope: scope, observation: roomObservation)
+            return .object(["status": outcome, "content": .string(room)])
         }
         // A person's window holds both directions: the chats they opened with
         // her over the bridge sit beside the ones she started (2026-09-22).
@@ -1408,11 +1454,14 @@ package enum AgentWorkspace {
            let changes = await navigation.observe(location: location, result: value, key: key) {
             fields["changes"] = changes; frame = .object(fields)
         }
-        if let life = HerScreen.lifeRoom(location, projection: recoveredProjection, frame: frame, dataRoot: dataRoot) { return .string(life) }
+        if let life = HerScreen.lifeRoom(location, projection: recoveredProjection, frame: frame, dataRoot: dataRoot) {
+            return .object(["status": outcome, "content": .string(life)])
+        }
         // A read with a room of its own (status.doctor) shows as that room, as
         // its page 2 already did (walk 6: page 1 came back as raw JSON with action ids).
         if let room = HerScreen.textRoomName(location) {
-            return .string(HerScreen.textRoom(room, place: location, projection: recoveredProjection, frame: frame, dataRoot: dataRoot, scope: scope))
+            return .object(["status": outcome, "content": .string(HerScreen.textRoom(room, place: location,
+                projection: recoveredProjection, frame: frame, dataRoot: dataRoot, scope: scope))])
         }
         return frame
     }
