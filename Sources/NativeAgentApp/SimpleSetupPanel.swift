@@ -100,7 +100,10 @@ struct SimpleSetupPanel<Content: View>: View {
                         .padding(12)
                     }
                 }
-                .background { if reduceTransparency { shape.fill(NativeAgentShell.room) } }
+                // A page read in full (Connectors, Providers) sits on the
+                // room's own fill; the glass keeps only its rim. Clear glass
+                // let the chat read through the text (User, 10-18).
+                .background { shape.fill(NativeAgentShell.room) }
                 .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
                 .padding(32)
             Button("Close", action: close)
