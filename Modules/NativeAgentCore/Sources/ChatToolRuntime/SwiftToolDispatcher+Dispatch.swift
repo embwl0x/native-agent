@@ -1232,8 +1232,29 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         }
         if let refusal = agentHostSetupRefusal(tool: tool, input: input) { return refusal }
         if let refusal = await standingBotsArgumentRefusal(tool: tool, input: input) { return refusal }
+        // A Mac verb whose screen control is off is answered by that
+        // permission's own card, the one the verb itself would hand back,
+        // never by a card for an action that cannot run (fresh-root drive
+        // 10-17: under Work, approving 'go' ran into the screen-control card
+        // inside the replay, where nobody saw it).
+        // The same access answer the verb reads (admitted Full Mac, the
+        // surface's trigger), so the card comes exactly when the verb would
+        // hand it back.
+        if Self.screenControlToolNames.contains(tool), await !fullMacToolAccess(surface: surface).accessibilityAllowed,
+           let need = macControlCategoryNeedEnvelope(
+               categories: ["accessibility"], mode: Self.screenControlReadToolNames.contains(tool) ? .read : .write,
+               why: "Screen control lets me read and control apps on your Mac.") {
+            return need
+        }
         return nil
     }
+
+    /// Every chat tool whose own gate needs the accessibility category, and
+    /// those of them that only read.
+    static let screenControlReadToolNames = Set(fullMacAccessibilityReadToolNames + macMenuReadToolNames
+        + macClipboardReadToolNames + macReadToolNames)
+    static let screenControlToolNames = screenControlReadToolNames.union(["act", "go"] + fullMacAccessibilityInjectionToolNames
+        + macClipboardWriteToolNames + macMenuPressToolNames)
 
     /// Connect-by-name, before a card exists. An agent this build has no row
     /// for, or one that is not installed, is a certain "no" — the person should

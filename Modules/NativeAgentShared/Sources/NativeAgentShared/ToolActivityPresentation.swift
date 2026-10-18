@@ -145,6 +145,10 @@ public enum ToolActivityPresentation {
 
     private static let titles = [
         "read": "Read a document", "apply_patch": "Edit files", "read_file": "Read a file",
+        // The Mac verbs: under Work every one of them is a card a person reads.
+        "go": "Open an app, file or page", "act": "Use an app on screen", "screen": "Look at the screen",
+        "menu": "Read an app's menus", "menu_press": "Choose a menu item", "wait": "Wait for the screen",
+        "clipboard_read": "Read the clipboard", "clipboard_write": "Copy to the clipboard",
         "chat_reply": "Reply to a conversation",
         "codex_message": "Send a coding request", "restart_app": "Restart the app",
         "write_file": "Write a file", "git": "Work with version history", "install_app": "Install the app",

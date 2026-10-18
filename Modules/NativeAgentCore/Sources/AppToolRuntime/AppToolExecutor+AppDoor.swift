@@ -1215,7 +1215,14 @@ extension AppToolExecutor {
                 receipts.append(receipt)
             }
         }
-        if case .object(var waiting)? = receipts.first(where: ChatToolOutcome.isWaitingOnPerson) {
+        // A receipt waiting on the person speaks for the batch. So does a card
+        // a call filed when it skipped (a permission it needs), but only when
+        // nothing in the batch ran: answering the card replays the batch, which
+        // then repeats nothing (fresh-root drive 10-17: a batched go+act filed
+        // the screen-control card inside its receipts and nobody saw it).
+        let speaking = receipts.first(where: ChatToolOutcome.isWaitingOnPerson)
+            ?? (receipts.allSatisfy(ChatToolOutcome.neverRan) ? receipts.first(where: InlineInteractionNeed.isWaiting) : nil)
+        if case .object(var waiting)? = speaking {
             waiting["receipts"] = .array(receipts)
             return .object(waiting)
         }
