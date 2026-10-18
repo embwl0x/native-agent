@@ -27,10 +27,12 @@ public enum MobileTrustAction: Sendable {
 
         public var summary: String {
             switch self {
-            case .safe: "Read files; no changes or Mac control"
-            case .workMode: "Edit approved workspaces; no outside writes or shell"
-            case .builder: "Edit workspaces; ask to write outside; no shell"
-            case .fullMac: "Files anywhere, shell, system control, move or trash"
+            // What the permission law does under each posture (PermissionLaw),
+            // and what only Full Mac opens (the Mac-control categories).
+            case .safe: "Read files; change nothing on your side; no shell or git"
+            case .workMode: "Edit approved workspaces; ask before sends or changes on your side; Mac control, shell and git need Full Mac"
+            case .builder: "Edit workspaces and ask before writing elsewhere; Mac control, shell and git need Full Mac"
+            case .fullMac: "Files anywhere, shell, system control, move or trash; deleting a contact, event or reminder still asks you"
             }
         }
     }

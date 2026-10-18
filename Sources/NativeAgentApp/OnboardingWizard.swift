@@ -758,6 +758,11 @@ private struct ProviderConnectStep: View {
                         OAuthSignInButton(provider: .chatgpt) { Task { await reload(connectedId: "openai_oauth_direct") } }
                         Divider()
                         OAuthSignInButton(provider: .anthropic) { Task { await reload(connectedId: "anthropic_oauth_direct") } }
+                        // Claude's other way in, as on the Providers page: a
+                        // `claude setup-token` paste (10-18, a fresh-install VM: the browser
+                        // sign-in is not always possible on a first run, and the
+                        // 09-22 cleanup had taken the row that held the paste).
+                        AnthropicSetupTokenInput { Task { await reload(connectedId: "anthropic_oauth_direct") } }
                         Divider()
                         OAuthSignInButton(provider: .xai) { Task { await reload(connectedId: "xai_oauth_direct") } }
                     }

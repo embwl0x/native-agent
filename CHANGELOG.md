@@ -6,6 +6,10 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.6.6 — first-run fixes (2026-10-18)
+
+- Onboarding shows the Claude setup-token paste under Sign in with Claude; file-access tools (shell, git, apply_patch, build, install) answer with their category card before any action card under Work, as the Mac verbs do for screen control; fetch.* cards read "Fetch from the web"; Trust preset summaries and the user guide say what the law does (Mac control, shell and git need Full Mac).
+
 ## 0.6.5 — the agent is the app (2026-10-17)
 
 ### Parts on one law

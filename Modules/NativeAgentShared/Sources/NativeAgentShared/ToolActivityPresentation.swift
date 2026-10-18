@@ -5,6 +5,14 @@ public enum ToolActivityPresentation {
     public static func title(_ name: String) -> String {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if let title = titles[name.lowercased()] { return title }
+        // A part's network reach, keyless or as a signed-in connector: what a
+        // person reads on its card ("weather wants to fetch from the web").
+        if name.lowercased().hasPrefix("fetch.") {
+            let source = name.dropFirst("fetch.".count)
+                .split(whereSeparator: { $0 == "_" || $0 == "." || $0 == "-" }).joined(separator: " ")
+            if source.lowercased() == "keyless" { return "Fetch from the web" }
+            if let first = source.first { return "Fetch from " + first.uppercased() + source.dropFirst() }
+        }
         let words = name.split(whereSeparator: { $0 == "_" || $0 == "." || $0 == "-" })
             .joined(separator: " ")
         guard let first = words.first else { return "Use a tool" }

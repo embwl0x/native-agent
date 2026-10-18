@@ -164,10 +164,10 @@ locations.
 
 | Preset | Access |
 |---|---|
-| **Safe** | Read files; no changes or Mac control. |
-| **Work mode** | Edit approved workspaces; no outside writes or shell. |
-| **Builder** | Edit workspaces; ask to write outside; no shell. |
-| **Full Mac** | Files anywhere, shell, system control, move or trash. |
+| **Safe** | Read files; change nothing on your side; no shell or git. |
+| **Work mode** | Edit approved workspaces; ask before sends or changes on your side; Mac control, shell and git need Full Mac. |
+| **Builder** | Edit workspaces and ask before writing elsewhere; Mac control, shell and git need Full Mac. |
+| **Full Mac** | Files anywhere, shell, system control, move or trash; deleting a contact, event or reminder still asks you. |
 
 Choosing Full Mac asks for confirmation. It stays on until the mode changes;
 there is no timer. For admitted turns, Full Mac grants the agent autonomy

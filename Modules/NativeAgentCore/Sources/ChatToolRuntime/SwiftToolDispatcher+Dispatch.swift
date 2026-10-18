@@ -1232,22 +1232,30 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         }
         if let refusal = agentHostSetupRefusal(tool: tool, input: input) { return refusal }
         if let refusal = await standingBotsArgumentRefusal(tool: tool, input: input) { return refusal }
-        // A Mac verb whose screen control is off is answered by that
-        // permission's own card, the one the verb itself would hand back,
-        // never by a card for an action that cannot run (fresh-root drive
+        // A tool whose own gate needs a Mac-control category that is off is
+        // answered by that category's card, the one the tool itself would hand
+        // back, never by a card for a call that cannot run (fresh-root drive
         // 10-17: under Work, approving 'go' ran into the screen-control card
-        // inside the replay, where nobody saw it).
-        // The same access answer the verb reads (admitted Full Mac, the
-        // surface's trigger), so the card comes exactly when the verb would
-        // hand it back.
+        // inside the replay, where nobody saw it; shell under Work the same
+        // with file access). The same access answer the tool reads (admitted
+        // Full Mac, the surface's trigger).
         if Self.screenControlToolNames.contains(tool), await !fullMacToolAccess(surface: surface).accessibilityAllowed,
            let need = macControlCategoryNeedEnvelope(
                categories: ["accessibility"], mode: Self.screenControlReadToolNames.contains(tool) ? .read : .write,
                why: "Screen control lets me read and control apps on your Mac.") {
             return need
         }
+        if Self.fileAccessGatedToolNames.contains(tool), await !fullMacToolAccess(surface: surface).fileOpsAllowed {
+            return builderFullMacRequired(tool: tool)
+        }
         return nil
     }
+
+    /// Every chat tool whose own gate is `builderFullMacRequired` whatever
+    /// its input (dispatch: shell, bash, git, apply_patch, the build and
+    /// remote-node tools, install and restart).
+    static let fileAccessGatedToolNames: Set<String> = ["shell", "bash", "git", "apply_patch", "swift_build", "swift_test",
+        "remote_node_list", "remote_node_execute", "install_app", "restart_app"]
 
     /// Every chat tool whose own gate needs the accessibility category, and
     /// those of them that only read.
