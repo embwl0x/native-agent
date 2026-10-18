@@ -733,12 +733,14 @@ struct DetachedChatPanelView: View {
             // Desk 658.11: the same shared live-turn card as the main window.
             // Keyed on THIS window's session, so a concurrent turn in another
             // session (detached or main) can never render here.
-            if MacChatTurnCardProjection.isVisible(
+            // Its room only grows while it is up, so the card changing does
+            // not move the transcript above (TurnCardRoom).
+            TurnCardRoom(shows: MacChatTurnCardProjection.isVisible(
                 appModel.engine.turns.lifecycle(for: sessionId),
                 sessionId: sessionId,
                 approvals: appModel.engine.approvals.records,
                 parseTimestamp: UserDisplayFormatters.parseFoundationISOTimestamp
-            ) {
+            ), floor: 0, turn: appModel.engine.turns.lifecycle(for: sessionId).map { "\($0.identity.sessionId)/\($0.identity.turnId)" } ?? "") {
                 MacChatTurnCardHost(
                     sessionId: sessionId,
                     onStop: { appModel.stopChatStream(sessionId: sessionId) }

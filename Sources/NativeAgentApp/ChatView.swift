@@ -385,34 +385,25 @@ struct ChatTurnCardInset: View {
     let store: ChatTurnCardClearance
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            if showThinkingRow {
-                // Desk 658.11: the one shared live-turn card. The
-                // detached window composes this exact host.
-                // No Stop here: the composer's Stop, in the send slot, is
-                // the one stop control (2026-09-23).
-                MacChatTurnCardHost(
-                    sessionId: appModel.activeChatSessionId,
-                    onOpenScreen: layoutProfile == SimpleViewMode.simple ? nil : { WorkPaneState.shared.userShow(.screen) }
-                )
-                // User, 2026-09-03: the working card shares the
-                // composer's frame, edge to edge.
-                .padding(.horizontal, NativeAgentShellLayout.roomGutter)
-                .frame(maxWidth: NativeAgentShellLayout.roomColumn, alignment: .topLeading)
-                .padding(.leading, NativeAgentShellLayout.roomLeadingInset)
-                .padding(.trailing, NativeAgentShellLayout.roomTrailingInset)
-                .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
-                .padding(.bottom, 6)
-                .transition(NativeAgentMotion.fade)
-            }
+        TurnCardRoom(shows: showThinkingRow, floor: MacChatTurnCardMetrics.floatingClearance,
+                     turn: appModel.engine.turns.lifecycle(for: appModel.activeChatSessionId).map { "\($0.identity.sessionId)/\($0.identity.turnId)" } ?? "") {
+            // Desk 658.11: the one shared live-turn card. The
+            // detached window composes this exact host.
+            // No Stop here: the composer's Stop, in the send slot, is
+            // the one stop control (2026-09-23).
+            MacChatTurnCardHost(
+                sessionId: appModel.activeChatSessionId,
+                onOpenScreen: layoutProfile == SimpleViewMode.simple ? nil : { WorkPaneState.shared.userShow(.screen) }
+            )
+            // User, 2026-09-03: the working card shares the
+            // composer's frame, edge to edge.
+            .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+            .frame(maxWidth: NativeAgentShellLayout.roomColumn, alignment: .topLeading)
+            .padding(.leading, NativeAgentShellLayout.roomLeadingInset)
+            .padding(.trailing, NativeAgentShellLayout.roomTrailingInset)
+            .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
+            .padding(.bottom, 6)
         }
-        // User, 2026-09-15: the floor is the SHOWN card's minimum,
-        // not a standing reservation. At rest no card is drawn and
-        // this inset still held 80pt of the transcript's room.
-        .frame(
-            minHeight: showThinkingRow ? MacChatTurnCardMetrics.floatingClearance : 0,
-            alignment: .bottom
-        )
         // The reservation is whatever this actually drew. The write
         // goes to the observable, which ChatView.body does not read,
         // so measuring the card costs the Latest pill a relayout and
@@ -426,6 +417,39 @@ struct ChatTurnCardInset: View {
         .animation(
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: showThinkingRow)
+    }
+}
+
+/// Room for the live-turn card that only grows while the card is up and goes
+/// with it. The card changes inside it (a tool's detail line, an approval
+/// row, the thinking clock) without moving the transcript above (User, 10-18:
+/// "when it moves or changes and expands the chat will move up or down with
+/// it"). The main window's inset and the detached panel both use it.
+struct TurnCardRoom<Card: View>: View {
+    let shows: Bool
+    let floor: CGFloat
+    /// The turn the card belongs to: a new turn starts from the floor even
+    /// when its card appears before the last one's hide is seen (Sol).
+    let turn: String
+    @ViewBuilder let card: () -> Card
+    @State private var held: CGFloat = 0
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            if shows {
+                card()
+                    .fixedSize(horizontal: false, vertical: true)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                        if height > held { held = height }
+                    }
+                    .transition(NativeAgentMotion.fade)
+            }
+        }
+        .frame(height: shows ? max(floor, held) : 0, alignment: .bottom)
+        .onChange(of: shows) { _, now in
+            if !now { held = 0 }
+        }
+        .onChange(of: turn) { held = 0 }
     }
 }
 
@@ -571,8 +595,13 @@ struct ChatView: View {
         // what is on screen rather than the last commit.
         appModel.flushLiveChatDrafts()
         draftSessionId = sessionId
-        draftText = appModel.chatDraft(for: sessionId)
-        draftAdoptedText = draftText
+        let stored = appModel.chatDraft(for: sessionId)
+        // Writing the same words back into the field puts the caret at its
+        // start, so a re-adopt while the person types (a chat settling its id,
+        // the view reappearing) sent the rest of the sentence before its first
+        // words (10-18). Only a different draft is written.
+        if draftText != stored { draftText = stored }
+        draftAdoptedText = stored
         draftEditedAt = .distantPast
     }
     @State var renameTitle = ""
