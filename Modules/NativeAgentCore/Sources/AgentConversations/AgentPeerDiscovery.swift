@@ -1,6 +1,8 @@
+import AuthoredCapabilities
 import AgentLinkTransport
 import AgentWorkspace
 import Foundation
+import MacControl
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
@@ -222,22 +224,6 @@ package enum AgentPeerDiscovery {
     static let agentAppWords: Set<String> = ["claude", "codex", "cursor", "zed", "lmstudio", "ollama", "muse", "endo",
                                              "grok", "gemini", "antigravity", "goose", "hermes", "dot"]
 
-    /// Where installs land: the Applications folders, then every recipe's
-    /// program folders, the ones connecting looks in (`AgentHostRow.programFolders`).
-    static func installFolders() -> [String] {
-        var seen: Set<String> = []
-        return (["/Applications", "~/Applications"] + AgentHostDirectory.rows.flatMap(\.programFolders)).map(AgentHostDirectory.expand)
-            .filter { $0.hasPrefix("/") && seen.insert($0).inserted }
-    }
-
-    /// An install or removal changes its folder's modification time.
-    static func installStamp() -> [String] {
-        installFolders().map { folder in
-            var info = stat()
-            return stat(folder, &info) == 0 ? "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec)" : "-"
-        }
-    }
-
     /// Every running program's path, from the process table. Nothing is run.
     static func runningPrograms() -> [String] {
         var pids = [pid_t](repeating: 0, count: Int(max(0, proc_listallpids(nil, 0))) + 64)
@@ -251,6 +237,19 @@ package enum AgentPeerDiscovery {
 
     static func appInfo(_ app: URL) -> NSDictionary? { NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist")) }
 
+    package typealias Bundle = MacAppIndex.App
+
+    static func bundles() async throws -> [Bundle] {
+        try await MacAppIndex.shared.apps()
+    }
+
+    static func apps(_ bundles: [Bundle]) -> [(url: URL, info: NSDictionary, id: String)] {
+        bundles.compactMap { app in
+            guard let id = app.bundleID, let info = app.info else { return nil }
+            return (app.url, info, id)
+        }
+    }
+
     /// The app's own program among the running ones, not a helper or updater inside it.
     static func running(_ app: URL, _ info: NSDictionary?, in programs: [String]) -> [String] {
         guard let name = info?["CFBundleExecutable"] as? String else { return [] }
@@ -259,27 +258,21 @@ package enum AgentPeerDiscovery {
     }
 
     /// Five read-only sources, each tagged on what it saw (`foundBy`): Launch
-    /// Services and the Applications folders, program folders, MCP settings
+    /// Services and the Mac's app index, program folders, MCP settings
     /// files, running programs, and A2A cards on declared loopback ports. A
     /// recipe is a candidate on any program evidence (an app, a program file, a
     /// running program); a settings file alone only adds to what was seen. It
     /// is `connectable` when connecting would find it too. An agent-named app
     /// no recipe knows is one with no connect path. A program file is only
     /// looked at, never run, whatever its name.
-    static func scanLocal() async -> [AgentDiscoveryCandidate] {
-        let folders = installFolders(), programs = runningPrograms()
+    static func scanLocal(_ bundles: [Bundle]) async -> [AgentDiscoveryCandidate] {
+        let programs = runningPrograms()
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let fm = FileManager.default
-        var named: [(url: URL, info: NSDictionary, id: String)] = []
-        for folder in folders.prefix(2) {
-            for file in ((try? fm.contentsOfDirectory(atPath: folder)) ?? []).sorted() where file.hasSuffix(".app") {
-                let words = file.dropLast(4).lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
-                let app = URL(fileURLWithPath: folder).appendingPathComponent(file)
-                // A background-only helper (a URL handler) is not an agent to talk to.
-                guard !agentAppWords.isDisjoint(with: words + [words.joined()]), let info = appInfo(app),
-                      info["LSBackgroundOnly"] as? Bool != true, let id = info["CFBundleIdentifier"] as? String else { continue }
-                named.append((app, info, id))
-            }
+        let named = apps(bundles).filter { app in
+            let words = app.url.deletingPathExtension().lastPathComponent.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
+            // A background-only helper (a URL handler) is not an agent to talk to.
+            return !agentAppWords.isDisjoint(with: words + [words.joined()]) && app.info["LSBackgroundOnly"] as? Bool != true
         }
         var results: [AgentDiscoveryCandidate] = []
         for row in AgentHostDirectory.rows {
@@ -535,32 +528,77 @@ public actor AgentDiscoverySession {
     public static let shared = AgentDiscoverySession()
     private var cached: [AgentDiscoveryCandidate]?
     private var pending: Task<[AgentDiscoveryCandidate], Never>?
-    /// The install folders as the last scan saw them.
-    private var installs: [String] = []
-    private let scan: @Sendable () async -> [AgentDiscoveryCandidate]
+    private var installs: Task<Void, Never>?
+    private var indexErrorLogged = false
+    private let scan: @Sendable ([AgentPeerDiscovery.Bundle]) async -> [AgentDiscoveryCandidate]
 
-    init(scan: @escaping @Sendable () async -> [AgentDiscoveryCandidate] = AgentPeerDiscovery.scanLocal) {
+    init(scan: @escaping @Sendable ([AgentPeerDiscovery.Bundle]) async -> [AgentDiscoveryCandidate] = AgentPeerDiscovery.scanLocal) {
         self.scan = scan
     }
 
     public func candidates(refresh: Bool = false, dataRoot: URL) async -> [AgentDiscoveryCandidate] {
         if let pending { return await pending.value }
         if !refresh { return cached ?? [] }
-        installs = AgentPeerDiscovery.installStamp()
-        let task = Task { await scan() }
+        let scan = scan
+        let task = Task {
+            let bundles: [AgentPeerDiscovery.Bundle]
+            do { bundles = try await AgentPeerDiscovery.bundles() }
+            catch { logIndexError(error); bundles = [] }
+            nativeLog("AgentDiscoverySession: discovery scan started")
+            return await scan(bundles)
+        }
         pending = task
         let result = await task.value
+        nativeLog("AgentDiscoverySession: discovery scan finished")
         cached = result
         pending = nil
         offer(result, dataRoot: dataRoot)
         return result
     }
 
-    /// The continuation's existing tick asks: the first time (launch), and
-    /// whenever an install folder changed since the last scan. Nothing polls.
-    public func refreshIfInstallsChanged(dataRoot: URL) async {
-        guard cached == nil || AgentPeerDiscovery.installStamp() != installs else { return }
-        _ = await candidates(refresh: true, dataRoot: dataRoot)
+    private func logIndexError(_ error: Error) {
+        guard !indexErrorLogged else { return }
+        indexErrorLogged = true
+        nativeLog("AgentDiscoverySession: app index unavailable: %@", error.localizedDescription)
+    }
+
+    /// `app.installed`, delivery only: each bundle id at a version this Mac's
+    /// scans have not seen, once the bundle is whole. The first scan records
+    /// what is there silently. The name and path are plain data.
+    private func arrived(_ bundles: [AgentPeerDiscovery.Bundle], dataRoot: URL) {
+        let url = dataRoot.appendingPathComponent("agents/installed-apps.json")
+        let baseline = FileManager.default.fileExists(atPath: url.path)
+        guard var seen = baseline ? (try? JSONDecoder().decode(Set<String>.self, from: Data(contentsOf: url))) : [] else {
+            return nativeLog("AgentDiscoverySession: %@ does not read; no app arrivals until it is fixed or removed", url.path)
+        }
+        let before = seen
+        for app in bundles {
+            guard let id = app.bundleID, let info = app.info else { continue }
+            if let sdef = info["OSAScriptingDefinition"] as? String,
+               !FileManager.default.fileExists(atPath: app.url.appendingPathComponent("Contents/Resources/" + sdef).path) { continue }
+            guard seen.insert(id + " " + app.version).inserted, baseline else { continue }
+            guard case .object(let payload) = app.json else { continue }
+            AbilityStore(dataRoot: dataRoot).signal("app.installed", payload)
+        }
+        guard seen != before || !baseline else { return }
+        do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(seen), to: url) }
+        catch { nativeLog("AgentDiscoverySession: could not keep installed apps: %@", error.localizedDescription) }
+    }
+
+    /// Register once; Spotlight's gathering and update edges own app arrivals.
+    public func watchInstalls(dataRoot: URL) {
+        guard installs == nil else { return }
+        installs = Task {
+            do {
+                for await _ in try await MacAppIndex.shared.changes() {
+                    arrived(try await AgentPeerDiscovery.bundles(), dataRoot: dataRoot)
+                    if pending == nil { Task { _ = await candidates(refresh: true, dataRoot: dataRoot) } }
+                }
+            } catch {
+                installs = nil
+                logIndexError(error)
+            }
+        }
     }
 
     /// After agent_connect: a connection ends its offer in the same call.

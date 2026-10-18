@@ -78,7 +78,8 @@ extension AppToolExecutor {
             // change only at a release.
             LLMToolSchema(
                 name: "app",
-                description: "NativeAgent itself, worked in process: your home, its pages, settings and buttons, and every tool you have. Nothing comes forward on the owner's screen unless an action says screen. {} is your home first, where you left off (open agent windows, work in progress, what waits and what arrived, each with a name like desk.4, mail or an agent's name), then a line per page and the action ids that work on every page. item alone opens a name or ref from home or one of its rooms; its text or fields go in args. page (+item) reads one: what it shows, its settings, its version, and its actions as id(args) label; the owner's ones say why and where they do them. action + args does one; the receipt says what changed and what else the app did. preview:true reports checks, would_card and approver and does nothing; script previews describe only calls reached. expected_version refuses if the page changed since that read. find takes words (\"disconnect telegram\") and returns matching pages and actions with args_schema, one example and scriptable. script runs a JavaScript function body that finishes a task in one call; app.* calls return synchronously and top-level await is not supported: app.<page>.<action>(args) for any action whose line does not say not in scripts, as app.inbox.archive({ids, reason}), plus app.read(page, item) (a home item opens only outside a script), app.find(words) and app.log(text); return what you want back. Each call is checked as its own action and gets a ledger row; one that is still the owner's, blocked or waiting on their card stops the script at that line, and the calls before it stay done. "
+                toolClass: .read,
+                description: "NativeAgent itself, worked in process: your home, its pages, settings and buttons, and every tool you have. Nothing comes forward on the owner's screen unless an action says screen. {} is your home first, where you left off (open agent windows, work in progress, what waits and what arrived, each with a name like desk.4, mail or an agent's name), then a line per page and the action ids that work on every page. item alone opens a name or ref from home or one of its rooms; its text or fields go in args. page (+item) reads one: what it shows, its settings, its version, and its actions as id(args) label; the owner's ones say why and where they do them. action + args does one; the receipt says what changed and what else the app did. preview:true reports checks, would_card and approver and does nothing; script previews describe only calls reached. expected_version refuses if the page changed since that read. find takes words (\"disconnect telegram\") and returns matching pages and actions with args_schema, one example and scriptable. script runs a JavaScript function body that finishes a task in one call; app.* calls return synchronously and top-level await is not supported: app.<page>.<action>(args) for any action whose line does not say not in scripts, as app.inbox.archive({ids, reason}), plus app.read(page, item) (a home item opens only outside a script), app.find(words) and app.log(text); return what you want back. Each call passes the turn's gates and gets its own ledger row. A call needing approval waits for the card: approved returns its real result; declined throws AppError with reason declined, which code can catch and continue. shell.run and shell.bash answer with exit_code, stdout and stderr as data whatever the exit code (a false test is an answer, not a failure); only a timeout, a cancel or a refusal throws. card.request waits and returns the person's answer. Full Mac writes need no approval card. Owner-only or blocked calls still stop at that line; earlier calls stay done. "
                     + "Permitted reads need no permission: do them. Finish every requested action and read before answering, and use every option the request names. mac.go opens apps, files and folders; content readers only read. "
                     + "One action uses app {action:\"files.read\",args:{path:\"README.md\"}}. Put its arguments inside args; page selects a reader, not an action id. find always discovers actions, including with page:\"home\"; use work.context {query} or chat.search {query} for saved work and history. Call these without a read first: " + AppActions.hot.map(\.hotLine).joined(separator: "; ") + ".",
                 parametersJSON: params(
@@ -93,7 +94,7 @@ extension AppToolExecutor {
                         ("preview", boolSchema("With action or script: report checks, would_card and approver; nothing is done. Script previews describe only calls reached.")),
                         ("expected_version", strSchema("With action: the version a read returned. Refused, with nothing done, if that page changed since. It hashes what the page shows, so a page changed and changed back has its old version again.")),
                         ("find", strSchema("What you want done, in words. Discovers actions on every page, including home, with args_schema, one example and scriptable. Search history explicitly with work.context or chat.search.")),
-                        ("script", strSchema("JavaScript function body: app.* calls return synchronously; top-level await is not supported. No direct network or file APIs; use eligible app actions. Up to 8 KB, 50 actions, 100 reads and 60 seconds of script time; time waiting on app calls does not count.")),
+                        ("script", strSchema("JavaScript function body: app.* calls return synchronously; top-level await is not supported. No direct network or file APIs; use eligible app actions. Up to 512 KB, 50 actions, 100 reads and 60 seconds of script time; time waiting on app calls does not count.")),
                     ],
                     required: []
                 )
@@ -103,6 +104,7 @@ extension AppToolExecutor {
         return [
             LLMToolSchema(
                 name: "chat_reply",
+                toolClass: .send,
                 description: "Reply to an exact opened human conversation's saved destination; the chat read binds its conversation/latest message. Creates no user turn or foreground-chat change. Answer your active conversation normally. Never automatically resend uncertain delivery.",
                 parametersJSON: params(properties: [
                     ("conversation_session_id", strSchema("Exact conversation id from app {page:\"chat\", item}.")),
@@ -112,11 +114,13 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.status",
+                toolClass: .read,
                 description: "Return visible NativeAgent Browser status and recent browser run receipts.",
                 parametersJSON: params(properties: [], required: [])
             ),
             LLMToolSchema(
                 name: "browser.open_url",
+                toolClass: .read,
                 description: "Open an http/https URL in the visible NativeAgent Browser and record a browser run receipt.",
                 parametersJSON: params(
                     properties: [
@@ -130,6 +134,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.read_text",
+                toolClass: .read,
                 description: "Read visible page text from the current NativeAgent Browser page and persist a source receipt. Current page must be http/https.",
                 parametersJSON: params(
                     properties: [
@@ -140,6 +145,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.read_links",
+                toolClass: .read,
                 description: "Read links from the current NativeAgent Browser page and persist a link-source receipt. Current page must be http/https.",
                 parametersJSON: params(
                     properties: [
@@ -150,6 +156,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.screenshot",
+                toolClass: .read,
                 description: "Capture a PNG screenshot from the current NativeAgent Browser page and persist a screenshot receipt. Current page must be http/https.",
                 parametersJSON: params(
                     properties: [
@@ -160,21 +167,25 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_status",
+                toolClass: .read,
                 description: "Whether the Chrome extension is connected and which tabs are yours in the NativeAgent group.",
                 parametersJSON: params(properties: [], required: [])
             ),
             LLMToolSchema(
                 name: "browser.chrome_reload_extension",
+                toolClass: .write,
                 description: "Reload the connected Chrome extension quietly. Your NativeAgent group tabs stay open. Returns the reconnect receipt or failure.",
                 parametersJSON: params(properties: [("dry_run", boolSchema("Describe current connection without reloading the extension."))], required: [])
             ),
             LLMToolSchema(
                 name: "browser.chrome_setup",
+                toolClass: .write,
                 description: "Set up Chrome on request via Trust's owner: prepare/reveal the bundled extension in a visible folder and open Chrome's extensions page, changing focus. Chrome still must load the unpacked extension; help with authorized Mac controls, then check browser.chrome_status. Copying files never proves installation; permissions never change.",
                 parametersJSON: params(properties: [("dry_run", boolSchema("Describe current connection without preparing files or opening apps."))], required: [])
             ),
             LLMToolSchema(
                 name: "browser.chrome_close_tab",
+                toolClass: .write,
                 description: "Explicitly close one of your NativeAgent group tabs. Omit tab_id for this conversation's tab. The person's tabs cannot be closed.",
                 parametersJSON: params(properties: [
                     ("tab_id", nullable(intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
@@ -183,6 +194,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_navigate",
+                toolClass: .read,
                 description: "Open/read a URL in this conversation's last tab if it is still in the NativeAgent group; otherwise open a new tab there. The owner's tabs are never used. Returns main content as numbered rows. url back/forward moves through this tab's history. fields + submit fills/sends a form in this call.",
                 parametersJSON: params(
                     properties: [
@@ -198,6 +210,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_snapshot",
+                toolClass: .read,
                 description: "Read Chrome's rendered document in reading order, including inline links. Act with node_id (row number as a string or label). Reads carry url, title, snapshot_id, version, captured_at, bytes and has_more. Read folded sections with the supplied more address; scrolling remains an action. scope page adds site nav.",
                 parametersJSON: params(
                     properties: [
@@ -213,6 +226,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_click",
+                toolClass: .write,
                 description: "Click one row of the current Chrome page with node_id: a row number as a string (\"73\") or its label (\"Sign in\"). Waits for any navigation it starts and returns the fresh page; no snapshot call needed.",
                 parametersJSON: params(
                     properties: [
@@ -226,6 +240,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_media",
+                toolClass: .write,
                 description: "Play, pause or seek the first audio/video in your Chrome tab, and only that player. Reports paused state, current time and whether the player confirmed it: playback advancing, the pause holding, the seek landing. When it is not confirmed, read the page and click the player's own control. Resume uses play; stop-playing uses pause.",
                 parametersJSON: params(properties: [
                     ("tab_id", nullable(intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
@@ -236,6 +251,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_scroll",
+                toolClass: .read,
                 description: "Move a Chrome page or scrollable row by delta_y pixels. Returns newly visible rows, distance moved and remaining below; explicitly reports no movement.",
                 parametersJSON: params(
                     properties: [
@@ -251,6 +267,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_fill",
+                toolClass: .write,
                 description: "Fill the current Chrome form: fields {label or row: value} sets text boxes/selects/checkboxes in page order, then submit clicks a button (true presses Enter). Finds all fields before typing. For one row use node_id + value. Returns filled fields and fresh page; never retries ambiguous dispatch.",
                 parametersJSON: params(
                     properties: [
@@ -267,6 +284,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_type",
+                toolClass: .write,
                 description: "Append text to an editable row (number or label), up to 20 s; returns typed progress and the fresh page. On partial progress send only the rest, never the whole text again.",
                 parametersJSON: params(
                     properties: [
@@ -282,6 +300,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_select",
+                toolClass: .write,
                 description: "Choose options in a select row by value or label (shown as label=value, * selected). Returns the fresh page.",
                 parametersJSON: params(
                     properties: [
@@ -296,6 +315,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_keypress",
+                toolClass: .write,
                 description: "Press a key or chord in a row (number or label): Enter, Tab, Escape, arrows, a single character like j or /. To move down the page use browser.chrome_scroll; to go back, browser.chrome_navigate{url:\"back\"}. Verified by what changed; returns the fresh page.",
                 parametersJSON: params(
                     properties: [
@@ -310,6 +330,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_set_checked",
+                toolClass: .write,
                 description: "Set a checkbox, radio or switch row on or off (idempotent). Returns the fresh page.",
                 parametersJSON: params(
                     properties: [
@@ -324,6 +345,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_double_click",
+                toolClass: .write,
                 description: "Double-click a row (number or label). Verified by what changed; returns the fresh page.",
                 parametersJSON: params(
                     properties: [
@@ -337,6 +359,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_drag",
+                toolClass: .write,
                 description: "Drag a drag-advertising node onto a drop-advertising node in one exact fresh Chrome snapshot/frame. Uses synthetic HTML events and page DataTransfer handlers without activating the tab. Target must accept dragover. dropDispatched does not prove success; check returned page. No OS/file dragging or pointer-only canvas gestures. Never automatically retry unknown outcomes.",
                 parametersJSON: params(
                     properties: [
@@ -351,6 +374,7 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_wait",
+                toolClass: .read,
                 description: "Wait up to 10 s for the tab to settle or a row to become visible/hidden/enabled/disabled. Rarely needed: acts already wait for navigation.",
                 parametersJSON: params(
                     properties: [

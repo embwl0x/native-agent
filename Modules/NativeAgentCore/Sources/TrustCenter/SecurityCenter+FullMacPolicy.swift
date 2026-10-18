@@ -148,10 +148,11 @@ extension SwiftNativeSecurityCenter {
     // "app" is the name the Mac chat saves its own turns under; a turn
     // resumed from one of her cards replays under that saved envelope, and it
     // is still the person's own Mac chat (User 09-27: "she's on full mac there
-    // should be none of that"). A peer's card saves as "agent-bridge".
+    // should be none of that"). A peer's card saves as "agent-bridge". "bot"
+    // is her own helper: it inherits her posture exactly (User 10-17).
     static let fullMacYoloLocalSurfaces: Set<String> = Set(
         [
-            "chat", "app", "desk", "codex-bridge", "claude-bridge",
+            "chat", "app", "bot", "desk", "codex-bridge", "claude-bridge",
             "connector_action", "nextgen_action", "native_actions", "mcp_ui",
         ]
             + WorkshopSurfaceVocabulary.gateSpellings

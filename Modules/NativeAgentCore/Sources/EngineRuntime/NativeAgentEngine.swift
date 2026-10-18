@@ -77,9 +77,8 @@ public final class NativeAgentEngine: Sendable {
     /// Agent contacts: A2A tasks, the desktop route, human replies, Grok's
     /// inbound answers and the reply/notice continuation, on this root's clients.
     public let agents: AgentContacts
-    /// ContextFlow: turn preparation, settled-tool prewarm and memory-record →
-    /// atom-id translation. Chat clients and prewarm reach it only on a root
-    /// with a body.
+    /// ContextFlow: turn preparation and memory-record → atom-id translation.
+    /// Chat clients reach it only on a root with a body.
     public let contextFlow: NativeContextFlowRuntime
 
     public init(
@@ -91,6 +90,11 @@ public final class NativeAgentEngine: Sendable {
         self.ports = ports
         self.hasBody = hasBody
         PeerTrust.install(dataRoot: dataRoot)
+        CapabilityLifecycle.keepAuthority = { root in
+            if case .present(let policy) = SavedTrustPolicyAuthority.read(dataRoot: root),
+               AppToolExecutor.lockedPolicyIsFullMac(policy) { return true }
+            return PeerDataTaint.ownerAuthorized
+        }
         self.memory = MemoryFacade(dataRoot: dataRoot)
         self.approvals = ApprovalsFacade(dataRoot: dataRoot)
         self.inbox = InboxFacade(dataRoot: dataRoot)
@@ -244,7 +248,6 @@ public final class NativeAgentEngine: Sendable {
         fileAccess: String = "read_only",
         approvalFiler: (any ApprovalFiler)? = nil,
         approvalTimeoutSeconds: Double = 30,
-        trust: (any AutonomyResolver)? = nil,
         verifiedSessionId: String? = nil
     ) -> any ToolDispatchClient {
         let tools = toolDispatchClient()
@@ -254,7 +257,6 @@ public final class NativeAgentEngine: Sendable {
             approvalFiler: approvalFiler,
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
-            trust: trust,
             verifiedSessionId: verifiedSessionId
         )
     }

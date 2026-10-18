@@ -14,6 +14,10 @@ package protocol AgentWorkspaceConversationPort: Sendable {
     func presentation(_ row: AgentConversationRecord) -> JSONValue
     func liveHandOff(_ row: AgentConversationRecord) -> Bool
     func unsettledAttention(_ row: AgentConversationRecord) -> Bool
+    /// A room in chat `scope` showed her these replies of a contact's (send
+    /// id: the words shown); the ones that chat asked for, shown exactly as
+    /// saved, are hers there and not handed over again.
+    func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL)
 }
 
 package struct AgentWorkspacePeer: Sendable {

@@ -70,12 +70,16 @@ public enum SchedulerJobRuntime {
         guard let key = nextWallClockOccurrence(for: job), let next = civilEpoch(key) else { return nil }
         if let saved, wallClockOccurrence(for: job, epoch: saved) == key { return saved }
         let zone = SchedulerJobNormalizer.resolveTimezone(schedule["timezone"] ?? schedule["tz"])
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(secondsFromGMT: 0)!
-        let components = utc.dateComponents([.year, .month, .day, .hour, .minute], from: Date(timeIntervalSince1970: next))
-        var local = utc
-        local.timeZone = zone
-        return local.date(from: components)?.timeIntervalSince1970
+        return wallClock(Date(timeIntervalSince1970: next), from: TimeZone(secondsFromGMT: 0)!, to: zone)?.timeIntervalSince1970
+    }
+
+    /// The civil minute `date` reads in `from`, formed again in `to`.
+    public static func wallClock(_ date: Date, from: TimeZone, to: TimeZone) -> Date? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = from
+        let components = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        calendar.timeZone = to
+        return calendar.date(from: components)
     }
 
     public static func epoch(from raw: JSONValue?) -> Double? {

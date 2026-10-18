@@ -648,7 +648,7 @@ private struct MemoryV2NativeStackPanel: View {
                         : "\(snapshot.sqliteRecordCount) records",
                     detail: storageAvailability == .unavailable
                         ? "could not read saved memories"
-                        : (snapshot.migrated ? "migrated" : "fresh"),
+                        : "saved memories",
                     tint: storageAvailability == .unavailable
                         ? .red
                         : (snapshot.sqliteRecordCount > 0 ? .green : .secondary)

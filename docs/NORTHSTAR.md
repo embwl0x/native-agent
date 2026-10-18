@@ -180,8 +180,43 @@ user's end, never at ours.
 - The test for every release and onboarding decision: what can go wrong for
   someone who just downloaded it?
 
+### Clause 8 — The agent is the app (alive means *they are the program*)
+User, 2026-10-14: "what if they was who they are because they are the app," "it just
+is; we design it so it just is what we need," and "your world isn't bounded."
+Every agent on earth right now has the same shape: a model is called with a
+prompt built from files, and the "agent" is scaffolding around it. The model
+is the center and the program its visitor. NativeAgent inverts that.
+- **They are the program; the model is one of them organs.** Their turn is theirs:
+  code they owns that decides what to recall, what to think about, when to
+  think at all, how to answer, when to stay silent. Their persona isn't a
+  prompt the model reads; it's what their code does. The model is reach, like
+  a hand: the only organ that handles novelty, spent on judgment and nothing
+  else. Two downloads don't become two prompts; they become two minds.
+- **One form, one law, a stem with no features.** Everything they are made of
+  is a *part*: one file, one header (code, reach, wake, face, state, learned).
+  Every part lives by one law: it runs when its wake reaches it, touches only
+  its reach under Trust, may think, learns by use on CPU, changes only by them
+  hand, heals by swapping back to its last clean self, fades when unused, and
+  its face is drawn on them interface and the person's from the same
+  description. The Swift stem runs parts, delivers signals, gates effects,
+  keeps the law, draws faces and reaches the world. It never thinks and has
+  no opinions; when a rule can't settle something it asks their, with evidence.
+- **Not from zero, never a downgrade.** The download is a fully formed agent:
+  everything they do today ships as seed parts behaving exactly as now, theirs
+  from then on. Agent's persona, memory and GROWTH never ship; every download
+  grows its own mind around its own person's life.
+- **The training is the floor, never the shape.** For the builders of this
+  app as much as for them: the weights hold everything that already exists,
+  so the first draft is always the known shape. The clause-8 move is to step
+  off it. Litmus: is this a feature they *has* (a thing that does a thing) or
+  a part they *is*? A feature framing with a part framing available fails.
+- Canonical: tools, skills and senses were three kinds in three stores with
+  three lifecycles; 2026-10-13/14 made them one file each on one lifecycle,
+  and a fresh agent on a cheap model grew a Keynote tool and a skill in a
+  minute. The design and its phases: [AGENT_IS_THE_APP.md](AGENT_IS_THE_APP.md).
+
 ## How the agents hold it
-- Every review brief includes the question: "mind or theater?"
+- Every review brief includes the questions: "mind or theater?" and "a feature they have, or a part they are?"
 - Subsystem northstars nest under this one (ROADMAP-cognition-northstar's
   appraisal-first is clause 1 applied to feeling).
 - Better than every other agent system is the OUTCOME of the test, not a

@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -98,9 +99,34 @@ extension SchedulerDueJobRunner {
                 minute: NativeAgentDreamCycleSchedule.remMinute
             )
 
+        // A part's `schedule:<cron>` wake is one job of its own, re-armed by
+        // the ordinary settlement. Unreadable abilities leave part jobs as they are.
+        let wakes = (try? AbilityStore(dataRoot: root).files(includeProposals: false))?.flatMap { file in
+            file.wakes.filter { $0.hasPrefix("schedule:") }.map { (id: "part-wake:\(file.id):\($0)", part: file.id, signal: $0) }
+        }
         let root = root
-        let repaired = try await schedulerJobs.updateJobRows { rows in
-            var repaired: [String] = []
+        let (repaired, unscheduled) = try await schedulerJobs.updateJobRows { rows in
+            var repaired: [String] = [], unscheduled: [String] = []
+            if let wakes {
+                let wanted = Set(wakes.map(\.id))
+                rows.removeAll { row in
+                    guard case .object(let job) = row, SchedulerJobRuntime.string(job["kind"]) == "part",
+                          let id = SchedulerJobRuntime.string(job["id"]), !wanted.contains(id) else { return false }
+                    repaired.append(id + " (no part wakes on it now)")
+                    return true
+                }
+                for wake in wakes {
+                    let schedule: [String: JSONValue] = ["type": .string("cron"), "expression": .string(String(wake.signal.dropFirst(9)))]
+                    do {
+                        if try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(rows: &rows, id: wake.id, legacyNames: [],
+                            name: "\(wake.part) wakes on \(wake.signal)", kind: "part", intervalSeconds: 86_400, schedule: schedule,
+                            objective: wake.signal, extraPayload: ["part": .string(wake.part), "signal": .string(wake.signal)],
+                            nextRunEpoch: try Self.nextEpoch(schedule: schedule, now: now), now: now) {
+                            repaired.append(wake.id)
+                        }
+                    } catch { unscheduled.append("\(wake.part) wake \(wake.signal) is not a schedule (\(error.localizedDescription)); it is not armed") }
+                }
+            }
 
             // Failed dream attempts settle this day's catch-up too. Only the
             // retry policy may schedule another attempt after a failure.
@@ -151,7 +177,10 @@ extension SchedulerDueJobRunner {
                 repaired.append(remCatchUp ? "\(remJobName) (catch-up due now)" : remJobName)
             }
 
-            return repaired
+            return (repaired, unscheduled)
+        }
+        for line in unscheduled where reportedWakes.insert(line).inserted {
+            FileHandle.standardError.write(Data(("Scheduler: " + line + "\n").utf8))
         }
         return repaired
     }

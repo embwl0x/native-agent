@@ -61,25 +61,19 @@ struct InfoPill: View {
 }
 
 extension View {
+    func sheetCloseButton() -> some View {
+        buttonStyle(.bordered)
+            .buttonBorderShape(.circle)
+            .foregroundStyle(Color(nsColor: .controlTextColor))
+            .accessibilityLabel("Close")
+    }
+
     /// The kit's card on a settings section; callers own content and padding.
     func settingsCardSurface() -> some View {
         self
             .frame(maxWidth: .infinity, alignment: .leading)
             .aliveCard()
             .accessibilityElement(children: .contain)
-    }
-
-    /// Shared capsule-tag chrome: semibold caption2 text, tight padding, a
-    /// 16%-tint capsule fill, and matching tinted foreground. Each call site
-    /// keeps its own (label, color) mapping — this owns only the visual chrome
-    /// so the pills can't drift byte-by-byte. Distinct from `StatusBadge` /
-    /// `InfoPill` (different padding/opacity by design).
-    func capsuleTag(_ color: Color) -> some View {
-        self
-            .font(.caption2.weight(.semibold))
-            .padding(.horizontal, 7).padding(.vertical, 2)
-            .background(color.opacity(0.16), in: Capsule())
-            .foregroundStyle(color)
     }
 
     func houseInset<S: Shape>(in shape: S) -> some View {

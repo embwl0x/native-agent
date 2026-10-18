@@ -3,6 +3,7 @@ import Foundation
 import ApprovalInbox
 import CryptoKit
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import TurnTrace
 import PersonaEngine
@@ -31,6 +32,7 @@ public enum AppDoorReentry {
     @TaskLocal public static var perform: Perform?
     public typealias Validate = @Sendable (String, [String: JSONValue]) async -> JSONValue?
     @TaskLocal public static var validate: Validate?
+    @TaskLocal public static var waitForInteraction: (@Sendable (InlineInteraction, String, [String: JSONValue]) async -> JSONValue)?
     /// What a send listed in an `app {actions}` call returns instead of
     /// running when the step also called something else: the step's held
     /// receipt (`heldOutboundResult`), nil when the step holds no send.
@@ -98,12 +100,30 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         ToolNameAliases.canonical(name) { SwiftToolDispatcher.nativeCanonicalToolNames.contains($0) }
     }
 
+    /// The door action an ingress call is: a dotted action name as itself, a
+    /// part's bare id as `authored.<id>`; nil for a native tool or an unknown name.
+    static func doorAction(_ tool: String) -> String? {
+        let trimmed = tool.trimmingCharacters(in: .whitespacesAndNewlines)
+        let action = trimmed.lowercased()
+        if action.contains(".") {
+            return AppActionBinding.action(input: ["action": .string(action)]) != nil ? action : nil
+        }
+        guard !action.isEmpty, !SwiftToolDispatcher.nativeCanonicalToolNames.contains(action) else { return nil }
+        let authored = ToolNameAliases.authoredAction(trimmed)
+        return AppActionBinding.action(input: ["action": .string(authored)]) != nil ? authored : nil
+    }
+
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let input = input.filter { $0.key != "__authored_primitive" }
         let action = tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         // Folded native calls already came through the door; translate only ingress.
-        if AppDoorReentry.perform == nil, action.contains("."), AppActionPolicy.action(input: ["action": .string(action)]) != nil {
+        // A part reached by its bare name from outside the door — an approved
+        // card's replay, a bridge's direct call — is the door call that runs it
+        // (`authored.<id>`), so its script has the chain to come back through
+        // and the card's exact call is what re-enters under the part's name.
+        if AppDoorReentry.perform == nil, AuthoredToolEffects.call?.tool != tool, let door = Self.doorAction(tool) {
             var call = input.filter { $0.key.hasPrefix("__") }
-            call["action"] = .string(action)
+            call["action"] = .string(door)
             call["args"] = .object(input.filter { !$0.key.hasPrefix("__") })
             return try await dispatch(tool: "app", input: call, surface: surface)
         }

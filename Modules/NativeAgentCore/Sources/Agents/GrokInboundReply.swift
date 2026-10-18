@@ -1,3 +1,4 @@
+import AgentWorkspace
 import GrokLink
 import Foundation
 import ChatOrchestration
@@ -66,19 +67,14 @@ public struct GrokInboundReply: Sendable {
         Task {
             defer { running.release(pending.messageID) }
             let store = GrokRequestStore(dataRoot: dataRoot), id = pending.messageID
-            func mark(_ state: String, if current: String) {
-                _ = try? store.update(id, peer: peer.id) { if $0.handOver == current { $0.handOver = state } }
-            }
-            if await GrokBotRoute.takenByWaiter(peer: peer.id, messageID: id, dataRoot: dataRoot) {
-                return mark("taken by wait", if: "pending")
-            }
+            // Taken: `shown` already named the door that showed it to her.
+            if await GrokBotRoute.takenByWaiter(peer: peer.id, messageID: id, dataRoot: dataRoot) { return }
             do {
                 _ = try await TurnAdmission.shared.run(sessionID: pending.conversationID, waitForCapacity: true) {
-                    // Only a still-pending hand-over starts a turn; a wait later in
-                    // the turn that just finished may have taken it meanwhile.
+                    // Only a still-pending hand-over starts a turn; a wait or a room
+                    // in the turn that just finished may have taken it meanwhile.
                     let claimed = try store.update(id, peer: peer.id) {
-                        if $0.seen == true, $0.handOver == "pending" { $0.handOver = "taken by wait" }
-                        else if $0.handOver == "pending" { $0.handOver = "handing over" }
+                        if $0.handOver == "pending" { $0.handOver = "handing over" }
                     }
                     guard claimed.handOver == "handing over" else { throw Taken() }
                     return try await enqueue(pending, text: text, peer: peer, dataRoot: dataRoot)
@@ -116,6 +112,14 @@ public struct GrokInboundReply: Sendable {
                 }
                 continue
             }
+            if saved.seen == true {
+                // Seen with its hand-over still pending: only a wait could leave
+                // that (saved before `shown` named the door, or cut off between).
+                _ = try? store.update(saved.messageID, peer: saved.peerID) {
+                    if $0.seen == true, $0.handOver == "pending" { $0.handOver = "taken by wait" }
+                }
+                continue
+            }
             guard let contact = contacts.first(where: { $0.id == saved.peerID && $0.transport == .grokBot }) else { continue }
             handOver(saved, text: text, peer: AgentBridgePrincipal(id: contact.id, peerID: contact.id, elevated: contact.elevationAllowed,
                 displayName: contact.name), dataRoot: dataRoot)
@@ -141,8 +145,12 @@ public struct GrokInboundReply: Sendable {
         // This credential can only answer a message this app sent, so say so:
         // unframed, the answer read as a new request and the question was re-asked
         // (driven 09-20).
+        // Which message it answers: unnamed, a late answer to her earlier
+        // message read as the answer to her newest one (10-14, "got it" for 17 × 23).
+        let asked = GrokBotRoute.thread(peer: peer.id, messageID: pending.messageID, dataRoot: dataRoot)
+            .first { $0.id == pending.messageID }?.prompt.map { "your message \u{201C}" + HerScreen.clip($0, 120) + "\u{201D}" }
         let message = AgentBridgeSurface.turnHeader(peerName: peer.displayName, elevated: peer.elevated)
-            + "[This is \(peer.displayName ?? "the other agent")'s answer to the message you sent it in this conversation. The exchange is complete: do not send the question again. Tell the person the answer once.]\n" + text
+            + "[This is \(peer.displayName ?? "the other agent")'s answer to \(asked ?? "a message you sent it whose text is no longer kept") in this conversation. The exchange is complete: do not send the question again. Tell the person the answer once.]\n" + text
         let request = TurnRequest(message: message, sessionID: pending.conversationID, surface: peer.surface,
                                   envelope: envelope, origin: origin)
         let enqueued = try await request.enqueue(on: client)

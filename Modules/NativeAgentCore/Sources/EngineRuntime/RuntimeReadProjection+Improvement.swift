@@ -1,4 +1,3 @@
-import DoctorChecks
 import Foundation
 import SelfImprovement
 
@@ -10,16 +9,4 @@ extension RuntimeReadProjection {
         status.status = status.status ?? "ready"
         return status
     }
-}
-
-extension RuntimeReadProjection {
-    /// `release/checklist.json`; missing reads as an empty checklist (every
-    /// field decodes if present).
-    public static func readReleaseChecklist(dataRoot: URL) async throws -> ReleaseChecklist {
-        let url = dataRoot
-            .appendingPathComponent("release", isDirectory: true)
-            .appendingPathComponent("checklist.json")
-        return try RuntimeReadProjection.readLocalJSON(url, fallbackJSON: "{}")
-    }
-
 }

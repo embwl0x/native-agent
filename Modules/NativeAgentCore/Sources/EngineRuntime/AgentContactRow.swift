@@ -126,7 +126,7 @@ public struct AgentContactRow: Identifiable, Sendable {
     /// The one word the row's pill carries; the full status stays below it.
     public var pillWord: String {
         if let word = health?.problemWord { return word }
-        if let health, ["recent_activity", "waiting"].contains(health.status) { return health.word ?? "Not checked" }
+        if let health, AgentLocalHealth.presenceStatuses.contains(health.status) { return health.word ?? "Not checked" }
         if contact != nil && (!credentialAvailable || state == .unavailable || contact?.unavailableAt != nil) { return "Unavailable" }
         if let word = health?.word, contact == nil || health?.problem != nil || unproven { return word }
         if builtIn { return "Not checked" }
@@ -142,7 +142,7 @@ public struct AgentContactRow: Identifiable, Sendable {
 
     public var status: String {
         if let health, let problem = health.problem { return problem + (health.presenceDetail.map { " · " + $0 } ?? "") }
-        if let health, ["recent_activity", "waiting"].contains(health.status) { return health.detail }
+        if let health, AgentLocalHealth.presenceStatuses.contains(health.status) { return health.detail }
         if credentialAvailable, state != .unavailable, contact?.unavailableAt == nil,
            let said = health?.problem ?? (unproven ? health?.detail : nil) { return said }
         if builtIn {

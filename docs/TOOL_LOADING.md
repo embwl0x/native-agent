@@ -110,9 +110,9 @@ discovery tool.
   server list. The built-in search action appears as `web.search`; `web.read`
   reads a page.
 - Self-authored tools follow `tool.propose` → `tool.approve` →
-  `authored.<id>`. A proposal supplies JavaScript run(input) and optional intercepted fixtures,
+  `face.action` (an unclaimed door id) or `authored.<id>`. A proposal supplies JavaScript run(input) and optional intercepted fixtures,
   with optional permissions and input schema. Only active registry entries
-  become authored actions; approval follows the current Trust policy.
+  become authored actions; approval follows Trust. Bundled seeds install once at launch; existing parts win.
 - Skills are JavaScript routines: discovery points to `skill.run`.
   `skill.read` returns metadata and declared params/input schema; source:true
   reviews exact code and fixtures. A routine without declared params says to
@@ -135,10 +135,12 @@ Cancellation stops the search.
 direct filesystem, network, process or timer API. Every nested app call
 re-enters the same gate chain.
 
-The registry's `scriptable` flag decides which actions may run. Home may be
-read, but home items cannot be opened from a script. Sends, shell commands,
-Mac control and MCP calls are examples of actions that must be separate app
-calls. Secret arguments must also be passed through a single action.
+Actions are scriptable unless they declare `scriptable: false` (card button
+presses). Each write retains its gates and receipt. A call that raises an
+approval card waits for the settled result; a decline throws `AppError` with
+reason `declined`, which the code can catch. `card.request` likewise waits for
+the person's answer. Full Mac writes need no approval card. Home may be read;
+use named actions for its items. Secret arguments still require a single action.
 
 The runner bounds source size, reads, actions and script time; time spent waiting on app calls is not counted.
 Its receipt retains completed effects if a later step fails; a script is not

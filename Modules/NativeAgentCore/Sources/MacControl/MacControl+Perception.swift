@@ -1615,14 +1615,30 @@ extension SwiftNativeMacControl {
             anchorPid = continuation.app?.processIdentifier
             anchoredApp = continuation.app
         }
-        let snapshotted = await lookSnapshot(
-            limits: limits,
-            scope: scope,
-            anchorPid: anchorPid,
-            anchorWindow: continuation?.window,
-            completeWindow: body["app_map"] == .bool(true) && grade == "look",
-            section: body.stringValue("section")
-        )
+        // A look replying to an act reads the window its owner re-read after
+        // the effect, while that is still the window this look anchors to.
+        let carried = MacSightCaptureBinding.current?.walked.flatMap { observed -> (read: MacAXRead, seam: [String: JSONValue])? in
+            guard continuation == nil, body["section"] == nil, body["app_map"] == .bool(true), grade == "look",
+                  let pid = anchorPid ?? accessibilitySource.frontmostApp()?.processIdentifier,
+                  observed.read.app?.processIdentifier == pid, let window = accessibilitySource.windowRoot(pid: pid),
+                  accessibilitySource.sameElement(window, observed.read.root) else { return nil }
+            return observed
+        }
+        // A carried read this look rejects is gone before the replacement walk: a
+        // replacement that runs out of time must not leave the old window to the view (Sol).
+        if carried == nil { MacSightCaptureBinding.current?.walked = nil }
+        let snapshotted: (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?) = if let carried {
+            (carried.read, carried.seam, nil)
+        } else {
+            await lookSnapshot(
+                limits: limits,
+                scope: scope,
+                anchorPid: anchorPid,
+                anchorWindow: continuation?.window,
+                completeWindow: body["app_map"] == .bool(true) && grade == "look",
+                section: body.stringValue("section")
+            )
+        }
         var read = snapshotted.read
         var seam = snapshotted.seam
         let anchor = snapshotted.anchor
@@ -1717,6 +1733,10 @@ extension SwiftNativeMacControl {
         // Four-verb sight keeps the complete action index. Native page windows
         // fold presentation later; a page budget never changes target identity.
         let fourVerbs = body["app_map"] == .bool(true) && grade == "look"
+        // A walk that ran out of time is not the whole window: the view reads that one afresh.
+        if fourVerbs, read.section == nil, !read.snapshot.truncationReasons.contains("time_budget") {
+            MacSightCaptureBinding.current?.walked = (read, seam)
+        }
         // Authored senses receive the same complete source snapshot. The
         // native screen page is compiled from that read, not a second walk.
         let needsMaterial = fourVerbs && (seam["chromium_family"] == .bool(true) || body["sense_material"] == .bool(true))
@@ -2073,7 +2093,8 @@ extension SwiftNativeMacControl {
         let started = now()
         let viewStartedNs = DispatchTime.now().uptimeNanoseconds
         var anchorPid: Int32?
-        if let requested = body.stringValue("app")?.trimmingCharacters(in: .whitespacesAndNewlines),
+        let walked = MacSightCaptureBinding.current?.walked
+        if walked == nil, let requested = body.stringValue("app")?.trimmingCharacters(in: .whitespacesAndNewlines),
            !requested.isEmpty {
             guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "view") }
             let resolution = MacBackgroundSight.resolve(requested, among: accessibilitySource.runningApps())
@@ -2140,9 +2161,11 @@ extension SwiftNativeMacControl {
         var windowIdentity: MacAXWindowIdentity?
         var axSelfRefused = false
         if accessibilityTrusted {
-            // A semantic capture must grade the same complete AX mechanism as
-            // look. The legacy public view keeps its existing bounded walk.
-            switch anchoredSnapshot(limits: limits, pid: anchorPid, window: nil, complete: semanticRawFrame) {
+            // A sight's view is the look's own complete walk; any other semantic
+            // capture grades the same complete AX mechanism as look. The legacy
+            // public view keeps its existing bounded walk.
+            switch walked.map({ MacAnchoredRead.read($0.read) })
+                ?? anchoredSnapshot(limits: limits, pid: anchorPid, window: nil, complete: semanticRawFrame) {
             case .read(let read):
                 snapshot = read.snapshot
                 windowIdentity = read.windowIdentity
@@ -2186,13 +2209,112 @@ extension SwiftNativeMacControl {
         guard !Task.isCancelled else { return await cancelCapture() }
         let captureRect: MacAXFrame? = (scope == .fullScreen) ? nil
             : MacTransientMenus.captureFrame(window: windowRect, menus: transientMenus)
+        // With no picture there is still a frame of reference: the window rect
+        // itself, at 1 point per pixel — so the legend is complete and only the
+        // drawing is missing.
+        let axGeometry: MacScreenViewGeometry? = {
+            guard let rect = captureRect ?? windowRect, rect.w > 0, rect.h > 0 else { return nil }
+            return MacScreenViewGeometry(
+                bounds: rect,
+                pixelWidth: Int(rect.w.rounded()),
+                pixelHeight: Int(rect.h.rounded())
+            )
+        }()
+
+        // 2. Number the actionable elements, and read what the window SAYS.
+        //
+        // THE EFFORTLESS-VISION ORDERING (User, 2026-08-12): the structured
+        // channel is her primary vision — text she reads losslessly — and the
+        // picture is the spatial backdrop it rides on. So both halves of the
+        // structure are built even when there is no image at all: the numbered
+        // controls AND the prose. The bar is "could she act correctly from the
+        // legend alone", and a legend with no prose fails it — a set of
+        // controls with no idea what the window says is not seeing the screen.
+        var sceneSelectionStartedNs = DispatchTime.now().uptimeNanoseconds
+        var sceneSelectionFinishedNs = sceneSelectionStartedNs
+        var selection = MacScreenViewBuilder.Selection(marks: [], omitted: 0, offscreen: 0)
+        var text = MacScreenViewBuilder.TextSelection(items: [], omitted: 0)
+        var marks: [JSONValue] = []
+        var texts: [JSONValue] = []
+        func select(in geometry: MacScreenViewGeometry?) {
+            sceneSelectionStartedNs = DispatchTime.now().uptimeNanoseconds
+            defer { sceneSelectionFinishedNs = DispatchTime.now().uptimeNanoseconds }
+            guard let snapshot, let geometry else { return }
+            selection = MacScreenViewBuilder.select(
+                nodes: snapshot.nodes,
+                geometry: geometry,
+                maxMarks: maxMarks,
+                settableAttributes: { node in
+                    node.element.map { accessibilitySource.settableAttributes(of: $0) } ?? []
+                }
+            )
+            text = MacScreenViewBuilder.visibleText(
+                nodes: snapshot.nodes,
+                geometry: geometry,
+                limit: Self.intValue(body, "max_text_items") ?? MacScreenViewBuilder.hardMaxTextItems
+            )
+            marks = selection.marks.map { $0.toJSON(valueChars: limits.valueChars) }
+            texts = text.items.map { $0.toJSON(valueChars: limits.valueChars) }
+        }
+
+        // A semantic view numbers its window from the AX read itself, so that
+        // read decides once, before any capture, who receives a picture: the
+        // caller that always wants one (`pixels: always` — a forced attachment
+        // or a bound live preview), a `screen` attachment of a thin window
+        // (`pixels: thin`), or on-device recognition of a thin window the AX
+        // marks do not already cover. An app read's retained text recognition
+        // needs the shot but no picture. A public view always delivers its picture.
+        var thinReason: String?
+        var recognizesPixels = false
+        var semanticFocusFrame: MacAXFrame?
+        var pictured = true
+        if semanticRawFrame {
+            select(in: axGeometry)
+            let words = (snapshot?.nodes ?? []).filter { MacPerceptionCompiler.readoutRoles.contains($0.attributes.role) }
+                .compactMap { $0.attributes.title ?? $0.attributes.value }
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            if semanticFocusVisualSurface, let snapshot, let axGeometry {
+                semanticFocusFrame = MacScreenViewBuilder.dominantVisualSurface(nodes: snapshot.nodes, geometry: axGeometry)
+            }
+            // Chromium renderer content belongs to the renderer's AX read,
+            // including a pending one; an incomplete read is reported as such.
+            // Pixels never quietly replace either.
+            let canvas = semanticFocusFrame ?? selection.marks
+                .filter { MacScreenViewBuilder.visualSurfaceRoles.contains($0.role) }.map(\.frame)
+                .max { $0.w * $0.h < $1.w * $1.h }
+            let windowArea = axGeometry.map { $0.bounds.w * $0.bounds.h } ?? 0
+            let canvasFraction = canvas.flatMap { windowArea > 0 ? min(1, $0.w * $0.h / windowArea) : nil }
+            thinReason = MacChromiumAccessibility.looksChromium(bundleId: app?.bundleIdentifier, pid: app?.processIdentifier, snapshot: nil)
+                || snapshot?.truncated == true ? nil : MacScreenViewBuilder.thinAccessibilityReason(
+                    accessibilityTrusted: accessibilityTrusted, marks: marks, texts: texts, windowArea: windowArea,
+                    canvasFraction: canvasFraction,
+                    sourceTextCount: words.count, sourceTextCharacters: words.reduce(0) { $0 + $1.count })
+            // Recognition earns its latency only where the marks are few or a
+            // visual surface is real; a thin window full of marks is read from them.
+            recognizesPixels = thinReason != nil
+                && (!accessibilityTrusted || selection.marks.count <= 6 || (canvasFraction ?? 0) >= 0.03)
+            pictured = body["pixels"] == .string("always") || recognizesPixels
+                || thinReason != nil && body["pixels"] == .string("thin")
+        }
+        let recognizesText = semanticRawFrame && scope == .focusedWindow && app?.bundleIdentifier != nil
+            && SenseAppReadCapture.current != nil
+        guard !Task.isCancelled else { return await cancelCapture() }
+
         let capturedAt = now()
         let screenCaptureStartedNs = DispatchTime.now().uptimeNanoseconds
-        let capture: Result<MacScreenShot, MacScreenCaptureFailure>
-        if isolatedWindow, let windowIdentity {
-            capture = await screenCaptureSource.capture(window: windowIdentity)
-        } else {
-            capture = await screenCaptureSource.capture(rect: captureRect)
+        var shot: MacScreenShot?
+        var imageFailure: MacScreenCaptureFailure?
+        if pictured || recognizesText {
+            let capture: Result<MacScreenShot, MacScreenCaptureFailure>
+            if isolatedWindow, let windowIdentity {
+                capture = await screenCaptureSource.capture(window: windowIdentity)
+            } else {
+                capture = await screenCaptureSource.capture(rect: captureRect)
+            }
+            switch capture {
+            case .success(let value): shot = value
+            case .failure(let failure): imageFailure = failure
+            }
         }
         guard !Task.isCancelled else { return await cancelCapture() }
         let screenCaptureFinishedNs = DispatchTime.now().uptimeNanoseconds
@@ -2228,14 +2350,8 @@ extension SwiftNativeMacControl {
                 from: screenCaptureStartedNs, to: screenCaptureFinishedNs
             )),
         ]
-        if semanticRawFrame, let snapshot {
-            let words = snapshot.nodes.filter { MacPerceptionCompiler.readoutRoles.contains($0.attributes.role) }
-                .compactMap { $0.attributes.title ?? $0.attributes.value }
-                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            output["accessibility_text_count"] = .int(Int64(words.count))
-            output["accessibility_text_characters"] = .int(Int64(words.reduce(0) { $0 + $1.count }))
-            output["accessibility_complete"] = .bool(!snapshot.truncated)
-        }
+        output["thin_accessibility_reason"] = thinReason.map(JSONValue.string)
+        if recognizesPixels { output["recognize_pixels"] = .bool(true) }
         if !accessibilityTrusted {
             output["accessibility_note"] = .string(MacAccessibilityReader.notTrustedNote)
         }
@@ -2246,62 +2362,16 @@ extension SwiftNativeMacControl {
             output["screen_recording_note"] = .string(Self.screenRecordingNote)
         }
 
-        // 2. The geometry the whole fusion hangs on. With no picture there is
-        //    still a frame of reference: the window rect itself, at 1 point per
-        //    pixel — so the legend is complete and only the drawing is missing.
-        let shot: MacScreenShot?
-        var imageFailure: MacScreenCaptureFailure?
-        switch capture {
-        case .success(let value): shot = value
-        case .failure(let failure):
-            shot = nil
-            imageFailure = failure
-        }
-        let geometry: MacScreenViewGeometry? = {
-            if let shot { return MacScreenViewGeometry(shot: shot) }
-            guard let rect = captureRect ?? windowRect, rect.w > 0, rect.h > 0 else { return nil }
-            return MacScreenViewGeometry(
-                bounds: rect,
-                pixelWidth: Int(rect.w.rounded()),
-                pixelHeight: Int(rect.h.rounded())
-            )
-        }()
-
-        // 3. Number the actionable elements, and read what the window SAYS.
-        //
-        // THE EFFORTLESS-VISION ORDERING (User, 2026-08-12): the structured
-        // channel is her primary vision — text she reads losslessly — and the
-        // picture is the spatial backdrop it rides on. So both halves of the
-        // structure are built even when there is no image at all: the numbered
-        // controls AND the prose. The bar is "could she act correctly from the
-        // legend alone", and a legend with no prose fails it — a set of
-        // controls with no idea what the window says is not seeing the screen.
-        let sceneSelectionStartedNs = DispatchTime.now().uptimeNanoseconds
-        var selection = MacScreenViewBuilder.Selection(marks: [], omitted: 0, offscreen: 0)
-        var text = MacScreenViewBuilder.TextSelection(items: [], omitted: 0)
-        if let snapshot, let geometry {
-            selection = MacScreenViewBuilder.select(
-                nodes: snapshot.nodes,
-                geometry: geometry,
-                maxMarks: maxMarks,
-                settableAttributes: { node in
-                    node.element.map { accessibilitySource.settableAttributes(of: $0) } ?? []
-                }
-            )
-            text = MacScreenViewBuilder.visibleText(
-                nodes: snapshot.nodes,
-                geometry: geometry,
-                limit: Self.intValue(body, "max_text_items") ?? MacScreenViewBuilder.hardMaxTextItems
-            )
-        }
-        let sceneSelectionFinishedNs = DispatchTime.now().uptimeNanoseconds
+        // The geometry the whole fusion hangs on: the picture's own when there
+        // is one, else the window rect.
+        let geometry = shot.map { MacScreenViewGeometry(shot: $0) } ?? axGeometry
+        if !semanticRawFrame { select(in: geometry) }
         guard !Task.isCancelled else { return await cancelCapture() }
 
         // Retain only the W2b recognizer's redacted text/positions from this
         // ephemeral WHOLE window. Do this before canvas cropping, downscaling
         // or action-mark masking can remove a caption that protects its value.
-        if semanticRawFrame, scope == .focusedWindow, let bundle = app?.bundleIdentifier,
-           let retained = SenseAppReadCapture.current {
+        if recognizesText, let bundle = app?.bundleIdentifier, let retained = SenseAppReadCapture.current {
             do {
                 guard let shot else {
                     throw SenseFailure(code: "source_unavailable", message: "The app read has no window capture for redacted text recognition.")
@@ -2317,19 +2387,14 @@ extension SwiftNativeMacControl {
             guard !Task.isCancelled else { return await cancelCapture() }
         }
 
-        // 4. Draw them, under the byte cap. Pixel-first semantic perception
+        // 3. Draw them, under the byte cap. Pixel-first semantic perception
         // gets the dominant canvas/image cropped from the native capture BEFORE
         // PNG fitting. Otherwise a high-entropy moving canvas spends the whole
         // window's byte budget before OCR ever sees its small status text.
         var imageDownscale: Double?
         var imageBytes: Int?
         let imageRenderStartedNs = DispatchTime.now().uptimeNanoseconds
-        if let shot, let geometry {
-            let semanticFocusFrame = semanticFocusVisualSurface
-                ? snapshot.flatMap {
-                    MacScreenViewBuilder.dominantVisualSurface(nodes: $0.nodes, geometry: geometry)
-                }
-                : nil
+        if pictured, let shot, let geometry {
             #if canImport(CoreGraphics)
             let renderShot = semanticFocusFrame.flatMap { shot.cropped(to: $0) } ?? shot
             #else
@@ -2380,9 +2445,7 @@ extension SwiftNativeMacControl {
         ))
         if output["image"] == nil {
             output["image"] = .null
-            output["image_unavailable_reason"] = .string(
-                (imageFailure ?? .captureFailed).rawValue
-            )
+            if pictured { output["image_unavailable_reason"] = .string((imageFailure ?? .captureFailed).rawValue) }
         }
         output["image_bytes"] = imageBytes.map { .int(Int64($0)) } ?? .null
         output["image_downscale"] = imageDownscale.map { .double($0) } ?? .null
@@ -2443,12 +2506,12 @@ extension SwiftNativeMacControl {
         // human timestamp, but never round the machine observation clock.
         output["captured_at_epoch_seconds"] = .double(capturedAt.timeIntervalSince1970)
         output["view_ttl_seconds"] = .int(Int64(MacScreenViewStore.ttlSeconds))
-        output["marks"] = .array(selection.marks.map { $0.toJSON(valueChars: limits.valueChars) })
+        output["marks"] = .array(marks)
         output["mark_count"] = .int(Int64(selection.marks.count))
         output["marks_omitted"] = .int(Int64(selection.omitted))
         output["marks_offscreen"] = .int(Int64(selection.offscreen))
         output["max_marks"] = .int(Int64(max(1, min(maxMarks, MacScreenViewBuilder.hardMaxMarks))))
-        output["text"] = .array(text.items.map { $0.toJSON(valueChars: limits.valueChars) })
+        output["text"] = .array(texts)
         output["text_omitted"] = .int(Int64(text.omitted))
         if let snapshot {
             output["ax_truncated"] = .bool(snapshot.truncated)
@@ -2460,7 +2523,7 @@ extension SwiftNativeMacControl {
             selection.truncated
                 || text.omitted > 0
                 || (snapshot?.truncated ?? false)
-                || output["image"] == .null
+                || pictured && output["image"] == .null
         )
         output["how_to_read"] = .string(
             "`marks` and `text` ARE the view — they describe every control and everything the "

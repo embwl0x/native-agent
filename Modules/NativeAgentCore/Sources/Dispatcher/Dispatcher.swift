@@ -480,7 +480,7 @@ public actor SwiftNativeDispatcher {
 
         let t0 = DispatchClockMonotonic.now()
         let raw: JSONValue
-        if ["read_file", "file_excerpt", "list_dir"].contains(tool) {
+        if ["read_file", "file_excerpt", "list_dir", "file_info"].contains(tool) {
             let imageSink = LocalToolImage.sink
             // Folder permission prompts and unavailable volumes can block even
             // metadata reads. Keep them off the caller's executor; BoundedWait

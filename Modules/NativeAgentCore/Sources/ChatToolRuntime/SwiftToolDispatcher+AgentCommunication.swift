@@ -295,11 +295,6 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         // Claude Code and Claude Desktop are Claude's doors: a message to one
         // goes to her inbox like claude_message, never to a headless run.
         if sending, AgentContactIdentity(dataRoot: dataRoot).canonical(agent) == "claude" {
-            guard !AgentSwarmInheritedToolScope.isWorker else {
-                throw AutonomyGateError.toolDenied(
-                    reason: "claude_message is reserved for the parent turn and is unavailable inside a swarm worker"
-                )
-            }
             var message: [String: JSONValue] = ["text": .string(try Self.peerString(args, "text", max: 64000)!)]
             if let thread = try Self.peerString(args, "conversation_id", max: 1024, required: false), thread.hasPrefix("claude:") {
                 message["conversation_id"] = .string(thread)
@@ -623,8 +618,21 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 for key in ["reply", "detail", "work", "provider_failure"] {
                     if let value = row[key] { envelope[key] = value }
                 }
+                // A failed peer's own why, read as normalization reads any failure's
+                // shape, when it sent no detail; what is promoted is peer text.
+                let gaveDetail = if case .string(let given)? = row["detail"] {
+                    !given.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } else { false }
+                // The effective status: a receipt may say ok and carry original_status failed.
+                let failed = row["original_status"].map { $0 != .string("ok") } ?? !ChatToolOutcome.outputLooksSuccessful(payload)
+                var promoted = false
+                if !gaveDetail, failed,
+                   case .object(let failure) = ChatToolOutcome.normalizedFailure(.object(["status": .string("failed"), "result": payload])),
+                   case .string(let why)? = failure["message"] {
+                    envelope["detail"] = .string(why)
+                    promoted = true
+                }
                 if let status = row["original_status"] { envelope["status"] = status }
-                envelope["untrusted_remote_data"] = .bool(PeerDataTaintDispatcher.containsPeerText(payload))
+                envelope["untrusted_remote_data"] = .bool(promoted || PeerDataTaintDispatcher.containsPeerText(payload))
             }
             // The same proof, on the same terms, for a network peer: the send
             // was accepted, and a reply counts only where one actually came
@@ -770,7 +778,8 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             if !AgentHostConnection.personApproved {
                 guard try await AgentACPApproval.connect(proposal, appName: Self.appDisplayName,
                     inbox: SwiftNativeApprovalInbox(root: dataRoot)) else {
-                    return .object(["status": .string("denied"), "changed": .bool(false), "completed": .bool(false)])
+                    return .object(["status": .string("denied"), "changed": .bool(false), "completed": .bool(false),
+                                    "detail": .string("The person declined this connection; nothing was sent.")])
                 }
             }
         } else if proposal.executablePath != executablePath {
@@ -1777,9 +1786,11 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 value["route"] = .string("chatgpt-dot-ipc")
                 value["readiness"] = ChatGPTDotIPCTransport.readiness
                 value["can_start_turn"] = .bool(ChatGPTDotIPCTransport.available)
-                value["capabilities"] = .array([.string("message"), .string("read")])
+                value["capabilities"] = .array(ChatGPTDotIPCTransport.available ? [.string("message"), .string("read")] : [.string("read")])
                 value["read_inputs"] = .array([.string("conversation_id"), .string("limit"), .string("offset"), .string("max_chars"), .string("text_offset"), .string("source_version")])
-                value["setup"] = .string("NativeAgent messages Dot in-house after a read-only route check. Unknown delivery is read by its original receipt, never resent. Dot's nativeagent-link inbound commands and per-agent Trust remain unchanged.")
+                value["setup"] = .string(ChatGPTDotIPCTransport.available
+                    ? "NativeAgent messages Dot in-house after a read-only route check. Unknown delivery is read by its original receipt, never resent. Dot's nativeagent-link inbound commands and per-agent Trust remain unchanged."
+                    : "Dot is inbound only: his messages arrive through nativeagent-link on this Mac as ordinary inbound turns, and a read returns the retained conversation. There is no way to send him a message from here; nothing to repair.")
             }
             return .object(value)
         }

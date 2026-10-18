@@ -6,6 +6,20 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.6.5 — the agent is the app (2026-10-17)
+
+### Parts on one law
+- Tools, skills and senses share one part header (does, reaches, wakes, appears, remembers); their turn is abilities/turn.js (step function; the stem owns loop, log, checkpoint, replay; a breaking version swaps back mid-turn and the turn replays); healing swaps a failing kept version for its last clean one. Parts think (one audited model call), act through the door under the same law and wait for cards, fetch as a connector, reach PIM and files, and wake on signals (schedule, app arrival, file change, turn end, message) with no polling; app arrivals offer growth once; repeated hand work drafts a habit; weather is the first built-in part.
+
+### Hands for any app
+- Every delivered screen image is a frame (MacImageFrames, per session): act at:{x,y} / drag from/to in image pixels, alone or as a step, through the one physical tail (performPointer); every sighting carries other apps' covering windows and no physical act lands or passes there. App names resolve by process, file and index name; the desktop picture masks by time budget and opaque pixels and is sized so no provider rescales it; menu paths take a list (one press); AppleScript receipts say what their events did and keep each event's timeout; their windows step aside before they looks or acts.
+
+### Building, permissions, turns
+- Shell results are data inside a skill run; the authoring road hands itself forward (save → validate → enable → run); the door repairs obvious argument slips and never fans out a list-taking argument. One PermissionLaw (declared class × posture × switch × steer): Full Mac acts, Work asks on User's side, Safe refuses there; Contacts/Calendar/Reminders deletes always a person's card; an untrusted peer's steer caps at Work; permission cards settle themselves. Steer cuts a reply mid-stream; after Stop a fresh send runs; Shotgun is a setting they can switch and is visible to recordings; bridge turns resume after a kill; recalled memories carry provenance and steer nothing.
+
+### Steadier, leaner
+- Registry resolvers held by reference (the reabstraction-thunk stack overflow); full dSYMs kept; installer restores the previous bundle on failure and names the failing line; weather follows the Mac; unzoned bots follow the Mac's zone; Dot is inbound-only on cloud-hosted ChatGPT; the 8770 bridge and legacy memory importer gone; net code smaller than 0.6.4 (~10.0k added, ~10.35k removed).
+
 ## 0.6.4 — abilities, one file each (2026-10-14)
 
 ### Abilities

@@ -31,11 +31,16 @@ struct ShotgunView: View {
 
     var body: some View {
         let controller = ShotgunController.shared
-        let sessionId = appModel.activeChatSessionId
+        let sessionId = controller.drivingSessionID ?? appModel.activeChatSessionId
         let turns = appModel.engine.turns
         let turn = turns.lifecycle(for: sessionId)?.presentation
         let preview = turns.screenPreview(for: sessionId)
-        let running = turns.isBusy(sessionId) || turn.map { !$0.isTerminal } == true
+        // A turn from another door (Telegram) has no Mac lifecycle: it runs while it
+        // is in flight on this root, and Stop reaches it by its session.
+        let remoteRunning = controller.driver.map { driver in
+            driver.session == sessionId && turns.inFlightTurns().contains { $0.turnId == driver.turn }
+        } ?? false
+        let running = turns.isBusy(sessionId) || turn.map { !$0.isTerminal } == true || remoteRunning
         let all = appModel.engine.transcripts.messages(for: sessionId)
         let mirrorRows = all.filter { $0.metadata?.interactionMirror != nil }
         let mirrorSessions = Set(mirrorRows.compactMap { $0.metadata?.interactionMirror?.sessionID }).sorted()

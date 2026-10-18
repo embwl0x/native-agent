@@ -290,10 +290,6 @@ public extension MacChatStreamAdapter {
         onScreenPreview: @escaping @Sendable (MacScreenPreviewUpdate) async -> Void
     ) -> AsyncThrowingStream<MacChatStreamUpdate, Error> {
         let message = text.isEmpty ? "(see attachments)" : text
-        let turnAttachments = attachments.map {
-            MultimodalAttachment(id: $0.id, type: $0.type, base64: $0.base64, mime: $0.mime,
-                                 name: $0.name, byteSize: $0.byteSize, path: $0.path)
-        }
         return stream(
             sessionId: sessionId, metaBox: metaBox, activityIdentity: activityIdentity,
             onTurnActivity: onTurnActivity, onScreenPreview: onScreenPreview
@@ -302,7 +298,7 @@ public extension MacChatStreamAdapter {
             client.chatStreamExecution(
                 message: message, sessionId: sessionId,
                 model: "", reasoningEffort: "", fileAccess: "auto",
-                attachments: turnAttachments, persona: nil, surface: "chat",
+                attachments: attachments, persona: nil, surface: "chat",
                 suppressUserAppend: hideUserBubble, choice: nil, serviceTier: serviceTier(),
                 consumerRendersInlineCards: true
             )

@@ -590,14 +590,9 @@ extension SwiftNativeMemoryV2 {
                 }
             }
             await storage.enqueueKnowledgeGraphProjection {
-                // Wait for migration before checking the canonical fingerprints.
-                let migrationMarker = dataRoot
-                    .appendingPathComponent("memory", isDirectory: true)
-                    .appendingPathComponent(".migrated_to_sqlite_v2_approved_only")
                 // Settings ▸ "Knowledge graph": the startup backfill is graph
                 // production too — off means it does not run.
-                if MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot),
-                   FileManager.default.fileExists(atPath: migrationMarker.path) {
+                if MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) {
                     do {
                         try await kgIndexer.reconcileProjectionIfNeeded(producing: true)
                         graphProjectionFailureSlot.withLock { $0 = nil }

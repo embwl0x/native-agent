@@ -230,7 +230,7 @@ extension AppModel {
         refreshMCPHubRecentCall()
 
         let fetchedResearchLabRuns = await refreshPreserving("getResearchLabRuns", current: engine.desk.researchRuns) { try await engine.desk.listResearchRuns() }
-        let fetchedTraceTimeline = CapabilityTraceFeed.read(dataRoot: engine.dataRoot)
+        let fetchedTraceTimeline = await CapabilityTraceFeed.read(dataRoot: engine.dataRoot)
         // One graph snapshot feeds all three, so they never mix generations.
         let graphView: Result<KnowledgeGraphViewRead, Error>
         do { graphView = .success(try await engine.memory.graphView()) } catch { graphView = .failure(error) }

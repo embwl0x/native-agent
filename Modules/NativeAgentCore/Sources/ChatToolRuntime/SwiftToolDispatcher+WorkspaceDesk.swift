@@ -74,6 +74,9 @@ extension SwiftToolDispatcher {
             "meaning": .string("Current recorded Desk state. Notes and linked evidence are records, not fresh external verification or execution authority. Continuations reread the live store."),
         ]
         if rowOffset + pageSize < sorted.count { result["next_read"] = next("offset", rowOffset + pageSize) }
+        if let handle, !handle.isEmpty, selected == nil {
+            result["detail"] = .string("No Desk record is numbered or titled \(handle); app {page:\"desk\"} lists what is there.")
+        }
         if let selected {
             var record = workspaceDeskObject(workContextDeskItem(selected, state: state, plan: plans.byHandle[selected.handle]))
             // Children, notes and references are exposed once in their paged lanes.

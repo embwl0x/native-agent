@@ -58,8 +58,7 @@ extension AppQuietSettingsHost {
 // MARK: - connections
 
 extension AppQuietToolHost {
-    /// The Connectors, Telegram and MCP pages' own buttons. Those report
-    /// through the status line, so the status line is the result.
+    /// The connections pages' buttons; MCP commands return their own result.
     func connections(verb: String, input: [String: JSONValue]) async -> JSONValue {
         func text(_ key: String) -> String {
             AppToolExecutor.inputString(input[key])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -205,11 +204,10 @@ extension AppQuietToolHost {
                     extra: ["ids": .array(appModel.mcpServers.map { .string($0.id) })])
             }
             switch verb {
-            case "mcp_warm": await appModel.warmMCPServer(server)
-            case "mcp_restart": await appModel.restartMCPServer(server)
-            default: await appModel.refreshMCPCache(server)
+            case "mcp_warm": return await appModel.runMCPCommand(.warm, server: server)
+            case "mcp_restart": return await appModel.runMCPCommand(.restart, server: server)
+            default: return await appModel.runMCPCommand(.refresh, server: server)
             }
-            return outcome(appModel.statusForAgent, ["server_id": .string(server.id)])
         }
     }
 }

@@ -125,8 +125,10 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     /// unverified one (its app, program or recipe changed since the proof) is
     /// not: the next send proves it again.
     public var isBroken: Bool { problem != nil && ["broken", "signed_out", "unavailable"].contains(observedStatus ?? availability) }
+    /// Presence words, overlaid live at every read: a state, never a problem.
+    public static let presenceStatuses: Set<String> = ["recent_activity", "waiting", "inbound_only"]
     public var problem: String? {
-        current && !["ready", "installed", "live", "recent_activity", "waiting", "unchecked"].contains(observedStatus ?? availability)
+        current && !(["ready", "installed", "live", "unchecked"] + Self.presenceStatuses).contains(observedStatus ?? availability)
             ? observedDetail + (repairDetail.map { " " + $0 } ?? "") : nil
     }
 

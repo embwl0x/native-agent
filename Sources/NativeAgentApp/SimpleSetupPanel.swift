@@ -90,18 +90,14 @@ struct SimpleSetupPanel<Content: View>: View {
                 .clipShape(shape)
                 .overlay(alignment: .topTrailing) {
                     if showsClose {
-                        // A fill, not glass: it sits on the panel's glass.
                         Button(action: close) {
                             Image(systemName: "xmark")
                                 .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(NativeAgentShell.secondary)
                                 .frame(width: 28, height: 28)
-                                .background(NativeAgentShell.softFill, in: Circle())
                                 .contentShape(Circle())
                         }
-                        .buttonStyle(.plain)
+                        .sheetCloseButton()
                         .padding(12)
-                        .accessibilityLabel("Close")
                     }
                 }
                 .background { if reduceTransparency { shape.fill(NativeAgentShell.room) } }

@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import CryptoKit
 import Foundation
 import NativeAgentCore
@@ -32,13 +33,15 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
     public var programs: OwnedProgramStore { OwnedProgramStore(root: root) }
     var abilities: AbilityStore { AbilityStore(dataRoot: root.deletingLastPathComponent()) }
 
-    public func candidate(_ input: SenseRecord, codeFiles: [String: Data], scope: String = "") async throws -> OwnedProgramStore.Candidate {
-        try await withStore { store in
+    public func candidate(_ input: SenseRecord, codeFiles: [String: Data], scope: String = "", header: [String: JSONValue] = [:]) async throws -> OwnedProgramStore.Candidate {
+        let part = try AbilityStore.partHeader(header.merging(["reach": try .fromEncodable(input.reach)]) { first, _ in first })
+        return try await withStore { store in
             guard input.language == .javascript, let entry = input.entry,
                   let bytes = codeFiles[entry], let code = String(data: bytes, encoding: .utf8) else {
                 throw Self.failure("Authored senses require a JavaScript entry.")
             }
             var record = input
+            record.reach = try JSONDecoder().decode(SenseReach.self, from: part["reach"]!.serializedData(pretty: false))
             let previous = store.senses.first { $0.id == record.id }
             if input.origin == .shared, let previous {
                 let current = previous.versions.first { $0.record.version == previous.currentVersion }!.record
@@ -57,7 +60,7 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
             let candidate = try OwnedProgramStore.Candidate(program: OwnedProgram(kind: .sense, id: record.id,
                 version: String(record.version), source: code, entry: .sense, reach: record.reach),
                 manifest: .object(["record": try .fromEncodable(record), "scope": .string(scope),
-                                   "files": try .fromEncodable(codeFiles.filter { $0.key != entry })]),
+                                   "files": try .fromEncodable(codeFiles.filter { $0.key != entry })].merging(part) { _, value in value }),
                 fixtures: .array([]), dependencyShapes: .object([:]), prior: try Self.selection(store, corner: record.corner))
             try self.programs.stage(candidate)
             return (false, candidate)
@@ -83,7 +86,7 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
         record.verbs = Array(Set(shown.things.flatMap(\.verbs))).sorted()
         record.status = .on; record.enabledAt = Date()
         let published = record
-        try await withStore { store in
+        try await withStore(enabling: true) { store in
             _ = try self.programs.proof(candidate, key: key)
             guard try Self.selection(store, corner: published.corner) == candidate.prior else {
                 throw Self.failure("The place's sense changed or is switched off. Read it and try again after restoring it.")
@@ -215,7 +218,7 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
 
     public func setStatus(id: String, version: Int, status: SenseStatus, preview: Bool = false,
                           ownerAuthorized: Bool = false) async throws -> SenseRecord {
-        let record = try await withStore(ownerAuthorized: ownerAuthorized) { store in
+        let record = try await withStore(ownerAuthorized: ownerAuthorized, enabling: status == .on) { store in
             let (i, j) = try Self.current(id, in: store)
             let current = store.senses[i].versions[j].record
             guard status != .on || store.senses[i].versions[j].record.language != .swift else {
@@ -290,7 +293,7 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
         }
     }
 
-    func withStore<T: Sendable>(ownerAuthorized: Bool = false, _ body: @escaping @Sendable (inout Store) throws -> (Bool, T)) async throws -> T {
+    func withStore<T: Sendable>(ownerAuthorized: Bool = false, enabling: Bool = false, _ body: @escaping @Sendable (inout Store) throws -> (Bool, T)) async throws -> T {
         try Task.checkCancellation()
         return try AbilityStore.withLock {
             var store = try Self.decode(self.abilities.registry(kind: .sense))
@@ -327,15 +330,15 @@ public final class FileSenseRegistry: SenseRegistryManaging, Sendable {
                                   try self.abilities.read(id: entry.id, slot: .current) == nil,
                                   try self.abilities.read(id: entry.id, slot: .next) == nil,
                                   defaults.contains(where: { $0.record.id == entry.id }) {
-                            let body = try version.record.entry.map { try String(contentsOf: BuiltInSenses.resourceRoot().appendingPathComponent($0), encoding: .utf8) } ?? ""
-                            try self.abilities.write(AbilityStore.File(id: entry.id, kind: .sense,
-                                metadata: ["record": try JSONValue.fromEncodable(version.record)], body: body, pathExtension: "js"))
+                            var record = fields["record"]!.objectValue!
+                            record["body"] = .string(try version.record.entry.map { try String(contentsOf: BuiltInSenses.resourceRoot().appendingPathComponent($0), encoding: .utf8) } ?? "")
+                            fields["record"] = .object(record)
                         }
                         return .object(fields)
                     })
                     return .object(fields)
                 })
-                try self.abilities.saveRegistry(.object(value), kind: .sense, ownerAuthorized: ownerAuthorized)
+                try self.abilities.saveRegistry(.object(value), kind: .sense, ownerAuthorized: ownerAuthorized, enabling: enabling)
             }
             return result
         }

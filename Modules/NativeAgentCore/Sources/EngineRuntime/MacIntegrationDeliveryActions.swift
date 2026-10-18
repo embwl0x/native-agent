@@ -355,6 +355,9 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
             }
             wait = Int(seconds)
         } else { wait = 60 }
+        guard try PairedPhoneStore.pairedCountChecked(at: deviceSync.dataRoot.appendingPathComponent("paired_phones.json")) > 0 else {
+            throw DeviceSyncError.underlying(message: "No paired phone. Pair an iPhone in NativeAgent before asking it for location or a photo.")
+        }
         let request = PhoneRequest(kind: kind, waitSeconds: wait)
         let bridge = await deviceSync.bridge
         let reply = try await bridge.phoneRequests.request(request)

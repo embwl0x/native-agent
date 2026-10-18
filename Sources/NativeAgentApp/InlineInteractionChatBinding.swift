@@ -317,7 +317,7 @@ final class InlineInteractionChatBinding {
 
     // MARK: - Grants made in System Settings
 
-    @ObservationIgnored private let grantWatch = InlineInteractionResolver.GrantWatch()
+    @ObservationIgnored private let grantWatch = InlineInteractionResolver.GrantWatch.shared
 
     private func watchUntilGranted(_ id: String, sessionID: String) {
         grantWatch.watchUntilGranted(id, sessionID: sessionID) { [weak self] in

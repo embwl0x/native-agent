@@ -142,9 +142,10 @@ extension SwiftToolDispatcher {
             lifecycleObserver: providerLifecycleObserver,
             moonshotCatalogDataRoot: dataRoot
         )
-        let workerTools = AgentSwarmInheritedToolScope(inner: self)
         let workerClient = swarmChatFactory.makeClient(
-            tools: workerTools,
+            // A worker is her hands: this same dispatcher, under User's
+            // posture like her own turn (the permission law).
+            tools: self,
             dataRoot: dataRoot,
             // Workers are real chat clients; name the swarm body as their
             // credential authority so they do not fall onto the alternate-root
@@ -164,54 +165,6 @@ extension SwiftToolDispatcher {
             turnTraceBus: workerClient.turnTraceBus,
             runLedgerDataRoot: dataRoot
         )
-    }
-}
-
-/// A swarm worker reuses NativeAgent's ordinary tool dispatcher and policy
-/// membrane. Only recursive delegation and app lifecycle replacement are
-/// removed from its request-scoped catalog; those actions must remain with the
-/// parent turn that owns the swarm receipt.
-struct AgentSwarmInheritedToolScope: ToolDispatchClient {
-    let inner: any ToolDispatchClient
-    @TaskLocal static var isWorker = false
-
-    private static let blocked: Set<String> = [
-        "agent_swarm",
-        "invoke_codex",
-        "codex_message", "claude_message", "omp_message",
-        "install_app", "restart_app",
-    ]
-
-    /// A worker sees Core's own catalog, as it did before the app's tools
-    /// joined it: those stay with the parent turn.
-    private func core<T>(_ body: () async throws -> T) async rethrows -> T {
-        try await SwiftToolDispatcher.$withoutAppTools.withValue(true) { try await body() }
-    }
-
-    private static func isParentOwned(_ tool: String) -> Bool {
-        // Match the inner dispatcher's alias table before checking this
-        // worker-only boundary, so no alias of a blocked tool slips past.
-        let canonical = ToolNameAliases.canonical(tool) { blocked.contains($0) }
-        return blocked.contains(canonical)
-    }
-
-    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        guard !Self.isParentOwned(tool) else {
-            throw AutonomyGateError.toolDenied(
-                reason: "\(tool) is reserved for the parent turn and is unavailable inside a swarm worker"
-            )
-        }
-        return try await Self.$isWorker.withValue(true) {
-            try await core { try await inner.dispatch(tool: tool, input: input, surface: surface) }
-        }
-    }
-
-    func listAvailableTools() async throws -> [String] {
-        try await core { try await inner.listAvailableTools() }.filter { !Self.isParentOwned($0) }
-    }
-
-    func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await core { try await inner.listAvailableToolSchemas() }.filter { !Self.isParentOwned($0.name) }
     }
 }
 

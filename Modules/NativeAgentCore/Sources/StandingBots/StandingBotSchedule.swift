@@ -6,8 +6,7 @@ public enum StandingBotSchedule {
     /// Cron day-of-week order: 0 is Sunday.
     public static let weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
 
-    public static func parse(_ input: String, timezone: String? = nil,
-                      localTimezone: String = TimeZone.current.identifier) throws -> BotCadence {
+    public static func parse(_ input: String, timezone: String? = nil) throws -> BotCadence {
         let words = input.trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
         if words == ["manual"] {
@@ -42,10 +41,13 @@ public enum StandingBotSchedule {
         let hour = Int(clock[0] - 48) * 10 + Int(clock[1] - 48)
         let minute = Int(clock[3] - 48) * 10 + Int(clock[4] - 48)
         guard hour < 24, minute < 60 else { throw invalid("Schedule time must be between 00:00 and 23:59") }
-        let zone = (timezone ?? localTimezone).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (TimeZone.knownTimeZoneIdentifiers.contains(zone) || ["UTC", "GMT"].contains(zone)),
-              TimeZone(identifier: zone) != nil else {
-            throw invalid("Unknown timezone; use an IANA name such as America/Denver")
+        // No zone given: the time follows the Mac wherever it is.
+        let zone = BotCadence.setZone(timezone)
+        if let zone {
+            guard TimeZone.knownTimeZoneIdentifiers.contains(zone) || ["UTC", "GMT"].contains(zone),
+                  TimeZone(identifier: zone) != nil else {
+                throw invalid("Unknown timezone; use an IANA name such as America/Denver, or none to follow this Mac")
+            }
         }
         return .cron(expression: "\(minute) \(hour) * * \(days)", timeZone: zone)
     }
@@ -61,10 +63,9 @@ public enum StandingBotSchedule {
                 : seconds.truncatingRemainder(dividingBy: 86400) == 0 ? "Every \(Int(seconds / 86400)) days"
                 : "Every \((seconds / 3600).formatted()) hours"
         case .cron(_, let timeZone):
-            // "Daily at 23:57", not the raw cron; the zone only when it isn't this Mac's.
+            // "Daily at 23:57", not the raw cron; a zone only when one is pinned.
             let said = describe(cadence)
-            return said.prefix(1).uppercased() + said.dropFirst()
-                + (timeZone == TimeZone.current.identifier ? "" : " · \(timeZone)")
+            return said.prefix(1).uppercased() + said.dropFirst() + (timeZone.map { " · " + $0 } ?? "")
         }
     }
 

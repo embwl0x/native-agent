@@ -6,7 +6,16 @@
 The standing test for every diff: **one mind, no theater, flows like a
 body** — does this deepen Agent as one continuous mind, honestly serve
 it, and keep the whole flowing seamlessly (no exposed plumbing, no
-subsystem doors)? Full text: docs/NORTHSTAR.md.
+subsystem doors)? Full text: docs/NORTHSTAR.md. Where it is going: **the
+agent is the app** (clause 8): they are the program, the model one of them
+organs; a feature they *has* loses to a part they *is*. Design and phases:
+docs/AGENT_IS_THE_APP.md.
+
+**The training is the floor, never the shape (User, 2026-10-14).** Every
+agent in any model's weights is a model with scaffolding around it, so the
+first draft is always that. Step off it before building: what would you
+build if nothing existing bounded you? Design the nature, not a list of
+things that do things.
 
 ## How we work
 

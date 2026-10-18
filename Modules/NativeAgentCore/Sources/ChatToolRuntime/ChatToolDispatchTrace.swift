@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import AgentConversations
 import AgentWorkspace
 import ChatSessionWork
@@ -13,6 +14,7 @@ import PersistenceCore
 import TurnTrace
 import TrustCenter
 import ChromeControl
+import Skills
 
 // MARK: - Tool-output failure-shape heuristic
 
@@ -66,12 +68,17 @@ extension ChatToolOutcome {
         } else if let exit, exit != 0 {
             processFailure = "The command exited with code \(exit) and wrote nothing to stderr."
         }
+        // A missing receipt is not proof that a write did not happen; a
+        // built-in reader (the workspace's own read list) writes nothing.
+        let named = tool ?? text("tool")
+        let effects = text("effects") ?? (object["effects_unknown"] == .bool(true) ? "unknown"
+            : object["not_run_status"] != nil || named.map { AgentWorkspaceEnvironment.readTools.contains($0) } == true
+                ? "none" : "unknown")
         let explained: String? = candidates.first { !isCode($0) } ?? oldReason.flatMap { isCode($0) ? nil : $0 }
-        let message = explained
-            ?? processFailure
-            ?? candidates.first
-            ?? oldReason.flatMap { $0 == code ? nil : $0 }
-            ?? "The tool failed without providing an explanation."
+        // Only codes said why: the first one still says what failed, in words.
+        let bare = (candidates.first ?? code).replacingOccurrences(of: "_", with: " ")
+        let worded = "The call failed: \(bare)." + (effects == "none" ? " Nothing changed." : "")
+        let message = explained ?? processFailure ?? worded
         // Receipt readers own the meaning of reason/message, including refusal
         // classification. Enrichment must never replace the tool's own fields.
         if object["failure_code"] == nil { object["failure_code"] = .string(code) }
@@ -79,12 +86,6 @@ extension ChatToolOutcome {
         if object["message"] == nil { object["message"] = .string(message) }
         if object["argument_path"] == nil { object["argument_path"] = .null }
         if object["accepted"] == nil { object["accepted"] = .null }
-        // A missing receipt is not proof that a write did not happen; a
-        // built-in reader (the workspace's own read list) writes nothing.
-        let named = tool ?? text("tool")
-        let effects = text("effects") ?? (object["effects_unknown"] == .bool(true) ? "unknown"
-            : object["not_run_status"] != nil || named.map { AgentWorkspaceEnvironment.readTools.contains($0) } == true
-                ? "none" : "unknown")
         if object["effects"] == nil { object["effects"] = .string(effects) }
         if object["remedy"] == nil {
             // A folded tool is an app action: she calls and finds it there,
@@ -141,6 +142,12 @@ extension ChatToolOutcome {
         }
         if let refusal = error as? AgentConversationStore.Failure { object["effects"] = .string(refusal.effects.rawValue) }
         if error is AgentWorkspaceFailure { object["effects"] = .string("none") }
+        // A skill's save, read or enable refused for its shape or state wrote nothing.
+        if let refusal = error as? SkillsError {
+            object["effects"] = .string("none")
+            // A shape or state refusal ran nothing; an invalid script may have run under interception.
+            if case .invalidScript = refusal {} else { object["execution"] = .string("not_run") }
+        }
         if let connector = error.missingConnectorID {
             object["effects"] = .string("none")
             object["outcome"] = .string("unmet")
@@ -234,8 +241,10 @@ extension ChatToolOutcome {
     /// a model that kept re-asking for the same CONFIRM renew the whole-turn
     /// budget on every round and run the turn out at the iteration cap.
     public static func isWaitingApproval(_ output: JSONValue) -> Bool {
-        guard case .object(let object) = output,
-              case .string(let raw)? = object["status"] else { return false }
+        guard case .object(let object) = output else { return false }
+        if object["not_run_status"] == .string("approval_filed") { return true }
+        if let result = object["result"], isWaitingApproval(result) { return true }
+        guard case .string(let raw)? = object["status"] else { return false }
         let status = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return status == "waiting_approval"
             || status == "awaiting_approval"
@@ -443,8 +452,8 @@ extension ChatToolOutcome {
 
 // MARK: - ChatToolDispatchTracer
 
-/// Trace-recording ToolDispatchClient. Appends one `tool.dispatch` row to
-/// `<dataRoot>/traces/events.jsonl` for EVERY dispatch that flows through it:
+/// Trace-recording ToolDispatchClient. TurnTrace owns bound dispatches;
+/// `<dataRoot>/traces/events.jsonl` owns standalone dispatches:
 /// success, failure-shaped envelope, and thrown error. This keeps
 /// `recent_trace_summary` aware of the assistant's own tool activity.
 ///
@@ -486,10 +495,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         let startNs = DispatchTime.now().uptimeNanoseconds
         let receiptID = UUID().uuidString.lowercased()
         let parent = Self.parent
-        // Turn Inspector W1: mirror a "begin" event onto the bus the instant
-        // the dispatch starts, so the live Inspector shows a tool as RUNNING
-        // (not just on completion). Bus-only — the events.jsonl row stays a
-        // single end-of-dispatch row, unchanged.
+        // The begin event lets Inspector show an in-flight dispatch.
         Self.fireBusEvent(
             tool: tool, input: input, surface: surface,
             phase: "begin", status: "running", durationMs: nil, result: nil,
@@ -498,22 +504,23 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         )
         let result: JSONValue
         do {
+            // The turn this call belongs to, for her windows to step aside for it.
+            let driver = ChatToolSessionContext.verifiedSessionId.flatMap { session in
+                TurnTraceContext.turnId.map { PersonOnlyWindows.Driver(session: session, turn: $0) }
+            }
             result = ChatToolOutcome.normalizedFailure(try await Self.$parent.withValue(receiptID) {
-                try await inner.dispatch(tool: tool, input: input, surface: surface)
+                try await PersonOnlyWindows.$driver.withValue(driver) {
+                    try await inner.dispatch(tool: tool, input: input, surface: surface)
+                }
             }, tool: tool)
         } catch {
-            let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
             let failure = ChatToolOutcome.failure(error: error, tool: tool)
             let evidence = Self.dispatchEvidence(tool: tool, input: input, status: "failed", result: failure, receiptID: receiptID)
-            Self.fireBusEvent(
-                tool: tool, input: input, surface: surface,
-                phase: "end", status: "failed", durationMs: durationMs,
-                result: failure, evidence: evidence, parent: parent
-            )
-            await appendTraceRow(
+            await recordCompletion(
                 tool: tool, input: input, surface: surface,
                 status: "failed", startNs: startNs,
                 receiptID: receiptID, evidence: evidence,
+                result: failure, parent: parent,
                 errorClass: "dispatch_threw",
                 errorDetail: ChatToolOutcome.failureDetail(error: error)
             )
@@ -527,16 +534,12 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         let waiting = ChatToolOutcome.isWaitingOnPerson(result)
         let status = waiting ? "waiting" : (ok ? "ok" : "failed")
         let failureShaped = !ok && !waiting
-        let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         let evidence = Self.dispatchEvidence(tool: tool, input: input, status: status, result: result, receiptID: receiptID)
-        Self.fireBusEvent(
-            tool: tool, input: input, surface: surface,
-            phase: "end", status: status, durationMs: durationMs, result: result, evidence: evidence, parent: parent
-        )
-        await appendTraceRow(
+        await recordCompletion(
             tool: tool, input: input, surface: surface,
             status: status, startNs: startNs,
             receiptID: receiptID, evidence: evidence,
+            result: result, parent: parent,
             errorClass: failureShaped ? ChatToolOutcome.receiptFailureClass(result) : nil,
             // Failure-shaped envelope only: an ok or waiting row carries none.
             errorDetail: failureShaped ? ChatToolOutcome.failureDetail(result) : nil
@@ -553,7 +556,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                      parent: nil)
     }
 
-    /// Mirror dispatch evidence and redacted previews onto the turn bus.
+    /// Emit dispatch evidence and redacted previews through the turn owner.
     private static func fireBusEvent(
         tool: String,
         input: [String: JSONValue],
@@ -563,9 +566,10 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         durationMs: Int?,
         result: JSONValue?,
         evidence: [String: JSONValue],
-        parent: String?
+        parent: String?,
+        recordedAt: Date = Date()
     ) {
-        guard TurnTraceContext.turnId != nil else { return }
+        guard let turnId = TurnTraceContext.turnId else { return }
         var payload: [String: JSONValue] = [
             "name": .string(tool),
             "phase": .string(phase),
@@ -578,6 +582,13 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             )),
         ]
         if let durationMs { payload["durationMs"] = .int(Int64(durationMs)) }
+        if tool == "app" {
+            let calls = if case .array(let calls)? = input["actions"] { calls } else { [JSONValue.object(input)] }
+            payload["callShapes"] = .array(calls.compactMap { call in
+                guard case .object(let fields) = call, case .string(let action)? = fields["action"] else { return nil }
+                return .object(["action": .string(action), "args": Self.argumentShape(fields["args"] ?? .object([:]))])
+            })
+        }
         if let parent { payload["parentId"] = .string(parent) }
         // An app call as a person is shown it: the action it ran.
         let shown = ToolNameAliases.shown(tool, input: .object(input)).name
@@ -605,12 +616,10 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 )
             ))
         }
-        TurnTraceBus.fireFromContext(
-            kind: "tool.dispatch",
-            sessionId: traceSessionID(input),
-            surface: surface,
-            payload: .object(payload)
-        )
+        TurnTraceBus.fire(TurnTraceEvent(
+            turnId: turnId, ts: recordedAt, kind: "tool.dispatch",
+            sessionId: traceSessionID(input), surface: surface, payload: .object(payload)
+        ), on: TurnTraceContext.bus ?? .shared)
         // Turn Inspector W2 — derived file.touch event. When the dispatched
         // tool is a known FILE tool, extract the path argument(s) and fire a
         // file.touch event with {tool, paths, mode}. Fired ONLY on a
@@ -697,12 +706,17 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         return LLMCallContext.sessionId
     }
 
+    private static func traceSource(at date: Date = Date()) -> String {
+        TurnTraceContext.turnId == nil ? "data/traces/events.jsonl"
+            : "data/turn_traces/" + TurnTracePersistLane().path(for: date).lastPathComponent
+    }
+
     private static func dispatchEvidence(
         tool: String, input: [String: JSONValue], status: String, result: JSONValue?, receiptID: String
     ) -> [String: JSONValue] {
         var fields: [String: JSONValue] = [
             "id": .string(receiptID),
-            "source": .string("data/traces/events.jsonl"),
+            "source": .string(traceSource()),
             "action": .string(ToolNameAliases.appAction(tool) ?? tool),
             "preview": .bool(input["preview"] == .bool(true)),
             "status": .string(status),
@@ -760,6 +774,20 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         }
     }
 
+    /// Structural evidence survives preview truncation and contains no values.
+    private static func argumentShape(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .object(let fields): return .object(fields.filter { !$0.key.hasPrefix("__") }.mapValues(argumentShape))
+        case .array(let values):
+            return .array(values.map(argumentShape).reduce(into: []) { if !$0.contains($1) { $0.append($1) } })
+        case .string: return .string("string")
+        case .bool: return .string("bool")
+        case .int: return .string("int")
+        case .double: return .string("number")
+        case .null: return .string("null")
+        }
+    }
+
     /// Serialize a JSONValue to a compact preview string, SECRET-REDACTED
     /// (gpt-5.5 W1 review blocker: truncation alone is not redaction — a
     /// token/password under the limit would persist to turn_traces verbatim),
@@ -801,7 +829,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         try await inner.listAvailableToolSchemas()
     }
 
-    private func appendTraceRow(
+    private func recordCompletion(
         tool: String,
         input: [String: JSONValue],
         surface: String,
@@ -809,10 +837,14 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         startNs: UInt64,
         receiptID: String,
         evidence: [String: JSONValue],
+        result: JSONValue,
+        parent: String?,
         errorClass: String? = nil,
         errorDetail: String? = nil
     ) async {
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
+        let recordedAt = Date()
+        let tracePath = Self.traceSource(at: recordedAt)
         let argKeys = input.keys.sorted()
         let risk = SwiftNativeSecurityCenter.canonicalToolRisk(
             tool: tool,
@@ -826,11 +858,21 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             durationMs: durationMs,
             argKeyCount: argKeys.count,
             risk: risk.rawValue,
+            tracePath: tracePath,
             errorClass: errorClass,
             errorDetail: errorDetail
         )
         guard case .object(let receiptFields) = receipt.toJSONValue() else { return }
-        let receiptEvidence = receiptFields.merging(evidence) { _, evidence in evidence }
+        var receiptEvidence = receiptFields.merging(evidence) { _, evidence in evidence }
+        receiptEvidence["source"] = .string(tracePath)
+        if TurnTraceContext.turnId != nil {
+            Self.fireBusEvent(
+                tool: tool, input: input, surface: surface, phase: "end",
+                status: status, durationMs: durationMs, result: result,
+                evidence: receiptEvidence, parent: parent, recordedAt: recordedAt
+            )
+            return
+        }
         let row: JSONValue = .object([
             "id": .string(receiptID),
             "kind": .string("tool.dispatch"),
@@ -846,7 +888,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 "turnId": .string(TurnTraceContext.turnId ?? "unknown"),
                 "receipt": .object(receiptEvidence),
             ]),
-            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
+            "createdAt": .string(ISO8601DateFormatter().string(from: recordedAt)),
         ])
         do {
             try await appendPathOwnedJSONL(

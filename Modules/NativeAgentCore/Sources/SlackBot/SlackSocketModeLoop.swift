@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import BackgroundLoops
@@ -1260,6 +1261,16 @@ public struct SlackSocketModeLoop: LoopRunner {
             let claim = try await deliveryJournal.claim(received)
             guard case .claimed(var record) = claim else { return true }
             let inbound = record.inbound.inbound
+            // Once the pass that ran its turn has handled it, whatever the outcome.
+            var handled: (session: String, run: String)?
+            defer {
+                if let handled {
+                    var payload: [String: JSONValue] = ["text": .string(inbound.text), "channel_id": .string(inbound.channelId),
+                        "user_id": .string(inbound.userId), "session_id": .string(handled.session), "turn_id": .string(handled.run)]
+                    if !config.allowedUserIds.contains(inbound.userId) { payload["agent"] = .string("slack:" + inbound.userId) }
+                    AbilityStore(dataRoot: dataRoot).signal("message.arrived:slack", payload)
+                }
+            }
             // Only unresolved messages can wake bots; the durable claim keeps
             // socket, history and recovery from repeating the same fan-out.
             if (try? await deliveryJournal.claimBotEvent(eventId: inbound.eventId)) == true {
@@ -1322,6 +1333,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 let sessionId = try await SlackSessionStore(dataRoot: dataRoot).activeSessionId(for: inbound)
                 let runId = UUID().uuidString
                 record = try await deliveryJournal.beginGeneration(eventId: inbound.eventId, runId: runId, sessionId: sessionId)
+                handled = (sessionId, runId)
                 let reply: SlackSocketModeReply
                 var failedBeforeAnswer = false
                 do {

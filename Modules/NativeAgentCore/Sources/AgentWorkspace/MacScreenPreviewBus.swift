@@ -301,23 +301,11 @@ public enum MacScreenPreviewFrame {
             guard case .string(let value)? = mark["label"] else { return nil }
             return value
         }()
-        if MacScreenViewBuilder.isSecretField(role: role, subrole: subrole, label: label) { return true }
-        // Last signal, and the one that does not depend on how a toolkit names
-        // things: a field whose displayed value is obscured glyphs IS a
-        // password box, whatever its role, subrole or label say. AppKit and
-        // WebKit both publish a secure field's value to accessibility as
-        // bullets, so an unlabelled web `<input type=password>` with no secure
-        // subrole — the one shape the checks above can miss — is caught here.
-        if case .string(let value)? = mark["value"], isObscured(value) { return true }
-        return false
-    }
-
-    /// True when every character is a mask glyph and there is at least one.
-    static func isObscured(_ value: String) -> Bool {
-        let masks: Set<Character> = ["\u{2022}", "\u{25CF}", "\u{00B7}", "\u{2024}", "*"]
-        let trimmed = value.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return false }
-        return trimmed.allSatisfy { masks.contains($0) }
+        let value: String? = {
+            guard case .string(let value)? = mark["value"] else { return nil }
+            return value
+        }()
+        return MacScreenViewBuilder.isSecretField(role: role, subrole: subrole, label: label, value: value)
     }
 
     private static func frame(_ value: JSONValue?) -> MacAXFrame? {

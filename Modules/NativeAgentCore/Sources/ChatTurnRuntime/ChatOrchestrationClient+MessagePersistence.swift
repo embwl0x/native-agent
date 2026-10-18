@@ -400,6 +400,7 @@ extension SwiftNativeChatOrchestrationClient {
         runId: String?,
         toolName: String,
         inputJSON: String,
+        ranCall: (tool: String, input: [String: JSONValue])?,
         resultSummary: String,
         ok: Bool,
         cognitiveResult: ChatToolOutcome.CognitiveResult? = nil,
@@ -421,7 +422,7 @@ extension SwiftNativeChatOrchestrationClient {
         let safeInputJSON = Self.redactedPersistedToolInput(tool: toolName, json: inputJSON)
         // An app call of a folded action returns that tool's result, kept and
         // observed as that tool's (a read's bounded receipt among them).
-        let ranTool = ToolNameAliases.shown(toolName, inputJSON: inputJSON).name
+        let ranTool = ranCall?.tool ?? ToolNameAliases.shown(toolName, inputJSON: inputJSON).name
         // W3.5-FIX 3 — and for `mac_view` the RESULT is a base64 screenshot of
         // the whole window. The persisted transcript is read back by every
         // surface and syncs; the pixels come out here and leave the digest.
@@ -504,6 +505,12 @@ extension SwiftNativeChatOrchestrationClient {
         ]
         // Keep the small receipt fields before the persisted body is clipped.
         // These are returned values, never the transcript's own id or runId.
+        if let ranCall {
+            let raw = (try? JSONValue.object(ranCall.input).serialize(pretty: false)) ?? "{}"
+            let safe = Self.redactedPersistedToolInput(tool: ranCall.tool, json: raw)
+            metadata["ranCall"] = .object(["tool": .string(ranCall.tool),
+                "input": (try? JSONValue.parse(Data(safe.utf8))) ?? .object([:])])
+        }
         if let originalResult {
             if ranTool == "image_generate", case .object(let result) = originalResult, let images = result["images"] {
                 metadata["generatedImages"] = images
@@ -1636,18 +1643,20 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     /// Carry the compaction outcome so the window cursor does not rewrite the
-    /// same prefix again. Only cancellation aborts this preparation.
+    /// same prefix again, and the transcript bytes the compactor read so the
+    /// turn's history selects from them instead of reading the file again.
+    /// Only cancellation aborts this preparation.
     func prepareSessionHistoryForTurn(
         sessionId: String,
         model: String,
         surface: String,
         runId: String
-    ) async throws(CancellationError) -> Bool {
-        var compactionRanThisTurn = false
+    ) async throws(CancellationError) -> (compacted: Bool, transcript: Data?) {
+        var outcome: ChatSessionCompactionOutcome?
         do {
-            compactionRanThisTurn = try await compactSessionBeforeContextIfNeeded(
+            outcome = try await compactSessionBeforeContextIfNeeded(
                 sessionId: sessionId, model: model, surface: surface, runId: runId
-            ).compacted
+            )
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -1668,7 +1677,7 @@ extension SwiftNativeChatOrchestrationClient {
         scheduleTranscriptAgingIfNeeded(
             sessionId: sessionId, model: model, surface: surface, runId: runId
         )
-        return compactionRanThisTurn
+        return (outcome?.compacted ?? false, outcome?.transcript)
     }
 
     @discardableResult
@@ -2269,7 +2278,7 @@ extension SwiftNativeChatOrchestrationClient {
     /// the transcript and on the glass. Scrubbed HERE, before the signature
     /// witness is minted, so the receipt is minted over the text that is
     /// actually stored.
-    static func scrubbedCardDisplay(_ interaction: InlineInteraction) -> InlineInteraction {
+    package static func scrubbedCardDisplay(_ interaction: InlineInteraction) -> InlineInteraction {
         var copy = interaction
         copy.title = Self.scrubbedCardText(copy.title, maximumCharacters: 120)
         copy.why = Self.scrubbedCardText(copy.why, maximumCharacters: 400)

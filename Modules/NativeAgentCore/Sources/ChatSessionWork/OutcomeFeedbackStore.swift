@@ -125,7 +125,7 @@ public struct OutcomeFeedbackStore: Sendable {
         let reaction = rating == "up" ? "thumbs_up" : "thumbs_down"
         return try await persistence.withFileLock(feedbackPath) {
             let existing = try Self.readExistingFeedbackFile(feedbackPath)
-            let prior = existing.reversed().first { row in
+            let prior = existing.rows.reversed().first { row in
                 guard case .object(let object) = row else { return false }
                 return object["schema"] == .string(Self.schema)
                     && object["sessionId"] == .string(sessionID)
@@ -166,7 +166,7 @@ public struct OutcomeFeedbackStore: Sendable {
                 logLabel: "OutcomeFeedbackStore",
                 takeLock: false,
                 maxBytes: Self.maximumExistingBytes,
-                capCheckStride: 1
+                validatedExistingCounts: (existing.physicalRows, existing.bytes)
             )
             return record
         }
@@ -246,7 +246,7 @@ public struct OutcomeFeedbackStore: Sendable {
         ])
         return try await persistence.withFileLock(feedbackPath) {
             let existing = try Self.readExistingFeedbackFile(feedbackPath)
-            if let prior = existing.first(where: { row in
+            if let prior = existing.rows.first(where: { row in
                 guard case .object(let object) = row else { return false }
                 return object["schema"] == .string(Self.continuationSchema)
                     && object["reactionMessageId"] == .string(reactionMessageID)
@@ -261,7 +261,7 @@ public struct OutcomeFeedbackStore: Sendable {
                 logLabel: "OutcomeFeedbackStore",
                 takeLock: false,
                 maxBytes: Self.maximumExistingBytes,
-                capCheckStride: 1
+                validatedExistingCounts: (existing.physicalRows, existing.bytes)
             )
             return record
         }
@@ -291,7 +291,7 @@ public struct OutcomeFeedbackStore: Sendable {
         let path = dataRoot.appendingPathComponent("context/feedback.jsonl")
         return try await persistence.withFileLock(path) {
             let existing = try Self.readExistingFeedbackFile(path)
-            return Set(existing.compactMap { row in
+            return Set(existing.rows.compactMap { row in
                 guard case .object(let object) = row,
                       object["schema"] == .string(Self.schema)
                         || object["schema"] == .string(Self.continuationSchema),
@@ -305,19 +305,21 @@ public struct OutcomeFeedbackStore: Sendable {
         }
     }
 
-    private static func readExistingFeedbackFile(_ path: URL) throws -> [JSONValue] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+    private static func readExistingFeedbackFile(_ path: URL) throws -> (rows: [JSONValue], physicalRows: Int, bytes: Int) {
+        guard FileManager.default.fileExists(atPath: path.path) else { return ([], 0, 0) }
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path.path),
               let number = attributes[.size] as? NSNumber,
               number.intValue <= maximumExistingBytes,
               let data = try? Data(contentsOf: path, options: [.mappedIfSafe]) else {
             throw OutcomeFeedbackError.feedbackStoreCorrupt
         }
-        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        var physicalLines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        if physicalLines.last?.isEmpty == true { physicalLines.removeLast() }
+        let lines = physicalLines.filter { !$0.isEmpty }
         guard lines.count <= maximumExistingRows else {
             throw OutcomeFeedbackError.feedbackStoreCorrupt
         }
-        return try lines.compactMap { line -> JSONValue? in
+        let rows = try lines.compactMap { line -> JSONValue? in
             guard let value = try? JSONValue.parse(Data(line)), case .object(let object) = value else {
                 throw OutcomeFeedbackError.feedbackStoreCorrupt
             }
@@ -378,5 +380,8 @@ public struct OutcomeFeedbackStore: Sendable {
             // Match readJSONL's UTF-8 admission after validating every row.
             return String(data: Data(line), encoding: .utf8) == nil ? nil : value
         }
+        // appendBytes repairs a missing separator before appending the row.
+        let appendBaseBytes = data.count + (!data.isEmpty && data.last != 0x0A ? 1 : 0)
+        return (rows, physicalLines.count, appendBaseBytes)
     }
 }

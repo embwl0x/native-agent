@@ -542,10 +542,8 @@ package enum AgentConversationSession {
            let delivered = string(fields["reply"]), let latest, agent.hasPrefix("peer:"),
            let message = string(latest.readInput?["message_id"]) {
             let clipped = fields["reply_truncated"] == .bool(true)
-            _ = try? GrokRequestStore(dataRoot: dataRoot).update(message, peer: String(agent.dropFirst(5))) {
-                if $0.state == "answered", let saved = $0.reply, saved == delivered || (clipped && saved.hasPrefix(delivered)) {
-                    $0.seen = true
-                }
+            GrokRequestStore(dataRoot: dataRoot).shown(message, peer: String(agent.dropFirst(5)), by: "wait") {
+                $0 == delivered || (clipped && $0.hasPrefix(delivered))
             }
         }
         // A contact's wait hands back the exchange, not its retained history.

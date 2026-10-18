@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Privacy
 import Foundation
 import NativeAgentCore
@@ -321,6 +322,10 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     }
 
     private func saveRoutine(_ fields: [String: JSONValue], script: JSONValue, steer: JSONValue?) async throws -> JSONValue {
+        let part = try AbilityStore.partHeader(fields)
+        guard case .bool(let createOnly) = fields["create_only"] ?? .bool(false) else {
+            throw SkillsError.invalidScript("create_only must be a Boolean.")
+        }
         guard let steer, SkillScript.originKind(steer) != nil,
               case .string(let name)? = fields["name"], !name.isEmpty, name.count <= 120,
               case .string(let description)? = fields["description"], !description.isEmpty,
@@ -342,6 +347,11 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                     .first { $0.pathExtension.lowercased() == "md" && $0.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame } : nil
             if let builtIn { try VerifiedPath.confirmNoSymlink(builtIn) }
             let builtInID = builtIn?.deletingPathExtension().lastPathComponent
+            if createOnly, try builtInID != nil || InstalledSkillInventory.match(name, in: inventory) != nil
+                || self.abilities.contains(id: SkillMutation.pyStrOptional(fields["id"]) ?? SkillMutation.slugify(name), name: name) {
+                return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("name_exists"),
+                    "detail": .string("That part name already exists. Choose a fresh name; nothing was replaced.")])
+            }
             let index = if let id = SkillMutation.pyStrOptional(fields["id"]) {
                 rows.firstIndex { $0.objectValue?["id"] == .string(id) }
             } else {
@@ -361,10 +371,11 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             let manifest: JSONValue = .object(["id": .string(id), "name": .string(name), "description": .string(description),
                 "triggers": fields["triggers"] ?? .array([]), "script": script, "origin": origin,
                 "overrides": builtIn != nil || before?["overrides"] == .string("built_in") || fields["overrides"] == .string("built_in") ? .string("built_in") : .null,
-                "converts": try OwnedProgramStore.conversionSources(fields["converts"])])
+                "converts": try OwnedProgramStore.conversionSources(fields["converts"])].merging(part) { _, value in value })
             let candidate = try OwnedProgramStore.Candidate(program: OwnedProgram(kind: .skill, id: id, version: "candidate",
                 source: SkillMutation.string(script, "source"), entry: .run, schema: SkillScript.inputSchema(script),
-                dependencies: (script.objectValue?["actions"]?.arrayValue ?? []).compactMap(SkillMutation.pyStrOptional)),
+                dependencies: (script.objectValue?["actions"]?.arrayValue ?? []).compactMap(SkillMutation.pyStrOptional),
+                resident: part["resident"] == .bool(true)),
                 manifest: manifest, fixtures: .array(fixtures), dependencyShapes: .object(pins),
                 prior: before.map(Self.routineSelection) ?? .null)
             try self.routineStore.stage(candidate)
@@ -418,12 +429,8 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             guard !(proof.objectValue?["receipts"]?.arrayValue ?? []).isEmpty else { throw SkillsError.invalidScript("Validation returned no runtime receipts.") }
         }
         catch {
-            try AbilityStore.withLock {
-                if let next = try abilities.read(id: candidate.id, slot: .next),
-                   next.metadata["candidate"]?.objectValue?["program"]?.objectValue?["version"] == .string(candidate.digest) {
-                    try abilities.remove(id: candidate.id, slot: .next)
-                }
-            }
+            // The candidate stands through a failed validation (OwnedProgramStore.validate
+            // says why); the refusal names what to fix, and the next save replaces it.
             throw error
         }
         let receipts = proof.objectValue?["receipts"]?.arrayValue ?? []
@@ -458,7 +465,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
 
     private func keepRoutine(_ current: [String: JSONValue], admittedBy: String?, reviewedDigest: String?, ownerAuthorized: Bool) async throws -> JSONValue {
         let id = SkillMutation.pyStr(current["id"] ?? .null)
-        guard ownerAuthorized || current["overrides"] != .string("built_in") else {
+        guard ownerAuthorized || admittedBy == "agent" || current["overrides"] != .string("built_in") else {
             throw SkillsError.invalidScript("Turning on an override of a built-in skill is the owner's.")
         }
         let candidate = try routineCandidate(current)
@@ -588,18 +595,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         return Set(held.keys).union(wanted.keys).filter { held[$0] != wanted[$0] }.sorted()
     }
 
-    /// What a finished run of a script skill says about it (skills-as-code
-    /// PR 5), kept in state.json under `runs`: its own faults in a row, the last
-    /// result, and the trust ladder, the distinct inputs of its clean runs
-    /// under this admission of this digest (a new digest, admission or pin
-    /// starts it over). `fault` is the skill's own; a run with none that isn't
-    /// `clean` was the world's and counts neither way. Returns its clean runs,
-    /// and its upgrade signals (`CapabilityLifecycle`), each one MY QUEUE line
-    /// at most once until it changes: the same world stop at the same step in
-    /// 2 of its last 3 runs, and a new digest's fault, offering the last clean one.
-    /// `runs.last` keeps the run's id, end time, reason and stop `step`.
-    /// `admission` is the one the run started under: a row turned off,
-    /// changed or admitted again since (by User or anything else) returns nil.
+    /// Distinct clean inputs and world-stop upgrade signals under this admission.
     public func recordRun(_ entry: InstalledSkillInventory.Entry, runID: String = "", digest: String, admission: JSONValue?, fault: String?, clean: Bool,
                           reason: String, step: String = "", inputHash: String) async throws -> (clean: Int, signals: [SkillLine])? {
         try await mutateRoutine(entry) { row in
@@ -614,17 +610,12 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             let stop = (fault ?? reason) + "@" + step
             let held: [JSONValue] = if same, case .array(let list)? = runs["stops"] { list } else { [] }
             let stops = Array((held + [.string(stop)]).suffix(3))
-            var faults = same ? SkillMutation.intValue(runs["faults"]) ?? 0 : 0
             if fault != nil {
-                faults += 1
                 inputs = []
             } else if clean {
-                faults = 0
                 if !inputs.contains(.string(inputHash)) {
                     inputs = Array((inputs + [.string(inputHash)]).suffix(CapabilityLifecycle.inputLimit))
                 }
-                row["lastCleanDigest"] = .string(digest)
-                row["lastCleanVersion"] = row["codeFingerprint"]
             }
             let name = SkillMutation.pyStrTruthyOr(row["name"], entry.id)
             var signals: [SkillLine] = []
@@ -636,28 +627,19 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 signals.append(("\(name) stopped on \(parts[0])\(parts.count > 1 && !parts[1].isEmpty ? " at \(parts[1])" : "") "
                     + "in 2 of its last 3 runs; upgrade it?", voices))
             }
-            let lastClean = SkillMutation.pyStrOptional(row["previousVersion"])
-            if CapabilityLifecycle.offersRollback(digest: digest, faulted: fault != nil, lastClean: lastClean),
-               noted["fault"] != .string(digest), let lastClean {
-                noted["fault"] = .string(digest)
-                signals.append(("\(name)'s new script faulted (\(fault ?? reason)); skill.rollback returns its previous version "
-                    + "(\(lastClean.prefix(8)))", voices))
-            }
             var last: [String: JSONValue] = ["at": .string(at), "result": .string(fault != nil ? "skill_fault" : clean ? "clean" : "world"),
                                              "reason": .string(fault ?? reason), "step": .string(step)]
             if !runID.isEmpty { last["run_id"] = .string(runID) }
-            row["runs"] = .object([
-                "faults": .int(Int64(faults)), "key": key, "inputs": .array(inputs), "stops": .array(stops),
+            row["runs"] = .object(runs.merging([
+                "key": key, "inputs": .array(inputs), "stops": .array(stops),
                 "noted": .object(noted), "last": .object(last),
-            ])
-            row["lastUsedAt"] = .string(at)
-            row["useCount"] = .int(Int64((SkillMutation.intValue(row["useCount"]) ?? 0) + 1))
+            ]) { _, new in new })
             return (inputs.count, signals)
         }
     }
 
     /// Swap the current and previous files, preserving origin and owner off.
-    public func rollbackScript(_ entry: InstalledSkillInventory.Entry, version: String?, steer: JSONValue, preview: Bool = false) async throws -> JSONValue {
+    public func rollbackScript(_ entry: InstalledSkillInventory.Entry, version: String?, steer: JSONValue, preview: Bool = false) throws -> JSONValue {
         let row = entry.row
         return try AbilityStore.withLock {
             guard row["source"] == .string("runtime_registry"),
@@ -679,11 +661,8 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             fields.merge(try abilities.states()[entry.id]?.objectValue ?? [:]) { _, statistic in statistic }
             fields = try CapabilityLifecycle.preservingOwnerOff(fields, before: row, preview: preview)
             if preview { return .object(fields) }
-            try CapabilityLifecycle.requireWrite()
-            try abilities.swap(id: entry.id)
-            var rows = try SkillsRegistry.decode(abilities.registry(kind: .skill))
-            rows[index] = .object(fields)
-            try abilities.saveRegistry(.array(rows), kind: .skill)
+            // Keep the reconciled provenance before the file can become current.
+            try abilities.swap(id: entry.id, record: fields)
             return .object(fields)
         }
     }
@@ -709,10 +688,10 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             "\(skill)'s script came with the \(SkillMutation.pyStr(origin["pack"] ?? .null)) pack, so turning it on is the owner's"
         } else if kind == nil {
             "\(skill)'s script has no attested origin, so turning it on is the owner's"
-        } else if !fullMac {
-            "Below Full Mac turning a script on is the owner's"
         } else { nil }
-        return users
+        if let users { return users }
+        do { try CapabilityLifecycle.requireKeep(ownerAuthorized: fullMac); return nil }
+        catch { return error.localizedDescription }
     }
 
     /// Agent lifecycle policy lives with the registry; the host only presents
@@ -789,7 +768,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             return (false, "\(skill) is built in: it ships with the app in persona/skills, so switching it off or deleting it is the owner's. Ask them.", fields)
         }
         let override = row["overrides"] == .string("built_in")
-        if override, ["enable", "disable", "delete", "quarantine", "rollback"].contains(verb), !ownerAuthorized {
+        if override, ["disable", "delete", "quarantine", "rollback"].contains(verb), !ownerAuthorized {
             return (false, "\(skill) is your version of a built-in, so switching it off or deleting it is the owner's. Ask them. "
                 + "Changing its active version is the owner's too.", fields)
         }
@@ -867,7 +846,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             }
         case "rollback":
             do {
-                let rolled = try await rollbackScript(matched, version: version, steer: SkillScript.origin(steeredBy: steer), preview: preview)
+                let rolled = try rollbackScript(matched, version: version, steer: SkillScript.origin(steeredBy: steer), preview: preview)
                 let lands = SkillMutation.string(rolled, "status")
                 let ownerOff = CapabilityLifecycle.requiresOwnerToEnable(rolled.objectValue ?? [:])
                 if preview {

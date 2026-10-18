@@ -1,10 +1,17 @@
 import Foundation
+import PersistenceCore
 
-/// A skill run's calls (`skill.run`): nothing it does files a card for User,
-/// an approval or an inline one, or opens a macOS permission prompt. Each
-/// filing point checks this and hands the step back to her instead.
+/// Authored calls carry their part's identity. Validation hands requests back
+/// without filing a card or opening a macOS permission prompt.
 public enum SkillRunContext {
     @TaskLocal public static var handsBack = false
+    @TaskLocal public static var partID: String?
+    @TaskLocal public static var input: JSONValue?
+    @TaskLocal public static var requester: String?
+    @TaskLocal public static var hostCallID: UUID?
+    /// Told each file the running part itself wrote, right after the write,
+    /// so its watch can tell that write from anyone else's.
+    @TaskLocal public static var wrote: (@Sendable (URL) -> Void)?
 
     /// What a filing point that can only throw throws inside a skill run.
     public struct HandBack: Error, LocalizedError {

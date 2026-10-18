@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import CognitiveSubstrate
-import ToolRegistry
 
 /// The settle stage a turn ends through, on every lane: whether it ends
 /// waiting on a card, the terminal it gets then, the sentence the transport
@@ -25,7 +24,7 @@ enum TurnSettle {
         guard completion != nil || origin?.authored != .agent else { return nil }
         // Finding an action (app {find}) or expanding context is not work.
         let meaningfulTools = result.toolDispatches.filter {
-            ToolNameAliases.ranTool($0.name, input: $0.input) != "context_expand"
+            $0.ranCall.tool != "context_expand"
                 && !($0.name == "app" && $0.input["find"] != nil && $0.input["action"] == nil)
         }
         let authored = NaturalExpressionGuidance.authoredHead(message)
@@ -36,8 +35,8 @@ enum TurnSettle {
         // An accepted asynchronous assignment is still owed. Its resident
         // continuation, carrying the completion binding, supplies the result.
         if meaningfulTools.contains(where: { dispatch in
-            let ran = ToolNameAliases.ranTool(dispatch.name, input: dispatch.input)
-            let input = ToolNameAliases.ranInput(dispatch.name, input: dispatch.input)
+            let ran = dispatch.ranCall.tool
+            let input = dispatch.ranCall.input
             guard ["agent_message", "codex_message", "claude_message", "omp_message", "bot_run_once"].contains(ran),
                   case .object(let fields) = dispatch.result else { return false }
             // A one-way note completes when sent: its contract deliberately

@@ -36,12 +36,12 @@ extension AppQuietToolHost {
                 UserFacingError.message(error, action: action)
             }).manageSkill(verb: verb, input: input, steer: steer)
         if outcome.refreshSkills { await appModel.loadSkillManifests() }
+        // The Tools page's own refresh, its catalog too, so a dropped tool leaves
+        // both lists; before the verb's status, which the refresh must not overwrite.
+        if outcome.refreshTools { _ = await appModel.refreshForSidebarItem(.tools) }
         if let status = outcome.toolStatus {
             appModel.recordToolOperationStatus(status.message, outcome: status.succeeded ? .succeeded : .failed)
             appModel.statusCause = status.cause
-        }
-        if outcome.refreshTools, let reloaded = try? await appModel.engine.tools.listAuthored() {
-            appModel.engine.tools.authored = reloaded
         }
         return (outcome.ok, outcome.detail, outcome.fields)
     }

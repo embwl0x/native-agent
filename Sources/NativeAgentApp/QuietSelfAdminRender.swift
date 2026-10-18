@@ -586,7 +586,7 @@ extension QuietSelfAdminRender {
         var sections = [section("Diagnostics", head)]
         do {
             let tools = try await appModel.engine.tools.listAuthored()
-            for (title, targets) in [("Tool ids for tool.restore", tools.filter { ["archived", "quarantined"].contains($0.status) }),
+            for (title, targets) in [("Tool ids for tool.restore", tools.filter { $0.status == "disabled" }),
                                      ("Tool ids for tool.approve", tools.filter { ToolApprovalEligibility.refusal(for: $0) == nil })] {
                 sections.append(section(title, targets.isEmpty ? ["None."] : targets.map { "\($0.id): \($0.name)" }))
             }

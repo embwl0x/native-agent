@@ -158,8 +158,8 @@ extension CapabilityLifecycle {
                     if let rows = fields[key] { fields[key] = abilityContents(rows) }
                 }
                 if let original = fields["builtIn"] { fields["builtIn"] = abilityContents(original) }
-                for field in ["uses", "useCount", "lastUsedAt", "lastRunVersion", "lastRun", "failuresInARow",
-                              "lastCleanCode", "lastCleanVersion", "lastCleanDigest", "runs"] { fields.removeValue(forKey: field) }
+                for field in ["uses", "useCount", "lastUsedAt", "lastRunVersion", "lastRun",
+                              "lastCleanCode", "lastCleanVersion", "runs"] { fields.removeValue(forKey: field) }
             }
             return .object(fields)
         default: return value
@@ -520,7 +520,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         rows.reserveCapacity(tail.count)
         var malformedJSONRowCount = 0
         for line in tail {
-            if let row = try? JSONValue.parse(Data(line.utf8)) {
+            if let line, let row = try? JSONValue.parse(Data(line.utf8)) {
                 rows.append(row)
             } else {
                 malformedJSONRowCount += 1
@@ -535,12 +535,12 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         )
     }
 
-    /// Tail raw physical lines so typed readers can keep their own decoding rules.
+    /// Tail physical lines; nil preserves a row rejected by strict UTF-8 decoding.
     public static func tailPhysicalLines(
         _ path: URL,
         limit: Int,
         maxBytes: Int?
-    ) throws -> (lines: [String], bytesRead: Int, truncatedToByteWindow: Bool) {
+    ) throws -> (lines: [String?], bytesRead: Int, truncatedToByteWindow: Bool) {
         guard limit > 0, maxBytes.map({ $0 > 0 }) ?? true,
               FileManager.default.fileExists(atPath: path.path) else {
             return ([], 0, false)
@@ -590,21 +590,13 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         return (Array(lines.suffix(limit)), data.count, seekFromEnd)
     }
 
-    /// Decode utf-8 with replacement, split on `\n`, drop trailing empty line, and
-    /// (when scanning from the middle of a file) drop the first possibly-partial
-    /// line to match Python's `tail_jsonl` behavior.
-    private static func decodeLines(_ data: Data, dropFirstPartial: Bool) -> [String] {
-        let text: String
-        if let utf8 = String(data: data, encoding: .utf8) {
-            text = utf8
-        } else {
-            // Match Python's errors="replace" semantics for tail_jsonl.
-            text = String(decoding: data, as: UTF8.self)
-        }
-        var parts = text.components(separatedBy: "\n")
-        if parts.last == "" { parts.removeLast() }
+    /// Split on `\n` and strictly decode UTF-8. Drop the trailing empty line and
+    /// any possibly-partial first line before decoding; invalid rows remain nil.
+    private static func decodeLines(_ data: Data, dropFirstPartial: Bool) -> [String?] {
+        var parts = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        if parts.last?.isEmpty == true { parts.removeLast() }
         if dropFirstPartial && !parts.isEmpty { parts.removeFirst() }
-        return parts
+        return parts.map { String(data: $0, encoding: .utf8) }
     }
 
     /// Synchronous append of caller-serialized, newline-terminated lines, for a

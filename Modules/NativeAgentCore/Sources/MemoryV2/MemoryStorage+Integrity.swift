@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import GRDB
 
@@ -99,12 +100,26 @@ extension MemoryStorage {
         }
     }
 
-    /// Stable canonical generation for rebuildable memory projections. Recall
-    /// counters are deliberately excluded by the consolidation fingerprint, so
-    /// ordinary reads do not force Spotlight/USER/KG reconciliation.
-    public func projectionGenerationFingerprint() async throws -> String {
+    /// Identity of the exact exported Spotlight items. Eligibility
+    /// matches its active-memory read; proposals and vector state are unrelated.
+    public func spotlightGenerationFingerprint() async throws -> String {
         try await dbPool.read { db in
-            try MemoryConsolidationGate.fingerprint(in: db)
+            var hasher = SHA256()
+            let rows = try Row.fetchCursor(db, sql: """
+                SELECT id, content, status FROM memories
+                WHERE status = 'active' AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
+                ORDER BY id
+                """)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            while let row = try rows.next() {
+                let item = SwiftNativeMemoryIndexer.makeItem(
+                    id: try row.decode(forColumn: "id"),
+                    text: try row.decode(forColumn: "content"),
+                    kind: try row.decode(forColumn: "status"))
+                hasher.update(data: try encoder.encode(item))
+            }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
         }
     }
 

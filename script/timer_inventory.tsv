@@ -1,8 +1,9 @@
 # path	needle	expected_count	classification	canonical_owner
-# Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift: the shared JSC watchdog retains the existing 0.25-second callback; sense progress renews its stall window, tools retain an absolute deadline, skill/script quotas exclude host replies. Cleared on completion.
+# MacAppIndex: Spotlight gathering/update notifications own app arrivals; AgentPeerDiscovery landing watches, Applications-folder watches and install stamps are removed. No timer or polling site.
+# Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift: the shared JSC watchdog retains the existing 0.25-second callback; accepted sense progress and every program host reply renew its stall window; both clocks exclude outstanding host replies. Cleared on completion.
 # Sources/NativeAgentSenseHost/PlugIO.swift: blocking bounded JSON input has no reply timer; the runner serves outstanding app replies while sense stall accounting is suspended, with cancellation, process exit and memory supervision retained.
 Modules/NativeAgentCore/Sources/Senses/HelperSenseRunner.swift	deadline.timeIntervalSinceNow	1	event_deadline	HelperSenseRunner live idle retention, rearmed by caller requests; expiration defers active entries and the read-to-watch hold until settlement/release
-Modules/NativeAgentCore/Sources/Senses/OwnedProgramRunner.swift	Task.sleep(until: deadline	1	timeout_retry_deadline	Extracted helper deadline owner; accepted sense progress renews only the sense stall window, tools keep an absolute deadline, skill/script quotas exclude host reply waits; cancelled on completion/stop
+Modules/NativeAgentCore/Sources/Senses/OwnedProgramRunner.swift	Task.sleep(until: deadline	1	timeout_retry_deadline	Shared helper progress deadline; accepted sense progress and every program host reply renew it; outstanding host replies pause it; cancelled on completion/stop
 Modules/NativeAgentCore/Sources/Senses/OwnedProgramRunner.swift	.seconds(1)	1	integrity_sweep	Extracted helper memory accounting when the adapter declares a cap; cancelled on exit/stop; retains the sense memory cap without adding a script quota
 Sources/NativeAgentApp/SensesView.swift	Task.sleep(for: .seconds(5))	1	visible_ui	SensesSurfaceState view-lifetime sampling of contract owners that have no complete push invalidation API; cancelled with the visible page or Work pane, reads only
 # AppRestartCoordinator.relauncherArgv: detached shell sleep of one second only while the restarting PID remains alive; waits for actual exit after transport reply and termination grace, never activates a live app on timeout. No new Swift timer primitive.
@@ -23,6 +24,7 @@ Modules/NativeAgentCore/Sources/DeviceSync/MacSyncEngine+WorkActivity.swift	Task
 Modules/NativeAgentCore/Sources/DeviceSync/MacPhoneRequestChannel.swift	Task.sleep(	1	timeout_retry_deadline	MacPhoneRequestChannel bounded result wait
 iOS/NativeAgentMobile/Sources/PhoneRequestCoordinator.swift	Task.sleep(	1	timeout_retry_deadline	PhoneRequestCoordinator request expiry
 # FileSystemProcessOwner: pipe readers use poll(100ms) only while draining an active child; the existing two-second EOF grace stops them when descendants retain pipe writers.
+Modules/NativeAgentCore/Sources/MacIntegration/MacIntegrationPermissions.swift	Task.sleep(for: Self.answer)	1	timeout_retry_deadline	MacLocationReader fresh-fix bound; a read waits on it only with no fix held (a held fix answers at once); cancelled on fix or failure; no polling
 Modules/NativeAgentCore/Sources/AgentConversations/AgentConversationSession.swift	try? await Task.sleep(for:	1	timeout_retry_deadline	AgentConversationSession.finishes: one two-second inline reply grace; expiry hands the still-running send to its tracked background owner, never establishes terminal state or retries
 Modules/NativeAgentCore/Sources/AgentWorkspace/AgentWorkspaceActionReadback.swift	*	1	timeout_retry_deadline	One 350ms loading-page readback delay per action; recheck exact tab identity, never replay the effect or poll in the background
 Modules/NativeAgentCore/Sources/Agents/GrokRoutineAccessibility.swift	*	6	timeout_retry_deadline	GrokRoutineAccessibility bounded launch, foreground, focus, paste, visible-in-chat observation, bounded chat scroll-back to the routine link and cancellation-independent routine panel cleanup; no webhook resend or background polling
@@ -49,6 +51,7 @@ Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoopsManager.swift	*	4
 Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestration+AutonomyGate.swift	*	1	timeout_retry_deadline	AutonomyGate
 Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestration+TurnEngine.swift	*	1	timeout_retry_deadline	TurnEngine.attentionRead
 Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift	*	1	timeout_retry_deadline	Unchanged provider recovery backoff and Retry-After wait
+Modules/NativeAgentCore/Sources/ChatTurnRuntime/TurnPart.swift	*	1	timeout_retry_deadline	Her turn part's helper spawn retry (resource exhaustion only) on the provider backoff curve, recorded as an observation each attempt; Stop (task cancellation or the cancel flag's file event) ends the wait
 Modules/NativeAgentCore/Sources/ChatToolRuntime/SwiftToolDispatcher+CodexBridgeTools.swift	*	1	timeout_retry_deadline	CodexBridgeTools; +Codex inbox directory-lock wait (2026-09-06, shared lock with script/codex_thread_wakeup.js)
 Modules/NativeAgentCore/Sources/ChatToolRuntime/SwiftToolDispatcher+SubprocessSupport.swift	*	5	timeout_retry_deadline	ToolSubprocessOwner
 Modules/NativeAgentCore/Sources/Context/ContextSourceMonitoring.swift	*	1	event_deadline	ContextSourceDebouncer
@@ -93,17 +96,14 @@ Modules/NativeAgentCore/Sources/ChromeControl/ChromeControlRuntime.swift	deadlin
 Sources/NativeAgentApp/ChatComposerChrome.swift	*	1	visible_ui	ChatComposerUI
 Sources/NativeAgentApp/ChatMessageListView.swift	*	1	visible_ui	ChatMessageListUI
 Sources/NativeAgentApp/InlineInteractionChatBinding.swift	*	1	visible_ui	InlineInteractionChatBinding.refreshSoon debounces the inline-card read behind a burst of transcript writes
-Modules/NativeAgentCore/Sources/ApprovalTransactions/InlineInteractionResolver+ChatLifecycle.swift	*	1	timeout_retry_deadline	watchUntilGranted re-checks a System Settings card at 1s ticks, capped at two minutes, only while one waits
 Sources/NativeAgentApp/QuietSelfAdminRender.swift	*	1	visible_ui	QuietSelfAdminRender.settle — waits for an offscreen hosting view's layout to go idle before the shutter
 Sources/NativeAgentApp/ChatViewStateCoordinators.swift	*	2	visible_ui	ChatScrollUI
 Sources/NativeAgentApp/CommandPalette.swift	*	3	visible_ui	CommandPaletteUI (focus deferrals; 150ms typing debounce before the message-index search)
-Modules/NativeAgentCore/Sources/Agents/ClaudeBridgeRuntime.swift	*	2	timeout_retry_deadline	ClaudeBridgeRuntime response latch and connection-read deadlines; app binds selection and launch wiring
+Modules/NativeAgentCore/Sources/Agents/ClaudeBridgeRuntime.swift	*	2	timeout_retry_deadline	ClaudeBridgeRuntime read-response latch and connection-read deadlines; tool work uses the shared human-pausable TurnDeadline
 Sources/NativeAgentApp/DetachedChatPanelView.swift	*	2	visible_ui	DetachedChatPanelViewUI
 Sources/NativeAgentApp/DeskLiveReloader.swift	*	1	event_deadline	DeskLiveActivityPresentationDeadline
 Modules/NativeAgentCore/Sources/DeviceSync/ICloudDeliveryNudgeQueue.swift	Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))	1	event_deadline	ICloudDeliveryNudgeQueue.dueDeadline
 Sources/NativeAgentApp/MacChatTranscriptSearch.swift	*	1	visible_ui	MacChatTranscriptSearchController.queryDebounce
-Modules/NativeAgentCore/Sources/MacControl/MacControlBridge.swift	*	1	timeout_retry_deadline	MacControlBridgeConnectionReadDeadline
-Modules/NativeAgentCore/Sources/MacControl/MacControlBridgeProcesses.swift	*	4	timeout_retry_deadline	MacControlBridgeProcesses (cancellation, emergency stop, process timeout, kill grace and bounded pipe-drain readiness waits)
 Sources/NativeAgentApp/MacIntegrationView.swift	*	1	visible_ui	MacIntegrationUI
 Sources/NativeAgentApp/MacPairingView.swift	*	2	visible_ui	MacPairingUI
 Modules/NativeAgentCore/Sources/DeviceSync/MacSyncEngine+Lifecycle.swift	Task.sleep(for: .seconds(Self.snapshotIntegrityCadence))	1	integrity_sweep	MacSyncSnapshotIntegrityFallback
@@ -146,7 +146,7 @@ Modules/NativeAgentCore/Sources/MacControl/MacAccessibilityActuator.swift	Thread
 Modules/NativeAgentCore/Sources/MacControl/MacActClosedLoop.swift	*	2	event_deadline	MacAXEffectCollector signal deadline; MacActClosedLoop.waitForEffect quiet window
 Modules/NativeAgentCore/Sources/MacControl/MacFourVerbsContracts.swift	*	1	event_deadline	MacFourVerbs.wait(seconds: caller-bounded settle wait)
 iOS/NativeAgentMobile/Sources/ActionResponseWaiters.swift	try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))	1	timeout_retry_deadline	ActionResponseWaiters.waitForResponse
-Modules/NativeAgentCore/Sources/NativeAgentCore/TurnDeadline.swift	*	1	timeout_retry_deadline	TurnDeadline.withThrowingDeadline (shared deadline; legacy optional wrapper delegates)
+Modules/NativeAgentCore/Sources/NativeAgentCore/TurnDeadline.swift	*	1	timeout_retry_deadline	TurnDeadline.withThrowingDeadline (shared active-work deadline; human waits suspend its single sleeper; legacy optional wrapper delegates)
 # 2026-09-16: the mood-tint sampling clock, pre-existing and previously unclassified — it blocked every commit touching a timer file. One repeating sample behind the window tint; idempotent, stopped with the window.
 Sources/NativeAgentApp/MoodTint.swift	Timer.scheduledTimer(withTimeInterval: Self.sampleSeconds	1	visible_ui	MoodTintWeather.refreshVisibility sampling only with enabled visible window consumers
 # 2026-09-17: the second_opinion tool's hard cap. The agent asked for this call, so the bound is its own wait, not one a turn absorbs; the losing side is cancelled and the outcome reads timeout.
@@ -178,3 +178,5 @@ Sources/NativeAgentApp/ShotgunPointer.swift	Task.sleep(for: Self.lingers)	1	visi
 Modules/NativeAgentCore/Sources/ChatToolRuntime/MCPToolCatalogWarmer.swift	Task.sleep(for: .seconds(wait))	1	event_deadline	MCPToolCatalogWarmer first sweep: one deadline per process, armed only by a catalog kick inside the first minute after launch; runs the ordinary single-flight kick when it fires
 Modules/NativeAgentCore/Sources/ChatToolRuntime/SwiftToolDispatcher+MacIntegration.swift	Task.sleep(nanoseconds: 1_500_000_000)	1	timeout_retry_deadline	maps.route: one 1.5 s pause before a single retry of a MapKit serverFailure, loadingThrottled or directionsNotFound directions error inside the same tool call; no loop
 Modules/NativeAgentCore/Sources/MacControl/MacFourVerbs+Wait.swift	Task.sleep(nanoseconds: UInt64(left	1	event_deadline	MacFourVerbs.wait plain seconds wait when NativeAgent is in front: caller-bounded, cancellable, ends the call
+Modules/NativeAgentCore/Sources/ChatToolRuntime/SwiftToolDispatcher+DesktopPixels.swift	Task.sleep(for: .milliseconds(100))	1	timeout_retry_deadline	Desktop picture waits for the desktop to hold still before the shot: at most 15 reads 100 ms apart until two inventories in a row agree (her own window stepping aside and Shotgun coming in move it for a moment); bounded to 1.5 s, cancellation stops it.
+Sources/NativeAgentApp/Shotgun.swift	Task.sleep(for: .milliseconds(50))	1	timeout_retry_deadline	stepAsideForScreen waits for the main window to order out after its 0.3 s fade: at most 10 checks 50 ms apart; the Mac verb or capture proceeds either way.

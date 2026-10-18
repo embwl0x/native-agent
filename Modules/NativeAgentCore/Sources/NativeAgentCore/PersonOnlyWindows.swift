@@ -38,6 +38,33 @@ public enum PersonOnlyWindows {
     private nonisolated(unsafe) static var motorObserver: (@Sendable () -> Void)?
     private nonisolated(unsafe) static var lastMotorSignal = -Double.infinity
     private nonisolated(unsafe) static var pointerObserver: (@Sendable (CGPoint, Bool) -> Void)?
+    private nonisolated(unsafe) static var stepAside: (@Sendable (Driver?) async -> Void)?
+
+    /// The session and turn whose tool call is running, set by the dispatch
+    /// chain around every tool: her windows step aside for that turn, and
+    /// Shotgun binds to it, whichever surface it came from.
+    public struct Driver: Sendable, Equatable {
+        public let session: String
+        public let turn: String
+        public init(session: String, turn: String) { self.session = session; self.turn = turn }
+    }
+    @TaskLocal public static var driver: Driver?
+
+    /// The app's way of getting its own windows out of her sight (Shotgun), installed once.
+    public static func installStepAside(_ handler: @escaping @Sendable (Driver?) async -> Void) {
+        lock.lock()
+        stepAside = handler
+        lock.unlock()
+    }
+
+    /// Her own windows step out of the way of a screen she is about to look at
+    /// or act on, from any surface's turn; returns once they are out of the
+    /// picture (User 10-16: she looked at WoW through her own full-screen window
+    /// and saw herself; a desktop picture was her own window, masked gray).
+    public static func stepAsideForScreen() async {
+        let handler = lock.withLock { stepAside }
+        await handler?(driver)
+    }
 
     /// The app's pointer effect, installed once. It runs synchronously before
     /// her event is posted, on whatever thread posts it.

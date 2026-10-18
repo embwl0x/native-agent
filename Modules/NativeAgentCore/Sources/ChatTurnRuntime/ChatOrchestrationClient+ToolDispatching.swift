@@ -33,7 +33,6 @@ extension SwiftNativeChatOrchestrationClient {
             approvalFiler: approvalFiler,
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
-            trust: trust,
             verifiedSessionId: verifiedSessionId,
             tracePeerTurn: true,
             allowsFirstConversationExemption: true

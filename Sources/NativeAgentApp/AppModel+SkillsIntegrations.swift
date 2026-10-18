@@ -455,23 +455,6 @@ extension AppModel {
         }
     }
 
-    /// The Diagnostics button may run only repairs that the currently shown
-    /// report explicitly offered. Onboarding calls `runDoctor(repair:)`
-    /// directly because fresh-install scaffold repair has no prior report.
-    @MainActor
-    @discardableResult
-    func repairSafeDoctorIssues() async -> DoctorFacade.RunOutcome {
-        let state = DoctorSafeRepairIssuesPresentation.state(
-            report: engine.doctor.report,
-            isRunning: engine.doctor.isRunning
-        )
-        guard state.canRun else {
-            statusText = state.detail
-            return .unavailable(state.detail)
-        }
-        return await runDoctor(repair: true, repairScope: .button)
-    }
-
     /// Reconcile the cheap live-owner rows in an existing Doctor report.
     /// This avoids preserving a recovered Telegram/provider/tool condition in
     /// the toolbar while also avoiding a second full Doctor run on tab entry.

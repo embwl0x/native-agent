@@ -104,6 +104,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_recent_trace_summary(input: [String: JSONValue]) async throws -> JSONValue {
+        let shapesView = jsonString(input["view"]) == "shapes"
         if jsonString(input["view"]) == "model_calls" {
             return try await TurnTraceRecentReader(dataRootOverride: dataRoot).modelCalls()
         }
@@ -155,6 +156,10 @@ extension SwiftToolDispatcher {
             .first { !$0.isEmpty }
         let turnID = jsonString(input["turn_id"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let trace = jsonString(input["trace"])
+        if shapesView, turnID?.isEmpty != false || trace == nil {
+            throw AutonomyGateError.toolDenied(reason: "shapes requires an exact turn_id and trace day file.")
+        }
         var fields: [String] = []
         if let requested = input["fields"], requested != .null {
             guard (turnID?.isEmpty == false || completedTurns != nil),
@@ -172,7 +177,9 @@ extension SwiftToolDispatcher {
 
         let snapshot: TurnTraceRecentReader.Snapshot
         do {
-            snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(history: completedTurns != nil || turnID?.isEmpty == false, since: since)
+            snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(
+                history: completedTurns != nil || turnID?.isEmpty == false, since: since,
+                holding: shapesView ? [turnID!] : [], trace: shapesView ? trace : nil)
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -181,6 +188,39 @@ extension SwiftToolDispatcher {
                 "traces": .array([]),
                 "source": .string("data/turn_traces/<current-day>.jsonl"),
             ])
+        }
+
+        if shapesView {
+            var calls: [JSONValue] = []
+            var incomplete = snapshot.truncated
+            for event in snapshot.events.sorted(by: { $0.ts < $1.ts }) where event.turnId == turnID {
+                guard event.kind == "tool.dispatch", case .object(let payload) = event.payload,
+                      payload["name"] == .string("app"), payload["phase"] == .string("begin") else { continue }
+                if payload["_truncated"] == .bool(true) { incomplete = true; continue }
+                guard payload["parentId"] == nil, case .array(let shapes)? = payload["callShapes"] else { continue }
+                for case .object(var call) in shapes {
+                    guard let action = jsonString(call["action"]), !["skill.run", "skill.resume"].contains(action) else { continue }
+                    call["createdAt"] = .string(event.ts.formatted(.iso8601))
+                    calls.append(.object(call))
+                }
+            }
+            var page: [JSONValue] = [], pageBytes = 0
+            let remaining = Array(calls.reversed().dropFirst(offset))
+            for call in remaining {
+                let size = try call.serializedData(pretty: false).count
+                guard size <= 24 * 1024 else {
+                    throw AutonomyGateError.toolDenied(reason: "A call shape exceeds the trace page budget.")
+                }
+                if page.count == limit || pageBytes + size > 24 * 1024 { break }
+                page.append(call); pageBytes += size
+            }
+            var next = input.filter { !$0.key.hasPrefix("__") }
+            next["offset"] = .int(Int64(offset + page.count))
+            let more = remaining.count > page.count
+            return .object(["status": .string("ok"), "traces": .array(page), "has_more": .bool(more),
+                "scan_truncated": .bool(incomplete),
+                "next_call": more ? .object(["tool": .string("app"), "input": .object([
+                    "action": .string("trace.recent"), "args": .object(next)])]) : .null])
         }
 
         let sessionTurnIDs: Set<String>
@@ -225,7 +265,7 @@ extension SwiftToolDispatcher {
             let action = jsonString(receipt["action"]) ?? jsonString(payload["name"]) ?? jsonString(payload["tool"]) ?? ""
             let arguments = jsonString(payload["args"]).flatMap { try? JSONValue.parse(Data($0.utf8)) }
             let args = if case .object(let args)? = arguments { args } else { [String: JSONValue]() }
-            let policy = AppActionPolicy.action(input: ["action": .string(action), "args": args["args"] ?? .object(args)])
+            let policy = AppActionBinding.action(input: ["action": .string(action), "args": args["args"] ?? .object(args)])
             return result["effects"] == .string("occurred")
                 || (policy?.read == false && (arguments != nil || policy?.readWhen.isEmpty == true))
         }

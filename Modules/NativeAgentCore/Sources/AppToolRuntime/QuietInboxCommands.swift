@@ -7,6 +7,7 @@ import NativeAgentCore
 import NativeAgentShared
 import NotificationInbox
 import PersistenceCore
+import TrustCenter
 
 @MainActor public protocol QuietInboxHost: QuietToolHost {
     var inboxDataRoot: URL { get }
@@ -76,8 +77,8 @@ extension QuietInboxHost {
         }
         let byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         if let unknown = ids.first(where: { byID[$0] == nil }) {
-            return refuse(AppToolExecutor.failure("unknown_id",
-                "No note has id \(unknown). Read app {page:\"inbox\"} for the current ids.", extra: ["id": .string(unknown)]))
+            return refuse(.object(["status": .string("not_found"), "reason": .string("unknown_id"), "id": .string(unknown),
+                "detail": .string("No note has id \(unknown). Read app {page:\"inbox\"} for the current ids.")]))
         }
         target.ids = ids
         target.byID = byID
@@ -149,13 +150,22 @@ extension QuietInboxHost {
                     extra: ["id": .string(item.id)]))
             }
             let fence = opensForUser ? nil : await inboxFloor(item, action: action, dataRoot: self.inboxDataRoot)
-            // A skill script's Install card is User's under Full Mac too: approving admits the script as his.
-            if action == "approve", let approvalID = item.related_approval_id, (try? await SwiftNativeApprovalInbox(
-                root: self.dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()).get(approvalID))?.action
-                == SwiftNativeApprovalInbox.skillScriptInstallAction {
-                return refuse(AppToolExecutor.failure("owners_call",
-                    "That's the owner's even under Full Mac: approving installs the script as theirs. Leave it for them; "
-                    + "inbox.withdraw takes back your ask.", extra: ["id": .string(item.id), "action": .string(action)]))
+            // Two cards are a person's under Full Mac too: a skill script's Install
+            // (approving admits the script as his) and a destructive call's (User,
+            // 10-17: what cannot be undone on his side waits for a human's tap, one
+            // card every time). Her own approve never stands in for his.
+            if action == "approve", let approvalID = item.related_approval_id,
+               let record = try? await SwiftNativeApprovalInbox(
+                   root: self.dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()).get(approvalID) {
+                let install = record.action == SwiftNativeApprovalInbox.skillScriptInstallAction
+                if install || PermissionLaw.humanDecides(action: record.action, payload: record.payload) {
+                    return refuse(AppToolExecutor.failure("owners_call",
+                        "That's the owner's even under Full Mac: " + (install
+                            ? "approving installs the script as theirs."
+                            : "what this card would run cannot be undone on their side, so it waits for their tap.")
+                        + " Leave it for them; inbox.withdraw takes back your ask.",
+                        extra: ["id": .string(item.id), "action": .string(action)]))
+                }
             }
             if !fullMac, let fence {
                 return refuse(AppToolExecutor.failure("owners_call",

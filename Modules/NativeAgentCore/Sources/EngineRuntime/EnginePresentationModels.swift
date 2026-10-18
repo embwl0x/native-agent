@@ -1941,6 +1941,10 @@ public enum InlineCardProjection {
             }
         }
 
+        if [.permission, .capability].contains(interaction.kind) {
+            lines += SystemPermissionPreflight.cardSettingsInstructions(interaction.allTargets)
+        }
+
         // How far the resolution reaches — said only where it is TRUE. A
         // this-request-only scope is a promise the card can keep just when it
         // has the models to pick from; with no options the choice is made in

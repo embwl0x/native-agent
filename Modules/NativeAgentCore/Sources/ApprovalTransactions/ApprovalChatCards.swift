@@ -51,8 +51,10 @@ public enum ApprovalChatCards {
 
     /// The card in the conversation User is in, unless it was raised there.
     private static func postCard(_ record: ApprovalRecord, dataRoot: URL) async -> Outcome {
+        let fromPart: Bool = if case .object(let payload) = record.payload { payload["hostCallID"] != nil } else { false }
         guard !record.chatCardDelivered,
-              let anchor = record.chatCardSessionId ?? usersConversation(unless: record.chatOriginSessionId, dataRoot: dataRoot)
+              let anchor = record.chatCardSessionId ?? usersConversation(
+                unless: fromPart ? nil : record.chatOriginSessionId, dataRoot: dataRoot)
         else { return .skipped }
         let card: JSONValue = .object([
             "sessionId": .string(anchor),

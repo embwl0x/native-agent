@@ -27,7 +27,7 @@ import AppKit
 
 // MARK: - Value types
 
-public struct MacAXFrame: Sendable, Equatable {
+public struct MacAXFrame: Sendable, Hashable {
     public let x: Double
     public let y: Double
     public let w: Double
@@ -367,7 +367,7 @@ public struct MacAXWindowHandle: Sendable {
 /// thousands of AX elements; an unbounded read would flood the turn. The
 /// `hard*` values are ceilings the caller CANNOT raise — `init` clamps.
 public struct MacAXLimits: Sendable, Equatable {
-    @TaskLocal static var readDeadline: Date?
+    @TaskLocal public static var readDeadline: Date?
     static let readSeconds: TimeInterval = 5
     public static let hardMaxNodes = 400
     public static let hardMaxDepth = 12
@@ -401,6 +401,15 @@ public struct MacAXLimits: Sendable, Equatable {
         var limits = MacAXLimits()
         limits.maxNodes = deepPageMaxNodes
         limits.maxDepth = deepPageMaxDepth
+        return limits
+    }()
+
+    /// Bounded by its deadline alone: the desktop picture shows a window's own
+    /// pixels only when every element of it was seen, so no count may cut it.
+    public static let whole: MacAXLimits = {
+        var limits = MacAXLimits()
+        limits.maxNodes = .max
+        limits.maxDepth = .max
         return limits
     }()
 }

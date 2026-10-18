@@ -220,7 +220,7 @@ struct MobileHelperEditorView: View {
                 let parts = Calendar.current.dateComponents([.hour, .minute], from: clock)
                 let days = request.timing == "weekly" ? String(weekday) : request.timing == "weekdays" ? "1-5" : "*"
                 request.cron = "\(parts.minute ?? 0) \(parts.hour ?? 0) * * \(days)"
-                request.timeZone = TimeZone.current.identifier; request.timing = "cron"
+                request.timing = "cron"  // no zone: the time follows the Mac
             }
             let payload = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
             _ = try await sync.helperAction("save_helper", payload: ["edit": payload])

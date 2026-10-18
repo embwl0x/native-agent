@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import ChatOrchestration
 import CryptoKit
 import Desk
@@ -10,53 +11,10 @@ import Senses
 import ToolRegistry
 import TrustCenter
 
-/// `skill.run` and `skill.resume` (skills-as-code PR 3): a runnable script
-/// skill runs as a strict run (`AppScriptRunner`) on frozen args its header's
-/// params check. Each call it makes is checked here, natively, before it is
-/// dispatched: one outside the skill's declared actions stops the run
-/// (not_declared), one that never runs inside a skill stops it
-/// (denied_in_skill), and one that can't be taken back or is User's hands its
-/// step back to her before it runs. A gate that would card hands back too
-/// (`SkillRunContext`), so a skill never files a card. A run that stops to ask
-/// or hands back is kept (`SkillRunStore`), and `skill.resume` goes on from
-/// there with her answer.
+/// Runnable skills keep their declared reach; every call uses the turn's gates.
 extension AppToolExecutor {
-    /// Direct actions a skill never calls unless they only read: a run never
-    /// starts or edits a skill, changes what she or anything may do (settings,
-    /// Trust, cards, tools, connectors, providers, chat controls), sends, or
-    /// reaches past the app (MCP). By the page word an id
-    /// starts with; gcal's one send; and the passes that stage User's
-    /// approvals as they go (dream, REM, self-improvement, consolidation,
-    /// hygiene, repair), which swallow a hand-back and report done.
-    static let deniedInSkill: Set<String> = [
-        "skill", "tool", "setting", "card", "connector", "telegram", "pairing", "mcp", "chat", "provider",
-        "agent", "codex", "omp", "mail", "agentmail", "messages", "slack", "notify", "phone", "inbox",
-        "gcal.send_invitations", "mind.dream", "mind.rem", "mind.self_improvement", "memory.consolidate",
-        "memory.hygiene", "doctor.repair",
-    ]
-
-    /// The stops a run is kept for, to resume: her decision, or a step handed back.
-    static let skillHandBacks: Set<String> = ["decide", "irreversible", "users_step", "would_card"]
-
-    /// A run's stops that are the skill's own fault (skills-as-code PR 5): its
-    /// logic was wrong (an expect, an expect_fail, a return it can't hand
-    /// back, a version it never read), it called past its header or the app
-    /// (not_declared, denied_in_skill, an action gone, its own bad args), or
-    /// a resume took another path. Never the world's: a stale version, a
-    /// changed read, User's no, a provider down, a hand-back, a decide, a timeout.
-    static let skillFaults: Set<String> = [
-        "expect_failed", "expected_failure_not_seen", "expected_failure_succeeded", "expect_fail_async",
-        "expect_fail_nested", "expect_fail_one_call", "not_declared", "denied_in_skill", "unknown_action",
-        "unknown_arg", "invalid_args", "missing_arg", "diverged", "not_own_version", "no_own_read", "unreadable_return",
-    ]
-
-    /// The skill's own fault a finished run's receipt shows, or nil; a script
-    /// error its own JavaScript threw is one too.
-    static func skillFault(_ receipt: [String: JSONValue]) -> String? {
-        let status = doorText(receipt["status"]), reason = doorText(receipt["reason"])
-        if status == "error", reason.isEmpty { return "script_error" }
-        return status != "ok" && skillFaults.contains(reason) ? reason : nil
-    }
+    /// The stops a run is kept for, to resume: her decision, or a card preview.
+    static let skillHandBacks: Set<String> = ["decide", "would_card"]
 
     /// One quiet MY QUEUE line each for skill availability changes,
     /// and their upgrade signals (`when: quiet`: shown on her next ordinary
@@ -85,38 +43,14 @@ extension AppToolExecutor {
         return line.isEmpty ? "" : "line " + line
     }
 
-    static func isDeniedInSkill(_ id: String, root: URL = PersistenceCore.defaultDataRoot()) -> Bool {
-        let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if ToolNameAliases.mcpTool(key) != nil
-            || ToolNameAliases.foldedTools.contains(where: { $0.key.hasPrefix("mcp__") && $0.value == key }) { return true }
-        if AppActions.action(key, dataRoot: root)?.read == true { return false }
-        return deniedInSkill.contains(key) || deniedInSkill.contains(String(key.split(separator: ".").first ?? ""))
-    }
-
     /// One call of a skill's run, before it is dispatched: nil runs it.
-    static func skillStep(_ id: String, declared: Set<String>, preview: Bool, root: URL = PersistenceCore.defaultDataRoot()) -> JSONValue? {
+    static func skillStep(_ id: String, declared: Set<String>) -> JSONValue? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if isDeniedInSkill(key, root: root) {
-            return doorRefusal("denied_in_skill", "\(key) never runs inside a skill; it was not run.",
-                remedy: "run_alone", "Make that call yourself, outside the skill, if you still want it.")
-        }
         guard declared.contains(key) else {
             return doorRefusal("not_declared", "\(key) is not among the actions this skill declares; it was not run.",
                 remedy: "none", "The skill's script calls what its header doesn't declare: fix the skill.")
         }
-        // An action no flag marks (none in the registry now) counts as irreversible.
-        let action = AppActions.action(key, dataRoot: root)
-        guard action?.irreversible != false || action?.isHis == true else { return nil }
-        let why = action?.isHis == true ? "users_step" : "irreversible"
-        let detail = why == "users_step"
-            ? "\(key) is the owner's, so a skill hands it back to you before it runs: it was not run."
-            : "\(key) can't be taken back, so a skill hands it back to you before it runs: it was not run."
-        if preview {
-            return .object(["status": .string("preview"), "action": .string(key), "would_hand_back": .string(why),
-                            "effects": .string("none"), "detail": .string(detail)])
-        }
-        return .object(["status": .string("not_run"), "reason": .string(why), "not_run_status": .string(why),
-                        "effects": .string("none"), "detail": .string(detail)])
+        return nil
     }
 
     /// The declared contract, with frozen identities for admitted pre-cutover pins.
@@ -217,8 +151,17 @@ extension AppToolExecutor {
     /// suspended: it dispatches no write, so its checks show where it would stop.
     @MainActor
     private func loadSkillScript(_ name: String, preview: Bool = false, root: URL) async -> (skill: SkillScriptRun?, refusal: JSONValue?) {
+        var selected: InstalledSkillInventory.Entry?
         func refuse(_ reason: String, _ detail: String, _ instruction: String) -> (SkillScriptRun?, JSONValue?) {
-            (nil, Self.doorRefusal(reason, detail + " Nothing ran.", remedy: "none", instruction))
+            var receipt = Self.doorRefusal(reason, detail + " Nothing ran.", remedy: "none", instruction)
+            if !preview, let selected, let digest = Self.inputString(selected.row["codeFingerprint"]) {
+                do { try AbilityStore(dataRoot: root).recordRun(id: selected.id, version: digest, receipt: receipt) }
+                catch {
+                    var fields = Self.skillFields(receipt); fields["accounting_error"] = .string(error.localizedDescription)
+                    receipt = .object(fields)
+                }
+            }
+            return (nil, receipt)
         }
         let entries: [InstalledSkillInventory.Entry]
         do {
@@ -231,6 +174,7 @@ extension AppToolExecutor {
             return refuse("unknown_skill", "No skill is called \(name.isEmpty ? "(none passed)" : name).",
                           "app skill.list shows the skills by name.")
         }
+        selected = entry
         guard case .object(let script)? = entry.row["script"],
               case .string(let source)? = script["source"] else {
             return refuse("not_a_script", "\(entry.name) has no JS routine, so it doesn't run.",
@@ -302,8 +246,8 @@ extension AppToolExecutor {
                     + (queued ? "; MY QUEUE says so." : "."),
                 "Read what changed, check the script still fits, then skill.enable admits it again.")
         }
-        for action in actions where Self.isDeniedInSkill(action, root: root) || AppActions.action(action, dataRoot: root)?.scriptable != true {
-            return refuse(Self.isDeniedInSkill(action, root: root) ? "denied_in_skill" : "not_scriptable",
+        for action in actions where AppActions.action(action, dataRoot: root)?.scriptable != true {
+            return refuse("not_scriptable",
                 "\(entry.name) declares \(action), which never runs inside a skill.",
                 "Fix the skill: its script makes that call nowhere, or you make it yourself outside the skill.")
         }
@@ -335,7 +279,7 @@ extension AppToolExecutor {
         }
         let declared = Set(skill.actions)
         let versions = SkillRunVersions(journal: replay?.journal ?? [], root: root)
-        let receipt = await SkillRunContext.$handsBack.withValue(true) {
+        let receipt = await SkillRunContext.$handsBack.withValue(false) {
             await DoorNotesSnapshot.$current.withValue(DoorNotesSnapshot()) {
                 await AppScriptRunner.run(source: skill.source, preview: preview, strict: true, input: .object(input),
                                           replay: replay, program: skill.program, dataRoot: root) { call in
@@ -360,7 +304,7 @@ extension AppToolExecutor {
                         }
                     }
                     if case .string(let id)? = call["action"] {
-                        if let stop = Self.skillStep(id, declared: declared, preview: preview, root: root) { return stop }
+                        if let stop = Self.skillStep(id, declared: declared) { return stop }
                         if let refused = versions.prepare(&call, id: id) { return refused }
                     }
                     if Task.isCancelled { return Self.failure("cancelled", "The turn stopped; nothing more ran.") }
@@ -383,25 +327,22 @@ extension AppToolExecutor {
         }
         if preview, case .array(let calls)? = out["calls"] {
             out["would"] = .array(calls.compactMap { row -> JSONValue? in
-                guard case .object(let fields) = row, fields["would_card"] == .bool(true) || fields["would_hand_back"] != nil
+                guard case .object(let fields) = row, fields["would_card"] == .bool(true)
                 else { return nil }
-                return .object(fields.filter { ["n", "step", "call", "would_card", "would_hand_back"].contains($0.key) })
+                return .object(fields.filter { ["n", "step", "call", "would_card"].contains($0.key) })
             })
         }
         let reason = Self.doorText(out["reason"])
         // What the run says about the skill: its own fault, the world's, or a clean run.
         if !preview {
-            out["script_effects"] = out["effects"]
             out["bookkeeping"] = .string("Skill lifecycle and upkeep.")
-            if out["effects"] == .string("none") { out["effects"] = .string("unknown") }
-            let fault = Self.skillFault(out)
+            let fault = AbilityStore.runOutcome(.object(out)) == "error" ? (reason.isEmpty ? "script_error" : reason) : nil
             let hash = SHA256.hash(data: (try? JSONValue.object(input).serializedData(pretty: false)) ?? Data())
                 .map { String(format: "%02x", $0) }.joined()
             if let kept = try? await SwiftNativeSkillsClient(root: root).recordRun(
                 skill.entry, runID: runID, digest: skill.digest, admission: skill.admission, fault: fault,
                 clean: fault == nil && out["status"] == .string("ok"), reason: reason.isEmpty ? Self.doorText(out["status"]) : reason,
                 step: Self.stopPlace(out), inputHash: String(hash.prefix(16))) {
-                if out["script_effects"] == .string("none") { out["effects"] = .string("occurred") }
                 out["ladder"] = .object(["clean": .int(Int64(kept.clean)), "of": .int(3)])
                 await Self.queueSkillLines(kept.signals, root: root)
 
@@ -488,7 +429,7 @@ extension AppToolExecutor {
                     throw SkillsError.invalidScript("Dependencies changed. Save the routine against the current actions.")
                 }
                 for id in candidate.program.dependencies {
-                    guard !Self.isDeniedInSkill(id, root: root), AppActions.action(id, dataRoot: root)?.scriptable == true else {
+                    guard AppActions.action(id, dataRoot: root)?.scriptable == true else {
                         throw SkillsError.invalidScript("Dependency \(id) is not scriptable. Save the routine against the current actions.")
                     }
                 }
@@ -497,14 +438,14 @@ extension AppToolExecutor {
                     key: key, capture: args["capture"] == .bool(true), input: args["input"],
                     runner: AppScriptRunner.runner(dataRoot: root), host: {
                         let versions = SkillRunVersions(journal: [], root: root)
-                        return AppScriptRunner.Host(call: { _ in .null }, validation: { call, fixture in
+                        return AppScriptRunner.Host(call: Self.doorCall(), validation: { call, fixture in
                             var call = call
                             if let id = Self.inputString(call["action"]) {
                                 guard Self.actionPin(id, root: root) == Self.doorText(pins[id]) else {
                                     return Self.failure("stale_dependency", "The declared action changed during validation.")
                                 }
                                 if !(await fixture.captured) {
-                                    if let stop = Self.skillStep(id, declared: Set(candidate.program.dependencies), preview: false, root: root) { return stop }
+                                    if let stop = Self.skillStep(id, declared: Set(candidate.program.dependencies)) { return stop }
                                     if let stop = versions.prepare(&call, id: id) { return stop }
                                 }
                             }

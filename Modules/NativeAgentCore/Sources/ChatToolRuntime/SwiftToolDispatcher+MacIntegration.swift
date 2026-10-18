@@ -196,6 +196,16 @@ extension SwiftToolDispatcher {
     //      return a `bridge_not_wired` envelope — same rationale: don't tear
     //      down the turn, let the LLM explain it.
     //   3. Otherwise forward to the bridge.
+    /// The refusal a switch User turned off gives this tool, whatever the
+    /// posture: asked here at dispatch, and by the approval gate before any
+    /// card, so a card never asks for what the switch would refuse.
+    package static func switchRefusal(integration: String, mode: MacIntegrationPermissionMode,
+                                      store: MacIntegrationPermissionStore) async throws -> JSONValue? {
+        guard let refusal = try await store.readinessChecked().refusal(integration: integration, mode: mode) else { return nil }
+        return .object(["status": .string("denied"), "reason": .string("operator_permission_off"),
+            "integration": .string(integration), "mode": .string(mode.rawValue), "message": .string(refusal)])
+    }
+
     func dispatchMacIntegrationTool(
         tool: String,
         surface: String,
@@ -212,9 +222,8 @@ extension SwiftToolDispatcher {
         let admitted = await fullMacYoloAdmitted(tool: tool, surface: surface)
         let allowed = await macIntegrationPermissionStore.allows(integration, mode: mode, fullMacAdmitted: admitted)
         guard allowed else {
-            if let refusal = try await macIntegrationPermissionStore.readinessChecked().refusal(integration: integration, mode: mode) {
-                return .object(["status": .string("denied"), "reason": .string("operator_permission_off"),
-                    "integration": .string(integration), "mode": .string(mode.rawValue), "message": .string(refusal)])
+            if let refusal = try await Self.switchRefusal(integration: integration, mode: mode, store: macIntegrationPermissionStore) {
+                return refusal
             }
             // The permission is not granted. That is not a refusal to be
             // relayed as prose with a "fix" hint — it is the person's

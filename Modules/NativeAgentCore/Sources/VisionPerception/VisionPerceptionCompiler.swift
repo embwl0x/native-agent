@@ -177,7 +177,7 @@ public struct VisionPerceptionCompiler: Sendable {
             } else {
                 let joined = visible.joined(separator: " ")
                 label = VisionRedactedText(
-                    raw: joined, json: .string(joined), secret: false, reason: nil
+                    raw: joined, json: .string(joined), secret: false
                 )
             }
             let fill = candidate.fillLuminance ?? grid.meanLuminance(in: candidate.rect)

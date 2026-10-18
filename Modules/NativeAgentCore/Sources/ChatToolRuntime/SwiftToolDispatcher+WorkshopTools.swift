@@ -580,6 +580,7 @@ extension SwiftToolDispatcher {
                     "status": .string("not_found"),
                     "task_id": .string(id),
                     "reason": .string(forTask.isEmpty ? "no task with id \(id)" : "task_deleted"),
+                    "detail": .string((forTask.isEmpty ? "No task has id \(id)" : "Task \(id) was deleted") + "; app {action:\"ledger.list\"} lists the current tasks."),
                 ])
             }
             return .object([

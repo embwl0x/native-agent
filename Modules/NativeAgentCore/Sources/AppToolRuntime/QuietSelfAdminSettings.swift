@@ -998,13 +998,14 @@ public enum QuietSettings {
     /// A bot's cadence, in one line the model can both read and write:
     /// `manual`, `interval:900`, or `cron:<zone>:<expression>`. Zones carry no
     /// colon and the expression is last, so the three-way split is unambiguous.
+    /// An empty zone (`cron::0 8 * * *`) follows the Mac wherever it is.
     public static func cadenceText(_ cadence: BotCadence) -> String {
         switch cadence {
         case .manual: return "manual"
         case .interval(let seconds):
             if let rounded = Int(exactly: seconds.rounded()) { return "interval:\(rounded)" }
             return "interval:\(seconds)"
-        case .cron(let expression, let timeZone): return "cron:\(timeZone):\(expression)"
+        case .cron(let expression, let timeZone): return "cron:\(timeZone ?? ""):\(expression)"
         }
     }
 
@@ -1024,17 +1025,17 @@ public enum QuietSettings {
             let parts = tail.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
             guard parts.count == 2 else {
                 throw QuietSettingError.badValue(
-                    "\(label): cron takes cron:<zone>:<expression>, as cron:Europe/London:0 7 * * *.")
+                    "\(label): cron takes cron:<zone>:<expression>, as cron:Europe/London:0 7 * * *, or cron::0 7 * * * to follow this Mac.")
             }
-            let zone = parts[0].trimmingCharacters(in: .whitespaces)
+            let zone = BotCadence.setZone(String(parts[0]))
             let expression = parts[1].trimmingCharacters(in: .whitespaces)
-            guard TimeZone(identifier: zone) != nil else {
+            if let zone, TimeZone(identifier: zone) == nil {
                 throw QuietSettingError.badValue("\(label): \(zone) is not a time zone.")
             }
             return .cron(expression: expression, timeZone: zone)
         }
         throw QuietSettingError.badValue(
-            "\(label) takes manual, interval:<seconds>, or cron:<zone>:<expression>.")
+            "\(label) takes manual, interval:<seconds>, or cron:<zone>:<expression> (an empty zone follows this Mac).")
     }
 
     @MainActor
@@ -1063,7 +1064,7 @@ public enum QuietSettings {
                     page: "bots",
                     label: "\(name) schedule",
                     kind: .text,
-                    note: "manual, interval:<seconds>, or cron:<zone>:<expression>. Scheduled runs "
+                    note: "manual, interval:<seconds>, or cron:<zone>:<expression> (an empty zone, cron::0 8 * * *, follows this Mac wherever it is). Scheduled runs "
                         + "may be no closer together than the bot floor "
                         + "(bots.minimum_interval_minutes), which the store enforces.",
                     read: { appModel in
@@ -1154,6 +1155,14 @@ public enum QuietSettings {
             note: "The glass takes a breath of warmth from how the agent is "
                 + "feeling, damped over hours. Dark mode only; light mode never takes it. "
                 + "Off leaves dark mode exactly as it is."
+        ))
+        rows.append(defaultsBool(
+            id: "chat.shotgun", page: "chat", label: "Shotgun",
+            key: ShotgunPreference.enabledKey, defaultOn: true,
+            note: "On: when the agent starts driving the Mac from this chat, the main window "
+                + "steps aside into Shotgun, a small floating chat the person keeps typing in while "
+                + "the agent drives. Off: the agent works in the background and the window stays put. "
+                + "Hers to set (10-17: asked to put herself back in Shotgun, she had no switch to reach)."
         ))
         rows.append(QuietSetting(
             id: "chat.model", page: "chat", label: "Chat's own model",

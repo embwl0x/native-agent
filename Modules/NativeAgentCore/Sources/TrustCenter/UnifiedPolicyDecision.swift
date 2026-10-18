@@ -79,39 +79,3 @@ public struct UnifiedPolicyDecision: Codable, Sendable, Equatable {
         return .object(payload)
     }
 }
-
-public extension UnifiedPolicyDecision {
-    static func turnPlan(
-        surface: String,
-        actor: String,
-        goalType: String,
-        risk: String,
-        requiresApprovalHint: Bool,
-        fileAccess: String,
-        fullMacActive: Bool,
-        developerMode: Bool,
-        remoteSurface: Bool,
-        surfaceTrusted: Bool,
-        expiresAt: String?
-    ) -> UnifiedPolicyDecision {
-        UnifiedPolicyDecision(
-            actionKind: "turn_plan",
-            actor: actor,
-            surface: surface,
-            requestedAction: goalType.isEmpty ? "chat" : goalType,
-            requestedCapability: "context_route",
-            dataScope: fileAccess.isEmpty ? "auto" : fileAccess,
-            sideEffectLevel: risk.isEmpty ? "low" : risk,
-            outcome: requiresApprovalHint ? .confirm : .allow,
-            reason: requiresApprovalHint
-                ? "turn route predicts an approval-gated action"
-                : "turn route is context planning only; tool actions re-evaluate before dispatch",
-            policySource: "turn_plan",
-            expiresAt: expiresAt,
-            fullMacActive: fullMacActive,
-            developerMode: developerMode,
-            remoteSurface: remoteSurface,
-            surfaceTrusted: surfaceTrusted
-        )
-    }
-}

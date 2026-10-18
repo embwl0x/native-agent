@@ -53,7 +53,7 @@ public enum SenseSandboxProfile {
             "(allow sysctl-read)",
             "(allow signal (target self) (target children))",
             "(allow file-read-metadata)",
-            "(allow file-read-data (literal \"/\") (subpath \"/System\") (subpath \"/private/var/db/timezone\") (subpath \"/usr/lib\") (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \(path(helperURL))) (literal \(path(helperURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/Senses/sense.js")))))",
+            "(allow file-read-data (literal \"/\") (subpath \"/System\") (subpath \"/private/var/db/timezone\") (subpath \"/usr/share/icu\") (subpath \"/usr/lib\") (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \(path(helperURL))) (literal \(path(helperURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/Senses/sense.js")))))",
             "(allow file-write-data (literal \"/dev/null\"))",
             "(allow file-read-data file-write-data (literal \"/dev/stdin\") (literal \"/dev/stdout\") (literal \"/dev/stderr\") (subpath \"/dev/fd\"))",
             "(allow process-exec (literal \(path(helperURL))))",

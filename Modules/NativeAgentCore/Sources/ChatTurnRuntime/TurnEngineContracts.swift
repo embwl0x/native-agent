@@ -35,6 +35,10 @@ public enum TurnEngineError: Error, LocalizedError {
     /// failure); previously the structured lanes discarded the visible
     /// partial entirely on cancel while text-compat persisted it.
     case streamCancelled(partial: String, underlying: Error)
+    /// Her turn part failed with no clean version left to swap in.
+    case turnPartFailed(String)
+    /// No helper can start to run her turn part, and waiting will not change that.
+    case turnHelperUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -53,6 +57,10 @@ public enum TurnEngineError: Error, LocalizedError {
             return (underlying as? LocalizedError)?.errorDescription ?? String(describing: underlying)
         case .streamCancelled(_, let underlying):
             return (underlying as? LocalizedError)?.errorDescription ?? String(describing: underlying)
+        case .turnPartFailed(let why):
+            return "My turn part could not run this turn: \(why) The turn part that ships with the app could not run it either; reinstall NativeAgent."
+        case .turnHelperUnavailable(let why):
+            return "My turn could not start its helper: \(why) Reinstall NativeAgent so its helper and sandbox profile are intact, then send again."
         }
     }
 }
@@ -191,10 +199,10 @@ enum TurnToolEvidenceProjection {
             return nil
         }
         // An app call of a folded action is the tool it ran, over its args.
-        let name = ToolNameAliases.ranTool(dispatch.name, input: dispatch.input).trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = dispatch.ranCall.tool.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !transientReaders.contains(name.lowercased()) else { return nil }
 
-        let arguments = inputSummary(ToolNameAliases.ranInput(dispatch.name, input: dispatch.input))
+        let arguments = inputSummary(dispatch.ranCall.input)
         let result = SessionHistoryPromptRenderer.toolEvidenceProjection(resultText(dispatch.result))
         guard hasStableFactShape(arguments) || hasStableFactShape(result) else { return nil }
 
@@ -275,7 +283,24 @@ struct TurnRouteAdmission: Sendable, Equatable {
 
 // MARK: - TurnContext
 
-/// The fully-assembled context handed to the LLM for one turn.
+/// What the stem gathers for her turn part to compose its prompt from:
+/// `turn.persona()` (prompt, guidance), `turn.pins()`, `turn.recall()` and
+/// `turn.context()` (digest, packet, history, facts). The order and the joins
+/// are hers, in `abilities/turn.js`.
+public struct TurnReach: Sendable, Equatable {
+    public internal(set) var persona = ""
+    public internal(set) var guidance = ""
+    public internal(set) var pins: [String] = []
+    public internal(set) var recall = ""
+    public internal(set) var digest = ""
+    public internal(set) var packet = ""
+    public internal(set) var history = ""
+    /// The facts of the moment, each already trimmed and non-empty.
+    public internal(set) var facts: [String] = []
+}
+
+/// The context handed to the LLM for one turn. Its system prompt is what her
+/// turn part composed from `turnReach` (`composing`).
 public struct TurnContext: Sendable {
     public let surface: String
     /// Exact persona selected for this turn. This follows the turn into tool
@@ -344,6 +369,7 @@ public struct TurnContext: Sendable {
     public internal(set) var historyWindowReceipt: HistoryWindowReceipt?
     /// Frozen duration from the context preparation summary, absent if unmeasured.
     public var preparationMs: Int64?
+    public internal(set) var turnReach: TurnReach
     /// The memory record identities behind THIS turn — legacy recall hits
     /// plus the ContextFlow packet's resolved provenance. On active turns
     /// memory arrives in the packet and `recalled` is empty, so without the
@@ -378,17 +404,16 @@ public struct TurnContext: Sendable {
         providerId: String? = nil,
         serviceTier: String? = nil,
         toolsAvailable: [String],
-        systemPrompt: String?,
         userMessage: String,
         toolSchemas: [LLMToolSchema] = [],
-        systemSegments: SystemPromptSegments? = nil,
         imageBlocks: [LLMContentBlock] = [],
         fluidContextTurn: ContextPreparedTurn? = nil,
         naturalExpressionCue: String? = nil,
         historyMessages: [LLMMessage] = [],
         turnVolatileBlock: String? = nil,
         historyWindowReceipt: HistoryWindowReceipt? = nil,
-        preparationMs: Int64? = nil
+        preparationMs: Int64? = nil,
+        turnReach: TurnReach
     ) {
         self.surface = surface
         self.personaID = personaID
@@ -401,9 +426,7 @@ public struct TurnContext: Sendable {
         self.serviceTier = serviceTier
         self.toolsAvailable = toolsAvailable
         self.toolSchemas = toolSchemas
-        self.systemPrompt = systemPrompt
         self.userMessage = userMessage
-        self.systemSegments = systemSegments
         self.imageBlocks = imageBlocks
         self.fluidContextTurn = fluidContextTurn
         self.naturalExpressionCue = naturalExpressionCue
@@ -411,6 +434,16 @@ public struct TurnContext: Sendable {
         self.turnVolatileBlock = turnVolatileBlock
         self.historyWindowReceipt = historyWindowReceipt
         self.preparationMs = preparationMs
+        self.turnReach = turnReach
+    }
+
+    /// The system her turn part named, and the tools it offered.
+    func composing(_ system: SystemPromptSegments, tools: [String]?) -> TurnContext {
+        var copy = self
+        copy.systemSegments = system
+        copy.systemPrompt = system.combined
+        if let tools { copy.toolSchemas = toolSchemas.filter { tools.contains($0.name) } }
+        return copy
     }
 
     /// v2Prefix relocation, run ONCE per turn at the message-seeding boundary

@@ -23,7 +23,7 @@ public enum RuntimeReadError: LocalizedError, Equatable {
 
 extension RuntimeReadProjection {
     public static func getTraces(dataRoot: URL) async throws -> [RuntimeTrace] {
-        switch CapabilityTraceFeed.read(dataRoot: dataRoot) {
+        switch await CapabilityTraceFeed.read(dataRoot: dataRoot) {
         case .current(let traces):
             return traces
         case .sourceAbsent, .empty:

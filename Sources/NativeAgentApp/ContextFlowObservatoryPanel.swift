@@ -105,8 +105,6 @@ struct ContextFlowHealthRowsPresentation: Equatable {
             ),
             Row(label: "Pressure", value: health.arenaMetrics.pressure.rawValue),
             Row(label: "Active leases", value: String(health.arenaMetrics.activeLeaseCount)),
-            Row(label: "Prewarm queue", value: String(health.pendingPrewarmHints)),
-            Row(label: "Prewarm receipts", value: String(health.prewarmUsefulnessReceipts)),
         ]
         if let reconciled = health.lastReconciledAt {
             rows.append(Row(

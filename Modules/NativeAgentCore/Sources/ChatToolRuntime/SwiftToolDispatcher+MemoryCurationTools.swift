@@ -108,7 +108,6 @@ public struct MemoryCuration: Sendable {
         }
         let page = listing.records
         let rows: [JSONValue] = page.map { record in
-            MemoryDataProvenance.consume(record.extras, dataRoot: dataRoot)
             var row: [String: JSONValue] = [
                 "id": .string(record.id),
                 "text": .string(record.text),
@@ -198,7 +197,6 @@ public struct MemoryCuration: Sendable {
         let pinned = curationBool(input, "pinned")
         let restore = curationBool(input, "restore") == true
         var update: [String: JSONValue] = [:]
-        MemoryDataProvenance.consume(row.extras, dataRoot: dataRoot)
         if case .object(let stamped)? = MemoryDataProvenance.stamping(.object(update)) { update = stamped }
         if let text { update["text"] = .string(text) }
         if let pinned { update["pinned"] = .bool(pinned) }

@@ -63,7 +63,7 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         } else {
             peerIdentity = nil
         }
-        if input["preview"] != .bool(true), let action = AppActionPolicy.action(tool: tool, input: input),
+        if input["preview"] != .bool(true), let action = AppActionBinding.action(tool: tool, input: input),
            action.lifecycle != nil, !action.read, let refusal = CapabilityLifecycle.writeRefusal {
             throw AutonomyGateError.toolDenied(reason: refusal)
         }

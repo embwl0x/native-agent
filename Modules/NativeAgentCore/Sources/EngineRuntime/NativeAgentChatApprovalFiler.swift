@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import ApprovalInbox
 import ChatOrchestration
@@ -71,7 +72,9 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         request["peer"] = PeerDataTaint.carriedRecord(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                                       peerID: envelope.verifiedUserId)
         request["fileAccess"] = ChatToolSessionContext.fileAccess.map(JSONValue.string) ?? .null
+        request["hostCallID"] = SkillRunContext.hostCallID.map { .string($0.uuidString) }
         let requestPayload: JSONValue = .object(request)
+        let preview = try JSONValue.object(request.filter { $0.key != "hostCallID" }).serialize(pretty: false)
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         // User, 2026-09-06: the SAME request, still pending, gets the SAME id.
         // Every invocation used to mint a fresh approval, so a model that
@@ -102,6 +105,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
                 "risk": .string("confirm"),
                 "reason": .string(reason),
                 "payload": requestPayload,
+                "payloadPreview": .string(preview),
                 "remoteResolvable": .bool(true),
                 "localOnly": .bool(false),
             ]),
@@ -162,6 +166,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             && left["agentExactProtocol"] == right["agentExactProtocol"]
             && left["origin"] == right["origin"]
             && left["peer"] == right["peer"]
+            && left["hostCallID"] == right["hostCallID"]
             // A card filed with other hands is another request (an old card has none).
             && left["fileAccess"] == right["fileAccess"]
     }

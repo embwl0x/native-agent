@@ -5,7 +5,7 @@ import Senses
 import NativeAgentCore
 import PersistenceCore
 
-/// One isolated context per helper/program. Senses retain their context;
+/// One isolated context per helper/program. Resident parts retain their context;
 /// all kinds share the VM, exception latch, host exchange and JSC watchdog.
 final class JavaScriptProgramRuntime {
     private typealias ShouldTerminate = @convention(c) (JSContextRef?, UnsafeMutableRawPointer?) -> Bool
@@ -46,13 +46,12 @@ final class JavaScriptProgramRuntime {
             forwarded = -Double.infinity; pendingMark = nil; forwardFailure = nil
             replyStarted = nil
         }
-        func suspendForReply() { if kind != .tool { replyStarted = ProcessInfo.processInfo.systemUptime } }
+        func suspendForReply() { replyStarted = ProcessInfo.processInfo.systemUptime }
         func resumeAfterReply() {
             if let replyStarted { last += ProcessInfo.processInfo.systemUptime - replyStarted }
             replyStarted = nil
         }
         func record(mark: Double? = nil) throws {
-            guard kind == .sense else { return }
             last = ProcessInfo.processInfo.systemUptime
             if let mark { pendingMark = mark }
             try flush()
@@ -70,6 +69,8 @@ final class JavaScriptProgramRuntime {
     private let progress: ProgressWindow
     private var progressCell: UnsafeMutableRawPointer { Unmanaged.passUnretained(progress).toOpaque() }
     private var context: JSContext?
+    private var body: JSValue?
+    private var updateInput: JSValue?
     private var record: SenseRecord?
     private var program: OwnedProgram?
     private var id = 0
@@ -182,7 +183,7 @@ final class JavaScriptProgramRuntime {
         try finish(result)
     }
 
-    private func createContext(sdk: String, inputJSON: String?, kind: OwnedProgram.Kind, workspace: String? = nil) throws -> JSContext {
+    private func createContext(sdk: String, inputJSON: String?, kind: OwnedProgram.Kind, workspace: String? = nil, dataRoot: String? = nil, measurementSystem: String? = nil) throws -> JSContext {
         guard let setTimeLimit = Self.setTimeLimit, Self.clearTimeLimit != nil else {
             throw failure("unsupported", "JavaScript execution time limits are unavailable.")
         }
@@ -208,21 +209,24 @@ final class JavaScriptProgramRuntime {
             }
             created.setObject(say, forKeyedSubscript: "__log" as NSString)
             if kind == .tool {
-                guard let workspace else { throw failure("bad_input", "Authored tools require their workspace path from the app.") }
+                guard let workspace, let dataRoot, let measurementSystem else { throw failure("bad_input", "Authored tools require their workspace, data paths and measurement system from the app.") }
                 created.setObject(FileManager.default.homeDirectoryForCurrentUser.path, forKeyedSubscript: "__home" as NSString)
                 created.setObject(workspace, forKeyedSubscript: "__workspace" as NSString)
+                created.setObject(dataRoot, forKeyedSubscript: "__dataRoot" as NSString)
+                created.setObject(measurementSystem, forKeyedSubscript: "__measurementSystem" as NSString)
             }
             if let inputJSON { created.setObject(inputJSON, forKeyedSubscript: "__input" as NSString) }
         }
         setTimeLimit(group, 0.25, Self.expired, progressCell)
-        created.evaluateScript(sdk, withSourceURL: URL(string: kind == .sense ? "sense-sdk.js" : "app-prelude.js"))
-        for name in ["__senseCall", "__senseRedactText", "__call", "__log", "__input", "__home", "__workspace"] { created.globalObject.deleteProperty(name) }
+        let result = created.evaluateScript(sdk, withSourceURL: URL(string: kind == .sense ? "sense-sdk.js" : "app-prelude.js"))
+        if inputJSON != nil { updateInput = result }
+        for name in ["__senseCall", "__senseRedactText", "__call", "__log", "__input", "__home", "__workspace", "__dataRoot", "__measurementSystem"] { created.globalObject.deleteProperty(name) }
         return created
     }
 
     private func runProgram(_ program: OwnedProgram, message: [String: Any]) throws {
-        guard context == nil, let runID = message["id"] as? Int, let ids = message["actionIDs"] as? [String] else {
-            throw failure("bad_input", "Program requires a fresh helper, an integer id and admitted action names.")
+        guard (context == nil || program.isResident), let runID = message["id"] as? Int, let ids = message["actionIDs"] as? [String] else {
+            throw failure("bad_input", "Program requires an available helper, an integer id and admitted action names.")
         }
         id = runID; callID = 0; logBytes = 0; thrown = nil; latched = nil
         progress.begin(id: id, seconds: program.seconds, kind: program.kind)
@@ -231,19 +235,21 @@ final class JavaScriptProgramRuntime {
         } ?? (program.entry == .run ? "{}" : nil)
         let names = String(decoding: try JSONSerialization.data(withJSONObject: ids), as: UTF8.self)
         let sdk = OwnedProgramRunner.prelude(ids: names, strict: program.kind == .skill,
-                                            input: inputJSON != nil, primitives: program.kind == .tool)
-        let context = try createContext(sdk: sdk, inputJSON: inputJSON, kind: program.kind, workspace: message["workspace"] as? String)
-        guard let group = JSContextGetGroup(context.jsGlobalContextRef) else { throw failure("unsupported", "JavaScript context is unavailable.") }
+                                            input: inputJSON != nil, primitives: program.kind == .tool, turn: program.kind == .turn)
+        let fresh = context == nil
+        if fresh { _ = try createContext(sdk: sdk, inputJSON: inputJSON, kind: program.kind, workspace: message["workspace"] as? String, dataRoot: message["dataRoot"] as? String, measurementSystem: message["measurementSystem"] as? String) }
+        guard let context, let group = JSContextGetGroup(context.jsGlobalContextRef), let setTimeLimit = Self.setTimeLimit else { throw failure("unsupported", "JavaScript context is unavailable.") }
+        setTimeLimit(group, 0.25, Self.expired, progressCell)
         defer { Self.clearTimeLimit?(group) }
+        if !fresh, let inputJSON { updateInput?.call(withArguments: [inputJSON]) }
         try checkExecution()
         if let thrown {
             try io.send(["id": id, "type": "program_done", "exception": ["message": "The script engine did not start: \(thrown)"]])
             return
         }
-        let body: JSValue?
-        if program.entry == .functionBody {
+        if body == nil, program.entry == .functionBody {
             body = context.evaluateScript("(function () {" + program.source + "\n})", withSourceURL: URL(string: "app-script.js"))
-        } else {
+        } else if body == nil {
             context.evaluateScript(program.source, withSourceURL: URL(string: "app-script.js"))
             body = context.objectForKeyedSubscript("run")
             if thrown == nil, body.map({ isFunction($0, in: context) }) != true {
@@ -324,9 +330,7 @@ final class JavaScriptProgramRuntime {
         try checkExecution()
         if let thrown {
             let message = String((thrown.toString() ?? "Sense threw an error.").prefix(1000))
-            let errorCode = thrown.objectForKeyedSubscript("code")
-            let code = errorCode?.isString == true ? (errorCode?.toString() ?? "crashed") : "crashed"
-            throw failure(message.contains("execution terminated") ? "timeout" : code, message)
+            throw failure(message.contains("execution terminated") ? "timeout" : "javascript", message)
         }
     }
 
@@ -352,6 +356,7 @@ final class JavaScriptProgramRuntime {
                         throw failure("bad_output", "App call requires kind, action, arguments and source line.")
                     }
                     let reply = try exchange(body, replyType: "host_reply")
+                    if body["kind"] as? String != "state" { try progress.record() }
                     guard let value = reply["value"] as? String else { throw failure("bad_output", "App call requires a journal reply.") }
                     return try jsonString(["value": value])
                 case "script_log": try io.send(body); return try jsonString(["value": NSNull()])

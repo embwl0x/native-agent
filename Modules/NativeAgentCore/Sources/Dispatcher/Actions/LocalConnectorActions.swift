@@ -88,6 +88,7 @@ public struct LocalConnectorActions: Sendable {
             "copy_file":    { FileSystemActions.transferFile($0, $1, copy: true) },
             "trash_file":   { FileSystemActions.trashFile($0, $1) },
             "list_dir":     { FileSystemActions.listDir($0, $1) },
+            "file_info":    { FileSystemActions.fileInfo($0, $1) },
             "system_info":  { FileSystemActions.systemInfo($0, $1) },
             // Wave 32 W08 — read-only repo introspection
             "grep":               { FileSystemActions.grep($0, $1) },
@@ -104,7 +105,7 @@ public struct LocalConnectorActions: Sendable {
         sideEffecting: ["write_file", "move_file", "copy_file", "trash_file"],
         // Successful read-only results are sufficient verification.
         trivialVerify: [
-            "read_file", "file_excerpt", "list_dir", "system_info",
+            "read_file", "file_excerpt", "list_dir", "file_info", "system_info",
             "grep", "git_status", "git_diff", "git_log", "repo_dirty_summary",
             "persona_read", "persona_list_skills", "workspace_list", "time_now",
         ]

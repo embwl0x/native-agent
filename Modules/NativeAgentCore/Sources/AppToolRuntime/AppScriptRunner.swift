@@ -1,8 +1,10 @@
+import AuthoredCapabilities
 import ChatOrchestration
 import Foundation
 import MacControl
 import PersistenceCore
 import Privacy
+import PersonaEngine
 import Senses
 import TrustCenter
 
@@ -122,7 +124,12 @@ enum AppScriptRunner {
 
 
     struct Host: OwnedProgramToolHost {
+        /// Reach the app has not wired for this host: the one refusal every default shares.
+        static let unwiredReach: @Sendable (String, JSONValue) async throws -> JSONValue = { operation, _ in
+            throw SenseFailure(code: "unavailable", message: "The app has not wired reach \(operation).")
+        }
         let call: Perform
+        var reach = Host.unwiredReach
         var validation: (@Sendable ([String: JSONValue], OwnedProgramFixtures) async -> JSONValue)?
         var toolHost = false
         var dataRoot = PersistenceCore.defaultDataRoot()
@@ -134,15 +141,22 @@ enum AppScriptRunner {
         var scriptKey: String { AppToolExecutor.doorScriptKey }
         func action(_ id: String) -> OwnedProgramAction? {
             resolved(id).map { action in
-                OwnedProgramAction(id: action.id, page: action.page, read: action.read, advisory: action.advisory,
-                                   readOnly: { action.readOnly(args: $0) })
+                OwnedProgramAction(id: action.id, page: action.page, read: action.read, advisory: action.advisory, partID: action.partAction ? action.tool : nil,
+                                   program: action.authored, readOnly: { action.readOnly(args: $0) })
             }
         }
-        func canonicalAction(_ id: String) -> String { AppActions.pagePrefixedAction(id)?.id ?? id }
+        func canonicalAction(_ id: String) -> String { resolved(id)?.id ?? AppActions.pagePrefixedAction(id)?.id ?? id }
         func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], ScriptError> {
             if toolHost {
-                guard let action = resolved(id), given.count == 1, case .object(let named) = given[0] else {
-                    return .failure(ScriptError(reason: "invalid_args", detail: "An authored dependency takes one named argument object."))
+                let named: [String: JSONValue]
+                if given.isEmpty { named = [:] }
+                else if given.count == 1, case .object(let object) = given[0] { named = object }
+                else {
+                    return .failure(ScriptError(reason: "invalid_args", detail: "An authored dependency takes no arguments or one named argument object; two or more arguments or a non-object are not accepted."))
+                }
+                guard let action = resolved(id) else { return AppScriptRunner.doorInput(id: id, given: given, dataRoot: dataRoot) }
+                guard action.scriptable else {
+                    return .failure(ScriptError(reason: "not_scriptable", detail: "\(action.id) is a card button; answer it outside the script."))
                 }
                 if let refusal = AppScriptRunner.secretRefusal(action, named) { return .failure(refusal) }
                 return .success(["action": .string(action.id), "args": .object(named)])
@@ -164,7 +178,13 @@ enum AppScriptRunner {
         func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? {
             SessionHistoryPromptRenderer.receiptField(key, in: receipt)
         }
-        func perform(_ input: [String: JSONValue]) async -> JSONValue { await call(input) }
+        func perform(_ input: [String: JSONValue]) async -> JSONValue {
+            guard !SkillRunContext.handsBack else { return await call(input) }
+            let requester = SkillRunContext.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot))'s \($0)" }
+            return await SkillRunContext.$requester.withValue(requester) {
+                await call(input)
+            }
+        }
         func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures) async -> JSONValue {
             if let validation { return await validation(input, fixture) }
             return await fixture.reply(input)
@@ -190,17 +210,27 @@ enum AppScriptRunner {
             return AppActions.legacyDependencyContract(saved) == current
         }
         func admitTool(_ id: String, input: [String: JSONValue]) async -> JSONValue? { await admit(id, input) }
+        func performReach(_ operation: String, arguments: JSONValue) async throws -> JSONValue {
+            try await reach(operation, arguments)
+        }
     }
 }
 
 extension AppToolExecutor {
-    public static func authoredProgramHost(dataRoot: URL,
-        admit: @escaping @Sendable (String, [String: JSONValue]) async -> JSONValue?) -> any OwnedProgramToolHost {
+    /// The door from inside an owned program: the originating turn's gate
+    /// chain answers each call.
+    static func doorCall() -> AppScriptRunner.Perform {
         let reentry = AppDoorReentry.perform
-        return AppScriptRunner.Host(call: { input in
+        return { input in
             guard let reentry else { return Self.failure("door_unavailable", "An authored app call needs the originating turn's gate chain.") }
             do { return try await reentry("app", input) }
             catch { return ChatToolOutcome.failure(error: error, tool: "app") }
-        }, toolHost: true, dataRoot: dataRoot, admit: admit)
+        }
+    }
+
+    public static func authoredProgramHost(dataRoot: URL,
+        reach: (@Sendable (String, JSONValue) async throws -> JSONValue)? = nil,
+        admit: @escaping @Sendable (String, [String: JSONValue]) async -> JSONValue?) -> any OwnedProgramToolHost {
+        AppScriptRunner.Host(call: doorCall(), reach: reach ?? AppScriptRunner.Host.unwiredReach, toolHost: true, dataRoot: dataRoot, admit: admit)
     }
 }

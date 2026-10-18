@@ -10,6 +10,7 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import ProviderRouting
+import TurnTrace
 
 extension NativeCognitionRuntime {
     func startApprovalLifecycleObservationIfNeeded() async {
@@ -81,14 +82,12 @@ extension NativeCognitionRuntime {
         if bootstrapIfNeeded {
             await ingestPreparedOrganismSignal(
                 signal,
-                persistSynchronously: persistSynchronously,
-                prewarmContext: false
+                persistSynchronously: persistSynchronously
             )
         } else {
             await ingestPreparedOrganismSignalAfterBootstrap(
                 signal,
-                persistSynchronously: persistSynchronously,
-                prewarmContext: false
+                persistSynchronously: persistSynchronously
             )
         }
     }
@@ -190,8 +189,7 @@ extension NativeCognitionRuntime {
         valence: Double? = nil,
         arousal: Double? = nil,
         metadata: [String: JSONValue] = [:],
-        persistSynchronously: Bool = true,
-        prewarmContext: Bool = true
+        persistSynchronously: Bool = true
     ) async {
         let signal = SomaticSignal(
             id: UUID(),
@@ -205,8 +203,7 @@ extension NativeCognitionRuntime {
         )
         await ingestPreparedOrganismSignal(
             signal,
-            persistSynchronously: persistSynchronously,
-            prewarmContext: prewarmContext
+            persistSynchronously: persistSynchronously
         )
     }
 
@@ -217,14 +214,12 @@ extension NativeCognitionRuntime {
     /// body signal.
     func ingestPreparedOrganismSignal(
         _ signal: SomaticSignal,
-        persistSynchronously: Bool = true,
-        prewarmContext: Bool = true
+        persistSynchronously: Bool = true
     ) async {
         await bootstrap()
         await ingestPreparedOrganismSignalAfterBootstrap(
             signal,
-            persistSynchronously: persistSynchronously,
-            prewarmContext: prewarmContext
+            persistSynchronously: persistSynchronously
         )
     }
 
@@ -287,8 +282,7 @@ extension NativeCognitionRuntime {
 
     private func ingestPreparedOrganismSignalAfterBootstrap(
         _ signal: SomaticSignal,
-        persistSynchronously: Bool,
-        prewarmContext: Bool
+        persistSynchronously: Bool
     ) async {
         let kind = signal.kind
         await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignalAdapter.movesFeelings(kind))
@@ -301,16 +295,6 @@ extension NativeCognitionRuntime {
         }
         await rescheduleResidualRepairDeadline()
         publishRuntimeChange(reason: "somatic:\(kind.rawValue)")
-        if prewarmContext && usesLiveAppBody {
-            let contextFlow = contextFlow
-            Task {
-                await contextFlow.prewarm(
-                    kind: .organism,
-                    id: signal.id.uuidString,
-                    terms: [kind.rawValue, signal.sourceOrgan] + signal.metadata.keys.sorted()
-                )
-            }
-        }
         // Clause 4: replay is tissue downstream of the canonical dream/REM
         // write, not an hourly poll pretending to notice it. The somatic signal
         // contains no replay payload; runReplay rereads the exact injected-root
@@ -364,7 +348,7 @@ extension NativeCognitionRuntime {
     public func clearOrganismDebugBodyOverride() async -> OrganismSnapshot {
         organismDebugBodyOverride = nil
         let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
-        let liveRead = Self.makeOrganismBodyRead(
+        let liveRead = await Self.makeOrganismBodyRead(
             dataRoot: dataRoot,
             phoneDeliveryPrediction: phoneDelivery
         )
@@ -505,7 +489,7 @@ extension NativeCognitionRuntime {
             liveRead = cached.read
         } else {
             let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
-            liveRead = Self.makeOrganismBodyRead(
+            liveRead = await Self.makeOrganismBodyRead(
                 dataRoot: dataRoot,
                 now: fixedAt,
                 phoneDeliveryPrediction: phoneDelivery
@@ -723,9 +707,9 @@ extension NativeCognitionRuntime {
         dataRoot: URL,
         now: Date = Date(),
         phoneDeliveryPrediction: OrganismPrediction? = nil
-    ) -> OrganismBodyRead {
+    ) async -> OrganismBodyRead {
         let signedPeer = SignedPeerEvidenceStore.load(dataRoot: dataRoot)
-        let mobileLastSeen = signedPeer?.observedAt
+        let mobileLastSeen = signedPeer?.contactAt
         let mobileConfigured = hasReadableContent(
             dataRoot.appendingPathComponent("mobile_push", isDirectory: true).appendingPathComponent("tokens.json")
         ) || hasReadableContent(
@@ -739,8 +723,8 @@ extension NativeCognitionRuntime {
                     id: "signed-peer:\($0.eventID)",
                     evidenceClass: .signedPeerContact,
                     observedAt: $0.peerCreatedAt,
-                    // Only this post-HMAC local observation controls freshness.
-                    receivedAt: $0.observedAt
+                    // The phone's own time, bounded by this authenticated receipt, controls freshness.
+                    receivedAt: $0.contactAt
                 )]
             } ?? [],
             staleAfter: staleAfter
@@ -754,7 +738,7 @@ extension NativeCognitionRuntime {
         )
         let memoryIntegrityReading = makeMemoryIntegrityReading(dataRoot: dataRoot, now: now)
         let dreamIntegrityReading = makeDreamIntegrityReading(dataRoot: dataRoot, now: now)
-        let toolCapabilityReading = makeToolCapabilityReading(dataRoot: dataRoot, now: now)
+        let toolCapabilityReading = await makeToolCapabilityReading(dataRoot: dataRoot, now: now)
         let approvalPathReading = makeApprovalPathReading(dataRoot: dataRoot, now: now)
         let resourcePressureReading = currentResourcePressureReading(dataRoot: dataRoot, now: now)
 
@@ -1072,7 +1056,7 @@ extension NativeCognitionRuntime {
     private nonisolated static func makeToolCapabilityReading(
         dataRoot: URL,
         now: Date
-    ) -> ToolCapabilityReading {
+    ) async -> ToolCapabilityReading {
         let configuredPaths = [
             dataRoot.appendingPathComponent("mcp", isDirectory: true).appendingPathComponent("servers.json"),
             dataRoot.appendingPathComponent("mcp", isDirectory: true)
@@ -1083,17 +1067,16 @@ extension NativeCognitionRuntime {
             .appendingPathComponent("active", isDirectory: true)
         let activeCatalogExists = FileManager.default.fileExists(atPath: activePath.path)
         let configured = configuredPaths.contains(where: hasReadableContent) || activeCatalogExists
-        let tracePath = dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-        let liveReceipt = lastJSONObjectInJSONL(
-            at: tracePath,
-            requiredKind: "tool.dispatch",
-            requiredStatus: "ok"
-        )
-        let liveReceiptAt = (liveReceipt?["createdAt"] as? String).flatMap {
-            ISO8601DateFormatter().date(from: $0)
-        }
+        let rows = try? await TurnTraceRecentReader(dataRootOverride: dataRoot)
+            .traceEvidence(now: now, maximumReadBytes: 128 * 1_024).rows
+        let liveReceipt = rows?.reversed().compactMap { row -> [String: JSONValue]? in
+            guard case .object(let object) = row, object["kind"] == .string("tool.dispatch"),
+                  object["status"] == .string("ok") else { return nil }
+            return object
+        }.first
+        let liveReceiptAt: Date? = if case .string(let raw)? = liveReceipt?["createdAt"] {
+            TurnTraceEvent.parseISO8601(raw)
+        } else { nil }
         let live = liveReceiptAt.map {
             $0.timeIntervalSince(now) <= 5 && now.timeIntervalSince($0) <= 6 * 60 * 60
         } == true
@@ -1116,7 +1099,7 @@ extension NativeCognitionRuntime {
             ))
         }
         if live, let liveReceiptAt {
-            let receiptID = (liveReceipt?["id"] as? String) ?? "tool-success"
+            let receiptID = if case .string(let id)? = liveReceipt?["id"] { id } else { "tool-success" }
             evidence.append(BodyEvidenceReference(
                 id: "tool-live:\(receiptID):\(liveReceiptAt.timeIntervalSince1970)",
                 evidenceClass: .liveToolCapability,

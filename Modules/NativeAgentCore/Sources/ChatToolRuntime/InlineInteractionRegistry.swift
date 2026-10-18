@@ -116,7 +116,8 @@ public enum InlineInteractionRegistry {
             // that switches on the day the person moves to Full Mac.
             let targets = ([target] + additionalTargets).filter { !$0.isEmpty }
             let known = !targets.isEmpty && targets.allSatisfy {
-                MacIntegrationID.all.contains($0) || isMacControlCategory($0) || SystemAppleScriptAdapter.automationTarget($0) != nil
+                MacIntegrationID.all.contains($0) || isMacControlCategory($0)
+                    || SystemPermissionPreflight.cardSettingsCapability($0) != nil
             }
             // User's fence, in code: Safe and Workspace are the person's own
             // standing posture and no card may move it. When the posture
@@ -272,10 +273,10 @@ public enum InlineInteractionRegistry {
     /// Mac Integration ids own their display names; the five Mac Control
     /// approval categories carry Trust's own titles.
     public static func macCapabilityDisplayName(_ id: String) -> String {
-        if let bundleID = SystemAppleScriptAdapter.automationTarget(id) { return "Automation for \(bundleID)" }
         if MacIntegrationID.all.contains(id) {
             return MacIntegrationID.displayName(for: id)
         }
+        if let bundleID = SystemAppleScriptAdapter.automationTarget(id) { return "Automation for \(bundleID)" }
         // The card names the thing being allowed ("File access"), not the
         // switch's own row title in Trust ("File changes") — a read that says
         // "File changes" reads as a lie to the person granting it.
@@ -526,7 +527,7 @@ public enum InlineInteractionRegistry {
                 ?? "I'll leave \(grantPhrase) " + InlineInteraction.ConsequenceCopy.permissionLeaveAlone,
             // User's fence, said out loud on the card: a grant is not for one
             // turn, and the person should know that before they tap.
-            persistenceNote: capabilities.allSatisfy { SystemAppleScriptAdapter.automationTarget($0) != nil }
+            persistenceNote: capabilities.allSatisfy { !MacIntegrationID.all.contains($0) && SystemAppleScriptAdapter.automationTarget($0) != nil }
                 ? "macOS keeps your Automation decision until you change it in System Settings."
                 : "Stays on until you turn it off in Trust.",
             cardProse: "I need your go-ahead for \(grantPhrase) \u{2014} allow it below, "

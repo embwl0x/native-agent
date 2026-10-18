@@ -96,7 +96,10 @@ public actor SwiftNativeTurnEngine {
     func checkedRouteAdmission(
         for surface: String,
         requestedModel: String? = nil,
-        requestedReasoningEffort: String? = nil
+        requestedReasoningEffort: String? = nil,
+        // A worker's own model: its route's model outright, so a surface with
+        // no usable pick cannot refuse it. Only the rest comes from the surface.
+        suppliedModel: String = ""
     ) async throws -> TurnRouteAdmission {
         let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let routingSurface = canonicalRoutingSurface(normalized)
@@ -126,7 +129,9 @@ public actor SwiftNativeTurnEngine {
         // never chose (which on a ChatGPT-only install was one the account
         // could not serve at all).
         let admittedModel: String
-        if ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, routingSurface) != nil {
+        if !suppliedModel.isEmpty {
+            admittedModel = suppliedModel
+        } else if ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, routingSurface) != nil {
             admittedModel = configuredModel
         } else if !requested.isEmpty {
             admittedModel = requested
@@ -163,8 +168,8 @@ public actor SwiftNativeTurnEngine {
         )
     }
 
-    /// Build the per-turn context WITHOUT firing the LLM — for inspection
-    /// and for tests that want to verify the assembled prompt shape.
+    /// Gather the per-turn context WITHOUT firing the LLM; her turn part
+    /// composes the prompt from it (`TurnContext.turnReach`).
     public func buildTurnContext(
         surface: String,
         userMessage: String
@@ -275,6 +280,17 @@ public actor SwiftNativeTurnEngine {
         // rides attention terms/entities alone.
         let queryMessage = queryUserMessage ?? userMessage
         trace.setCount("contextFlow.queryMessageChars", queryMessage.count)
+        // Pin one clock instant for both the dynamic clock line and the receipt
+        // flag. The flag is the active semantic, not mere preference-file
+        // availability: an outside-window turn must never look quiet merely
+        // because a window happens to be configured.
+        let currentTurnClock = clockNowOverride ?? clock()
+        // The facts of this moment read nothing assembled below, so they
+        // gather beside it and the composition at the end consumes them once.
+        async let currentFacts = includeClockContext
+            ? currentTurnFacts(clockNowOverride: currentTurnClock, quietHours: quietHoursSnapshot,
+                               sessionID: sessionID, queryUserMessage: queryMessage)
+            : nil
         // Start the existing MiniLM query lane before the bounded attention
         // read. The ticket is read after that already-required work, and the
         // read is bounded by `queryEmbeddingWarmupWaitNanos` — so semantic
@@ -294,19 +310,7 @@ public actor SwiftNativeTurnEngine {
         let attentionStartNs = DispatchTime.now().uptimeNanoseconds
         let attention = await resolvedAttentionInputs(now: clock(), message: queryMessage, trace: &trace)
         trace.record(.contextFlowAttention, since: attentionStartNs)
-        // M9 (2026-07-11): on the Workshop surface, ContextFlow reuses
-        // `activeTask` as the execution prewarm-cache id (ContextFlowCoordinator
-        // prewarmScopes), so intent must never collide there. Resident Desk
-        // pursuit is also withheld from ordinary turns: work context remains
-        // query-selectable through its adaptive projection, but does not color
-        // unrelated conversation merely because a pursuit exists.
-        //
-        // P2-3: `missions` and `workshop` were two DISTINCT ContextSurfaces
-        // until 2026-08-05, so the same surface suppressed or kept pursuit
-        // intent depending only on how the caller spelled it — the prewarm
-        // collision was live for anyone who wrote `workshop`. They are one
-        // surface now, and the suppression follows the surface, not the
-        // spelling.
+        // Work context remains query-selectable without coloring unrelated turns.
         let suppressActiveIntent = ContextSurface(rawValue: surface) == .workshop
             || attention.residentWorkIntent
         // Sweep R4 A5: this used to be a bare `valueIfReady` — a pure sample,
@@ -654,9 +658,6 @@ public actor SwiftNativeTurnEngine {
         var servedContextMemoryIDs: [String] = []
         var contextFlowMemoryAtomCount: Int?
         if let preparedContextTurn {
-            for item in preparedContextTurn.packet.selectedItems {
-                for source in item.untrustedSources ?? [] { PeerDataTaint.markConsumed(peer: source) }
-            }
             contextFlowMemoryAtomCount = preparedContextTurn.packet.selectedItems.reduce(into: 0) {
                 if $1.pointer.kind == .memory || $1.pointer.kind == .correction { $0 += 1 }
             }
@@ -757,41 +758,32 @@ public actor SwiftNativeTurnEngine {
             try Task.checkCancellation()
             throw TurnEngineError.toolCatalogLoadFailed(underlying: error)
         }
-        // 6. Assembled system prompt: compiled persona packet (canonical
-        //    order, surface guidance baked in) + recall + REM pins rendered
-        //    INLINE under a dedicated header (fix 6 — pins pre-emptive).
-        //    U1 step 2b/3b: rendered as STABLE (persona+pins) / DYNAMIC
-        //    (recall) segments; the combined systemPrompt is derived from
-        //    the segments so `systemPrompt == segments.combined` holds by
-        //    construction (the caching-contract invariant the Anthropic
-        //    adapters verify before splitting system blocks).
+        // 6. What her turn part composes the system prompt from: the
+        //    compiled persona packet (canonical order, surface guidance baked
+        //    in), how she speaks, the REM pins (fix 6 — pre-emptive), recall
+        //    and the context packet. The order and the joins are hers
+        //    (abilities/turn.js); the stem only gathers.
         let renderStartNs = DispatchTime.now().uptimeNanoseconds
-        let rawSegments = Self.renderSystemPromptSegments(
-            compiledPersonaPrompt: compiledPersonaPrompt,
-            recalled: recalled,
-            remPins: remPins,
-            budget: turnBudget,
-            requiredDocuments: Self.stablePrefixRequiredDocuments(preparedContextTurn),
-            userMemoryCore: userMemoryCore,
-            surfaceGuidance: preparedContextTurn?.kernel.surfaceGuidance ?? ""
+        // Phase 5A: the first-run invitation rules are for an agent that
+        // does not know its person yet. Once a pinned USER core exists
+        // they are generic onboarding, not hers.
+        let established = !(userMemoryCore ?? []).isEmpty
+        let reach = TurnReach(
+            persona: Self.renderPersonaPrompt(
+                compiledPersonaPrompt: compiledPersonaPrompt,
+                requiredDocuments: Self.stablePrefixRequiredDocuments(preparedContextTurn),
+                userMemoryCore: userMemoryCore,
+                surfaceGuidance: preparedContextTurn?.kernel.surfaceGuidance ?? ""
+            ),
+            guidance: established ? NaturalExpressionGuidance.baseline
+                : NaturalExpressionGuidance.baseline + "\n" + NaturalExpressionGuidance.onboarding,
+            pins: remPins.map(\.text),
+            recall: Self.renderRecalledMemoryBlock(recalled, budget: turnBudget) ?? "",
+            packet: [
+                preparedContextTurn.map(Self.renderContextPacket) ?? "",
+                MacWorkContinuation.current?.modelContext ?? "",
+            ].filter { !$0.isEmpty }.joined(separator: "\n\n")
         )
-        let packetDynamic = [
-            preparedContextTurn.map(Self.renderContextPacket) ?? "",
-            MacWorkContinuation.current?.modelContext ?? "",
-        ].filter { !$0.isEmpty }.joined(separator: "\n\n")
-        let resolvedSegments: SystemPromptSegments
-        if packetDynamic.isEmpty {
-            resolvedSegments = rawSegments
-        } else {
-            let dynamic = rawSegments.dynamic.isEmpty
-                ? packetDynamic
-                : packetDynamic + "\n\n" + rawSegments.dynamic
-            resolvedSegments = SystemPromptSegments(
-                stable: rawSegments.stable,
-                stableSuffix: rawSegments.stableSuffix,
-                dynamic: dynamic
-            )
-        }
         trace.record(.promptRender, since: renderStartNs)
         let baseContext = TurnContext(
             surface: surface,
@@ -804,19 +796,13 @@ public actor SwiftNativeTurnEngine {
             providerId: admittedProvider,
             serviceTier: admittedServiceTier,
             toolsAvailable: toolNames,
-            systemPrompt: resolvedSegments.combined,
             userMessage: userMessage,
             toolSchemas: toolSchemas,
-            systemSegments: resolvedSegments,
             imageBlocks: imageBlocks,
-            fluidContextTurn: preparedContextTurn
+            fluidContextTurn: preparedContextTurn,
+            turnReach: reach
         )
         var finalContext: TurnContext
-        // Pin one clock instant for both the dynamic clock line and the receipt
-        // flag. The flag is the active semantic, not mere preference-file
-        // availability: an outside-window turn must never look quiet merely
-        // because a window happens to be configured.
-        let currentTurnClock = clockNowOverride ?? clock()
         let quietHoursActive: Bool = {
             guard let quietHours = quietHoursSnapshot else { return false }
             var calendar = Calendar(identifier: .gregorian)
@@ -831,18 +817,13 @@ public actor SwiftNativeTurnEngine {
             "clock.quietHoursActive",
             quietHoursActive
         )
-        if includeClockContext {
+        if let facts = await currentFacts {
             // Receipt truth: the dynamic prompt gets the quiet-hours marker
             // only on an active turn, and the summary carries that same pinned
             // active state for live-rate observation.
             let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
             finalContext = await contextByAppendingCurrentTurnFacts(
-                baseContext,
-                clockNowOverride: currentTurnClock,
-                quietHours: quietHoursSnapshot,
-                sessionID: sessionID,
-                queryUserMessage: queryMessage
-            )
+                baseContext, facts: facts, sessionID: sessionID, clockNowOverride: currentTurnClock)
             trace.record(ContextStageName.contextClockRuntime, since: runtimeStartNs)
         } else {
             finalContext = baseContext
@@ -872,9 +853,6 @@ public actor SwiftNativeTurnEngine {
         // legacy (non-ContextFlow) turn both lanes read the same value.
         trace.setInjectedMemoryIDs(baseContext.resolvedRecalledIds)
         trace.setCount("memory.recallHits.legacy", recalled.count)
-        trace.setCount("system.stableChars", finalContext.systemSegments?.stable.count ?? 0)
-        trace.setCount("system.dynamicChars", finalContext.systemSegments?.dynamic.count ?? 0)
-        trace.setCount("system.combinedChars", finalContext.systemPrompt?.count ?? 0)
         trace.setCount("userMessageChars", userMessage.count)
         trace.setCount("imageBlockCount", imageBlocks.count)
         trace.setFlag("snapshot.requestScoped", true)
@@ -1146,9 +1124,6 @@ public actor SwiftNativeTurnEngine {
         thresholdChars: Int,
         clock: ContextRenderClock = .unstamped
     ) -> String {
-        for source in item.untrustedSources ?? [] {
-            PeerDataTaint.markConsumed(peer: source)
-        }
         let kind = item.pointer.kind.rawValue
         let text = item.text
         /// `- [kind] (age) body [provenance] <expand marker>`
@@ -1608,13 +1583,23 @@ public actor SwiftNativeTurnEngine {
         )
     }
 
-    func contextByAppendingCurrentTurnFacts(
-        _ context: TurnContext,
-        clockNowOverride: Date? = nil,
+    /// What a turn can gather about this moment before its context exists:
+    /// read-only facts only, so a failed assembly loses nothing and a retry
+    /// sees the same. Whatever consumes state is read at composition.
+    typealias ReadOnlyTurnFacts = (
+        clock: String, momentCount: Int?, note: String?, directive: String?,
+        voiceStep: String?, place: String?, glance: String?
+    )
+
+    /// The read-only facts of this moment. None reads the assembled context,
+    /// so a turn starts them at its entry, beside history and context assembly;
+    /// `contextByAppendingCurrentTurnFacts` reads the rest and composes them.
+    func currentTurnFacts(
+        clockNowOverride: Date?,
         quietHours: TurnQuietHoursWindow?,
-        sessionID: String? = nil,
-        queryUserMessage: String? = nil
-    ) async -> TurnContext {
+        sessionID: String?,
+        queryUserMessage: String
+    ) async -> ReadOnlyTurnFacts {
         // clockNowOverride (turn-context-iteration-cache follow-up,
         // 2026-08-13): the clock line renders into the DYNAMIC system
         // segment, and a multi-iteration tool turn that crosses a minute
@@ -1623,34 +1608,66 @@ public actor SwiftNativeTurnEngine {
         // changed byte). A tool loop passes its turn-start instant on every
         // iteration so the turn reads as one moment; nil = per-build clock()
         // (single-shot turns, unchanged).
-        let withClock = Self.contextByAppendingClockContext(
-            context, now: clockNowOverride ?? clock(), quietHours: quietHours)
-        let momentNudge = await momentReviewNudge(sessionID: sessionID)
-        let withMoments = momentNudge.map {
-            Self.contextByAppendingRuntimeContext(withClock, runtimeContext: $0)
-        } ?? withClock
-        let withUpdateNote = Self.contextByAppendingUpdateNote(
-            withMoments,
-            dataRoot: remPinsDataRoot
+        let clock = Self.renderClockContext(now: clockNowOverride ?? clock(), quietHours: quietHours)
+        let momentCount = await memoryPromoter?.pendingMomentCount()
+        let momentsRender = momentCount.flatMap { momentReviewNudge(count: $0, sessionID: sessionID, commit: false) } != nil
+        // Her screen's glance (Phase 2): what changed since she last looked
+        // and what needs her, plus live built/recent abilities. Dynamic segment,
+        // never the cached prefix; helpers' own sessions do not get hers.
+        let glanceRead = remPinsDataRoot.flatMap { root in sessionID.flatMap { $0.hasPrefix("bot-") ? nil : (root, $0) } }
+        async let glance: String? = { () async -> String? in
+            guard let read = glanceRead else { return nil }
+            return await ChatWorkspaceBinding.glance(dataRoot: read.0, scope: read.1, turn: clockNowOverride,
+                                                    includingMoments: !momentsRender)
+        }()
+        // The update note (U1, 2026-09-10): after the app updates, the agent
+        // had no way to know what changed. The app leaves ONE note on disk when
+        // the bundle version changes (`ChatUpdateNote`); it rides the next
+        // turn's dynamic segment and is stamped after provider acceptance. The
+        // note itself says she may summarise it when asked, never announce it.
+        // Its sibling, a one-shot directive this SESSION owes its next turn
+        // (Sol P1-4), is keyed to one conversation, so a bot shelf turn cannot
+        // eat the instruction the person's own next turn was supposed to get.
+        let note = remPinsDataRoot.flatMap { ChatUpdateNote.pendingNote(dataRoot: $0) }
+        let directive = remPinsDataRoot.flatMap { root in
+            sessionID.flatMap { ChatSessionDirective.pendingDirective(dataRoot: root, sessionID: $0) }
+        }
+        let voiceStep = FirstConversationPersonaExemption.pendingVoiceDirective(
+            dataRoot: remPinsDataRoot, sessionID: sessionID
         )
-        var withSessionDirective = Self.contextByAppendingSessionDirective(
-            withUpdateNote,
-            dataRoot: remPinsDataRoot,
-            sessionID: sessionID
-        )
+        var place: String?
+        if ContextCorrectionScope.isReferentialFollowup(queryUserMessage), let read = glanceRead {
+            place = await ChatWorkspaceBinding.currentPlace(dataRoot: read.0, scope: read.1)
+        }
+        return (clock, momentCount, note, directive, voiceStep, place, await glance)
+    }
+
+    /// Composition, at the boundary where the context exists: the facts that
+    /// consume state are read here, once — the moments line (its churn state),
+    /// the elsewhere line (chosen by the peer taint history rendering latches)
+    /// and workspace arrivals (marked announced as read) — then every fact in
+    /// her dynamic segment's order, then the runtime line, which names the
+    /// model and provider this context was admitted on.
+    func contextByAppendingCurrentTurnFacts(
+        _ context: TurnContext,
+        facts: ReadOnlyTurnFacts,
+        sessionID: String?,
+        clockNowOverride: Date?
+    ) async -> TurnContext {
+        let moments = facts.momentCount.flatMap { momentReviewNudge(count: $0, sessionID: sessionID, commit: true) }
         // One timeline across doors (Wave 2 #10): one line when User said
         // something on another of his doors since her last reply here, one
         // when a wake of hers concluded since, and on a turn he started one
         // per bridge conversation, with what she did there. On a turn another
         // agent steers, without his words (Agent, 10-02) and no bridge; her
         // wake is her own (User, 10-02).
-        var elsewhereRead: (dataRoot: URL, scope: String, surface: String, peer: Bool)?
+        var elsewhere: String?
         if let dataRoot = remPinsDataRoot, let sessionID, !sessionID.hasPrefix("bot-") {
             // Claude's and Codex's turns run as "chat" with no envelope; their
             // bridge is only in the origin.
             let origin = ChatPersistenceContext.originProvenance
             let surface = [origin?.surface, ChatToolSessionContext.envelope?.surface].compactMap { $0 }
-                .first { HerScreen.door($0) != nil } ?? withSessionDirective.surface
+                .first { HerScreen.door($0) != nil } ?? context.surface
             let taint = PeerDataTaint.current
             // An elevated peer's lane is the person's own (PeerTrust, User 10-03).
             let lane = origin?.agent == "agent"
@@ -1659,103 +1676,23 @@ public actor SwiftNativeTurnEngine {
                 || origin?.agent != nil) && !(lane.map { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) } ?? false)
             let peer = laneSteered || PeerTurnEffectPolicy.isPeerBridge(surface: surface)
                 || taint?.isTainted == true || taint?.elevatedSources.isEmpty == false
-            elsewhereRead = (dataRoot, sessionID, surface, peer)
+            elsewhere = await HerScreen.elsewhere(dataRoot: dataRoot, scope: sessionID, surface: surface,
+                                                  peer: peer, turn: clockNowOverride)
         }
-        // Her screen's glance (Phase 2): what changed since she last looked
-        // and what needs her, plus live built/recent abilities. Dynamic segment,
-        // never the cached prefix; helpers' own sessions do not get hers.
-        let glanceRead = remPinsDataRoot.flatMap { root in sessionID.flatMap { $0.hasPrefix("bot-") ? nil : (root, $0) } }
-        // Both reads start now, side by side, and each lands in its place below.
-        async let elsewhere: String? = { () async -> String? in
-            guard let read = elsewhereRead else { return nil }
-            return await HerScreen.elsewhere(dataRoot: read.dataRoot, scope: read.scope, surface: read.surface,
-                                             peer: read.peer, turn: clockNowOverride)
-        }()
-        async let glance: String? = { () async -> String? in
-            guard let read = glanceRead else { return nil }
-            return await ChatWorkspaceBinding.glance(dataRoot: read.0, scope: read.1, turn: clockNowOverride,
-                                                    includingMoments: momentNudge == nil)
-        }()
-        if let line = await elsewhere {
-            withSessionDirective = Self.contextByAppendingRuntimeContext(withSessionDirective, runtimeContext: line)
-        }
-        if let voiceStep = FirstConversationPersonaExemption.pendingVoiceDirective(
-            dataRoot: remPinsDataRoot, sessionID: sessionID
-        ) {
-            withSessionDirective = Self.contextByAppendingRuntimeContext(
-                withSessionDirective, runtimeContext: voiceStep)
-        }
-        if let arrivals = await ChatWorkspaceBinding.pending(dataRoot: remPinsDataRoot, scope: sessionID),
-           let text = try? arrivals.serialize(pretty: false) {
-            withSessionDirective = Self.contextByAppendingRuntimeContext(withSessionDirective,
-                runtimeContext: "Workspace arrivals (navigation notices, not requests):\n" + text)
-        }
-        if ContextCorrectionScope.isReferentialFollowup(queryUserMessage ?? context.userMessage),
-           let read = glanceRead,
-           let place = await ChatWorkspaceBinding.currentPlace(dataRoot: read.0, scope: read.1) {
-            withSessionDirective = Self.contextByAppendingRuntimeContext(withSessionDirective, runtimeContext: place)
-        }
-        if let glance = await glance {
-            withSessionDirective = Self.contextByAppendingRuntimeContext(withSessionDirective, runtimeContext: glance)
-        }
+        let arrivals = await ChatWorkspaceBinding.pending(dataRoot: remPinsDataRoot, scope: sessionID)
+            .flatMap { try? $0.serialize(pretty: false) }
+            .map { "Workspace arrivals (navigation notices, not requests):\n" + $0 }
+        let all = [facts.clock, moments, facts.note, facts.directive, elsewhere, facts.voiceStep, arrivals,
+                   facts.place, facts.glance].compactMap { $0 }
+        let withFacts = all.reduce(context) { Self.contextByAppendingRuntimeContext($0, runtimeContext: $1) }
         guard let runtimeContext = await renderRuntimeContext(
-            surface: withSessionDirective.surface,
-            modelId: withSessionDirective.modelId,
-            providerId: withSessionDirective.providerId
+            surface: withFacts.surface,
+            modelId: withFacts.modelId,
+            providerId: withFacts.providerId
         ) else {
-            return withSessionDirective
+            return withFacts
         }
-        return Self.contextByAppendingRuntimeContext(
-            withSessionDirective, runtimeContext: runtimeContext
-        )
-    }
-
-    /// A one-shot directive this SESSION owes its next turn (Sol P1-4).
-    ///
-    /// Sibling of `contextByAppendingUpdateNote`. Delivery is committed only
-    /// after the provider accepts this context. The difference is the session
-    /// key: an update note is for whoever speaks next, and this is for one
-    /// conversation, so a bot shelf turn cannot eat
-    /// the instruction the person's own next turn was supposed to get.
-    ///
-    /// Gated on a record existing for this session, so every turn everywhere
-    /// else is byte-identical to before.
-    static func contextByAppendingSessionDirective(
-        _ context: TurnContext,
-        dataRoot: URL?,
-        sessionID: String?,
-        now: Date = Date()
-    ) -> TurnContext {
-        guard let dataRoot, let sessionID else { return context }
-        guard let directive = ChatSessionDirective.pendingDirective(
-            dataRoot: dataRoot, sessionID: sessionID, now: now
-        ) else { return context }
-        return Self.contextByAppendingRuntimeContext(context, runtimeContext: directive)
-    }
-
-    // MARK: - The update note (U1, 2026-09-10)
-    //
-    // After the app updates, the agent had no way to know what changed — someone
-    // asked theirs and it could not find out, and most people will ask their
-    // agent rather than read a changelog. The app leaves ONE note on disk when
-    // the bundle version changes (`ChatUpdateNote`); this puts it in front of the
-    // agent on the next turn and stamps it after provider acceptance.
-    //
-    // It rides the DYNAMIC segment for the same reason the moments nudge does:
-    // `splittingVolatileBlock()` lifts that out of the cached system prefix, so
-    // a one-off note costs no prompt-cache prefix. No push, no sound, and no
-    // chat row — the note itself tells the agent it may summarise this when
-    // asked and must not announce it unprompted.
-    static func contextByAppendingUpdateNote(
-        _ context: TurnContext,
-        dataRoot: URL?,
-        now: Date = Date()
-    ) -> TurnContext {
-        guard let dataRoot else { return context }
-        guard let note = ChatUpdateNote.pendingNote(dataRoot: dataRoot, now: now) else {
-            return context
-        }
-        return Self.contextByAppendingRuntimeContext(context, runtimeContext: note)
+        return Self.contextByAppendingRuntimeContext(withFacts, runtimeContext: runtimeContext)
     }
 
     /// Capture only pending instructions actually present in the prepared
@@ -1802,9 +1739,10 @@ public actor SwiftNativeTurnEngine {
     /// dropped and their next turn simply renders the line once.
     static let momentNudgeSessionCap = 64
 
-    func momentReviewNudge(sessionID: String?) async -> String? {
-        guard let memoryPromoter else { return nil }
-        let count = await memoryPromoter.pendingMomentCount()
+    /// The line for `count` waiting moments, when it renders this turn.
+    /// `commit` records this turn in the session's churn state; only the
+    /// composition that delivers it commits.
+    func momentReviewNudge(count: Int, sessionID: String?, commit: Bool) -> String? {
         let key = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionKey = (key?.isEmpty == false) ? key! : "swift-turn-engine"
         var state = momentNudgeState[sessionKey] ?? (lastCount: -1, turnsSinceRender: Self.momentNudgeRefreshTurns)
@@ -1812,8 +1750,8 @@ public actor SwiftNativeTurnEngine {
         let due = state.turnsSinceRender >= Self.momentNudgeRefreshTurns
         state.lastCount = count
         state.turnsSinceRender = (changed || due) ? 0 : state.turnsSinceRender + 1
-        momentNudgeState[sessionKey] = state
-        if momentNudgeState.count > Self.momentNudgeSessionCap {
+        if commit { momentNudgeState[sessionKey] = state }
+        if commit, momentNudgeState.count > Self.momentNudgeSessionCap {
             for key in momentNudgeState.keys.sorted().prefix(
                 momentNudgeState.count - Self.momentNudgeSessionCap
             ) where key != sessionKey {
@@ -1968,7 +1906,6 @@ public actor SwiftNativeTurnEngine {
         // honest — a memory dropped by the row limit or the block bound
         // contributes no entities either.
         for row in rows {
-            MemoryDataProvenance.consume(row.hit.extras)
             if case .object(let extras)? = row.hit.extras,
                case .array(let names)? = extras["kg_related"] {
                 for value in names {
@@ -2053,12 +1990,6 @@ public actor SwiftNativeTurnEngine {
         return nil
     }
 
-    /// Segment-producing core for the compiled-persona chat path (U1 2b/3b).
-    /// STABLE = compiled persona packet + REM pins (rarely change within a
-    /// session). DYNAMIC = memory recall (keyed per user message — churns
-    /// every turn). `combined` is byte-identical to the pre-segments
-    /// rendering; the split only marks where the provider cache breakpoint
-    /// may safely land.
     /// The persona's required documents that belong in the STABLE prefix but
     /// are NOT already inside the compiled kernel.
     ///
@@ -2126,16 +2057,15 @@ public actor SwiftNativeTurnEngine {
         stablePrefixPersonaDocuments(prepared).included
     }
 
-    nonisolated static func renderSystemPromptSegments(
+    /// The persona prompt her turn part leads its stable segment with: the
+    /// compiled packet, the required documents the kernel does not carry, then
+    /// surface guidance.
+    nonisolated static func renderPersonaPrompt(
         compiledPersonaPrompt: String,
-        recalled: [MemoryRecallHit],
-        remPins: [REMPin],
-        budget: ContextBudgetPolicy.Resolved? = nil,
-        requiredDocuments: [RequiredDocument] = [],
-        userMemoryCore: [String]? = nil,
-        surfaceGuidance: String = ""
-    ) -> SystemPromptSegments {
-        var stableLines: [String] = []
+        requiredDocuments: [RequiredDocument],
+        userMemoryCore: [String]?,
+        surfaceGuidance: String
+    ) -> String {
         // 2026-09-18: join before trimming so a resident kernel's final newline
         // is the same document separator the cold compiler emits.
         let requiredPrompt = PersonaCompiler.renderPrompt(
@@ -2144,81 +2074,20 @@ public actor SwiftNativeTurnEngine {
             }, uniquingKeysWith: { first, _ in first }),
             userMemoryCore: userMemoryCore
         )
-        let body = [compiledPersonaPrompt, requiredPrompt, surfaceGuidance]
+        return [compiledPersonaPrompt, requiredPrompt, surfaceGuidance]
             .filter { !$0.isEmpty }.joined(separator: "\n\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !body.isEmpty {
-            stableLines.append(body)
-        }
-        // Phase 5A: the first-run invitation rules are for an agent that
-        // does not know its person yet. Once a pinned USER core exists
-        // they are generic onboarding, not hers.
-        let established = !(userMemoryCore ?? []).isEmpty
-        stableLines.append(established
-            ? NaturalExpressionGuidance.baseline
-            : NaturalExpressionGuidance.baseline + "\n" + NaturalExpressionGuidance.onboarding)
-        // Fix 6: pins rendered FIRST, under a dedicated authority header.
-        // Phase 5A: a pin already in the prompt verbatim (REM appends every
-        // approved lesson to GROWTH, so all of them are) is not injected twice.
-        let unseenPins = remPins.filter {
-            !body.contains($0.text.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        if !unseenPins.isEmpty {
-            let bullets = unseenPins.map { "- \($0.text)" }.joined(separator: "\n")
-            stableLines.append("# Pinned facts (REM-approved overrides)\n\(bullets)")
-        }
-        var dynamicLines: [String] = []
-        if let memoryBlock = renderRecalledMemoryBlock(recalled, budget: budget) {
-            dynamicLines.append(memoryBlock)
-        }
-        return SystemPromptSegments(
-            stable: stableLines.joined(separator: "\n\n"),
-            dynamic: dynamicLines.joined(separator: "\n\n")
-        )
     }
 
-    nonisolated static func contextByAppendingClockContext(
-        _ context: TurnContext,
-        now: Date,
-        localTimeZone: TimeZone = .current,
-        quietHours: TurnQuietHoursWindow? = nil
-    ) -> TurnContext {
-        let clockContext = renderClockContext(
-            now: now, localTimeZone: localTimeZone, quietHours: quietHours)
-        return contextByAppendingRuntimeContext(context, runtimeContext: clockContext)
-    }
-
+    /// One fact of the moment for her turn part's dynamic segment.
     nonisolated static func contextByAppendingRuntimeContext(
         _ context: TurnContext,
         runtimeContext: String
     ) -> TurnContext {
         let trimmed = runtimeContext.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return context }
-
-        let segments: SystemPromptSegments?
-        let systemPrompt: String?
-        if let existingSegments = context.systemSegments {
-            let dynamic = existingSegments.dynamic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? trimmed
-                : existingSegments.dynamic + "\n\n" + trimmed
-            segments = SystemPromptSegments(
-                stable: existingSegments.stable,
-                stableSuffix: existingSegments.stableSuffix,
-                dynamic: dynamic
-            )
-            systemPrompt = segments?.combined
-        } else {
-            segments = nil
-            let existing = context.systemPrompt?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            systemPrompt = existing.isEmpty
-                ? trimmed
-                : existing + "\n\n" + trimmed
-        }
-
         var copy = context
-        copy.systemPrompt = systemPrompt
-        copy.systemSegments = segments
+        copy.turnReach.facts.append(trimmed)
         return copy
     }
 

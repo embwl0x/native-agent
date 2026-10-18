@@ -305,7 +305,7 @@ public actor SwiftNativeWorkshopRunner {
         // Build tools_summary. Always include chat.synthesize.
         let connectorActions = await planner.availableConnectorActions()
         try Task.checkCancellation()
-        var availableTools: [(id: String, description: String, autonomy: String)] = []
+        var availableTools: [(id: String, description: String)] = []
         var schemas: [String: JSONValue] = [:]
         for action in connectorActions {
             guard case .object(let obj) = action,
@@ -315,15 +315,13 @@ public actor SwiftNativeWorkshopRunner {
                 if case .string(let s) = obj["description"] ?? .null { return s }
                 return aid
             }()
-            let autonomy = DefaultToolAutonomy.resolve(toolId: aid)
             if case .object? = obj["parameters"] { schemas[aid] = obj["parameters"] }
-            availableTools.append((id: aid, description: desc, autonomy: autonomy))
+            availableTools.append((id: aid, description: desc))
         }
         if !availableTools.contains(where: { $0.id == "chat.synthesize" }) {
             availableTools.append((
                 id: "chat.synthesize",
-                description: "Use the AI to synthesize, draft, analyze, or reason over text",
-                autonomy: "auto"
+                description: "Use the AI to synthesize, draft, analyze, or reason over text"
             ))
         }
         // Render the FULL tool menu (was prefix(30) — which silently cut
@@ -332,7 +330,7 @@ public actor SwiftNativeWorkshopRunner {
         // do everything). Cap high (200) only as a prompt-size backstop.
         let toolsSummary = availableTools.prefix(200).map { t in
             let schema = schemas[t.id].flatMap { try? $0.serialize(pretty: false) }
-            return "  - \(t.id): \(t.description) [autonomy=\(t.autonomy)]" + (schema.map { " [schema=\($0)]" } ?? "")
+            return "  - \(t.id): \(t.description)" + (schema.map { " [schema=\($0)]" } ?? "")
         }.joined(separator: "\n")
 
         // Current date/time for the plan. The planner had NO clock, so a

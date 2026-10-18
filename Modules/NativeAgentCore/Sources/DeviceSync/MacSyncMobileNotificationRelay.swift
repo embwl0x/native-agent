@@ -308,8 +308,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 "eventId": .string(eventID),
                 "source": .string(source),
             ],
-            persistSynchronously: false,
-            prewarmContext: false
+            persistSynchronously: false
         )
     }
 
@@ -325,8 +324,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 "eventId": .string(eventID),
                 "channel": .string(channel),
             ],
-            persistSynchronously: false,
-            prewarmContext: false
+            persistSynchronously: false
         )
     }
 
@@ -342,8 +340,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 "eventId": .string(eventID),
                 "source": .string(source),
             ],
-            persistSynchronously: false,
-            prewarmContext: false
+            persistSynchronously: false
         )
     }
 

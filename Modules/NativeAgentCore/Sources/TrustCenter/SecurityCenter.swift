@@ -1,6 +1,8 @@
 import FeedPolicy
+import NativeAgentCore
 import Foundation
 import PersistenceCore
+import ToolRegistry
 
 enum SecurityRisk: String, Sendable, Comparable {
     case low
@@ -297,16 +299,9 @@ public actor SwiftNativeSecurityCenter {
         // security .ask routes to a real approval instead of a dead deny —
         // so flipping this to local-only is a one-line change if group
         // surfaces ever join the allowlist.
-        let autonomyLevel = resolveAutonomyLevel(
-            tool: canonicalTool,
-            input: input,
-            policy: policy,
-            userOverrides: snapshot.userConfiguredAutonomyOverrides,
-            origin: origin,
-            originAssessment: originAssessment,
-            profile: profile,
-            fullMacYoloAuthority: fullMacYoloAuthority
-        )
+        let (toolClass, law, autonomyLevel) = PermissionLaw.answer(
+            tool: tool, input: input, policy: policy, saved: snapshot.userConfiguredAutonomyOverrides,
+            dataRoot: dataRoot, roots: trustedRoots, capabilities: profile.capabilities)
         let promptInjectionKeys = Self.promptInjectionKeys(in: .object(input))
         let secretKeys = Self.secretKeys(in: .object(input))
         // W2/W3-FIX-R2 2 — `redactedInputPreview` is PERSISTED to
@@ -321,7 +316,7 @@ public actor SwiftNativeSecurityCenter {
         let redacted = Self.redactValue(
             .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
         )
-        let signedToolKnown = try await isSignedOrBuiltinTool(canonicalTool)
+        let signedToolKnown = try isSignedOrBuiltinTool(canonicalTool)
         let rollbackRequired = profile.capabilities.contains("filesystem_write")
             || profile.capabilities.contains("filesystem_delete")
             || profile.capabilities.contains("destructive")
@@ -356,6 +351,13 @@ public actor SwiftNativeSecurityCenter {
             reasons.append(.init(.cause, "security kill switch is active"))
         }
 
+        // Safe changes nothing on User's side of the line (the law).
+        if decision != .block, law == "blocked" {
+            decision = .block
+            reasons.append(.init(.cause, "Safe keeps everything beyond your own data as it is, and only the person lifts it. "
+                + "Ask them to choose Work mode or above in Trust."))
+        }
+
         if enforceAutonomy, decision != .block {
             switch autonomyLevel {
             case "blocked":
@@ -378,21 +380,11 @@ public actor SwiftNativeSecurityCenter {
         // SecurityCenter to leave ordinary autonomy resolution to an outer
         // gate (`enforceAutonomy == false`).
         if decision != .block,
-           fullMacYoloAuthority.state == .explicitlyBlocked {
+           fullMacYoloAuthority.state == .explicitlyBlocked || profile.capabilities.contains(where: {
+               SwiftNativeTrustCenter.hasExplicitBlockOverride($0, overrides: snapshot.userConfiguredAutonomyOverrides)
+           }) {
             decision = .block
             reasons.append(.init(.cause, "tool is explicitly blocked by the user"))
-        }
-
-        // Resetting macOS permissions always asks: a saved per-tool `auto`
-        // override does not answer it, even under Full Mac. User must approve
-        // the reset explicitly. This runs even for callers
-        // that resolve autonomy in the outer chat gate
-        // (`enforceAutonomy == false`), so every dispatch surface sees the
-        // same effect-time decision.
-        if decision != .block,
-           profile.capabilities.contains("system_permission_reset") {
-            decision = Self.maxDecision(decision, .ask)
-            reasons.append(.init(.cause, "system permission changes require explicit approval"))
         }
 
         // Full Mac is authority selected by the trusted operator; it is not an
@@ -491,13 +483,6 @@ public actor SwiftNativeSecurityCenter {
         }
 
         if decision != .block,
-           profile.capabilities.contains("outside_app_data_write"),
-           !fullMac {
-            decision = .block
-            reasons.append(.init(.cause, "Writing outside the app’s files requires Full Mac access."))
-        }
-
-        if decision != .block,
            profile.capabilities.contains("other_app_settings_write"),
            !fullMac {
             decision = Self.maxDecision(decision, .ask)
@@ -582,10 +567,9 @@ public actor SwiftNativeSecurityCenter {
         // per-call ask/confirm policy. Flatten asks here, after every security
         // rule has had a chance to produce a hard `.block`, so direct/raw
         // SecurityCenter clients and composed chat clients see the same
-        // decision. This never upgrades a block. Resetting macOS permissions
-        // still requires User's explicit approval, even under Full Mac.
-        if decision == .ask, fullMacYoloAuthority.admitted,
-           !profile.capabilities.contains("system_permission_reset") {
+        // decision. This never upgrades a block. Destructive (a delete for
+        // good, a macOS permission reset) still asks User, even under Full Mac.
+        if decision == .ask, fullMacYoloAuthority.admitted, toolClass != .destructive {
             decision = .allow
             reasons.append(.init(.note, "Full Mac allows this action without asking again."))
         }
@@ -755,37 +739,6 @@ public actor SwiftNativeSecurityCenter {
         dataRoot
             .appendingPathComponent("security", isDirectory: true)
             .appendingPathComponent("audit.jsonl")
-    }
-
-    private func resolveAutonomyLevel(
-        tool: String,
-        input: [String: JSONValue],
-        policy: [String: JSONValue],
-        userOverrides: [String: JSONValue],
-        origin: SecurityOriginContext,
-        originAssessment: OriginAssessment,
-        profile: ToolProfile,
-        fullMacYoloAuthority: FullMacYoloAuthorityAssessment
-    ) -> String {
-        // 2026-07-21 audit fix: an explicit USER-SET "blocked" entry
-        // outranks the yolo posture (mirror of the SwiftNativeTrustCenter
-        // resolver fix — confirm/send_approval stay flattened by yolo;
-        // consult the raw user file so merged code defaults can't
-        // masquerade as explicit entries).
-        if fullMacYoloAuthority.admitted {
-            return "auto"
-        }
-        let overrides = Self.object(policy["toolAutonomy"])
-        let defaultLevel = overrides["default"] ?? .string("send_approval")
-        let bundle: [String: JSONValue] = [
-            "autonomyOverrides": .object(overrides),
-            "autonomyDefault": defaultLevel,
-        ]
-        let level = trustCenter.autonomyForTool(tool, policy: bundle)
-        // An app door action that runs its old tool's code in process keeps
-        // the level saved on that tool: the stricter of the two stands.
-        guard tool == "app", let old = Self.appActionOldTool(input) else { return level }
-        return SwiftNativeTrustCenter.moreRestrictiveAutonomy(level, trustCenter.autonomyForTool(old, policy: bundle))
     }
 
     func assessOrigin(
@@ -978,17 +931,19 @@ public actor SwiftNativeSecurityCenter {
         )
     }
 
-    private func isSignedOrBuiltinTool(_ tool: String) async throws -> Bool {
-        if Self.builtinToolPrefixes.contains(where: { tool.hasPrefix($0) })
-            || Self.builtinToolNames.contains(tool)
+    private func isSignedOrBuiltinTool(_ tool: String) throws -> Bool {
+        if AuthoredToolEffects.primitiveCapabilities[tool] != nil || tool.hasPrefix("fetch.")
+            || AppActionBinding.builtInToolName(tool)
+            || Self.connectorActionIDs.contains(where: { $0.value == tool && AppActionBinding.builtInToolName($0.key) })
             || Self.notificationToolNames.contains(tool)
             || Self.catalogToolNames.contains(tool) {
             return true
         }
-        let registryPath = dataRoot
-            .appendingPathComponent("tools", isDirectory: true)
-            .appendingPathComponent("registry.json")
-        let raw = try await persistence.readJSON(registryPath, ifMissing: .object([:]))
-        return Self.registryContainsSignedTool(raw, tool: tool)
+        return try ToolRegistryActions.entries(dataRoot: dataRoot).contains { value in
+            guard case .object(let row) = value,
+                  (Self.string(row["name"]) ?? Self.string(row["id"])) == tool else { return false }
+            return !(Self.string(row["manifestSignature"]) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 }

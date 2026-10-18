@@ -591,20 +591,33 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleTool(conn: conn, body: body, surface: BridgeLane.claudeSurfaceName, headers: headers)
+            handleTool(conn: conn, body: body, lane: "claude", headers: headers)
         case "/codex/tool":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleTool(conn: conn, body: body, surface: BridgeLane.codexSurfaceName, headers: headers)
+            handleTool(conn: conn, body: body, lane: "codex", headers: headers)
         case "/codex/reply", "/claude/reply":
             guard method == "POST",
                   let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                   let session = json["session_id"] as? String,
                   let request = json["request_id"] as? String,
-                  let principal = bridgeCallerPrincipal(headers: headers) else {
+                  let principal = bridgeCallerPrincipal(headers: headers,
+                      lane: path == "/claude/reply" ? "claude" : "codex") else {
                 writeJSON(conn, status: 400, obj: ["error": "invalid_caller_result_request"])
+                return
+            }
+            func wholeNumber(_ value: Any?) -> Int? {
+                guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      number.doubleValue.isFinite, number.doubleValue == Double(number.intValue) else { return nil }
+                return number.intValue
+            }
+            let offset = json["offset"] == nil ? 0 : wholeNumber(json["offset"])
+            let maxChars = json["max_chars"] == nil ? 8000 : wholeNumber(json["max_chars"])
+            guard let offset, (0...1_048_576).contains(offset), let maxChars, (1...16000).contains(maxChars) else {
+                writeJSON(conn, status: 400, obj: ["error": "invalid_pagination",
+                    "detail": "offset is an integer from 0 through 1048576; max_chars from 1 through 16000."])
                 return
             }
             let tasks = self.tasks
@@ -612,12 +625,25 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 do {
                     let task = try await tasks.get("na3.\(session).\(request)", owner: principal.id)
                     writeJSON(conn, status: 200, obj: AgentContactRoutes.contactReply(task, requestID: request, sessionID: session,
-                                                                     offset: 0, maxChars: 8000), onSent: {
+                                                                     offset: offset, maxChars: maxChars), onSent: {
                         if !task.text.isEmpty { Task { await tasks.recordReplyFetch(task) } }
                     })
                 } catch {
-                    writeJSON(conn, status: 404, obj: ["status": "unavailable",
-                        "detail": "No retained result is available for this caller and request. Absence does not authorize resending."])
+                    // A /claude/message turn retains no task: its reply is
+                    // the conversation's, kept in the bridge's reply ledger
+                    // (message-replies.jsonl) by request id for the caller
+                    // that sent the message, including a turn that resumed
+                    // after a relaunch. Another caller's ids read as nothing.
+                    let receipt = ClaudeBridgeMessageRuntime.agentReplyReceipt(requestID: request, sessionID: session,
+                        offset: offset, maxChars: maxChars, logURL: ClaudeBridgeMessageRuntime.messageReplyURL(),
+                        principal: principal.id)
+                    guard receipt["status"] as? String == "ok" else {
+                        writeJSON(conn, status: 404, obj: ["status": "unavailable",
+                            "detail": "No retained result is available for this caller and request. Absence does not authorize resending.",
+                            "evidence": receipt["evidence"] ?? NSNull()])
+                        return
+                    }
+                    writeJSON(conn, status: 200, obj: receipt)
                 }
             }
         case "/claude/organism/debug", "/codex/organism/debug":
@@ -798,8 +824,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     }
 
     private func handleMessage(conn: NWConnection, body: Data, defaultSender: String, headers: [String: String]) {
-        guard let principal = bridgeCallerPrincipal(headers: headers,
-            authenticatedLane: defaultSender == "claude" ? defaultSender : nil) else {
+        guard let principal = bridgeCallerPrincipal(headers: headers, lane: defaultSender) else {
             writeJSON(conn, status: 403, obj: ["error": "invalid_peer_identity"])
             return
         }
@@ -810,17 +835,20 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
 
     // MARK: - /claude/tool
 
-    private func bridgeCallerPrincipal(headers: [String: String], authenticatedLane: String? = nil) -> AgentBridgePrincipal? {
-        let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: host.dataRoot,
-                                                     authenticatedLane: authenticatedLane)
+    /// The listener authenticated the bearer, so every route of a lane —
+    /// message, tool and reply alike — binds it to that lane's own contact
+    /// (`PeerTrust.contact(forLane:)`): its turn is trusted exactly when the
+    /// person elevated that contact. A lane with no contact stays anonymous;
+    /// claimed peers keep their own identity.
+    private func bridgeCallerPrincipal(headers: [String: String], lane: String) -> AgentBridgePrincipal? {
+        let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: host.dataRoot, authenticatedLane: lane)
         guard !principal.replyOnly,
               !AgentBridgePrincipal.claimsIdentity(headers: headers) || principal.peerID != nil else { return nil }
-        // The listener authenticated the bearer; only a named built-in route
-        // binds it to that lane's contact. Claimed peers keep their own identity.
         return principal
     }
 
-    private func handleTool(conn: NWConnection, body: Data, surface: String, headers: [String: String]) {
+    private func handleTool(conn: NWConnection, body: Data, lane: String, headers: [String: String]) {
+        let surface = BridgeLane.bridgeSurfaceName(forSender: lane)
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             writeJSON(conn, status: 400, obj: ["error": "invalid_json"])
             return
@@ -829,7 +857,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             writeJSON(conn, status: 400, obj: ["error": "missing_name"])
             return
         }
-        guard let principal = bridgeCallerPrincipal(headers: headers) else {
+        guard let principal = bridgeCallerPrincipal(headers: headers, lane: lane) else {
             writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
             return
         }
@@ -860,9 +888,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         let taskID = context.flatMap { context in request.map { "na3.\(context).\($0)" } }
         let requestDigest = AgentPeerReplayClaimStore.digest(body)
         let started = Date()
-        // U5 W-G: bound the work phase (same latch pattern as handleMessage).
         let workLatch = WorkLatch()
-        let workTask = Task.detached(priority: .userInitiated) { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             var admitted = false
             do {
@@ -878,8 +905,10 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     }
                     admitted = true
                 }
-                let result = try await turn.bind {
-                    try await tools.dispatch(tool: name, input: inputJV, surface: turn.surface)
+                let result = try await TurnDeadline.withThrowingDeadline(seconds: Double(Self.toolWorkDeadlineSeconds)) {
+                    try await turn.bind {
+                        try await tools.dispatch(tool: name, input: inputJV, surface: turn.surface)
+                    }
                 }
                 if let taskID { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
                 let resultAny = jsonValueToAny(result)
@@ -896,6 +925,16 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     try? await tasks.finishTool(taskID, owner: principal.id,
                                                result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]))
                 }
+                if error is TurnDeadline.DeadlineExceeded {
+                    guard workLatch.claim() else { return }
+                    self.publishEvent(kind: "tool_timeout", payload: [
+                        "name": name, "surface": surface, "seconds": Self.toolWorkDeadlineSeconds,
+                    ])
+                    self.writeJSON(conn, status: 504, obj: [
+                        "error": "work_timeout", "name": name, "seconds": Self.toolWorkDeadlineSeconds,
+                    ])
+                    return
+                }
                 self.publishEvent(kind: "tool_failed", payload: [
                     "name": name,
                     "ok": false,
@@ -909,20 +948,6 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     "detail": String(describing: error),
                 ])
             }
-        }
-        workLatch.arm(afterSeconds: Self.toolWorkDeadlineSeconds) { [weak self] in
-            guard let self, workLatch.claim() else { return }
-            workTask.cancel()
-            self.publishEvent(kind: "tool_timeout", payload: [
-                "name": name,
-                "surface": surface,
-                "seconds": Self.toolWorkDeadlineSeconds,
-            ])
-            self.writeJSON(conn, status: 504, obj: [
-                "error": "work_timeout",
-                "name": name,
-                "seconds": Self.toolWorkDeadlineSeconds,
-            ])
         }
     }
 

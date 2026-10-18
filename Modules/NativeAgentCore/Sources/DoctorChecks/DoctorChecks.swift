@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import Security
 import CloudKit
@@ -643,10 +644,21 @@ public struct AbilityFilesCheck: DoctorCheck {
     public let id = "ability_files"
     public let title = "Ability Files"
     private let root: URL
+    nonisolated(unsafe) private static var seedFailures: [String: [String]] = [:]
+
+    package static func recordSeedFailures(_ failures: [String], root: URL) {
+        AbilityStore.withLock { seedFailures[root.standardizedFileURL.path] = failures }
+    }
 
     public init(root: URL = defaultDataRoot()) { self.root = root }
 
     public func run() async -> CheckResult {
+        let failures = AbilityStore.withLock { Self.seedFailures[root.standardizedFileURL.path] ?? [] }
+        if !failures.isEmpty {
+            return CheckResult(id: id, title: title, status: "fail", detail: failures.joined(separator: "\n"),
+                harm: "Bundled parts could not be installed; their capabilities are unavailable.",
+                human_action: "Fix the named bundled seed or installation error and relaunch. Existing parts are preserved.", owner: .builder)
+        }
         do {
             let files = try AbilityStore(dataRoot: root).files()
             return CheckResult(id: id, title: title, status: "ok", detail: "\(files.count) ability files read successfully.")

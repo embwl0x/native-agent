@@ -1,4 +1,3 @@
-import MemoryV2
 import AppToolRuntime
 import Cognition
 import Context
@@ -144,16 +143,6 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     func setGlobalHotkeyEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: "globalHotkeyEnabled")
         GlobalHotkeyManager.shared.setEnabled(enabled)
-    }
-
-    func memoryMode() async throws -> String {
-        EmbeddingsSettingsStatusPresentation(status: try await MemoryStatusProjection.embeddingsStatus(dataRoot: appModel.engine.dataRoot)).memoryMode
-    }
-    func setMemoryMode(_ mode: String) async throws {
-        let result = try await MemoryStatusProjection.setEmbeddingsMemoryMode(mode, dataRoot: appModel.engine.dataRoot)
-        if let error = result.error {
-            throw QuietSettingError.unavailable(result.detail.map { "\(error): \($0)" } ?? error)
-        }
     }
 
     func savePersonalityName(_ name: String) async -> String? {

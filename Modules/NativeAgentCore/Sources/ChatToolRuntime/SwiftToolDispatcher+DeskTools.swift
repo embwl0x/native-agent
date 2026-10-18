@@ -308,7 +308,7 @@ extension SwiftToolDispatcher {
                 result["archived_projection"] = .string(archiveProjection)
                 result["archivedMatchCount"] = .int(Int64(archivedMatchCount))
                 result["next_archive_read"] = nextArchiveRead
-                if archivedMatchCount > 0 { result["status"] = .string("ok") }
+                if archivedMatchCount > 0 { result["status"] = .string("ok"); result["detail"] = nil }
             }
             return .object(result)
         }

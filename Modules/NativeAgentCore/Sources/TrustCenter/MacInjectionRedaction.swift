@@ -41,7 +41,7 @@ public enum MacInjectionArgRedaction {
 
     /// The secret args an `app` call carries, by its action.
     public static func appDoorSecretKeys(_ input: [String: JSONValue]) -> [String] {
-        let keys = AppActionPolicy.action(input: input)?.secretArgs ?? []
+        let keys = AppActionBinding.action(input: input)?.secretArgs ?? []
         let foldedTool = ToolNameAliases.ranTool("app", input: input)
         return Array(Set(keys + (secretKeysByTool[normalized(foldedTool)] ?? []))).sorted()
     }
@@ -53,7 +53,7 @@ public enum MacInjectionArgRedaction {
     public static func namesAppDoorSecretAction(_ source: String) -> Bool {
         let text = source.lowercased()
         let words = Set(text.split { !($0.isLetter || $0.isNumber || $0 == "_") }.map(String.init))
-        let actions = AppActionPolicy.secretActionIDs
+        let actions = AppActionBinding.secretActionIDs
             + secretKeysByTool.keys.compactMap { ToolNameAliases.appAction($0) }
         return actions.contains { id in
             text.contains(id) || id.split(separator: ".").allSatisfy { words.contains(String($0)) }
@@ -78,7 +78,7 @@ public enum MacInjectionArgRedaction {
     public static func redacted(tool: String, input: [String: JSONValue]) -> [String: JSONValue] {
         // An action id called as a tool name (mac.act) is an app call; redact it as one.
         let action = JSONValue.string(tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-        if tool.contains("."), AppActionPolicy.action(input: ["action": action]) != nil,
+        if tool.contains("."), AppActionBinding.action(input: ["action": action]) != nil,
            case .object(let args)? = redacted(tool: "app", input: ["action": action, "args": .object(input)])["args"] {
             return args
         }

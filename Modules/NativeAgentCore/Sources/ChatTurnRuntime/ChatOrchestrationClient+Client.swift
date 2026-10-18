@@ -54,6 +54,25 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
     let autocompactionConfig: ChatSessionAutocompactionConfig
     let clock: @Sendable () -> Date
 
+    /// Parts waking between turns use the same client and checked Chat pick.
+    public func withCurrentChatModel<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
+        try await ProviderTurnChoice.$current.withValue(nil) {
+        let admission = try await engine.checkedRouteAdmission(for: "chat")
+        return try await withModelContext(admission, surface: "chat", body)
+        }
+    }
+
+    func withModelContext<T: Sendable>(_ admission: TurnRouteAdmission, surface: String,
+                                     _ body: () async throws -> T) async rethrows -> T {
+        try await LLMCallContext.$client.withValue(llm) {
+        try await LLMCallContext.$surface.withValue(surface) {
+        try await LLMCallContext.$admittedModel.withValue(admission.modelId) {
+        try await LLMCallContext.$providerId.withValue(admission.providerId) {
+        try await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
+        try await LLMCallContext.$serviceTier.withValue(admission.serviceTier, operation: body)
+        } } } } }
+    }
+
     public init(
         engine: SwiftNativeTurnEngine,
         tools: any ToolDispatchClient,
@@ -241,10 +260,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         )
         let prefixTelemetrySink = ConversationPrefixTelemetrySink()
         return try await ConversationPrefixTelemetry.$sink.withValue(prefixTelemetrySink) {
-        try await LLMCallContext.$admittedModel.withValue(admission.modelId) {
-        try await LLMCallContext.$providerId.withValue(admission.providerId) {
-        try await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
-        try await LLMCallContext.$serviceTier.withValue(admission.serviceTier) {
+        try await withModelContext(admission, surface: surface) {
             let execution = try await executeStructuredChatStreaming(
                 message: message,
                 sessionId: sessionId,
@@ -266,9 +282,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
             let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
             response.requestedModel = requested.isEmpty ? nil : requested
             return response
-        }
-        }
-        }
         }
         }
         }

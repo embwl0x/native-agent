@@ -34,13 +34,18 @@ public enum MacBackgroundSight {
 
     /// Resolve `name` against the running apps, WITHOUT activating anything.
     ///
-    /// Four passes, narrowest first, and each pass is only consulted when the
+    /// Six passes, narrowest first, and each pass is only consulted when the
     /// one before it found nothing — so an exact name always beats a substring
     /// and "Mail" can never be stolen by "Mailplane" while Mail is running:
     ///   1. exact name or exact bundle id (case-insensitive);
     ///   2. name prefix;
     ///   3. name substring;
-    ///   4. bundle-id substring.
+    ///   4. bundle-id substring;
+    ///   5. the same with spaces and punctuation gone ("World of Warcraft" is
+    ///      the process "Wow" with bundle id com.blizzard.worldofwarcraft);
+    ///   6. the installed app the Apps screen knows by that name, by its bundle
+    ///      id: every name an app has resolves to the one app (10-16, Agent:
+    ///      "Nothing called World of Warcraft is running" while it was).
     ///
     /// A pass that finds exactly one match wins. A pass that finds several
     /// returns `.ambiguous` rather than picking one: guessing which window she
@@ -57,11 +62,26 @@ public enum MacBackgroundSight {
         // never part of the localized name AppKit reports.
         let bare = needle.hasSuffix(".app") ? String(needle.dropLast(4)) : needle
 
+        func squashed(_ text: String) -> String { normalized(text).filter { $0.isLetter || $0.isNumber } }
+        let flat = squashed(bare)
+        // The installed index is consulted only once the running names failed.
+        var knownCache: Set<String>?
+        func known() -> Set<String> {
+            if let knownCache { return knownCache }
+            let found = Set((MacAppIndex.shared.readyApps() ?? []).filter { app in
+                app.platform == "mac" && (squashed(app.name) == flat
+                    || squashed(app.url.deletingPathExtension().lastPathComponent) == flat)
+            }.compactMap { $0.bundleID?.lowercased() })
+            knownCache = found
+            return found
+        }
         let passes: [(MacAXAppInfo) -> Bool] = [
             { normalized($0.name) == bare || normalized($0.bundleIdentifier ?? "") == bare },
             { normalized($0.name).hasPrefix(bare) },
             { normalized($0.name).contains(bare) },
             { normalized($0.bundleIdentifier ?? "").contains(bare) },
+            { !flat.isEmpty && (squashed($0.name) == flat || squashed($0.bundleIdentifier ?? "").contains(flat)) },
+            { known().contains(normalized($0.bundleIdentifier ?? "")) },
         ]
         for pass in passes {
             let hits = apps.filter(pass)

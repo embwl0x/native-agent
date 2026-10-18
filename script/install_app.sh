@@ -26,6 +26,8 @@
 # app stays in the menu bar.
 
 set -euo pipefail
+# Say which line died: a silent exit 1 cost a debug loop (10-17).
+trap 'echo "[install_app.sh] FAILED line $LINENO: $BASH_COMMAND" >&2' ERR
 
 for arg in "$@"; do
     case "$arg" in
@@ -61,6 +63,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
 # shellcheck source=lib/development_bundle_signing.sh
 source "$ROOT/script/lib/development_bundle_signing.sh"
+source "$ROOT/script/lib/release_symbols.sh"
 
 # Keep the installer's final signing identity aligned with build_and_run.sh.
 # That builder already loads this ignored, machine-local file before it stamps
@@ -160,11 +163,24 @@ DIST_BUNDLE="$ROOT/dist/$APP_NAME.app"
 # before staging or touching the running installation.
 if [[ ! -x "$DIST_BUNDLE/Contents/MacOS/NativeAgentSenseHost" \
    || ! -f "$DIST_BUNDLE/Contents/Resources/Senses/sense.js" \
-   || ! -f "$DIST_BUNDLE/Contents/Resources/Senses/builtin.json" ]]; then
-    echo "[install_app.sh] ERROR: built bundle is missing the Senses helper or authoring kit." >&2
+   || ! -f "$DIST_BUNDLE/Contents/Resources/Senses/builtin.json" \
+   || ! -f "$DIST_BUNDLE/Contents/Resources/abilities/turn.js" ]]; then
+    echo "[install_app.sh] ERROR: built bundle is missing the Senses helper, authoring kit or seed turn part." >&2
     exit 1
 fi
 TEMP_BUNDLE="$(dirname "$APP_DEST")/.NativeAgent.app.tmp.$$"
+APP_OLD="${APP_DEST}.old.$$"
+trap '
+    # The previous bundle comes back before anything else is cleaned: a failed
+    # cleanup under set -e must never strand it at .old (Sol).
+    if [ -d "$APP_OLD" ] && [ ! -d "$APP_DEST" ]; then
+        echo "[install_app.sh] mid-swap failure — restoring previous bundle"
+        mv "$APP_OLD" "$APP_DEST"
+        /usr/bin/open "$APP_DEST" 2>/dev/null || true
+    fi
+    rm -rf "$TEMP_BUNDLE" || true
+' EXIT
+trap 'exit 1' INT TERM HUP
 rm -rf "$TEMP_BUNDLE"
 cp -R "$DIST_BUNDLE" "$TEMP_BUNDLE"
 if [[ "$INSTALL_EMBEDDING_DISTRIBUTION" == separate-download ]]; then
@@ -202,6 +218,66 @@ fi
 # Preserve the builder's version and provenance, including its internal-build
 # suffix. Readiness must compare against those bytes, never a later Git HEAD.
 INSTALL_SOURCE_REVISION="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentSourceRevision' "$TEMP_BUNDLE/Contents/Info.plist")"
+# Keep each product/UUID set once; revisions retain references for symbolication.
+DSYM_ARCHIVE="$HOME/Library/Logs/NativeAgent-dsyms"
+case "$NATIVEAGENT_BUILD_CONFIG" in
+    debug) DSYM_PRODUCTS="$ROOT/DerivedData/Build/Products/Debug" ;;
+    release) DSYM_PRODUCTS="$ROOT/DerivedData/Build/Products/Release" ;;
+esac
+DSYM_MANIFEST="$TEMP_BUNDLE/.symbols.tsv"
+: > "$DSYM_MANIFEST"
+for dsym in "$DSYM_PRODUCTS"/*.dSYM; do
+    [[ -d "$dsym" ]] || continue
+    for dwarf in "$dsym/Contents/Resources/DWARF/"*; do
+        binary="$(find "$TEMP_BUNDLE/Contents" -type f -name "$(basename "$dwarf")" -print -quit)"
+        [[ -n "$binary" ]] || continue 2
+        symbol_uuids="$(release_executable_uuids "$dwarf")"
+        binary_uuids="$(release_executable_uuids "$binary")"
+        if [[ -z "$symbol_uuids" || "$symbol_uuids" != "$binary_uuids" ]]; then
+            echo "[install_app.sh] ERROR: symbols do not match staged $binary; rebuild $NATIVEAGENT_BUILD_CONFIG." >&2
+            exit 1
+        fi
+    done
+    uuid_set="$(release_executable_uuids "$dsym")"
+    uuid_key="$(printf '%s\n' "$uuid_set" | shasum -a 256 | awk '{print $1}')"
+    retained="$DSYM_ARCHIVE/objects/$(basename "$dsym")/$uuid_key/$(basename "$dsym")"
+    if [[ ! -e "$retained" ]]; then
+        # Older installs archived one dSYM per revision directory; the keyed
+        # objects/ store was checked above and holds no dSYM at this depth.
+        for candidate in "$DSYM_ARCHIVE"/*/"$(basename "$dsym")"; do
+            [[ -d "$candidate" && "$candidate" != "$DSYM_ARCHIVE/objects/"* ]] || continue
+            candidate_uuids="$(release_executable_uuids "$candidate")"
+            if [[ "$candidate_uuids" == "$uuid_set" ]]; then
+                retained="$candidate"
+                break
+            fi
+        done
+    fi
+    symbol_ref="${retained#"$DSYM_ARCHIVE/"}"
+    if [[ -e "$retained" ]]; then
+        if ! diff -qr "$dsym/Contents/Resources/DWARF" "$retained/Contents/Resources/DWARF"; then
+            echo "[install_app.sh] ERROR: retained symbols differ for $uuid_set; inspect $retained before installing." >&2
+            exit 1
+        fi
+        echo "[symbols] reused $symbol_ref"
+    else
+        mkdir -p "$(dirname "$retained")"
+        ditto "$dsym" "$TEMP_BUNDLE/.symbols.dSYM"
+        mv "$TEMP_BUNDLE/.symbols.dSYM" "$retained"
+        echo "[symbols] archived $symbol_ref"
+    fi
+    printf '%s\t%s\n' "$(basename "$dsym")" "$symbol_ref" >> "$DSYM_MANIFEST"
+done
+if [[ ! -s "$DSYM_MANIFEST" ]]; then
+    echo "[install_app.sh] ERROR: no symbols match the staged app; rebuild $NATIVEAGENT_BUILD_CONFIG with dSYMs." >&2
+    exit 1
+fi
+mkdir -p "$DSYM_ARCHIVE/$INSTALL_SOURCE_REVISION"
+if [[ -f "$DSYM_ARCHIVE/$INSTALL_SOURCE_REVISION/manifest.tsv" ]]; then
+    cat "$DSYM_ARCHIVE/$INSTALL_SOURCE_REVISION/manifest.tsv" >> "$DSYM_MANIFEST"
+fi
+LC_ALL=C sort -u "$DSYM_MANIFEST" -o "$DSYM_MANIFEST"
+mv "$DSYM_MANIFEST" "$DSYM_ARCHIVE/$INSTALL_SOURCE_REVISION/manifest.tsv"
 INSTALL_SOURCE_DIRTY="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentSourceDirty' "$TEMP_BUNDLE/Contents/Info.plist")"
 EXPECTED_SOURCE_DIRTY=false
 [[ -z "$INSTALL_BUILD_STATUS" ]] || EXPECTED_SOURCE_DIRTY=true
@@ -209,7 +285,6 @@ if [[ "$INSTALL_SOURCE_REVISION" != "$INSTALL_BUILD_HEAD" ]] || \
    [[ "$(cat "$TEMP_BUNDLE/Contents/Resources/VERSION_SHA")" != "$INSTALL_SOURCE_REVISION" ]] || \
    [[ "$INSTALL_SOURCE_DIRTY" != "$EXPECTED_SOURCE_DIRTY" ]]; then
     echo "[install_app.sh] ERROR: builder provenance does not match the captured source; refusing installation." >&2
-    rm -rf "$TEMP_BUNDLE"
     exit 1
 fi
 
@@ -288,29 +363,11 @@ if pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
 fi
 
 # 5. Atomic swap.
-# HOTFIX 2026-06-03: the atomic-mv rollback trap previously ran from this
-# point through EOF, which meant any failure AFTER the fresh bundle landed
-# (notably the post-install `/usr/bin/open` step on launchd-163) would restore
-# the OLD bundle — ~/Applications/ was forever stuck at the pre-cutover binary.
-# Fix: scope the trap to ONLY the 2-line gap between the two mvs. The
-# moment the new bundle is in place, clear the trap so later post-install
-# failures (launchd-163, open errors) don't undo a successful install.
-APP_OLD="${APP_DEST}.old.$$"
 if [ -d "$APP_DEST" ]; then
     mv "$APP_DEST" "$APP_OLD"
-    # Restore only if the SECOND mv (below) fails or we crash between them.
-    trap '
-        if [ -d "$APP_OLD" ] && [ ! -d "$APP_DEST" ]; then
-            echo "[install_app.sh] mid-swap failure — restoring previous bundle"
-            mv "$APP_OLD" "$APP_DEST"
-            # The running app was already quit above — relaunch the restored
-            # bundle so a mid-swap failure never leaves the app down.
-            /usr/bin/open "$APP_DEST" 2>/dev/null || true
-        fi
-    ' EXIT ERR INT TERM HUP
 fi
 mv "$TEMP_BUNDLE" "$APP_DEST"
-# Clear only the mid-swap trap. The previous bundle stays recoverable until
+# Staging is now installed. The previous bundle stays recoverable until
 # the replacement proves its authenticated runtime identity and chat readiness.
 trap - EXIT ERR INT TERM HUP
 

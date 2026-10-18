@@ -1893,7 +1893,7 @@ extension AppModel {
             try IntentRoutePlan(await SwiftNativeRouterPlanClient().planRoute(message: message))
         })
         guard didRoute else { return }
-        let traceTimeline = EngineRuntime.CapabilityTraceFeed.read(dataRoot: engine.dataRoot)
+        let traceTimeline = await EngineRuntime.CapabilityTraceFeed.read(dataRoot: engine.dataRoot)
         capabilityTraceTimeline = traceTimeline
         traces = traceTimeline.traces
     }

@@ -79,8 +79,8 @@ public enum AgentBridgeSurface {
 /// The principal behind one inbound peer request.
 ///
 /// The bridge bearer is a TRANSPORT credential shared by every route; it says
-/// the caller reached the port. The authenticated built-in Claude route binds
-/// it to Claude's contact; generic routes require a peer's scoped credential
+/// the caller reached the port. Every route of a built-in lane (`/claude/…`,
+/// `/codex/…`) binds it to that lane's contact; generic routes require a peer's scoped credential
 /// from `AgentPeerCredentials`. Explicit peer headers always bind as that peer.
 /// Authority comes from the contact's elevation in Trust Center; an unelevated
 /// caller remains on `agent-bridge`.

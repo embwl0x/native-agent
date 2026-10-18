@@ -283,10 +283,10 @@ struct EngineWorkshopSessionEffects: WorkshopSessionEffects {
         )
     }
 
-    /// The production turn: one ephemeral, read-only tool turn on the
-    /// "workshop" surface (P2-3; "missions" on 0.3.x installs).
-    /// surface. No chat session state, no transcript, her pinned model resolves
-    /// from the surface picker. The membrane governs writes.
+    /// The production turn: one ephemeral tool turn on the "workshop" surface
+    /// (P2-3; "missions" on 0.3.x installs), under User's posture like any other.
+    /// No chat session state, no transcript, her pinned model resolves from the
+    /// surface picker.
     func productionTurnExecutor(
         dataRoot: URL
     ) -> @Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String) {
@@ -295,10 +295,7 @@ struct EngineWorkshopSessionEffects: WorkshopSessionEffects {
             let response = try await LLMCallContext.$purpose.withValue("workshop") {
             try await client.runEphemeralToolTurn(
                 message: request.promptSeed,
-                fileAccess: "read_only",
-                autonomyResolver: WorkshopAutonomyResolver(
-                    base: SwiftNativeTrustCenter(dataRoot: dataRoot)
-                ),
+                fileAccess: "auto",
                 requireCompleted: true,
                 surface: WorkshopSurfaceVocabulary.canonical
             )

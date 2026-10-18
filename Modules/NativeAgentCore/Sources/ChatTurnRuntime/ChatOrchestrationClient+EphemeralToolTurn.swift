@@ -18,7 +18,6 @@ extension SwiftNativeChatOrchestrationClient {
         fileAccess: String = "read_only",
         attachments: [MultimodalAttachment] = [],
         persona: String? = nil,
-        autonomyResolver: (any AutonomyResolver)? = nil,
         providerID: String? = nil,
         serviceTierOverride: String? = nil,
         verifiedSessionId: String? = nil,
@@ -41,38 +40,9 @@ extension SwiftNativeChatOrchestrationClient {
         let attachmentInput = try Self.turnAttachmentInput(
             message: message, attachments: attachments, dataRoot: dataRoot)
         let imageBlocks = attachmentInput.imageBlocks
-        let baseContext = try await engine.buildTurnContext(
-            surface: surface,
-            userMessage: attachmentInput.userMessage,
-            personaOverride: persona,
-            imageBlocks: imageBlocks,
-            sessionID: nil
-        )
         let modelOverride = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let effortOverride = reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
-        let context = TurnContext(
-            surface: baseContext.surface,
-            personaID: baseContext.personaID,
-            personaDocs: baseContext.personaDocs,
-            personaFingerprint: baseContext.personaFingerprint,
-            recalled: baseContext.recalled,
-            modelId: modelOverride.isEmpty ? baseContext.modelId : modelOverride,
-            reasoningEffort: effortOverride.isEmpty ? baseContext.reasoningEffort : effortOverride,
-            providerId: providerID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                ? providerID
-                : baseContext.providerId,
-            // nil preserves existing callers. A captured standard tier is
-            // passed explicitly as "default", never nil/fresh-surface fallback.
-            serviceTier: serviceTierOverride ?? baseContext.serviceTier,
-            toolsAvailable: baseContext.toolsAvailable,
-            systemPrompt: baseContext.systemPrompt,
-            userMessage: baseContext.userMessage,
-            toolSchemas: baseContext.toolSchemas,
-            systemSegments: baseContext.systemSegments,
-            imageBlocks: baseContext.imageBlocks,
-            fluidContextTurn: baseContext.fluidContextTurn,
-            preparationMs: baseContext.preparationMs
-        )
+        let providerOverride = providerID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // Ephemeral/execution turns are still turns of the same resident mind.
         // Freeze and commit the existing cognitive projection once, then feed
         // that exact capsule/posture through the ordinary runtime-context seam.
@@ -84,22 +54,52 @@ extension SwiftNativeChatOrchestrationClient {
         // synthetic identity expires with the request and grants no authority
         // beyond the resolver/membrane already supplied by the caller.
         let toolSessionId = verifiedSessionId ?? projectionSessionId
-        let cognitiveProjection = await prepareCognitiveTurnProjection(
-            surface: surface,
-            userMessage: message,
-            sessionId: projectionSessionId,
-            runId: runId
-        )
-        let (contextWithCognition, pendingProjectionCommit) = await Self.contextByAppendingCognitiveCapsule(
-            to: context,
-            surface: surface,
-            userMessage: message,
-            runId: runId,
-            sessionId: projectionSessionId,
-            fileAccess: fileAccess,
-            projection: cognitiveProjection
-        )
-        let projectedContext = contextWithCognition ?? context
+        let prepare = { [self] () async throws in
+            let context = try await engine.buildTurnContext(
+                surface: surface,
+                userMessage: attachmentInput.userMessage,
+                personaOverride: persona,
+                imageBlocks: imageBlocks,
+                sessionID: nil
+            )
+            let cognitiveProjection = await prepareCognitiveTurnProjection(
+                surface: surface,
+                userMessage: message,
+                sessionId: projectionSessionId,
+                runId: runId
+            )
+            let (contextWithCognition, pendingProjectionCommit) = await Self.contextByAppendingCognitiveCapsule(
+                to: context,
+                surface: surface,
+                userMessage: message,
+                runId: runId,
+                sessionId: projectionSessionId,
+                fileAccess: fileAccess,
+                projection: cognitiveProjection
+            )
+            return (contextWithCognition ?? context, pendingProjectionCommit)
+        }
+        // A caller that supplies any part of its route has that whole route
+        // admitted once, before anything sizes against it (context, packet
+        // budget, runtime line, cognitive capsule): every supplied part kept,
+        // the rest the surface's pick. A caller that supplies none runs on the
+        // route it was called under, as it always has.
+        var route: TurnRouteAdmission?
+        if !modelOverride.isEmpty || !effortOverride.isEmpty || !providerOverride.isEmpty || serviceTierOverride != nil {
+            let surfaceRoute = try await engine.checkedRouteAdmission(for: surface, suppliedModel: modelOverride)
+            route = TurnRouteAdmission(
+                routingSurface: surfaceRoute.routingSurface,
+                modelId: modelOverride.isEmpty ? surfaceRoute.modelId : modelOverride,
+                reasoningEffort: effortOverride.isEmpty ? surfaceRoute.reasoningEffort : effortOverride,
+                providerId: providerOverride.isEmpty ? surfaceRoute.providerId : providerOverride,
+                serviceTier: serviceTierOverride ?? surfaceRoute.serviceTier
+            )
+        }
+        let (projectedContext, pendingProjectionCommit) = if let route {
+            try await withModelContext(route, surface: surface) { try await prepare() }
+        } else {
+            try await prepare()
+        }
         let requestTools = Set(projectedContext.toolSchemas.map(\.name))
         // 2026-09-18: restricted non-chat surfaces keep their narrower trust
         // source and no first-conversation exemption (Sol P0-1); default
@@ -110,10 +110,9 @@ extension SwiftNativeChatOrchestrationClient {
             approvalFiler: approvalFiler,
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
-            trust: autonomyResolver ?? trust,
             verifiedSessionId: toolSessionId,
             tracePeerTurn: true,
-            allowsFirstConversationExemption: autonomyResolver == nil
+            allowsFirstConversationExemption: true
         )
         // Temporary workers still own a real execution identity. Bind their
         // own run rather than leaving traces unknown or inheriting the parent

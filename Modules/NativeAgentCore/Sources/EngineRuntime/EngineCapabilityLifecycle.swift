@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import AppToolRuntime
 import ApprovalInbox
 import ChatOrchestration
@@ -66,10 +67,15 @@ public struct CapabilityLifecycleCommands: Sendable {
     /// sees each one as a decided row; she turns back on only what she turned
     /// off; deleting is final; built-in skills are User's.
     private func runSkill(verb: String, input: [String: JSONValue], steer: [String]) async -> VerbOutcome {
+        if input["preview"] == .bool(true), ["tool_approve", "tool_restore"].contains(verb) {
+            let fullMac = await AppToolExecutor.freshQuietPosture(dataRoot: dataRoot)?.name == AppToolExecutor.fullMacModeName
+            do { try CapabilityLifecycle.requireKeep(ownerAuthorized: fullMac || PeerDataTaint.ownerAuthorized) }
+            catch { return VerbOutcome(false, error.localizedDescription, ["reason": .string("owners_call")]) }
+        }
         if verb.hasPrefix("tool_") { return await manageAuthoredTool(verb: verb, input: input, steer: steer) }
+        let fullMac = await AppToolExecutor.freshQuietPosture(dataRoot: dataRoot)?.name == AppToolExecutor.fullMacModeName
         let name = AppToolExecutor.inputString(input["name"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let root = dataRoot
-        let fullMac = await AppToolExecutor.freshQuietPosture(dataRoot: root)?.name == AppToolExecutor.fullMacModeName
         // The door's preview (enable, restore, rollback): the same checks, nothing written, no card.
         let preview = input["preview"] == .bool(true)
         // Only the transport's verified caller can carry User's authority;
@@ -133,7 +139,17 @@ public struct CapabilityLifecycleCommands: Sendable {
         do { tools = try await self.tools.listAuthored() } catch {
             return VerbOutcome(false, "The tool registry didn't read (\(error.localizedDescription))." + Self.retry, [:])
         }
-        let matchedID = InstalledSkillInventory.match(raw, in: tools.map { $0.toJSON() })?.id
+        // For an approval, the one verb that pins a candidate: its digest, or a prefix of 8 or more
+        // hex characters only it has (git's short id), names its tool, and only that candidate publishes.
+        let digests = verb != "tool_approve" || raw.count < 8 || !raw.allSatisfy(\.isHexDigit) ? [] : tools.filter { $0.candidateDigest?.hasPrefix(raw.lowercased()) == true }
+        let named = InstalledSkillInventory.match(raw, in: tools.map { $0.toJSON() })?.id
+        let byDigest = digests.count == 1 ? digests[0] : nil
+        if let named, let byDigest, byDigest.id != named {
+            return VerbOutcome(false, "\(raw) names the tool \(named) and begins \(byDigest.id)'s candidate digest. "
+                + "Pass the full tool_id or the full digest; nothing was done.", [:])
+        }
+        let digest = byDigest?.candidateDigest
+        let matchedID = named ?? byDigest?.id
         if verb == "tool_reject", !raw.isEmpty {
             let id = matchedID ?? raw
             let fields: [String: JSONValue] = ["tool_id": .string(id), "name": .string(id)]
@@ -149,7 +165,8 @@ public struct CapabilityLifecycleCommands: Sendable {
             return VerbOutcome(false, "No tool you wrote has id or name \(raw.isEmpty ? "(none passed)" : raw). Pass tool_id as one of these.",
                     ["tools": .array(tools.map { .object(["id": .string($0.id), "name": .string($0.name), "status": .string($0.status)]) })])
         }
-        let fields: [String: JSONValue] = ["tool_id": .string(tool.id), "name": .string(tool.name)]
+        var fields: [String: JSONValue] = ["tool_id": .string(tool.id), "name": .string(tool.name)]
+        if let digest { fields["candidate_digest"] = .string(digest) }
         if verb == "tool_drop" {
             do {
                 let changed = try await ToolRegistryActions.drop(id: tool.id, dataRoot: dataRoot, preview: preview, ownerAuthorized: PeerDataTaint.ownerAuthorized)
@@ -187,11 +204,13 @@ public struct CapabilityLifecycleCommands: Sendable {
                     fields.merging(["would_status": .string("active")]) { $1 })
             }
             do {
-                let updated = try await self.tools.promote(id: tool.id, allowRisky: true)
+                let updated = try await self.tools.promote(id: tool.id, allowRisky: true, digest: digest)
                 guard try await self.tools.listAuthored().first(where: { $0.id == updated.id })?.status == "active" else {
                     return VerbOutcome(false, "Tool activation could not be confirmed after reloading the registry." + Self.retry, fields,
                         toolStatus: .init(message: "Tool activation could not be confirmed after reloading the registry.", succeeded: false))
                 }
+            } catch let error as NSError where error.domain == "CapabilityLifecycle" {
+                return VerbOutcome(false, error.localizedDescription, fields.merging(["reason": .string("owners_call")]) { $1 })
             } catch {
                 let message = formatFailure(error, "turn that tool on")
                 return VerbOutcome(false, Self.forAgent(message, error) + Self.retry, fields,
@@ -271,7 +290,8 @@ public struct CapabilityLifecycleCommands: Sendable {
     /// Her authoring surface: the tool filed as a proposal on the Tools page,
     /// validated, waiting for Approve; once active it is `authored.<tool_id>`.
     private func proposeAuthoredTool(_ input: [String: JSONValue], steer: [String]) async -> VerbOutcome {
-        let id = AppToolExecutor.inputString(input["tool_id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let given = AppToolExecutor.inputString(input["tool_id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let id = SwiftNativeToolExecution.toolID(given)
         let fields: [String: JSONValue] = ["tool_id": .string(id)]
         guard SwiftToolDispatcher.isAuthorableToolName(id) else {
             return VerbOutcome(false, "\(id) is a built-in tool's name. Pick another tool_id; nothing was filed.", fields)
@@ -286,19 +306,29 @@ public struct CapabilityLifecycleCommands: Sendable {
         let result: ProposalValidationResult
         do {
             result = try await SwiftNativeToolExecution(root: dataRoot).propose(
-                id: id, description: AppToolExecutor.inputString(input["description"]) ?? "",
+                id: given, description: AppToolExecutor.inputString(input["description"]) ?? "",
                 code: AppToolExecutor.inputString(input["code"]) ?? "", tests: tests,
                 permissions: SwiftNativeToolExecution.declaredStrings(input["permissions"], name: "permissions"),
                 inputSchema: input["input_schema"],
                 actions: SwiftNativeToolExecution.declaredStrings(input["actions"], name: "actions"),
                 origin: .object(["steer": .array(steer.map(JSONValue.string))]),
-                capture: input["capture"] == .bool(true), input: input["input"], converts: input["converts"])
+                capture: input["capture"] == .bool(true), input: input["input"], converts: input["converts"],
+                header: input.filter { AbilityStore.partKeys.contains($0.key) })
         } catch {
-            return VerbOutcome(false, "\(id) was not filed: \(error.localizedDescription).", fields)
+            // Thrown before staging, nothing was written; thrown after it, the
+            // call says so itself, with the candidate it filed.
+            if case .stagedButFailed(let digest, let committed, let why)? = error as? ToolExecutionError {
+                return VerbOutcome(false, committed
+                    ? "\(id) is filed as a candidate on the Tools page but its validation did not complete: \(why). Fix it and tool.propose again."
+                    : "\(id)'s candidate write did not complete, so it may or may not be on file: \(why). Read the Tools page, then tool.propose again.",
+                    fields.merging(["effects": .string(committed ? "occurred" : "unknown"), "candidate_digest": .string(digest)]) { $1 })
+            }
+            return VerbOutcome(false, "\(id) was not filed: \(error.localizedDescription).", fields.merging(["effects": .string("none")]) { $1 })
         }
-        let filed = fields.merging(["validation_errors": .array(result.errors.map(JSONValue.string)),
+        var filed = fields.merging(["validation_errors": .array(result.errors.map(JSONValue.string)),
                                    "capture": result.capture.map(JSONValue.string) ?? .null,
                                    "candidate_digest": result.candidateDigest.map(JSONValue.string) ?? .null]) { $1 }
+        if let used = result.respelled { filed["argument_notes"] = .array([.string("Used tool_id \(used), the id rule's spelling of \(given).")]) }
         guard result.valid else {
             return VerbOutcome(false, "\(id) is filed on the Tools page but failed validation: \(result.errors.joined(separator: "; ")). "
                 + "Fix it and tool.propose again.", filed)

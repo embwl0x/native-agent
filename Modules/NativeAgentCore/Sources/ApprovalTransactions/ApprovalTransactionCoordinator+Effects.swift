@@ -73,6 +73,13 @@ public extension ApprovalTransactionCoordinator {
         let provenance = ApprovalResolutionProvenance.local(
             decidedBy: PersonaCompiler.agentDisplayName(dataRoot: PersistenceCore.defaultDataRoot()))
         if approve {
+            // A step that cannot be undone on his side waits for his tap even
+            // under Full Mac (User, 10-17); her approve never stands in for his.
+            let staged = try await stagedWorkshopStep(executionId: id, stepId: execution.currentStepId)
+            if PermissionLaw.humanDecides(action: staged.action, payload: staged.payload) {
+                return .object(["status": .string("owners_call"), "id": .string(id), "step_id": .string(execution.currentStepId),
+                    "detail": .string("That step would run something that cannot be undone on the person's side, so its card waits for their tap even under Full Mac. Nothing was approved; leave it for them, or deny it.")])
+            }
             let record = try await resolveWorkshopStep(
                 executionId: id, stepId: execution.currentStepId, decision: "approve", provenance: provenance, runner: runner())
             return .object(["status": .string("approved"), "id": .string(id), "step_id": .string(execution.currentStepId),
@@ -94,11 +101,24 @@ public extension ApprovalTransactionCoordinator {
         provenance: ApprovalResolutionProvenance = .local(decidedBy: "mac_ui"),
         runner: SwiftNativeWorkshopRunner
     ) async throws -> WorkshopExecution.WorkshopExecutionRecord {
-        let root = dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
         guard try await runner.getWorkshopExecution(executionId) != nil else {
             throw effects.workshopStepNotFound("workshop execution \(executionId)")
         }
-        let inbox = SwiftNativeApprovalInbox(root: root)
+        let staged = try await stagedWorkshopStep(executionId: executionId, stepId: stepId)
+        _ = try await resolveApproval(
+            id: staged.id,
+            decision: decision,
+            provenance: provenance
+        )
+        guard let record = try await runner.getWorkshopExecution(executionId) else {
+            throw effects.workshopStepNotFound("workshop execution \(executionId)")
+        }
+        return record
+    }
+
+    /// The pending card staged for exactly this step.
+    func stagedWorkshopStep(executionId: String, stepId: String) async throws -> ApprovalRecord {
+        let inbox = SwiftNativeApprovalInbox(root: dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot())
         try await inbox.mergeLegacyApprovalRows()
         let pending = try await inbox.list(filter: ApprovalFilter(status: "pending"))
         guard let staged = pending.first(where: { record in
@@ -117,14 +137,6 @@ public extension ApprovalTransactionCoordinator {
                     + "\(executionId)/\(stepId)"
             )
         }
-        _ = try await resolveApproval(
-            id: staged.id,
-            decision: decision,
-            provenance: provenance
-        )
-        guard let record = try await runner.getWorkshopExecution(executionId) else {
-            throw effects.workshopStepNotFound("workshop execution \(executionId)")
-        }
-        return record
+        return staged
     }
 }

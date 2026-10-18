@@ -1,20 +1,15 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
-import os
 
 /// Primitive effects retain the authored envelope and the turn's ordinary gates.
 public enum AuthoredToolEffects {
     @TaskLocal public static var admissionOnly = false
-    @TaskLocal public static var approvedCall: (tool: String, input: [String: JSONValue])?
+    @TaskLocal public static var call: (tool: String, perform: @Sendable () async throws -> JSONValue)?
 
     public static let primitiveCapabilities: [String: Set<String>] = [
-        "files.list": ["safe_read", "filesystem_read"], "files.count": ["safe_read", "filesystem_read"],
-        "files.read": ["safe_read", "filesystem_read"], "files.info": ["safe_read", "filesystem_read"],
-        "files.write": ["filesystem_write"], "files.mkdir": ["filesystem_write"],
-        "files.copy": ["filesystem_write"], "files.move": ["filesystem_write"],
-        "files.remove": ["filesystem_delete", "destructive"],
         "network.receive": ["safe_read", "network_read"],
         "network.connect": ["network_write"], "network.listen": ["network_write"],
         "network.accept": ["network_write"], "network.close": ["network_write"],
@@ -27,62 +22,20 @@ public enum AuthoredToolEffects {
             && [.string("getd"), .string("cnte"), .string("doex")].contains(args["event_id"] ?? .null))
     }
 
-    public static func primitiveEffects(_ operation: String, arguments: JSONValue?) -> Set<String> {
+    public static func primitiveEffect(_ operation: String, arguments: JSONValue?) -> (tool: String, capabilities: Set<String>) {
+        let args: [String: JSONValue] = if case .object(let fields)? = arguments { fields } else { [:] }
         if operation == "apps.call", case .object(let args)? = arguments, appReadOnly(args) {
-            return ["safe_read", "applescript"]
+            return (operation, ["safe_read", "applescript"])
         }
-        return primitiveCapabilities[operation] ?? ["destructive"]
-    }
-}
-
-/// Registry flags supplied by the app door, without a dependency on its executor.
-public struct AppActionPolicy: Sendable {
-    public let isHis: Bool
-    public let irreversible: Bool
-    public let read: Bool
-    public let readWhen: [String: JSONValue]
-    public let secretArgs: [String]
-    public let lifecycle: CapabilityLifecycle.Action?
-
-    public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
-                lifecycle: CapabilityLifecycle.Action? = nil) {
-        self.isHis = isHis; self.irreversible = irreversible; self.read = read
-        self.secretArgs = secretArgs; self.readWhen = readWhen
-        self.lifecycle = lifecycle
-    }
-
-    public func readOnly(args: [String: JSONValue]) -> Bool {
-        read || (!readWhen.isEmpty && readWhen.allSatisfy { (args[$0.key] ?? .null) == $0.value })
-    }
-
-    // Installed from AppActions at executor assembly, before any app call or
-    // receipt. No static initializer here reaches back into the app schemas.
-    private static let registry = OSAllocatedUnfairLock<[String: AppActionPolicy]>(initialState: [:])
-
-    public static func register(_ actions: [String: AppActionPolicy]) {
-        registry.withLock { $0 = actions }
-    }
-
-    public static func action(tool: String = "app", input: [String: JSONValue]) -> AppActionPolicy? {
-        let id: String
-        if tool == "app", case .string(let action)? = input["action"] { id = action }
-        else if let action = ToolNameAliases.appAction(tool, input: input) { id = action }
-        else { return nil }
-        guard let policy = registry.withLock({ $0[id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] }) else {
-            return tool == "app" && ToolNameAliases.appFindQuery(input) != nil
-                ? AppActionPolicy(isHis: false, irreversible: false, read: true, secretArgs: []) : nil
+        if operation == "fetch" || operation.hasPrefix("fetch.") {
+            let read = args["method"] == nil || arguments?.stringFields["method"]?.uppercased() == "GET"
+            let connector = operation == "fetch" ? arguments?.stringFields["connector"]
+                : operation == "fetch.keyless" ? nil : String(operation.dropFirst("fetch.".count))
+            let capability = connector.map { "connector_\(read ? "read" : "write"):\($0)" } ?? "network_public"
+            return ("fetch." + (connector ?? "keyless"), read
+                ? [capability, "safe_read", "network_read"] : [capability, "network_write", "external_send"])
         }
-        let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
-        return AppActionPolicy(isHis: policy.isHis, irreversible: policy.irreversible,
-                               read: policy.readOnly(args: args), secretArgs: policy.secretArgs, readWhen: policy.readWhen,
-                               lifecycle: policy.lifecycle)
-    }
-
-    /// Whether the table is installed yet: before assembly nothing is known.
-    public static var isRegistered: Bool { registry.withLock { !$0.isEmpty } }
-
-    static var secretActionIDs: [String] {
-        registry.withLock { $0.compactMap { $0.value.secretArgs.isEmpty ? nil : $0.key } }
+        return (operation, primitiveCapabilities[operation] ?? ["destructive"])
     }
 }
 
@@ -134,262 +87,6 @@ extension SwiftNativeSecurityCenter {
         "slack.post_message",
         "slack_post_message",
     ]
-    static let builtinToolNames: Set<String> = [
-        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
-        "recall_memory",
-        // commit_memory (2026-06-11): Agent's memory WRITE path, restored
-        // after the Python→Swift chat cutover dropped it. Built-in, low risk —
-        // a persona-internal long-term memory write, NOT a Mac filesystem op
-        // and NOT a shell/process spawn. Mirrors recall_memory's profiling.
-        // (Note: "commit" trips no keyword catcher below, so without this
-        // registration it would route through the unsigned path; the explicit
-        // memory_write tag branch in profile() pins the capability shape.)
-        "commit_memory",
-        // The moments lane (2026-09-02). memory_moments_pending is a pure
-        // read of her own proposal queue; memory_moment_review promotes or
-        // drops one row in her own MemoryV2 store. Registered explicitly so
-        // evaluateTool routes both through the built-in path and the pinned
-        // branches below decide their shape — "review"/"pending" trip no
-        // keyword catcher, so without this they would resolve to
-        // {tool_call}/.low with rollbackRequired false.
-        "memory_moments_pending", "memory_moment_review",
-        // User, 2026-09-05: the agent's own-store curation: two writes to her
-        // own store.
-        "forget_memory", "rebuild_knowledge_graph",
-        // Agent, 2026-09-06: read_chat_message reads one already-persisted
-        // transcript row. Registered explicitly so evaluateTool routes it
-        // through the built-in path — "read"/"message" would otherwise land it
-        // on the keyword classifier rather than the plain-local-read shape
-        // search_chat_history already has.
-        "read_chat_message", "workspace", "work_context", "artifact_find",
-        // workshop_submit / workshop_status (2026-06-11, U5 W-I): Agent's execution
-        // chat lane. workshop_submit is a medium-risk write (a thin shim into
-        // the execution queue; the executor's own gates apply downstream),
-        // workshop_status is a low-risk read. Neither spawns a Process. Register
-        // explicitly so SecurityCenter.evaluateTool routes them through the
-        // built-in path and the dedicated profile branches pin their shapes —
-        // "submit" trips no keyword catcher, and "status" would otherwise only
-        // get safe_read.
-        "workshop_submit",
-        "workshop_status",
-        // task_ledger_post / task_ledger_list (2026-06-11, U6): the cross-agent
-        // task ledger chat lane. task_ledger_post is a medium-risk WRITE (an
-        // append to <dataRoot>/orchestration/task_ledger.jsonl — NOT a Mac
-        // filesystem op and NOT a process spawn), task_ledger_list is a
-        // low-risk read. "post"/"list" trip no keyword catcher, so register
-        // explicitly and pin the shapes via the dedicated profile branches.
-        "task_ledger_post",
-        "task_ledger_list",
-        // delegation_status (2026-08-11, W2): read-only projection over the
-        // claude/codex wake-job records under ~/.config. No write, no process
-        // spawn, no network — but "status" would otherwise only pick up the
-        // generic safe_read keyword catcher via the unsigned path, so register
-        // it explicitly and pin the shape in the dedicated branch below.
-        "delegation_status",
-        // agent-desk chat lane: desk_read is a low-risk read; the nine
-        // mutations are medium ledger-class writes into <dataRoot>/desk/ — NOT
-        // a Mac filesystem op and NOT a process spawn. Register explicitly so
-        // evaluateTool routes them through the built-in path and the dedicated
-        // profile branches pin their shapes (otherwise "status"/"note"/"close"
-        // mis-classify via the keyword catchers below).
-        "desk_read", "desk_add_item", "desk_set_status", "desk_update_item",
-        "desk_note", "desk_add_ref", "desk_set_cadence", "desk_set_notify",
-        "desk_close", "desk_archive",
-        "desk_blocked_on", "desk_defer", "desk_breakdown",
-        // desk_nag_control: writes User's nag preferences to
-        // <dataRoot>/desk/nag_config.json. Same medium ledger-class write —
-        // "control" trips no keyword catcher, so register it explicitly.
-        "desk_nag_control",
-        // desk_open_pursuit / desk_work_log: registered at the other four
-        // sites since the pursuit lane shipped, missing HERE — so `desk_` fell
-        // through to no keyword catcher, resolved to {tool_call}/.low, and
-        // `rollbackRequired` was false for the only chat path that opens an
-        // origin=agent pursuit. Found 2026-08-02; DeskToolRegistrationTests
-        // now set-diffs all five sites so a 4-of-5 registration fails the
-        // build instead of waiting for an audit.
-        "desk_open_pursuit", "desk_work_log",
-        // studio chat lane (desk 903): the agent's aesthetic journal and the
-        // consults filed against it. studio_consult / studio_journal are medium
-        // ledger-class WRITES under <dataRoot>/studio/ — a local file write, NOT
-        // a Mac filesystem op, NOT a process spawn, and with no third-party side
-        // effect of any kind. studio_consult_read / studio_recall are pure local
-        // reads. Registered explicitly because "consult"/"journal" trip NO
-        // keyword catcher below (they would resolve to {tool_call}/.low with
-        // rollbackRequired false — the 4-of-5 failure the desk lane already
-        // shipped once), and because "read"/"recall" would otherwise give the
-        // two reads only the generic safe_read catcher via the unsigned path.
-        // Checked against every sieve below: none of the four names contains
-        // send/post/message/reply/tweet, so external_send does NOT misfire and
-        // they must NOT be added to notificationToolNames (that set is a
-        // carve-out FROM external_send; adding a tool that never trips it would
-        // instead ADD the external_send capability at medium risk).
-        "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
-        // studio_journal_amend (0.4.14): the same medium ledger-class write as
-        // studio_journal — one appended correction record under
-        // <dataRoot>/studio/. Registered explicitly for the same reason as its
-        // siblings: "amend" trips no keyword catcher below, and the `_journal`
-        // substring is not what classifies it.
-        "studio_journal_amend",
-        "studio_shelf_read", "studio_shelf_set",
-        // dream_diary_read (0.4.14): a pure local read of <dataRoot>/dream_diary/
-        // — the same safe_read/.low class as studio_recall. Registered
-        // explicitly because "diary"/"read" would otherwise give it only the
-        // generic safe_read catcher via the unsigned path, and it contains no
-        // send/post/message substring, so external_send does not misfire.
-        "dream_diary_read",
-        "remote_node_list",
-        "remote_node_execute",
-        // Both names dispatch to the same built-in transcript reader. Keeping
-        // the canonical name registered here prevents it from looking like an
-        // unsigned dynamic tool while the compatibility alias looks built-in.
-        "search_chat_history",
-        "session_search",
-        "search_kg",
-        "recent_trace_summary",
-        "tool_result_page",
-        "scratchpad_read",
-        "scratchpad_write",
-        "list_skills",
-        // Canonical app-data skill mutation. The skill body may guide future
-        // behavior but cannot modify tools, policy, approvals, or authority.
-        "save_skill",
-        "list_dir",
-        "read_file",
-        "read_page",
-        "maps_route",
-        "maps_search",
-        "write_file",
-        "mail_save_attachment",
-        "mac_screenshot_save",
-        // gpt-5.5 review-2 NEEDS_FIX: native file operations the policy
-        // preview surfaces (file_move/file_trash → these names). Without
-        // registration here SecurityCenter.evaluateTool routed them through
-        // the unsigned-high-risk path even though they're built-in Mac
-        // file actions.
-        "move_file",
-        "copy_file",
-        "trash_file",
-        "persona_read",
-        "persona_write",
-        "persona_append_section",
-        "full_mac_read_file",
-        "full_mac_list_dir",
-        // ClaudeBridge return channel (2026-06-08): Agent→Claude
-        // message tool. Pure file write to ~/.config/claude-bridge/,
-        // no external side effect. Built-in, signed by inclusion here.
-        "claude_message",
-        // Codex bridge return channel (2026-06-08/15): Agent→Codex async
-        // note. Local inbox write to ~/.config/codex-agent-bridge/ plus a
-        // best-effort local Mac notification when the app bridge is wired.
-        "codex_message",
-        "omp_message",
-        // AgentMail chat lane: list/read are external reads; send only stages a
-        // bounded replay request for the shared approval executor.
-        "agentmail_list",
-        "agentmail_read",
-        "agentmail_send",
-        // Codex/OpenAI image generation: app-owned spend path that writes
-        // generated files only under NativeAgent data/generated_images.
-        "image_generate",
-        "slack_status",
-        "google_calendar_calendars", "google_calendar_list", "google_calendar_status", "google_calendar_free_busy", "google_calendar_read", "google_calendar_send_invitations",
-        "slack_list_channels",
-        "slack_search_messages",
-        "slack_post_message",
-        // time_now (2026-06-08): zero-input, zero-side-effect clock
-        // read. Caught missing when Agent called it mid-test and got
-        // "not in the dispatch table." Safe to mark built-in.
-        "time_now",
-        // Codex bridge real-time invocation (2026-06-08): Agent spawns
-        // `codex exec` as a bounded subprocess. Default sandbox is
-        // workspace-write and every run audits to data/from_codex/<uuid>.json.
-        "invoke_codex",
-        // agent-builder-tools (2026-06-08): apply_patch and the
-        // fixed-argv SwiftPM builders are Process-based builder tools.
-        // shell/bash/git get critical risk via the `shell` / `exec` keyword
-        // catcher below (lower.contains("shell")) — the others don't trip any
-        // keyword, so we register them explicitly here so
-        // SecurityCenter.evaluateTool routes them through the built-in path.
-        // Their high-risk classification is enforced by the autonomy gate
-        // (default `confirm` in policy.json).
-        "apply_patch",
-        "swift_build",
-        "swift_test",
-        // gpt-5.5 review fix (2026-06-08): explicit registration of the
-        // shell-class trio so SecurityCenter.evaluateTool routes them via
-        // the built-in path (otherwise `git` alone doesn't trip the shell/
-        // exec keyword catcher and lands in the unsigned-high-risk lane).
-        "shell",
-        "bash",
-        "git",
-        // App lifecycle tools: restart_app relaunches the installed bundle;
-        // install_app schedules the canonical rebuild/sign/install script.
-        // No keyword classifier below catches "restart", and "install" alone
-        // would undersell the process-spawn/system-control shape.
-        "restart_app", "install_app",
-        // Visible Browser app tools. They are app-owned WKWebView actions
-        // run by the app's executor (AppToolExecutor); register them so the security
-        // evaluator treats them as signed NativeAgent built-ins rather than
-        // unknown tool names.
-        "browser.status",
-        "browser.open_url",
-        "browser.navigate",
-        "browser.read_text",
-        "browser.read_links",
-        "browser.screenshot",
-        "browser.chrome_setup",
-        "browser.chrome_status",
-        "browser.chrome_reload_extension",
-        "browser.chrome_close_tab",
-        "browser.chrome_navigate",
-        "browser.chrome_snapshot",
-        "browser.chrome_click",
-        "browser.chrome_fill",
-        "browser.chrome_type",
-        "browser.chrome_select",
-        "browser.chrome_keypress",
-        "browser.chrome_set_checked",
-        "browser.chrome_double_click",
-        "browser.chrome_wait",
-        "browser.chrome_scroll",
-        // The one app door: reads, and actions classified by action id.
-        "app",
-    ]
-    static let builtinToolPrefixes: [String] = [
-        "browser.",
-        "mac.",
-        "memory.",
-        "local_files.",
-        "calendar.",
-        "gmail.",
-        "agentmail.",
-        "email.",
-        "x.",
-        "slack.",
-        "tool_",
-        "list_",
-        "search_",
-        "read_",
-        "get_",
-        "persona_",
-        "market.",
-        "market_",
-        // Mac integration chat tools are NativeAgent-builtins with underscore
-        // names (e.g. mail_send, messages_send). The actual side-effect gate
-        // remains MacIntegrationPermissionStore + autonomy/approval below; this
-        // registration only prevents built-ins from looking like unknown
-        // unsigned high-risk tools when their names contain send/delete/create.
-        "contacts_",
-        "mail_",
-        "messages_",
-        "notes_",
-        "music_",
-        "mac_calendar_",
-        "mac_reminders_",
-        "mac_spotlight_",
-        "scheduler_",
-    ]
-
     static let slackReadToolNames: Set<String> = [
         "slack.status",
         "slack.list_channels",
@@ -448,54 +145,18 @@ extension SwiftNativeSecurityCenter {
         "layout.write": ("app_data_write", .medium),
     ]
 
-    /// The retired tool each app door action was, by id or by its first
-    /// word. The tools are gone; their names stay as Trust keys, so a level
-    /// User saved on one still binds the action (`resolveAutonomyLevel`, the
-    /// stricter of the two, and `doorSavedBlock` for a block).
-    static let appActionOldTools: [String: String] = [
-        "inbox": "inbox", "provider": "provider", "connector": "connections", "telegram": "connections",
-        "mcp": "connections", "mind": "mind_run", "skill": "skill_manage", "tool": "skill_manage",
-        "desk.deny": "workshop_reject", "doctor.repair": "doctor_status", "doctor.support_report": "upkeep",
-        "export": "upkeep", "backup": "upkeep", "embeddings": "upkeep", "memory": "upkeep",
-        "chat": "chat_session", "chat.draft": "interaction_act", "chat.send": "interaction_act",
-        "chat.model": "interaction_act", "chat.think": "interaction_act", "chat.fast": "interaction_act",
-        "chat.open_card": "interaction_act", "chat.close_card": "interaction_act", "chat.speak": "interaction_act",
-        "chat.scratch": "interaction_act", "page.show": "interaction_act", "browser.show": "interaction_act", "pane": "interaction_act",
-        "persona.set": "interaction_act", "app.check_updates": "interaction_act",
-        "setting.set": "app_setting_set", "page.screenshot": "app_page_screenshot", "card": "interaction_act",
-        "chat.list": "chat_conversations",
-        "memory.list": "list_memories", "memory.rewrite": "rewrite_memory", "memory.pin": "rewrite_memory",
-        "agent.recipe": "agent_contacts", "agent.recipe_write": "agent_connect", "agent.verify": "agent_message",
-        "layout.read": "app_page_read", "layout.write": "app_setting_set",
-    ]
-
-    static func appActionOldTool(_ input: [String: JSONValue]) -> String? {
-        guard case .string(let raw)? = input["action"] else { return nil }
-        let id = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // A folded tool's own call carries its level: it re-enters under its name.
-        guard !ToolNameAliases.isFoldedAction(id) else { return nil }
-        return appActionOldTools[id] ?? id.split(separator: ".").first.flatMap { appActionOldTools[String($0)] }
-    }
-
     static func profile(
         tool: String,
         input: [String: JSONValue],
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
     ) -> ToolProfile {
-        if case .object(let primitive)? = input["__authored_primitive"],
-           case .string(let operation)? = primitive["operation"] {
-            var authored = input
-            authored.removeValue(forKey: "__authored_primitive")
-            var result = profile(tool: tool, input: authored, dataRoot: dataRoot, trustedWorkspaceRoots: trustedWorkspaceRoots)
-            let effects = AuthoredToolEffects.primitiveEffects(operation, arguments: primitive["arguments"])
-            if operation == "apps.call", effects.contains("safe_read") {
-                // The enclosing tool is already admitted; this event's tier is a read.
-                return ToolProfile(capabilities: effects.union(["tool_call"]), risk: .low)
-            }
-            result.capabilities.formUnion(effects)
-            result.risk = max(result.risk, effects.contains("destructive") || effects.contains("system_control") ? .critical : effects.contains("safe_read") ? .low : .high)
-            return result
+        if AuthoredToolEffects.primitiveCapabilities[tool] != nil || tool.hasPrefix("fetch.") {
+            let effects = AuthoredToolEffects.primitiveEffect(tool, arguments: .object(input)).capabilities
+            return ToolProfile(capabilities: effects.union(["tool_call"]), risk:
+                effects.contains("destructive") || effects.contains("system_control") ? .critical
+                    : effects.contains("safe_read") ? .low
+                        : effects.contains("network_write") || effects.contains("external_send") ? .high : .medium)
         }
         // These mutate the same app-owned jobs as create. In particular,
         // delete is cancellation, not a filesystem-delete capability.
@@ -647,7 +308,7 @@ extension SwiftNativeSecurityCenter {
         // key, a connector token — stands behind a second, checked Full Mac
         // read taken immediately before the write (AppToolExecutor+InteractionAct).
         if tool == "app" {
-            let appAction = AppActionPolicy.action(input: input)
+            let appAction = AppActionBinding.action(input: input)
             let action = string(input["action"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
             let named = ["action", "script"].contains { key in
                 if case .string(let text)? = input[key] { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -657,7 +318,7 @@ extension SwiftNativeSecurityCenter {
             let acts = named && input["preview"] != .bool(true)
             // A folded tool's action only passes the call on: it re-enters
             // under the tool's own name and is judged there, card and all.
-            if acts, appAction?.read == true || ToolNameAliases.isFoldedAction(action) {
+            if acts, appAction?.read == true || appAction?.folded == true {
                 add("safe_read", .low)
             } else if acts, let mapped = appActionCapabilities[action] {
                 add(mapped.capability, mapped.risk)
@@ -759,6 +420,15 @@ extension SwiftNativeSecurityCenter {
 
         if ["trash_file", "move_file", "copy_file"].contains(tool) {
             add("filesystem_write", .medium)
+            if capabilityWritesOutsideAppData(input: input, dataRoot: dataRoot, trustedWorkspaceRoots: trustedWorkspaceRoots) {
+                add("outside_app_data_write", .high)
+            }
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if AppActionBinding.authorableToolName(tool),
+           let file = try? AbilityStore(dataRoot: dataRoot).read(id: tool), file.kind == .tool {
+            // Running the sandbox has no effect; its host calls carry the actual capabilities.
+            add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         let lower = tool.lowercased()
@@ -788,15 +458,6 @@ extension SwiftNativeSecurityCenter {
                 // artifacts, snapshot files, etc.).
                 add("destructive", .high)
             }
-        }
-        // Keep the effect classifier outside the builder-name membership so
-        // catalog aliases (`mac.shell` / `mac_shell`) receive the same floor.
-        if commandMutatesSystemPermissionAuthority(tool: tool, input: input) {
-            add("system_permission_reset", .critical)
-            add("destructive", .critical)
-        }
-        if commandDeletes(tool: tool, input: input) {
-            add("destructive", .critical)
         }
         if tool == "invoke_codex" {
             add("process_spawn", .high)
@@ -996,7 +657,7 @@ extension SwiftNativeSecurityCenter {
             || lower.contains("keychain") {
             add("secrets", .high)
         }
-        if lower.contains("read") || lower.contains("list") || lower.contains("search")
+        if tool == "file_info" || lower.contains("read") || lower.contains("list") || lower.contains("search")
             || lower.contains("recall") || lower.contains("status") || lower.contains("get") {
             capabilities.insert("safe_read")
         }
@@ -1039,67 +700,15 @@ extension SwiftNativeSecurityCenter {
         return transport == "acp" ? launch.acp != nil : launch.commandLine != nil
     }
 
-    /// Pure effect classifier for commands that mutate the host permission
-    /// authority. This is deliberately not an LLM instruction or word-choice
-    /// constraint: the Trust boundary evaluates the exact tool arguments at
-    /// effect time. It catches the supported `tccutil reset` path plus direct
-    /// mutation attempts against TCC.db. False positives only request a human
-    /// confirmation; false negatives would let an agent silently revoke its
-    /// own capabilities.
-    static func commandMutatesSystemPermissionAuthority(
-        tool: String,
-        input: [String: JSONValue]
-    ) -> Bool {
-        let normalizedTool = tool.lowercased()
-        guard ["shell", "bash", "mac.shell", "mac_shell"].contains(normalizedTool) else {
-            return false
-        }
-        let command = string(input["cmd"])
-            ?? string(input["command"])
-            ?? ""
-        let lower = command.lowercased()
-        if lower.contains("tccutil"),
-           lower.range(of: #"\breset\b"#, options: .regularExpression) != nil {
-            return true
-        }
-        guard lower.contains("tcc.db") else { return false }
-
-        // Reading the TCC database is diagnostic evidence, not a permission
-        // change. In particular, `sqlite3 ...TCC.db "SELECT ..."` must stay
-        // autonomous under Full Mac. Require an actual mutating SQL or file
-        // operation instead of treating the mere presence of `sqlite3` as a
-        // write. Word boundaries avoid accidental matches inside paths/text.
-        let mutationPattern = #"\b(delete|update|insert|replace|drop|alter|create|vacuum|reindex|rm|mv|cp|truncate|chmod|chown|dd)\b"#
-        return lower.range(of: mutationPattern, options: .regularExpression) != nil
-    }
-
-    /// A shell or git call whose text deletes or rewrites history: rm, trash,
-    /// find -delete, git clean, reset --hard, push --force. Read from the
-    /// command so the peer floor sees it; a shell is otherwise just `shell`.
-    static func commandDeletes(tool: String, input: [String: JSONValue]) -> Bool {
-        let normalizedTool = tool.lowercased()
-        let text: String
-        if ["shell", "bash", "mac.shell", "mac_shell"].contains(normalizedTool) {
-            text = string(input["cmd"]) ?? string(input["command"]) ?? ""
-        } else if normalizedTool == "git" {
-            if case .array(let args)? = input["args"] {
-                text = "git " + args.compactMap { string($0) }.joined(separator: " ")
-            } else {
-                text = "git " + (string(input["args"]) ?? "")
-            }
-        } else {
-            return false
-        }
-        let pattern = #"\b(rm|rmdir|unlink|shred|srm|trash)\b|\s-delete\b|\bgit\s+(.*\s)?clean\b|\breset\s+(.*\s)?--hard\b|\bpush\b.*(\s--force|\s-f\b)"#
-        return text.lowercased().range(of: pattern, options: .regularExpression) != nil
-    }
+    /// The tools that run a command line; what one reaches is not known.
+    static let commandLineTools: Set<String> = ["shell", "bash", "mac.shell", "mac_shell", "git"]
 
     /// The name a policy entry, profile and receipt are keyed on. Spellings
     /// resolve through the one alias table (`ToolNameAliases`); what is left
     /// here is not aliasing: a chat tool that fronts a connector action is
     /// judged as that action (`x_search` performs `x.search_recent`), and no
     /// such action id is ever dispatched as a tool.
-    static func policyToolName(_ raw: String) -> String {
+    package static func policyToolName(_ raw: String) -> String {
         let tool = ToolNameAliases.canonical(raw).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return connectorActionIDs[tool] ?? tool
     }

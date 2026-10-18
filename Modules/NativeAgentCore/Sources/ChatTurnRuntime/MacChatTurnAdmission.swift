@@ -188,7 +188,10 @@ public extension MacChatTurnPresentationPort {
                 task: nil
             )
         }
-        if !fromQueue && (sessionIsRunning || queueDrainIsStarting || !existingQueue.isEmpty) {
+        // A paused backlog (Stop) never swallows what the person types next:
+        // idle, a fresh send runs now and the backlog stays paused behind it.
+        let queuePaused = macChatTurns.pausedQueueSessions.contains(targetSessionId)
+        if !fromQueue && (sessionIsRunning || queueDrainIsStarting || (!existingQueue.isEmpty && !queuePaused)) {
             guard existingQueue.filter({ $0.startedTurnID == nil }).count < QueuedChatTurn.maxPerSession else {
                 let rejection = rejectMacChatTurn("Send-next queue is full (20 messages)")
                 return MacChatStartedTurn(acceptance: rejection, task: nil)
@@ -231,7 +234,7 @@ public extension MacChatTurnPresentationPort {
                 task: nil
             )
         }
-        macChatTurns.pausedQueueSessions.remove(targetSessionId)
+        if existingQueue.isEmpty { macChatTurns.pausedQueueSessions.remove(targetSessionId) }
         let generation = (macChatTurns.taskGenerations[targetSessionId] ?? 0) + 1
         macChatTurns.taskGenerations[targetSessionId] = generation
         let activityIdentity = MacChatTurnIdentity(

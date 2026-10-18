@@ -176,9 +176,8 @@ enum OrganismProspectiveAffect {
     // "tool group" strings for CognitiveAttentionSignals.predictedToolGroups. Those
     // strings fold into Fluid Context's NeedSignal → queryText (ContextSelection.swift
     // queryText / packet fingerprint), i.e. they become LEXICAL + EMBEDDING query
-    // terms matched against prewarmable material (tool-result atoms — ContextPrewarm's
-    // `.toolResult` scope — and memory records). So the group vocabulary must be REAL
-    // WORDS that occur in that material, not invented codes.
+    // terms matched against tool-result atoms and memory records. So the group
+    // vocabulary must be REAL WORDS that occur in that material, not invented codes.
     //
     // WHY ONLY `.toolCompletion`:
     // The ledger carries five prediction kinds (OrganismPredictionKind). Only pending

@@ -91,10 +91,11 @@ public actor MockSpotlightIndexClient: SpotlightIndexClient {
 // a SpotlightIndexClient. Stays minimal — Phase C is just "the index path
 // exists and round-trips"; richer attribute-set fields land later.
 public actor SwiftNativeMemoryIndexer {
+    public static let defaultDomain = "memory.nativeagent"
     private let client: any SpotlightIndexClient
     private let domain: String
 
-    public init(client: any SpotlightIndexClient, domain: String = "memory.nativeagent") {
+    public init(client: any SpotlightIndexClient, domain: String = SwiftNativeMemoryIndexer.defaultDomain) {
         self.client = client
         self.domain = domain
     }
@@ -117,7 +118,7 @@ public actor SwiftNativeMemoryIndexer {
         try await client.deleteAll(domainIdentifier: domain)
     }
 
-    private static func makeItem(id: String, text: String, kind: String?, domain: String) -> SpotlightItem {
+    static func makeItem(id: String, text: String, kind: String?, domain: String = defaultDomain) -> SpotlightItem {
         let title = String(text.prefix(80))
         let keywords: [String] = kind.map { [$0] } ?? []
         return SpotlightItem(
@@ -134,7 +135,7 @@ extension SwiftNativeMemoryIndexer {
     public static func reindex(dataRoot: URL, client: any SpotlightIndexClient) async throws -> ReindexOutcome {
         let marker = markerURL(dataRoot: dataRoot)
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        let generation = try await storage.projectionGenerationFingerprint()
+        let generation = try await storage.spotlightGenerationFingerprint()
         let memories = try await storage.listMemories(
             persona: nil,
             status: "active",
@@ -152,7 +153,7 @@ extension SwiftNativeMemoryIndexer {
         try await indexer.removeAll()
         try await indexer.indexBatch(batch)
 
-        let completedGeneration = try await storage.projectionGenerationFingerprint()
+        let completedGeneration = try await storage.spotlightGenerationFingerprint()
         guard completedGeneration == generation else {
             // A concurrent canonical write makes this batch stale. There
             // is intentionally no marker: the next reindex must start
@@ -226,7 +227,7 @@ public actor MemorySpotlightBootstrap {
         }
         let generation: String
         do {
-            generation = try await storage.projectionGenerationFingerprint()
+            generation = try await storage.spotlightGenerationFingerprint()
         } catch {
             return
         }

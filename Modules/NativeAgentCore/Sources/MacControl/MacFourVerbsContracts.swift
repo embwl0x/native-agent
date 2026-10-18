@@ -95,6 +95,9 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
     public let controls: [MacScreenRender.Control]
     public let values: [MacScreenRender.Value]
     public let targets: [MacFourVerbsSupplementalTarget]
+    /// Other apps' windows above this one, in screen points (wherever the
+    /// pixels came from): where a physical act must not land or pass.
+    public let obstructions: [MacAXFrame]
     /// Non-rendered, handle-free telemetry for diagnosing the perception
     /// boundary. This never becomes screen prose or an action authority.
     public let diagnostics: [String: JSONValue]
@@ -109,6 +112,7 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
         controls: [MacScreenRender.Control] = [],
         values: [MacScreenRender.Value] = [],
         targets: [MacFourVerbsSupplementalTarget] = [],
+        obstructions: [MacAXFrame] = [],
         diagnostics: [String: JSONValue] = [:]
     ) {
         self.appName = appName
@@ -120,6 +124,7 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
         self.controls = controls
         self.values = values
         self.targets = targets
+        self.obstructions = obstructions
         self.diagnostics = diagnostics
     }
 }
@@ -144,19 +149,40 @@ public enum MacTypeMode: String, Sendable {
     case replace, append
 }
 
-/// Her-screen Phase 5 — one step of a batched `act`: a semantic or key verb,
-/// a name, and text/mode for `type`. No repeat, hold or button inside a step.
+/// A place on an image she was handed, in that image's pixels: `at` (a
+/// drag's start) and a drag's end `to`. `image` is its frame id; nil is her
+/// session's latest. Only the hands turn it into a screen point.
+public struct MacImagePlace: Sendable, Equatable {
+    public let image: String?
+    public let at: MacPointerPosition
+    public let to: MacPointerPosition?
+
+    public init(image: String?, at: MacPointerPosition, to: MacPointerPosition? = nil) {
+        self.image = image
+        self.at = at
+        self.to = to
+    }
+}
+
+/// Her-screen Phase 5 — one step of a batched `act`: a verb, a name (or a
+/// place on an image), text/mode for `type`, and a named drag's `to`. No
+/// repeat, hold or button inside a step.
 public struct MacActStep: Sendable, Equatable {
     public let verb: String
     public let target: String
     public let text: String?
     public let mode: MacTypeMode
+    public let to: String?
+    public let place: MacImagePlace?
 
-    public init(verb: String, target: String, text: String? = nil, mode: MacTypeMode = .replace) {
+    public init(verb: String, target: String, text: String? = nil, mode: MacTypeMode = .replace,
+                to: String? = nil, place: MacImagePlace? = nil) {
         self.verb = verb
         self.target = target
         self.text = text
         self.mode = mode
+        self.to = to
+        self.place = place
     }
 }
 

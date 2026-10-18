@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import MacControl
 import PersistenceCore
@@ -89,6 +90,7 @@ extension MacAppleScriptBridge {
         "mail_delete_target_changed": "The indexed message moved or changed before deletion; nothing moved to Trash. Locate it again before trying again.",
         "no_trash_mailbox": "Mail has no Trash mailbox for this message's account; nothing was deleted.",
         "message_already_in_trash": "That message is already in Trash; it was left there and was not permanently deleted.",
+        "mail_lookup_timed_out": "Mail did not answer in time; nothing changed. Read it again, and if it repeats, look at Mail itself.",
         "mail_index_unavailable": "Mail's message index could not be read (NativeAgent may need macOS Full Disk Access); nothing was listed or changed.",
         "thread_not_found": "That conversation is not in Messages now; list threads again with messages_recent_threads.",
         "invalid_history_cursor": "before_message_id works only with the same thread_id, using older_before_message_id from the last read.",

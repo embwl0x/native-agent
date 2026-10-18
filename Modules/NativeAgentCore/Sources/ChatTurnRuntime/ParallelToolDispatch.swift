@@ -181,7 +181,7 @@ public enum ParallelToolDispatch {
     /// safe_read keyword. Keep tight; growing this list requires reading
     /// the tool's impl and confirming zero side effects.
     static let readOnlyAllowlist: Set<String> = [
-        "time_now", "agent_introspect", "daemon_introspect",
+        "time_now", "agent_introspect",
         "recent_trace_summary",
         "web_fetch", "x_me", "x_timeline",
         "music_now_playing", "market_quote",

@@ -17,9 +17,11 @@ CODE_SIGN_STYLE = Manual
 CODE_SIGN_IDENTITY = -
 CODE_SIGN_ENTITLEMENTS = NativeAgent.adhoc.entitlements
 
-// Release (NATIVEAGENT_BUILD_CONFIG=release installs) strips local symbols
-// from the bundle's executables; the dwarf-with-dsym dSYMs stay beside the
-// product in DerivedData for symbolication. Debug keeps its symbols for lldb.
-DEPLOYMENT_POSTPROCESSING[config=Release] = YES
+// No strip at build time (10-17): with DEPLOYMENT_POSTPROCESSING the product
+// in DerivedData was stripped in place and every later dSYM was generated from
+// the stripped binary, so a release crash could not be read (Agent's 18:58Z
+// crash: 0 compile units in the dSYM). A development install keeps its symbols;
+// the public release lane strips its own copy after archiving a full dSYM
+// (script/lib/release_symbols.sh).
 
 #include? "../local/NativeAgent.xcconfig"

@@ -111,7 +111,7 @@ struct StandingBotsDisk: Sendable {
             }
         case .cron(let expression, let zone):
             guard !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  TimeZone(identifier: zone) != nil else { throw StandingBotsError.invalidValue("cron") }
+                  zone.map({ TimeZone(identifier: $0) != nil }) ?? true else { throw StandingBotsError.invalidValue("cron") }
             if validateCron { _ = try Self.nextOccurrence(bot, after: bot.updatedAt) }
         }
     }
@@ -123,8 +123,9 @@ struct StandingBotsDisk: Sendable {
         case .manual: return .distantFuture
         case .interval(let seconds): return date.addingTimeInterval(max(seconds, minimumInterval))
         case .cron(let expression, let zone):
+            // No stored zone: "local", the scheduler's own word for following the Mac.
             let value: JSONValue = .object(["schedule": .object([
-                "type": .string("cron"), "expression": .string(expression), "timezone": .string(zone)
+                "type": .string("cron"), "expression": .string(expression), "timezone": .string(zone ?? "local")
             ])])
             do {
                 // Configuration time is not a run. Space cron occurrences only

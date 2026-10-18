@@ -158,6 +158,8 @@ enum NativeAgentAppMain {
 
         // Mark public first launch in place before state owners initialize.
         InlineInteractionResolver.platform = AppInlineInteractionPlatformPort()
+        // Every open permission card settles by itself from here on, from launch.
+        Task { @MainActor in InlineInteractionResolver.GrantWatch.shared.start() }
         _ = NSApplication.shared
         guard AppDelegate.claimSingleAppInstance() else { return }
         let dataRoot = PersistenceCore.defaultDataRoot()
@@ -611,9 +613,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
 // Preserve the app transcript type when ChatOrchestration is also imported.
 typealias ChatMessage = EngineRuntime.ChatMessage
-// NativeAgentShared and Core both ship a `MemoryRecord` (MemoryV2), a
-// `MultimodalAttachment` and a `ChatSession` (ChatOrchestration's wire
-// mirrors); the app's UI and decoding use the NativeAgentShared ones.
+// NativeAgentShared and Core both ship a `MemoryRecord` (MemoryV2) and a
+// `ChatSession`; `MultimodalAttachment` is one shared value. The app's UI
+// and decoding use the NativeAgentShared names.
 typealias MemoryRecord = NativeAgentShared.MemoryRecord
 typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
 typealias ChatSession = NativeAgentShared.ChatSession

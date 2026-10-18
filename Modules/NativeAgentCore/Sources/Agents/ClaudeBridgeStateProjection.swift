@@ -79,8 +79,6 @@ public enum ClaudeBridgeStateProjection {
                 "activeLeases": 0,
                 "pressure": NSNull(),
                 "prewarmingAllowed": false,
-                "pendingPrewarmHints": 0,
-                "prewarmUsefulnessReceipts": 0,
                 "lastReconciledAt": NSNull(),
                 "lastError": NSNull(),
             ]
@@ -97,8 +95,6 @@ public enum ClaudeBridgeStateProjection {
             "activeLeases": health.arenaMetrics.activeLeaseCount,
             "pressure": health.arenaMetrics.pressure.rawValue,
             "prewarmingAllowed": health.arenaMetrics.prewarmingAllowed,
-            "pendingPrewarmHints": health.pendingPrewarmHints,
-            "prewarmUsefulnessReceipts": health.prewarmUsefulnessReceipts,
             "lastReconciledAt": health.lastReconciledAt.map { iso.string(from: $0) as Any }
                 ?? NSNull(),
             "lastError": health.lastError.map { $0 as Any } ?? NSNull(),

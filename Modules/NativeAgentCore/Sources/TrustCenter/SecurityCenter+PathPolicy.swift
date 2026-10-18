@@ -2,6 +2,9 @@ import Foundation
 import PersistenceCore
 
 extension SwiftNativeSecurityCenter {
+    /// Her line for the paths a call names: true when one lands beyond her
+    /// data root and Trust's workspace roots. A `..` cannot be followed with
+    /// confidence, so it counts as beyond.
     static func capabilityWritesOutsideAppData(
         input: [String: JSONValue],
         dataRoot: URL,
@@ -10,6 +13,7 @@ extension SwiftNativeSecurityCenter {
         let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
         for path in pathLikeStrings(in: .object(input)) {
             let expanded = HomePath.expand(path.trimmingCharacters(in: .whitespacesAndNewlines))
+            if expanded.split(separator: "/").contains("..") { return true }
             guard expanded.hasPrefix("/") else { continue }
             let normalized = URL(fileURLWithPath: expanded)
                 .standardizedFileURL

@@ -2,8 +2,95 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import Senses
+import TrustCenter
+import SlackConnector
+import XConnector
+import GitHubConnector
+import AgentConversations
+import ToolExecution
 
 extension SwiftToolDispatcher {
+    public func performReach(_ operation: String, arguments: JSONValue, surface: String) async throws -> JSONValue {
+        guard case .object(let args) = arguments else {
+            throw SenseFailure(code: "bad_input", message: "Reach takes one named argument object.")
+        }
+        guard operation == "fetch" else {
+            throw SenseFailure(code: "unsupported", message: "Unknown reach \(operation).")
+        }
+        return try await fetch(args)
+    }
+
+    private func fetch(_ args: [String: JSONValue]) async throws -> JSONValue {
+        let fields = JSONValue.object(args).stringFields
+        var request = try SwiftNativeToolExecution.fetchRequest(args)
+        let url = request.url!, host = url.host!.lowercased()
+        let byteLimit = 4 * 1024 * 1024
+        if let connector = fields["connector"] {
+            guard url.scheme == "https", url.port == nil || url.port == 443 else {
+                throw SenseFailure(code: "permission_denied", message: "Authenticated fetch requires HTTPS on the connector's API host.")
+            }
+            if connector == "agentmail" {
+                request = try AgentMailActions.authorizeFetch(request, dataRoot: dataRoot)
+            } else {
+                guard connectorAPIHosts[connector]?.contains(host) == true else {
+                    throw SenseFailure(code: "permission_denied", message: "This URL is outside connector:\(connector)'s API hosts.")
+                }
+                let token: String
+                switch connector {
+                case "gmail", "calendar", "notion":
+                    guard let auth = Self.loadCloudConnectorAuth(connector: connector, root: dataRoot) else {
+                        throw SenseFailure(code: "not_connected", message: "Connect \(connector) before using its reach.")
+                    }
+                    if connector == "notion" { token = auth.accessToken }
+                    else {
+                        let health = try GoogleOAuthCredentials.credentialStatus(path: auth.path)
+                        token = health.requiresRefresh || health.expiresAt.map({ $0 <= Date() }) == true
+                            ? try await GoogleOAuthCredentials.refresh(path: auth.path) : auth.accessToken
+                    }
+                    if connector == "notion" { request.setValue("2022-06-28", forHTTPHeaderField: "Notion-Version") }
+                case "slack":
+                    guard let saved = try SlackCredentials.read(.bot, dataRoot: dataRoot) else {
+                        throw SenseFailure(code: "not_connected", message: "Connect Slack before using its reach.")
+                    }
+                    token = saved
+                case "x": token = try await XConnectorActions.currentBearer(dataRoot: dataRoot)
+                case "github": token = try await GitHubConnectorActions.loadToken(dataRoot: dataRoot)
+                default: throw SenseFailure(code: "bad_input", message: "Unknown connector.")
+                }
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
+        } else { throw SenseFailure(code: "undeclared", message: "Keyless fetch belongs to the network_public broker.") }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil; configuration.urlCredentialStorage = nil; configuration.urlCache = nil
+        let session = URLSession(configuration: configuration, delegate: OwnedFetchRedirects(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        let credential = request.value(forHTTPHeaderField: "Authorization")?.replacingOccurrences(of: "Bearer ", with: "")
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let response = response as? HTTPURLResponse else {
+                throw SenseFailure(code: "world_error", message: "fetch received no HTTP response.")
+            }
+            var data = Data()
+            // Bytes arriving are progress, the same as a provider stream's.
+            for try await byte in bytes {
+                guard data.count < byteLimit else { throw SenseFailure(code: "output_limit", message: "fetch response exceeds the 4 MiB primitive limit.") }
+                data.append(byte)
+                ProviderStreamContext.activity?()
+            }
+            let headers = response.allHeaderFields.reduce(into: [String: String]()) { result, entry in
+                result[String(describing: entry.key)] = String(describing: entry.value)
+            }
+            return try SwiftNativeToolExecution.fetchReply(status: response.statusCode, headers: headers, data: data, credential: credential)
+        } catch {
+            if let credential, !credential.isEmpty {
+                throw SenseFailure(code: (error as? SenseFailure)?.code ?? "world_error",
+                    message: error.localizedDescription.replacingOccurrences(of: credential, with: "[redacted]"))
+            }
+            throw error
+        }
+    }
+
     private struct CloudConnectorAuth {
         var accessToken: String
         var path: URL
@@ -986,5 +1073,13 @@ extension SwiftToolDispatcher {
             normalized += String(repeating: "=", count: 4 - remainder)
         }
         return Data(base64Encoded: normalized)
+    }
+}
+
+/// Redirects are returned to the caller; no redirected request can carry a credential or change its Trust tier.
+private final class OwnedFetchRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 }

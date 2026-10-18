@@ -109,10 +109,6 @@ private struct SessionHistoryLineReadResult: Sendable {
     let sourceBytes: Int64
     let bytesRead: Int64
     let truncated: Bool
-    /// The file exists but could not be opened or read. Without this, a
-    /// failed read is `lines: []` — indistinguishable from an empty
-    /// transcript, which the receipt then reports as a clean read.
-    var readFailed: Bool = false
 }
 
 // MARK: - SessionHistoryReader
@@ -233,11 +229,15 @@ public actor SessionHistoryReader {
         let truncatedRead: Bool
         let mode: String
         if let limit, limit > 0, !strictEvidence {
+            // A bounded tail: only the bytes the selection needs, from the end.
+            let handle = try? FileHandle(forReadingFrom: path)
             let result = Self.tailLinesResult(
-                from: path,
+                size: (try? handle?.seekToEnd()).map(Int.init) ?? 0,
                 minimumLineCount: max(64, limit * 3),
                 maximumBytes: maximumBytes
-            )
+            ) { offset, count in
+                (try? handle?.seek(toOffset: UInt64(offset))).flatMap { _ in try? handle?.read(upToCount: count) }
+            }
             lines = result.lines
             sourceBytes = result.sourceBytes
             bytesRead = result.bytesRead
@@ -372,34 +372,34 @@ public actor SessionHistoryReader {
         return tail.map(\.message)
     }
 
-    /// Read the first few messages plus a bounded tail. This lets the prompt
-    /// renderer keep true opening anchors for continuity without loading an
+    /// The one read of a session's live transcript for a turn. Every prompt
+    /// selection below runs over these bytes, whether they come from here or
+    /// from the compactor's validated read of the same file this turn. nil:
+    /// no transcript (or no valid id), which selects as empty history.
+    public func transcriptBytes(forSessionId id: String) throws -> Data? {
+        guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else { return nil }
+        let path = dataRoot.appendingPathComponent("chat/messages/\(safeId).jsonl")
+        do { return try Data(contentsOf: path) } catch CocoaError.fileReadNoSuchFile { return nil }
+    }
+
+    /// The first few messages plus a bounded tail. This lets the prompt
+    /// renderer keep true opening anchors for continuity without decoding an
     /// entire large JSONL transcript on every turn.
-    public func promptMessagesWithStats(
-        forSessionId id: String,
+    public nonisolated func promptMessagesWithStats(
+        transcript: Data?,
         anchorLimit: Int = 3,
         tailLimit: Int,
         excludingRunId: String? = nil
-    ) async throws -> SessionHistoryReadResult {
-        guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
-            return SessionHistoryReadResult(
-                messages: [],
-                stats: SessionHistoryReadStats(mode: "invalid_session_id")
-            )
-        }
-        let excludedRunId = excludingRunId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldExcludeRun = excludedRunId?.isEmpty == false
-        let path = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(safeId).jsonl")
-        guard FileManager.default.fileExists(atPath: path.path) else {
+    ) -> SessionHistoryReadResult {
+        guard let transcript else {
             return SessionHistoryReadResult(
                 messages: [],
                 stats: SessionHistoryReadStats(mode: "missing")
             )
         }
+        let excludedRunId = excludingRunId?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let shouldExcludeRun = excludedRunId?.isEmpty == false
         if tailLimit <= 0 {
             return SessionHistoryReadResult(
                 messages: [],
@@ -407,12 +407,12 @@ public actor SessionHistoryReader {
             )
         }
         let head = Self.headLinesResult(
-            from: path,
+            from: transcript,
             maximumLineCount: max(0, anchorLimit),
             maximumBytes: Self.promptHeadMaximumBytes
         )
         let tail = Self.tailLinesResult(
-            from: path,
+            from: transcript,
             minimumLineCount: max(64, tailLimit),
             maximumBytes: Self.promptTailMaximumBytes
         )
@@ -448,45 +448,68 @@ public actor SessionHistoryReader {
     }
 
     /// Return bounded candidates for semantic "earlier session" ranking.
-    /// Small transcripts are cheap enough to read exactly. Large transcripts
+    /// Small transcripts are cheap enough to decode exactly. Large transcripts
     /// are sampled through fixed-size interior windows; exact older wording is
     /// still available through the explicit search_chat_history tool. JSONL
     /// remains authoritative and this projection owns no stale sidecar state.
+    /// From the file, reading only the windows it samples.
     public func relevanceMessagesWithStats(
         forSessionId id: String,
         excludingRunId: String? = nil
-    ) async throws -> SessionHistoryReadResult {
+    ) throws -> SessionHistoryReadResult {
         guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
-            return SessionHistoryReadResult(
-                messages: [],
-                stats: SessionHistoryReadStats(mode: "invalid_session_id")
-            )
+            return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "invalid_session_id"))
         }
-        let excludedRunId = excludingRunId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldExcludeRun = excludedRunId?.isEmpty == false
-        let path = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(safeId).jsonl")
+        let path = dataRoot.appendingPathComponent("chat/messages/\(safeId).jsonl")
         guard FileManager.default.fileExists(atPath: path.path) else {
+            return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "missing"))
+        }
+        guard let handle = try? FileHandle(forReadingFrom: path), let size = try? handle.seekToEnd() else {
+            return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "read_failed"))
+        }
+        return relevanceMessagesWithStats(size: Int(size), excludingRunId: excludingRunId) { offset, count in
+            (try? handle.seek(toOffset: UInt64(offset))).flatMap { _ in try? handle.read(upToCount: count) }
+        }
+    }
+
+    /// From the bytes this turn already holds.
+    public nonisolated func relevanceMessagesWithStats(
+        transcript: Data?,
+        excludingRunId: String? = nil
+    ) -> SessionHistoryReadResult {
+        guard let transcript else {
             return SessionHistoryReadResult(
                 messages: [],
                 stats: SessionHistoryReadStats(mode: "missing")
             )
         }
+        return relevanceMessagesWithStats(size: transcript.count, excludingRunId: excludingRunId) {
+            transcript.subdata(in: (transcript.startIndex + $0)..<(transcript.startIndex + $0 + $1))
+        }
+    }
 
-        let sourceBytes = Self.fileSize(at: path)
+    private nonisolated func relevanceMessagesWithStats(
+        size: Int,
+        excludingRunId: String?,
+        bytes: (_ offset: Int, _ count: Int) -> Data?
+    ) -> SessionHistoryReadResult {
+        let excludedRunId = excludingRunId?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let shouldExcludeRun = excludedRunId?.isEmpty == false
         let lineRead: SessionHistoryLineReadResult
         let mode: String
-        if sourceBytes <= Int64(Self.relevanceFullReadMaximumBytes) {
-            lineRead = Self.allLinesResult(from: path)
+        if size <= Self.relevanceFullReadMaximumBytes {
+            guard let whole = bytes(0, size) else {
+                return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "read_failed"))
+            }
+            lineRead = Self.allLinesResult(from: whole)
             mode = "relevance_full_small"
         } else {
             lineRead = Self.sampledLinesResult(
-                from: path,
+                size: size,
                 maximumBytes: Self.relevanceSampleMaximumBytes,
-                windowCount: Self.relevanceSampleWindowCount
+                windowCount: Self.relevanceSampleWindowCount,
+                bytes: bytes
             )
             mode = "relevance_sampled"
         }
@@ -507,7 +530,7 @@ public actor SessionHistoryReader {
         return SessionHistoryReadResult(
             messages: out,
             stats: SessionHistoryReadStats(
-                mode: lineRead.readFailed ? "read_failed" : mode,
+                mode: mode,
                 sourceBytes: lineRead.sourceBytes,
                 bytesRead: lineRead.bytesRead,
                 linesRead: lineRead.lines.count,
@@ -521,49 +544,35 @@ public actor SessionHistoryReader {
         )
     }
 
+    /// The last lines, read back from the end in 64 KB steps, each counted
+    /// once, until at least `minimumLineCount` complete rows or the byte
+    /// budget. `bytes(offset, count)` reads from bytes in hand or from the
+    /// file alike, so a tail never has to read the whole transcript.
     private nonisolated static func tailLinesResult(
-        from path: URL,
+        size: Int,
         minimumLineCount: Int,
-        maximumBytes: Int? = nil
+        maximumBytes: Int? = nil,
+        bytes: (_ offset: Int, _ count: Int) -> Data?
     ) -> SessionHistoryLineReadResult {
-        guard minimumLineCount > 0,
-              let handle = try? FileHandle(forReadingFrom: path) else {
+        guard minimumLineCount > 0, size > 0 else {
             return SessionHistoryLineReadResult(lines: [], sourceBytes: 0, bytesRead: 0, truncated: false)
         }
-        defer { try? handle.close() }
-
-        let chunkSize: UInt64 = 64 * 1024
-        let fileSize = (try? handle.seekToEnd()) ?? 0
-        guard fileSize > 0 else {
-            return SessionHistoryLineReadResult(lines: [], sourceBytes: 0, bytesRead: 0, truncated: false)
-        }
-
-        var offset = fileSize
-        var data = Data()
+        let byteLimit = max(1, maximumBytes ?? Int.max)
+        var offset = size
+        var chunks: [Data] = []
         var lineCount = 0
-        let byteLimit = UInt64(max(1, maximumBytes ?? Int.max))
-        while offset > 0 && lineCount <= minimumLineCount && UInt64(data.count) < byteLimit {
-            let remainingBudget = byteLimit - UInt64(data.count)
-            let readSize = min(chunkSize, offset, remainingBudget)
-            guard readSize > 0 else { break }
+        while offset > 0 && lineCount <= minimumLineCount && size - offset < byteLimit {
+            let readSize = min(64 * 1024, offset, byteLimit - (size - offset))
             offset -= readSize
-            do {
-                try handle.seek(toOffset: offset)
-                let chunk = try handle.read(upToCount: Int(readSize)) ?? Data()
-                data.insert(contentsOf: chunk, at: 0)
-            } catch {
+            guard let chunk = bytes(offset, readSize), chunk.count == readSize else {
                 return SessionHistoryLineReadResult(
-                    lines: [],
-                    sourceBytes: Int64(fileSize),
-                    bytesRead: Int64(data.count),
-                    truncated: offset > 0
-                )
+                    lines: [], sourceBytes: Int64(size), bytesRead: Int64(size - offset), truncated: offset > 0)
             }
-            lineCount = data.reduce(0) { count, byte in count + (byte == 0x0A ? 1 : 0) }
+            lineCount += chunk.reduce(0) { count, byte in count + (byte == 0x0A ? 1 : 0) }
+            chunks.append(chunk)
         }
-
-        let text = String(decoding: data, as: UTF8.self)
-        var lines = text
+        var lines = String(decoding: chunks.reversed().reduce(into: Data(capacity: size - offset)) { $0.append($1) },
+                           as: UTF8.self)
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map(String.init)
         if offset > 0, !lines.isEmpty {
@@ -574,35 +583,40 @@ public actor SessionHistoryReader {
         }
         return SessionHistoryLineReadResult(
             lines: lines,
-            sourceBytes: Int64(fileSize),
-            bytesRead: Int64(data.count),
+            sourceBytes: Int64(size),
+            bytesRead: Int64(size - offset),
             truncated: offset > 0
         )
     }
 
+    private nonisolated static func tailLinesResult(
+        from data: Data,
+        minimumLineCount: Int,
+        maximumBytes: Int? = nil
+    ) -> SessionHistoryLineReadResult {
+        tailLinesResult(size: data.count, minimumLineCount: minimumLineCount, maximumBytes: maximumBytes) {
+            data.subdata(in: (data.startIndex + $0)..<(data.startIndex + $0 + $1))
+        }
+    }
+
     private nonisolated static func headLinesResult(
-        from path: URL,
+        from data: Data,
         maximumLineCount: Int,
         maximumBytes: Int? = nil
     ) -> SessionHistoryLineReadResult {
-        guard maximumLineCount > 0,
-              let handle = try? FileHandle(forReadingFrom: path) else {
+        guard maximumLineCount > 0 else {
             return SessionHistoryLineReadResult(lines: [], sourceBytes: 0, bytesRead: 0, truncated: false)
         }
-        defer { try? handle.close() }
-
-        let fileSize = (try? handle.seekToEnd()) ?? 0
-        try? handle.seek(toOffset: 0)
-        var data = Data()
-        var lineCount = 0
         let byteLimit = max(1, maximumBytes ?? Int.max)
-        while lineCount < maximumLineCount && data.count < byteLimit {
-            let chunk = (try? handle.read(upToCount: min(16 * 1024, byteLimit - data.count))) ?? Data()
-            if chunk.isEmpty { break }
-            data.append(chunk)
-            lineCount = data.reduce(0) { count, byte in count + (byte == 0x0A ? 1 : 0) }
+        var end = 0
+        var lineCount = 0
+        while lineCount < maximumLineCount && end < byteLimit && end < data.count {
+            let next = min(end + 16 * 1024, byteLimit, data.count)
+            lineCount += data[(data.startIndex + end)..<(data.startIndex + next)]
+                .reduce(0) { count, byte in count + (byte == 0x0A ? 1 : 0) }
+            end = next
         }
-        var lines = String(decoding: data, as: UTF8.self)
+        var lines = String(decoding: data[data.startIndex..<(data.startIndex + end)], as: UTF8.self)
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map(String.init)
         if lines.count > maximumLineCount {
@@ -610,18 +624,13 @@ public actor SessionHistoryReader {
         }
         return SessionHistoryLineReadResult(
             lines: lines,
-            sourceBytes: Int64(fileSize),
-            bytesRead: Int64(data.count),
-            truncated: UInt64(data.count) < fileSize
+            sourceBytes: Int64(data.count),
+            bytesRead: Int64(end),
+            truncated: end < data.count
         )
     }
 
-    private nonisolated static func allLinesResult(from path: URL) -> SessionHistoryLineReadResult {
-        guard let data = try? Data(contentsOf: path) else {
-            return SessionHistoryLineReadResult(
-                lines: [], sourceBytes: 0, bytesRead: 0, truncated: false, readFailed: true
-            )
-        }
+    private nonisolated static func allLinesResult(from data: Data) -> SessionHistoryLineReadResult {
         let lines = String(decoding: data, as: UTF8.self)
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map(String.init)
@@ -636,72 +645,51 @@ public actor SessionHistoryReader {
     /// Samples complete JSONL rows from evenly spaced interior windows. Any
     /// row crossing a window boundary is intentionally dropped rather than
     /// parsed as corrupt. Giant tool rows therefore consume at most one fixed
-    /// window and cannot force the reader to chase their boundary.
+    /// window and cannot force the reader to chase their boundary. Only the
+    /// sampled windows are read, from the file or from bytes in hand alike.
     private nonisolated static func sampledLinesResult(
-        from path: URL,
+        size: Int,
         maximumBytes: Int,
-        windowCount: Int
+        windowCount: Int,
+        bytes: (_ offset: Int, _ count: Int) -> Data?
     ) -> SessionHistoryLineReadResult {
-        guard maximumBytes > 0,
-              windowCount > 0,
-              let handle = try? FileHandle(forReadingFrom: path) else {
-            return SessionHistoryLineReadResult(
-                lines: [], sourceBytes: 0, bytesRead: 0, truncated: false, readFailed: true
-            )
-        }
-        defer { try? handle.close() }
-
-        let fileSize = (try? handle.seekToEnd()) ?? 0
-        guard fileSize > 0 else {
+        guard maximumBytes > 0, windowCount > 0, size > 0 else {
             return SessionHistoryLineReadResult(lines: [], sourceBytes: 0, bytesRead: 0, truncated: false)
         }
         let effectiveCount = min(windowCount, maximumBytes)
         let windowSize = max(1, maximumBytes / effectiveCount)
-        let readableWindow = min(UInt64(windowSize), fileSize)
-        let maximumStart = fileSize - readableWindow
+        let readableWindow = min(windowSize, size)
+        let maximumStart = size - readableWindow
         var lines: [String] = []
         var bytesRead: Int64 = 0
 
         for index in 1...effectiveCount {
             let fraction = Double(index) / Double(effectiveCount + 1)
-            let start = UInt64(Double(maximumStart) * fraction)
-            do {
-                try handle.seek(toOffset: start)
-                let data = try handle.read(upToCount: Int(readableWindow)) ?? Data()
-                bytesRead += Int64(data.count)
-                guard !data.isEmpty else { continue }
-
-                var lower = data.startIndex
-                var upper = data.endIndex
-                if start > 0 {
-                    guard let newline = data.firstIndex(of: 0x0A) else { continue }
-                    lower = data.index(after: newline)
-                }
-                if start + UInt64(data.count) < fileSize {
-                    guard let newline = data.lastIndex(of: 0x0A), newline >= lower else { continue }
-                    upper = newline
-                }
-                guard lower < upper else { continue }
-                lines.append(contentsOf: String(decoding: data[lower..<upper], as: UTF8.self)
-                    .split(separator: "\n", omittingEmptySubsequences: true)
-                    .map(String.init))
-            } catch {
-                continue
+            let start = Int(Double(maximumStart) * fraction)
+            guard let window = bytes(start, readableWindow) else { continue }
+            bytesRead += Int64(window.count)
+            var lower = window.startIndex
+            var upper = window.endIndex
+            if start > 0 {
+                guard let newline = window.firstIndex(of: 0x0A) else { continue }
+                lower = window.index(after: newline)
             }
+            if start + window.count < size {
+                guard let newline = window.lastIndex(of: 0x0A), newline >= lower else { continue }
+                upper = newline
+            }
+            guard lower < upper else { continue }
+            lines.append(contentsOf: String(decoding: window[lower..<upper], as: UTF8.self)
+                .split(separator: "\n", omittingEmptySubsequences: true)
+                .map(String.init))
         }
         return SessionHistoryLineReadResult(
             lines: lines,
-            sourceBytes: Int64(fileSize),
+            sourceBytes: Int64(size),
             bytesRead: bytesRead,
-            truncated: UInt64(bytesRead) < fileSize
+            truncated: bytesRead < Int64(size)
         )
     }
-
-    private nonisolated static func fileSize(at path: URL) -> Int64 {
-        guard let value = try? path.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return 0 }
-        return Int64(value)
-    }
-
     private nonisolated static func decodeMessages(
         from lines: [String],
         excludingRunId: String?,

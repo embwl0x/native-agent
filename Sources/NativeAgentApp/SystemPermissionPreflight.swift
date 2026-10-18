@@ -1,4 +1,5 @@
 import Connectors
+import AttentionRouting
 // PATCH-2026-08-18: system-permission preflight.
 //
 // Root cause this file exists for: commit 130dc377 made SFSpeechRecognizer
@@ -11,16 +12,17 @@ import Connectors
 // where macOS cannot render a prompt, so the system resolves it .denied.
 //
 // This type supplies the three things that were missing: a NON-PROMPTING status
-// read, a foreground acquisition path, and a pure judgement seam
-// (`healthWarnings(from:)` / `warningSummary(for:)`) that tests can drive from
-// hand-built fixtures instead of host TCC state.
+// read, a foreground acquisition path, and warning copy naming the Settings pane.
 import Foundation
 import AppKit
 import ApplicationServices
 import CoreGraphics
 import EventKit
 import Contacts
+import AVFoundation
 import MacIntegration
+import MacControl
+import NativeAgentCore
 import NativeAgentShared
 
 extension SystemPermissionPreflight {
@@ -30,7 +32,20 @@ extension SystemPermissionPreflight {
     @MainActor
     static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool {
         for id in ids {
-            guard let gate = cardGate(id, mode: mode), cardStatus(gate, mode: mode) != .granted else { continue }
+            guard let gate = cardSettingsCapability(id), let url = settingsURL(for: gate) else { continue }
+            let opened = NSWorkspace.shared.open(url)
+            ModuleLog.app("[permission-card] \(opened ? "Opened" : "Could not open") \(url.absoluteString)")
+            if let bundleID = SystemAppleScriptAdapter.automationTarget(id) {
+                _ = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID, ask: true)
+                continue
+            }
+            if gate == .notifications {
+                if await NativeAgentNotifications.notificationSettings().authorizationStatus == "not_determined" {
+                    _ = await NativeAgentNotifications.requestAuthorizationError()
+                }
+                continue
+            }
+            guard cardStatus(gate, mode: mode) != .granted else { continue }
             switch gate {
             case .calendars where mode == .write:
                 if cardStatus(gate, mode: mode) == .notDetermined {
@@ -40,18 +55,20 @@ extension SystemPermissionPreflight {
             case .reminders: _ = await LocalPIMConnectorActions.requestReminderAccess()
             case .contacts where status(gate) == .notDetermined:
                 _ = try? await CNContactStore().requestAccess(for: .contacts)
+            case .speechRecognition: _ = await requestSpeechRecognitionIfNotDetermined()
+            case .location: MacLocationReader.requestAuthorization()
+            case .microphone where status(gate) == .notDetermined:
+                _ = await AVCaptureDevice.requestAccess(for: .audio)
             // These two list the app in their pane on first ask, so the
             // person has a switch to turn on.
             case .accessibility:
                 _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
             case .screenRecording: _ = CGRequestScreenCaptureAccess()
+            case .inputMonitoring: _ = CGRequestListenEventAccess()
             default: break
             }
-            guard cardStatus(gate, mode: mode) != .granted, let url = settingsURL(for: gate) else { continue }
-            NSWorkspace.shared.open(url)
-            return true
         }
-        return false
+        return await cardBlockReason(ids, mode: mode) != nil
     }
 
 }

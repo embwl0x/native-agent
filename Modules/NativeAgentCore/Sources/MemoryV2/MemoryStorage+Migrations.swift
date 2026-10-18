@@ -4,51 +4,6 @@ import GRDB
 extension MemoryStorage {
     // MARK: - Migrator
 
-    /// One-time adoption of stores poisoned by the pre-2026-08-27 graph-first
-    /// bug (stable-failure #4 / Desk 751.7): the KnowledgeGraph side could
-    /// create memory.sqlite itself — kg tables present, zero grdb_migrations
-    /// rows — and replaying v2_knowledge_graph against those tables bricked
-    /// the whole migration chain on the next open. Stamp v2 as applied ONLY
-    /// when the ledger has no applied migrations, the memories table is absent
-    /// (v1 never ran, so this cannot be a real migrated store), and both kg
-    /// tables match the v2 shape column-for-column. Any other shape is left
-    /// untouched so migrate() fails loud rather than guessing (gpt-5.5 review
-    /// 2026-08-27: stamp only on exact match, otherwise stay loud).
-    static func adoptLedgerlessGraphStoreIfNeeded(_ pool: DatabasePool) throws {
-        try pool.write { db in
-            let applied = (try? Int.fetchOne(
-                db, sql: "SELECT COUNT(*) FROM grdb_migrations")) ?? 0
-            guard applied == 0 else { return }
-            guard try !db.tableExists("memories"),
-                  try db.tableExists("kg_entities"),
-                  try db.tableExists("kg_relationships") else { return }
-            func columns(_ table: String) throws -> [String] {
-                try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
-                    .compactMap { $0["name"] as String? }
-            }
-            let v2Entities = [
-                "id", "name", "type", "summary", "aliases_json",
-                "mention_count", "first_seen", "last_seen",
-                "provenance", "metadata_json",
-            ]
-            let v2Relationships = [
-                "id", "from_id", "to_id", "type", "weight",
-                "mention_count", "provenance", "metadata_json",
-            ]
-            guard try columns("kg_entities") == v2Entities,
-                  try columns("kg_relationships") == v2Relationships else { return }
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS grdb_migrations (
-                  identifier TEXT NOT NULL PRIMARY KEY
-                )
-                """)
-            try db.execute(sql: """
-                INSERT OR IGNORE INTO grdb_migrations (identifier)
-                VALUES ('v2_knowledge_graph')
-                """)
-        }
-    }
-
     static var migrator: DatabaseMigrator {
         var m = DatabaseMigrator()
         m.registerMigration("v1_initial") { db in

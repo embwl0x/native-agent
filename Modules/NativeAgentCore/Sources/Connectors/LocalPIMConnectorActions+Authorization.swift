@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 @preconcurrency import EventKit
 import PersistenceCore

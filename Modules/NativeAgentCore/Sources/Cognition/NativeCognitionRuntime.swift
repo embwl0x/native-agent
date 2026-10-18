@@ -16,7 +16,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     public let dataRoot: URL
     /// The app-owned pieces this mind reaches (see CognitionHost).
     let host: any CognitionHost
-    /// The engine root's ContextFlow, prewarmed and reloaded from the live body.
+    /// The engine root's ContextFlow, reloaded from the live body.
     let contextFlow: NativeContextFlowRuntime
     public var usesLiveAppBody: Bool {  // internal for actor extensions (move-only Wave C)
         dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL

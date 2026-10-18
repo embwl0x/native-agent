@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import CryptoKit
 import NativeAgentCore
@@ -79,6 +80,13 @@ let connectorSensitiveDataSubpaths: Set<String> = [
     "senses/news",
 ]
 
+// App-data reach retains the private-store exclusions of the former file broker.
+let connectorPartPrivateDataSubpaths = [
+    "credentials", "connectors", "telegram/config.json", "slack/config.json",
+    "catalog/.pack_signing_key", "mobile", "mobile_push", "notifications/push_tokens.json",
+    "claude", "bridge-config",
+]
+
 // MARK: - Action context
 
 /// The execution context a connector action reads. Distilled from the Python
@@ -108,6 +116,7 @@ public struct ConnectorActionContext: Sendable {
     /// Mirrors Python `context["_na_workspace_root"]` override /
     /// `_resolve_workspace_root_bt()`.
     public var workspaceRoot: String?
+    let appDataWrite: Bool?
 
     public init(
         repoRoot: String,
@@ -123,6 +132,10 @@ public struct ConnectorActionContext: Sendable {
         self.extraAllowedRoots = extraAllowedRoots
         self.personaRoot = personaRoot
         self.workspaceRoot = workspaceRoot
+        if let reach = AbilityStore.fileReach, let dataRoot,
+           reach.root.standardizedFileURL.resolvingSymlinksInPath().path == URL(fileURLWithPath: dataRoot).standardizedFileURL.resolvingSymlinksInPath().path {
+            self.appDataWrite = reach.write
+        } else { self.appDataWrite = nil }
     }
 
     /// Build from a DispatchContext. `repo_root` comes from `ctx.repoRoot`;
@@ -173,7 +186,7 @@ enum FileSystemActions {
     /// `standardizedFileURL.resolvingSymlinksInPath()` so macOS
     /// `/var → /private/var` symlinks normalise the same way Python's
     /// `Path.resolve()` does.
-    static func resolvePath(_ raw: String, repoRoot: String) -> URL {
+    static func resolvePath(_ raw: String, repoRoot: String, followFinalLink: Bool = true) -> URL {
         let base = repoRoot.isEmpty ? "." : repoRoot
         let path: String
         if let address = URL(string: raw), address.isFileURL {
@@ -190,14 +203,16 @@ enum FileSystemActions {
         } else {
             p = URL(fileURLWithPath: base).appendingPathComponent(expanded)
         }
-        return p.standardizedFileURL.resolvingSymlinksInPath()
+        let standardized = p.standardizedFileURL
+        return followFinalLink || standardized.path == "/" ? standardized.resolvingSymlinksInPath()
+            : standardized.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(standardized.lastPathComponent)
     }
 
     /// Mirror `_allowed_roots`. Returns [] (sandbox
     /// disabled at this layer) when file_access mode == "full" OR sandbox ==
     /// "danger-full-access". Otherwise repo_root + writableRoots + addDirs +
     /// extraAllowedRoots + data/skills.
-    static func allowedRoots(_ ctx: ConnectorActionContext) -> [URL] {
+    static func allowedRoots(_ ctx: ConnectorActionContext, write: Bool = false) -> [URL] {
         let mode = stringField(ctx.fileAccess, "mode").lowercased()
         let sandbox = stringField(ctx.fileAccess, "sandbox").lowercased()
         if mode == "full" || sandbox == "danger-full-access" {
@@ -217,9 +232,10 @@ enum FileSystemActions {
             for v in arr { if case .string(let s) = v { add(s) } }
         }
         for r in ctx.extraAllowedRoots { add(r) }
-        // data/skills sub-tree only (committed skill bodies). NOT full data root.
+        // Ordinary callers get skills; a part adds only its declared data reach.
         if let dr = ctx.dataRoot, !dr.isEmpty {
             add(URL(fileURLWithPath: dr).appendingPathComponent("skills").path)
+            if let appDataWrite = ctx.appDataWrite, !write || appDataWrite { add(dr) }
         }
         return roots
     }
@@ -261,6 +277,8 @@ enum FileSystemActions {
         let prefix = drPath.hasSuffix("/") ? drPath : drPath + "/"
         guard pPath == drPath || pPath.hasPrefix(prefix) else { return false }
         let relStr = pPath == drPath ? "" : String(pPath.dropFirst(prefix.count))
+        if ctx.appDataWrite != nil,
+           connectorPartPrivateDataSubpaths.contains(where: { relStr == $0 || relStr.hasPrefix($0 + "/") }) { return true }
         if relStr == "senses/ledger" || relStr.hasPrefix("senses/ledger/") { return true }
         if relStr == "senses/news" || relStr.hasPrefix("senses/news/") { return true }
         let parts = relStr.split(separator: "/").map(String.init)
@@ -777,6 +795,15 @@ enum FileSystemActions {
     // MARK: - write_file
 
     static func mutationRefusal(_ resolved: URL, _ ctx: ConnectorActionContext, write: Bool = true) -> JSONValue? {
+        if ctx.appDataWrite != nil, write {
+            let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path)
+            let protected = (Array(connectorSensitiveDataSubpaths) + connectorPartPrivateDataSubpaths + CapabilityLifecycle.protectedStores)
+                .map { dataRoot.appendingPathComponent($0) }
+                + [ctx.personaRoot.map { URL(fileURLWithPath: $0) } ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)]
+            if protected.contains(where: { isWithinRoots(resolved, [$0]) || isWithinRoots($0, [resolved]) }) {
+                return errResult("The path reaches a protected app store or executable authority.", code: "path_not_allowed")
+            }
+        }
         if write {
             do {
                 try CapabilityLifecycle.requireFileMutation(resolved,
@@ -784,8 +811,9 @@ enum FileSystemActions {
                     personaRoot: ctx.personaRoot.map { URL(fileURLWithPath: $0) })
             } catch { return errResult(error.localizedDescription, code: "path_not_allowed") }
         }
-        let allowed = allowedRoots(ctx)
-        if stringField(ctx.fileAccess, "sandbox") == "read-only" || stringField(ctx.fileAccess, "mode") == "read_only" {
+        let allowed = allowedRoots(ctx, write: write)
+        if (stringField(ctx.fileAccess, "sandbox") == "read-only" || stringField(ctx.fileAccess, "mode") == "read_only"),
+           !(ctx.appDataWrite == true && ctx.dataRoot.map { isWithinRoots(resolved, [URL(fileURLWithPath: $0)]) } == true) {
             return errResult("Sandbox is read-only — cannot write files. Request write access for this session.", code: "path_not_allowed")
         }
         if !allowed.isEmpty && !isWithinRoots(resolved, allowed) {
@@ -1029,6 +1057,37 @@ enum FileSystemActions {
     }
 
     // MARK: - list_dir
+
+    static func fileInfo(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
+        let rawPath = stringField(input, "path")
+        if rawPath.isEmpty { return errResult("path is required", code: "bad_input") }
+        let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot, followFinalLink: false)
+        let allowed = allowedRoots(ctx)
+        if !allowed.isEmpty && !isWithinRoots(resolved, allowed) {
+            return errResult("Path '\(resolved.path)' is outside sandbox roots: \(rootsRepr(allowed))", code: "path_not_allowed")
+        }
+        if isSensitiveDataPath(resolved, ctx) {
+            return errResult("Path '\(resolved.path)' is under a sensitive data sub-tree.", code: "path_not_allowed")
+        }
+        do {
+            var metadata = stat()
+            if resolved.path == "/" {
+                let fd = try VerifiedPath.open(resolved, flags: O_RDONLY | O_DIRECTORY)
+                defer { _ = Darwin.close(fd) }
+                guard fstat(fd, &metadata) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+            } else {
+                let parent = try VerifiedPath.openParent(of: resolved)
+                defer { parent.release() }
+                guard fstatat(parent.fd, parent.name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else { throw VerifiedPath.Failure.posix(errno) }
+            }
+            let type = metadata.st_mode & mode_t(S_IFMT)
+            let modified = Date(timeIntervalSince1970: Double(metadata.st_mtimespec.tv_sec) + Double(metadata.st_mtimespec.tv_nsec) / 1e9)
+            return .object(["name": .string(resolved.lastPathComponent), "directory": .bool(type == mode_t(S_IFDIR)),
+                "regular": .bool(type == mode_t(S_IFREG)), "size": .int(metadata.st_size),
+                "modified": .string(ISO8601DateFormatter().string(from: modified))])
+        } catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code) }
+        catch { return errResult(error.localizedDescription, code: "read_failed") }
+    }
 
     static func listDir(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let started = ContinuousClock.now
@@ -1329,7 +1388,10 @@ enum FileSystemActions {
             guard input["check_updates"] != .bool(true) else {
                 return errResult("Use app for an installed app version or check_updates for macOS updates, separately.", code: "bad_input")
             }
-            guard !app.isEmpty, let url = SystemAppControlAdapter.installedApplicationURL(named: app),
+            let installedURL: URL?
+            do { installedURL = try SystemAppControlAdapter.installedApplicationURL(named: app) }
+            catch { return errResult(error.localizedDescription, code: "app_index_unavailable") }
+            guard !app.isEmpty, let url = installedURL,
                   let bundle = Bundle(url: url), let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
                   !version.isEmpty else {
                 return errResult("No readable version for that exact installed app name. Supply its exact name or full .app path.", code: "app_version_unavailable")

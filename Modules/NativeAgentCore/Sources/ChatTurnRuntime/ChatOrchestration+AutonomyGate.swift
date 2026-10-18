@@ -26,93 +26,16 @@ import MacControl
 
 public typealias AutonomyResolver = ChatTurnContracts.AutonomyResolver
 
-/// Optional trust-aware refinement used only after SecurityCenter has
-/// authenticated the concrete conversation origin. Keeping this separate from
-/// `AutonomyResolver` preserves lightweight test/custom resolvers while letting
-/// Full Mac YOLO distinguish an allowlisted Telegram/iOS/Slack caller from an
-/// untrusted caller on the same nominal surface.
-public protocol OriginAwareAutonomyResolver: AutonomyResolver {
-    func autonomyLevel(
-        forTool toolName: String,
-        surface: String,
-        originTrusted: Bool
-    ) async throws -> String
-}
-
-extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
-    public func autonomyLevel(forTool toolName: String, surface: String) async throws -> String {
-        try await autonomyLevel(forTool: toolName, surface: surface, originTrusted: false)
-    }
-
-    public func autonomyLevel(
-        forTool toolName: String,
-        surface: String,
-        originTrusted: Bool
-    ) async throws -> String {
-        // Resolve the normalized policy and raw user-only overrides from one
-        // checked authority generation. Two independent reads could otherwise
-        // splice a just-revoked override with the prior broad posture.
-        let authorization = try await self.loadAuthorizationSnapshotChecked()
-        let policy = authorization.policy
-        // 2026-07-21 audit fix: an explicit USER-SET "blocked" entry
-        // OUTRANKS the broad yolo/full-Mac posture — previously an active
-        // yolo window silently flattened even a deliberate user-set
-        // "blocked". confirm/send_approval stay flattened (pinned behavior);
-        // consult the RAW user file, NOT the merged policy: merged code
-        // defaults would masquerade as explicit entries.
-        let yoloAuthority = SwiftNativeSecurityCenter.fullMacYoloAuthority(
-            tool: toolName,
-            surface: surface,
-            originTrusted: originTrusted,
-            snapshot: authorization
-        )
-        if yoloAuthority.admitted {
-            return "auto"
-        }
-        // SwiftNativeTrustCenter stores tool autonomy under `toolAutonomy`;
-        // autonomyForTool reads overrides from `autonomyOverrides`. Bridge.
-        var bundle: [String: JSONValue] = [:]
-        if case .object(let ta)? = policy["toolAutonomy"] {
-            bundle["autonomyOverrides"] = .object(ta)
-        }
-        if case .string(let def)? = policy["autonomyDefault"] {
-            bundle["autonomyDefault"] = .string(def)
-        }
-        return self.autonomyForTool(toolName, policy: bundle)
-    }
-}
+/// The law's answer by name; the input-aware answer is SecurityCenter's.
+extension SwiftNativeTrustCenter: AutonomyResolver {}
 
 // MARK: - AutonomyGate
 
 public actor AutonomyGate {
-    private let trust: any AutonomyResolver
     private let filer: (any ApprovalFiler)?
 
-    public init(
-        trust: any AutonomyResolver,
-        approvalFiler: (any ApprovalFiler)? = nil
-    ) {
-        self.trust = trust
+    public init(approvalFiler: (any ApprovalFiler)? = nil) {
         self.filer = approvalFiler
-    }
-
-    public func autonomyLevel(toolName: String, surface: String) async throws -> String {
-        try await trust.autonomyLevel(forTool: toolName, surface: surface)
-    }
-
-    public func autonomyLevel(
-        toolName: String,
-        surface: String,
-        originTrusted: Bool
-    ) async throws -> String {
-        if let originAware = trust as? any OriginAwareAutonomyResolver {
-            return try await originAware.autonomyLevel(
-                forTool: toolName,
-                surface: surface,
-                originTrusted: originTrusted
-            )
-        }
-        return try await trust.autonomyLevel(forTool: toolName, surface: surface)
     }
 
     /// File an approval request and await its resolution. Returns the final

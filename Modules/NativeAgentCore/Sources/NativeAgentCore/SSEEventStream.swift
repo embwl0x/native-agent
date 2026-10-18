@@ -15,6 +15,8 @@ public enum ProviderStreamContext {
     /// A live first-output cut must not repeat the learned deadline on retry.
     @TaskLocal public static var retryingLiveFirstOutputCut: Bool = false
     @TaskLocal public static var diagnosticEvent: (@Sendable (SSEEvent) -> Void)?
+    /// The transport validated the route, chose the adapter and is sending.
+    @TaskLocal public static var dispatched: (@Sendable () -> Void)?
 }
 
 /// One parsed Server-Sent Event.

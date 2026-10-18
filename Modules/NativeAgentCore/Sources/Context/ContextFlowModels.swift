@@ -544,60 +544,22 @@ public struct ContextStoredGeneration: Codable, Equatable, Sendable {
     }
 }
 
-public enum ContextReceiptKind: String, Codable, Sendable {
-    case compile
-    case selection
-    case expansion
-    case degraded
-    case feedback
-    case prewarm
-    case pressure
-}
-
-public struct ContextStoreReceipt: Codable, Equatable, Sendable {
-    public let id: UUID
-    public let kind: ContextReceiptKind
-    public let generationID: Int64?
-    public let summary: String
-    public let details: [String: String]
-    public let createdAt: Date
-
-    public init(
-        id: UUID = UUID(),
-        kind: ContextReceiptKind,
-        generationID: Int64? = nil,
-        summary: String,
-        details: [String: String] = [:],
-        createdAt: Date = Date()
-    ) {
-        self.id = id
-        self.kind = kind
-        self.generationID = generationID
-        self.summary = summary
-        self.details = details
-        self.createdAt = createdAt
-    }
-}
-
 public struct ContextStorePruneResult: Codable, Equatable, Sendable {
     public let deletedGenerations: Int
     public let deletedAtomVersions: Int
     public let deletedSourceVersions: Int
     public let deletedRelationshipVersions: Int
-    public let deletedReceipts: Int
 
     public init(
         deletedGenerations: Int,
         deletedAtomVersions: Int,
         deletedSourceVersions: Int,
-        deletedRelationshipVersions: Int,
-        deletedReceipts: Int
+        deletedRelationshipVersions: Int
     ) {
         self.deletedGenerations = deletedGenerations
         self.deletedAtomVersions = deletedAtomVersions
         self.deletedSourceVersions = deletedSourceVersions
         self.deletedRelationshipVersions = deletedRelationshipVersions
-        self.deletedReceipts = deletedReceipts
     }
 
     /// Total rows deleted across every category. A5.5(b): used to decide whether
@@ -605,7 +567,7 @@ public struct ContextStorePruneResult: Codable, Equatable, Sendable {
     /// pages, so a rewrite would be pure churn).
     public var totalDeleted: Int {
         deletedGenerations + deletedAtomVersions + deletedSourceVersions
-            + deletedRelationshipVersions + deletedReceipts
+            + deletedRelationshipVersions
     }
 }
 

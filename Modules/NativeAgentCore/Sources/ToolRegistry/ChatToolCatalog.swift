@@ -258,7 +258,7 @@ extension ChatCatalogTool {
         case "act": return "Use a control on your Mac's screen."
         case "image_generate": return "Create an image from a description."
         case "time_now": return "Check the current date and time."
-        case "inner_state", "agent_introspect", "daemon_introspect": return "Check how I'm doing and what I'm working on."
+        case "inner_state", "agent_introspect": return "Check how I'm doing and what I'm working on."
         case "recall_memory", "recall_search", "search_kg": return "Find something I remember."
         case "commit_memory": return "Remember something for later."
         case "search_chat_history", "session_search": return "Find an earlier conversation."

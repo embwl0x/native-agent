@@ -145,6 +145,7 @@ public enum ToolActivityPresentation {
 
     private static let titles = [
         "read": "Read a document", "apply_patch": "Edit files", "read_file": "Read a file",
+        "chat_reply": "Reply to a conversation",
         "codex_message": "Send a coding request", "restart_app": "Restart the app",
         "write_file": "Write a file", "git": "Work with version history", "install_app": "Install the app",
         "shell": "Run a command", "list_dir": "List files", "image_generate": "Create an image",

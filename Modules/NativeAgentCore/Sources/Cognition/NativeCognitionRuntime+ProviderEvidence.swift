@@ -8,15 +8,16 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import ProviderRouting
+import TurnTrace
 
 extension NativeCognitionRuntime {
     public nonisolated static func providerPathEvidence(
         providerID: String, dataRoot: URL, since: Date, now: Date = Date()
     ) async throws -> (model: String, observedAt: Date)? {
-        let receipt = try await SwiftNativePersistenceCore().readJSONLReporting(
-            dataRoot.appendingPathComponent("traces/events.jsonl"))
-        guard receipt.report.malformedLineCount == 0 else {
-            throw PersistenceCoreError.ioFailure("Provider evidence is incomplete; repair traces/events.jsonl before checking the provider.")
+        let receipt = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
+            .traceEvidence(now: now, since: since)
+        guard receipt.report.malformedLineCount == 0, !receipt.report.trailingPartialLine else {
+            throw PersistenceCoreError.ioFailure("Provider evidence is incomplete; inspect the retained trace sources before checking the provider.")
         }
         var newest: (model: String, observedAt: Date)?
         for row in receipt.rows {
@@ -61,16 +62,11 @@ extension NativeCognitionRuntime {
     }
 
     func restoreProviderLifecycleEvidence() async {  // internal for actor extensions (move-only Wave C)
-        let path = dataRoot.appendingPathComponent("traces/events.jsonl")
-        // This feed interleaves provider calls with tool, preload, plan and
-        // memory rows. Read a bounded mixed-event window, then keep the newest
-        // provider outcomes; tailing only 32 mixed rows restored just 15 live
-        // outcomes and made healthy providers look uncertain after restart.
-        let rows = (try? await SwiftNativePersistenceCore().tailJSONL(
-            path,
-            limit: Self.maximumProviderLifecycleEvidence * 64,
-            maxBytes: 1_048_576
-        )) ?? []
+        // Keep a bounded evidence window across the canonical turn files and
+        // standalone ledger, then restore the newest provider outcomes.
+        let rows = (try? await TurnTraceRecentReader(
+            dataRootOverride: dataRoot, rowLimit: Self.maximumProviderLifecycleEvidence * 64
+        ).traceEvidence(maximumReadBytes: 1_048_576).rows) ?? []
         var restored: [String: ProviderPathEvidence] = [:]
         for row in rows.reversed() {
             guard restored.count < Self.maximumProviderLifecycleEvidence else { break }
@@ -96,16 +92,18 @@ extension NativeCognitionRuntime {
               case .object(let payload)? = object["payload"],
               case .string(let provider)? = payload["provider"],
               case .string(let model)? = payload["model"] else { return nil }
-        let outcome: ProviderPathEvidenceOutcome = {
+        let outcome: ProviderPathEvidenceOutcome? = {
             guard case .string(let status)? = object["status"] else {
                 return .succeeded // completed rows from before status existed
             }
             switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             case "ok", "succeeded", "completed": return .succeeded
             case "cancelled", "canceled": return .cancelled
+            case "unknown": return nil
             default: return .failed
             }
         }()
+        guard let outcome else { return nil }
         let rowID: String = {
             if case .string(let id)? = object["id"], !id.isEmpty { return id }
             return "\(provider):\(model):\(rawDate)"

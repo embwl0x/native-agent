@@ -237,7 +237,7 @@ struct BotsEditorSheet: View {
                 time = next; weekday = Calendar.current.component(.weekday, from: next) - 1
             }
         case .cron(let expression, let timeZone):
-            when = "Custom"; cron = expression; zone = timeZone
+            when = "Custom"; cron = expression; zone = timeZone ?? ""
             let parts = expression.split(separator: " ").map(String.init)
             if parts.count == 5, parts[2] == "*", parts[3] == "*",
                let minute = Int(parts[0]), let hour = Int(parts[1]), (0...59).contains(minute), (0...23).contains(hour),

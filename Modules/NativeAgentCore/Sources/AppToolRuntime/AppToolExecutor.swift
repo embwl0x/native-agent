@@ -1,4 +1,7 @@
+import AuthoredCapabilities
+import AgentWorkspace
 import ChromeControl
+import CryptoKit
 import Privacy
 import Foundation
 import AttentionRouting
@@ -7,6 +10,7 @@ import ChatOrchestration
 import Cognition
 import CognitiveSubstrate
 import MacIntegration
+import MacControl
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
@@ -62,9 +66,10 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         presentation: any QuietToolPresentationPort,
         interactions: any ToolInteractionResolving
     ) {
-        AppActionPolicy.register(Dictionary(AppActions.all.map { ($0.id, $0.policy) },
-                                            uniquingKeysWith: { first, _ in first }))
-        ToolNameAliases.registerAppActions(AppActions.all.map { (id: $0.id, tool: $0.tool, input: $0.input) })
+        AppActionBinding.register(Dictionary(uniqueKeysWithValues: AppActions.all.map { ($0.id, $0.binding) }),
+                                 tools: Array(SwiftToolDispatcher.nativeToolDescriptors.values) + Self.sharedDescriptors,
+                                 authorableToolName: SwiftToolDispatcher.isAuthorableToolName,
+                                 partPolicy: { id in AppActions.action(id, dataRoot: securityCenter.dataRoot)?.binding })
         // Register a closure, not a static table dependency: app's schema
         // already reads AppActions during descriptor assembly below.
         RunawayOutputDetector.registerAppReadOnlyCalls(Self.doorReadOnly)
@@ -131,7 +136,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// (ToolNameAliases). The app itself is the one `app` door; the browser
     /// tools and `chat_reply` are its actions (browser.*, chrome.*, chat.reply)
     /// and stay here for internal callers and the membranes that name them.
-    private static let buckets: [String: ChatToolCatalogBucket] = Dictionary(uniqueKeysWithValues:
+    package static let buckets: [String: ChatToolCatalogBucket] = Dictionary(uniqueKeysWithValues:
         browserToolNames.map { ($0, .browser) } + [("chat_reply", .core)] + doorToolNames.map { ($0, .alwaysOn) })
 
     /// Built once: the schemas are constant, and Core reads this on every call.
@@ -165,7 +170,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             // MacIntegration gate. Check the gate here so the user's "iPhone
             // Notifications" Write toggle actually denies the call.
             let admission = await securityCenter.fullMacYoloAuthority(
-                tool: tool, origin: AppChatToolDispatcher.securityOrigin(input: input, surface: surface))
+                tool: tool, origin: AppChatToolDispatcher.securityOrigin(surface: surface))
             let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMobile, mode: .write, fullMacAdmitted: admission.admitted)
             guard allowed else {
                 return Self.macIntegrationDeniedEnvelope(integration: MacIntegrationID.notifyMobile, mode: "write")
@@ -173,7 +178,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             return try await runMobileNotify(input: input, surface: surface)
         case "mac_notify":
             let admission = await securityCenter.fullMacYoloAuthority(
-                tool: tool, origin: AppChatToolDispatcher.securityOrigin(input: input, surface: surface))
+                tool: tool, origin: AppChatToolDispatcher.securityOrigin(surface: surface))
             let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write, fullMacAdmitted: admission.admitted)
             guard allowed else {
                 return Self.macIntegrationDeniedEnvelope(integration: MacIntegrationID.notifyMac, mode: "write")
@@ -322,18 +327,70 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             }
             let call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
                                                       sessionId: Self.inputString(input["__session_id"]))
-            do { return try await perform(action.tool, call) }
+            do {
+                var result = try await perform(action.tool, call)
+                // A read that failed changed nothing: its receipt says so, whatever the inner layer guessed.
+                if action.read, case .object(var fields) = result, fields["status"] == .string("failed"),
+                   fields["effects"] != .string("occurred"), fields["effects"] != .string("partial") {
+                    fields["effects"] = .string("none")
+                    fields["remedy"] = .object(["kind": .string("inspect"), "next_call": .null,
+                        "instruction": .string("Nothing changed. Do what the reason names, or tell the person why.")])
+                    result = .object(fields)
+                }
+                if action.partAction, case .object(let fields) = result, let returned = fields["returned"] {
+                    var answer: [String: JSONValue] = if case .object(let answer) = returned { answer } else { ["result": returned] }
+                    if fields["status"] == .string("ok") || fields["status"] == .string("refused") && answer["status"] == .string("failed") {
+                        // The part supplies its payload; only the runner can attest its effects.
+                        for key in ["effects", "calls", "changed"] { answer[key] = fields[key] }
+                        return .object(answer)
+                    }
+                }
+                return result
+            }
             catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
         }
         // A setting and a card hold the posture gate themselves, and say it in
         // their own words (a setting's requested and current values; a card's
         // origin and Full Mac checks).
         if action.id == "setting.set" { return await runAppSettingSet(input: input, surface: surface) }
+        if action.id == "setting.get" { return await runAppSettingGet(input: input) }
         if action.isCard { return await runCardAction(input: input, surface: surface) }
-        if !action.safe, !action.readOnly(args: input), let refusal = await Self.quietChangesRefusal() { return refusal }
         try Task.checkCancellation()
         let verb = Self.inputString(action.input["verb"]) ?? ""
         switch action.tool {
+        case "mac_apps":
+            let name = Self.inputString(input["name"]) ?? ""
+            let every = try await MacAppIndex.shared.apps().filter { name.isEmpty || $0.name.localizedCaseInsensitiveContains(name) }
+            let all = input["all"] == .bool(true)
+            let apps = all ? every : MacAppIndex.installed(every)
+            let twice = MacAppIndex.collisions(apps)
+            // Two installed apps with one shown name: each goes by its file name, and says so;
+            // when the file names tie as well, by its folder ("NativeAgent (~/Applications)").
+            var fileNames: [String: Int] = [:]
+            for app in apps where twice.contains(app.name.lowercased()) {
+                fileNames[app.url.deletingPathExtension().lastPathComponent.lowercased(), default: 0] += 1
+            }
+            let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+            // One bundle id on two different apps (a beta beside its release): a launch by id is a coin flip, so the row says so.
+            var ids: [String: Int] = [:]
+            for app in apps { ids[app.bundleID ?? "", default: 0] += 1 }
+            let rows: [JSONValue] = apps.map { app in
+                guard case .object(var fields) = app.json else { return app.json }
+                if ids[app.bundleID ?? "", default: 0] > 1 { fields["bundle_id_shared"] = .bool(true) }
+                guard twice.contains(app.name.lowercased()) else { return .object(fields) }
+                let file = app.url.deletingPathExtension().lastPathComponent
+                var folder = app.url.deletingLastPathComponent().standardizedFileURL.path
+                if folder.hasPrefix(home) { folder = "~" + folder.dropFirst(home.count) }
+                fields["shown_name"] = fields["name"]
+                fields["name"] = .string(fileNames[file.lowercased(), default: 0] > 1 ? "\(file) (\(folder))" : file)
+                fields["name_collision"] = .bool(true)
+                return .object(fields)
+            }
+            return .object(["status": .string("ok"), "apps": .array(rows), "count": .int(Int64(apps.count)),
+                            "other_copies_and_ios": .int(Int64(every.count - MacAppIndex.installed(every).count)),
+                            "source": .string("the Mac's app index (Spotlight): the installed copy of each Mac app, as the Apps screen shows them"
+                                + (all ? ", plus every other copy (builds, backups) and iOS build the Mac indexes, tagged by kind and platform" : "; all:true lists other copies and iOS builds too")
+                                + "; an app on a volume Spotlight does not index is not listed")])
         case "undo":
             return try await doorUndo(input: input)
         case "read_file" where action.id == "chrome.history":
@@ -355,8 +412,6 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
                 dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         case "photos_read":
             return await runPhotosRead(verb: verb, input: input)
-        case "weather_forecast":
-            return try await runWeatherForecast(input: input, surface: surface)
         case "sense_act":
             return await runSenseAct(input: input)
         case "sense_make":
@@ -373,6 +428,38 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             return await runMyQueue(verb: verb, input: input, surface: surface)
         case "house_file":
             return await runHouseFile(input: input, surface: surface)
+        case "resident_wake":
+            let line = (Self.inputString(input["line"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let part = SkillRunContext.partID else {
+                return Self.doorRefusal("not_a_part", "home.arrive is a part's way to you; this call came from no part's run. Nothing was filed.",
+                    remedy: "none", "Say it in this turn instead.")
+            }
+            guard !line.isEmpty else {
+                return Self.doorRefusal("invalid_args", "Pass line: what it should tell you. Nothing was filed.",
+                    remedy: "correct_arguments", "Call home.arrive with line.")
+            }
+            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let format = DateFormatter()
+            format.dateFormat = "yyyy-MM-dd"
+            let day = format.string(from: Date())
+            var identity = Data(line.utf8)
+            if case .object(let input) = SkillRunContext.input, input["signal"] == .string("app.installed") {
+                identity = try JSONValue.array([.string(line), input["bundle_id"] ?? .null, input["version"] ?? .null]).serializedData(pretty: false)
+            }
+            let digest = SHA256.hash(data: identity).prefix(8).map { String(format: "%02x", $0) }.joined()
+            let id = "part:" + part + ":" + day + ":" + digest
+            guard !ResidentWake.knows(id, dataRoot: root) else {
+                return .object(["status": .string("ok"), "effects": .string("none"), "detail": .string("Already on your home today.")])
+            }
+            // The part's thread carries the hop rule, so a part cannot keep waking her.
+            var item = ResidentWake.Item(id: id, line: part + ": " + line, thread: "part:" + part, home: true)
+            if let taint = PeerDataTaint.current, taint.isTainted { item.agent = taint.sourceDescription }
+            guard ResidentWake.shared.request(dataRoot: root, reason: "what your parts noticed", items: [item]) else {
+                return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("not_kept"),
+                                "detail": .string("The arrival could not be kept, so nothing was filed. Call it again.")])
+            }
+            return .object(["status": .string("ok"), "effects": .string("occurred"),
+                            "detail": .string("On your home; it wakes you once.")])
         case "workshop_reject":
             let id = Self.inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !id.isEmpty else {
@@ -452,8 +539,8 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// What would refuse an action now, asked without running it, for
     /// the door's preview: the checks its real run makes first, through the
     /// same functions (a card's `cardRefusal`, a setting's `settingRefusal`,
-    /// Safe, the composer's `composerRefusal`, the app's inbox and chat
-    /// fences). Nil when nothing would.
+    /// the composer's `composerRefusal`, the app's inbox and chat fences).
+    /// Nil when nothing would.
     @MainActor
     func foldedRefusal(_ action: AppAction, input: [String: JSONValue], surface: String) async -> JSONValue? {
         if action.tool == "request_interaction" {
@@ -476,7 +563,6 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         if action.isFold { return await AppDoorReentry.validate?(action.tool, input) }
         if action.isCard { return await cardRefusal(input: input, surface: surface) }
         if action.id == "setting.set" { return await settingRefusal(input: input) }
-        if !action.safe, let refusal = await Self.quietChangesRefusal() { return refusal }
         if action.tool == "rewrite_memory" {
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             do {

@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import CryptoKit
 import Foundation
 import NativeAgentCore
@@ -11,7 +12,7 @@ public protocol OwnedAppCalling: Sendable {
 /// Exact executable bytes, not an admission. The lifecycle owner checks the
 /// selected version and authority before handing a program to the runner.
 public struct OwnedProgram: Codable, Sendable, Equatable {
-    public enum Kind: String, Codable, Sendable { case sense, tool, skill, script }
+    public enum Kind: String, Codable, Sendable { case sense, tool, skill, script, turn }
     public enum Entry: String, Codable, Sendable { case functionBody, run, sense }
 
     public let kind: Kind
@@ -25,18 +26,21 @@ public struct OwnedProgram: Codable, Sendable, Equatable {
     public let permissions: [String]
     public let reach: SenseReach
     public let seconds: Double
+    private let resident: Bool?
+    public var isResident: Bool { resident == true }
 
     public init(kind: Kind, id: String, version: String, source: String, entry: Entry,
                 schema: JSONValue = .object([:]), dependencies: [String] = [],
-                permissions: [String] = [], reach: SenseReach = SenseReach(), seconds: Double? = nil) {
+                permissions: [String] = [], reach: SenseReach = SenseReach(), seconds: Double? = nil, resident: Bool = false) {
         self.kind = kind; self.id = id; self.version = version; self.source = source; self.entry = entry
         self.schema = schema; self.dependencies = dependencies; self.permissions = permissions; self.reach = reach
         self.seconds = seconds ?? (kind == .sense ? 30 : kind == .tool ? 10 : 60)
+        self.resident = resident ? true : nil
         digest = SHA256.hash(data: Data(source.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    public var sourceLimit: Int { kind == .script || kind == .skill ? 8 * 1024 : 512 * 1024 }
-    public var returnLimit: Int { kind == .tool ? 4 * 1024 * 1024 : OwnedProgramRunner.returnLimit }
+    public var sourceLimit: Int { AbilityStore.sourceLimit }
+    public var returnLimit: Int { kind == .tool || kind == .turn ? 4 * 1024 * 1024 : OwnedProgramRunner.returnLimit }
 
     public func validate() throws {
         guard !id.isEmpty, !version.isEmpty, seconds.isFinite, seconds > 0,
@@ -53,13 +57,17 @@ public struct OwnedProgram: Codable, Sendable, Equatable {
 /// the shared journal; dependencies and permissions never grant an action.
 public struct OwnedProgramAction: Sendable {
     public let id: String
+    public let partID: String?
     public let page: String
     public let read: Bool
     public let advisory: Bool
+    /// The action runs a program she wrote; a recording never runs one.
+    public let program: Bool
     public let readOnly: @Sendable ([String: JSONValue]) -> Bool
-    public init(id: String, page: String, read: Bool, advisory: Bool = false,
+    public init(id: String, page: String, read: Bool, advisory: Bool = false, partID: String? = nil, program: Bool = false,
                 readOnly: @escaping @Sendable ([String: JSONValue]) -> Bool) {
-        self.id = id; self.page = page; self.read = read; self.advisory = advisory; self.readOnly = readOnly
+        self.id = id; self.partID = partID; self.page = page; self.read = read; self.advisory = advisory; self.program = program
+        self.readOnly = readOnly
     }
 }
 
@@ -101,6 +109,8 @@ public protocol OwnedProgramHostProfile: Sendable {
     /// Return a terminal receipt with status, effects and result, including
     /// partial/unknown effects on failure. Preview writes never reach this owner.
     func primitive(_ operation: String, arguments: JSONValue, preview: Bool) async throws -> JSONValue
+    /// Her turn part's synchronous reach (`turn.persona()` and the rest).
+    func reach(_ name: String) async throws -> JSONValue
 }
 
 extension OwnedProgramHostProfile {
@@ -112,6 +122,9 @@ extension OwnedProgramHostProfile {
     public func primitiveAction(_ operation: String) -> OwnedProgramAction? { nil }
     public func primitive(_ operation: String, arguments: JSONValue, preview: Bool) async throws -> JSONValue {
         throw SenseFailure(code: "unsupported", message: "This host does not admit primitive \(operation).")
+    }
+    public func reach(_ name: String) async throws -> JSONValue {
+        throw SenseFailure(code: "unsupported", message: "Only her turn part reaches turn.\(name)().")
     }
 }
 

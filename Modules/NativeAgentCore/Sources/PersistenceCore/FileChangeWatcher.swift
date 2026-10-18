@@ -36,7 +36,8 @@ public final class FileChangeWatcher: @unchecked Sendable {
     }
 
     fileprivate init(unpooledPath: URL, handler: @escaping Handler) {
-        self.paths = [unpooledPath.standardizedFileURL]
+        // The registry's own key, already standardized: publish matches on it.
+        self.paths = [unpooledPath]
         self.handler = handler
         // Return only after the vnode sources are armed. An asynchronous first
         // arm leaves a startup window where a CLI can create/replace the file
@@ -287,17 +288,20 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// `path` is the entry's own key. Standardizing it again here missed the
+    /// entry once a watched file appeared: an existing path under /private/tmp
+    /// or /private/var standardizes to /tmp or /var.
     private func publish(path: URL) {
         lock.lock()
         let handlers: [FileChangeWatcher.Handler]
-        if let entry = entries[path.standardizedFileURL] {
+        if let entry = entries[path] {
             handlers = Array(entry.handlers.values)
         } else {
             handlers = []
         }
         lock.unlock()
         for handler in handlers {
-            handler(path.standardizedFileURL)
+            handler(path)
         }
     }
 

@@ -267,7 +267,6 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     public var sqliteProposalCount: Int
     /// `nil` before the direct store probe, `false` when it could not read.
     public var storageReadable: Bool?
-    public var migrated: Bool
     public var coreMLReady: Bool
     public var coreMLModelLabel: String
     public var embedderDimensions: Int
@@ -340,7 +339,6 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         sqliteRecordCount: 0,
         sqliteProposalCount: 0,
         storageReadable: nil,
-        migrated: false,
         coreMLReady: false,
         coreMLModelLabel: "MiniLM-L6-v2 (pending .mlpackage)",
         embedderDimensions: 384,
@@ -373,19 +371,11 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
             snap.storageReadable = true
             snap.sqliteRecordCount = counts.active
             spotlightEligibleCount = counts.active
-            storageGeneration = try await store.projectionGenerationFingerprint()
+            storageGeneration = try await store.spotlightGenerationFingerprint()
             snap.sqliteProposalCount = counts.pendingProposals
         } catch {
             snap.storageReadable = false
         }
-
-        // Migration marker — written by MemoryV2Migrator on a successful
-        // JSON → SQLite import. Presence proves the new store is the
-        // canonical backend on this data root.
-        let marker = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent(".migrated_to_sqlite_v1", isDirectory: false)
-        snap.migrated = FileManager.default.fileExists(atPath: marker.path)
 
         // Core ML MiniLM probe. 2026-06-07 task #88: this used to roll its
         // own `Bundle.main.url(forResource: "MiniLM_L6_v2", ...)` check that

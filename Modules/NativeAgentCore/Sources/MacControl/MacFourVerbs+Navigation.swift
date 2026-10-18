@@ -19,22 +19,22 @@ extension MacFourVerbs {
         guard !trimmed.isEmpty else {
             return MacFourVerbsReply(ok: false, text: "Where to? Give me an app, a folder, a file or a link.")
         }
-        let behind: [String: JSONValue] = front ? [:] : ["background": .bool(true)]
-        func opening(_ url: URL) -> [String: JSONValue] { behind.merging(["url": .string(url.absoluteString)]) { _, new in new } }
-        // Read the recipient even while foreground activation is settling.
-        var landingApp: String?
-
         // AppKit cannot raise an app over loginwindow. In User's ordinary setup
         // that is the screensaver layer, and the existing wake organ is the
         // safe, bounded way through it. A four-verb caller should never have to
         // discover a fifth tool or translate `loginwindow` into that action.
-        // The look owner wakes only while that layer covers the screen and
-        // keeps all wake/injection gates below this surface.
-        if front, case .blind(let readiness) = await sight(part: nil),
-           readiness.detail["error"] == .string("display_obstructed")
-            || readiness.detail["error"] == .string("mac_locked") {
-            return readiness
+        // A foreground move needs the screen, so the wake owner clears a covered
+        // screen and steps her windows aside before it; behind, nothing is raised.
+        let placement: [String: JSONValue] = front ? ["require_front": .bool(true)] : ["background": .bool(true)]
+        func opening(_ url: URL) -> [String: JSONValue] { placement.merging(["url": .string(url.absoluteString)]) { _, new in new } }
+        func covered(_ result: MacControlResult) -> MacFourVerbsReply? {
+            guard let code = result.error, ["display_obstructed", "mac_locked"].contains(code) else { return nil }
+            let why = Self.string(Self.object(result.output)["message"]) ?? MacScreenLock.reply
+            return MacFourVerbsReply(ok: false, text: "I can't see the screen right now. " + why,
+                                     detail: ["error": .string(code), "message": .string(why)])
         }
+        // Read the recipient even while foreground activation is settling.
+        var landingApp: String?
 
         let result: MacControlResult
         let moved: String
@@ -67,7 +67,8 @@ extension MacFourVerbs {
                 // independently verifies that the requested app is frontmost.
                 // Behind, it launches without activating and raises nothing.
                 let appResult = try await host.dispatch(
-                    action: "focus_app", body: behind.merging(["app": .string(trimmed)]) { _, new in new })
+                    action: "focus_app", body: placement.merging(["app": .string(trimmed)]) { _, new in new })
+                if let refusal = covered(appResult) { return refusal }
                 if appResult.ok {
                     result = appResult
                     let out = Self.object(appResult.output)
@@ -76,15 +77,16 @@ extension MacFourVerbs {
                     verificationDestination = Self.string(out["bundle_identifier"]) ?? trimmed
                     landingApp = verificationDestination
                     moved = front ? "Switched to \(trimmed)."
-                        : out["launched"] == .bool(true) ? "Launched \(trimmed) behind; nothing came to the front."
-                        : "\(trimmed) is running behind; nothing came to the front."
+                        : out["launched"] == .bool(true) ? "Launched \(trimmed) without activating it."
+                        : "\(trimmed) is running; I activated nothing."
                     settlesAsynchronously = true
                 } else {
                     // Search folders only when no such app exists. An app that
                     // was found but slow to come forward is not a folder, and the
                     // search can raise a Desktop prompt that holds the whole turn.
                     var appMissing = false
-                    if case .object(let out) = appResult.output, out["status"] == .string("failed") { appMissing = true }
+                    if case .object(let out) = appResult.output, out["status"] == .string("failed"),
+                       appResult.error?.contains("app_not_found:") == true { appMissing = true }
                     switch !appMissing ? NamedFolderResolution.none : Self.namedFolder(trimmed, under: namedLocationRoots) {
                     case .unique(let folder):
                         result = try await host.dispatch(action: "open_target", body: opening(folder))
@@ -113,6 +115,7 @@ extension MacFourVerbs {
             }
         }
         guard !Task.isCancelled else { return MacFourVerbsReply(ok: false, text: "I stopped waiting for the app.") }
+        if let refusal = covered(result) { return refusal }
         if !front, landingApp == nil {
             return MacFourVerbsReply(ok: result.ok, text: result.ok ? moved + " Nothing came to the front."
                 : "I couldn't complete the request to go to \(trimmed).", detail: Self.operationDetail(result))
@@ -151,6 +154,10 @@ extension MacFourVerbs {
                 detail: detail
             )
         case .seen(let hit):
+            // Behind is what was asked; where it is now is the fresh screen's to
+            // say, since an app can bring itself forward as it opens.
+            let receipt = front ? moved : moved
+                + (hit.isFront ? " \(hit.appName ?? trimmed) is in front." : " Nothing came to the front.")
             let landed = Self.destination(verificationDestination, matches: hit)
             var detail = Self.operationDetail(result).merging(hit.detail) { current, _ in current }
             detail["observed_destination"] = landed.map(JSONValue.bool) ?? .null
@@ -160,14 +167,14 @@ extension MacFourVerbs {
                 detail["verification_evidence"] = .string("fresh_screen_destination_match")
                 return MacFourVerbsReply(
                     ok: true,
-                    text: (result.ok ? moved : "\(trimmed) is in front.") + " Now looking at " + hit.place + ".\n" + hit.render,
+                    text: (result.ok ? receipt : "\(trimmed) is in front.") + " Now looking at " + hit.place + ".\n" + hit.render,
                     detail: detail
                 )
             }
             if landed == nil, result.ok {
                 return MacFourVerbsReply(
                     ok: true,
-                    text: moved + " The fresh screen is " + hit.place
+                    text: receipt + " The fresh screen is " + hit.place
                         + ", but it does not expose enough destination identity to prove the exact landing.\n"
                         + hit.render,
                     detail: detail

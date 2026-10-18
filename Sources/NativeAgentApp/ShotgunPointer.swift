@@ -84,7 +84,7 @@ final class AgentPointerOverlay {
         panel.isOpaque = false
         panel.hasShadow = false
         panel.animationBehavior = .none
-        panel.sharingType = .none
+        panel.sharingType = .readOnly  // her captures skip it by number; a recording shows her pointer
         panel.contentView = NSHostingView(rootView: AgentPointerView(model: model))
         self.panel = panel
         return panel

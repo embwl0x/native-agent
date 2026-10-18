@@ -379,10 +379,7 @@ extension SwiftNativeChatOrchestrationClient {
                 requestedModel: model,
                 requestedReasoningEffort: reasoningEffort
             )
-        await LLMCallContext.$admittedModel.withValue(admission.modelId) {
-        await LLMCallContext.$providerId.withValue(admission.providerId) {
-        await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
-        await LLMCallContext.$serviceTier.withValue(admission.serviceTier) {
+        await withModelContext(admission, surface: surface) {
             await runAdmittedStream(
                 message: message,
                 sessionId: sessionId,
@@ -395,9 +392,6 @@ extension SwiftNativeChatOrchestrationClient {
                 suppressUserAppend: suppressUserAppend,
                 continuation: continuation
             )
-        }
-        }
-        }
         }
         }
         } catch {

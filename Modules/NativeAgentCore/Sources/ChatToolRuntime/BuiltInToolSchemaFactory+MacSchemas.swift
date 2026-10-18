@@ -12,10 +12,17 @@ extension BuiltInToolSchemaFactory {
         includeFullMacAccessibilityInjectionTools: Bool,
         includeActivityQueryTool: Bool
     ) {
+        schemas.append(requestedSchema(
+            name: "mac_location",
+            toolClass: .read,
+            description: "Read where this Mac is through Location Services. If permission is unavailable, ask through its ordinary permission card; never infer a city from timezone or network information.",
+            parametersJSON: params(properties: [], required: [])
+        ))
         if includeFullMacFileTools {
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "mac_screenshot_save",
+                    toolClass: .write,
                     description: "Save a system screenshot as PNG with macOS screencapture only when a saved file is requested. To look at the screen or take a screenshot and describe it, use mac.look pixels:true, which respects owner takeover and writes no file. Saving defaults to all displays, Desktop and macOS screenshot naming; returns saved paths without displaying pixels to the model. Optional window_id, app (front visible window by exact app name) or region selects one capture. Requires Full Mac file access, the Accessibility category and Screen Recording permission; existing files are refused.",
                     parametersJSON: params(properties: [
                         ("path", strSchema("PNG destination path; defaults to Desktop/Screenshot with the local date and time. Additional displays get numbered PNG paths.")),
@@ -26,6 +33,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "file_excerpt",
+                    toolClass: .read,
                     description: "Read numbered lines of a local text file. Returns start_line, end_line, total_lines, has_more and next arguments. For byte windows use files.read. Requires Trust Center Full Mac file access.",
                     parametersJSON: params(
                         properties: [
@@ -38,6 +46,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "grep",
+                    toolClass: .read,
                     description: "Search inside local text files for lines matching a pattern or phrase. Returns bounded matching text with file paths, line numbers and explicit coverage; narrow the path/pattern when results are limited. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
@@ -50,6 +59,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "git_status",
+                    toolClass: .read,
                     description: "Read branch, ahead/behind counts, and staged, unstaged, and untracked changes. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [("cwd", strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace."))],
@@ -58,6 +68,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "git_diff",
+                    toolClass: .read,
                     description: "Read staged or unstaged changes, or committed patches since a date, optionally limited to a path. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
@@ -71,6 +82,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "git_log",
+                    toolClass: .read,
                     description: "Read commits and changed files across them, optionally since a date. With since, the file union covers the entire period even when commit details reach their limit. Returns per-commit files and has_more coverage. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
@@ -84,6 +96,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "repo_dirty_summary",
+                    toolClass: .read,
                     description: "Read a combined summary of the branch, changed files, and recent commits. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
@@ -97,6 +110,7 @@ extension BuiltInToolSchemaFactory {
                 // The admitted bridge uses the same autonomy gate as local chat.
                 requestedSchema(
                     name: "shell",
+                    toolClass: .write,
                     description: "Run a shell command via /bin/sh -c. Captures stdout/stderr/exit_code. Requires Trust Center Full Mac file_ops_allowed; queues an approval request unless toolAutonomy=auto for 'shell'. Default cwd is a verified NativeAgent source checkout when present, otherwise the canonical <dataRoot>/workspace used by public installs. Default timeout: 120s, max 600s. Use bash tool instead if you need bash-specific syntax (arrays, [[, process substitution). For checks, do not append `| tail; echo exit...` because that can mask the real failing exit code. \(Self.nativeToolPreferenceGuidance)",
                     parametersJSON: params(
                         properties: [
@@ -109,6 +123,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "bash",
+                    toolClass: .write,
                     description: "Run a shell command via /bin/bash -c (not sh). Same shape as shell. Use this when the command needs bash features: arrays, [[ ]] tests, process substitution, $'...' ANSI-C quoting, etc. For checks, do not append `| tail; echo exit...` because that can mask the real failing exit code. \(Self.nativeToolPreferenceGuidance)",
                     parametersJSON: params(
                         properties: [
@@ -121,6 +136,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "git",
+                    toolClass: .write,
                     description: "Run git with explicit args. Equivalent to `git <args>`. Returns stdout/stderr/exit_code. Default cwd is a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace. Default timeout 60s. Use for status, diff, log, blame, show, etc. Args may be an array (preferred) or a shell-style string for forgiving model calls. Mutating ops remain autonomy-gated.",
                     parametersJSON: params(
                         properties: [
@@ -133,6 +149,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "apply_patch",
+                    toolClass: .write,
                     description: "Apply a unified diff patch via `git apply` (3-way merge by default inside a Git repository; plain apply outside one). Writes the patch payload to a tmpfile then runs git apply against it. Returns exit_code + stderr (which contains conflict info on failure). Default cwd is a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.",
                     parametersJSON: params(
                         properties: [
@@ -145,6 +162,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "swift_build",
+                    toolClass: .write,
                     description: "Run a fixed-argv SwiftPM build. Ordinary modes use NativeAgent's workspace-confined outer wrapper; active Full Mac YOLO may build an explicitly selected external package without that wrapper. Command shape is `swift build --disable-sandbox --package-path <package_path> --configuration <debug|release>` plus optional product/target/jobs. TrustCenter, autonomy, audit receipts, and sensitive-path fences still apply.",
                     parametersJSON: params(
                         properties: [
@@ -161,6 +179,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "swift_test",
+                    toolClass: .write,
                     description: "Run fixed-argv SwiftPM tests. Ordinary modes use NativeAgent's workspace-confined outer wrapper; active Full Mac YOLO may test an explicitly selected external package without that wrapper. Command shape is `swift test --disable-sandbox --package-path <package_path> --configuration <debug|release>` plus optional filter/jobs. TrustCenter, autonomy, audit receipts, and sensitive-path fences still apply.",
                     parametersJSON: params(
                         properties: [
@@ -176,11 +195,13 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "remote_node_list",
+                    toolClass: .read,
                     description: "List explicitly configured MacControl trusted remote effect nodes, their pinned host-key fingerprints, enablement, and executable allowlists. This is a read-only inventory; remote nodes never own chat, memory, context, or schedules.",
                     parametersJSON: params(properties: [], required: [])
                 ),
                 requestedSchema(
                     name: "remote_node_execute",
+                    toolClass: .send,
                     description: "Run one argv-shaped command on an explicitly enabled trusted remote node. The node is re-read at effect time, the executable must exactly match its allowlist, SSH host identity is pinned, output is bounded, and a durable receipt is written. This remains behind Trust Center Full Mac; standard modes follow their normal autonomy gate, while admitted Full Mac YOLO runs without a per-call prompt.",
                     parametersJSON: params(
                         properties: [
@@ -194,6 +215,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "install_app",
+                    toolClass: .write,
                     description: "Canonical NativeAgent app install after Swift source changes. Schedules `script/install_app.sh` outside NativeAgent's outer sandbox, after a short grace delay, so the current reply can persist before the installer rebuilds, signs, installs to ~/Applications/NativeAgent.app, and restarts the app. Use this when `swift_build` passed and the running UI must pick up code changes. Do not use `restart_app` for this; restart_app only relaunches the already-installed bundle.",
                     parametersJSON: params(
                         properties: [
@@ -207,6 +229,7 @@ extension BuiltInToolSchemaFactory {
                 // The detached relauncher preserves the reply grace and ten-minute cooldown.
                 requestedSchema(
                     name: "restart_app",
+                    toolClass: .write,
                     description: "Restart the already-installed NativeAgent.app bundle: writes an audit receipt, spawns a detached relauncher, then terminates the app after a \(Int(AppRestartCoordinator.terminateGraceSeconds))s grace so this turn finishes persisting. This does not build, stage, sign, or install new Swift code; after Swift source edits use install_app instead. After this tool returns 'restarting', keep the final reply to one short sentence; it must be composed and persisted inside the grace window. The relauncher waits for the process to exit and reopens the app bundle. Refuses if a tool-initiated restart fired within the last 10 minutes (cooldown). Requires Trust Center Full Mac file_ops_allowed; queues an approval unless toolAutonomy=auto for 'restart_app'.",
                     parametersJSON: params(
                         properties: [
@@ -220,6 +243,7 @@ extension BuiltInToolSchemaFactory {
         if includeFullMacSystemTools {
             schemas.append(requestedSchema(
                 name: "mac_media",
+                toolClass: .write,
                 description: "Control the Mac's Now Playing app with a system media key: play/pause, next or previous across Music, Spotify, browsers and podcasts. Play/pause is a toggle; the receipt reports the key sent and observed Music/Spotify states without claiming an unknown app's playback state. Requires Full Mac system access; never launches Music or Spotify to read their states.",
                 parametersJSON: params(properties: [
                     ("action", obj([("type", .string("string")),
@@ -229,6 +253,7 @@ extension BuiltInToolSchemaFactory {
             ))
             schemas.append(requestedSchema(
                 name: "mac_volume",
+                toolClass: .write,
                 description: "Read or change this Mac's output volume and mute state directly; no screen or guide read is needed. With no args, read only. Set level, adjust by signed percentage points, or set muted; returns the observed level and mute state.",
                 parametersJSON: params(properties: [
                     ("level", intSchema("Output volume percent (0–100); cannot combine with adjust.", minimum: 0, maximum: 100)),
@@ -239,7 +264,8 @@ extension BuiltInToolSchemaFactory {
             schemas.append(
                 requestedSchema(
                     name: "system_info",
-                    description: "Read this Mac's system, disk, memory, top five CPU/memory processes, battery, network, local/public IP, connected macOS VPN services and Wi-Fi SSID directly; unavailable fields are labeled. Public IP uses a 3-second HTTPS lookup. Only when requested, speed_test:true measures upload/download and responsiveness with networkQuality, limited to 20 seconds and using internet bandwidth. With app, only read that installed app's bundle version by exact name or full .app path in the standard application directories. With check_updates:true, only list available macOS software updates, read-only with a 30-second deadline; this does not check NativeAgent or App Store apps. Use app, check_updates or speed_test separately. Check App Store → Updates for App Store app updates. No app opening, screen or guide read is needed. Available only when Trust Center Full Mac system access is active.",
+                    toolClass: .read,
+                    description: "Read this Mac's system, disk, memory, top five CPU/memory processes, battery, network, local/public IP, connected macOS VPN services and Wi-Fi SSID directly; unavailable fields are labeled. Public IP uses a 3-second HTTPS lookup. Only when requested, speed_test:true measures upload/download and responsiveness with networkQuality, limited to 20 seconds and using internet bandwidth. With app, only read that installed app's bundle version by exact name or full .app path from the Mac's app index. With check_updates:true, only list available macOS software updates, read-only with a 30-second deadline; this does not check NativeAgent or App Store apps. Use app, check_updates or speed_test separately. Check App Store → Updates for App Store app updates. No app opening, screen or guide read is needed. Available only when Trust Center Full Mac system access is active.",
                     parametersJSON: params(properties: [
                         ("check_updates", boolSchema("List macOS software updates instead of system information; never installs anything.")),
                         ("app", strSchema("Exact installed app name or full .app path; read CFBundleShortVersionString and build directly without launching it.")),
@@ -254,6 +280,7 @@ extension BuiltInToolSchemaFactory {
                 // Clipboard reads redact text and name non-text flavors without dumping them.
                 requestedSchema(
                     name: "clipboard_read",
+                    toolClass: .read,
                     description: "Read what is on this Mac's clipboard right now, as text. Read-only: it leaves the clipboard and the screen unchanged. Pair it with a copy (select all, then ⌘C) to read a dense document the screen cannot show you in words. Lines that are themselves a secret — a password, an API key, a one-time code, a card number, a recovery phrase — come back as \"[redacted: <reason>]\" and are listed under `redactions`; that is redaction, not an empty clipboard, and re-reading will not reveal them. Non-text contents (an image, a file, an app's own flavor) are reported by type and size under `types` — the bytes are never returned. Available only when Trust Center Full Mac is active with the Accessibility category enabled.",
                     parametersJSON: params(
                         properties: [
@@ -265,6 +292,7 @@ extension BuiltInToolSchemaFactory {
                 // Menu reads do not open menus; disabled items remain visible.
                 requestedSchema(
                     name: "menu",
+                    toolClass: .read,
                     description: "List an app's menu bar as nameable paths — \"File › Export › PDF…\", \"Edit › Find › Find Next\". This is the cheapest deterministic route to anything an app can do: no coordinates, no scrolling, no guessing which toolbar icon means export. Read-only, and it does not open any menu — the paths come from the app's published accessibility tree whether or not a menu is drawn. Bounded: three levels deep, capped in item count, one walk (the result says if a bound cut it). Items that are greyed out are still listed with `enabled: false` — present but switched off in this state, which is different from absent. Press one with menu_press. Available only when Trust Center Full Mac is active with the Accessibility category enabled.",
                     parametersJSON: params(
                         properties: [
@@ -276,6 +304,7 @@ extension BuiltInToolSchemaFactory {
                 // Read consolidates the requested content instead of requiring repeated frames.
                 requestedSchema(
                     name: "read",
+                    toolClass: .read,
                     description: "read a document end to end — a contract, a PDF, a long article, a thread. Different from `screen`: `screen` answers \"what is in front of me and what can I do to it\" in one bounded glance; `read` answers \"what does this say\" and returns all of it. If the window in front is showing a file (or you name one with `path`), the file's own text is extracted — PDFs through PDFKit, plain text directly — so you get the author's characters rather than a scrape of a rendering. Otherwise it reads the front window's text, scrolls one screenful, reads again, merges on the overlap, and keeps going until the content stops changing; it then scrolls back to where it started. It presses nothing, types nothing and opens nothing. Long results are retained whole for this turn — when the answer comes back as a bounded summary with a `result_handle`, page through the rest with app result.page (tool_result_page where that is your tool); do not re-run this to see more. Lines that are themselves a secret come back as \"[redacted: <reason>]\". Refusals are in words: no document in front, a password-protected file, a scanned PDF with no text layer (ask for `screen` instead), a secure password field. Available only when Trust Center Full Mac is active with the Accessibility category enabled; naming an explicit `path` additionally needs Full Mac file access.",
                     parametersJSON: params(
                         properties: [
@@ -288,6 +317,7 @@ extension BuiltInToolSchemaFactory {
                 // Addressable marks are the default calling convention; coordinates are fallback.
                 requestedSchema(
                     name: "mac_view",
+                    toolClass: .read,
                     description: "see the screen the way a person does: one fused view of the frontmost window that returns the accessibility structure and a screenshot, with every clickable and scrollable element outlined and numbered on the image. Read the structure first — `marks` gives each number's role, label, value, state, frame and real element path, and `text` gives everything the window says in reading order; together they describe the screen completely, and the image is the spatial backdrop showing where each numbered thing sits rather than something you must decode. Use the numbered marks to understand where controls are; use act by name to interact with them. This call is read-only and changes nothing. Marks are valid only for the most recent view: if the screen may have changed, call mac_view again — an older view id is refused rather than guessed at. Read-only perception: it changes nothing. Needs the Trust Center Full Mac Accessibility category, and the picture half also needs the macOS Screen Recording permission (a separate grant from Accessibility) — when that is missing you still get the numbered legend, and the result says so.",
                     parametersJSON: params(
                         properties: [
@@ -304,10 +334,11 @@ extension BuiltInToolSchemaFactory {
                 // Perception grades let the caller request only the detail needed.
                 requestedSchema(
                     name: "screen",
+                    toolClass: .read,
                     description: "Look at the live screen now. Default: a structured page in words — SCREEN (app/window), WHERE (navigation), LIST/GRID or CANVAS, DO (controls), SAYS (status). Address a numbered row as 'row 3' (a bare number means a control labeled with it); look again for fresh evidence. Pass part to inspect a section or thing; part: menu reads the app's menu bar. Pass app to read another running app's window without activating it; act with the same app works there in the background. Structured reads of NativeAgent itself are refused because self Accessibility reads deadlock; use app (desk.read, mind.inner_state, agent.introspect) for internal state. When a window's accessibility is thin (canvas, game, video), screen attaches one small image of just that window; part: 'visual region N' crops to that region. For actual visible desktop pixels, use pixels:true with no app or part. That capture reads the other windows through Accessibility only to find secret fields (passwords, card codes, keys), which it masks; a window it cannot fully inspect, including NativeAgent's own, is masked in full. It does not claim an action succeeded just because a screenshot was captured.",
                     parametersJSON: params(
                         properties: [
-                            ("pixels", boolSchema("Set true for actual primary-desktop pixels to verify visual outcomes, including overlapping windows and Liquid Glass. Secret fields are masked; a window that cannot be fully inspected through Accessibility, including NativeAgent's own, is masked in full. Requires existing Full Mac read authority and Screen Recording permission. No focus change or permission prompt. With app or part it instead attaches that window's or region's image even when its accessibility is rich. Image is transient and bounded to 1600px; capture success is not action verification. Default false keeps the structured screen read.")),
+                            ("pixels", boolSchema("Set true for actual primary-desktop pixels to verify visual outcomes, including overlapping windows and Liquid Glass. Secret fields are masked; a window that cannot be fully inspected through Accessibility, including NativeAgent's own, is masked in full. Requires existing Full Mac read authority and Screen Recording permission. No focus change or permission prompt. With app or part it instead attaches that window's or region's image even when its accessibility is rich. Image is transient and bounded so you see it at the receipt's own size (short side ≤ 768 px); capture success is not action verification. Default false keeps the structured screen read.")),
                             ("structured", boolSchema("Include bounded, already-redacted controls for workspace selections in detail.controls. Each control's handle is bound to that result's frame_id; return both to act for an exact selection. Default false keeps the concise natural screen.")),
                             ("__sense_screen_frame", strSchema("The frozen screen identity from More. Pass the entire More object as mac.look args to continue that page with its original handles.")),
                             ("__sense_text_offset", intSchema("The reading position from More; pass it unchanged with __sense_screen_frame and app.")),
@@ -319,6 +350,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "wait",
+                    toolClass: .read,
                     description: "Wait for the frontmost external Mac app's screen to settle or for `until` text to appear, for example while a page loads. This is not a general sleep or a wait for background jobs. Bounded (default 10s, max 60s); returns the final screen or a timeout. If NativeAgent is in front, use app {page:\"current\"} to inspect it; screen waiting cannot observe NativeAgent. With `agent`, wait for that contact's in-flight reply instead (default 60s, max 300s), returning the conversation as app agent.read shows it; no polling or resend needed.",
                     parametersJSON: params(
                         properties: [
@@ -332,6 +364,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "mac_look",
+                    toolClass: .read,
                     description: "look at the frontmost window — the app reads the on-screen accessibility structure and hands you the distilled answer instead of a tree you have to parse. Three grades: `glance` is one line (app, window title, how many controls, where the focus is, whether a sheet or dialog is up, the first few buttons); `look` is the structured percept — the window, the focused element, any modal, the landmarks (toolbar, sidebar, table, list, web area) and every labeled interactive control with a stable `handle`, its role, value and real element path; `stare` is the full raw AX tree, the full raw AX tree, and you should rarely need it. Prefer `glance` to orient and `look` to act: a look costs roughly a tenth to a seventieth of a stare. Controls the app publishes no name for are never hidden — they are counted by role under `unlabeled`. Handles are valid only for the returned `frame_id`; if the screen may have changed, look again. Read-only perception: it clicks nothing, types nothing and changes nothing. Requires the macOS Accessibility system grant; available only when Trust Center Full Mac is active with the Accessibility category enabled.",
                     parametersJSON: params(
                         properties: [
@@ -349,6 +382,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "mac_attention",
+                    toolClass: .read,
                     description: "Pay continuous, explicit attention to this Mac without a polling loop or another model. `start` installs a passive, on-device event observer for a bounded time and returns a fresh fused screen view. `next` waits efficiently for physical pointer/keyboard/scroll activity or an app change (up to wait_ms), then returns one fresh fused view; keyboard content is never captured, only an activity pulse. Physical user input always wins: it immediately invalidates the old view and motor tools refuse with yielded_to_user until you call `next` and re-observe. `status` reports the live session; `stop` removes every observer and forgets the ephemeral state. While active, pass the returned attention.session and attention.user_sequence as attention_session and attention_user_sequence on every Mac motor action. Read-only perception under the Full Mac Accessibility gate; the screenshot half also needs Screen Recording permission.",
                     parametersJSON: params(
                         properties: [
@@ -372,6 +406,7 @@ extension BuiltInToolSchemaFactory {
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "activity_query",
+                    toolClass: .read,
                     description: "Summarise which Mac apps were in use over a time range, from a local, on-device activity log the user explicitly opted into and separately allowed this selected AI provider to read. It knows which app was frontmost and for how long — not what was done inside it, not what was typed, and not the contents of any field. Where the user enabled window titles, a secret-redacted title may appear on example spans; treat it as a weak hint, not a description of the work, and never quote it as fact about content. Apps on the user's exclusion list are absent from the answer entirely, even for days when they were still being recorded, so totals can legitimately be lower than a full day. The answer is capped at 50 rows and refuses rather than silently truncating an over-dense source range. Read-only and deterministic; the store is never exposed to iPhone/Telegram/Slack/iCloud/bridges. If capture or Agent Access is off in Trust Center this tool refuses rather than returning an empty day; do not read a refusal as \"nothing happened\".",
                     parametersJSON: params(
                         properties: [
@@ -388,10 +423,19 @@ extension BuiltInToolSchemaFactory {
             ])
         }
         if includeFullMacAccessibilityInjectionTools {
+            let point: [(String, JSONValue)] = [
+                ("type", .string("object")),
+                ("properties", obj([("x", numSchema("Image pixels from the left edge.")), ("y", numSchema("Image pixels from the top edge."))])),
+                ("required", .array([.string("x"), .string("y")])),
+            ]
+            let at = obj(point + [("description", .string("Instead of a target: a point in pixels of an image a screen call handed you; click, double_click, right_click, hover, move or hold lands there."))])
+            let from = obj(point + [("description", .string("For drag by point: where it starts, in pixels of the image; give `to` as a point too."))])
+            let image = strSchema("With at/from: the image the point was read from (its screen receipt's image.id). Omitted: the latest screen image this session was handed.")
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "act",
-                    description: "Do a whole flow in ONE call with steps:[…] — names, menu paths ('Format > Make Plain Text'), chords, {verb,target,text,mode}; each verified on a fresh read, stops at first failure. One receipt line per step; a step ending in ? ('OK?') is skipped if absent. Menus and keys that need the screen stop with needs_front unless the task explicitly requests front:true. E.g. save as plain text on the Desktop: app:'TextEdit' front:true steps:['Format > Make Plain Text','OK?','cmd+s',{verb:'type',target:'Save As',text:'hello.txt'},'cmd+d','return'] (cmd+d = Desktop in a save dialog). In a Save sheet, type only the file name; choose a folder via Go to Folder (cmd+shift+g), type its path, then Return. Single act: verb + target, by name or visible ordinal, against a fresh fused screen. Semantic: click/open/type/select/toggle/scroll/dismiss. Physical: double_click, right_click, hover, move, drag (give `to`), hold, key (target a key/chord sequence like `cmd+s` or `1 2 3`; `hold` can target `key w`). For named type, mode:'replace' (default) keeps the existing form-fill behavior and can replace the whole value. mode:'append' preserves existing text, inserts at the target's verified end, and verifies prior text plus insertion; it never replaces the whole value. Include a newline in text when adding a new line. Append requires a named accessibility text target; if its contents or end cannot be verified, it refuses. type with no target keeps typing into whatever has focus (replace mode only); where accessibility can't set a value it types real keystrokes. Unlabeled pixel objects appear as numbered visual regions and take physical actions only. `repeat` runs a short burst, re-resolving the target before every attempt so moving targets are followed; ambiguity, drift, a vanished target or the time limit stops it. `holding` keeps keys/modifiers down around a physical move, drag, click, scroll or key (e.g. `w d` while dragging a world view). Accessibility targets use the app's own action; pixel-only ones use the bounded physical hand. Pass app to act in that app's window in the background without taking the front; if it needs the front it stops with needs_front and says why. Only pass front:true when the task explicitly asks to bring the app forward; then it restores the previous front app. Needs active Full Mac Accessibility app control; there is no per-call approval.",
+                    toolClass: .write,
+                    description: "Do a whole flow in ONE call with steps:[…] — names, menu paths ('Format > Make Plain Text'), chords, {verb,target,text,mode}; each verified on a fresh read, stops at first failure. One receipt line per step; a step ending in ? ('OK?') is skipped if absent. Menus and keys that need the screen stop with needs_front unless the task explicitly requests front:true. E.g. save as plain text on the Desktop: app:'TextEdit' front:true steps:['Format > Make Plain Text','OK?','cmd+s',{verb:'type',target:'Save As',text:'hello.txt'},'cmd+d','return'] (cmd+d = Desktop in a save dialog). In a Save sheet, type only the file name; choose a folder via Go to Folder (cmd+shift+g), type its path, then Return. Single act: verb + target, by name or visible ordinal, against a fresh fused screen. Semantic: click/open/type/select/toggle/scroll/dismiss. Physical: double_click, right_click, hover, move, drag (give `to`), hold, key (target a key/chord sequence like `cmd+s` or `1 2 3`; `hold` can target `key w`). Where nothing has a name (a thumbnail, a track, a drawn area), act at a point instead, alone or as a step: at:{x,y} for click, double_click, right_click, hover, move or hold, or verb:'drag' from:{x,y} to:{x,y}, in pixels of an image a screen call handed you; button, holding and seconds work as for any physical act, repeat and to_app don't. A point is read in the image `image` names (default: the latest screen image this session) and becomes a screen point by that image's own frame, inside the window in front; the receipt says the screen point used. For named type, mode:'replace' (default) keeps the existing form-fill behavior and can replace the whole value. mode:'append' preserves existing text, inserts at the target's verified end, and verifies prior text plus insertion; it never replaces the whole value. Include a newline in text when adding a new line. Append requires a named accessibility text target; if its contents or end cannot be verified, it refuses. type with no target keeps typing into whatever has focus (replace mode only); where accessibility can't set a value it types real keystrokes. Unlabeled pixel objects appear as numbered visual regions and take physical actions only. `repeat` runs a short burst, re-resolving the target before every attempt so moving targets are followed; ambiguity, drift, a vanished target or the time limit stops it. `holding` keeps keys/modifiers down around a physical move, drag, click, scroll or key (e.g. `w d` while dragging a world view). Accessibility targets use the app's own action; pixel-only ones use the bounded physical hand. Pass app to act in that app's window in the background without taking the front; if it needs the front it stops with needs_front and says why. Only pass front:true when the task explicitly asks to bring the app forward; then it restores the previous front app. Needs active Full Mac Accessibility app control; there is no per-call approval.",
                     parametersJSON: params(
                         properties: [
                             ("verb", enumStringSchema(["click", "double_click", "right_click", "open", "type", "select", "toggle", "scroll", "dismiss", "hover", "move", "drag", "hold", "key", "press"], "What to do. press = key for a key/chord (cmd+s, return), click for a named control. double_click and right_click are the real mouse gestures.")),
@@ -402,7 +446,10 @@ extension BuiltInToolSchemaFactory {
                             ("mode", enumStringSchema(["replace", "append"], "For named `type`: replace (default) keeps form-fill behavior and may replace the whole value; append inserts at the verified end, preserves prior text, and never sets the whole value. Append requires a named accessibility text target and verified contents/end; otherwise it refuses. Omit or use replace for other verbs.")),
                             ("direction", enumStringSchema(["up", "down", "left", "right"], "For `scroll`: which way to move. Left/right sends horizontal wheel input.")),
                             ("scroll_amount", intSchema("For scroll: wheel magnitude in lines, 1 for fine adjustment through120. Use0 (or omit) for ordinary/default behavior, including all non-scroll verbs. An explicit amount requests wheel input rather than page-key fallback.", minimum: 0, maximum: 120)),
-                            ("to", strSchema("For `drag`: the named/numbered destination. A displayed canvas is also a target: drag from 'left side of canvas' to 'right side of canvas', or use top/bottom corners. Move, hover, pointer hold and scroll also accept canvas; fresh geometry and obstruction checks stay automatic.")),
+                            ("to", obj([("anyOf", .array([strSchema(), obj(point)])), ("description", .string("For `drag`: the named/numbered destination. A displayed canvas is also a target: drag from 'left side of canvas' to 'right side of canvas', or use top/bottom corners. Move, hover, pointer hold and scroll also accept canvas; fresh geometry and obstruction checks stay automatic. With `from`, a point {x, y} in the same image's pixels."))])),
+                            ("at", at),
+                            ("from", from),
+                            ("image", image),
                             ("to_app", strSchema("For `drag` only: the running app whose front window `to` lives in, when the drop lands in a different app from the one in front — \"drag report.pdf to the message body, to_app: Mail\". The destination is resolved in that app's window without activating it, so nothing moves while I am looking; then, if the drop needs that app in front, it stops with needs_front unless the task explicitly requests front:true. With front:true it is brought forward once and the result says that focus moved and why. Refused in words if the app is not running, if the name matches more than one running app, if nothing in that window answers to `to`, if raising it would cover the thing being picked up, or if the drag would cross a password field. Hold `option`/`cmd` with `holding` for the app's own copy/move variant. For text, prefer clipboard_write plus a paste — this is for dragging things accessibility can name.")),
                             ("steps", obj([
                                 ("type", .string("array")),
@@ -414,7 +461,11 @@ extension BuiltInToolSchemaFactory {
                                         ("type", .string("object")),
                                         ("properties", obj([
                                             ("verb", strSchema("click, double_click, right_click, open, type, select, toggle, scroll, dismiss, key or press.")),
-                                            ("target", strSchema("The name, as the screen shows it. Required for append; omit only for replace-mode type into whatever has focus.")),
+                                            ("target", strSchema("The name, as the screen shows it. Required for append; omit only for replace-mode type into whatever has focus, or when at/from gives a point.")),
+                                            ("to", obj([("anyOf", .array([strSchema(), obj(point)])), ("description", .string("For drag: the named destination, or with `from` a point {x, y} in image pixels."))])),
+                                            ("at", at),
+                                            ("from", from),
+                                            ("image", image),
                                             ("text", strSchema("For type: the literal text; include a newline when append should add a line.")),
                                             ("mode", enumStringSchema(["replace", "append"], "For named type: replace (default) keeps form-fill behavior; append preserves prior text and inserts at its verified end. Append requires a named accessibility text target; it never replaces the whole value. Omit or use replace for other verbs.")),
                                         ])),
@@ -437,10 +488,17 @@ extension BuiltInToolSchemaFactory {
                 // paste. Menu presses run the app's own handler, including destructive actions.
                 requestedSchema(
                     name: "menu_press",
+                    toolClass: .write,
                     description: "Press one menu item by name, as the menu bar shows it: \"File › Export › PDF…\". Levels can be separated by ›, >, or /. This runs the app's own menu handler — the same thing that happens when a person picks it — so it can save, close, quit, or delete depending on what you name. Resolve the path with `menu` first: an unknown path refuses and lists what is actually there, an ambiguous one refuses and names the candidates, and an item the app has greyed out refuses in words rather than pressing nothing and calling it done. Whether the intended thing happened is for the next look to say. Needs active Full Mac Accessibility app control; there is no per-call approval.",
                     parametersJSON: params(
                         properties: [
-                            ("path", strSchema("The menu path to press, e.g. \"File › Export › PDF…\" or \"Edit > Find > Find Next\".")),
+                            ("path", obj([
+                                ("description", .string("The menu path to press: one string, e.g. \"File › Export › PDF…\" or \"Edit > Find > Find Next\", or the levels as a list of titles [\"File\", \"Export\", \"PDF…\"] (one press, not one per entry).")),
+                                ("anyOf", .array([
+                                    obj([("type", .string("string"))]),
+                                    obj([("type", .string("array")), ("items", obj([("type", .string("string"))])), ("minItems", .int(1))]),
+                                ])),
+                            ])),
                             ("app", strSchema("Optional: press in this running app's menu bar instead of the frontmost app's. Defaults to whatever is in front.")),
                         ],
                         required: ["path"]
@@ -448,6 +506,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "clipboard_write",
+                    toolClass: .write,
                     description: "Put text on this Mac's clipboard, replacing whatever was there. The next paste (⌘V) in any app will produce this text, and what was on the clipboard before is gone. It types nothing and clicks nothing by itself — to get the text into a document, paste it afterwards. Bounded at 100000 characters. The result reports how many characters were written and whether reading the clipboard back matched; the text itself is never echoed. Needs active Full Mac Accessibility app control; there is no per-call approval.",
                     parametersJSON: params(
                         properties: [
@@ -458,6 +517,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "go",
+                    toolClass: .write,
                     description: "Get to an app, file, folder, http/https URL, or System Settings pane link (x-apple.systempreferences:com.apple.wifi-settings-extension) through the canonical Mac-control owner, then read the fresh screen. Without front it opens or launches behind, activating nothing, and reads that app's window; act with app works there. With front:true, only when the task explicitly asks to bring it forward, it switches the screen and activation is independently verified. File/URL opening is reported only as an accepted request unless the screen proves where it landed. Needs active Full Mac Accessibility app control; there is no per-call approval.",
                     parametersJSON: params(
                         properties: [
@@ -470,6 +530,7 @@ extension BuiltInToolSchemaFactory {
                 // An action returns the observed change with its receipt.
                 requestedSchema(
                     name: "mac_wake",
+                    toolClass: .write,
                     description: "Wake the screen: if this Mac is showing a screensaver or the display has gone to sleep, nudge it away and hand back a fresh view of the real desktop underneath, in one call. Use it when mac_view shows only the screensaver or the login window and you need to see or act on what is actually there. It posts the smallest possible input — a one-point mouse move plus a bare Shift tap, neither of which can click, type text, or authenticate — and then returns exactly what mac_view returns (`marks`, `text`, the annotated image, and a `view` id you can act on), plus a `wake` block saying whether the screen really came back. If the saver/login layer remains, it reports that observed obstruction without guessing why. Requires approval and an active Full Mac window with the Accessibility category on.",
                     parametersJSON: params(
                         properties: [

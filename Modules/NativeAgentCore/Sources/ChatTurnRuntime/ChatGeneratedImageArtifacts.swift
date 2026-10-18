@@ -1,6 +1,5 @@
 import Foundation
 import PersistenceCore
-import ToolRegistry
 
 public enum ChatGeneratedImageArtifacts {
     public static func attachments(
@@ -10,7 +9,7 @@ public enum ChatGeneratedImageArtifacts {
         var out: [MultimodalAttachment] = []
         var seen: Set<String> = []
         // app image.generate is image_generate too.
-        for dispatch in dispatches where ToolNameAliases.ranTool(dispatch.name, input: dispatch.input) == "image_generate" {
+        for dispatch in dispatches where dispatch.ranCall.tool == "image_generate" {
             for attachment in attachments(fromToolResult: dispatch.result, dataRoot: dataRoot) {
                 guard let path = attachment.path, !seen.contains(path) else { continue }
                 seen.insert(path)

@@ -327,18 +327,6 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             sessionId: resolvedSessionID, source: "ios", conversationKind: .direct
         )
 
-        let coAttachments: [ChatOrchestration.MultimodalAttachment] = (msg.attachments ?? []).map { a in
-            ChatOrchestration.MultimodalAttachment(
-                id: a.id,
-                type: a.type,
-                base64: a.base64,
-                mime: a.mime,
-                name: a.name,
-                byteSize: a.byteSize,
-                path: a.path
-            )
-        }
-
         // File access remains a signed per-message request. Provider/model/
         // effort/tier metadata is UI evidence only; the central facade admits
         // those controls from Mac-owned canonical routing.
@@ -394,7 +382,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 model: "",
                 reasoningEffort: "",
                 fileAccess: chatFileAccess,
-                attachments: coAttachments,
+                attachments: msg.attachments ?? [],
                 persona: nil,
                 surface: "ios",
                 suppressUserAppend: suppressUserAppend,

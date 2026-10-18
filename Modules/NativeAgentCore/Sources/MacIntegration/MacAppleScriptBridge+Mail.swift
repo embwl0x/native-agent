@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import AppKit
 import SQLite3

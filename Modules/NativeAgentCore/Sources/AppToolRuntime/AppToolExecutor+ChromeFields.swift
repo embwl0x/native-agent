@@ -187,7 +187,7 @@ extension AppToolExecutor {
         func refused(_ why: String) -> JSONValue {
             .object(["ok": .bool(false), "error": .string("fields_not_sent"), "reason": .string((head + [why]).joined(separator: "\n"))])
         }
-        guard await chromeFollowUpAllowed("browser.chrome_snapshot", input: input, surface: surface) else {
+        guard await chromeFollowUpAllowed("browser.chrome_snapshot", surface: surface) else {
             return refused("Reading the page needs your approval here, so nothing was filled. Call browser.chrome_snapshot, then fill one row at a time.")
         }
         var seen = ChromePageMirror.page(tab: tab, session: session)
@@ -237,7 +237,7 @@ extension AppToolExecutor {
         var lines: [String] = [], ok = true, last: String?, lastTool = actionId
         var takeover: [String: JSONValue]?
         func act(_ tool: String, target: String, wants: Set<String>, extra: [String: JSONValue], shown: String, submission: Bool = false) async -> Bool {
-            if tool != actionId, await !chromeFollowUpAllowed(tool, input: input, surface: surface, enforceAutonomy: submission ? true : nil) {
+            if tool != actionId, await !chromeFollowUpAllowed(tool, surface: surface, enforceAutonomy: submission ? true : nil) {
                 lines.append("✗ " + shown + ": needs your approval here; call " + tool + " for it"); return false
             }
             for attempt in 0..<2 {

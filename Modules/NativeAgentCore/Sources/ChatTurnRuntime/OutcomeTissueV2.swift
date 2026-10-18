@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ChatSessionWork
-import ToolRegistry
 
 extension ResponseOutcomeObservationV2 {
     public static func make(
@@ -29,7 +28,7 @@ extension ResponseOutcomeObservationV2 {
         let toolReferences = Array((result?.toolDispatches ?? []).prefix(64).enumerated()).compactMap {
             index, dispatch -> ResponseOutcomeToolReference? in
             // A folded app action is recorded as the tool it ran.
-            guard let tool = closedToken(ToolNameAliases.ranTool(dispatch.name, input: dispatch.input), maximum: 128)
+            guard let tool = closedToken(dispatch.ranCall.tool, maximum: 128)
             else { return nil }
             let sourceID = dispatch.id ?? "sequence:\(index)"
             let opaqueID = CausalTransitionEvidence.opaqueIdentity("\(turnID)|tool|\(sourceID)")
@@ -66,7 +65,7 @@ extension ResponseOutcomeObservationV2 {
                         ? .observed : .unverified)),
             "motor": motorReferences.isEmpty
                 ? (boundedDispatches.contains(where: {
-                    let ran = ToolNameAliases.ranTool($0.name, input: $0.input)
+                    let ran = $0.ranCall.tool
                     return ToolCausalBoundary.hasCanonicalMotorOwner(tool: ran)
                         || ToolCausalBoundary.isExternalProtocolTool(ran)
                 }) ? .unknown : .notApplicable)
@@ -115,7 +114,7 @@ extension ResponseOutcomeObservationV2 {
     ) -> ResponseOutcomeMotorReference? {
         guard case .object(let object) = dispatch.result,
               let binding = ToolCausalBoundary.motorReference(
-                  tool: ToolNameAliases.ranTool(dispatch.name, input: dispatch.input),
+                  tool: dispatch.ranCall.tool,
                   output: dispatch.result
               ) else { return nil }
         let verification: OutcomeEvidenceState = {

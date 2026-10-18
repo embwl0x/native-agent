@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import FeedPolicy
 import Foundation
 import CryptoKit
@@ -166,7 +167,10 @@ public actor TurnFirstRenderRegistry {
 public struct TurnTraceEvent: Sendable, Equatable {
     /// Per-string-field cap applied to every string LEAF in the payload.
     public static let maxPayloadStringChars = 2000
-    /// Hard serialized persisted-row ceiling. The payload is sized together
+    /// Hard serialized persisted-row ceiling for turn events. Model-call
+    /// receipts retain the mixed ledger's existing traceMaximumBytes budget
+    /// so moving their owner cannot clip cache-prefix evidence.
+    /// The payload is sized together
     /// with the event envelope; bounding the payload alone can still write a
     /// line over the promised limit once ids, timestamp, kind and surface are
     /// added.
@@ -176,6 +180,15 @@ public struct TurnTraceEvent: Sendable, Equatable {
     private static let maxEnvelopeFieldUTF8Bytes = 480
     private static let maxEnvelopeFieldJSONBytes = 512
     private static let oversizedPreviewBytes = 6 * 1024
+
+    /// Whose words steered the turn in flight, when they are not the owner's.
+    /// Installed by the engine over the turn's own taint.
+    public static var steer: @Sendable () -> String? {
+        get { steerLock.withLock { steerHook } }
+        set { steerLock.withLock { steerHook = newValue } }
+    }
+    private static let steerLock = NSLock()
+    nonisolated(unsafe) private static var steerHook: @Sendable () -> String? = { nil }
 
     public let turnId: String
     public let ts: Date
@@ -211,6 +224,14 @@ public struct TurnTraceEvent: Sendable, Equatable {
             .map(Self.boundEnvelopeString)
         let boundedThread = (threadId ?? TurnTraceContext.threadId)
             .map(Self.boundEnvelopeString)
+        // A turn's end names the part whose run started it (its end must not
+        // wake that part) and whose words steered it, read on the turn's own task.
+        var payload = payload
+        if TurnTracePersistLane.terminalKinds.contains(boundedKind), case .object(var fields) = payload {
+            if let part = SkillRunContext.partID { fields["part"] = .string(part) }
+            if let steer = Self.steer() { fields["steered_by"] = .string(steer) }
+            payload = .object(fields)
+        }
         self.turnId = boundedTurnID
         self.ts = ts
         self.kind = boundedKind
@@ -250,8 +271,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
         self.payload = boundedPayload
     }
 
-    /// Bound every string leaf of a JSONValue tree to `maxPayloadStringChars`,
-    /// then enforce a hard serialized byte ceiling over the whole payload.
+    /// Bound turn-event string leaves, then enforce the serialized row ceiling.
+    /// Model-call telemetry keeps its original ledger payload and byte budget.
     /// Oversized payloads retain stable lifecycle fields plus a bounded JSON
     /// preview, original byte count, and digest so truncation remains explicit
     /// without making the per-day ledger unbounded.
@@ -265,7 +286,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
         destinationId: String? = nil,
         threadId: String? = nil
     ) -> JSONValue {
-        let leafBound = boundLeaves(value)
+        let byteLimit = kind == "llm.call" ? JSONLLineCaps.traceMaximumBytes : maxPayloadBytes
+        let leafBound = kind == "llm.call" ? value : boundLeaves(value)
         guard persistedRowBytes(
                 payload: leafBound,
                 turnId: turnId,
@@ -275,7 +297,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 surface: surface,
                 destinationId: destinationId,
                 threadId: threadId
-              ).map({ $0 > maxPayloadBytes }) == true,
+              ).map({ $0 > byteLimit }) == true,
               let serialized = try? leafBound.serializedData(pretty: false) else {
             return leafBound
         }
@@ -294,11 +316,21 @@ public struct TurnTraceEvent: Sendable, Equatable {
             ),
         ]
         if case .object(let object) = leafBound {
+            // Canonical model-call receipts retain every scalar measurement
+            // when larger structured metadata forces preview summarization.
+            if kind == "llm.call" {
+                for (key, field) in object {
+                    switch field {
+                    case .array, .object: continue
+                    default: summary[key] = field
+                    }
+                }
+            }
             let stableKeys = [
                 "schema", "phase", "status", "name", "tool", "stage",
                 "milestone", "provider", "model", "resultClass",
                 "durationMs", "elapsedMs", "inputTokens", "outputTokens",
-                "argKeys", "shown", "receipt",
+                "argKeys", "shown", "receipt", "parentId", "cacheMarkers",
                 // Context snapshots can include bounded previews that are
                 // intentionally much larger than one trace row. Keep their
                 // scalar integrity facts when that preview is summarized so
@@ -346,9 +378,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 destinationId: destinationId,
                 threadId: threadId
             ) ?? Int.max
-            if rowBytes <= maxPayloadBytes { return bounded }
+            if rowBytes <= byteLimit { return bounded }
             guard previewBytes > 0 else { break }
-            previewBytes = max(0, previewBytes - max(256, rowBytes - maxPayloadBytes + 64))
+            previewBytes = max(0, previewBytes - max(256, rowBytes - byteLimit + 64))
         }
 
         // Defensive fallback removes optional lifecycle fields only. The
@@ -370,7 +402,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 surface: surface,
                 destinationId: destinationId,
                 threadId: threadId
-            ).map({ $0 <= maxPayloadBytes }) == true {
+            ).map({ $0 <= byteLimit }) == true {
                 return candidate
             }
             summary.removeValue(forKey: key)
@@ -540,9 +572,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
             && destinationId.map(Self.boundEnvelopeString) == destinationId
             && threadId.map(Self.boundEnvelopeString) == threadId
         guard physicalByteCount > 0,
-              physicalByteCount <= Self.maxPayloadBytes,
+              physicalByteCount <= (kind == "llm.call" ? JSONLLineCaps.traceMaximumBytes : Self.maxPayloadBytes),
               envelopeIsCanonical,
-              !Self.hasOversizedStringLeaf(payload) else {
+              kind == "llm.call" || !Self.hasOversizedStringLeaf(payload) else {
             self.init(jsonRow: value)
             return
         }
@@ -1031,7 +1063,7 @@ public struct TurnTracePersistLane: Sendable {
                 // review, 2026-09-11). Non-terminal trace rows stay non-durable.
                 durable: Self.terminalKinds.contains(event.kind)
             )
-            Self.postTerminalIfNeeded(event)
+            postTerminalIfNeeded(event, trace: target)
         } catch {
             FileHandle.standardError.write(
                 Data("TurnTracePersistLane: append failed (turn \(event.turnId)): \(error)\n".utf8)
@@ -1049,18 +1081,22 @@ public struct TurnTracePersistLane: Sendable {
     /// (GPT-5.6 round review, 2026-09-11).
     ///
     /// The abandoned-turn reconciler's synthetic row is NOT a turn that just
-    /// finished, so it does not post.
-    private static func postTerminalIfNeeded(_ event: TurnTraceEvent) {
-        guard terminalKinds.contains(event.kind) else { return }
+    /// finished, so it does not post. Her parts that wake on `turn.ended` get
+    /// this edge, with where its rows are and the part whose run started it.
+    private func postTerminalIfNeeded(_ event: TurnTraceEvent, trace: URL) {
+        guard Self.terminalKinds.contains(event.kind) else { return }
         if case .object(let payload) = event.payload,
            case .string("terminal_reconciliation")? = payload["observedBy"] {
             return
         }
-        NotificationCenter.default.post(
-            name: .turnTraceTerminalPersisted,
-            object: nil,
-            userInfo: ["turnId": event.turnId]
-        )
+        var info: [String: Any] = ["turnId": event.turnId, "kind": event.kind, "trace": trace.path]
+        info["sessionId"] = event.sessionId
+        info["surface"] = event.surface
+        if case .object(let fields) = event.payload {
+            if case .string(let part)? = fields["part"] { info["part"] = part }
+            if case .string(let steer)? = fields["steered_by"] { info["agent"] = steer }
+        }
+        NotificationCenter.default.post(name: .turnTraceTerminalPersisted, object: nil, userInfo: info)
     }
 
     /// Append one row under the day file's OWN write lock, after re-reading
@@ -1115,7 +1151,7 @@ public struct TurnTracePersistLane: Sendable {
                 capCheckStride: 4096,
                 durable: true
             )
-            Self.postTerminalIfNeeded(event)
+            postTerminalIfNeeded(event, trace: target)
             return true
         }
     }
@@ -1171,13 +1207,17 @@ public struct TurnTraceRecentReader: Sendable {
         public let sourceURLs: [URL]
         public let truncated: Bool
         public let oldestRetainedDay: Date?
+        public let malformedRows: Int
+        public let trailingPartialLine: Bool
 
-        public init(sourceURL: URL, events: [TurnTraceEvent], sourceURLs: [URL] = [], truncated: Bool = false, oldestRetainedDay: Date? = nil) {
+        public init(sourceURL: URL, events: [TurnTraceEvent], sourceURLs: [URL] = [], truncated: Bool = false, oldestRetainedDay: Date? = nil, malformedRows: Int = 0, trailingPartialLine: Bool = false) {
             self.sourceURL = sourceURL
             self.events = events
             self.sourceURLs = sourceURLs.isEmpty ? [sourceURL] : sourceURLs
             self.truncated = truncated
             self.oldestRetainedDay = oldestRetainedDay
+            self.malformedRows = malformedRows
+            self.trailingPartialLine = trailingPartialLine
         }
     }
 
@@ -1193,13 +1233,20 @@ public struct TurnTraceRecentReader: Sendable {
     }
 
     /// Unwindowed history shares a tail budget; since reads the complete retained window.
-    /// With `holding`, since parses only the lines holding one of its marks (a
-    /// kind, a turn id) and skips the rest unparsed.
-    public func read(now: Date = Date(), history: Bool = false, since: Date? = nil, holding marks: [String] = []) async throws -> Snapshot {
+    /// With `holding`, framing is checked before selecting a kind or turn id.
+    public func read(now: Date = Date(), history: Bool = false, since: Date? = nil, holding marks: [String] = [], trace: String? = nil, maximumReadBytes: Int = TurnTraceRecentReader.maxBytes) async throws -> Snapshot {
         let sourceURL = lane.path(for: now)
         let paths: [URL]
         var oldestRetainedDay: Date?
-        if let since {
+        if let trace {
+            let filename = String(trace.dropFirst("turn_traces/".count))
+            guard trace == "turn_traces/" + filename, filename.hasSuffix(".jsonl"),
+                  let day = TurnTracePersistLane.day(from: String(filename.dropLast(6))),
+                  filename == TurnTracePersistLane.dayString(from: day) + ".jsonl" else {
+                throw PersistenceCoreError.ioFailure("trace must name turn_traces/<yyyy-MM-dd>.jsonl.")
+            }
+            paths = [sourceURL.deletingLastPathComponent().appendingPathComponent(filename)]
+        } else if let since {
             let directory = sourceURL.deletingLastPathComponent()
             let entries = FileManager.default.fileExists(atPath: directory.path)
                 ? try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) : []
@@ -1219,73 +1266,167 @@ public struct TurnTraceRecentReader: Sendable {
         var events: [TurnTraceEvent] = []
         var sources: [URL] = []
         var remainingRows = rowLimit
-        var remainingBytes = Self.maxBytes
+        var remainingBytes = maximumReadBytes
         var truncated = false
+        var malformedRows = 0
+        var trailingPartialLine = false
         for path in paths {
-            guard since != nil || (remainingRows > 0 && remainingBytes > 0) else { truncated = true; break }
+            guard trace != nil || since != nil || (remainingRows > 0 && remainingBytes > 0) else { truncated = true; break }
             var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory) else { continue }
+            guard FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory) else {
+                if trace != nil { truncated = true }
+                continue
+            }
             if isDirectory.boolValue {
                 throw PersistenceCoreError.ioFailure("turn trace path is a directory: \(path.path)")
             }
-            if let since {
+            if since != nil || trace != nil {
                 sources.append(path)
-                let rows: [JSONValue]
-                if marks.isEmpty {
-                    let receipt = try await persistence.readJSONLReporting(path)
-                    // A torn line (e.g. a write cut by a crash) marks the window incomplete; it must not hide the rest.
-                    if receipt.report.malformedLineCount > 0 { truncated = true }
-                    rows = receipt.rows
-                } else {
-                    let needles = marks.map { Data($0.utf8) }
-                    let lines = try Data(contentsOf: path).split(separator: 0x0A).filter { line in needles.contains { line.range(of: $0) != nil } }
-                    rows = lines.compactMap { try? JSONValue.parse(Data($0)) }
-                    if rows.count < lines.count { truncated = true }
-                }
-                for row in rows {
-                    guard let event = TurnTraceEvent(jsonRow: row) else { truncated = true; continue }
-                    guard event.ts >= since, event.ts <= now else { continue }
+                let receipt = try await persistence.readJSONLReporting(path)
+                malformedRows += receipt.report.malformedLineCount
+                trailingPartialLine = trailingPartialLine || receipt.report.trailingPartialLine
+                if !receipt.report.isClean { truncated = true }
+                for row in receipt.rows {
+                    guard let event = TurnTraceEvent(jsonRow: row) else { malformedRows += 1; truncated = true; continue }
+                    guard marks.isEmpty || marks.contains(event.kind) || marks.contains(event.turnId) else { continue }
+                    guard since.map({ event.ts >= $0 }) ?? true, event.ts <= now else { continue }
                     events.append(event)
                 }
                 continue
             }
             let receipt = try await persistence.tailJSONLReadReceipt(path, limit: remainingRows, maxBytes: remainingBytes)
             sources.append(path)
-            events += receipt.rows.compactMap(TurnTraceEvent.init(jsonRow:))
+            let decoded = receipt.rows.compactMap(TurnTraceEvent.init(jsonRow:))
+            malformedRows += receipt.malformedJSONRowCount + receipt.rows.count - decoded.count
+            events += decoded
             remainingRows -= receipt.physicalRowsScanned
             remainingBytes -= receipt.bytesRead
             truncated = truncated || receipt.truncatedToByteWindow || remainingRows <= 0
         }
-        return Snapshot(sourceURL: sourceURL, events: events, sourceURLs: sources, truncated: truncated, oldestRetainedDay: oldestRetainedDay)
+        return Snapshot(sourceURL: sourceURL, events: events, sourceURLs: sources, truncated: truncated, oldestRetainedDay: oldestRetainedDay, malformedRows: malformedRows, trailingPartialLine: trailingPartialLine)
+    }
+
+    /// Turn evidence has one durable owner. Historical ledger rows are removed
+    /// only when matched to a retained event, preserving any older outcome.
+    public func traceEvidence(
+        now: Date = Date(), since: Date? = nil,
+        maximumReadBytes: Int = TurnTraceRecentReader.maxBytes
+    ) async throws -> (rows: [JSONValue], report: JSONLReadReport, turns: Snapshot, sourceAbsent: Bool) {
+        let turns = try await read(now: now, history: true, since: since,
+                                   holding: since == nil ? [] : ["llm.call", "provider.noReply", "tool.dispatch", "turn.plan", "turn.terminal"],
+                                   maximumReadBytes: maximumReadBytes)
+        let path = lane.resolvedDataRoot().appendingPathComponent("traces/events.jsonl")
+        let ledger: (rows: [JSONValue], report: JSONLReadReport)
+        if since != nil {
+            ledger = try await persistence.readJSONLReporting(path)
+        } else {
+            let tail = try await persistence.tailJSONLReadReceipt(path, limit: rowLimit, maxBytes: maximumReadBytes)
+            ledger = (tail.rows, JSONLReadReport(malformedLineCount: tail.malformedJSONRowCount))
+        }
+        func matchKey(kind: String, payload: [String: JSONValue], date: Date) throws -> Data? {
+            let identity: [JSONValue]
+            switch kind {
+            case "tool.dispatch":
+                guard case .object(let receipt)? = payload["receipt"],
+                      case .string(let id)? = receipt["id"] else { return nil }
+                identity = [.string(id)]
+            case "turn.plan":
+                guard case .string(let id)? = payload["runId"] else { return nil }
+                identity = [.string(id)]
+            case "llm.call", "provider.noReply":
+                guard case .string(let turn)? = payload["turnId"], !turn.isEmpty, turn != "unknown" else { return nil }
+                // Historical calls have no shared id; match their recorded second
+                // and measurements, consuming each ledger row at most once.
+                let fields = kind == "llm.call"
+                    ? ["provider", "model", "surface", "purpose", "streaming", "durationMs", "ttftMs", "inputTokens", "outputTokens"]
+                    : ["provider", "surface", "seconds", "events"]
+                identity = [.string(turn), .int(Int64(date.timeIntervalSince1970.rounded(.down)))]
+                    + fields.map { payload[$0] ?? .null }
+            default: return nil
+            }
+            return try JSONValue.array([.string(kind)] + identity).serializedData(pretty: false)
+        }
+        var matches: [Data: [Int]] = [:]
+        for (index, row) in ledger.rows.enumerated().reversed() {
+            guard case .object(let object) = row, case .string(let kind)? = object["kind"],
+                  case .object(let payload)? = object["payload"],
+                  case .string(let raw)? = object["createdAt"], let date = TurnTraceEvent.parseISO8601(raw),
+                  let key = try matchKey(kind: kind, payload: payload, date: date) else { continue }
+            matches[key, default: []].append(index)
+        }
+        var matched: Set<Int> = []
+        var rows: [JSONValue] = []
+        for event in turns.events {
+            guard ["llm.call", "provider.noReply", "tool.dispatch", "turn.plan"].contains(event.kind),
+                  case .object(var payload) = event.payload else { continue }
+            if event.kind == "tool.dispatch", payload["phase"] != .string("end") { continue }
+            payload["turnId"] = .string(event.turnId)
+            if let key = try matchKey(kind: event.kind, payload: payload, date: event.ts),
+               let index = matches[key]?.popLast(), case .object(let legacy) = ledger.rows[index] {
+                matched.insert(index)
+                if case .object(let older)? = legacy["payload"] { payload = older.merging(payload) { _, current in current } }
+                if payload["status"] == nil { payload["status"] = legacy["status"] }
+            }
+            let title: String
+            if event.kind == "turn.plan", case .string(let goal)? = payload["goalType"],
+               case .string(let mode)? = payload["contextMode"] { title = "\(goal) -> \(mode)" }
+            else if case .string(let value)? = payload[event.kind == "tool.dispatch" ? "name" : event.kind == "llm.call" ? "model" : "provider"] { title = value }
+            else { title = event.kind }
+            let id: String
+            if event.kind == "tool.dispatch", case .object(let receipt)? = payload["receipt"],
+               case .string(let receiptID)? = receipt["id"] { id = receiptID }
+            else {
+                id = SHA256.hash(data: try event.jsonRow.serializedData(pretty: false))
+                    .map { String(format: "%02x", $0) }.joined()
+            }
+            rows.append(.object([
+                "id": .string(id), "kind": .string(event.kind), "title": .string(title),
+                "status": payload["status"] ?? .string(event.kind == "provider.noReply" ? "failed" : event.kind == "llm.call" ? "unknown" : "ok"),
+                "createdAt": .string(event.ts.formatted(TurnTraceEvent.fractionalISO8601)),
+                "payload": .object(payload),
+            ]))
+        }
+        rows += ledger.rows.enumerated().compactMap { matched.contains($0.offset) ? nil : $0.element }
+        var report = ledger.report
+        report.malformedLineCount += turns.malformedRows
+        report.trailingPartialLine = report.trailingPartialLine || turns.trailingPartialLine
+        var dated: [(row: JSONValue, date: Date, index: Int)] = []
+        for (index, row) in rows.enumerated() {
+            var date = Date.distantPast
+            if case .object(let object) = row, case .string(let raw)? = object["createdAt"],
+               let parsed = TurnTraceEvent.parseISO8601(raw) { date = parsed }
+            dated.append((row, date, index))
+        }
+        dated.sort { $0.date == $1.date ? $0.index < $1.index : $0.date < $1.date }
+        rows = dated.map(\.row)
+        return (rows, report, turns,
+                turns.sourceURLs.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) }
+                    && !FileManager.default.fileExists(atPath: path.path))
     }
 
     public func modelCalls(now: Date = Date()) async throws -> JSONValue {
-        let path = lane.path(for: now).deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("traces/events.jsonl")
-        let receipt = try await persistence.readJSONLReporting(path)
+        let weekAgo = now.addingTimeInterval(-7 * 86_400)
+        let evidence = try await traceEvidence(now: now, since: weekAgo)
         var calls: [(Date, String, String, Int64?)] = []
         var oldest: Date?
-        for row in receipt.rows {
+        for row in evidence.rows {
             guard case .object(let object) = row,
                   case .string(let rawDate)? = object["createdAt"],
                   let date = TurnTraceEvent.parseISO8601(rawDate) else {
-                throw PersistenceCoreError.ioFailure("Model calls: a trace row has no readable createdAt; repair traces/events.jsonl.")
+                throw PersistenceCoreError.ioFailure("Model calls: a trace row has no readable createdAt; inspect the retained trace sources.")
             }
             oldest = min(oldest ?? date, date)
             guard object["kind"] == .string("llm.call"), date <= now,
                   date >= now.addingTimeInterval(-7 * 86_400) else { continue }
             guard case .object(let payload)? = object["payload"] else {
-                throw PersistenceCoreError.ioFailure("Model calls: a call has no payload; repair traces/events.jsonl.")
+                throw PersistenceCoreError.ioFailure("Model calls: a call has no payload; inspect the retained trace sources.")
             }
             let purpose = if case .string(let value)? = payload["purpose"] { value } else { "other" }
             let turn = if case .string(let value)? = payload["turnId"], !value.isEmpty { value } else { "unknown" }
             let duration: Int64? = if case .int(let value)? = payload["durationMs"], value >= 0 { value } else { nil }
             calls.append((date, purpose, turn, duration))
         }
-        // Rounds come from each turn's terminal row in the turn traces, which
-        // keep the week events.jsonl does not; only those rows are parsed.
-        let weekAgo = now.addingTimeInterval(-7 * 86_400)
-        let week = try await read(now: now, since: weekAgo, holding: ["turn.terminal"])
+        let week = evidence.turns
         let rounds = Self.rounds(week.events)
         let windows: [JSONValue] = [("24h", 86_400.0), ("7d", 7 * 86_400.0)].map { label, seconds in
             let since = now.addingTimeInterval(-seconds)
@@ -1333,11 +1474,11 @@ public struct TurnTraceRecentReader: Sendable {
                             "first_six": .array(made.prefix(6).map(JSONValue.string))])
         }
         return .object([
-            "status": .string(receipt.report.malformedLineCount == 0 && !receipt.report.trailingPartialLine ? "ok" : "incomplete"),
+            "status": .string(evidence.report.malformedLineCount == 0 && !evidence.report.trailingPartialLine && !week.truncated ? "ok" : "incomplete"),
             "title": .string("Model calls"), "until": .string(now.formatted(.iso8601)),
-            "measurement": .string("Recorded llm.call rows in traces/events.jsonl, including recorded failures. Unbound calls use turn_id unknown; unlabelled older calls use purpose other. Windows may exceed retained rows. Missing durations are not estimated. rounds_per_turn is each finished turn's model rounds (its first call and one per tool round, from its turn.terminal row in the per-day turn traces), nearest-rank p50/p90; heaviest_asks are the week's five turns with the most rounds, ! marking a call that failed."),
-            "malformed_rows": .int(Int64(receipt.report.malformedLineCount)),
-            "trailing_partial_line": .bool(receipt.report.trailingPartialLine),
+            "measurement": .string("Recorded llm.call rows in turn_traces and standalone calls in traces/events.jsonl, including recorded failures. Unbound calls use turn_id unknown; unlabelled older calls use purpose other. Windows may exceed retained rows. Missing durations are not estimated. rounds_per_turn is each finished turn's model rounds (its first call and one per tool round, from its turn.terminal row in the per-day turn traces), nearest-rank p50/p90; heaviest_asks are the week's five turns with the most rounds, ! marking a call that failed."),
+            "malformed_rows": .int(Int64(evidence.report.malformedLineCount)),
+            "trailing_partial_line": .bool(evidence.report.trailingPartialLine),
             "windows": .array(windows),
             "heaviest_asks": .array(heaviest),
             "turn_traces_incomplete": .bool(week.truncated),
@@ -1435,7 +1576,9 @@ public struct TurnTraceRecentReader: Sendable {
 extension Notification.Name {
     /// Posted after a turn's TERMINAL row (`turn.terminal` / `turn.cancelled` /
     /// `turn.failed`) has been durably appended to the trace. userInfo carries
-    /// `turnId`. Unlike `.chatTurnCompleted` this cannot fire without a turn.
+    /// `turnId`, `kind`, `trace` (the day file), and `sessionId`, `surface`,
+    /// `part` and `agent` (whose words steered it) when known. Unlike `.chatTurnCompleted` this cannot fire
+    /// without a turn.
     public static let turnTraceTerminalPersisted =
         Notification.Name("turnTraceTerminalPersisted")
 }

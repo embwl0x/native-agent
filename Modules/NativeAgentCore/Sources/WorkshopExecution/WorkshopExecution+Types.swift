@@ -319,48 +319,17 @@ public struct WorkshopExecutionEnqueueResult: Codable, Sendable, Equatable {
 
 public enum WorkshopArgumentValidation {
     public static func validate(_ value: JSONValue, schema: JSONValue) throws {
-        guard case .object(let rules) = schema else {
-            throw WorkshopExecutionError.invalidRequest("tool argument schema is unavailable")
+        guard let problem = value.schemaProblem(schema: schema) else { return }
+        let message: String
+        switch problem.keyword {
+        case "schema": message = "tool argument schema is unavailable: \(problem.expected)"
+        case "type": message = "tool argument has an incompatible schema type"
+        case "enum": message = "tool argument is outside its declared values"
+        case "required": message = "missing tool argument: \(problem.path)"
+        case "additionalProperties": message = "unknown tool argument: \(problem.path)"
+        default: message = "tool argument \(problem.path) must be \(problem.expected)"
         }
-        if let declaredType = rules["type"] {
-            let types: [JSONValue]
-            if case .array(let alternatives) = declaredType { types = alternatives }
-            else { types = [declaredType] }
-            let compatible = types.contains { type in
-                switch (type, value) {
-                case (.string("string"), .string), (.string("boolean"), .bool),
-                     (.string("integer"), .int), (.string("number"), .int),
-                     (.string("number"), .double), (.string("object"), .object),
-                     (.string("array"), .array), (.string("null"), .null): return true
-                default: return false
-                }
-            }
-            guard compatible else {
-                throw WorkshopExecutionError.invalidRequest("tool argument has an incompatible schema type")
-            }
-        }
-        if case .array(let options)? = rules["enum"], !options.contains(value) {
-            throw WorkshopExecutionError.invalidRequest("tool argument is outside its declared values")
-        }
-        if case .object(let object) = value {
-            if case .array(let required)? = rules["required"] {
-                for case .string(let key) in required where object[key] == nil {
-                    throw WorkshopExecutionError.invalidRequest("missing tool argument: \(key)")
-                }
-            }
-            if case .object(let properties)? = rules["properties"] {
-                for (key, child) in object {
-                    if let childSchema = properties[key] {
-                        try validate(child, schema: childSchema)
-                    } else if rules["additionalProperties"] == .bool(false) {
-                        throw WorkshopExecutionError.invalidRequest("unknown tool argument: \(key)")
-                    }
-                }
-            }
-        }
-        if case .array(let items) = value, let itemSchema = rules["items"] {
-            for item in items { try validate(item, schema: itemSchema) }
-        }
+        throw WorkshopExecutionError.invalidRequest(message)
     }
 }
 
@@ -400,135 +369,6 @@ public struct StubWorkshopPlannerLLM: WorkshopPlannerLLM {
     public func availableConnectorActions() async -> [JSONValue] { [] }
     public func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String) {
         throw WorkshopExecutionError.plannerFailure("stub planner does not run codex")
-    }
-}
-
-// MARK: - Tool autonomy (planner-side use only)
-
-/// Subset of the retired daemon::DEFAULT_TOOL_AUTONOMY needed for the
-/// planner's `tools_summary` rendering. The dispatch-time autonomy gate
-/// stays in the Python executor; we only use this map for the planner
-/// prompt's `[autonomy=...]` annotation. Keep in sync with missions.py
-/// L150-L213 — any divergence is a planner-prompt drift, not a security
-/// gap (the gate lives elsewhere).
-enum DefaultToolAutonomy {
-    static let map: [String: String] = [
-        "search.*": "auto",
-        "chat.synthesize": "auto",
-        "local_files.search": "auto",
-        "local_files.read": "auto",
-        "local_files.list": "auto",
-        "searxng.search": "auto",
-        "searxng.fetch": "auto",
-        "github.search_issues": "auto",
-        "github.list_repos": "auto",
-        "github.list_issues": "auto",
-        "github.set_repo_visibility": "confirm",
-        "github_set_repo_visibility": "confirm",
-        "gh.search_issues": "auto",
-        "gh.list_repos": "auto",
-        "gh.get_issue": "auto",
-        "gh.get_pull_request": "auto",
-        "gh.create_issue": "draft_auto",
-        "gmail.list_inbox": "auto",
-        "gmail.read": "auto",
-        "gmail.search": "auto",
-        "gmail.draft": "auto",
-        "gmail.send": "send_approval",
-        "agentmail.list_inbox": "auto",
-        "agentmail.read": "auto",
-        "agentmail.search": "auto",
-        "agentmail.send": "send_approval",
-        "email.list_inbox": "auto",
-        "email.draft": "auto",
-        "email.send": "send_approval",
-        "calendar.list_events": "auto",
-        "calendar.availability": "auto",
-        "calendar.find_availability": "auto",
-        "calendar.create_event": "draft_auto",
-        "calendar.cancel_event": "send_approval",
-        "notion.search": "auto",
-        "notion.read_page": "auto",
-        "notion.query_database": "auto",
-        "notion.create_page": "draft_auto",
-        "notion.append_block": "draft_auto",
-        "slack.status": "auto",
-        "slack.list_channels": "auto",
-        "slack.search_messages": "auto",
-        "slack.list_unreads": "auto",
-        "slack.post_message": "send_approval",
-        "browser.navigate": "auto",
-        "browser.screenshot": "auto",
-        "browser.read_text": "auto",
-        "default": "send_approval",
-    ]
-
-    static let approvalRank: [String: Int] = [
-        "auto": 0,
-        "draft_auto": 1,
-        "send_approval": 2,
-        "destructive_strong": 3,
-    ]
-
-    /// Mirrors the retired daemon::resolve_tool_autonomy.
-    /// 1. exact match
-    /// 2. glob match, longest-pattern-first
-    /// 3. "default" key.
-    static func resolve(toolId: String) -> String {
-        if let v = map[toolId] { return v }
-        let patterns = map.keys
-            .filter { $0 != "default" }
-            .sorted { $0.count > $1.count }
-        for pat in patterns {
-            if Self.fnmatch(pat, toolId) {
-                return map[pat]!
-            }
-        }
-        return map["default"] ?? "send_approval"
-    }
-
-    static func needsApproval(_ level: String) -> Bool {
-        (approvalRank[level] ?? 99) >= (approvalRank["send_approval"] ?? 2)
-    }
-
-    /// True iff `toolId` matches an EXPLICIT autonomy entry (exact or glob) —
-    /// i.e. NOT governed by the catch-all "default" key. The non-yolo step gate
-    /// uses this to enforce a KNOWN tool's intrinsic autonomy (so the planner
-    /// can't mark email.send as "auto" to skip approval) WITHOUT force-gating
-    /// unknown tools — those must still reach dispatch and fail honestly when no
-    /// dispatcher is wired (unknownStepKindFailsHonestlyWithoutDispatcher).
-    static func hasKnownEntry(_ toolId: String) -> Bool {
-        if map[toolId] != nil { return true }
-        for pat in map.keys where pat != "default" {
-            if fnmatch(pat, toolId) { return true }
-        }
-        return false
-    }
-
-    /// Minimal fnmatch supporting `*` only (matches Python's fnmatch on the
-    /// patterns we actually use, which are all `prefix.*` style). No `?`,
-    /// no character classes — none of the DEFAULT_TOOL_AUTONOMY keys use
-    /// them. Anchored on both ends.
-    static func fnmatch(_ pattern: String, _ name: String) -> Bool {
-        if !pattern.contains("*") { return pattern == name }
-        // Split on `*` and match each chunk left-to-right.
-        let parts = pattern.split(separator: "*", omittingEmptySubsequences: false).map(String.init)
-        // Anchoring: first chunk must be prefix, last chunk must be suffix.
-        var rest = name[...]
-        for (idx, chunk) in parts.enumerated() {
-            if chunk.isEmpty { continue }
-            if idx == 0 {
-                guard rest.hasPrefix(chunk) else { return false }
-                rest = rest.dropFirst(chunk.count)
-            } else if idx == parts.count - 1 {
-                guard rest.hasSuffix(chunk) else { return false }
-                rest = rest.dropLast(chunk.count)
-            } else {
-                guard let r = rest.range(of: chunk) else { return false }
-                rest = rest[r.upperBound...]
-            }
-        }
-        return true
     }
 }
 

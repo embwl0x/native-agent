@@ -164,16 +164,6 @@ enum RunStatusBadgePresentation {
         let sourceStatus: String
     }
 
-    /// Statuses emitted by the current native run writers and retained ledger
-    /// history. Aliases stay here rather than relying on generic capitalization
-    /// at every Runs surface.
-    static let knownRawStatuses: Set<String> = [
-        "active", "blocked", "canceled", "cancelled", "completed", "done",
-        "disabled", "failed", "failed_pre_dispatch", "interrupted", "pending",
-        "partial", "queued", "rolled_back", "running", "skipped", "succeeded", "timeout",
-        "timed_out", "unknown", "waiting_approval"
-    ]
-
     static func badge(for rawStatus: String) -> Badge {
         let sourceStatus = boundedRawStatus(rawStatus)
         let key = normalizedKey(rawStatus)

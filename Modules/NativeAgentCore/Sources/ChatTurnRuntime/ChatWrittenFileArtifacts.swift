@@ -1,7 +1,6 @@
 import Foundation
 import CryptoKit
 import UniformTypeIdentifiers
-import ToolRegistry
 import PersistenceCore
 
 /// Whole-file write receipts shared by live delivery and canonical recovery.
@@ -16,8 +15,8 @@ public enum ChatWrittenFileArtifacts {
     public static func files(from dispatches: [TurnEngineResult.ToolDispatchRecord],
                              maximumBytes: Int = 10_000_000) -> [File] {
         dispatches.compactMap { dispatch in
-            guard ToolNameAliases.ranTool(dispatch.name, input: dispatch.input) == "write_file" else { return nil }
-            let input = ToolNameAliases.ranInput(dispatch.name, input: dispatch.input)
+            guard dispatch.ranCall.tool == "write_file" else { return nil }
+            let input = dispatch.ranCall.input
             guard case .object(let receipt) = dispatch.result, receipt["ok"] == .bool(true),
                   receipt["append"] == .bool(false), case .string(let content)? = input["content"],
                   receipt["bytes_written"] == .int(Int64(content.utf8.count)),

@@ -9,7 +9,6 @@ import SwiftUI
 import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
-import MemoryV2
 import ToolRegistry
 import KnowledgeGraph
 import XConnector
@@ -211,13 +210,6 @@ extension AppModel {
         try await engine.memory.reject(proposalID: id, reason: reason)
         await loadMemoryProposals(animateDecision: true)
         engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
-    }
-
-    @MainActor
-    func triggerMemoryConsolidation(dryRun: Bool = false) async throws -> [String: Any] {
-        let result = try await MemoryConsolidationHygiene.runConsolidation(dataRoot: engine.dataRoot, dryRun: dryRun)
-        await loadMemoryProposals()
-        return result
     }
 
     // PATCH-2026-05-29: dreams-tab — Dreams tab data + control methods.

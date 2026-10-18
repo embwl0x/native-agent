@@ -61,8 +61,10 @@ public enum AgentConversationView {
             "detail": .string(entries.isEmpty ? "No recent worklog entries match this read." : "Claude's recorded work; not independently verified.")])
     }
 
+    /// A reply is awaited only while his transport can carry one: inbound
+    /// only, her retained conversation is read as it is, nothing pending.
     public static func dotReply(_ receipt: JSONValue, sentAt: Date?) -> JSONValue {
-        guard let sentAt, case .object(var fields) = receipt else { return receipt }
+        guard let sentAt, ChatGPTDotIPCTransport.available, case .object(var fields) = receipt else { return receipt }
         fields["status"] = .string("waiting")
         fields["reply_deadline"] = .string(ISO8601DateFormatter().string(from: sentAt.addingTimeInterval(1800)))
         return expiringReply(.object(fields))

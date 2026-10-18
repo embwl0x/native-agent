@@ -64,6 +64,14 @@ package enum ChatWorkspaceBinding {
         }
         func liveHandOff(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.liveHandOff(row) }
         func unsettledAttention(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.unsettledAttention(row) }
+        func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL) {
+            guard peer.hasPrefix("peer:") else { return }
+            let store = GrokRequestStore(dataRoot: dataRoot), id = String(peer.dropFirst(5))
+            // Its hand-over goes to the chat that asked; seen in another, it still goes.
+            for (answer, words) in answers where (try? store.read(answer, peer: id))?.conversationID == scope {
+                store.shown(answer, peer: id, by: "the room") { $0 == words }
+            }
+        }
     }
 
     private struct Tools: AgentWorkspaceToolPort {

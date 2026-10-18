@@ -149,11 +149,6 @@ extension AppToolExecutor {
 
     /// The posture gate setting.set stands behind, for the app's other
     /// writes (Doctor repair, upkeep). Nil when changes are allowed.
-    static func quietChangesRefusal() async -> JSONValue? {
-        guard let posture = await freshQuietPosture() else { return unreadablePostureFailure() }
-        return posture.changesAllowed ? nil : readOnlyFailure(posture)
-    }
-
     static func readOnlyFailure(_ posture: QuietPosture) -> JSONValue {
         failure(
             "trust_mode_read_only",
@@ -372,7 +367,10 @@ extension AppToolExecutor {
             }
             request = Self.text(receipt["user_request"])
             restoresPrevious = true
-        } else if ChatTurnRuntimeContext.current != nil {
+        } else if ChatTurnRuntimeContext.current != nil,
+                  await Self.freshQuietPosture()?.name != Self.fullMacModeName {
+            // Under Full Mac her own dials are hers (owner-only rows refused above);
+            // below it a change needs the person's words.
             request = Self.text(input["because"])
             guard let request, request.split(whereSeparator: \.isWhitespace).count >= 3,
                   let restores = await ChatToolSessionContext.settingRequestEvidence?(setting.id, input["value"] ?? .null, await setting.read(appModel), request) else {
@@ -471,6 +469,25 @@ extension AppToolExecutor {
         for (key, value) in detail { extra[key] = value }
         let code = if case QuietSettingError.users = error { "owners_call" } else { "write_refused" }
         return failure(code, error.localizedDescription, extra: extra)
+    }
+
+    /// One setting's current value, read from the page's own state: the
+    /// inverse of setting.set, with its names and refusals.
+    @MainActor
+    func runAppSettingGet(input: [String: JSONValue]) async -> JSONValue {
+        let requested = Self.text(input["setting"])
+        guard !requested.isEmpty else {
+            return Self.failure("missing_setting", "Name the setting. Its page read (app {page}) has the names.")
+        }
+        guard let appModel = quietHost() else { return Self.unattachedFailure() }
+        guard let setting = QuietSettings.setting(id: requested, host: appModel) else {
+            return Self.failure("unknown_setting",
+                "No setting is called that. Read its page first for the names (app {page}) rather than guessing one.",
+                extra: ["requested": .string(requested), "known": .array(QuietSettings.all(host: appModel).map { .string($0.id) })])
+        }
+        return .object(["status": .string("ok"), "effects": .string("none"), "read_only": .bool(true),
+                        "setting": .string(setting.id), "page": .string(setting.page), "label": .string(setting.label),
+                        "kind": .string(setting.kind.rawValue), "value": await setting.read(appModel)])
     }
 
     @MainActor

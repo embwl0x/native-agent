@@ -213,6 +213,7 @@ extension RuntimeReadProjection {
         var out: [T] = []
         out.reserveCapacity(tail.count)
         for line in tail {
+            guard let line else { continue }
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { continue }
             if let lineData = trimmed.data(using: .utf8),

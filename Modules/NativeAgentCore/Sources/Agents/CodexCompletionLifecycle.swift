@@ -368,13 +368,13 @@ public struct CodexCompletionLifecycle: Sendable {
         return reconciled.sorted()
     }
 
-    public func reconciliationRows() async throws -> [(id: String, digest: String, status: String, response: ChatResponse?, route: AgentBridgeCompletionRoute?, routeSettled: Bool)] {
-        var rows: [(String, String, String, ChatResponse?, AgentBridgeCompletionRoute?, Bool)] = []
+    public func reconciliationRows() async throws -> [(id: String, digest: String, status: String, response: ChatResponse?, route: AgentBridgeCompletionRoute?, routeSettled: Bool, principal: String?)] {
+        var rows: [(String, String, String, ChatResponse?, AgentBridgeCompletionRoute?, Bool, String?)] = []
         for path in try stateURLs() where !Self.isCorruptTombstone(path) {
             guard let state = try await loadState(path) else { continue }
             let decision = CodexCompletionLifecycleProjection(state)
             guard let status = decision.status else { continue }
-            rows.append((state.deliveryId, state.requestDigest, status, state.response, state.route, decision.routeSettled))
+            rows.append((state.deliveryId, state.requestDigest, status, state.response, state.route, decision.routeSettled, state.principal))
         }
         return rows
     }

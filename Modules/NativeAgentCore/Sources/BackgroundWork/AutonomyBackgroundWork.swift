@@ -331,17 +331,6 @@ public struct AutonomyPromotionLoop: LoopRunner {
     /// external/irreversible-consequence guards (send mail, draft+auto-send),
     /// NOT trust friction, so approval volume must never loosen them.
     static let hardExcludeTiers: Set<String> = ["send_approval", "draft_auto"]
-    /// Defensive literal exclusion: builder/process-spawning + agent-invoking
-    /// tools. They are already `auto` (so they would not be confirm/supervised
-    /// anyway) but are listed so a hypothetical mis-tiered entry can never be
-    /// proposed for promotion.
-    static let hardExcludeTools: Set<String> = [
-        // shell-class builders (Process spawn / fs write / arbitrary code)
-        "shell", "bash", "git", "apply_patch",
-        "swift_build", "swift_test",
-        // app/agent control surfaces
-        "restart_app", "install_app", "invoke_codex",
-    ]
     static let minApprovals = 5
     static let minSpanDays = 14
     static let minDistinctDays = 3
@@ -353,16 +342,15 @@ public struct AutonomyPromotionLoop: LoopRunner {
     /// legitimate promotion TARGET iff it is a trust-friction tier and not an
     /// external/irreversible/privileged surface. Used by BOTH the propose gate
     /// AND the locked apply (the apply path must NOT trust the card's
-    /// payload.tool — a forged approved card naming `shell`/`restart_app`/an
+    /// payload.tool — a forged approved card naming `shell` or an
     /// `invoke_*` surface must be rejected even if the on-disk tier somehow
     /// reads confirm/supervised). Keeping it in one place means the apply path
     /// and the proposal path can never drift.
     public static func isPromotableTarget(tool: String, tier: String) -> Bool {
-        if hardExcludeTools.contains(tool) { return false }
         if tool.hasPrefix("invoke_") { return false }          // any agent-invoke surface
         // Code-execution / OS-automation / fs-write name SHAPES — never auto-
-        // promote a tool that can run code or mutate the system, even under a
-        // namespaced alias the explicit list misses (gpt-5.5 r2: `mac.shell`,
+        // promote a tool that can run code or mutate the system, namespaced
+        // aliases included (gpt-5.5 r2: `mac.shell`,
         // `mac.jxa`, `mac.applescript`, `mac.write_file` are shell/exec/write
         // tools TrustCenter classifies as approval-gated, but `mac.shell` is
         // not literally `shell`). Conservative by design: a safe tool that

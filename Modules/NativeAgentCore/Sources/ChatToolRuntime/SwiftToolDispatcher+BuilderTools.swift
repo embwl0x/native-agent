@@ -1323,12 +1323,12 @@ extension SwiftToolDispatcher {
             return .object(env)
         }
 
-        let stdoutDrain: SystemProcessAdapter.PipeDrain
-        let stderrDrain: SystemProcessAdapter.PipeDrain
+        let stdoutDrain: ProcessPipeDrain
+        let stderrDrain: ProcessPipeDrain
         do {
-            stdoutDrain = try SystemProcessAdapter.PipeDrain(handle: stdout.fileHandleForReading) { stdoutBuf.append($0) }
+            stdoutDrain = try ProcessPipeDrain(handle: stdout.fileHandleForReading) { stdoutBuf.append($0) }
             do {
-                stderrDrain = try SystemProcessAdapter.PipeDrain(handle: stderr.fileHandleForReading) { stderrBuf.append($0) }
+                stderrDrain = try ProcessPipeDrain(handle: stderr.fileHandleForReading) { stderrBuf.append($0) }
             } catch {
                 stdoutDrain.stopAndWait()
                 throw error

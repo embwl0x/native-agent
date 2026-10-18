@@ -56,8 +56,6 @@ public protocol QuietSettingsHost: AnyObject {
     /// The mode in effect after the write, which setup or safety can hold off.
     func setContextFlowMode(_ mode: ContextFlowMode) async -> ContextFlowMode
     func setGlobalHotkeyEnabled(_ enabled: Bool)
-    func memoryMode() async throws -> String
-    func setMemoryMode(_ mode: String) async throws
     /// Nil when saved; otherwise what was wrong with it.
     func savePersonalityName(_ name: String) async -> String?
     func saveSearchServiceURL(_ url: String) async throws

@@ -1,6 +1,8 @@
+import AuthoredCapabilities
 import ChatOrchestration
 import CryptoKit
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import Senses
 import TrustCenter
@@ -28,6 +30,11 @@ extension AppToolExecutor {
             return Self.failure("stale_version", "Sense changed; read sense.versions and use its current version.")
         }
         let preview = input["preview"] == .bool(true)
+        if preview, verb == "restore" {
+            let fullMac = await Self.freshQuietPosture(dataRoot: registry.root.deletingLastPathComponent())?.name == Self.fullMacModeName
+            do { try CapabilityLifecycle.requireKeep(ownerAuthorized: fullMac || PeerDataTaint.ownerAuthorized) }
+            catch { return Self.failure("owners_call", error.localizedDescription) }
+        }
         let record: SenseRecord
         switch verb {
         case "drop": record = try await registry.drop(id: id, version: current.version, preview: preview, ownerAuthorized: PeerDataTaint.ownerAuthorized)
@@ -42,6 +49,8 @@ extension AppToolExecutor {
                 record = try await registry.setStatus(id: id, version: current.version, status: .on, preview: preview)
             } catch let refusal as SenseFailure where refusal.code == "owners_call" {
                 return Self.failure(refusal.code, refusal.message)
+            } catch let refusal as NSError where refusal.domain == "CapabilityLifecycle" {
+                return Self.failure("owners_call", refusal.localizedDescription)
             }
         default: return Self.failure("invalid_args", "Unknown sense lifecycle action.")
         }
@@ -75,7 +84,7 @@ extension AppToolExecutor {
         if input["trial_id"] != nil || input["digest"] != nil {
             guard let trial = Self.inputString(input["trial_id"]), let digest = Self.inputString(input["digest"]),
                   input["keep"] == .bool(true), !scope.isEmpty,
-                  ["code", "place", "why", "show", "apps"].allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
+                  (["code", "place", "why", "show", "apps"] + Array(AbilityStore.partKeys)).allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
                 return Self.failure("invalid_args", "Keep a trial with trial_id, digest and keep:true in the conversation that tried it. Omit code, place, why and show; run a fresh trial to change the candidate.")
             }
             do {
@@ -142,9 +151,11 @@ extension AppToolExecutor {
                 }
                 record.reach.apps = values.compactMap { Self.inputString($0) }
             }
+            let part = try AbilityStore.partHeader(input.merging(["reach": try .fromEncodable(record.reach)]) { first, _ in first })
+            record.reach = try JSONDecoder().decode(SenseReach.self, from: part["reach"]!.serializedData(pretty: false))
             record.grownBecause = Self.inputString(input["why"]) ?? "Agent made it in her turn"
             guard !scope.isEmpty else { return Self.failure("no_conversation", "Run sense.make in a chat conversation to retain this trial.") }
-            let candidate = try await registry.candidate(record, codeFiles: ["sense.js": Data(code.utf8)], scope: scope)
+            let candidate = try await registry.candidate(record, codeFiles: ["sense.js": Data(code.utf8)], scope: scope, header: part)
             record = try FileSenseRegistry.record(candidate)
             let outcome = await runner.run(record, request: .read(address: view.page.address),
                                            source: CapturedSenseSource(corner: corner, material: material))

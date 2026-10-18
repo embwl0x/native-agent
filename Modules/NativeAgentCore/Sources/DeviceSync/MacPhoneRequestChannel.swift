@@ -1,5 +1,7 @@
+import Cognition
 import Foundation
 import NativeAgentShared
+import PersistenceCore
 
 /// One bounded waiter per request; authenticated bridge delivery settles it.
 @MainActor
@@ -18,6 +20,7 @@ public final class MacPhoneRequestChannel {
         guard pending.isEmpty else {
             throw DeviceSyncError.underlying(message: "Another phone request is waiting. Let it finish first.")
         }
+        let seconds = Int(request.expiresAt.timeIntervalSinceNow.rounded())
         try Task.checkCancellation()
         let text = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
         return try await withTaskCancellationHandler {
@@ -25,8 +28,12 @@ public final class MacPhoneRequestChannel {
                 let deadline = Task { [weak self] in
                     do { try await Task.sleep(for: .seconds(max(0, request.expiresAt.timeIntervalSinceNow))) }
                     catch { return }
+                    // The Mac knows only when it last heard from the phone, not whether it is listening.
+                    let contact = SignedPeerEvidenceStore.load(dataRoot: PersistenceCore.defaultDataRoot())?.contactAt
+                    let heard = contact.map { "it was last heard from at \(ISO8601DateFormatter().string(from: $0)), \(Int(-$0.timeIntervalSinceNow / 60)) minutes ago" }
+                        ?? "it has not been heard from on this Mac"
                     self?.finish(request.id, result: .failure(DeviceSyncError.underlying(
-                        message: "Phone request \(request.id) expired without a result. The phone may have been offline or closed; no result is claimed."
+                        message: "The phone has not answered in \(seconds) s; \(heard). If NativeAgent is open on the phone, ask again; or give a place."
                     )))
                 }
                 pending[request.id] = Pending(continuation: continuation, deadline: deadline)

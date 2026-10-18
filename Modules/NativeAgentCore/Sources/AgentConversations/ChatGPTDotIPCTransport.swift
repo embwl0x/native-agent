@@ -29,9 +29,24 @@ public enum ChatGPTDotIPCTransport {
         return false
     }
 
+    /// Dot is inbound only (User 10-16): he reaches her by running the local
+    /// message command on this Mac; she cannot start a message to him, since
+    /// ChatGPT 26.1013 and later keeps his conversation in its cloud and no
+    /// window here owns it. Not a broken reply path, nothing to repair. The
+    /// listener's word is the reason; should ChatGPT ever hand the
+    /// conversation back to a local window, sends work again by themselves.
+    public static var inboundOnly: Bool {
+        guard case .object(let value) = readiness else { return true }
+        // Loading is a moment, not a way: a send then waits, as it always did.
+        return ![.string("available"), .string("not_checked"), .string("loading")].contains(value["status"] ?? .null)
+    }
+
     public static var detail: String {
-        if case .object(let value) = readiness, case .string(let detail)? = value["detail"] { return detail }
-        return "In-house ChatGPT Dot · two-way"
+        if available { return "In-house ChatGPT Dot · two-way" }
+        let reason: String = if case .object(let value) = readiness, case .string(let why)? = value["detail"], !why.isEmpty { why } else { "Dot messaging has not been checked yet." }
+        guard inboundOnly else { return reason }
+        return "Inbound only. Dot reaches her by running the local message command on this Mac (nativeagent-link message, with his contact file). "
+            + "She cannot start a message to him, and a reply typed in his own chat does not arrive here: " + reason
     }
 
     public static let didChange = Notification.Name("ChatGPTDotIPCTransport.didChange")
@@ -175,6 +190,12 @@ public enum ChatGPTDotIPCTransport {
         }) else { return }
         NotificationCenter.default.post(name: didChange, object: nil)
         guard let root else { return }
+        // Inbound only has no send path to be unavailable: a mark an earlier refused send left is lifted here, once.
+        if inboundOnly, let peers = try? AgentPeerStore(dataRoot: root).list() {
+            for peer in peers where owns(peer) && peer.unavailableAt != nil {
+                AgentPeerStore(dataRoot: root).clearUnavailable(peerID: peer.id, since: .distantPast)
+            }
+        }
         Task.detached(priority: .utility) {
             await AgentContactHealth.shared.refresh(dataRoot: root)
             // Room messages a failed ingestion kept are tried again.

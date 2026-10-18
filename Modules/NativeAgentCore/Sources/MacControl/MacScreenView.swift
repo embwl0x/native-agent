@@ -152,11 +152,20 @@ public protocol MacScreenCaptureSource: Sendable {
     /// Capture only this window's pixels, independently of covering windows.
     /// Never substitute a desktop crop when the source cannot honor identity.
     func capture(window: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure>
+    /// One enumeration of the windows on screen, then any of them by its exact
+    /// window number (never a sibling at the same frame), no wider than
+    /// `maxPixelWidth`: what a composite of many windows needs.
+    func windowCapture() async -> MacScreenWindowCapture
 }
+
+public typealias MacScreenWindowCapture = @Sendable (_ windowNumber: Int, _ maxPixelWidth: Int) async -> Result<MacScreenShot, MacScreenCaptureFailure>
 
 public extension MacScreenCaptureSource {
     func capture(window: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
         .failure(.captureFailed)
+    }
+    func windowCapture() async -> MacScreenWindowCapture {
+        { _, _ in .failure(.captureFailed) }
     }
 }
 
@@ -541,6 +550,51 @@ public struct MacScreenViewGeometry: Sendable, Equatable {
             || frame.y + frame.h <= bounds.y
         return !noOverlap
     }
+
+    /// Image pixels → global screen points: `placement` run backwards, on the
+    /// same two measured scales. Nil off the image.
+    public func screenPoint(imageX x: Double, imageY y: Double) -> MacPointerPosition? {
+        guard scaleX > 0, scaleY > 0, (0...Double(pixelWidth)).contains(x), (0...Double(pixelHeight)).contains(y) else { return nil }
+        return MacPointerPosition(x: bounds.x + x / scaleX, y: bounds.y + y / scaleY)
+    }
+}
+
+/// Every image she is handed is a frame: the pixels delivered and the global
+/// screen rect they cover, so a point she reads off the picture is a place
+/// her hand can go, by the picture's own measured scale and never an assumed
+/// Retina factor. Ids are random, so an old id is refused rather than meaning
+/// another picture. Each chat session holds its own last 16; an id or "the
+/// latest" is looked up only among the asking session's.
+public enum MacImageFrames {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var held: [(id: String, session: String, geometry: MacScreenViewGeometry)] = []
+
+    /// Keep a delivered image; its receipt fields and the sentence that reads them.
+    public static func remember(_ geometry: MacScreenViewGeometry) -> (fields: JSONValue, words: String) {
+        let id = "img-" + UUID().uuidString.prefix(8).lowercased()
+        let session = PersonOnlyWindows.driver?.session ?? ""
+        lock.withLock {
+            held.append((id, session, geometry))
+            if held.count(where: { $0.session == session }) > 16,
+               let oldest = held.firstIndex(where: { $0.session == session }) { held.remove(at: oldest) }
+        }
+        let b = geometry.bounds, w = geometry.pixelWidth, h = geometry.pixelHeight
+        func n(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(format: "%.2f", v) }
+        return (.object([
+            "id": .string(id), "width": .int(Int64(w)), "height": .int(Int64(h)),
+            "screen": .object(["x": .double(b.x), "y": .double(b.y), "w": .double(b.w), "h": .double(b.h)]),
+        ]), "Image \(id) is \(w)×\(h) px covering screen points (\(n(b.x)), \(n(b.y))) \(n(b.w))×\(n(b.h)): "
+            + "a point (ix, iy) in this image is screen point (\(n(b.x)) + ix*\(n(b.w))/\(w), \(n(b.y)) + iy*\(n(b.h))/\(h)); "
+            + "no Retina factor to apply. act at:{x,y} takes this image's pixels as they are.")
+    }
+
+    /// This session's image by id, or its latest when no id is given.
+    public static func frame(_ id: String?) -> (id: String, geometry: MacScreenViewGeometry)? {
+        let session = PersonOnlyWindows.driver?.session ?? ""
+        return lock.withLock {
+            held.last { $0.session == session && (id == nil || $0.id == id) }
+        }.map { ($0.id, $0.geometry) }
+    }
 }
 
 // MARK: - Pure fusion logic
@@ -597,6 +651,59 @@ public enum MacScreenViewBuilder {
         }.max { lhs, rhs in lhs.w * lhs.h < rhs.w * rhs.h }
     }
 
+    /// Her-screen Phase 6 — WHEN WORDS FAIL. Nil means the accessibility read
+    /// carries the window and no pixels are attached. A reason means the
+    /// window is a canvas, a game, video, or an app that publishes almost
+    /// nothing, and one small image of it earns its bytes. Real AppKit
+    /// windows publish named controls or text and never reach a reason.
+    public static func thinAccessibilityReason(
+        accessibilityTrusted: Bool,
+        marks: [JSONValue],
+        texts: [JSONValue],
+        windowArea: Double,
+        canvasFraction: Double?,
+        sourceTextCount: Int,
+        sourceTextCharacters: Int
+    ) -> String? {
+        guard accessibilityTrusted else { return "no accessibility read" }
+        // A dominant AXImage/AXCanvas (or childless AXWebArea) is unreadable
+        // content even when its surrounding toolbar has plenty of words.
+        // Chromium renderer reads are retained by the caller; window-wide
+        // text counts can only grade windows without a dominant visual body.
+        if (canvasFraction ?? 0) >= 0.5 { return "canvas" }
+        if sourceTextCharacters >= 80 || sourceTextCount >= 4 { return nil }
+        let visibleCharacters = texts.reduce(0) { total, value in
+            guard case .object(let item) = value, case .string(let text)? = item["text"] else { return total }
+            return total + text.count
+        }
+        if visibleCharacters >= 80 { return nil }
+        let unnamedRoles: Set<String> = ["AXGroup", "AXScrollArea", "AXSplitGroup",
+                                         "AXLayoutArea", "AXUnknown", "AXWebArea"]
+        let roles = marks.compactMap { value -> (role: String, named: Bool)? in
+            guard case .object(let mark) = value, case .string(let role)? = mark["role"] else { return nil }
+            let labeled: Bool = {
+                switch mark["label"] {
+                case .string(let text)?: return !text.trimmingCharacters(in: .whitespaces).isEmpty
+                case .object?: return true
+                default: return false
+                }
+            }()
+            return (role, labeled && !unnamedRoles.contains(role))
+        }
+        let named = roles.filter(\.named).count
+        let characters = texts.reduce(0) { total, value in
+            guard case .object(let item) = value else { return total }
+            if case .string(let text)? = item["text"] { return total + text.count }
+            return total + 20
+        }
+        // One meaningful thing per ~100k pt² (a 1400×900 window wants ~12),
+        // never fewer than four; any real paragraph of text is not thin.
+        let floor = max(4, Int(windowArea / 100_000))
+        guard named + texts.count < floor, characters < 80 else { return nil }
+        if named == 0, texts.isEmpty { return roles.isEmpty ? "no controls or words" : "only unnamed groups" }
+        return "few controls or words for its size"
+    }
+
     /// Roles that are worth a number even when the app advertises no AX action
     /// for them. Two families:
     ///   • CLICKABLE — the things a human would point at.
@@ -627,8 +734,14 @@ public enum MacScreenViewBuilder {
         "token", "pin code", "security code", "2fa", "one-time code",
     ]
 
-    public static func isSecretField(role: String, subrole: String?, label: String?) -> Bool {
+    /// With `value`, a field whose displayed value is all mask glyphs IS a
+    /// password box whatever its role, subrole or label say: AppKit and WebKit
+    /// publish a secure field's value as bullets, so an unlabelled web
+    /// `<input type=password>` with no secure subrole is caught here.
+    public static func isSecretField(role: String, subrole: String?, label: String?, value: String? = nil) -> Bool {
         if role == "AXSecureTextField" || subrole == "AXSecureTextField" { return true }
+        if let shown = value?.trimmingCharacters(in: .whitespaces), !shown.isEmpty,
+           shown.allSatisfy({ ["\u{2022}", "\u{25CF}", "\u{00B7}", "\u{2024}", "*"].contains($0) }) { return true }
         guard let label = label?.lowercased(), !label.isEmpty else { return false }
         return secretLabelHints.contains { label.contains($0) }
     }
@@ -693,9 +806,10 @@ public enum MacScreenViewBuilder {
         // W3.5-FIX-R4 — built once from the WHOLE node set (an enclosing group
         // is never itself markable, so it is not in `candidates`).
         let context = MacScreenViewTextRedaction.nodeSecretContext(nodes)
+        let names = LabelIndex(nodes)
         for (index, candidate) in kept.enumerated() {
             let attributes = candidate.node.attributes
-            let named = inferLabel(for: candidate.node, frame: candidate.frame, among: nodes)
+            let named = inferLabel(for: candidate.node, frame: candidate.frame, in: names)
             let label = named.label
             let enclosing = MacScreenViewTextRedaction.enclosingKinds(
                 forNodeAt: candidate.frame,
@@ -760,11 +874,56 @@ public enum MacScreenViewBuilder {
     /// directly above with horizontal overlap, closest wins, path order breaks
     /// ties — and it is always LABELLED as an inference, because a guessed name
     /// presented as a fact is how a confident click lands on the wrong control.
+    /// The texts that can name a control, indexed once per node set: children
+    /// by parent path, and nameable text by 240-point cell, so naming every
+    /// control of a dense window costs its neighbourhood, not the whole tree.
+    /// Cells are read within the 2^16-point span any display can sit in.
+    public struct LabelIndex: Sendable {
+        let nodes: [MacAXNode]
+        let children: [[Int]: [Int]]
+        let cells: [SIMD2<Int>: [Int]]
+
+        public init(_ nodes: [MacAXNode]) {
+            var children: [[Int]: [Int]] = [:]
+            var cells: [SIMD2<Int>: [Int]] = [:]
+            for (index, node) in nodes.enumerated() {
+                if !node.path.isEmpty { children[Array(node.path.dropLast()), default: []].append(index) }
+                // A scroll bar's thumb reads as a raw position (0.4012…), never a name.
+                guard textRoles.contains(node.attributes.role),
+                      !scrollPositionRoles.contains(node.attributes.role),
+                      let text = node.attributes.title ?? node.attributes.value,
+                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let frame = node.attributes.frame, frame.w > 0, frame.h > 0 else { continue }
+                for cell in Self.cells(frame) { cells[cell, default: []].append(index) }
+            }
+            self.nodes = nodes
+            self.children = children
+            self.cells = cells
+        }
+
+        static func cells(_ frame: MacAXFrame) -> [SIMD2<Int>] {
+            guard [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else { return [] }
+            func cell(_ v: Double) -> Int { Int((min(max(v, -65_536), 65_536) / 240).rounded(.down)) }
+            return (cell(frame.y)...cell(frame.y + frame.h)).flatMap { y in
+                (cell(frame.x)...cell(frame.x + frame.w)).map { SIMD2(x: $0, y: y) }
+            }
+        }
+
+        /// Every nameable text that could sit left of or above `frame` within
+        /// reach; one spanning several cells comes once per cell, which the
+        /// nearest-wins rule does not mind.
+        func neighbours(of frame: MacAXFrame) -> [MacAXNode] {
+            Self.cells(MacAXFrame(x: frame.x - 241, y: frame.y - 241, w: frame.w + 242, h: frame.h + 242))
+                .flatMap { (cells[$0] ?? []).map { nodes[$0] } }
+        }
+    }
+
     public static func inferLabel(
         for node: MacAXNode,
         frame: MacAXFrame,
-        among nodes: [MacAXNode]
+        in index: LabelIndex
     ) -> (label: String?, source: String) {
+        let nodes = index.nodes
         if let title = node.attributes.title, !title.isEmpty { return (title, "title") }
         // A popup button / checkbox often carries its meaning in its value.
         if !isSecretField(role: node.attributes.role, subrole: node.attributes.subrole, label: nil),
@@ -781,8 +940,7 @@ public enum MacScreenViewBuilder {
             var budget = 3
             func descendantText(path: [Int], depth: Int) -> String? {
                 guard depth < 2 else { return nil }
-                for child in nodes where child.path.count == path.count + 1
-                    && Array(child.path.dropLast()) == path {
+                for child in (index.children[path] ?? []).map({ nodes[$0] }) {
                     guard budget > 0 else { return nil }
                     budget -= 1
                     if let text = child.attributes.title ?? child.attributes.value {
@@ -798,13 +956,10 @@ public enum MacScreenViewBuilder {
             }
         }
         var best: (text: String, distance: Double, path: [Int])?
-        for candidate in nodes {
-            // A scroll bar's thumb reads as a raw position (0.4012…), never a name.
-            guard textRoles.contains(candidate.attributes.role),
-                  !scrollPositionRoles.contains(candidate.attributes.role) else { continue }
+        for candidate in index.neighbours(of: frame) {
+            // Only nameable text is indexed (see `LabelIndex`).
             guard let text = candidate.attributes.title ?? candidate.attributes.value,
-                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
-            guard let other = candidate.attributes.frame, other.w > 0, other.h > 0 else { continue }
+                  let other = candidate.attributes.frame else { continue }
             let sameRow = other.y < frame.y + frame.h && other.y + other.h > frame.y
             let toTheLeft = other.x + other.w <= frame.x + 1
             let above = other.y + other.h <= frame.y + 1
@@ -1604,6 +1759,45 @@ public enum MacScreenViewTextRedaction {
         }
         if kinds.secret, looksLikeRedactableValue(text) { return "enclosing_secret_caption" }
         return nil
+    }
+
+    /// The desktop picture's boxes: every element on screen whose words the
+    /// legend and the prose would withhold, and every control the legend's
+    /// field verdict calls secret under the name the legend gives it. One pass
+    /// over the elements against the captions and names indexed once, never
+    /// each control against every element (Chrome has 2,310 controls). Nil
+    /// past the deadline: the window is then masked whole rather than stalling
+    /// the picture.
+    public static func secretFrames(
+        nodes: [MacAXNode],
+        geometry: MacScreenViewGeometry,
+        deadline: Date
+    ) -> [MacAXFrame]? {
+        let context = nodeSecretContext(nodes)
+        let names = MacScreenViewBuilder.LabelIndex(nodes)
+        // The indexes are built from a walk the share already bounded; past the deadline the window is masked whole.
+        guard Date() < deadline else { return nil }
+        var frames: [MacAXFrame] = []
+        for node in nodes {
+            guard Date() < deadline else { return nil }
+            let attributes = node.attributes
+            guard let frame = attributes.frame, frame.w > 0, frame.h > 0, geometry.intersects(frame) else { continue }
+            let enclosing = enclosingKinds(forNodeAt: frame, path: node.path, among: context.enclosingCaptions)
+            func withheld(_ text: String?, under label: String?) -> Bool {
+                guard let text else { return false }
+                if case .object = redactedNodeString(text, valueChars: MacAXLimits.hardValueChars, frame: frame,
+                    under: label, enclosing: enclosing, context: context) { return true }
+                return false
+            }
+            let control = MacScreenViewBuilder.isMarkable(attributes)
+            let name = control ? MacScreenViewBuilder.inferLabel(for: node, frame: frame, in: names).label : attributes.title
+            if withheld(name, under: nil) || withheld(attributes.value, under: name)
+                || (control && MacScreenViewBuilder.isSecretField(role: attributes.role, subrole: attributes.subrole,
+                        label: name, value: attributes.value)) {
+                frames.append(frame)
+            }
+        }
+        return frames
     }
 
     // MARK: shapes

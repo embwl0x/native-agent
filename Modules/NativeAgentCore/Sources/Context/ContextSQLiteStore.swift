@@ -278,19 +278,6 @@ public actor ContextSQLiteStore {
                 arguments: [sourceFingerprint, atomCount, sourceCount, generationID]
             )
 
-            let receipt = ContextStoreReceipt(
-                kind: .compile,
-                generationID: generationID,
-                summary: "published context generation",
-                details: [
-                    "changed_sources": String(draft.changedSources.count),
-                    "removed_sources": String(draft.removedSourceIDs.count),
-                    "atoms": String(atomCount),
-                ],
-                createdAt: draft.createdAt
-            )
-            try Self.insertReceipt(receipt, db: db)
-
             return ContextGenerationRecord(
                 id: generationID,
                 parentID: parentID,
@@ -381,12 +368,11 @@ public actor ContextSQLiteStore {
         }
     }
 
-    // MARK: - Health, failures, and receipts
+    // MARK: - Health and failures
 
     public func markSourceDegraded(
         _ sourceID: ContextSourceID,
-        error: String,
-        at date: Date = Date()
+        error: String
     ) async throws {
         let boundedError = Self.bounded(error, maxUTF8Bytes: 2_048, fallback: "compile failed")
         try await dbPool.write { db in
@@ -406,38 +392,6 @@ public actor ContextSQLiteStore {
                 """,
                 arguments: [boundedError, sourceID.rawValue]
             )
-            try Self.insertReceipt(
-                ContextStoreReceipt(
-                    kind: .degraded,
-                    summary: "context source compile failed",
-                    details: ["source_id": sourceID.rawValue, "error": boundedError],
-                    createdAt: date
-                ),
-                db: db
-            )
-        }
-    }
-
-    public func recordReceipt(_ receipt: ContextStoreReceipt) async throws {
-        try await dbPool.write { db in
-            try Self.insertReceipt(receipt, db: db)
-        }
-    }
-
-    public func recentReceipts(limit: Int = 100) async throws -> [ContextStoreReceipt] {
-        try await dbPool.read { db in
-            let boundedLimit = max(0, min(limit, 500))
-            let rows = try Row.fetchAll(
-                db,
-                sql: """
-                SELECT id, kind, generation_id, summary, details_json, created_at
-                FROM context_receipts
-                ORDER BY created_at DESC, id ASC
-                LIMIT ?
-                """,
-                arguments: [boundedLimit]
-            )
-            return try rows.map(Self.decodeReceipt)
         }
     }
 
@@ -529,8 +483,7 @@ public actor ContextSQLiteStore {
 
     public func prune(
         retainingLatest generationLimit: Int = 8,
-        protectedGenerationIDs: Set<Int64> = [],
-        receiptLimit: Int = 10_000
+        protectedGenerationIDs: Set<Int64> = []
     ) async throws -> ContextStorePruneResult {
         try await dbPool.write { db in
             let activeID = try Int64.fetchOne(
@@ -598,22 +551,6 @@ public actor ContextSQLiteStore {
                 try db.execute(sql: "DELETE FROM context_generations WHERE id = ?", arguments: [id])
             }
 
-            let boundedReceiptLimit = max(0, receiptLimit)
-            let receiptIDs = try String.fetchAll(
-                db,
-                sql: """
-                SELECT id FROM (
-                    SELECT id, ROW_NUMBER() OVER (
-                        PARTITION BY kind ORDER BY created_at DESC, id ASC
-                    ) AS rank FROM context_receipts
-                ) WHERE rank > ?
-                """,
-                arguments: [boundedReceiptLimit]
-            )
-            for id in receiptIDs {
-                try db.execute(sql: "DELETE FROM context_receipts WHERE id = ?", arguments: [id])
-            }
-
             // A removed source has no active meaning. Once every retained
             // generation-specific version is gone, retaining its identity row
             // only makes each incremental compile scan a growing tombstone set.
@@ -630,8 +567,7 @@ public actor ContextSQLiteStore {
                 deletedGenerations: deadGenerations.count,
                 deletedAtomVersions: deadAtomKeys.count,
                 deletedSourceVersions: deadSourceKeys.count,
-                deletedRelationshipVersions: deadRelationshipKeys.count,
-                deletedReceipts: receiptIDs.count
+                deletedRelationshipVersions: deadRelationshipKeys.count
             )
         }
     }
@@ -851,8 +787,8 @@ public actor ContextSQLiteStore {
                 """)
         }
         // Version payloads own source policy, atom eligibility and relationships.
-        // Keep the queried source hash/health; source-version errors and receipts
-        // retain diagnostics without the unread failure history.
+        // Keep the queried source hash/health and source-version errors
+        // without the unread failure history.
         migrator.registerMigration("context_payload_ownership_v4") { db in
             try db.execute(sql: """
                 DROP TABLE context_meta;
@@ -882,6 +818,9 @@ public actor ContextSQLiteStore {
                 ALTER TABLE context_relationship_versions DROP COLUMN weight;
                 ALTER TABLE context_relationship_versions DROP COLUMN provenance;
                 """)
+        }
+        migrator.registerMigration("context_drop_receipts_v5") { db in
+            try db.execute(sql: "DROP TABLE context_receipts")
         }
         return migrator
     }
@@ -1018,28 +957,6 @@ public actor ContextSQLiteStore {
         )
     }
 
-    private static func decodeReceipt(_ row: Row) throws -> ContextStoreReceipt {
-        guard let idRaw: String = row["id"],
-              let id = UUID(uuidString: idRaw),
-              let kindRaw: String = row["kind"],
-              let kind = ContextReceiptKind(rawValue: kindRaw),
-              let summary: String = row["summary"],
-              let detailsJSON: String = row["details_json"],
-              let createdAt: Double = row["created_at"] else {
-            throw ContextFlowStoreError.malformedStoredValue("receipt")
-        }
-        let generationID: Int64? = row["generation_id"]
-        let details: [String: String] = try decodeJSON(detailsJSON)
-        return ContextStoreReceipt(
-            id: id,
-            kind: kind,
-            generationID: generationID,
-            summary: summary,
-            details: details,
-            createdAt: Date(timeIntervalSince1970: createdAt)
-        )
-    }
-
     private static func decodeFeedbackEvent(_ row: Row) throws -> ContextFeedbackEvent {
         guard let id: String = row["id"],
               let atomIDsJSON: String = row["atom_ids_json"],
@@ -1131,34 +1048,6 @@ public actor ContextSQLiteStore {
             sql: "SELECT COUNT(*) FROM context_sources WHERE health = ?",
             arguments: [health.rawValue]
         ) ?? 0
-    }
-
-    private static func insertReceipt(_ receipt: ContextStoreReceipt, db: Database) throws {
-        try db.execute(
-            sql: """
-            INSERT INTO context_receipts (
-                id, kind, generation_id, summary, details_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            arguments: [
-                receipt.id.uuidString,
-                receipt.kind.rawValue,
-                receipt.generationID,
-                bounded(receipt.summary, maxUTF8Bytes: 1_024, fallback: "context receipt"),
-                try encodeJSON(receipt.details),
-                receipt.createdAt.timeIntervalSince1970,
-            ]
-        )
-        // Turn receipts must stay bounded even when no source changes trigger
-        // generation pruning. Retention is part of the receipt transaction,
-        // one ring per kind so prewarm churn never evicts turn selections.
-        try db.execute(sql: """
-            DELETE FROM context_receipts WHERE id IN (
-                SELECT id FROM context_receipts WHERE kind = ?
-                ORDER BY created_at DESC, id ASC
-                LIMIT -1 OFFSET 10000
-            )
-            """, arguments: [receipt.kind.rawValue])
     }
 
     private static func unusedVersionKeys(

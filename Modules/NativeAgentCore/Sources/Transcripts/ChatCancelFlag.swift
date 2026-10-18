@@ -39,10 +39,15 @@ public enum ChatCancelFlag {
                 InFlightTurn(runId: runId, sessionId: sessionId, turnId: turnId, acceptedAt: Date()))
             runs.latest[key] = runId
         }
+        NotificationCenter.default.post(name: inFlightDidChange, object: nil)
         guard var parts = URLComponents(url: file, resolvingAgainstBaseURL: false) else { return file }
         parts.fragment = runId
         return parts.url ?? file
     }
+
+    /// A run was accepted or finished, on any session and surface: whoever
+    /// shows a turn from another door (Shotgun) follows this.
+    public static let inFlightDidChange = Notification.Name("ChatCancelFlag.inFlightDidChange")
 
     public static func finish(_ flag: URL) {
         guard let runId = flag.fragment else { return }
@@ -58,6 +63,7 @@ public enum ChatCancelFlag {
                 }
             }
         }
+        NotificationCenter.default.post(name: inFlightDidChange, object: nil)
     }
 
     /// Every run accepted and not yet finished, on any session. The app's quit

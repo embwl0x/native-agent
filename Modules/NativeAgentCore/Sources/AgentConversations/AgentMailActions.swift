@@ -222,6 +222,17 @@ public enum AgentMailActions {
         }
     }
 
+    public static func authorizeFetch(_ request: URLRequest, dataRoot: URL) throws -> URLRequest {
+        let config = try loadConfig(dataRoot: dataRoot)
+        guard let url = request.url, url.scheme == "https", url.host == config.apiBase.host,
+              url.port == config.apiBase.port else {
+            throw AgentMailError("invalid_url", detail: "fetch must use AgentMail's configured API host.")
+        }
+        var request = request
+        request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
     private struct Config {
         let apiKey: String
         let apiBase: URL

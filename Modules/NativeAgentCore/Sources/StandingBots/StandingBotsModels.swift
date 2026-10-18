@@ -46,10 +46,19 @@ public enum BotRunLimits {
 }
 
 /// Configuration only. Interpreting cron expressions and scheduling belong to the future runner.
+/// TIME (User 10-15): a cron keeps a zone only when someone set one on it; with
+/// none it runs in the Mac's own zone wherever the Mac is.
 public enum BotCadence: Codable, Equatable, Sendable {
     case manual
     case interval(seconds: TimeInterval)
-    case cron(expression: String, timeZone: String)
+    case cron(expression: String, timeZone: String?)
+
+    /// A zone as a writer was given it: blank, "local" or "system" sets none.
+    public static func setZone(_ zone: String?) -> String? {
+        guard let zone = zone?.trimmingCharacters(in: .whitespacesAndNewlines), !zone.isEmpty,
+              !["local", "system"].contains(zone.lowercased()) else { return nil }
+        return zone
+    }
 }
 
 public struct BotBudget: Codable, Equatable, Sendable {

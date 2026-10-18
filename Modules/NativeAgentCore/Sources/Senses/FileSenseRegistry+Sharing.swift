@@ -3,7 +3,7 @@ import Foundation
 extension FileSenseRegistry {
     /// A single portable JSON bundle: metadata plus explicitly manifested source,
     /// never a recursive copy of the sense directory or its notebook.
-    struct Bundle: Codable, Sendable {
+    struct Bundle: Encodable, Sendable {
         var format = 1
         var record: SenseRecord
         var codeFiles: [String: Data]
@@ -54,24 +54,5 @@ extension FileSenseRegistry {
             }
             return (false, .exported(target))
         }
-    }
-
-    public func importBundle(from bundle: URL) async throws -> SenseRecord {
-        let path = try Self.safeURL(bundle.lastPathComponent, under: bundle.deletingLastPathComponent())
-        let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes[.size] as? NSNumber, size.intValue <= Self.maximumBundleBytes else {
-            throw Self.failure("Sense bundle must be a regular file within the size limit.")
-        }
-        let bytes = try Data(contentsOf: path)
-        guard bytes.count <= Self.maximumBundleBytes else { throw Self.failure("Sense bundle exceeds the size limit.") }
-        let imported = try JSONDecoder().decode(Bundle.self, from: bytes)
-        guard imported.format == 1, imported.record.language != .native else { throw Self.failure("Unsupported portable sense bundle.") }
-        try Self.validate(Version(record: imported.record, files: imported.codeFiles.keys.sorted()))
-        var record = imported.record
-        record.origin = .shared; record.status = .on; record.unavailableReason = nil
-        record.createdAt = Date(); record.reach.readPaths = []; record.grownBecause = nil
-        record.version = 1; record.candidateDigest = nil; record.disabledBy = nil
-        return try await upsert(record, codeFiles: imported.codeFiles)
     }
 }

@@ -4,23 +4,13 @@ import Darwin
 import NativeAgentCore
 import PersistenceCore
 import Desk
+import ToolRegistry
 
-// Wave B — the Workshop membrane (H1, L12), enforced IN CODE, never in a prompt.
-//
-// A workshop work session runs through the SAME chat orchestration a normal
-// turn does, but its tool surface is a HARD ALLOWLIST wrapped around the real
-// SwiftToolDispatcher: read-only tools + desk writes + a single, containment-
-// checked artifact writer. Everything else — mac_control, shell, generic
-// write_file, external sends, persona/memory writes, workshop_submit, sub-agent
-// spawn — is refused BY NAME before the call reaches any backend. This is the
-// ceiling: even if the model, the system prompt, or a future surface tries a
-// forbidden tool, the dispatcher says no (H1: workshop sessions never inherit
-// the generic execution path's `fileAccess:auto` + full dispatcher).
-//
-// Because ChatOrchestration builds a turn's tool schemas from the dispatcher's
-// `listAvailableToolSchemas()` (ChatOrchestration+TurnEngine.swift:583), this
-// wrapper ALSO decides what the model even sees: the allowlisted read/desk
-// tools plus `workshop_artifact_write`. Anything outward is not a tool here.
+// The Workshop membrane. A workshop work session runs through the SAME chat
+// orchestration and gated chain a normal turn does, with the same tools and
+// the same answers (the permission law: User's posture decides, and a sub-agent
+// is her hands, not a lesser user). The membrane adds the session's own
+// handle-scoped artifact writer, its artifact reader and its progress report.
 
 /// Records the artifact paths a session wrote, so the pump can put them on the
 /// session receipt. One collector per session (the profile is built per run).
@@ -81,15 +71,14 @@ public actor WorkshopProgressCollector {
     public func failedCalls() -> [String] { failures }
 }
 
-/// The membrane. A `ToolDispatchClient` that ceilings a workshop session's tool
-/// use to a hard allowlist and implements the one workshop-only write tool with
-/// canonical-path containment.
+/// The membrane. A `ToolDispatchClient` that adds a workshop session's own
+/// tools to the dispatcher it wraps, the artifact writer with canonical-path
+/// containment among them.
 public struct WorkshopToolProfile: ToolDispatchClient {
-    /// The real dispatcher the allowlisted read/desk tools delegate to.
+    /// The real dispatcher every other tool goes to.
     let inner: any ToolDispatchClient
     /// The artifact writer for `workshop_artifact_write` (handle-scoped root,
-    /// containment-checked). Handled IN this wrapper — never delegated to
-    /// `inner`, so a generic `write_file` is unreachable.
+    /// containment-checked). Handled IN this wrapper, never delegated to `inner`.
     let artifactWriter: WorkshopArtifactWriter
     let collector: WorkshopArtifactCollector
     let progressCollector: WorkshopProgressCollector
@@ -112,51 +101,24 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         self.collector = collector
         self.progressCollector = progressCollector
         self.allowsDeskWorkLog = allowsDeskWorkLog
+        _ = Self.registered
     }
+
+    /// Her own handle-scoped tools, declared to Trust like every other tool.
+    private static let registered: Void = AppActionBinding.registerTools(
+        [artifactWriteSchema, artifactReadSchema, progressSchema].map { ToolDescriptor(schema: $0, bucket: .core) })
 
     public static let deskWorkLogToolName = "desk_work_log"
 
-    /// The allowlist as this session sees it.
+    /// Every tool, but desk_work_log only where it can accept this session's item.
     func permits(_ tool: String) -> Bool {
-        guard Self.allowed.contains(tool) else { return false }
-        return allowsDeskWorkLog || tool != Self.deskWorkLogToolName
+        allowsDeskWorkLog || tool != Self.deskWorkLogToolName
     }
 
-    /// The dedicated workshop write tool — the ONLY write beyond desk ops.
+    /// The session's own handle-scoped tools.
     public static let artifactToolName = "workshop_artifact_write"
     public static let artifactReadToolName = "workshop_artifact_read"
     public static let progressToolName = "workshop_progress"
-
-    /// The hard read/desk allowlist. Snake_case to match the dispatcher's
-    /// built-in names. Conservative on purpose: anything not here (and not the
-    /// artifact tool) is refused, so a future tool is unavailable to workshop
-    /// until someone deliberately adds it — no silent privilege creep. Mirrors
-    /// the execution synthesize read-only surface, plus desk read + desk_work_log.
-    public static let allowed: Set<String> = [
-        // filesystem READS
-        "read_file", "list_dir",
-        // memory / knowledge READS
-        "recall_memory", "recall_search", "search_kg", "context_lookup",
-        // prior-conversation READS. 2026-09-06: read_chat_message pages one
-        // already-found message whole — the same reach as the search that
-        // returns its id and a 368-character preview.
-        "search_chat_history", "session_search", "read_chat_message",
-        // bounded skill reads / introspection. Generic tool discovery is
-        // intentionally absent: tool_catalog/list_tools describe the inner
-        // dispatcher's full surface and are not a workshop capability.
-        "read_skill", "list_skills", "time_now",
-        // trace READS (observability, read-only)
-        "recent_trace_summary",
-        // desk: read the live board + log a work receipt onto a pursuit
-        "desk_read", "desk_work_log",
-    ]
-
-    /// A tool the workshop session may invoke: the read/desk allowlist plus the
-    /// artifact writer. `workshop_artifact_write` is deliberately NOT in
-    /// `allowed` (that set gates delegation to `inner`); it is handled here.
-    static func isPermitted(_ tool: String) -> Bool {
-        tool == artifactToolName || tool == artifactReadToolName || tool == progressToolName || allowed.contains(tool)
-    }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         do {
@@ -189,11 +151,8 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         if tool == Self.progressToolName {
             return try await handleProgress(args)
         }
-        if tool == Self.deskWorkLogToolName, !allowsDeskWorkLog {
+        if !permits(tool) {
             throw WorkshopMembraneError.deskWorkLogNotAvailable
-        }
-        guard permits(tool) else {
-            throw WorkshopMembraneError.toolNotPermitted(tool)
         }
         return try await inner.dispatch(tool: tool, input: input, surface: surface)
     }
@@ -238,10 +197,10 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
         return LLMToolSchema(
             name: artifactToolName,
+            toolClass: .write,
             description:
                 "Write a workshop artifact (notes, findings, drafts) into this pursuit's own "
-                + "folder. The ONLY file write available in a workshop session — sandboxed to "
-                + "data/workshop/<handle>/.",
+                + "folder, data/workshop/<handle>/.",
             parametersJSON: data
         )
     }()
@@ -259,6 +218,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
         return LLMToolSchema(
             name: artifactReadToolName,
+            toolClass: .read,
             description: "Read one prior artifact owned by this Desk handle (maximum 64 KiB).",
             parametersJSON: data
         )
@@ -281,6 +241,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
         return LLMToolSchema(
             name: progressToolName,
+            toolClass: .write,
             description: "Record a typed Desk-owned progress disposition. Call once near the end of the session.",
             parametersJSON: data
         )
@@ -335,7 +296,6 @@ public struct WorkshopToolProfile: ToolDispatchClient {
 }
 
 public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
-    case toolNotPermitted(String)
     case badArtifactArgs(String)
     case pathEscapesRoot(String)
     case unsafeComponent(String)
@@ -350,10 +310,6 @@ public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
         case .sessionClosed:
             return "this Desk work session has ended (its deadline passed and its receipt is "
                 + "already filed) — no further artifact writes are accepted."
-        case .toolNotPermitted(let tool):
-            return "tool '\(tool)' is not permitted in a Desk work session "
-                + "(allowlist: \(WorkshopToolProfile.allowed.sorted().joined(separator: ", ")), "
-                + "plus \(WorkshopToolProfile.artifactToolName))."
         case .badArtifactArgs(let why):
             return "workshop_artifact_write: \(why)"
         case .pathEscapesRoot(let p):

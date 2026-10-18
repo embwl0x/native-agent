@@ -19,6 +19,8 @@ import Foundation
 // adapter streaming paths: the binding wraps the SYNCHRONOUS stream
 // construction, and the inner Task inherits the values at creation.
 public enum LLMCallContext {
+    /// The admitted turn's client, for thoughts made by its owned code.
+    @TaskLocal public static var client: (any LLMClient)?
     @TaskLocal public static var toolCapabilityNote: (@Sendable (String) -> Void)?
     @TaskLocal public static var turnTokenBudget: TurnTokenBudget?
     /// Remaining output ceiling for the current provider request.
@@ -369,6 +371,17 @@ public struct ToolFailureError: Error, LocalizedError, Sendable {
     public var errorDescription: String? { message }
 }
 
+/// What a call IS to the permission law: a read, a write, a send that reaches
+/// another person or service, or a destructive act with no way back (deleted
+/// for good, emptied, an ability's history dropped). Declared once where the
+/// tool is declared; Trust derives every decision from it, the posture, the
+/// integration switch and who steered the turn.
+public enum ToolClass: Int, Sendable, Comparable {
+    case read, write, send, destructive
+
+    public static func < (lhs: ToolClass, rhs: ToolClass) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
 /// JSON Schema descriptor for a single tool the LLM is allowed to call. Lives
 /// in NativeAgentCore (no PersistenceCore dep) so the `parameters` JSON Schema
 /// body is stored as raw canonical-JSON bytes rather than a duplicated
@@ -393,9 +406,13 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
     /// FALSE for every other lane and every other provider, so a request that
     /// never sets it is byte-identical to the pre-2026-09 wire.
     public let deferLoading: Bool
+    /// The class its declaration gives it; nil for a schema that came from
+    /// elsewhere (a decoded copy, an MCP server). Never on the wire.
+    public let toolClass: ToolClass?
 
     public init(
         name: String,
+        toolClass: ToolClass? = nil,
         description: String,
         parametersJSON: Data,
         deferLoading: Bool = false
@@ -404,10 +421,17 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         self.description = description
         self.parametersJSON = parametersJSON
         self.deferLoading = deferLoading
+        self.toolClass = toolClass
     }
 
     private enum CodingKeys: String, CodingKey {
         case name, description, parametersJSON, deferLoading
+    }
+
+    /// The offered contract; the class is policy, not part of it.
+    public static func == (lhs: LLMToolSchema, rhs: LLMToolSchema) -> Bool {
+        lhs.name == rhs.name && lhs.description == rhs.description
+            && lhs.parametersJSON == rhs.parametersJSON && lhs.deferLoading == rhs.deferLoading
     }
 
     /// Hand-rolled so a persisted schema written before `deferLoading` existed
@@ -419,6 +443,7 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         self.description = try container.decode(String.self, forKey: .description)
         self.parametersJSON = try container.decode(Data.self, forKey: .parametersJSON)
         self.deferLoading = try container.decodeIfPresent(Bool.self, forKey: .deferLoading) ?? false
+        self.toolClass = nil
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -485,6 +510,8 @@ public struct LLMStreamToolCall: Sendable, Equatable {
 
 public enum LLMToolBoundaryReason: String, Sendable, Equatable {
     case repeatedBlock, repeatedAction, fabricatedResult, postCallProse, outputLimit
+    /// The person steered mid-reply: the stream was cut at the next delta so their words land now.
+    case steered
 }
 
 public enum LLMMessageStreamEvent: Sendable, Equatable {

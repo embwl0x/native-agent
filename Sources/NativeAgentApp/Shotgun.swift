@@ -16,6 +16,7 @@ import AttentionRouting
 // work either way.
 
 import AppKit
+import AppToolRuntime
 import Carbon.HIToolbox
 import MacControl
 import NativeAgentCore
@@ -51,9 +52,10 @@ final class ShotgunPanel: NSPanel {
         isOpaque = false
         hasShadow = true
         animationBehavior = .none
-        // Ruling 1: out of every capture that honours it. Her own captures
-        // also leave it out by window number (PersonOnlyWindows).
-        sharingType = .none
+        // Ruling 1: her own captures leave it out by window number
+        // (PersonOnlyWindows). The person's recordings keep it (10-17: the
+        // Resolve showcase recording showed no Shotgun at all).
+        sharingType = .readOnly
         setFull(true)
     }
 
@@ -118,7 +120,7 @@ enum ShotgunShortcut: String, CaseIterable, Identifiable {
 final class ShotgunController: NSObject, NSWindowDelegate {
     static let shared = ShotgunController()
     /// The composer's switch. On: NativeAgent steps aside when she starts driving.
-    static let enabledKey = "NativeAgent.shotgun.enabled"
+    static let enabledKey = ShotgunPreference.enabledKey
     /// Where User last left it: the panel's bottom-right corner, "x,y".
     static let cornerKey = "NativeAgent.shotgun.corner"
     /// The size User last gave it, "w,h".
@@ -144,6 +146,12 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     /// The turn that already stepped aside: once per turn, so a main window
     /// User brought back stays back.
     @ObservationIgnored private var steppedAsideTurn: String?
+    /// The session and turn driving the Mac while Shotgun is up, named by the
+    /// call itself: its running state and Stop are the ones Shotgun shows,
+    /// whichever surface the turn came from (a Telegram drive is not the chat
+    /// on screen and has no Mac lifecycle; it is stopped by its session).
+    private(set) var driver: PersonOnlyWindows.Driver?
+    var drivingSessionID: String? { driver?.session }
     /// True while the panel is placed or animated, so only User's drag becomes
     /// the remembered spot.
     @ObservationIgnored private var placing = false
@@ -164,6 +172,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         guard self.appModel == nil else { return }
         self.appModel = appModel
         PersonOnlyWindows.install(passPointerThrough: { Self.onMain { $0.passPointerThrough() } })
+        PersonOnlyWindows.installStepAside { driver in await ShotgunController.shared.stepAsideForScreen(driver: driver) }
         PersonOnlyWindows.observeAgent(
             motor: {
                 DispatchQueue.main.async { MainActor.assumeIsolated { ShotgunController.shared.maybeStepAside() } }
@@ -185,6 +194,11 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             let window = note.object as? NSWindow
             MainActor.assumeIsolated { ShotgunController.shared.windowBecameKey(window) }
         })
+        // A turn from another door ended (or began): the remote driver is let go
+        // the moment its turn leaves flight, and the view reads running again.
+        observers.append(center.addObserver(
+            forName: Notification.Name("ChatCancelFlag.inFlightDidChange"), object: nil, queue: .main
+        ) { _ in MainActor.assumeIsolated { ShotgunController.shared.releaseDriverIfDone() } })
         observeTurns()
         Task { @MainActor in
             for await _ in await MacAttentionSessionStore.shared.driverChanges() {
@@ -345,28 +359,43 @@ final class ShotgunController: NSObject, NSWindowDelegate {
 
     // MARK: - Stepping aside
 
-    /// The turn on screen, while a Mac verb of it is running (its live screen
-    /// pane opens with the first Mac verb of the turn).
-    private func drivingTurnID() -> String? {
+    /// A turn driving the Mac, from any surface (Telegram's drive of WoW
+    /// never stepped aside, 10-16): the chat on screen first, then any other
+    /// session busy with a Mac verb (its live screen pane opens with the
+    /// first Mac verb of the turn).
+    private func drivingTurnID() -> String? { drivingSession()?.turn }
+
+    private func drivingSession() -> (session: String, turn: String)? {
         guard let appModel else { return nil }
         let turns = appModel.engine.turns
-        let sessionId = appModel.activeChatSessionId
-        guard turns.isBusy(sessionId), turns.screenPreview(for: sessionId) != nil else { return nil }
-        return turns.activeTurnIDsBySession[sessionId]
+        let active = appModel.activeChatSessionId
+        for sessionId in [active] + turns.activeTurnIDsBySession.keys.sorted().filter({ $0 != active })
+        where turns.isBusy(sessionId) && turns.screenPreview(for: sessionId) != nil {
+            if let turn = turns.activeTurnIDsBySession[sessionId] { return (sessionId, turn) }
+        }
+        return nil
     }
 
     private func observeTurns() {
         let busy = withObservationTracking {
             _ = drivingTurnID()
-            return appModel.map { $0.engine.turns.isBusy($0.activeChatSessionId) } ?? false
+            return appModel.map { model in model.engine.turns.activeTurnIDsBySession.keys.contains { model.engine.turns.isBusy($0) } } ?? false
         } onChange: {
             Task { @MainActor in
                 ShotgunController.shared.observeTurns()
                 ShotgunController.shared.maybeStepAside()
             }
         }
-        // The drive is over: her pointer goes.
+        // The Mac chat's drive is over: her pointer goes.
         if !busy { agentPointer.fade() }
+        releaseDriverIfDone()
+    }
+
+    /// The named driver stays only while its turn is in flight on this root.
+    private func releaseDriverIfDone() {
+        if let driver, let appModel, !appModel.engine.turns.inFlightTurns().contains(where: { $0.turnId == driver.turn }) {
+            self.driver = nil
+        }
     }
 
     /// A real Mac drive, at its first move: her hands just moved — a click,
@@ -375,11 +404,36 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     /// render and background browser work move no hands here, so they never
     /// step aside. Once per turn.
     private func maybeStepAside() {
-        guard let turnID = drivingTurnID(), turnID != steppedAsideTurn,
+        guard let driving = drivingSession(), driving.turn != steppedAsideTurn,
               PersonOnlyWindows.secondsSinceAgentHands() < 3 else { return }
-        steppedAsideTurn = turnID
+        steppedAsideTurn = driving.turn
+        if driver == nil { driver = PersonOnlyWindows.Driver(session: driving.session, turn: driving.turn) }
         guard UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true else { return }
         stepAside()
+    }
+
+    /// Her sight or hands need the screen now (a desktop picture, a Mac verb
+    /// on the front app): the main window goes, from any surface's turn, and
+    /// the call returns once it is out of the picture. The composer's switch
+    /// still rules; User bringing the window back is still his.
+    func stepAsideForScreen(driver named: PersonOnlyWindows.Driver?) async {
+        // The call's own session and turn bind Shotgun first, whatever the
+        // window is doing; a busy session is the fallback.
+        let driving = named ?? drivingSession().map { PersonOnlyWindows.Driver(session: $0.session, turn: $0.turn) }
+        if let driving { driver = driving }
+        guard UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true else { return }
+        let main = Self.mainWindow().flatMap { $0.isVisible && !$0.isMiniaturized ? $0 : nil }
+        guard let main else { return }
+        // His hands on this window right now: it stays under them; her verb goes on without it.
+        if main.isKeyWindow, let ago = MacPersonInput.activeSecondsAgo(), ago < 3 { return }
+        // Once per turn: a window he brought back during the turn stays back.
+        if let driving {
+            guard driving.turn != steppedAsideTurn else { return }
+            steppedAsideTurn = driving.turn
+        }
+        stepAside()
+        // The fade is 0.3 s; the capture or verb waits for the window to be gone.
+        for _ in 0..<10 where main.isVisible { try? await Task.sleep(for: .milliseconds(50)) }
     }
 
     private func agentPointerMoved(to point: CGPoint, pressed: Bool) {

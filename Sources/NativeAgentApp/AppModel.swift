@@ -415,14 +415,6 @@ final class AppModel: Sendable {
     /// Shared by every mounted approval surface. This is UI coordination only;
     /// the ApprovalInbox actor remains the durable terminal-decision authority.
     var approvalResolutionInFlightIDs: Set<String> = []
-    /// Retains the one resolver task so direct callers (chat cards included)
-    /// join an active decision instead of re-entering the approval executor.
-    var approvalResolutionTasks: [String: Task<ApprovalRecord, Error>] = [:]
-    /// The decision each in-flight resolution is carrying. 2026-09-06: joining
-    /// by id alone handed the FIRST decision's result back to a second caller
-    /// who asked for the opposite one, so a Deny pressed over a running Approve
-    /// silently reported "approved".
-    var approvalResolutionDecisions: [String: String] = [:]
     var mcpServers: [MCPServer] = []
     var mcpConsent: [MCPConsentRecord] = []
     var mcpTools: [MCPTool] = []
@@ -978,28 +970,6 @@ extension AppModel {
     }
 
     @MainActor
-    // PATCH-2026-05-06: dev-mode added as parameter, forwarded to daemon payload
-    @discardableResult
-    func saveTrustPolicy(permissionLevel: String, autonomyDefault: String, requireBackups: Bool, outsideDefault: String, developerMode: Bool = false, dreamScheduler: Bool? = nil) async -> Bool {
-        do {
-            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveTrustPolicyFull(
-                permissionLevel: permissionLevel,
-                autonomyDefault: autonomyDefault,
-                requireBackups: requireBackups,
-                outsideDefault: outsideDefault,
-                developerMode: developerMode,
-                dreamScheduler: dreamScheduler
-            )
-            applySavedTrustPolicy(savedPolicy, status: "Trust policy saved")
-            await refreshAll()
-            return true
-        } catch {
-            recordTrustActionFailure(UserFacingError.message(error, action: "save trust settings"), cause: error)
-            return false
-        }
-    }
-
-    @MainActor
     func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async {
         do {
             let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMemoryPolicy(
@@ -1304,26 +1274,6 @@ extension AppModel {
             providersFresh = false
         }
         return providersFresh
-    }
-
-    /// PATCH-2026-05-07: chat-provider-picker Set chat provider (POST to
-    /// /v1/providers/active) and update local state.
-    @MainActor
-    func setChatProvider(_ providerId: String, previous: String? = nil) async -> Bool {
-        let rollbackProvider = previous ?? chatProvider
-        do {
-            try await engine.providers.routing.setActiveProvider(surface: "chat", providerId: providerId)
-            chatProvider = providerId
-            Task {
-                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
-            }
-            statusText = "Chat provider → \(providerId)"
-            return true
-        } catch {
-            chatProvider = rollbackProvider
-            setFailureStatus(error, action: "switch the chat provider")
-            return false
-        }
     }
 
     @MainActor

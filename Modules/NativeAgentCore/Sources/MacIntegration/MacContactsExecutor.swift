@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import Contacts
 import PersistenceCore

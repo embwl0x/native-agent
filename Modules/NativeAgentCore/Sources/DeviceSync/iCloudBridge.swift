@@ -1502,6 +1502,19 @@ public final class iCloudBridge: ObservableObject {
         case .deliver:
             break
         }
+        // Every signed message is the phone's contact, its answers to our
+        // requests included: a phone that just answered is not silent.
+        do {
+            try await SignedPeerEvidenceStore.record(
+                eventID: msg.id,
+                channel: .chat,
+                peerCreatedAt: msg.timestamp,
+                dataRoot: PersistenceCore.defaultDataRoot()
+            )
+        } catch {
+            nativeLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
+                  msg.id, error.localizedDescription)
+        }
         if msg.metadata?["kind"] == PhonePlaceEvent.messageKind {
             guard let event = try? JSONDecoder().decode(PhonePlaceEvent.self, from: Data(msg.text.utf8)),
                   event.id == msg.id, event.isValid else {
@@ -1534,17 +1547,6 @@ public final class iCloudBridge: ObservableObject {
                 syncStatus = "Processed iPhone action (CloudKit)"
             }
             return handled
-        }
-        do {
-            try await SignedPeerEvidenceStore.record(
-                eventID: msg.id,
-                channel: .chat,
-                peerCreatedAt: msg.timestamp,
-                dataRoot: PersistenceCore.defaultDataRoot()
-            )
-        } catch {
-            nativeLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
-                  msg.id, error.localizedDescription)
         }
         activeCloudKitChats += 1
         defer { activeCloudKitChats -= 1 }

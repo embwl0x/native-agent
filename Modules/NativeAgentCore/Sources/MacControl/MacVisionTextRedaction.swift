@@ -26,13 +26,11 @@ public struct VisionRedactedText: Sendable, Equatable {
     /// `{redacted, sha256, reason}` digest object.
     public let json: JSONValue
     public let secret: Bool
-    public let reason: String?
 
-    public init(raw: String, json: JSONValue, secret: Bool, reason: String?) {
+    public init(raw: String, json: JSONValue, secret: Bool) {
         self.raw = raw
         self.json = json
         self.secret = secret
-        self.reason = reason
     }
 
     /// The clear text when redaction let it through, nil when it withheld it.
@@ -124,13 +122,9 @@ public enum VisionTextRedaction {
                 )
             }
             if case .string = json {
-                return VisionRedactedText(raw: box.text, json: json, secret: false, reason: nil)
+                return VisionRedactedText(raw: box.text, json: json, secret: false)
             }
-            var reason: String?
-            if case .object(let object) = json, case .string(let value)? = object["reason"] {
-                reason = value
-            }
-            return VisionRedactedText(raw: box.text, json: json, secret: true, reason: reason)
+            return VisionRedactedText(raw: box.text, json: json, secret: true)
         }
         // Whole-frame and tile OCR can observe the same secret as different
         // strings. Withhold every overlapping fragment before any text escapes.
@@ -138,12 +132,10 @@ public enum VisionTextRedaction {
         while let secretIndex = pending.popLast() {
             for index in boxes.indices where !redacted[index].secret
                 && boxes[index].rect.intersection(boxes[secretIndex].rect).area > 0 {
-                let reason = "overlapping_secret"
                 redacted[index] = VisionRedactedText(
                     raw: boxes[index].text,
-                    json: MacScreenViewTextRedaction.redactedText(boxes[index].text, reason: reason),
-                    secret: true,
-                    reason: reason
+                    json: MacScreenViewTextRedaction.redactedText(boxes[index].text, reason: "overlapping_secret"),
+                    secret: true
                 )
                 pending.append(index)
             }

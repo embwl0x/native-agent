@@ -184,7 +184,9 @@ enum ChatComposerSendAction: Equatable {
     case appendToPausedQueue
 
     static func resolve(isRunning: Bool, hasQueuedTurns: Bool, isQueuePaused: Bool) -> Self {
-        if hasQueuedTurns { return isQueuePaused ? .appendToPausedQueue : .appendToQueue }
+        // Idle with a paused backlog (after Stop): the send runs now and the
+        // backlog stays paused behind it (MacChatTurnAdmission decides the same).
+        if hasQueuedTurns { return isQueuePaused ? (isRunning ? .appendToPausedQueue : .send) : .appendToQueue }
         return isRunning ? .queueNext : .send
     }
 

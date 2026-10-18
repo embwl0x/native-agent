@@ -240,6 +240,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 response: response,
                 client: client,
                 request: baseRequest,
+                principal: principal,
                 claudeReplyID: claudeReplyID,
                 claudeReplyText: rawText,
                 requestID: requestID,
@@ -375,7 +376,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     request.codexCompletion = CodexCompletionTranscriptBinding(
                         deliveryId: "bridge-http." + requestID, requestDigest: requestID, model: "", reasoningEffort: nil)
                     _ = try await CodexCompletionLifecycle.shared.claim(deliveryId: "bridge-http." + requestID,
-                        requestDigest: requestID, sessionId: sessionId, responseRunId: requestID)
+                        requestDigest: requestID, sessionId: sessionId, responseRunId: requestID, principal: principal.id)
                     resp = try await TurnAdmission.shared.run(sessionID: sessionId) {
                         try await request.chat(on: client, progress: progress)
                     }
@@ -434,7 +435,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 if let completionDelivery {
                     persistedReply["completionDelivery"] = completionDelivery.jsonObject
                 }
-                let receiptWritten = Self.persistMessageReply(persistedReply, requestID: requestID)
+                let receiptWritten = Self.persistMessageReply(persistedReply, requestID: requestID, principal: principal.id)
                 if deliveryId == nil, receiptWritten {
                     try await CodexCompletionLifecycle.shared.recordDelivery(AgentBridgeCompletionDelivery(status: "completed",
                         surface: "bridge-http", delivery: "receipt", artifactCount: 1, attempts: 0, reason: nil),
@@ -571,7 +572,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     "reply": "",
                     "detail": failureDetail,
                     "deliveryId": deliveryId ?? NSNull(),
-                ], requestID: requestID)
+                ], requestID: requestID, principal: principal.id)
                 self.eventPublisher("message_failed", [
                     "requestId": requestID,
                     "sessionId": sessionId ?? NSNull(),
@@ -630,8 +631,10 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     /// Read the existing receipt stream, without a second store or an action
     /// replay. Bounded scan and bounded rows keep recovery independent of log
     /// size. A damaged/incomplete scope cannot establish absence or uniqueness.
+    /// With `principal`, only a receipt recorded for that caller is a match;
+    /// another caller's receipt for the same ids reads as no receipt.
     public static func agentReplyReceipt(requestID: String, sessionID: String, offset: Int = 0,
-                                  maxChars: Int = 8000, logURL: URL) -> [String: Any] {
+                                  maxChars: Int = 8000, logURL: URL, principal: String? = nil) -> [String: Any] {
         var result: [String: Any] = ["request_id": requestID, "session_id": sessionID,
             "status": "unavailable", "original_outcome": "unknown",
             "detail": "A missing receipt does not prove failure or authorize replay."]
@@ -678,6 +681,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             // identity matches. Malformed JSON still cannot establish scope.
             if let rawID = row["requestId"], !(rawID is String) { return "malformed_receipts" }
             guard row["requestId"] as? String == requestID else { return nil }
+            if let principal, row["principal"] as? String != principal { return nil }
             matches += 1
             guard let rowSession = row["sessionId"] as? String,
                   let status = row["status"] as? String, !status.isEmpty,
@@ -770,6 +774,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         response: @escaping Response,
         client: any ChatOrchestrationClient,
         request: TurnRequest,
+        principal: AgentBridgePrincipal,
         claudeReplyID: String?,
         claudeReplyText: String,
         requestID: String,
@@ -861,7 +866,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 turn.codexCompletion = .some(.some(CodexCompletionTranscriptBinding(
                     deliveryId: "bridge-http." + requestID, requestDigest: requestID, model: "", reasoningEffort: nil)))
                 _ = try await CodexCompletionLifecycle.shared.claim(deliveryId: "bridge-http." + requestID,
-                    requestDigest: requestID, sessionId: enqueued.sessionId, responseRunId: enqueued.runId)
+                    requestDigest: requestID, sessionId: enqueued.sessionId, responseRunId: enqueued.runId, principal: principal.id)
                 let resp = try await TurnAdmission.shared.run(sessionID: enqueued.sessionId) {
                     try await turn.chat(on: client, progress: self.chatNoticeSink(
                         requestID: requestID,
@@ -894,7 +899,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     "durationMs": durationMs,
                     "reply": resp.output,
                     "attachments": attachmentPayload,
-                ], requestID: requestID)
+                ], requestID: requestID, principal: principal.id)
                 if receiptWritten {
                     try await CodexCompletionLifecycle.shared.recordDelivery(AgentBridgeCompletionDelivery(status: "completed",
                         surface: "bridge-http", delivery: "receipt", artifactCount: 1, attempts: 0, reason: nil),
@@ -934,7 +939,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     "durationMs": Int(Date().timeIntervalSince(started) * 1000),
                     "reply": "",
                     "detail": "turn stopped before it finished",
-                ], requestID: requestID)
+                ], requestID: requestID, principal: principal.id)
                 self.eventPublisher("message_failed", [
                     "requestId": requestID,
                     "runId": enqueued.runId,
@@ -954,7 +959,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     "durationMs": Int(Date().timeIntervalSince(started) * 1000),
                     "reply": "",
                     "detail": String(describing: error),
-                ], requestID: requestID)
+                ], requestID: requestID, principal: principal.id)
                 self.eventPublisher("message_failed", [
                     "requestId": requestID,
                     "runId": enqueued.runId,
@@ -1188,17 +1193,22 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 attachmentCount: attachments.count, completionDeliveryStatus: nil)
             guard persistMessageReply(["at": ISO8601DateFormatter().string(from: Date()), "status": status,
                 "sessionId": response.sessionId ?? "", "runId": response.runId, "model": response.model,
-                "reply": response.output, "attachments": attachments, "replyPersisted": true], requestID: requestID, logURL: logURL) else { throw CocoaError(.fileWriteUnknown) }
+                "reply": response.output, "attachments": attachments, "replyPersisted": true], requestID: requestID,
+                principal: row.principal, logURL: logURL) else { throw CocoaError(.fileWriteUnknown) }
             try await lifecycle.recordDelivery(AgentBridgeCompletionDelivery(status: "completed", surface: "bridge-http",
                 delivery: "receipt", artifactCount: 1, attempts: 0, reason: nil), deliveryId: row.id, requestDigest: row.digest)
         }
     }
 
     @discardableResult
-    private static func persistMessageReply(_ payload: [String: Any], requestID: String, logURL: URL? = nil) -> Bool {
+    /// `principal` is the authenticated caller the message came from; the
+    /// reply is served back only to that caller.
+    private static func persistMessageReply(_ payload: [String: Any], requestID: String, principal: String?,
+                                            logURL: URL? = nil) -> Bool {
         messageReplyLock.lock()
         defer { messageReplyLock.unlock() }
-        let payload = messageReplyRecord(payload, requestID: requestID)
+        var payload = messageReplyRecord(payload, requestID: requestID)
+        if let principal { payload["principal"] = principal }
         let file = logURL ?? messageReplyURL()
         let dir = file.deletingLastPathComponent()
         do {

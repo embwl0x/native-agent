@@ -4,7 +4,9 @@
 # the bundle is signed.
 
 release_executable_uuids() {
-  /usr/bin/dwarfdump --uuid "$1" 2>/dev/null \
+  # No UUIDs (not a Mach-O or dSYM) is an empty answer, not a pipeline failure
+  # under pipefail: callers compare the set.
+  { /usr/bin/dwarfdump --uuid "$1" 2>/dev/null || true; } \
     | awk '{print $2}' \
     | LC_ALL=C sort
 }

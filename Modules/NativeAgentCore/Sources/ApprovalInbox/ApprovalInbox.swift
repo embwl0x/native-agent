@@ -1,5 +1,7 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 // Surface identity is security-relevant and `ConversationSurfaceProfile` owns
 // the remote/iOS sets. A second copy of them here would be a second answer to
@@ -405,11 +407,17 @@ public protocol ApprovalInboxProtocol: Sendable {
     func annotateExecution(
         _ id: String,
         executedAction: JSONValue,
-        detail: String
+        detail: String,
+        result: JSONValue?
     ) async throws -> ApprovalRecord
 }
 
 public extension ApprovalInboxProtocol {
+    @discardableResult
+    func annotateExecution(_ id: String, executedAction: JSONValue, detail: String) async throws -> ApprovalRecord {
+        try await annotateExecution(id, executedAction: executedAction, detail: detail, result: nil)
+    }
+
     /// Source-compatible local decision convenience. Remote adapters must use
     /// the typed provenance overload and cannot enter through this label.
     @discardableResult
@@ -658,7 +666,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// match-or-create path builds a row through EXACTLY this logic instead of
     /// a second copy of it. Pure: no file IO, no lock.
     private static func makeApprovalRecord(body: JSONValue, now: Date) throws -> ApprovalRecord {
-        // Every approval row is made here: a skill's step never files one.
+        // Validation cannot file an approval.
         if SkillRunContext.handsBack { throw SkillRunContext.HandBack("an approval") }
         let bodyObj: [String: JSONValue]
         if case .object(let obj) = body {
@@ -666,7 +674,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         } else {
             bodyObj = [:]
         }
-        let payload: JSONValue
+        var payload: JSONValue
         if case .object = bodyObj["payload"] ?? .null {
             payload = bodyObj["payload"] ?? .object([:])
         } else {
@@ -683,6 +691,10 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             rawPayloadPreview = s
         } else {
             rawPayloadPreview = (try? payload.serialize(pretty: false)) ?? ""
+        }
+        if let id = SkillRunContext.hostCallID, case .object(var fields) = payload {
+            fields["hostCallID"] = .string(id.uuidString)
+            payload = .object(fields)
         }
         let action = codepointPrefix(pyStr(bodyObj["action"], fallback: "unknown"), 120)
         // A script install card shows the whole script it admits, never part of it.
@@ -725,7 +737,10 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         let stamp = isoTimestamp(now)
         let approval = ApprovalRecord(
             id: UUID().uuidString.lowercased(),
-            title: codepointPrefix(strip(pyStr(bodyObj["title"], fallback: "Approval required")), 160),
+            title: codepointPrefix(SkillRunContext.requester.map {
+                let verb = ToolActivityPresentation.title(action)
+                return "\($0) wants to \(verb.prefix(1).lowercased())\(verb.dropFirst())"
+            } ?? strip(pyStr(bodyObj["title"], fallback: "Approval required")), 160),
             action: action,
             risk: pyStr(bodyObj["risk"], fallback: "medium"),
             reason: codepointPrefix(strip(pyStr(bodyObj["reason"], fallback: "")), 1000),
@@ -814,9 +829,10 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     public func annotateExecution(
         _ id: String,
         executedAction: JSONValue,
-        detail: String
+        detail: String,
+        result: JSONValue? = nil
     ) async throws -> ApprovalRecord {
-        try await runSerialized { [persistence, approvalsPath] in
+        let record = try await runSerialized { [persistence, approvalsPath] in
             try await persistence.withFileLock(approvalsPath) {
                 let items = try Self.loadApprovalRowsChecked(at: approvalsPath)
                 var mutated = items
@@ -831,6 +847,12 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                             "could not re-parse annotated approval record"
                         )
                     }
+                    if await ApprovalLifecycleBus.shared.awaitsHostReply(record) {
+                        var state: [String: JSONValue] = if case .object(let saved)? = object["chatContinuation"] { saved } else { [:] }
+                        state["done"] = .bool(true)
+                        state["settlement"] = .string("host_reply")
+                        object["chatContinuation"] = .object(state)
+                    }
                     mutated[index] = .object(object)
                     annotated = record
                     break
@@ -840,6 +862,9 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 return annotated
             }
         }
+        await ApprovalLifecycleBus.shared.publish(.init(phase: .executed, record: record,
+            result: result ?? executedAction))
+        return record
     }
 
     /// Claim or complete the reporting turn independently of deletable chat history.

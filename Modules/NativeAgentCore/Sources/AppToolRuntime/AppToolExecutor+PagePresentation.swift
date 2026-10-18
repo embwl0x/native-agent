@@ -91,7 +91,8 @@ extension AppToolExecutor {
             return AppToolExecutor.pageReadResult(page: "agent_view", fields: ["status": .string("ok"), "title": .string("Agent view"), "tabs": tabs])
         }
         guard rooms.contains(room) else {
-            return AppToolExecutor.failure("unknown_room", "The Agent view has no tab called that.", extra: ["requested": .string(room), "tabs": tabs])
+            return .object(["status": .string("not_found"), "reason": .string("unknown_room"), "detail": .string("The Agent view has no tab called that."),
+                            "requested": .string(room), "tabs": tabs])
         }
         let named = pageInputText(input["session_id"])
         let scope = named.isEmpty ? activeSessionID : named

@@ -19,6 +19,14 @@ extension SwiftToolDispatcher {
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.count <= 64000 else {
                 throw AgentCommunicationError.invalid("Dot messages require text of at most 64000 characters.")
             }
+            // Inbound only: nothing is tried, nothing is marked unavailable; the receipt says why.
+            if ChatGPTDotIPCTransport.inboundOnly {
+                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                    "reason": .string("inbound_only"), "effects": .string("none"),
+                    "detail": .string(ChatGPTDotIPCTransport.detail),
+                    "remedy": .object(["kind": .string("none"), "next_call": .null,
+                        "instruction": .string("Nothing was sent, and no retry will deliver it. Tell the person; Dot's next message to you arrives on its own.")])])
+            }
             var input: [String: JSONValue] = ["action": .string("send")]
             input["conversation_id"] = args["conversation_id"]
             // Dot answers in his own chat; the listener brings his reply into
@@ -38,8 +46,15 @@ extension SwiftToolDispatcher {
                     return .object(["status": .string("sent"), "sent": .bool(true),
                                     "detail": .string("ChatGPT accepted the message, but its local transcript could not be saved. Nothing was resent.")])
                 }
-            } else if case .object(let fields) = result, fields["status"] != .string("busy") {
+            } else if case .object(var fields) = result, fields["status"] != .string("busy") {
                 AgentPeerStore(dataRoot: dataRoot).recordUnavailable(peerID: peer.id)
+                // Nothing left this Mac: the receipt says so, and no remedy may say it might have.
+                if fields["sent"] == .bool(false) {
+                    fields["effects"] = .string("none")
+                    fields["remedy"] = .object(["kind": .string("none"), "next_call": .null,
+                        "instruction": .string("Nothing was sent. Do what the detail names, or tell the person why.")])
+                    result = .object(fields)
+                }
             }
             return result
         }
@@ -59,7 +74,10 @@ extension SwiftToolDispatcher {
         }
         let conversation = try await ChatGPTDotIPCTransport.conversation(dataRoot, peer, [], nil, window: window)
         guard !ChatGPTDotIPCTransport.available, case .object(var fields) = conversation else { return conversation }
+        // The read is her retained Dot conversation and completes as one; that
+        // she cannot send is its state, said beside it, never its failure.
         fields["state_detail"] = .string(ChatGPTDotIPCTransport.detail)
+        fields["can_start_turn"] = .bool(false)
         return .object(fields)
     }
 

@@ -24,6 +24,9 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public var workingNotes = ""
     public var runningStep: Int?
     public var deliveryPending = false
+    /// Her turn part's log: every event it was handed and what it returned.
+    /// A relaunch replays it through `step` to rebuild the part's state.
+    public var log: [JSONValue]?
 
     public var hasRedeliveryOwner: Bool {
         guard helperDefinition == nil, case .string(let surface)? = replyRoute["surface"] else { return false }

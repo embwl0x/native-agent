@@ -15,6 +15,11 @@ public actor BotRunnerScheduler {
         var lastRunAt: Date? = nil
         /// The last occurrence this scheduler found already past its window.
         var missed: BotMissedRun? = nil
+        /// The Mac's zone when `next` was resolved; a cron with no zone of its
+        /// own re-resolves when the Mac moves (User 10-15).
+        var zone: String? = TimeZone.autoupdatingCurrent.identifier
+        /// `next` and the zone it was resolved in are only ever written together.
+        mutating func plan(_ date: Date) { next = date; zone = TimeZone.autoupdatingCurrent.identifier }
     }
     /// When this scheduler came up, fixed at construction — a `static let` would
     /// be initialized on first read, which is always after the due date and
@@ -104,7 +109,7 @@ public actor BotRunnerScheduler {
                 job.missed = cleared
                 job.lastRunAt = date
                 if job.next < date.addingTimeInterval(BotRunLimits.minimumInterval) {
-                    job.next = try next(bot, after: date, lastRunAt: date)
+                    job.plan(try next(bot, after: date, lastRunAt: date))
                     job.scheduledFrom = date
                 }
                 jobs[id.uuidString] = job
@@ -123,7 +128,24 @@ public actor BotRunnerScheduler {
         for bot in bots where !bot.paused {
             let key = bot.id.uuidString
             // Jobs saved before the preference existed already use the 15-minute floor.
-            if jobs[key]?.revision != bot.updatedAt || (jobs[key]?.minimumInterval ?? 15 * 60) != BotRunLimits.minimumInterval {
+            var replan = jobs[key]?.revision != bot.updatedAt || (jobs[key]?.minimumInterval ?? 15 * 60) != BotRunLimits.minimumInterval
+            // A zone move re-plans nothing: an unzoned cron's pending occurrence keeps
+            // its wall clock in the Mac's new zone. The time-zone notification already
+            // wakes this pass; a run in flight is placed on completion. A job saved
+            // before zones were recorded is planned afresh.
+            if !replan, case .cron(_, nil) = bot.cadence, inFlight[bot.id] == nil, var job = jobs[key],
+               job.reason == nil, job.zone != TimeZone.autoupdatingCurrent.identifier {
+                // A carried time inside the floor after the last run is planned afresh too,
+                // as is a civil minute the new zone skips (a DST gap shifts it an hour).
+                if let old = job.zone.flatMap(TimeZone.init(identifier:)),
+                   let carried = SchedulerJobRuntime.wallClock(job.next, from: old, to: .autoupdatingCurrent),
+                   SchedulerJobRuntime.wallClock(carried, from: .autoupdatingCurrent, to: old)
+                       == SchedulerJobRuntime.wallClock(job.next, from: old, to: old),
+                   carried >= (job.lastRunAt ?? .distantPast).addingTimeInterval(BotRunLimits.minimumInterval) {
+                    job.plan(carried); jobs[key] = job
+                } else { replan = true }
+            }
+            if replan {
                 let anchor = jobs[key]?.revision == bot.updatedAt
                     ? (jobs[key]?.scheduledFrom ?? max(bot.updatedAt, Date())) : bot.updatedAt
                 // An edit reschedules the bot; it does not erase the record of
@@ -192,7 +214,7 @@ public actor BotRunnerScheduler {
                     job.missed = BotMissedRun(dueAt: job.next, reason: Self.reason(
                         bot, due: job.next, autonomyEnabled: autonomyEnabled,
                         startedAt: startedAt, lastTick: lastTick, now: now))
-                    job.next = try next(bot, after: now, lastRunAt: job.lastRunAt)
+                    job.plan(try next(bot, after: now, lastRunAt: job.lastRunAt))
                     job.scheduledFrom = now
                     jobs[key] = job
                     changed = true

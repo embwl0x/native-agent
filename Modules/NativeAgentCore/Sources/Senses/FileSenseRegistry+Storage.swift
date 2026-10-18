@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -12,9 +13,12 @@ extension FileSenseRegistry {
     public func sourceFiles(_ record: SenseRecord) throws -> [String: Data] {
         if let digest = record.candidateDigest {
             let candidate = try programs.load(id: record.id, digest: digest)
-            let saved = try Self.record(candidate)
+            var saved = try Self.record(candidate)
+            if saved.reach.apps == nil { saved.reach.apps = [] }
+            var reach = record.reach
+            if reach.apps == nil { reach.apps = [] }
             guard saved.id == record.id, saved.version == record.version, saved.corner == record.corner,
-                  saved.entry == record.entry, saved.reach == record.reach, saved.mode == record.mode,
+                  saved.entry == record.entry, saved.reach == reach, saved.mode == record.mode,
                   saved.origin == record.origin, let entry = record.entry,
                   case .object(let manifest) = candidate.manifest, let files = manifest["files"] else {
                 throw Self.failure("Selected sense metadata differs from its immutable candidate.")
@@ -45,7 +49,7 @@ extension FileSenseRegistry {
     }
 
     static let maximumBundleBytes = 8_000_000
-    static let maximumCodeBytes = 4_000_000
+    static let maximumCodeBytes = AbilityStore.sourceLimit
     private static let forbiddenComponents: Set<String> = ["data", "persona", "ledger", "wall-ledger", "secrets", "credentials"]
 
     static func validateID(_ id: String) throws {

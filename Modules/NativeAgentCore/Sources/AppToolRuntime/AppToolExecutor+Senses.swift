@@ -38,7 +38,8 @@ extension AppActions {
                 scriptable: reader.scriptable, read: true,
                 scope: ([record.id, record.corner.key, record.grownBecause ?? ""] + record.verbs).joined(separator: " "),
                 schema: schema(reader).map { LLMToolSchema(name: reader.tool,
-                    description: "Read \(record.id) · \(record.corner.key)", parametersJSON: $0.parametersJSON) })
+                    description: "Read \(record.id) · \(record.corner.key)", parametersJSON: $0.parametersJSON) },
+                folded: reader.folded)
         }
         return reads + views.flatMap { view in
             view.page.things.flatMap { thing in
@@ -47,7 +48,7 @@ extension AppActions {
                     guard seen.insert(id).inserted else { return nil }
                     return AppAction(id, view.page.corner.key, verb + " " + thing.name, ["address", "args?:object"],
                         tool: "sense_act", input: ["sense_id": .string(view.record.id), "verb": .string(verb)],
-                        scriptable: false, scope: ([view.record.id, view.record.corner.key, view.page.title, thing.detail ?? ""] + view.record.verbs).joined(separator: " "))
+                        scope: ([view.record.id, view.record.corner.key, view.page.title, thing.detail ?? ""] + view.record.verbs).joined(separator: " "))
                 }
             }
         }

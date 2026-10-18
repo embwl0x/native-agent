@@ -1,3 +1,5 @@
+import AuthoredCapabilities
+import AgentWorkspace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -17,9 +19,11 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "Guidance bodies are retained history. Use skill.run for the converted routine, or source:true to review its code.")
         }
         let client = SwiftNativeSkillsClient(root: dataRoot)
-        let read = try client.readSkill(name: requireString(input, "name"),
-            source: input["source"] == .bool(true))
-        return read
+        do { return try client.readSkill(name: requireString(input, "name"), source: input["source"] == .bool(true)) }
+        catch SkillsError.unknownSkill(let name) {
+            return .object(["status": .string("not_found"), "reason": .string("unknown_skill"), "effects": .string("none"),
+                            "detail": .string(SkillsError.unknownSkill(name).localizedDescription)])
+        }
     }
 
     func impl_save_skill(input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -45,11 +49,17 @@ extension SwiftToolDispatcher {
             "script": script, "fixtures": input["fixtures"] ?? .array([]), "dependencyShapes": .object(pins),
             "converts": input["converts"] ?? .array([]),
             "overrides": input["overrides"] ?? .null,
-        ]), steer: SkillScript.origin(steeredBy: steer.sources + steer.elevated))
+            "create_only": input["create_only"] ?? .bool(false),
+        ].merging(input.filter { AbilityStore.partKeys.contains($0.key) }) { _, value in value }), steer: SkillScript.origin(steeredBy: steer.sources + steer.elevated))
         let row: [String: JSONValue] = if case .object(let fields) = saved { fields } else { [:] }
+        if row["status"] == .string("failed") { return saved }
+        // The road from here, each step handing back the next: validate with
+        // input that fits its params, enable, run.
+        let sample = ToolSignature.example(SkillScript.inputSchema(script), name: "input")
         return .object(["status": .string("saved"), "skill": .string(name), "candidate_digest": row["candidateDigest"] ?? .null,
             "selected_version": row["codeFingerprint"] ?? .null, "skill_status": row["status"] ?? .null,
-            "next_call": .object(["action": .string("skill.validate"), "args": .object(["name": .string(name)])]),
+            "next_call": .object(["action": .string("skill.validate"), "args": .object(["name": .string(name), "input": sample])]),
+            "then": .string("skill.enable {name} turns the validated candidate on; skill.run {name, args} runs it."),
             "authority": .string("Every routine call takes the ordinary turn's dispatch chain; a skill grants no authority.")])
     }
 }

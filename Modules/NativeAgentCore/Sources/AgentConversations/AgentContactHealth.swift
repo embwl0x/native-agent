@@ -53,13 +53,14 @@ public actor AgentContactHealth {
             checkedAt: Date(), authenticated: false)
     }
 
+    /// Dot's word is his transport's: two-way while ChatGPT lets a local
+    /// window own his conversation, otherwise inbound only (never broken).
     private nonisolated static func dotPresence() -> AgentLocalHealth {
         let fields: [String: JSONValue] = if case .object(let fields) = ChatGPTDotIPCTransport.readiness { fields } else { [:] }
         let available = fields["status"] == .string("available")
-        let missingWindow = ["dot_not_selected", "dot_not_open"].contains(text(fields["reason"]) ?? "")
-        return AgentLocalHealth(status: available ? "ready" : fields["status"] == .string("not_checked") ? "unchecked" : "waiting",
-            detail: available ? "Ready" : missingWindow ? "No ChatGPT window has Dot's conversation open." : text(fields["detail"]) ?? "Dot's conversation has not been checked.",
-            checkedAt: Date(), authenticated: false)
+        return AgentLocalHealth(status: available ? "ready" : fields["status"] == .string("not_checked") ? "unchecked"
+                                    : ChatGPTDotIPCTransport.inboundOnly ? "inbound_only" : "waiting",
+            detail: available ? "Ready" : ChatGPTDotIPCTransport.detail, checkedAt: Date(), authenticated: false)
     }
 
     public func installGrokVerifier(dataRoot: URL, verify: @escaping @Sendable (String) async throws -> Void) async {
@@ -235,8 +236,11 @@ public actor AgentContactHealth {
             let operation = failure?.0.operationID ?? (expired == nil ? nil : newest?.operationID)
             let fractional = ISO8601DateFormatter()
             fractional.formatOptions.insert(.withFractionalSeconds)
-            let unavailable = peer?.unavailableAt.flatMap(fractional.date)
-            let broken = ([failure?.1, unavailable]
+            // An inbound-only contact has no send path to be unavailable: a send
+            // it refused is not a broken reply path (the transport lifts an older mark).
+            let inboundOnly = peer.map { ChatGPTDotIPCTransport.owns($0) && ChatGPTDotIPCTransport.inboundOnly } == true
+            let unavailable = inboundOnly ? nil : peer?.unavailableAt.flatMap(fractional.date)
+            let broken = inboundOnly ? nil : ([failure?.1, unavailable]
                 .compactMap { $0 }.filter { (good ?? .distantPast) < $0 }).min()
             let proof = peer?.roundTripProof ?? peer?.mcpReturnProof
             let appVersion = peer?.appBundleIDs.compactMap(AgentHostRow.applicationURL).first
@@ -262,13 +266,20 @@ public actor AgentContactHealth {
             let unverified = recipeChanged || programChanged
                 || (peer?.transport == .desktopChat && proof != nil && (proof?.appVersion == nil || appVersion == nil))
                 || (peer?.appBundleIDs.isEmpty == false && proof?.appVersion.map { $0 != appVersion } == true)
-            if broken != nil || expired != nil || interrupted != nil || unverified {
+            // An inbound-only contact has no outbound path: no broken, expired, interrupted or unverified send.
+            if !inboundOnly, broken != nil || expired != nil || interrupted != nil || unverified {
                 var observed = previous[agent] ?? AgentLocalHealth(status: "broken", detail: "", checkedAt: Date(), authenticated: false)
                 observed.status = broken != nil ? "broken" : expired != nil ? "no_reply_by_deadline" : interrupted != nil ? "interrupted" : "unverified"
                 observed.brokenSince = broken
                 observed.lastGoodAt = good
                 observed.failureOperation = operation
-                observed.detail = broken.map {
+                // Dot's own transport knows what is wrong; its words lead, and they say
+                // which way is broken: a send that cannot be delivered is not a reply path.
+                let dotWords: String? = if let peer, ChatGPTDotIPCTransport.owns(peer), !ChatGPTDotIPCTransport.available,
+                    case .object(let state) = ChatGPTDotIPCTransport.readiness, let why = Self.text(state["detail"]), !why.isEmpty {
+                    "Sends to \(peer.name) cannot be delivered: \(why) He can still reach her by running the local message command on this Mac (nativeagent-link message, with his contact file); a reply typed in his own chat no longer arrives. Last good send \(good.map(iso.string) ?? "never")."
+                } else { nil }
+                observed.detail = dotWords ?? broken.map {
                     "Reply path broken since \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Open Connect for \(peer?.name ?? agent) and verify its reply path; do not resend the message."
                 } ?? expired.map {
                     "No reply by the deadline \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Open Connect for \(peer?.name ?? agent) and verify its reply path; do not resend the message."
@@ -319,8 +330,9 @@ public actor AgentContactHealth {
                 observed.status = "installed"
                 observed.detail = "Installed; no reply proven yet"
             }
-            observed.repairAttemptedAt = previous[agent]?.repairAttemptedAt
-            observed.repairFor = previous[agent]?.repairFor
+            // Nothing to repair on an inbound-only contact: an earlier repair's words go with the fault.
+            observed.repairAttemptedAt = observed.status == "inbound_only" ? nil : previous[agent]?.repairAttemptedAt
+            observed.repairFor = observed.status == "inbound_only" ? nil : previous[agent]?.repairFor
             if let old = previous[agent] { arrive(agent, from: old, to: observed, peers: peers, dataRoot: dataRoot) }
             previous[agent] = observed
             changed = true

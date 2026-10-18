@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import AgentWorkspace
 import Foundation
 import NativeAgentCore
@@ -54,7 +55,7 @@ extension SwiftToolDispatcher {
     ///     a symlink inside the root that points outside is rejected,
     ///   * the first path component is in `allowedTopLevels`.
     /// Throws `AutonomyGateError.toolDenied` on any violation.
-    func resolveSandboxed(_ relativePath: String) throws -> URL {
+    func resolveSandboxed(_ relativePath: String, followFinalLink: Bool = true) throws -> URL {
         let trimmed = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty path")
@@ -94,7 +95,7 @@ extension SwiftToolDispatcher {
                 reason: "SwiftToolDispatcher: '\(trimmed)' is not under an allowed subdir of data/ (one of: \(allowed))"
             )
         }
-        return candidateResolved
+        return followFinalLink ? candidateResolved : candidate
     }
 
     static func stringArray(_ value: JSONValue?) -> [String] {
@@ -299,7 +300,8 @@ extension SwiftToolDispatcher {
 
     func resolveTrustedFilePath(
         _ rawPath: String,
-        includeRepoSandbox: Bool = true
+        includeRepoSandbox: Bool = true,
+        followFinalLink: Bool = true
     ) async throws -> URL {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -314,13 +316,12 @@ extension SwiftToolDispatcher {
         if workspaceAlias != trimmed {
             let candidate = URL(fileURLWithPath: workspaceAlias)
                 .standardizedFileURL
-                .resolvingSymlinksInPath()
             guard Self.isSelfOrAncestor(root: workspaceRoot, of: candidate) else {
                 throw AutonomyGateError.toolDenied(
                     reason: "SwiftToolDispatcher: workspace path escapes the canonical workspace"
                 )
             }
-            return candidate
+            return followFinalLink ? candidate.resolvingSymlinksInPath() : candidate
         }
 
         // Bundled read-only reference docs, before the repo sandbox: `docs/` is
@@ -334,7 +335,7 @@ extension SwiftToolDispatcher {
         if includeRepoSandbox,
            !trimmed.hasPrefix("/"),
            !trimmed.hasPrefix("~"),
-           let sandboxed = try? resolveSandboxed(trimmed) {
+           let sandboxed = try? resolveSandboxed(trimmed, followFinalLink: followFinalLink) {
             return sandboxed
         }
 
@@ -345,13 +346,12 @@ extension SwiftToolDispatcher {
             let candidate = workspaceRoot
                 .appendingPathComponent(trimmed)
                 .standardizedFileURL
-                .resolvingSymlinksInPath()
             guard Self.isSelfOrAncestor(root: workspaceRoot, of: candidate) else {
                 throw AutonomyGateError.toolDenied(
                     reason: "SwiftToolDispatcher: relative path escapes the canonical workspace"
                 )
             }
-            return candidate
+            return followFinalLink ? candidate.resolvingSymlinksInPath() : candidate
         }
 
         let expanded = HomePath.expand(trimmed)
@@ -362,15 +362,15 @@ extension SwiftToolDispatcher {
         }
         let candidate = URL(fileURLWithPath: expanded)
             .standardizedFileURL
-            .resolvingSymlinksInPath()
         let roots = await trustedWorkspaceRoots()
-        guard roots.contains(where: { Self.isSelfOrAncestor(root: $0, of: candidate) }) else {
+        guard AbilityStore.fileReachAllows(candidate, write: !includeRepoSandbox)
+            || roots.contains(where: { Self.isSelfOrAncestor(root: $0, of: candidate) }) else {
             let renderedRoots = roots.map(\.path).sorted().joined(separator: ", ")
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(trimmed)' is outside trusted workspace roots (\(renderedRoots))"
             )
         }
-        return candidate
+        return followFinalLink ? candidate.resolvingSymlinksInPath() : candidate
     }
 
     func requireString(_ input: [String: JSONValue], _ key: String) throws -> String {
@@ -480,7 +480,7 @@ extension SwiftToolDispatcher {
     }
 
     func categoryForLocalConnectorTool(_ tool: String) -> String? {
-        if Self.fullMacFileToolNames.contains(tool) || tool == "read_file" || tool == "list_dir" {
+        if Self.fullMacFileToolNames.contains(tool) || ["read_file", "list_dir", "file_info"].contains(tool) {
             return "file_ops"
         }
         if Self.fullMacSystemToolNames.contains(tool) {
@@ -504,7 +504,7 @@ extension SwiftToolDispatcher {
             // call wanted, and it never touches the Trust posture itself.
             if let category, let need = macControlCategoryNeedEnvelope(
                 categories: [category],
-                mode: (tool == "read_file" || tool == "list_dir") ? .read : .write,
+                mode: ["read_file", "list_dir", "file_info"].contains(tool) ? .read : .write,
                 why: "\(tool) needs \(InlineInteractionRegistry.macCapabilityDisplayName(category).lowercased()), which is off right now."
             ) {
                 return need
@@ -876,9 +876,11 @@ extension SwiftToolDispatcher {
         switch tool {
         case "screen":
             let seen = await verbs.screen(part: str("part"), app: str("app"), structured: input["structured"] == .bool(true))
-            reply = seen.ok ? pixels?.attach().map {
-                MacFourVerbsReply(ok: true, text: seen.text + "\n" + $0,
-                    detail: seen.detail.merging(["pixel_capture_status": .string($0)]) { _, new in new })
+            reply = seen.ok ? pixels?.attach().map { line in
+                var detail = seen.detail
+                detail["pixel_capture_status"] = .string(line)
+                detail["image"] = pixels?.imageFrame
+                return MacFourVerbsReply(ok: true, text: seen.text + "\n" + line, detail: detail)
             } ?? seen : seen
         case "act":
             func typeMode(_ fields: [String: JSONValue]) throws -> MacTypeMode {
@@ -915,42 +917,62 @@ extension SwiftToolDispatcher {
                     direction: str("direction"))
                 break
             }
+            // A place on an image she was handed: {x, y} in that image's pixels.
+            func imagePoint(_ value: JSONValue?) throws -> MacPointerPosition? {
+                guard case .object(let point)? = value else { return nil }
+                func coordinate(_ key: String) -> Double? {
+                    switch point[key] { case .double(let v)?: return v; case .int(let v)?: return Double(v); default: return nil }
+                }
+                guard let x = coordinate("x"), let y = coordinate("y"), let position = MacPointerPosition(x: x, y: y) else {
+                    throw AutonomyGateError.toolDenied(reason: "a point is {x, y} in pixels of the image it was read from; nothing was run")
+                }
+                return position
+            }
             // Her-screen Phase 5 — `steps`: a short ordered batch in one call.
             // A plain string is shorthand for press (a key/chord → key, a
-            // name → click); an object is {verb, target, text?}.
-            if case .array(let rawSteps)? = input["steps"], !rawSteps.isEmpty {
-                let steps: [MacActStep] = try rawSteps.map { raw in
-                    switch raw {
-                    case .string(let name) where !name.trimmingCharacters(in: .whitespaces).isEmpty:
-                        return MacActStep(verb: "press", target: name)
-                    case .object(let rawStep):
-                        let mode = try typeMode(rawStep)
-                        // "" is absent here too, so it never hides the field beside it.
-                        let step = rawStep.filter { $0.value != .string("") && $0.value != .null }
-                        // {verb:"key", text:"cmd+s"}: a key's chord may ride in text.
-                        guard case .string(var verb)? = step["verb"] else { break }
-                        var text: String?
-                        // `value` is the word the screen shows (`Save As text = …`).
-                        if case .string(let value)? = step["text"] ?? step["value"], !value.isEmpty { text = value }
-                        // {verb:"type", text:…} with no target types into whatever has focus.
-                        if step["target"] == nil, verb == "type", text != nil {
-                            guard mode == .replace else {
-                                throw AutonomyGateError.toolDenied(reason: "append requires a named text target; nothing was run")
-                            }
-                            return MacActStep(verb: verb, target: "", text: text, mode: mode)
-                        }
-                        guard case .string(let target)? = step["target"]
-                                ?? (["key", "press"].contains(verb) ? step["text"] : nil),
-                              !target.trimmingCharacters(in: .whitespaces).isEmpty else { break }
-                        // A step's own button:"right" is a right-click, not a silent left one.
-                        if verb == "click", step["button"] == .string("right") { verb = "right_click" }
-                        return MacActStep(verb: verb, target: target, text: text, mode: mode)
-                    default: break
+            // name → click); an object is {verb, target, text?}, or a verb at
+            // a place on an image (at, or a drag's from/to).
+            func parseStep(_ raw: JSONValue) throws -> MacActStep {
+                switch raw {
+                case .string(let name) where !name.trimmingCharacters(in: .whitespaces).isEmpty:
+                    return MacActStep(verb: "press", target: name)
+                case .object(let rawStep):
+                    let mode = try typeMode(rawStep)
+                    // "" is absent here too, so it never hides the field beside it.
+                    let step = rawStep.filter { $0.value != .string("") && $0.value != .null }
+                    // {verb:"key", text:"cmd+s"}: a key's chord may ride in text.
+                    guard case .string(var verb)? = step["verb"] else { break }
+                    // A step's own button:"right" is a right-click, not a silent left one.
+                    if verb == "click", step["button"] == .string("right") { verb = "right_click" }
+                    if let at = try imagePoint(step["at"] ?? step["from"]) {
+                        var image: String?
+                        if case .string(let id)? = step["image"] { image = id }
+                        return MacActStep(verb: verb, target: "", place: MacImagePlace(image: image, at: at, to: try imagePoint(step["to"])))
                     }
-                    throw AutonomyGateError.toolDenied(
-                        reason: "each step is a name (\"9\") or {verb, target, text?}; nothing was run"
-                    )
+                    var text: String?
+                    // `value` is the word the screen shows (`Save As text = …`).
+                    if case .string(let value)? = step["text"] ?? step["value"], !value.isEmpty { text = value }
+                    // {verb:"type", text:…} with no target types into whatever has focus.
+                    if step["target"] == nil, verb == "type", text != nil {
+                        guard mode == .replace else {
+                            throw AutonomyGateError.toolDenied(reason: "append requires a named text target; nothing was run")
+                        }
+                        return MacActStep(verb: verb, target: "", text: text, mode: mode)
+                    }
+                    guard case .string(let target)? = step["target"]
+                            ?? (["key", "press"].contains(verb) ? step["text"] : nil),
+                          !target.trimmingCharacters(in: .whitespaces).isEmpty else { break }
+                    var to: String?
+                    if case .string(let destination)? = step["to"] { to = destination }
+                    return MacActStep(verb: verb, target: target, text: text, mode: mode, to: to)
+                default: break
                 }
+                throw AutonomyGateError.toolDenied(
+                    reason: "each step is a name (\"9\"), {verb, target, text?}, or {verb, at:{x,y}} / {verb:\"drag\", from:{x,y}, to:{x,y}}; nothing was run"
+                )
+            }
+            if case .array(let rawSteps)? = input["steps"], !rawSteps.isEmpty {
+                let steps = try rawSteps.map(parseStep)
                 reply = await verbs.act(verb: "", target: "", app: str("app"),
                                         front: input["front"] == .bool(true), steps: steps)
                 break
@@ -959,7 +981,10 @@ extension SwiftToolDispatcher {
             let focusTarget: (String) -> String? = { verb in
                 ["key", "press"].contains(verb) ? str("text") : verb == "type" && str("text") != nil ? "" : nil
             }
-            guard let verb = str("verb"), let target = str("target") ?? focusTarget(verb) else {
+            let place = try imagePoint(input["at"] ?? input["from"]).map {
+                MacImagePlace(image: str("image"), at: $0, to: try imagePoint(input["to"]))
+            }
+            guard let verb = str("verb"), let target = place != nil ? "" : str("target") ?? focusTarget(verb) else {
                 throw AutonomyGateError.toolDenied(
                     reason: "act needs `verb` and `target` — say what to do and the name of the thing"
                 )
@@ -1007,7 +1032,8 @@ extension SwiftToolDispatcher {
                 // Her-screen Phase 4 — act in that app's window in the back;
                 // `front: true` brings it forward briefly and puts it back.
                 app: str("app"),
-                front: input["front"] == .bool(true)
+                front: input["front"] == .bool(true),
+                place: place
             )
         case "go":
             guard let name = str("name") ?? str("target") else {

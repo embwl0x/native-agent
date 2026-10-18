@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import OSLog
 import ApprovalTransactions
@@ -43,6 +44,9 @@ import Darwin
 import KnowledgeGraph
 import MCPDispatcher
 import NativeAgentShared
+import Skills
+import Senses
+import ToolExecution
 
 /// Native effects used by Core's background composition. Scheduling, admission
 /// and reconciliation remain with the existing engine and background owners.
@@ -90,6 +94,19 @@ extension NativeAgentEngine {
     }
 
     public static func installRuntimeObservationsAtLaunch(dataRoot: URL) {
+        AbilityStore.runVoices = { file in
+            Array(Set((file.kind == .skill ? SkillScript.voices(file.record ?? [:]) : []) + PeerDataTaint.abilitySources)).sorted()
+        }
+        AbilityStore.skillRollback = { root, id, version in
+            guard let entry = try InstalledSkillInventory.entries(dataRoot: root).first(where: { $0.id == id }) else { throw SkillsError.unknownSkill(id) }
+            _ = try SwiftNativeSkillsClient(root: root).rollbackScript(entry, version: version, steer: SkillScript.origin(steeredBy: PeerDataTaint.abilitySources))
+        }
+        AbilityStore.healArrival = { root, id, line, peers in
+            let line = TurnSecretRedactor.redactText(line)
+            return ResidentWake.shared.request(dataRoot: root, reason: "a part's run failed",
+                items: peers.isEmpty ? [.init(id: id, line: line, home: true)]
+                    : peers.map { .init(id: id + ":" + $0, line: line, agent: $0, home: true) })
+        }
         let crashLog = BodyReport.crashBreadcrumbs(dataRoot)
         do {
             try FileManager.default.createDirectory(at: crashLog.deletingLastPathComponent(),
@@ -147,6 +164,9 @@ extension NativeAgentEngine {
         }
         // No state owner or ingress exists until restore and recovery succeed.
         await Task.detached(priority: .utility) {
+            if let resources {
+                await installBundledParts(dataRoot: dataRoot, resources: resources)
+            }
             do { try NativeAgentBuildIdentity.current.writeLaunchStamp(root: dataRoot) }
             catch { ModuleLog.app("[launch] Could not record app start time: %@", error.localizedDescription) }
             do {
@@ -158,6 +178,40 @@ extension NativeAgentEngine {
         _ = await Task.detached(priority: .userInitiated) { NativeAgentEngine.live }.value
         await SurfaceLayoutLive.shared.attach(dataRoot: dataRoot)
         return true
+    }
+
+    private static func installBundledParts(dataRoot: URL, resources: URL) async {
+        let abilities = AbilityStore(dataRoot: dataRoot)
+        var failures: [String] = []
+        do {
+            let bundled = AbilityStore(dataRoot: resources)
+            let seeds = try FileManager.default.contentsOfDirectory(at: bundled.root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+            let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot) { _, _ in nil }
+            await OwnedProgramInvocation.$host.withValue(host) {
+                for url in seeds.sorted(by: { $0.path < $1.path }) {
+                    do {
+                        let seed = try AbilityStore.decode(url)
+                        guard try bundled.path(id: seed.id, pathExtension: seed.pathExtension) == url else {
+                            throw CocoaError(.fileReadCorruptFile)
+                        }
+                        // Already there: only an untouched seed whose bundle changed does any work.
+                        if let current = try abilities.read(id: seed.id, slot: .current) {
+                            guard AbilityStore.isSeed(current), current.body != seed.body else { continue }
+                        } else if try abilities.contains(id: seed.id) { continue }
+                        let kept = seed.kind == .tool ? try await SwiftNativeToolExecution(root: dataRoot).bundledSeed(seed) : seed
+                        try abilities.installSeed(kept)
+                    } catch {
+                        failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+            }
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+        AbilityFilesCheck.recordSeedFailures(failures, root: dataRoot)
+        if !failures.isEmpty {
+            _ = await MaintenanceBackgroundWork.routeDoctorRows([await AbilityFilesCheck(root: dataRoot).run()], dataRoot: dataRoot)
+        }
     }
 
     public static func installBotProviderCheck() async {
@@ -243,6 +297,8 @@ extension NativeAgentEngine {
                     _ = NativeAgentEngine.live
                     do { try await waitForSenses() }
                     catch { ModuleLog.app("[senses] Launch registration unavailable: %@", error.localizedDescription) }
+                    // Before the loops start: their sources signal parts, and senses watch files.
+                    EnginePartWake.start(dataRoot: dataRoot)
                     let loops = assembleAllLoops()
                     await installBotProviderCheck()
                     return loops
@@ -255,7 +311,6 @@ extension NativeAgentEngine {
         DoctorFacade.armFirstTurnRefresh {
             await makeAutoDoctorLoop(freshMeasurement: true).tickOutcome()
         }
-        Task.detached(priority: .utility) { await reconcileDeskAtLaunch(dataRoot: dataRoot) }
         Task.detached(priority: .utility) {
             await configureMemoryPromotionAtLaunch(dataRoot: dataRoot,
                 makeLLMClient: { makeSharedLLMClient() }, momentsEnabled: momentsEnabled)
@@ -289,8 +344,6 @@ extension NativeAgentEngine {
         Task.detached { await NativeAgentEngine.live.chrome.stop(); group.leave() }
         group.enter()
         Task.detached { await NativeAgentEngine.liveCognition.flushForTermination(); group.leave() }
-        group.enter()
-        Task.detached { await TurnPlanTraceWriter.shared.drain(); group.leave() }
         group.enter()
         Task.detached { await BackgroundLoopsManager.shared.shutdown(); group.leave() }
         group.enter()
@@ -339,58 +392,20 @@ extension NativeAgentEngine {
         dataRoot: URL,
         storageUnavailable: @MainActor @Sendable () -> Void
     ) async -> Bool {
-        let logger = Logger(subsystem: "com.nativeagent.app", category: "memory-migration")
-        let canonicalStorage: MemoryStorage
+        let logger = Logger(subsystem: "com.nativeagent.app", category: "memory-launch")
         do {
-            canonicalStorage = try await SwiftNativeMemoryV2.resolvedStorage(
+            _ = try await SwiftNativeMemoryV2.resolvedStorage(
                 dataRoot: dataRoot
             )
         } catch {
-            logger.error("MemoryV2 canonical storage unavailable; migration and projections refused: \(String(describing: error), privacy: .public)")
+            logger.error("MemoryV2 canonical storage unavailable; projections refused: \(String(describing: error), privacy: .public)")
             await storageUnavailable()
             return false
         }
-        let report = await MemoryV2Migrator(
-            dataRoot: dataRoot,
-            storage: canonicalStorage
-        ).migrate()
-        if report.skippedAlreadyMigrated {
-            logger.info("MemoryV2 migration: already complete; skipped")
-        } else {
-            logger.info(
-                "MemoryV2 migration: memories=\(report.memoriesImported, privacy: .public) proposals=\(report.proposalsImported, privacy: .public) tombstones=\(report.tombstonesImported, privacy: .public) errors=\(report.errors.count, privacy: .public)"
-            )
-            for err in report.errors.prefix(5) {
-                logger.error("MemoryV2 migration error: \(err, privacy: .public)")
-            }
-        }
-        await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
-            namespace: "memory-v2",
-            stableID: "migration",
-            operation: .reconcile,
-            reason: "memory_migration_finished"
-        ))
-        await DerivedStateInvalidationCenter.shared.flush()
-        guard report.requiredFailures == 0 else {
-            logger.error("MemoryV2 derived projection reconciliation refused because migration is incomplete")
-            return false
-        }
-
-        // A full graph rebuild is only required when this launch actually
-        // crossed the canonical migration boundary. On healthy launches,
-        // the shared MemoryV2 startup hook performs a bounded additive
-        // backfill instead of deleting and recreating every graph row.
         // 2026-09-11: a pending statement retired by its own correction must
         // not leave a tombstone that blocks the correction (Astra comb 1).
         // Idempotent, no-op once clean.
         await SwiftNativeMemoryV2.shared.repairSupersededTombstones()
-        if !report.skippedAlreadyMigrated {
-            do {
-                _ = try await SwiftNativeMemoryV2.shared.reconcileKnowledgeGraphProjection()
-            } catch {
-                logger.error("MemoryV2 Knowledge Graph reconciliation failed: \(String(describing: error), privacy: .public)")
-            }
-        }
         if let generator = await SwiftNativeMemoryV2.shared.bindUserMDGenerator(
             dataRoot: dataRoot,
             personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
@@ -425,23 +440,6 @@ extension NativeAgentEngine {
         }
     }
 
-    public static func reconcileDeskAtLaunch(dataRoot: URL) async {
-        // Reconcile historical Desk feeds written before parent/child
-        // terminal-state invariants existed. The store repairs by appending
-        // ordinary set_status ops under its canonical flock; it never
-        // rewrites the event log or hot-edits desk_state.json.
-        do {
-            let ops = try await SwiftNativeDeskStore(
-                dataRoot: dataRoot
-            ).reconcileTerminalParentsWithNonTerminalDescendants()
-            OrganPulse.record("launch.desk_hierarchy", found: ops.count, note: "\(ops.count) statuses set")
-        } catch {
-            FileHandle.standardError.write(
-                Data("Desk hierarchy reconciliation failed: \(error)\n".utf8)
-            )
-        }
-    }
-
     public static func reconcileApprovalsAtLaunch(
         dataRoot: URL,
         presentation: any MemoryRepairPresentationPort,
@@ -451,14 +449,15 @@ extension NativeAgentEngine {
     ) async {
         // Reconcile before staging: a crash after approval but before execution
         // leaves a staging stamp that would otherwise prevent repair forever.
-        let repairs = await MemoryApprovalTransactions.reconcileUnappliedMemoryRepairs(dataRoot: dataRoot)
+        let records = await ApprovalTransactionCoordinator.resolvedApprovalsForReconciliation(dataRoot: dataRoot)
+        let repairs = await MemoryApprovalTransactions.reconcileUnappliedMemoryRepairs(dataRoot: dataRoot, records: records)
         OrganPulse.record("launch.memory_repairs", found: repairs, note: "\(repairs) re-run")
         await MemoryRepairOneShot.stageIfNeeded(
             dataRoot: dataRoot,
             presentation: presentation)
         await LegacyCorrectionScopeMigration.runIfNeeded(dataRoot: dataRoot)
         // Backfills and swaps use the same approved-execution recovery path.
-        let backfills = await MemoryApprovalTransactions.reconcileUnappliedKindBackfills(dataRoot: dataRoot)
+        let backfills = await MemoryApprovalTransactions.reconcileUnappliedKindBackfills(dataRoot: dataRoot, records: records)
         OrganPulse.record("launch.kind_backfills", found: backfills, note: "\(backfills) re-run")
         await MemoryApprovalTransactions.stageKindBackfillIfNeeded(
             dataRoot: dataRoot,
@@ -487,7 +486,7 @@ extension NativeAgentEngine {
         } catch {
             nativeLog("[browser] restart recovery failed: %@", String(describing: error))
         }
-        let approvals = await approvals.reconcileUnappliedApprovalExecutions()
+        let approvals = await approvals.reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, records: records)
         OrganPulse.record("launch.approval_executions", found: approvals, note: "\(approvals) re-run")
         Task { await ApprovalTransactionCoordinator.settleDeskWaitsOnEveryResolve(dataRoot: dataRoot) }
         // Revalidate legacy evidence before staging the same local-only review
@@ -1380,6 +1379,8 @@ extension NativeAgentEngine {
             events: { paths, loopId in
                 EventDeadlinePhysiology.storeAndFileEvents(paths: paths, notifications: [
                     BotRunQueue.didChange,
+                    // A part's `schedule:` wakes are its own jobs, kept with its header.
+                    AbilityStore.didChange,
                     // 2026-09-06: every deadline this runner reports is an ABSOLUTE
                     // instant derived from local time — a cron-shaped job's "09:00", an
                     // idle crossing. A clock correction or a time-zone move changes

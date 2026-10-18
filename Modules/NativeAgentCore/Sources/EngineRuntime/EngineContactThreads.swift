@@ -380,7 +380,8 @@ public enum AgentContactThreads {
             status[contact.id] = .read
         }
         // Dot's thread owns its wait; every view uses the same reply projection.
-        for id in dots {
+        // Inbound only, no reply is awaited: his thread carries his contact's state.
+        for id in dots where ChatGPTDotIPCTransport.available {
             guard let last = lines[id]?.last, last.fromAgent else { continue }
             if case .object(let reply) = AgentConversationView.dotReply(.object([:]), sentAt: last.at), reply["terminal"] == .bool(true) {
                 status[id] = .failed

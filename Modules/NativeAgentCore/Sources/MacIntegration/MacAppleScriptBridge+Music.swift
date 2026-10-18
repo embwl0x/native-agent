@@ -287,6 +287,7 @@ extension MacAppleScriptBridge {
                 ])
             }
             let parts = raw.components(separatedBy: "|||")
+            let unparsed = "Music answered in a shape this read does not know, so the track is unknown. Nothing changed; read it again, and if it repeats, look at Music itself."
             let state = parts.first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
             let normalizedState = state.lowercased()
             let knownStates: Set<String> = [
@@ -299,6 +300,7 @@ extension MacAppleScriptBridge {
                     "integration": .string("music"),
                     "track": .null,
                     "reason": .string("malformed_now_playing_response"),
+                    "detail": .string(unparsed),
                 ])
             }
             let isPlaying = normalizedState == "playing"
@@ -352,7 +354,7 @@ extension MacAppleScriptBridge {
                     "status": .string("failed"),
                     "integration": .string("music"),
                     "reason": .string("now_playing_applescript_error"),
-                    "applescript_error": .string(msg),
+                    "detail": .string("Music could not read the current track: \(msg). Nothing changed."),
                 ])
             }
             return .object([
@@ -362,6 +364,7 @@ extension MacAppleScriptBridge {
                 "playerState": .string(state),
                 "track": .null,
                 "reason": .string("malformed_now_playing_response"),
+                "detail": .string(unparsed),
             ])
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "music", app: app)

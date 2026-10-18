@@ -43,7 +43,6 @@ extension SwiftToolDispatcher {
         var remainingBudget = recallContentBudgetChars
         var budgetSpent = false
         return hits.map { hit in
-            MemoryDataProvenance.consume(hit.extras, dataRoot: dataRoot)
             var d: [String: JSONValue] = [
                 "preview": .string(hit.preview),
                 "score": .double(hit.score),
@@ -337,7 +336,6 @@ extension SwiftToolDispatcher {
         if let provenance = Self.memoryProvenanceDisplay(record.extras) {
             result["provenance"] = .string(provenance)
         }
-        MemoryDataProvenance.consume(record.extras, dataRoot: dataRoot)
         result.merge(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot)) { _, value in value }
         if let origin = MemoryMoments.recallOrigin(source: record.sourceRunId, metadata: record.extras) {
             result["origin"] = origin
@@ -689,7 +687,6 @@ extension SwiftToolDispatcher {
                     if let origin = MemoryMoments.recallOrigin(source: row.sourceRunId, metadata: row.extras) { fields["origin"] = origin }
                     if row.text.count <= remaining {
                         fields["text"] = .string(row.text)
-                        MemoryDataProvenance.consume(row.extras)
                         fields.merge(MemoryDataProvenance.fields(in: row.extras)) { _, value in value }
                         remaining -= row.text.count
                     } else {

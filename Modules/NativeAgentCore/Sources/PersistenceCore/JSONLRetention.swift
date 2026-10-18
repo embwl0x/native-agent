@@ -258,6 +258,8 @@ public func appendJSONLCapped(
     maxBytes: Int? = nil,
     trimToBytes: Int? = nil,
     capCheckStride: Int = JSONLLineCaps.capCheckStride,
+    // Validated by the caller under the same file lock as this append.
+    validatedExistingCounts: (lines: Int, bytes: Int)? = nil,
     // When the feed is a RECORD rather than telemetry, the append has to be on
     // the platter before this call returns. `appendBytes` refuses a raw durable
     // append to a path-owned feed, so the durable route has to run here, inside
@@ -321,7 +323,8 @@ public func appendJSONLCapped(
         // it, the old code rewrote that file for EVERY new row. Trigger-backed
         // feeds now count only at bounded stride checkpoints, even when mature.
         // Explicit hard byte ceilings are checked on every append separately.
-        let shouldCheckLines = fullCheckWillBeDue || effectiveTrimTrigger == nil
+        let shouldCheckLines = validatedExistingCounts.map { $0.lines + 1 > effectiveMaxLines }
+            ?? (fullCheckWillBeDue || effectiveTrimTrigger == nil)
         if let beforePotentialLineCap {
             let reachesByteCeiling: Bool
             if let effectiveMaxBytes {
@@ -375,7 +378,10 @@ public func appendJSONLCapped(
             nativeLog("%@: %@ cap dropped %d oldest line(s)",
                   logLabel, path.lastPathComponent, dropped)
         }
-        if let effectiveMaxBytes, let effectiveTrimToBytes {
+        if let effectiveMaxBytes, let effectiveTrimToBytes,
+           try validatedExistingCounts.map({
+               $0.bytes + (try event.serialize(pretty: false).utf8.count) + 1 > effectiveMaxBytes
+           }) ?? true {
             let byteDropped = try enforceJSONLByteCap(
                 at: path,
                 maxBytes: effectiveMaxBytes,

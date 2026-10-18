@@ -1,9 +1,11 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Senses
 import TrustCenter
 import ToolRegistry
+import MacControl
 
 extension SwiftNativeToolExecution {
     func validate(_ candidate: OwnedProgramStore.Candidate, capture: Bool = false, input: JSONValue? = nil) async throws -> ProposalValidationResult {
@@ -17,11 +19,13 @@ extension SwiftNativeToolExecution {
             try SenseSandboxProfile.build(reach: SenseReach(), helperURL: helper, scratch: scratch,
                 dataRoot: dataRoot, personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
         }
-        let broker = ToolPrimitiveBroker(root: root, permissions: Set(candidate.program.permissions))
-        let host = ToolHost(base: base, candidate: candidate, broker: broker, input: Self.fields(input ?? .object([:])), admission: {})
+        let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), host: base, abilityID: candidate.id)
+        let host = ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: root, admission: {})
         do {
             let proof = try await store.validate(candidate, key: key, capture: capture, input: input, runner: runner, host: { host }) {
-                try ToolPrimitiveBroker.checkInput($0, schema: candidate.program.schema)
+                if let problem = $0.schemaProblem(schema: candidate.program.schema) {
+                    throw SenseFailure(code: "bad_input", message: "Tool input \(problem.path) must be \(problem.expected).")
+                }
             }
             await broker.close()
             return ProposalValidationResult(valid: true,
@@ -41,15 +45,38 @@ struct ToolHost: OwnedProgramHostProfile {
     let base: any OwnedProgramToolHost
     let candidate: OwnedProgramStore.Candidate
     let broker: ToolPrimitiveBroker
-    let input: [String: JSONValue]
+    let dataRoot: URL
     let admission: @Sendable () async throws -> Void
+    private var appTargets: [String: String] {
+        var targets: [String: String] = [:]
+        for permission in candidate.program.permissions {
+            let parts = permission.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2, ["app_read", "app_write"].contains(parts[0]), targets[parts[1]] != "write" {
+                targets[parts[1]] = parts[0] == "app_write" ? "write" : "read"
+            }
+        }
+        return targets
+    }
     var actionIDs: [String] { candidate.program.dependencies }
+    private func declaredDependency(_ id: String) -> String? {
+        let resolved = base.canonicalAction(id)
+        return candidate.program.dependencies.first { base.canonicalAction($0) == resolved }
+    }
+    private func dependencyMatches(_ id: String) -> Bool {
+        guard let declared = declaredDependency(id) else { return action(id) != nil }
+        return base.dependencyMatches(id, SwiftNativeToolExecution.fields(candidate.dependencyShapes)[declared])
+    }
     var floorReasons: Set<String> { base.floorReasons.union(["undeclared_dependency", "state_changed"]) }
     var scriptKey: String { base.scriptKey }
-    func action(_ id: String) -> OwnedProgramAction? { actionIDs.contains(id) ? base.action(id) : nil }
+    func action(_ id: String) -> OwnedProgramAction? {
+        guard let action = base.action(id) else { return nil }
+        let permissions = candidate.program.permissions
+        return declaredDependency(id) != nil || action.page == "files" && (permissions.contains("app_data_write")
+            || action.read && permissions.contains("app_data_read")) ? action : nil
+    }
     func canonicalAction(_ id: String) -> String { base.canonicalAction(id) }
     func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], OwnedProgramRunner.ScriptError> {
-        guard actionIDs.contains(id) else {
+        guard action(id) != nil else {
             return .failure(.init(reason: "undeclared_dependency", detail: "Declare \(id) as an app-action dependency and validate it. It was not called."))
         }
         return base.doorInput(id: id, given: given)
@@ -59,25 +86,28 @@ struct ToolHost: OwnedProgramHostProfile {
     func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence { base.evidence(receipt) }
     func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? { base.receiptField(key, in: receipt) }
     func validationPerform(_ call: [String: JSONValue], fixture: OwnedProgramFixtures) async -> JSONValue {
-        guard case .string(let id)? = call["action"], actionIDs.contains(id),
-              base.dependencyMatches(id, SwiftNativeToolExecution.fields(candidate.dependencyShapes)[id]) else {
+        guard case .string(let id)? = call["action"], action(id) != nil,
+              dependencyMatches(id) else {
             return Self.failure("stale_dependency", "The declared app action is unavailable or changed.", effects: "none")
         }
         return await fixture.reply(call)
     }
 
     func perform(_ call: [String: JSONValue]) async -> JSONValue {
-        guard case .string(let id)? = call["action"], actionIDs.contains(id) else {
+        guard case .string(let id)? = call["action"], action(id) != nil else {
             return Self.failure("undeclared_dependency", "A tool calls only its declared app actions.", effects: "none")
         }
         do {
             try Task.checkCancellation()
-            guard base.dependencyMatches(id, SwiftNativeToolExecution.fields(candidate.dependencyShapes)[id]) else {
+            guard dependencyMatches(id) else {
                 throw SenseFailure(code: "stale_dependency", message: "The app action changed after validation.")
             }
             try await admission()
             try Task.checkCancellation()
-            return await base.perform(call)
+            let permissions = candidate.program.permissions
+            let reach = permissions.contains("app_data_read") || permissions.contains("app_data_write")
+                ? (root: dataRoot, write: permissions.contains("app_data_write")) : nil
+            return await AbilityStore.$fileReach.withValue(reach) { await base.perform(call) }
         } catch {
             return Self.failure((error as? SenseFailure)?.code ?? (error is CancellationError ? "cancelled" : "failed"),
                                 error.localizedDescription, effects: "none")
@@ -85,15 +115,25 @@ struct ToolHost: OwnedProgramHostProfile {
     }
 
     func primitiveAction(_ operation: String) -> OwnedProgramAction? {
-        guard ToolPrimitiveBroker.operations.contains(operation) else { return nil }
+        guard operation == "apps.call" || ToolPrimitiveBroker.operations.contains(operation) else { return nil }
         let read = ToolPrimitiveBroker.readOperations.contains(operation)
-        return OwnedProgramAction(id: operation, page: operation.hasPrefix("files.") ? "files" : operation == "apps.call" ? "apps" : "network",
+        return OwnedProgramAction(id: operation, page: operation == "apps.call" ? "apps" : "network",
                                   read: read, readOnly: { ToolPrimitiveBroker.readOnly(operation, .object($0)) })
     }
 
     func checkPrimitive(_ operation: String, arguments: JSONValue) async -> JSONValue? {
         do {
-            try await broker.check(operation, arguments: arguments)
+            if operation == "apps.call" {
+                try Task.checkCancellation()
+                guard case .object(let args) = arguments, case .string(let bundleID)? = args["bundle_id"],
+                      let access = appTargets[bundleID] else {
+                    throw SenseFailure(code: "undeclared_target", message: "Declare app_read:<bundle_id> or app_write:<bundle_id> for this target.")
+                }
+                guard access == "write" || AuthoredToolEffects.appReadOnly(args) else {
+                    throw SenseFailure(code: "read_only", message: "A read-declared app refuses modifying or unclassified events.")
+                }
+                try SystemAppleScriptAdapter.checkAppScript(args)
+            } else { try await broker.check(operation, arguments: arguments) }
             return nil
         } catch {
             let reason = (error as? SenseFailure)?.code ?? (error is CancellationError ? "cancelled" : "world_error")
@@ -103,24 +143,33 @@ struct ToolHost: OwnedProgramHostProfile {
 
     func primitive(_ operation: String, arguments: JSONValue, preview: Bool) async throws -> JSONValue {
         if let refused = await checkPrimitive(operation, arguments: arguments) { return refused }
+        if operation == "model.call" { return try await performPrimitive(operation, arguments: arguments) }
+        let effect = AuthoredToolEffects.primitiveEffect(operation, arguments: arguments)
+        let args = SwiftNativeToolExecution.fields(arguments)
+        return await AuthoredToolEffects.$call.withValue((effect.tool, {
+            try await self.performPrimitive(operation, arguments: arguments)
+        })) {
+            await base.admitTool(effect.tool, input: args)
+                ?? Self.failure("door_unavailable", "A primitive needs the originating turn's gate chain.", effects: "none")
+        }
+    }
+
+    private func performPrimitive(_ operation: String, arguments: JSONValue) async throws -> JSONValue {
         var dispatched = false
         do {
             try await admission()
-            if let refused = await base.admitTool(candidate.program.id, input: input.merging([
-                "__authored_primitive": .object(["operation": .string(operation), "arguments": arguments,
-                                                "fingerprint": .string(candidate.digest)])
-            ]) { $1 }) {
-                guard case .object(var fields) = refused else { return refused }
-                fields["execution"] = .string("not_run")
-                return .object(fields)
-            }
+            guard await !broker.closed else { throw CancellationError() }
             dispatched = true
-            let result = try await broker.perform(operation, arguments: arguments)
+            let result = if operation == "apps.call" {
+                try await SystemAppleScriptAdapter().callApp(arguments, targets: appTargets)
+            } else { try await broker.perform(operation, arguments: arguments) }
             let read = ToolPrimitiveBroker.readOnly(operation, arguments)
+            // An app call's effects are what its events did, as its adapter observed them.
+            let observed = if operation == "apps.call", case .object(let fields) = result, case .string(let effects)? = fields["effects"] { effects } else { nil as String? }
             if operation == "apps.call", case .object(let fields) = result, case .string(let state)? = fields["state"] {
                 var refusal: [String: JSONValue] = ["status": .string("refused"), "reason": .string(state),
                     "detail": fields["detail"] ?? .string(state), "result": result,
-                    "effects": .string(read || ["needs_consent", "denied", "unavailable"].contains(state) ? "none" : "unknown")]
+                    "effects": .string(observed ?? (read || ["needs_consent", "denied", "unavailable"].contains(state) ? "none" : "unknown"))]
                 if state == "needs_consent", case .string(let bundleID)? = fields["bundle_id"] {
                     refusal["detail"] = .string("macOS Automation consent has not been asked for \(bundleID). Request the owner's permission card to ask macOS.")
                     refusal["next_call"] = .object(["tool": .string("app"), "input": .object([
@@ -132,9 +181,10 @@ struct ToolHost: OwnedProgramHostProfile {
                 }
                 return .object(refusal)
             }
-            return Self.receipt(result, effects: read ? "none" : "occurred")
+            return Self.receipt(result, effects: observed ?? (read ? "none" : "occurred"))
         } catch {
-            let reason = (error as? SenseFailure)?.code ?? (error is CancellationError ? "cancelled" : "world_error")
+            let code = (error as? SenseFailure)?.code
+            let reason = error is CancellationError ? "cancelled" : code ?? "world_error"
             return Self.failure(reason, error.localizedDescription,
                 effects: !dispatched || ToolPrimitiveBroker.readOnly(operation, arguments) ? "none" : "unknown",
                 execution: dispatched ? "attempted" : "not_run")

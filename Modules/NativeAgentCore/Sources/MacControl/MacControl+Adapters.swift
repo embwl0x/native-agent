@@ -13,6 +13,7 @@ import CryptoKit
 import AppKit
 import Carbon
 import OSAKit
+import os
 #endif
 
 // MARK: - Adapter results
@@ -152,8 +153,14 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
     public static let appleScriptOutcomeUnknownCode = -1002
 
     public static func automationTarget(_ permission: String) -> String? {
-        let prefix = "applescript:"
-        guard permission.hasPrefix(prefix), permission.count > prefix.count else { return nil }
+        switch permission {
+        case "notes": return "com.apple.Notes"
+        case "mail": return "com.apple.mail"
+        case "music": return "com.apple.Music"
+        default: break
+        }
+        guard let prefix = ["applescript:", "jxa:"].first(where: permission.hasPrefix),
+              permission.count > prefix.count else { return nil }
         return String(permission.dropFirst(prefix.count))
     }
 
@@ -221,13 +228,38 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
             return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path),
                             "state": .string("unavailable"), "detail": .string(error.localizedDescription)])
         }
-        return await Task.detached { permission(bundleID: bundleID, url: url, pid: pid, ask: ask) }.value
+        // The consent check waits like any Apple Event (ask:true can wait on the person): on the one queue.
+        return (try? await onAppleScriptQueue { _ in permission(bundleID: bundleID, url: url, pid: pid, ask: ask) })
+            ?? .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "state": .string("unavailable"),
+                        "detail": .string("The consent check was cancelled before it ran.")])
         #else
         return .object(["state": .string("unavailable")])
         #endif
     }
 
     #if canImport(AppKit)
+    // OSA permits background execution (AppleScript 10.6 release notes). One serial
+    // queue owns dictionary reads, consent checks, scripts and their reply waits, so a
+    // blocked app parks this thread, never a Swift cooperative worker. Work cancelled
+    // while queued never sends; a running script reads the flag at each event.
+    private static let appleScriptQueue = DispatchQueue(label: "NativeAgent.AppleScript", qos: .userInitiated)
+
+    private static func onAppleScriptQueue<Value: Sendable>(
+        _ operation: @escaping @Sendable (OSAllocatedUnfairLock<Bool>) throws -> Value
+    ) async throws -> Value {
+        let cancelled = OSAllocatedUnfairLock(initialState: false)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                appleScriptQueue.async {
+                    continuation.resume(with: Result {
+                        guard !cancelled.withLock({ $0 }) else { throw CancellationError() }
+                        return try autoreleasepool { try operation(cancelled) }
+                    })
+                }
+            }
+        } onCancel: { cancelled.withLock { $0 = true } }
+    }
+
     @MainActor private static func runningApp(at url: URL) -> NSRunningApplication? {
         let path = url.standardizedFileURL.resolvingSymlinksInPath()
         return NSWorkspace.shared.runningApplications.first {
@@ -277,7 +309,7 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
             throw SenseFailure(code: "app_unavailable", message: "No installed app resolves \(bundleID).")
         }
         if args["dictionary"] == .bool(true), args["script"] == nil {
-            return try await Task.detached {
+            return try await Self.onAppleScriptQueue { _ in
                 var definition: Unmanaged<CFData>?
                 let code = OSACopyScriptingDefinitionFromURL(url as CFURL, 0, &definition)
                 guard code == 0, let data = definition?.takeRetainedValue(),
@@ -285,20 +317,19 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                     throw SenseFailure(code: "dictionary_unavailable", message: "Scripting dictionary unavailable for \(url.path) (\(code)).")
                 }
                 return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(true), "sdef": .string(text)])
-            }.value
+            }
         }
         let pid = try await Self.appProcess(at: url)
-        let permission = await Task.detached { Self.permission(bundleID: bundleID, url: url, pid: pid) }.value
-        guard case .object(let consent) = permission, consent["state"] == .string("allowed") else { return permission }
-        try Task.checkCancellation()
-        let task = Task<JSONValue, Error>.detached {
-            try Task.checkCancellation()
+        return try await Self.onAppleScriptQueue { cancelled in
+            let permission = Self.permission(bundleID: bundleID, url: url, pid: pid)
+            guard case .object(let consent) = permission, consent["state"] == .string("allowed") else { return permission }
+            var effects: String?
             do {
                 let value: NSAppleEventDescriptor?
                 if case .string(let source)? = args["script"] {
                     let target = bundleID.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
                     let program = "use AppleScript version \"2.4\"\ntell application id \"\(target)\"\n\(source)\nend tell"
-                    value = try Self.scriptValue(program, pid: pid, authored: true)
+                    value = try Self.scriptValue(program, pid: pid, authored: true, cancelled: cancelled, effects: &effects)
                 } else {
                     let event = NSAppleEventDescriptor.appleEvent(withEventClass: try Self.fourCode(args["event_class"]),
                         eventID: try Self.fourCode(args["event_id"]), targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
@@ -310,6 +341,11 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                     // Bound each reply with the Apple Event Manager's standard timeout.
                     let options: NSAppleEventDescriptor.SendOptions = [.waitForReply, .neverInteract,
                         .init(rawValue: UInt(kAEDoNotPromptForUserConsent))]
+                    // A cancel that arrived during the preflight stops the event before it is sent.
+                    guard !cancelled.withLock({ $0 }) else {
+                        throw NSError(domain: "NativeAgentAppleEvent", code: -128,
+                                      userInfo: [NSLocalizedDescriptionKey: "The call was cancelled before its event was sent."])
+                    }
                     let reply = try event.sendEvent(options: options, timeout: TimeInterval(kAEDefaultTimeout))
                     let code = reply.paramDescriptor(forKeyword: keyErrorNumber)?.int32Value ?? 0
                     guard code == 0 else {
@@ -318,21 +354,25 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                     }
                     value = reply.paramDescriptor(forKeyword: keyDirectObject)
                 }
-                return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(read),
-                                "code": .int(0), "value": Self.json(value)])
+                var done: [String: JSONValue] = ["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(read),
+                                                 "code": .int(0), "value": Self.json(value)]
+                // Only a script's events are observed; a single event's effects follow its class.
+                done["effects"] = effects.map(JSONValue.string)
+                return .object(done)
             } catch {
                 let error = Self.appError(error, pid: pid, app: url.deletingPathExtension().lastPathComponent) as NSError
                 let code = error.userInfo["apple_event_code"] as? Int ?? error.code
-                return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(read),
+                var failed: [String: JSONValue] = ["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(read),
                     "code": .int(Int64(code)), "state": .string(error.userInfo["state"] as? String
                         ?? (code == -1744 ? "needs_consent" : code == -1743 ? "denied" : "failed")),
                     "message": .string(error.localizedDescription),
                     "detail": .string(error.userInfo["state"] != nil ? error.localizedDescription
                         : code == -1743 ? "Automation was denied by the owner; only the owner can change it in System Settings › Privacy & Security › Automation."
-                        : error.localizedDescription)])
+                        : error.localizedDescription)]
+                failed["effects"] = effects.map(JSONValue.string)
+                return .object(failed)
             }
         }
-        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
         #else
         throw SenseFailure(code: "unavailable", message: "App events require macOS.")
         #endif
@@ -346,8 +386,7 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "No installed app resolves \(bundleID)."])
         }
         let pid = try await appProcess(at: url)
-        let task = Task<String, Error>.detached {
-            try Task.checkCancellation()
+        return try await onAppleScriptQueue { cancelled in
             let consent = permission(bundleID: bundleID, url: url, pid: pid)
             guard case .object(let fields) = consent, fields["state"] == .string("allowed") else {
                 if case .object(let fields) = consent, case .int(let code)? = fields["code"], ![-1743, -1744].contains(code) {
@@ -359,7 +398,8 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
             let path = url.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
             let program = source.replacingOccurrences(of: "tell application \"__NativeAgentApp__\"", with: "tell application \"\(path)\"")
             let value: NSAppleEventDescriptor
-            do { value = try scriptValue(program, pid: pid, authored: false) }
+            var effects: String?
+            do { value = try scriptValue(program, pid: pid, authored: false, cancelled: cancelled, effects: &effects) }
             catch { throw appError(error, pid: pid, app: url.deletingPathExtension().lastPathComponent) }
             guard let text = value.stringValue else {
                 throw NSError(domain: "NativeAgentAppleScript", code: -1700,
@@ -367,7 +407,6 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
             }
             return text
         }
-        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
 
     private static func appError(_ error: Error, pid: pid_t, app: String) -> Error {
@@ -393,24 +432,29 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
         }
         var info = ns.userInfo
         info["state"] = state
+        info["observation"] = observation
         info[NSLocalizedDescriptionKey] = "\(app) didn't answer in time — it may be showing a dialog or still busy. \(observation) "
             + (ns.code == appleScriptOutcomeUnknownCode ? ns.localizedDescription : "Observe before retrying.")
         return NSError(domain: ns.domain, code: ns.code, userInfo: info)
     }
 
-    private static func scriptValue(_ source: String, pid: pid_t, authored: Bool) throws -> NSAppleEventDescriptor {
-        try Task.checkCancellation()
+    /// `effects` is what the script's events did: none when it sent only reads,
+    /// occurred when the app accepted another event, unknown when the app answered one with an error.
+    private static func scriptValue(_ source: String, pid: pid_t, authored: Bool, cancelled: OSAllocatedUnfairLock<Bool>,
+                                    effects: inout String?) throws -> NSAppleEventDescriptor {
         guard let language = OSALanguage(forName: "AppleScript") else {
             throw SenseFailure(code: "unavailable", message: "AppleScript language is unavailable.")
         }
         let instance = OSALanguageInstance(language: language)
-        var target = (pid: pid, authored: authored, refused: false, sent: false)
+        typealias Target = (pid: pid_t, authored: Bool, refused: Bool, wrote: Bool, attempted: Bool, cancelled: OSAllocatedUnfairLock<Bool>)
+        var target: Target = (pid, authored, false, false, false, cancelled)
         return try withUnsafeMutablePointer(to: &target) { pointer in
             // A private component confines even computed targets and nested tells;
-            // every send keeps the raw primitive's consent, interaction and reply policy.
-            let sendCode = OSASetSendProc(instance.componentInstance, { event, reply, _, _, _, _, _, refCon in
+            // every send keeps the raw primitive's consent, interaction and reply policy,
+            // and the reply wait the script itself declared (`with timeout`, else the default).
+            let sendCode = OSASetSendProc(instance.componentInstance, { event, reply, _, _, timeout, _, _, refCon in
                 guard let event, let reply, let refCon else { return OSErr(-50) }
-                let target = refCon.assumingMemoryBound(to: (pid: pid_t, authored: Bool, refused: Bool, sent: Bool).self)
+                let target = refCon.assumingMemoryBound(to: Target.self)
                 var pid: pid_t = 0
                 var size = 0
                 let addressCode = AEGetAttributePtr(event, keyAddressAttr, typeKernelProcessID, nil, &pid,
@@ -420,15 +464,30 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                     target.pointee.refused = true
                     return OSErr(-1743)
                 }
-                if Task<Never, Never>.isCancelled { return OSErr(-128) }
-                target.pointee.sent = true
-                return OSErr(AESendMessage(event, reply, AESendMode(kAEWaitReply | kAENeverInteract | kAEDoNotPromptForUserConsent),
-                                          kAEDefaultTimeout))
+                if target.pointee.cancelled.withLock({ $0 }) { return OSErr(-128) }
+                // Each event is judged by the raw app call's own read rule.
+                var eventClass: OSType = 0, eventID: OSType = 0
+                AEGetAttributePtr(event, keyEventClassAttr, typeType, nil, &eventClass, MemoryLayout<OSType>.size, &size)
+                AEGetAttributePtr(event, keyEventIDAttr, typeType, nil, &eventID, MemoryLayout<OSType>.size, &size)
+                let read = AuthoredToolEffects.appReadOnly(["event_class": .string(SystemAppleScriptAdapter.codeText(eventClass)),
+                                                            "event_id": .string(SystemAppleScriptAdapter.codeText(eventID))])
+                let sent = OSErr(AESendMessage(event, reply, AESendMode(kAEWaitReply | kAENeverInteract | kAEDoNotPromptForUserConsent),
+                                               Int(timeout)))
+                // Another event wrote only when the app accepted it; an error reply or failed send leaves it
+                // unconfirmed. One macOS refused for want of consent never reached the app.
+                if !read, ![-1743, -1744].contains(sent) {
+                    var number: Int32 = 0
+                    let errorReply = AEGetParamPtr(reply, keyErrorNumber, typeSInt32, nil, &number, MemoryLayout<Int32>.size, &size) == noErr && number != 0
+                    if sent == noErr, !errorReply { target.pointee.wrote = true } else { target.pointee.attempted = true }
+                }
+                return sent
             }, pointer)
-            let activeCode = OSASetActiveProc(instance.componentInstance, { _ in
-                Task<Never, Never>.isCancelled ? OSErr(-128) : 0
-            }, nil)
+            let activeCode = OSASetActiveProc(instance.componentInstance, { refCon in
+                guard let refCon else { return OSErr(-50) }
+                return refCon.assumingMemoryBound(to: Target.self).pointee.cancelled.withLock { $0 } ? OSErr(-128) : 0
+            }, pointer)
             defer {
+                effects = pointer.pointee.attempted ? "unknown" : pointer.pointee.wrote ? "occurred" : "none"
                 OSASetSendProc(instance.componentInstance, nil, nil)
                 OSASetActiveProc(instance.componentInstance, nil, nil)
             }
@@ -446,9 +505,9 @@ public final class SystemAppleScriptAdapter: OwnedAppCalling, Sendable {
                 throw NSError(domain: "NativeAgentAppleEvent", code: -1743, userInfo: ["state": "undeclared_target",
                     NSLocalizedDescriptionKey: "The script must target only the declared app process \(pid)."])
             }
-            let number = Task<Never, Never>.isCancelled ? -128 : error?[OSAScriptErrorNumber] as? Int ?? 0
+            let number = cancelled.withLock({ $0 }) ? -128 : error?[OSAScriptErrorNumber] as? Int ?? 0
             guard number == 0, let value else {
-                let unknown = pointer.pointee.sent && [ -128, -1712 ].contains(number)
+                let unknown = (pointer.pointee.wrote || pointer.pointee.attempted) && [ -128, -1712 ].contains(number)
                 if !authored, [-1743, -1744].contains(number) {
                     throw AppleScriptError.permissionDenied(app: "the declared app")
                 }
@@ -638,76 +697,6 @@ public final class SystemProcessAdapter: Sendable {
             self.continuation = nil
             lock.unlock()
             continuation?.resume()
-        }
-    }
-
-    /// Nonblocking readers keep EOF inside the subprocess deadline. A child
-    /// exiting does not imply EOF when descendants still own pipe writers.
-    package final class PipeDrain: @unchecked Sendable {
-        private let handle: FileHandle
-        private let onData: @Sendable (Data) -> Void
-        private let queue = DispatchQueue(label: "NativeAgent.process.pipe")
-        private let source: DispatchSourceRead
-        private let completion = DispatchGroup()
-
-        package init(handle: FileHandle, onData: @escaping @Sendable (Data) -> Void) throws {
-            self.handle = handle
-            self.onData = onData
-            let fd = handle.fileDescriptor
-            let flags = fcntl(fd, F_GETFL)
-            guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
-                throw MacControlError.ioFailure("Could not configure subprocess pipe")
-            }
-            source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-            completion.enter()
-            source.setEventHandler { [self] in drain() }
-            source.setCancelHandler { [self] in
-                try? handle.close()
-                completion.leave()
-                source.setEventHandler(handler: nil)
-                source.setCancelHandler(handler: nil)
-            }
-            source.resume()
-        }
-
-        private func drain() {
-            var bytes = [UInt8](repeating: 0, count: 65_536)
-            // Bound each callback so a continuous writer cannot prevent stop.
-            for _ in 0..<64 {
-                let count = read(handle.fileDescriptor, &bytes, bytes.count)
-                if count > 0 {
-                    onData(Data(bytes.prefix(count)))
-                } else if count == 0 {
-                    source.cancel()
-                    return
-                } else if errno != EINTR {
-                    if errno != EAGAIN && errno != EWOULDBLOCK { source.cancel() }
-                    return
-                }
-            }
-        }
-
-        package func stop() {
-            queue.async { [self] in
-                guard !source.isCancelled else { return }
-                drain()
-                source.cancel()
-            }
-        }
-
-        package func wait(timeout: DispatchTime) -> DispatchTimeoutResult {
-            completion.wait(timeout: timeout)
-        }
-
-        package func stopAndWait() {
-            stop()
-            completion.wait()
-        }
-
-        package func wait() async {
-            await withCheckedContinuation { continuation in
-                completion.notify(queue: .global(qos: .utility)) { continuation.resume() }
-            }
         }
     }
 
@@ -1018,13 +1007,18 @@ public final class SystemProcessAdapter: Sendable {
 
         let outBuf = _Buffer(byteLimit: outputByteLimit)
         let errBuf = _Buffer(byteLimit: outputByteLimit)
-        let outDrain = try PipeDrain(handle: outPipe.fileHandleForReading) { outBuf.append($0) }
-        let errDrain: PipeDrain
+        let outDrain: ProcessPipeDrain
         do {
-            errDrain = try PipeDrain(handle: errPipe.fileHandleForReading) { errBuf.append($0) }
+            outDrain = try ProcessPipeDrain(handle: outPipe.fileHandleForReading) { outBuf.append($0) }
+        } catch {
+            throw MacControlError.ioFailure(error.localizedDescription)
+        }
+        let errDrain: ProcessPipeDrain
+        do {
+            errDrain = try ProcessPipeDrain(handle: errPipe.fileHandleForReading) { errBuf.append($0) }
         } catch {
             outDrain.stop()
-            throw error
+            throw MacControlError.ioFailure(error.localizedDescription)
         }
 
         let completion = _ProcessCompletion()
@@ -1172,7 +1166,7 @@ public final class SystemAppControlAdapter: Sendable {
 
     @MainActor
     private static func isApplicationRunningOnMain(matching query: String) -> Bool {
-        !runningApplications(matching: query).isEmpty
+        (try? runningApplications(matching: query).isEmpty) == false
     }
 
     private static func application(_ app: NSRunningApplication, matches query: String) -> Bool {
@@ -1188,7 +1182,7 @@ public final class SystemAppControlAdapter: Sendable {
         if let running = try runningApp(matching: query) {
             return runResult(requested: query, app: running, launched: false, activated: false, terminated: false)
         }
-        guard let url = applicationURL(matching: query) else {
+        guard let url = try applicationURL(matching: query) else {
             throw MacControlError.appControlFailed("app_not_found: \(query)")
         }
         let launched = try await openApplication(at: url, activates: false)
@@ -1255,7 +1249,7 @@ public final class SystemAppControlAdapter: Sendable {
                 terminated: false
             )
         }
-        guard let url = applicationURL(matching: query) else {
+        guard let url = try applicationURL(matching: query) else {
             throw MacControlError.appControlFailed("app_not_found: \(query)")
         }
         let launched = try await openApplication(at: url)
@@ -1328,9 +1322,9 @@ public final class SystemAppControlAdapter: Sendable {
 
     @MainActor
     private static func quitAppOnMain(named query: String) async throws -> AppControlRunResult {
-        let running = runningApplications(matching: query)
+        let running = try runningApplications(matching: query)
         guard !running.isEmpty else {
-            if let url = applicationURL(matching: query) {
+            if let url = try applicationURL(matching: query) {
                 return AppControlRunResult(
                     requestedName: query,
                     matchedName: url.deletingPathExtension().lastPathComponent,
@@ -1390,7 +1384,7 @@ public final class SystemAppControlAdapter: Sendable {
 
     @MainActor
     private static func runningApp(matching query: String) throws -> NSRunningApplication? {
-        let running = runningApplications(matching: query)
+        let running = try runningApplications(matching: query)
         let identities = Set(running.map {
             $0.bundleURL?.standardizedFileURL.path ?? $0.bundleIdentifier ?? "pid:\($0.processIdentifier)"
         })
@@ -1401,7 +1395,7 @@ public final class SystemAppControlAdapter: Sendable {
     }
 
     @MainActor
-    private static func runningApplications(matching query: String) -> [NSRunningApplication] {
+    private static func runningApplications(matching query: String) throws -> [NSRunningApplication] {
         let running = NSWorkspace.shared.runningApplications
         let lower = query.lowercased()
         // A person means the app with a Dock icon, not a helper or service
@@ -1420,7 +1414,7 @@ public final class SystemAppControlAdapter: Sendable {
         if !exactBundle.isEmpty { return preferRegular(exactBundle) }
         // "Mail" with Mail stopped and MailMate running means Mail: a partial
         // name only when no app by that exact name is installed either.
-        guard applicationURL(matching: query) == nil else { return [] }
+        guard try applicationURL(matching: query) == nil else { return [] }
         let partial = running.filter { app in
             let name = (app.localizedName ?? "").lowercased()
             let bundle = (app.bundleIdentifier ?? "").lowercased()
@@ -1430,40 +1424,33 @@ public final class SystemAppControlAdapter: Sendable {
     }
 
     @MainActor
-    private static func applicationURL(matching query: String) -> URL? {
-        if looksLikeBundleIdentifier(query),
-           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: query) {
+    private static func applicationURL(matching query: String) throws -> URL? {
+        if let url = try installedApplicationURL(named: query) { return url }
+        if looksLikeBundleIdentifier(query), let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: query) {
+            nativeLog("SystemAppControlAdapter: Launch Services resolved %@ to %@", query, url.path)
             return url
         }
-        if let url = installedApplicationURL(named: query) { return url }
         // Anywhere else Launch Services knows an app by exactly this name.
+        guard !query.contains("/") else { return nil }
         let name = query.hasSuffix(".app") ? String(query.dropLast(4)) : query
         guard let path = NSWorkspace.shared.fullPath(forApplication: name) else { return nil }
         let url = URL(fileURLWithPath: path)
         return url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame ? url : nil
     }
 
-    /// Exact name or bundle path, bounded to the standard application directories.
-    public static func installedApplicationURL(named query: String) -> URL? {
+    /// Exact name, bundle id or bundle path from the Mac's own app index.
+    public static func installedApplicationURL(named query: String) throws -> URL? {
         let expandedQuery = (query as NSString).expandingTildeInPath
         if expandedQuery.hasPrefix("/"), expandedQuery.hasSuffix(".app") {
             let url = URL(fileURLWithPath: expandedQuery)
             if isApplicationBundle(url) { return url }
         }
-        let fm = FileManager.default
-        let appName = query.hasSuffix(".app") ? query : "\(query).app"
-        let candidateDirs = [
-            URL(fileURLWithPath: "/Applications", isDirectory: true),
-            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
-            URL(fileURLWithPath: "/Applications/Utilities", isDirectory: true),
-            URL(fileURLWithPath: "/System/Applications/Utilities", isDirectory: true),
-            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
-        ]
-        for dir in candidateDirs {
-            let url = dir.appendingPathComponent(appName)
-            if isApplicationBundle(url) { return url }
-        }
-        return nil
+        let name = query.hasSuffix(".app") ? String(query.dropLast(4)) : query
+        return try MacAppIndex.shared.apps().first {
+            $0.bundleID?.caseInsensitiveCompare(query) == .orderedSame
+                || $0.name.caseInsensitiveCompare(name) == .orderedSame
+                || $0.url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame
+        }?.url
     }
 
     private static func looksLikeBundleIdentifier(_ query: String) -> Bool {

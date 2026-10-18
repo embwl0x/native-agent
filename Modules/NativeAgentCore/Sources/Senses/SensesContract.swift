@@ -370,7 +370,6 @@ public protocol SenseRegistryManaging: SenseRegistry {
     func setStatus(id: String, version: Int, status: SenseStatus, preview: Bool, ownerAuthorized: Bool) async throws -> SenseRecord
     func markUnavailable(id: String, version: Int, reason: String) async throws
     func exportBundle(id: String, to destination: URL, userApproved: Bool) async throws -> SenseExportResult
-    func importBundle(from bundle: URL) async throws -> SenseRecord
 }
 
 public enum SenseExportResult: Sendable, Equatable {

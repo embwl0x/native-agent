@@ -14,8 +14,10 @@ public protocol InlineInteractionPlatformPort {
     func pairedPhoneCount() async -> Int
     func connectorRecords(root: URL) async throws -> [InlineInteractionConnectorStatus]
     func providers() async throws -> [InlineInteractionProviderStatus]
-    func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) -> String?
-    var applicationIsActive: Bool { get }
+    func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> String?
+    func permissionChanges() -> AsyncStream<Void>
+    /// Every card still open in the inbox, with the session it belongs to.
+    func openInteractionCards() async -> [(id: String, sessionID: String)]
     func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool
     func writeInteractionSnapshots() async
     func refreshInteractionInbox() async

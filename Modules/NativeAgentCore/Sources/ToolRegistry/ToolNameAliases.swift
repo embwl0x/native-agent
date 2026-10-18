@@ -101,7 +101,7 @@ public enum ToolNameAliases {
     private static let foldedEntries: KeyValuePairs<String, String> = [
         "time_now": "time.now", "context_expand": "context.expand", "inner_state": "mind.inner_state",
         "agent_introspect": "agent.introspect", "list_skills": "skill.list", "read_skill": "skill.read",
-        "recent_trace_summary": "trace.recent", "daemon_introspect": "agent.introspect",
+        "recent_trace_summary": "trace.recent",
         // Step 2, her own state (User 10-02). recall_search is recall_memory's
         // old alias and folds with it.
         "desk_read": "desk.read", "desk_add_item": "desk.add", "desk_set_status": "desk.set_status",
@@ -181,7 +181,7 @@ public enum ToolNameAliases {
         // Step 5 (User 10-02): files, shell, the web, the browser, chat search
         // and result paging. session_search is search_chat_history's alias and
         // folds with it; SearXNG's search is the web's search.
-        "read_file": "files.read", "list_dir": "files.list", "file_excerpt": "files.excerpt", "grep": "files.grep",
+        "read_file": "files.read", "list_dir": "files.list", "file_info": "files.info", "file_excerpt": "files.excerpt", "grep": "files.grep",
         "write_file": "files.write", "move_file": "files.move", "copy_file": "files.copy", "trash_file": "files.trash", "apply_patch": "files.patch", "mac_spotlight_search": "files.spotlight",
         "shell": "shell.run", "bash": "shell.bash", "git": "git.run", "git_status": "git.status",
         "git_diff": "git.diff", "git_log": "git.log", "repo_dirty_summary": "git.summary",
@@ -203,7 +203,7 @@ public enum ToolNameAliases {
         "screen": "mac.look", "act": "mac.act", "go": "mac.go", "wait": "mac.wait", "read": "mac.read",
         "menu": "mac.menu", "menu_press": "mac.menu_press", "clipboard_read": "mac.clipboard_read",
         "clipboard_write": "mac.clipboard_write", "system_info": "mac.system_info", "mac_volume": "mac.volume", "activity_query": "mac.activity",
-        "mac_screenshot_save": "mac.screenshot_save",
+        "mac_screenshot_save": "mac.screenshot_save", "mac_location": "mac.location",
         "music_now_playing": "music.now_playing", "music_control": "music.control", "mac_media": "mac.media",
         "music_search_library": "music.search", "music_list_library": "music.library",
         "music_list_playlists": "music.playlists",
@@ -233,6 +233,8 @@ public enum ToolNameAliases {
         "skill.validate": ["fixtures": "input"],
         "skill.enable": ["digest": "version"],
         "agent.read": ["id": "message_id"],
+        // 10-17, Agent: "mac.go wants name, not app; shell.bash wants cmd, not command".
+        "mac.go": ["app": "name"], "shell.run": ["command": "cmd"], "shell.bash": ["command": "cmd"],
         "x.search": ["max_results": "limit"], "x.timeline": ["max_results": "limit"], "x.user_tweets": ["max_results": "limit"],
     ]
 
@@ -347,23 +349,8 @@ public enum ToolNameAliases {
     public static func appAction(_ tool: String, input: [String: JSONValue]) -> String? {
         let tool = canonical(tool)
         if let id = appAction(tool) { return id }
-        let matches = actionRouteLock.withLock { actionRoutes[tool] ?? [] }
-            .filter { route in route.input.allSatisfy { input[$0.key] == $0.value } }
-        guard let mostSpecific = matches.map({ $0.input.count }).max() else { return nil }
-        let selected = matches.filter { $0.input.count == mostSpecific }
-        return selected.count == 1 ? selected[0].id : nil
+        return AppActionBinding.actionID(tool: tool, input: input)
     }
-
-    /// Legacy dispatchers resolve from the app's declared routes, not a verb table.
-    public static func registerAppActions(_ actions: [(id: String, tool: String, input: [String: JSONValue])]) {
-        actionRouteLock.withLock {
-            actionRoutes = Dictionary(grouping: actions, by: \.tool).mapValues { routes in
-                routes.map { (id: $0.id, input: $0.input) }
-            }
-        }
-    }
-    private static let actionRouteLock = NSLock()
-    nonisolated(unsafe) private static var actionRoutes: [String: [(id: String, input: [String: JSONValue])]] = [:]
 
     /// Free text in the action slot can only discover, never execute a guessed action.
     public static func appFindQuery(_ input: [String: JSONValue]) -> String? {
@@ -391,8 +378,7 @@ public enum ToolNameAliases {
 
     /// An action that only passes the call on to the tool it folds.
     public static func isFoldedAction(_ id: String) -> Bool {
-        foldedActionIDs.contains(id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) || mcpTool(id) != nil
-            || authoredTool(id) != nil
+        AppActionBinding.binding(id)?.folded == true
     }
 
     /// The tool a call ran: an `app` call of a folded action is that tool,
@@ -400,16 +386,21 @@ public enum ToolNameAliases {
     /// given as an action (the door opens it as the item), is agent_message,
     /// so its send is held, owed and counted like one.
     public static func ranTool(_ name: String, input: [String: JSONValue]) -> String {
+        ranCall(name, input: input).tool
+    }
+
+    public static func ranCall(_ name: String, input: [String: JSONValue]) -> (tool: String, input: [String: JSONValue]) {
+        let args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
         if name == "app", case .string(let item)? = input["action"] ?? input["item"],
            item.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasSuffix(".say"),
            mcpTool(item) == nil, authoredTool(item) == nil {
             let page = (input["page"].flatMap { if case .string(let text) = $0 { text } else { nil } } ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if page.isEmpty || page == "home" { return "agent_message" }
+            if page.isEmpty || page == "home" { return ("agent_message", args) }
         }
-        guard name == "app", case .string(let action)? = input["action"] else { return name }
-        let id = action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return foldedTools.filter { $0.value == id }.keys.sorted().first ?? mcpTool(action) ?? authoredTool(action) ?? name
+        guard name == "app", case .string(let action)? = input["action"],
+              let binding = AppActionBinding.binding(action), binding.folded else { return (name, input) }
+        return (binding.tool, binding.arguments(args))
     }
 
     /// The tools a call runs: each entry's of an `app {actions}` list, else its one.
@@ -420,10 +411,7 @@ public enum ToolNameAliases {
 
     /// The input a call ran with: a folded `app` action's args, by the tool's own names.
     public static func ranInput(_ name: String, input: [String: JSONValue]) -> [String: JSONValue] {
-        let tool = ranTool(name, input: input)
-        guard tool != name else { return input }
-        if case .object(let args)? = input["args"] { return hostArgs(tool, args) }
-        return [:]
+        ranCall(name, input: input).input
     }
 
     /// A call as a person is shown it: a folded `app` action as the tool it
@@ -435,7 +423,8 @@ public enum ToolNameAliases {
         }
         let action = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !action.isEmpty else { return (name, input) }
-        let ran = ranTool(name, input: fields)
+        // Historical generated labels survive unmounting or dropping their executable.
+        let ran = mcpTool(raw) ?? authoredTool(raw) ?? ranTool(name, input: fields)
         return (ran == name ? action : ran, fields["args"] ?? .object([:]))
     }
 

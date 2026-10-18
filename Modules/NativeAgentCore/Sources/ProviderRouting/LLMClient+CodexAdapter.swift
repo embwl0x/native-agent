@@ -2,7 +2,6 @@ import Foundation
 @preconcurrency import Dispatch
 import NativeAgentCore
 import PersistenceCore
-import MacControl
 
 /// Incremental UTF-8 decoder for chunked byte streams. A multibyte codepoint
 /// (2-4 bytes) can be split across two reads; naive per-read decoding drops
@@ -699,10 +698,10 @@ public final class CodexAdapter: LLMAdapter {
             // decoding returns nil for the partial-bytes read and drops the
             // bytes silently. See `Utf8StreamDecoder` for details.
             let utf8Decoder = Utf8StreamDecoder()
-            let stdoutReader: SystemProcessAdapter.PipeDrain
-            let stderrReader: SystemProcessAdapter.PipeDrain
+            let stdoutReader: ProcessPipeDrain
+            let stderrReader: ProcessPipeDrain
             do {
-                stdoutReader = try SystemProcessAdapter.PipeDrain(
+                stdoutReader = try ProcessPipeDrain(
                     handle: outPipe.fileHandleForReading
                 ) { data in
                     // stdout carries only the model's answer: the request was admitted.
@@ -713,7 +712,7 @@ public final class CodexAdapter: LLMAdapter {
                 }
 
                 do {
-                    stderrReader = try SystemProcessAdapter.PipeDrain(
+                    stderrReader = try ProcessPipeDrain(
                         handle: errPipe.fileHandleForReading
                     ) { data in
                         if !data.isEmpty { activity?() }
@@ -898,12 +897,12 @@ public final class CodexAdapter: LLMAdapter {
             // returned truncated output.
             let stdoutBuf = LockBox(Data())
             let stderrBuf = LockBox(Data())
-            let stdoutReader: SystemProcessAdapter.PipeDrain
-            let stderrReader: SystemProcessAdapter.PipeDrain
+            let stdoutReader: ProcessPipeDrain
+            let stderrReader: ProcessPipeDrain
             do {
-                stdoutReader = try SystemProcessAdapter.PipeDrain(handle: outPipe.fileHandleForReading) { data in stdoutBuf.mutate { $0.append(data) } }
+                stdoutReader = try ProcessPipeDrain(handle: outPipe.fileHandleForReading) { data in stdoutBuf.mutate { $0.append(data) } }
                 do {
-                    stderrReader = try SystemProcessAdapter.PipeDrain(handle: errPipe.fileHandleForReading) { data in stderrBuf.mutate { $0.append(data) } }
+                    stderrReader = try ProcessPipeDrain(handle: errPipe.fileHandleForReading) { data in stderrBuf.mutate { $0.append(data) } }
                 } catch {
                     stdoutReader.stopAndWait()
                     throw error

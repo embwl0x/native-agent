@@ -257,9 +257,18 @@ public struct TurnContinuationRuntime: Sendable {
             guard try await settleReply(response: response, route: route, envelope: envelope,
                 settlement: .durable(deliveryID: "turn-restart.\(checkpoint.runId)", requestDigest: digest, notifyRequestedResult: false)) == "completed" else { return }
             try checkpoint.remove(dataRoot: dataRoot)
-        } else if checkpoint.helperDefinition == nil, route.kind == .local {
+        } else if checkpoint.helperDefinition == nil, let kind = route.kind, kind == .local || kind == .callerResult {
+            // The reply is in the conversation: the chat showing it refreshes,
+            // and the reply-delivery owner (the delegation outcome loop, which
+            // reconciles the bridge's reply ledger from the transcript) hears
+            // the conversation changed, so the caller's next read returns it
+            // without waiting for the owner's integrity sweep.
             await MainActor.run {
                 NotificationCenter.default.post(name: .chatTurnCompleted, object: checkpoint.sessionId)
+            }
+            if kind == .callerResult {
+                StoreChangeBus.shared.emit(StoreChange(store: .replyDelivery,
+                    path: dataRoot.appendingPathComponent("chat/messages/\(checkpoint.sessionId).jsonl")))
             }
         }
         if response.terminalState == .completed {

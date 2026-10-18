@@ -895,7 +895,7 @@ extension SwiftToolDispatcher {
     package static func consumePersistedHistoryEvidence(_ value: JSONValue) {
         switch value {
         case .object(let fields):
-            MemoryDataProvenance.consume(.object(fields))
+            // A peer's words read now steer; a memory's provenance in the receipt does not.
             if case .bool(true)? = fields["untrusted_remote_data"],
                case .string(let peer)? = fields["agent"] {
                 let line = HumanConversationReader.string(fields["preview"] ?? fields["excerpt"] ?? fields["text"]) ?? ""

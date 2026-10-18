@@ -386,7 +386,7 @@ extension NativeCognitionRuntime: LLMCallLifecycleObserving {
         if let turnId = event.turnId { metadata["turnId"] = .string(turnId) }
 
         // The router awaits only the in-memory organism mutation. Persistence
-        // coalesces behind the actor and Context prewarm is intentionally absent:
+        // coalesces behind the actor:
         // provider lifecycle is body evidence, not new semantic context.
         await ingestOrganismSignal(
             kind: kind,
@@ -394,8 +394,7 @@ extension NativeCognitionRuntime: LLMCallLifecycleObserving {
             intensity: intensity,
             valence: valence,
             metadata: metadata,
-            persistSynchronously: false,
-            prewarmContext: false
+            persistSynchronously: false
         )
     }
 }

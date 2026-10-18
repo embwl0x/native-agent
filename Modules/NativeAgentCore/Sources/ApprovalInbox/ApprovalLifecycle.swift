@@ -1,8 +1,11 @@
 import Foundation
+import NativeAgentCore
+import PersistenceCore
 
 public enum ApprovalLifecyclePhase: String, Sendable, Equatable {
     case requested
     case resolved
+    case executed
 }
 
 /// A process-local edge emitted only after the canonical approval store has
@@ -11,10 +14,12 @@ public enum ApprovalLifecyclePhase: String, Sendable, Equatable {
 public struct ApprovalLifecycleEvent: Sendable, Equatable {
     public let phase: ApprovalLifecyclePhase
     public let record: ApprovalRecord
+    public let result: JSONValue?
 
-    public init(phase: ApprovalLifecyclePhase, record: ApprovalRecord) {
+    public init(phase: ApprovalLifecyclePhase, record: ApprovalRecord, result: JSONValue? = nil) {
         self.phase = phase
         self.record = record
+        self.result = result
     }
 }
 
@@ -23,14 +28,15 @@ public struct ApprovalLifecycleEvent: Sendable, Equatable {
 public actor ApprovalLifecycleBus {
     public static let shared = ApprovalLifecycleBus()
 
-    private var continuations: [UUID: AsyncStream<ApprovalLifecycleEvent>.Continuation] = [:]
+    public typealias HostContext = @Sendable (@escaping @Sendable () async throws -> JSONValue) async throws -> JSONValue
+    private var continuations: [UUID: (host: Bool, reply: AsyncStream<ApprovalLifecycleEvent>.Continuation, context: HostContext?)] = [:]
 
-    public func events() -> AsyncStream<ApprovalLifecycleEvent> {
-        let id = UUID()
+    public func events(forHostCall hostID: UUID? = nil, context: HostContext? = nil) -> AsyncStream<ApprovalLifecycleEvent> {
+        let id = hostID ?? UUID()
         let pair = AsyncStream<ApprovalLifecycleEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(64)
         )
-        continuations[id] = pair.continuation
+        continuations[id] = (hostID != nil, pair.continuation, context)
         pair.continuation.onTermination = { [weak self] _ in
             Task { await self?.removeContinuation(id) }
         }
@@ -38,13 +44,33 @@ public actor ApprovalLifecycleBus {
     }
 
     public func publish(_ event: ApprovalLifecycleEvent) {
-        for continuation in continuations.values {
-            continuation.yield(event)
+        if event.phase == .resolved || event.phase == .executed {
+            if event.record.status == "resolved", let id = hostCallID(event.record) { continuations[id]?.reply.yield(event) }
+            if event.phase == .executed { return }
+        }
+        for continuation in continuations.values where !continuation.host {
+            continuation.reply.yield(event)
         }
     }
 
     private func removeContinuation(_ id: UUID) {
-        continuations.removeValue(forKey: id)
+        continuations.removeValue(forKey: id)?.reply.finish()
+    }
+
+    public func finish(_ id: UUID) { removeContinuation(id) }
+
+    public func awaitsHostReply(_ record: ApprovalRecord) -> Bool {
+        guard let id = hostCallID(record) else { return false }
+        return record.status == "resolved" && continuations[id]?.host == true
+    }
+
+    public func hostContext(_ record: ApprovalRecord) -> HostContext? {
+        hostCallID(record).flatMap { continuations[$0]?.context }
+    }
+
+    private func hostCallID(_ record: ApprovalRecord) -> UUID? {
+        guard case .object(let fields) = record.payload, case .string(let raw)? = fields["hostCallID"] else { return nil }
+        return UUID(uuidString: raw)
     }
 
     public nonisolated static func fire(

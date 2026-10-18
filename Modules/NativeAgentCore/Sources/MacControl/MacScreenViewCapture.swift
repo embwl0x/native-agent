@@ -191,6 +191,45 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         }
     }
 
+    public func windowCapture() async -> MacScreenWindowCapture {
+        guard isScreenRecordingTrusted() else { return { _, _ in .failure(.screenRecordingNotTrusted) } }
+        let content: MacScreenCaptureValue<SCShareableContent>
+        do {
+            content = MacScreenCaptureValue(value: try await macScreenCaptureWait { request in
+                SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+                    request.receive(content, error)
+                }
+            })
+        } catch { return { _, _ in .failure(.captureFailed) } }
+        return { windowNumber, maxPixelWidth in
+            do {
+                try Task.checkCancellation()
+                guard let window = content.value.windows.first(where: { Int($0.windowID) == windowNumber }),
+                      !PersonOnlyWindows.contains(number: windowNumber) else { return .failure(.captureFailed) }
+                let filter = SCContentFilter(desktopIndependentWindow: window)
+                let configuration = SCStreamConfiguration()
+                let rect = filter.contentRect
+                let scale = min(max(1, min(Double(filter.pointPixelScale), 4)), Double(max(1, maxPixelWidth)) / max(1, rect.width))
+                configuration.width = max(1, Int((rect.width * scale).rounded()))
+                configuration.height = max(1, Int((rect.height * scale).rounded()))
+                configuration.ignoreShadowsSingleWindow = true
+                configuration.showsCursor = false
+                configuration.captureResolution = .best
+                configuration.pixelFormat = kCVPixelFormatType_32BGRA
+                let image: CGImage = try await macScreenCaptureWait { request in
+                    SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, error in
+                        request.receive(image, error)
+                    }
+                }
+                return .success(MacScreenShot(bounds: MacAXFrame(
+                    x: window.frame.minX, y: window.frame.minY, w: window.frame.width, h: window.frame.height),
+                    pixelWidth: image.width, pixelHeight: image.height, cgImage: image))
+            } catch {
+                return .failure(.captureFailed)
+            }
+        }
+    }
+
     public func capture(rect: MacAXFrame?) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
         guard isScreenRecordingTrusted() else { return .failure(.screenRecordingNotTrusted) }
         let content: SCShareableContent

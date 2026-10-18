@@ -187,6 +187,9 @@ targets:
       - path: Resources/Senses
         type: folder
         buildPhase: resources
+      - path: Resources/abilities
+        type: folder
+        buildPhase: resources
       - path: docs/licenses/A2A-gRPC-NOTICES.txt
         buildPhase: resources
       - path: docs/licenses/Codex-LICENSE.txt
@@ -353,6 +356,7 @@ targets:
         NSMicrophoneUsageDescription: NativeAgent uses your microphone for voice input.
         NSSpeechRecognitionUsageDescription: NativeAgent uses speech recognition to transcribe your voice.
         NSLocalNetworkUsageDescription: NativeAgent uses the local network to connect the Mac app and trusted companion devices.
+        NSLocationUsageDescription: NativeAgent uses this Mac's location when you ask for local information such as weather.
         NSDesktopFolderUsageDescription: NativeAgent may read files from your Desktop when you request it.
         NSDocumentsFolderUsageDescription: NativeAgent may read files from your Documents folder when you request it.
         NSDownloadsFolderUsageDescription: NativeAgent may read files from your Downloads folder when you request it.

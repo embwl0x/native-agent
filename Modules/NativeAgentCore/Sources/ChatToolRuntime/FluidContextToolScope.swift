@@ -122,7 +122,6 @@ extension SwiftToolDispatcher {
         ]
         let sources = prepared.packet.selectedItems.first { $0.pointer == pointer }?.untrustedSources ?? []
         let provenance = JSONValue.object(["peer_sources": .array(sources.map(JSONValue.string))])
-        MemoryDataProvenance.consume(provenance)
         fields.merge(MemoryDataProvenance.fields(in: provenance)) { _, value in value }
         return .object(fields)
     }

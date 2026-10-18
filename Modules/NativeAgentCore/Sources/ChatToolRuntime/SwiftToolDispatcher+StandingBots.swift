@@ -469,7 +469,9 @@ extension SwiftToolDispatcher {
                 throw StandingBotsError.invalidValue("unknown bots tool")
             }
         } catch let error as BotRunAdmissionError {
-            return .object(["status": .string("unavailable"), "reason": .string(error.rawValue)])
+            return .object(["status": .string("unavailable"), "reason": .string(error.rawValue), "detail": .string(error == .paused
+                ? "This bot is paused; resume it to run it."
+                : "This bot is already running; its result lands on the shelf when it finishes.")])
         } catch let error as ToolFailureError {
             var result = ChatToolOutcome.failure(error: error, tool: tool)
             if case .object(var fields) = result {
@@ -525,7 +527,7 @@ private func botObject(_ value: JSONValue?, field: String) throws -> [String: JS
 private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field: String) throws -> T {
     var shape = type == Bool.self ? "A boolean." : type == Int.self ? "An integer." : type == String.self ? "A string."
         : type == BotBudget.self ? "An object with tokens: positive integer and seconds: positive finite number."
-        : type == BotCadence.self ? "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone?: string}. Omitted timeZone uses this Mac's current zone."
+        : type == BotCadence.self ? "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone?: string}. Omitted timeZone follows this Mac wherever it is; name one only to pin the time to a place."
         : "An object matching " + field + "."
     guard let value else { throw botArgumentError("missing " + field, field: field, accepted: shape) }
     do { return try JSONDecoder().decode(type, from: value.serializedData(pretty: false)) }
@@ -650,9 +652,9 @@ private func botCadence(_ value: JSONValue?) throws -> BotCadence {
     // the model round the retry loop with nothing to change. Dropped before
     // the count AND before the decode: the synthesized enum decoder wants a
     // single key too.
-    let shape = "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone?: string}. Omitted timeZone uses this Mac's current zone."
+    let shape = "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone?: string}. Omitted timeZone follows this Mac wherever it is; name one only to pin the time to a place."
     guard case .object(let raw) = value else { throw botArgumentError("cadence must be an object", field: "cadence", accepted: shape) }
-    var object = raw.filter { $0.value != .null }
+    let object = raw.filter { $0.value != .null }
     guard object.count == 1 else { throw botArgumentError("cadence requires exactly one of manual, interval or cron", field: "cadence", accepted: shape) }
     try botKeys(object, allowed: ["manual", "interval", "cron"], path: "$.cadence")
     if let manual = object["manual"] {
@@ -662,14 +664,11 @@ private func botCadence(_ value: JSONValue?) throws -> BotCadence {
     } else if let interval = object["interval"] {
         try botKeys(botObject(interval, field: "cadence.interval"), allowed: ["seconds"], path: "$.cadence.interval")
     } else {
-        var cron = try botObject(object["cron"], field: "cadence.cron")
-        try botKeys(cron, allowed: ["expression", "timeZone"], path: "$.cadence.cron")
-        if cron["timeZone"] == nil || cron["timeZone"] == .null || cron["timeZone"] == .string("") {
-            cron["timeZone"] = .string(TimeZone.current.identifier)
-        }
-        object["cron"] = .object(cron)
+        try botKeys(botObject(object["cron"], field: "cadence.cron"), allowed: ["expression", "timeZone"], path: "$.cadence.cron")
     }
-    return try botDecode(BotCadence.self, .object(object), field: "cadence")
+    let cadence = try botDecode(BotCadence.self, .object(object), field: "cadence")
+    guard case .cron(let expression, let zone) = cadence else { return cadence }
+    return .cron(expression: expression, timeZone: BotCadence.setZone(zone))
 }
 
 /// Both pre-approval and persistence call this adapter; cadence validity and
@@ -719,10 +718,15 @@ private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, oper
     fields["schedule"] = .string(StandingBotSchedule.describe(bot.cadence))
     fields["output_format"] = .string(bot.outputFormat ?? "")
     if case .cron(_, let zone) = bot.cadence {
-        fields["timezone"] = .string(zone)
         fields["mac_timezone"] = .string(TimeZone.current.identifier)
-        if zone != TimeZone.current.identifier {
-            fields["timezone_warning"] = .string("Schedule time zone \(zone) differs from this Mac's current zone \(TimeZone.current.identifier). Saved timing was not changed.")
+        if let zone {
+            fields["timezone"] = .string(zone)
+            if zone != TimeZone.current.identifier {
+                fields["timezone_warning"] = .string("Schedule time zone \(zone) differs from this Mac's current zone \(TimeZone.current.identifier). Saved timing was not changed.")
+            }
+        } else {
+            fields["timezone"] = .null
+            fields["timezone_detail"] = .string("Follows the Mac: \(TimeZone.current.identifier).")
         }
     }
     fields["scheduler_status"] = .string(bot.paused ? "paused" : bot.eventTrigger != nil ? "on_event" : bot.cadence == .manual ? "manual" : "scheduled")

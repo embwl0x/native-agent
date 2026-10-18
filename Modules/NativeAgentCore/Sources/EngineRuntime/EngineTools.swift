@@ -132,12 +132,12 @@ public final class ToolsFacade {
     /// Promote a proposal. The promoted record carries the registry's typed
     /// slots plus every extras key the promote engine merges in, and reads
     /// back through the same authored-field check as the list.
-    public nonisolated func promote(id: String, allowRisky: Bool, ownerAuthorized: Bool = false) async throws -> ToolRecord {
+    public nonisolated func promote(id: String, allowRisky: Bool, ownerAuthorized: Bool = false, digest: String? = nil) async throws -> ToolRecord {
         let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot) { _, _ in
             .object(["status": .string("refused"), "effects": .string("none"), "reason": .string("door_unavailable")])
         }
         let proposal = try await OwnedProgramInvocation.$host.withValue(host) {
-            try await SwiftNativeToolExecution(root: dataRoot).promote(id: id, allowRisky: allowRisky, ownerAuthorized: ownerAuthorized).toJSON()
+            try await SwiftNativeToolExecution(root: dataRoot).promote(id: id, allowRisky: allowRisky, ownerAuthorized: ownerAuthorized, digest: digest).toJSON()
         }
         if let field = ToolRecord.stringFieldProblem(in: proposal) {
             throw ToolRegistryError.registryUnreadable(reason: "promoted tool \(id) has no valid \(field)")
@@ -153,11 +153,6 @@ public final class ToolsFacade {
         let record = try await SwiftNativeToolRegistry(root: dataRoot).quarantine(id: id, reason: reason, ownerAuthorized: ownerAuthorized)
         try Self.checkAuthored(record)
         return record
-    }
-
-    /// The registry refuses `autoRun`: it has no execution consumer.
-    public nonisolated func updateTool(id: String, autoRun: Bool) async throws -> ToolRecord {
-        try await ToolRegistryActions.updateTool(id: id, autoRun: autoRun, dataRoot: dataRoot, validate: Self.checkAuthored)
     }
 
     /// Loads the catalog into `catalog`, recording a failure instead of

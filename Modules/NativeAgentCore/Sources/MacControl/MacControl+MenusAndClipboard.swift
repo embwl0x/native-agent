@@ -202,11 +202,30 @@ extension SwiftNativeMacControl {
                 durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
-        guard let requested = body.stringValue("path")?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !requested.isEmpty else {
+        // One path, written as a string or as its levels in a list (10-17: a
+        // list pressed three separate menus). A listed title is one level, so
+        // it may not itself contain a level separator.
+        let requested: String
+        if case .array(let parts)? = body["path"] {
+            var levels: [String] = []
+            for part in parts {
+                guard case .string(let text) = part else {
+                    return refuse("bad_path", "menu_press path as a list takes one menu title per entry, as text.")
+                }
+                let title = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !title.isEmpty, title.rangeOfCharacter(from: CharacterSet(charactersIn: "›»→>/|")) == nil else {
+                    return refuse("bad_path", "A listed menu title is empty or contains a level separator (› » → > / |); give each level as its own entry.")
+                }
+                levels.append(title)
+            }
+            requested = levels.joined(separator: " › ")
+        } else {
+            requested = body.stringValue("path")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        guard !requested.isEmpty else {
             return refuse(
                 "missing_path",
-                "menu_press needs `path` — the menu path to press, like \"File › Export › PDF\"."
+                "menu_press needs `path` — the menu path to press, like \"File › Export › PDF\" (a string, or its components as a list)."
             )
         }
         let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
@@ -369,8 +388,11 @@ extension SwiftNativeMacControl {
                 "opens_submenu": .bool(item.hasSubmenu),
                 // The press ran the app's handler. Whether the INTENDED
                 // consequence happened is for the next look to say, never for
-                // this result to claim.
+                // this result to claim. Said in words too: 10-17, Agent read
+                // the bare 'unverified' as a failed press and routed every
+                // menu through act instead.
                 "verified": .bool(false),
+                "note": .string("Pressed: \(app.name) ran the item's handler. What it opened or changed is for your next look to see, so this result does not claim it."),
             ]),
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000)

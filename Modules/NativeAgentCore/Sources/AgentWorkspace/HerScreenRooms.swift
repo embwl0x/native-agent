@@ -86,8 +86,11 @@ extension HerScreen {
 
     /// A TALK line: chat text as its first meaningful sentence, markdown off.
     private static func line(_ at: Date?, _ who: String, _ text: String, now: Date, talk: Bool = true) -> String {
-        pad(at.map { age(now.timeIntervalSince($0)) } ?? "", 5) + pad(clip(who, 20), 10) + clip(talk ? sentence(text) : text, 80)
+        pad(at.map { age(now.timeIntervalSince($0)) } ?? "", 5) + pad(clip(who, 20), 10) + said(text, talk: talk)
     }
+
+    /// The words a TALK line shows of this text.
+    private static func said(_ text: String, talk: Bool = true) -> String { clip(talk ? sentence(text) : text, 80) }
 
     // MARK: Helper
 
@@ -161,6 +164,10 @@ extension HerScreen {
         var talk = thread.suffix(6).map {
             line($0.at, ($0.byPerson ? person : $0.mine ? "me" : slug) + ($0.door.map { " · " + $0 } ?? ""), $0.text, now: now)
         }
+        // Replies this room shows her, by the send each answers, with the
+        // words shown: one shown exactly as saved is hers, as a wait's is.
+        var answers: [String: String] = [:]
+        for row in thread.suffix(6) where !row.mine { if let id = row.answers { answers[id] = said(row.text) } }
         if mainThread, let chat = theirs.first(where: { $0.id != scope }),
            chat.at > max(thread.last?.at ?? .distantPast, record?.exchanges?.last?.sentAt ?? .distantPast) {
             // Its newest bridge chat other than the one she is in: that one is
@@ -170,6 +177,7 @@ extension HerScreen {
             let tail = chatTail(chat.id, dataRoot: dataRoot).suffix(6)
             if tail.contains(where: { !$0.mine }) { AgentWorkspacePorts.current.tools.markConsumed(peer: chat.who) }
             talk = tail.map { line($0.at, $0.mine ? "me" : slug + " · " + route, $0.text, now: now) }
+            answers = [:]
             // Their last message in each of the next few chats too, oldest
             // first: one newer test chat must not hide the ask before it.
             for older in theirs.filter({ $0.id != scope && $0.id != chat.id }).prefix(3) {
@@ -192,7 +200,10 @@ extension HerScreen {
         for exchange in exchanges.suffix(3) {
             // Typed by the person in the contact's thread: theirs, not mine.
             if let prompt = exchange.prompt, !prompt.isEmpty { talk.append(line(exchange.sentAt, exchange.byPerson == true ? person : "me", prompt, now: now)) }
-            if let reply = exchange.reply, !reply.isEmpty { talk.append(line(nil, slug, reply, now: now)) }
+            if let reply = exchange.reply, !reply.isEmpty {
+                talk.append(line(nil, slug, reply, now: now))
+                answers[exchange.id] = said(reply)
+            }
         }
         if mainThread, talk.isEmpty, exchanges.isEmpty, contact.builtIn { talk = laneTalk(contact.id, slug: slug, now: now) }
         if talk.isEmpty, exchanges.isEmpty, let record, let reply = replyText(unwrap(record.receipt)) {
@@ -241,6 +252,7 @@ extension HerScreen {
         if listed.contains(where: { $0.id != scope }) { verbs.append(("chat.N", "open one of those chats")) }
         let kind = contact.builtIn ? "built-in agent" : contact.kind ?? "agent"
         observed?(world, now)
+        if !previewing, !answers.isEmpty { AgentWorkspacePorts.current.conversations.shown(answers: answers, peer: contact.id, scope: scope, dataRoot: dataRoot) }
         return screen([contact.name.uppercased(), kind, state] + (label.map { $0 == "Main" ? [] : ["thread " + clip($0, 30)] } ?? []),
             [section("TALK", talk), section("LAST SEND", outcome), section("CHATS", chatLines), issue.map { section("READ", [clip($0, 100)]) } ?? []], verbs: verbs)
     }

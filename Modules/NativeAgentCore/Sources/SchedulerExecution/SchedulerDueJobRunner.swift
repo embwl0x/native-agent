@@ -15,6 +15,8 @@ public actor SchedulerDueJobRunner {
         case harnessBenchmark = "harness_benchmark"
         case proactiveScan = "proactive_scan"
         case workshop
+        /// A part's `schedule:<cron>` wake: one job per part and schedule.
+        case part
     }
 
     typealias DueJob = SwiftNativeTriggerScheduler.DueJob
@@ -46,6 +48,8 @@ public actor SchedulerDueJobRunner {
     /// exited yet. A new scheduler pass must not overlap them.
     var inFlightJobBodies = 0
     var jobBodyExitWaiters: [CheckedContinuation<Void, Never>] = []
+    /// A part's schedule that does not parse, said once rather than every pass.
+    var reportedWakes: Set<String> = []
 
     public nonisolated var jobsPath: URL {
         root.appendingPathComponent("scheduler", isDirectory: true)

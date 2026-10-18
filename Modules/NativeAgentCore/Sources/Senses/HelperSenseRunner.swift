@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import CryptoKit
 import Darwin
@@ -34,7 +35,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
     private let profile: SandboxProfile
     private let limits: Limits
     private let apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?
-    private let notebooks = SenseNotebooks()
+    private let notebooks = PartNotebooks.shared
     private var live: [String: Live] = [:]
     private var onCall: [UUID: SenseHelperProcess] = [:]
     private var viewAddresses: [String: (version: Int, address: String?)] = [:]
@@ -181,7 +182,8 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
                 return await complete(.failed(SenseFailure(code: "bad_output", message: "Sense page exceeds the text ceiling; fold it and offer more.")), record: record, request: request)
             }
             if record.status == .on, !record.verbsEnabled { for i in page.things.indices { page.things[i].verbs = [] } }
-            if case .read = request, record.status == .on, let registry = SensesHub.shared.registry {
+            if case .read = request, record.status == .on, let registry = SensesHub.shared.registry,
+               (try? AbilityStore(dataRoot: dataRoot).read(id: record.id)) == nil {
                 if let managing = registry as? any SenseRegistryManaging {
                     do {
                         try await managing.recordUse(senseID: record.id, version: record.version)
@@ -211,6 +213,14 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
             let key = try await slotKey(record, source: source, address: address)
             if let existing = live[key]?.process, live[key]?.record.version == record.version {
                 process = existing
+            } else if record.mode == .live {
+                // A resident sense keeps the slot an event wakes, with its context.
+                await stopSlot(key)
+                let generation = UUID()
+                process = try makeProcess(record, key: key, generation: generation, address: address)
+                live[key] = Live(record: record, source: source, process: process, generation: generation,
+                                 failures: [], address: address, idleAt: Date().addingTimeInterval(limits.idleSeconds))
+                armIdle(key)
             } else {
                 process = try makeProcess(record, key: key, generation: UUID(), address: address)
                 onCall[token] = process
@@ -269,7 +279,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700])
         do {
-            guard let code = try registry.sourceFiles(record)[entry], code.count <= 512 * 1_024,
+            guard let code = try registry.sourceFiles(record)[entry], code.count <= AbilityStore.sourceLimit,
                   let script = String(data: code, encoding: .utf8) else {
                 throw SenseFailure(code: "bad_entry", message: "Sense source must be UTF-8 and at most 512 KiB.")
             }
@@ -394,7 +404,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
 private actor SenseHelperProcess {
     private struct Pending {
         let id: Int
-        let events: AsyncStream<JSONValue>.Continuation
+        let events: AsyncThrowingStream<JSONValue, Error>.Continuation
         let result: CheckedContinuation<SenseOutcome, Never>
         let stallWindow: TimeInterval
         var worker: Task<Void, Never>?
@@ -403,7 +413,7 @@ private actor SenseHelperProcess {
     private let dataRoot: URL
     private let script: String
     private let notebook: URL
-    private let notebooks: SenseNotebooks
+    private let notebooks: PartNotebooks
     private let scratch: URL
     private let limits: HelperSenseRunner.Limits
     private let apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?
@@ -427,7 +437,7 @@ private actor SenseHelperProcess {
     private var reader: Task<Void, Never>?
     private var idleHolds = 0
 
-    init(record: SenseRecord, dataRoot: URL, script: String, notebook: URL, notebooks: SenseNotebooks, scratch: URL, helper: URL,
+    init(record: SenseRecord, dataRoot: URL, script: String, notebook: URL, notebooks: PartNotebooks, scratch: URL, helper: URL,
          profile: String, limits: HelperSenseRunner.Limits, initialAddress: String?, apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?,
          onSettled: @escaping @Sendable () async -> Void,
          onExit: @escaping @Sendable (SenseFailure?) async -> Void) throws {
@@ -497,7 +507,7 @@ private actor SenseHelperProcess {
         let id = nextID
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                let (stream, events) = AsyncStream<JSONValue>.makeStream(bufferingPolicy: .bufferingOldest(128))
+                let (stream, events) = AsyncThrowingStream<JSONValue, Error>.makeStream(bufferingPolicy: .bufferingOldest(128))
                 pending = Pending(id: id, events: events, result: continuation,
                     stallWindow: limits.requestSeconds)
                 // Born in the requesting task, so its door calls retain that
@@ -560,7 +570,7 @@ private actor SenseHelperProcess {
                         var logBytes = 0
                         var view: SenseInteractiveView?
                         var presented = false
-                        for await message in stream {
+                        for try await message in stream {
                             try Task.checkCancellation()
                             guard case .object(let fields) = message, case .string(let type)? = fields["type"] else {
                                 throw SenseFailure(code: "bad_output", message: "Sense helper sent an invalid message.")
@@ -713,6 +723,21 @@ private actor SenseHelperProcess {
     private func finish(_ id: Int, _ outcome: SenseOutcome) {
         guard let current = pending, current.id == id else { return }
         pending = nil
+        var outcome = outcome
+        let receipt: JSONValue
+        switch outcome {
+        case .failed(let failure): receipt = .object(["status": .string("failed"), "reason": .string(failure.code), "detail": .string(failure.message)])
+        case .acted(let result, _): receipt = result == .null ? .object(["status": .string("ok")]) : result
+        case .page: receipt = .object(["status": .string("ok"), "read": .bool(true)])
+        }
+        do { try AbilityStore(dataRoot: dataRoot).recordRun(id: record.id, version: record.candidateDigest ?? String(record.version), receipt: receipt) }
+        catch {
+            if case .acted(let result, let provenance) = outcome {
+                var fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { ["result": result] }
+                fields["accounting_error"] = .string(error.localizedDescription)
+                outcome = .acted(.object(fields), provenance)
+            } else { outcome = .failed(SenseFailure(code: "accounting", message: error.localizedDescription)) }
+        }
         current.events.finish(); transport.end(id); current.worker?.cancel()
         current.result.resume(returning: outcome)
         let waiting = waiters; waiters.removeAll()
@@ -760,10 +785,7 @@ private actor SenseHelperProcess {
                         replied = true
                         if let current = pending, fields["id"] == .int(Int64(current.id)) {
                             if fields["type"] == .string("failed") {
-                                let failure = try JSONDecoder().decode(SenseFailure.self,
-                                    from: JSONEncoder().encode(fields["failure"] ?? .null))
-                                finish(current.id, .failed(failure))
-                                await terminate(failure: failure); return
+                                throw try JSONDecoder().decode(SenseFailure.self, from: JSONEncoder().encode(fields["failure"] ?? .null))
                             }
                             if case .dropped = current.events.yield(message) {
                                 throw SenseFailure(code: "output_limit", message: "Sense helper exceeded its pending message limit.")
@@ -773,21 +795,24 @@ private actor SenseHelperProcess {
                         }
                     } catch {
                         let failure = HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))
-                        if let pending { finish(pending.id, .failed(failure)) }
-                        await terminate(failure: failure); return
+                        await readerFailed(failure); return
                     }
                 case .ended(let detail):
                     let failure = SenseFailure(code: replied ? "crashed" : "spawn_failed", message: detail)
-                    if let pending { finish(pending.id, .failed(failure)) }
-                    await terminate(failure: failure); return
+                    await readerFailed(failure); return
                 }
             }
             if !stopped {
                 let failure = SenseFailure(code: "resource_limit", message: "Sense helper output ended before its process settled.")
-                if let pending { finish(pending.id, .failed(failure)) }
-                await terminate(failure: failure)
+                await readerFailed(failure)
             }
         }
+    }
+
+    private func readerFailed(_ failure: SenseFailure) async {
+        // Its requesting worker owns error attribution and settlement.
+        if let pending { pending.events.finish(throwing: failure) }
+        else { await terminate(failure: failure) }
     }
 
     private func service(_ fields: [String: JSONValue], source: any SenseSourceProvider) async throws {
@@ -1176,7 +1201,19 @@ private actor SenseHelperProcess {
 
 /// All invocations share one non-suspending read/mutate/write owner. Atomic
 /// replacement alone cannot serialize concurrent processes' notebook updates.
-private actor SenseNotebooks {
+public actor PartNotebooks {
+    public static let shared = PartNotebooks()
+
+    /// The sense notebook is also the durable state of tools and skills. It is
+    /// separate from AbilityStore's lifecycle accounting, keyed by part id.
+    public func access(dataRoot: URL, id: String, setting: Bool, value: JSONValue) throws -> JSONValue {
+        guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\") else {
+            throw SenseFailure(code: "bad_state", message: "Part notebook id is invalid.")
+        }
+        return try access(dataRoot.appendingPathComponent("senses/\(id)/state.json"),
+                          key: "part", setting: setting, value: value)
+    }
+
     func access(_ notebook: URL, key: String, setting: Bool, value: JSONValue) throws -> JSONValue {
         guard notebook.resolvingSymlinksInPath().path == notebook.standardizedFileURL.path else {
             throw SenseFailure(code: "bad_state", message: "Sense notebook cannot be a symbolic link.")

@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 @preconcurrency import EventKit
 import NativeAgentCore
@@ -33,7 +34,8 @@ public enum LocalPIMConnectorActions {
         if let calendarID, !store.calendars(for: .event).contains(where: { $0.calendarIdentifier == calendarID }) {
             return .object(["status": .string("failed"), "reason": .string("Unknown calendar_id.")])
         }
-        let events = await upcomingEventRows(window: window, calendarName: calendarName, calendarID: calendarID, limit: limit)
+        let events = await upcomingEventRows(window: window, calendarName: calendarName, calendarID: calendarID,
+            query: inputString(input["query"]) ?? "", limit: limit)
 
         var payload: [String: JSONValue] = [
             "status": .string("completed"),
@@ -65,6 +67,7 @@ public enum LocalPIMConnectorActions {
         window: CalendarListWindow,
         calendarName: String?,
         calendarID: String?,
+        query: String,
         limit: Int
     ) async -> [JSONValue] {
         await Task.detached(priority: .userInitiated) { () -> [JSONValue] in
@@ -75,6 +78,8 @@ public enum LocalPIMConnectorActions {
             }
             return LocalPIMStore.withEvents(start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ in
                 events
+                    .filter { query.isEmpty || ($0.title ?? "").localizedCaseInsensitiveContains(query)
+                        || ($0.notes ?? "").localizedCaseInsensitiveContains(query) }
                     .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
                     .prefix(limit)
                     .map { eventJSON($0) }

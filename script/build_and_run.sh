@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Say which line died: a silent exit 1 cost a debug loop (10-17).
+trap 'echo "[build_and_run.sh] FAILED line $LINENO: $BASH_COMMAND" >&2' ERR
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/provisioning_profile_contract.sh
@@ -149,6 +151,7 @@ xcodebuild -quiet \
   -destination "platform=macOS,arch=$(uname -m)" -derivedDataPath "$DERIVED_DATA" \
   -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
   ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+  DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
   NATIVEAGENT_MAC_BUNDLE_ID="$NATIVEAGENT_MAC_BUNDLE_ID" \
   NATIVEAGENT_ICLOUD_CONTAINER_ID="$NATIVEAGENT_ICLOUD_CONTAINER_ID" \
   NATIVEAGENT_MOBILE_SOURCE_KEY="$NATIVEAGENT_MOBILE_SOURCE_KEY" \

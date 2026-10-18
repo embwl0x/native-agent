@@ -10,7 +10,15 @@ final class MacSightCaptureBinding: @unchecked Sendable {
     let frameID: String
     private let lock = NSLock()
     private var validate: (@Sendable () async -> Bool)?
+    private var read: (read: MacAXRead, seam: [String: JSONValue])?
     init(frameID: String) { self.frameID = frameID }
+    /// One complete window walk and its seam, read once for every reader of
+    /// it: the look's walk for its supplemental view, and an act's post-effect
+    /// read for the look that replies to it.
+    var walked: (read: MacAXRead, seam: [String: JSONValue])? {
+        get { lock.withLock { read } }
+        set { lock.withLock { read = newValue } }
+    }
     func confirm(validate: @escaping @Sendable () async -> Bool = { true }) {
         lock.lock(); defer { lock.unlock() }
         self.validate = validate
@@ -290,6 +298,9 @@ extension MacFourVerbs {
         var editableHandles: Set<String> = []
         /// Keyboard focus may be (or is) a password field. Unknown counts as secure.
         var focusSecure: Bool = true
+        /// Other apps' windows over this one, in screen points: a hand landing
+        /// on one would reach that app, so no physical act ends or passes there.
+        var obstructions: [MacAXFrame] = []
     }
 
     /// A resolvable thing on the screen. `label` is the DISPLAY text — what the
@@ -379,8 +390,10 @@ extension MacFourVerbs {
     // private target/render compilation used by screen and act.
     /// `seek`: a name the caller is about to act on. When the ordinary walk
     /// stops short of it, the look searches deeper and frames it (`seekScoped`).
-    func sight(part: String?, app: String? = nil, seek: String? = nil) async -> Sighted {
+    func sight(part: String?, app: String? = nil, seek: String? = nil,
+               observed: (read: MacAXRead, seam: [String: JSONValue])? = nil) async -> Sighted {
         let captureBinding = MacSightCaptureBinding(frameID: UUID().uuidString)
+        captureBinding.walked = observed
         let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
         let app = continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app
         let result: MacControlResult
@@ -896,7 +909,8 @@ extension MacFourVerbs {
                     || read.map {
                         $0.secret || MacScreenViewBuilder.isSecretField(role: $0.role, subrole: $0.subrole, label: $0.label)
                     } == true
-            }()
+            }(),
+            obstructions: nativeAXSupplement?.obstructions ?? []
         ))
     }
 

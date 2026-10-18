@@ -152,17 +152,9 @@ extension MacFourVerbs {
             )
         }
 
-        var body: [String: JSONValue] = [
-            "gesture": .string(verb.rawValue),
-            "x": .double(start.x),
-            "y": .double(start.y),
-        ]
-        if verb == .drag {
-            body["travel_seconds"] = .double(seconds ?? 0)
-        } else if let seconds { body["seconds"] = .double(seconds) }
-        if let holding { body["holding"] = .string(holding) }
-        if let button { body["button"] = .string(button) }
-        var description: String
+        var end: MacPointerPosition?
+        var spokenEnd: String?
+        var excluded: [MacAXFrame] = []
         if verb == .drag {
             guard let destination, !destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return MacFourVerbsReply(ok: false, text: "Where should I drag \(spokenSource) to?")
@@ -194,47 +186,129 @@ extension MacFourVerbs {
             let exactDestinationAlias = endTarget.aliases.contains {
                 Self.normalize($0) == Self.normalize(destination)
             }
-            guard let end = Self.safeAimPoint(for: endTarget, in: endFrame,
+            guard let point = Self.safeAimPoint(for: endTarget, in: endFrame,
                 describedBy: exactDestinationAlias ? "" : destination) else {
                 return Self.obstructedPointReply(screen: before.render)
             }
-            let secureFrames = before.targets.filter(\.secret).compactMap(\.frame)
-            guard MacRegionAim.pathIsClear(from: start, to: end, excluding: secureFrames) else {
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: before.appName ?? "this window"),
-                    detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
-                )
-            }
-            guard MacRegionAim.pathIsClear(from: start, to: end,
-                excluding: source.excludedFrames + endTarget.excludedFrames) else {
-                return Self.obstructedPointReply(screen: before.render)
-            }
+            end = point
+            spokenEnd = Self.spokenName(endTarget, requestedAs: destination)
+            excluded = source.excludedFrames + endTarget.excludedFrames
+        }
+        return await performPointer(
+            verb.rawValue, at: start, to: end, saying: spokenSource, destination: spokenEnd,
+            before: before, excluding: excluded, seconds: seconds, holding: holding, button: button,
+            attention: attention, physicalOnly: source.physicalOnly,
+            pointerTarget: (verb == .hover || verb == .move) ? target : nil,
+            receipt: reobservedAfterTransientMiss ? ["dynamic_reobserved": .bool(true)] : [:]
+        )
+    }
+
+    /// The one physical tail, once both ends are screen points, for a named
+    /// act and a place on an image alike: a drag's line clear of password
+    /// fields, both ends and the line clear of anything covering the window,
+    /// then the hand, with what it did said in words.
+    func performPointer(
+        _ gesture: String, at start: MacPointerPosition, to end: MacPointerPosition?,
+        saying source: String, destination: String?, before: Sighting, excluding excluded: [MacAXFrame] = [],
+        seconds: Double?, holding: String?, button: String?, attention: BurstAttention?,
+        physicalOnly: Bool = false, pointerTarget: String? = nil, receipt: [String: JSONValue] = [:]
+    ) async -> MacFourVerbsReply {
+        if let end, !MacRegionAim.pathIsClear(from: start, to: end, excluding: before.targets.filter(\.secret).compactMap(\.frame)) {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: before.appName ?? "this window"),
+                detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
+            )
+        }
+        guard MacRegionAim.pathIsClear(from: start, to: end ?? start, excluding: excluded + before.obstructions) else {
+            return Self.obstructedPointReply(screen: before.render)
+        }
+        var body: [String: JSONValue] = [
+            "gesture": .string(gesture),
+            "x": .double(start.x),
+            "y": .double(start.y),
+        ]
+        if let end {
             body["to_x"] = .double(end.x)
             body["to_y"] = .double(end.y)
-            description = "\(button == "right" ? "Right-dragged" : "Dragged") \(spokenSource) to \(Self.spokenName(endTarget, requestedAs: destination))."
-        } else {
-            switch verb {
-            case .hover: description = "Hovered over \(spokenSource)."
-            case .hold: description = button == "right" ? "Held the right button on \(spokenSource)." : "Held \(spokenSource)."
-            case .move: description = "Moved to \(spokenSource)."
-            case .doubleClick: description = (button == "right" ? "Double-right-clicked " : "Double-clicked ") + spokenSource + "."
-            case .drag, .key: description = "Used \(spokenSource)."
-            }
+        }
+        if gesture == PhysicalVerb.drag.rawValue {
+            body["travel_seconds"] = .double(seconds ?? 0)
+        } else if let seconds { body["seconds"] = .double(seconds) }
+        if let holding { body["holding"] = .string(holding) }
+        if let button { body["button"] = .string(button) }
+        let right = button == "right"
+        let description = switch gesture {
+        case "drag": "\(right ? "Right-dragged" : "Dragged") \(source) to \(destination ?? "there")."
+        case "hover": "Hovered over \(source)."
+        case "hold": right ? "Held the right button on \(source)." : "Held \(source)."
+        case "move": "Moved to \(source)."
+        case "double_click": (right ? "Double-right-clicked " : "Double-clicked ") + source + "."
+        case "click": (right ? "Right-clicked " : "Clicked ") + source + "."
+        default: "Used \(source)."
         }
         let reply = await performHand(
             body: body,
             description: description,
             attention: attention,
             before: before,
-            allowGenericScreenChangeVerification: !source.physicalOnly,
-            afterPart: source.physicalOnly ? "visual surface" : nil,
-            pointerTarget: (verb == .hover || verb == .move) ? target : nil
+            allowGenericScreenChangeVerification: !physicalOnly,
+            afterPart: physicalOnly ? "visual surface" : nil,
+            pointerTarget: pointerTarget
         )
-        var detail = reply.detail
-        if reobservedAfterTransientMiss { detail["dynamic_reobserved"] = .bool(true) }
+        var detail = reply.detail.merging(receipt) { _, new in new }
         if let button { detail["button"] = .string(button) }
         return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
+    }
+
+    /// A place on an image she was handed: the image's own frame turns its
+    /// pixels into screen points, which must lie in the window in front; then
+    /// the same physical tail as a named act. The receipt names the image and
+    /// the screen points used.
+    func performAtPlace(
+        _ place: MacImagePlace, verb: String, seconds: Double?, holding: String?, button: String?,
+        before carried: Sighting?, attention: BurstAttention?
+    ) async -> MacFourVerbsReply {
+        func refused(_ words: String, _ error: String, screen: String? = nil) -> MacFourVerbsReply {
+            MacFourVerbsReply(ok: false, text: words + " Nothing was sent." + (screen.map { "\n" + $0 } ?? ""),
+                              detail: ["error": .string(error)])
+        }
+        guard verb == "click" || PhysicalVerb(rawValue: verb).map({ $0 != .key }) == true,
+              (place.to != nil) == (verb == PhysicalVerb.drag.rawValue) else {
+            return refused("A point takes click, double_click, right_click, hover, hold or move with at:{x,y}, or drag with from:{x,y} and to:{x,y}.",
+                           "invalid_point_act")
+        }
+        guard let frame = MacImageFrames.frame(place.image) else {
+            return refused(place.image.map { "I don't hold image \($0) (only this session's last few are kept); look again with screen pixels and point into that." }
+                ?? "No image has been handed to me in this session yet; take screen with pixels:true first and point into it.", "unknown_image")
+        }
+        let geometry = frame.geometry
+        guard let start = geometry.screenPoint(imageX: place.at.x, imageY: place.at.y),
+              place.to.map({ geometry.screenPoint(imageX: $0.x, imageY: $0.y) != nil }) != false else {
+            return refused("That point is outside image \(frame.id), which is \(geometry.pixelWidth)×\(geometry.pixelHeight) px.", "point_outside_image")
+        }
+        let end = place.to.flatMap { geometry.screenPoint(imageX: $0.x, imageY: $0.y) }
+        func spoken(_ point: MacPointerPosition) -> String { "screen point (\(Int(point.x.rounded())), \(Int(point.y.rounded())))" }
+        let before: Sighting
+        if let carried { before = carried } else {
+            switch await sight(part: nil) {
+            case .blind(let reply): return reply
+            case .seen(let seen): before = seen
+            }
+        }
+        guard let window = before.windowFrame ?? before.visibleFrame else {
+            return refused("I can't tell where the window in front is, so I won't point into it.", "front_window_unknown", screen: before.render)
+        }
+        guard start.isInside(window), end?.isInside(window) != false else {
+            return refused("That lands at \(spoken(start))\(end.map { " to " + spoken($0) } ?? ""), outside the window in front (\(before.appName ?? "unknown")), where I haven't looked.",
+                           "point_outside_front_window", screen: before.render)
+        }
+        var receipt: [String: JSONValue] = ["image": .string(frame.id), "screen_point": start.json]
+        receipt["screen_to"] = end?.json
+        return await performPointer(
+            verb, at: start, to: end, saying: spoken(start) + " of " + frame.id, destination: end.map(spoken),
+            before: before, seconds: seconds, holding: holding, button: button, attention: attention, receipt: receipt
+        )
     }
 
     // MARK: - fable51 item 32b — the two-anchor drag

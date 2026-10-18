@@ -108,6 +108,7 @@ public enum ProviderStreamGuard {
         providerLabel: String,
         isOutput: @escaping @Sendable (Element) -> Bool
     ) -> AsyncThrowingStream<Element, Error> {
+        let activity = ProviderStreamContext.activity
         return AsyncThrowingStream { continuation in
             let state = ProviderStreamGuardState(startedAt: monotonicNow())
             let producer = Task {
@@ -116,6 +117,7 @@ public enum ProviderStreamGuard {
                     try await ProviderStreamContext.$stallOnly.withValue(config.wallTimeout == 0) {
                     try await ProviderStreamContext.$activity.withValue({
                         _ = state.markProviderActivity(monotonicNow())
+                        activity?()
                     }) {
                     try await ProviderStreamContext.$admitted.withValue({ state.markAdmitted() }) {
                     // Idle time begins only when the producer has actually

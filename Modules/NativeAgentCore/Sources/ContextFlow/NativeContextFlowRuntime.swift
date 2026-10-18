@@ -743,11 +743,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         }
     }
 
-    public func prewarm(kind: ContextPrewarmHintKind, id: String, terms: [String]) async {
-        guard let coordinator else { return }
-        _ = await coordinator.submitPrewarm(kind: kind, id: id, terms: terms)
-    }
-
     private func installMemoryPressureSource() {
         memoryPressureObserver?.start { [weak self] pressure in
             await self?.applyObservedMemoryPressure(pressure)

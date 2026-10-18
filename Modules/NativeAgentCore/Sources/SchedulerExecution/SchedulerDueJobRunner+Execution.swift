@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import AttentionRouting
 import DreamREMCycle
@@ -54,6 +55,12 @@ extension SchedulerDueJobRunner {
                 detail: "proactive scan surfaced \(scan.itemIds.count) opportunity card(s)",
                 output: scan.output
             )
+        case .part:
+            // The deadline only fires the signal; the run is the stem's, on its own gate chain.
+            // Fires that land while the part's run still waits are one news.
+            let part = string(job.payload["part"]) ?? "", signal = string(job.payload["signal"]) ?? ""
+            AbilityStore(dataRoot: root).signal(signal, part: part)
+            return JobResult(status: "completed", detail: "\(signal) delivered to \(part)", output: .object(["part": .string(part)]))
         case .workshop:
             let title = string(job.payload["title"]) ?? job.name
             let objective = string(job.payload["objective"]) ?? ""

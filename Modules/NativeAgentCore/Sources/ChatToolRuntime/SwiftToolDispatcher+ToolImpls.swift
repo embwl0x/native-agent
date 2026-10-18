@@ -117,23 +117,23 @@ extension SwiftToolDispatcher {
         return input
     }
 
-    func impl_list_dir(input: [String: JSONValue]) async throws -> JSONValue {
+    func impl_file_metadata(tool: String, input: [String: JSONValue]) async throws -> JSONValue {
         let path = try requireString(input, "path")
-        let url = try await resolveTrustedFilePath(path)
-        try requireNonSensitiveReadPath(url, tool: "list_dir")
+        let url = try await resolveTrustedFilePath(path, followFinalLink: tool != "file_info")
+        try requireNonSensitiveReadPath(url, tool: tool)
         var patchedInput = input
         patchedInput["path"] = .string(url.path)
         // The path has already passed the ordinary read-root and sensitive
         // fences. Share the bounded listing implementation without invoking
         // the Full Mac-only connector route or widening the approved roots.
         let ctx = ConnectorActionContext(
-            repoRoot: url.path,
+            repoRoot: tool == "file_info" ? url.deletingLastPathComponent().path : url.path,
             dataRoot: dataRoot.path
         )
         guard let result = LocalConnectorActions.fileSystemDefault.run(
-            "list_dir", input: patchedInput, ctx: ctx
+            tool, input: patchedInput, ctx: ctx
         ) else {
-            throw AutonomyGateError.toolDenied(reason: "list_dir has no Swift local connector implementation")
+            throw AutonomyGateError.toolDenied(reason: "\(tool) has no Swift local connector implementation")
         }
         // Repo-relative paths and absolute paths have intentionally different
         // trust resolution. Continue with the spelling that passed the gate;
@@ -149,14 +149,14 @@ extension SwiftToolDispatcher {
     /// Preview checks through the file reader's own fences and parser. No sense
     /// growth, image delivery, dispatch ledger, provider, command or write runs.
     func fileReadPreviewRefusal(tool: String, input: [String: JSONValue], surface: String) async -> JSONValue? {
-        guard ["read_file", "list_dir", "file_excerpt"].contains(tool) else { return nil }
+        guard ["read_file", "list_dir", "file_info", "file_excerpt"].contains(tool) else { return nil }
         let input = tool == "list_dir" ? Self.listDirInput(input) : input
         do {
             let result = try await FileReadSourceMaterial.$metadataOnly.withValue(true) {
                 if await self.fullMacToolAccess(surface: surface).fileOpsAllowed || tool == "file_excerpt" {
                     return try await self.impl_local_connector_tool(tool: tool, input: input, surface: surface)
                 }
-                return tool == "read_file" ? try await self.impl_read_file(input: input) : try await self.impl_list_dir(input: input)
+                return tool == "read_file" ? try await self.impl_read_file(input: input) : try await self.impl_file_metadata(tool: tool, input: input)
             }
             return ChatToolOutcome.outputLooksSuccessful(result) ? nil : ChatToolOutcome.normalizedFailure(result, tool: tool)
         } catch {

@@ -41,7 +41,7 @@ extension AppToolExecutor {
         }
         let source = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Google/Chrome/Default/History")
-        let origin = AppChatToolDispatcher.securityOrigin(input: input, surface: surface)
+        let origin = AppChatToolDispatcher.securityOrigin(surface: surface)
         let envelope = await securityCenter.evaluateTool(tool: "read_file", input: ["path": .string(source.path)],
             origin: origin, enforceAutonomy: enforceAutonomySecurity)
         try await securityCenter.record(envelope)
@@ -174,7 +174,7 @@ extension AppToolExecutor {
         // The browser's own back/forward chords are history, not page keys.
         if actionId == "browser.chrome_keypress",
            let history = ["Meta+[": "back", "BrowserBack": "back", "Meta+]": "forward", "BrowserForward": "forward"][Self.inputString(input["key"]) ?? ""],
-           await chromeFollowUpAllowed("browser.chrome_navigate", input: input, surface: surface) {
+           await chromeFollowUpAllowed("browser.chrome_navigate", surface: surface) {
             var go: [String: JSONValue] = ["url": .string(history)]
             for key in ["tab_id", "dryRun", "dry_run", "expected_user_sequence"] { go[key] = input[key] }
             return try await runBrowserTool(actionId: "browser.chrome_navigate", input: go, surface: surface)
@@ -184,7 +184,7 @@ extension AppToolExecutor {
         if actionId == "browser.chrome_keypress", (Self.inputString(input["node_id"]) ?? "").isEmpty {
             let key = Self.inputString(input["key"]) ?? ""
             let steps: [String: Int] = ["PageDown": 1_200, "Space": 1_200, " ": 1_200, "PageUp": -1_200, "ArrowDown": 120, "ArrowUp": -120]
-            guard let delta = steps[key], await chromeFollowUpAllowed("browser.chrome_scroll", input: input, surface: surface) else {
+            guard let delta = steps[key], await chromeFollowUpAllowed("browser.chrome_scroll", surface: surface) else {
                 return .object(["ok": .bool(false), "error": .string("key_needs_row"),
                     "reason": .string("A key is pressed in a row: add node_id (its number or label, like the search box). "
                         + "To move down the page, call browser.chrome_scroll{delta_y: 1200}. Nothing was sent.")])
@@ -193,7 +193,7 @@ extension AppToolExecutor {
             for key in ["tab_id", "dryRun", "dry_run", "expected_user_sequence"] { scroll[key] = input[key] }
             return try await runBrowserTool(actionId: "browser.chrome_scroll", input: scroll, surface: surface)
         }
-        let origin = AppChatToolDispatcher.securityOrigin(input: input, surface: surface)
+        let origin = AppChatToolDispatcher.securityOrigin(surface: surface)
         func run(_ id: String, _ input: [String: JSONValue]) async throws -> JSONValue {
             let result = try await ChromeControlInvocationContext.$origin.withValue(origin) {
                 try await ChromeControlInvocationContext.$tool.withValue(id) {
@@ -334,12 +334,12 @@ extension AppToolExecutor {
         scrollCursor: JSONValue? = nil,
         run: (String, [String: JSONValue]) async throws -> JSONValue
     ) async -> String {
-        guard await chromeFollowUpAllowed("browser.chrome_snapshot", input: input, surface: surface) else {
+        guard await chromeFollowUpAllowed("browser.chrome_snapshot", surface: surface) else {
             return "No page attached: reading the page needs your approval here. Call browser.chrome_snapshot."
         }
         var settled = false
         if Self.chromeMayNavigate.contains(actionId),
-           await chromeFollowUpAllowed("browser.chrome_wait", input: input, surface: surface) {
+           await chromeFollowUpAllowed("browser.chrome_wait", surface: surface) {
             // Twice at most: a quiet window can close before a slow load starts.
             for _ in 0..<2 {
                 let waited = try? await run("browser.chrome_wait", [
@@ -467,9 +467,9 @@ extension AppToolExecutor {
 
     /// A read the app makes on her behalf clears the same Trust gate her own
     /// call would; anything that would ask or is blocked is simply not made.
-    public func chromeFollowUpAllowed(_ tool: String, input: [String: JSONValue], surface: String, enforceAutonomy: Bool? = nil) async -> Bool {
+    public func chromeFollowUpAllowed(_ tool: String, surface: String, enforceAutonomy: Bool? = nil) async -> Bool {
         let envelope = await securityCenter.evaluateTool(
-            tool: tool, input: [:], origin: AppChatToolDispatcher.securityOrigin(input: input, surface: surface),
+            tool: tool, input: [:], origin: AppChatToolDispatcher.securityOrigin(surface: surface),
             enforceAutonomy: enforceAutonomy ?? enforceAutonomySecurity)
         try? await securityCenter.record(envelope)
         if enforceAutonomy == true,

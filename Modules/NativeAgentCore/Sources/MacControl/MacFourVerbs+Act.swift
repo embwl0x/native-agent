@@ -54,7 +54,9 @@ extension MacFourVerbs {
         front: Bool = false,
         /// Her-screen Phase 5 — a short ordered batch, run in ONE call. When
         /// given, `verb`/`target` are ignored.
-        steps: [MacActStep] = []
+        steps: [MacActStep] = [],
+        /// A place on an image instead of a target name.
+        place: MacImagePlace? = nil
     ) async -> MacFourVerbsReply {
         if steps.isEmpty, Self.parseVerb(rawVerb).0 == "key",
            (try? MacKeySyntax.parseChords(Self.keySpec(target) ?? target)) == nil,
@@ -75,7 +77,7 @@ extension MacFourVerbs {
                     await act(verb: rawVerb, target: target, text: text, mode: mode,
                               to: destination, toApp: destinationApp, seconds: seconds,
                               repeat: requestedRepeat, interval: interval, holding: holding,
-                              button: button, scrollAmount: scrollAmount, app: app, front: front, steps: steps)
+                              button: button, scrollAmount: scrollAmount, app: app, front: front, steps: steps, place: place)
                 }
             } onCancel: { binding.cancel() }
         }
@@ -108,7 +110,7 @@ extension MacFourVerbs {
                 return await self.actCore(
                     verb: rawVerb, target: target, text: text, mode: mode, to: destination, toApp: destinationApp,
                     seconds: seconds, repeat: requestedRepeat, interval: interval, holding: holding,
-                    button: button, scrollAmount: scrollAmount, app: anchorApp, expect: expect
+                    button: button, scrollAmount: scrollAmount, app: anchorApp, expect: expect, place: place
                 )
             }
         }
@@ -371,10 +373,16 @@ extension MacFourVerbs {
         button: String?,
         scrollAmount: Int?,
         app: String?,
-        expect: FrontExpectation?
+        expect: FrontExpectation?,
+        place: MacImagePlace?
     ) async -> MacFourVerbsReply {
         let requestedInput = requestedRepeat ?? 1
         let requested = max(1, requestedInput)
+        if place != nil, requested > 1 {
+            return MacFourVerbsReply(ok: false,
+                text: "A point can't be found again between attempts, so repeat doesn't apply to it. Nothing was sent.",
+                detail: ["error": .string("repeat_with_point")])
+        }
         let accepted = min(requested, Self.maximumActRepeats)
         let pause = max(0, min(interval ?? 0, Self.maximumActIntervalSeconds))
         let perAttemptBudget = max(0, min(seconds ?? 0, 10)) + pause
@@ -398,7 +406,8 @@ extension MacFourVerbs {
                 attention: nil,
                 app: app,
                 expect: expected,
-                retrySighting: capture
+                retrySighting: capture,
+                place: place
             ) }
             let first = await attempt(expect, capture: observed)
             let error = Self.string(first.detail["error"])
@@ -627,7 +636,9 @@ extension MacFourVerbs {
         /// A batch's next step presses return or enter on what this one types.
         commitFollows: Bool = false,
         /// One-call recovery pins its second attempt to this first sighting.
-        retrySighting: SightCarry? = nil
+        retrySighting: SightCarry? = nil,
+        /// A place on an image instead of a name: the hand goes there.
+        place: MacImagePlace? = nil
     ) async -> MacFourVerbsReply {
         // "right_click" / "secondary_click" is a click with the right button.
         let rawButton = Self.isRightClick(rawVerb) ? "right" : rawButton
@@ -672,7 +683,7 @@ extension MacFourVerbs {
             )
         }
         if app != nil {
-            if PhysicalVerb(rawValue: verbName) != nil {
+            if PhysicalVerb(rawValue: verbName) != nil || place != nil {
                 return needsFront("\(verbName) moves the real pointer or keyboard, which only reaches the app in front")
             }
             if holding != nil || rawButton.map({ ["left", "right"].contains($0.lowercased()) }) == true {
@@ -687,6 +698,11 @@ extension MacFourVerbs {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .flatMap { $0.isEmpty ? nil : $0 }
         if let namedDestinationApp {
+            guard place == nil else {
+                return MacFourVerbsReply(ok: false,
+                    text: "A point is in the window in front, so to_app doesn't apply to it. Nothing was sent.",
+                    detail: ["error": .string("to_app_with_point")])
+            }
             guard verbName == PhysicalVerb.drag.rawValue else {
                 return MacFourVerbsReply(
                     ok: false,
@@ -722,6 +738,13 @@ extension MacFourVerbs {
                     detail: ["error": .string("invalid_mouse_button_action")]
                 )
             }
+        }
+        if let place {
+            let reply = await Self.$requiredFrontPid.withValue(expect?.pid) {
+                await performAtPlace(place, verb: verbName, seconds: seconds, holding: holding, button: button,
+                                     before: carry?.take(), attention: attention)
+            }
+            return Self.frontChangedWords(reply, verbName: verbName)
         }
         let direction: ScrollDirection = {
             guard verbName == MacActVerb.scroll.rawValue else { return parsedDirection }
@@ -1148,8 +1171,12 @@ extension MacFourVerbs {
             Self.addAttention(attention, to: &body)
 
             let result: MacControlResult
+            // The action owner's post-effect read, carried to the reply look.
+            let postRead = MacSightCaptureBinding(frameID: UUID().uuidString)
             do {
-                result = try await host.dispatch(action: "act", body: body)
+                result = try await MacSightCaptureBinding.$current.withValue(postRead) {
+                    try await host.dispatch(action: "act", body: body)
+                }
             } catch {
                 return MacFourVerbsReply(
                     ok: false,
@@ -1167,7 +1194,7 @@ extension MacFourVerbs {
                 let mechanism = Self.plainWords(
                     Self.string(output["guidance"]) ?? Self.string(output["message"])
                 ) ?? Self.refusalWords(result.error ?? "unknown")
-                let after = await sight(part: nil, app: app)
+                let after = await sight(part: nil, app: app, observed: postRead.walked)
                 if result.error == "needs_front" {
                     var screen: String?
                     if case .seen(let hit) = after { screen = hit.render }
@@ -1233,7 +1260,7 @@ extension MacFourVerbs {
             }
 
             var effect = Self.effectWords(output: output, verb: verb, typed: text)
-            let after = await sight(part: nil, app: app)
+            let after = await sight(part: nil, app: app, observed: postRead.walked)
             if case .seen(let hit) = after { carry?.last = hit }
             let stayedInApp: Bool = {
                 guard case .seen(let hit) = after else { return false }
@@ -1762,7 +1789,8 @@ extension MacFourVerbs {
             // "OK?" — an optional step (a confirm that only sometimes appears):
             // skipped, not failed, when nothing answers to it.
             let optional = asked.target.hasSuffix("?") && asked.target.count > 1
-            let step = optional ? MacActStep(verb: asked.verb, target: String(asked.target.dropLast()), text: asked.text, mode: asked.mode) : asked
+            let step = optional ? MacActStep(verb: asked.verb, target: String(asked.target.dropLast()), text: asked.text,
+                                             mode: asked.mode, to: asked.to, place: asked.place) : asked
             // After step 1 the app's own sheet or dialog (a save sheet) may be
             // what's in front: the same process is still required, not the
             // same window rect.
@@ -1774,9 +1802,9 @@ extension MacFourVerbs {
             let typedBefore = ["key", "press"].contains(Self.parseVerb(step.verb).0) ? previousTyped : nil
             var reply = await Self.$typedJustBefore.withValue(typedBefore) {
                 await actOnce(
-                    verb: step.verb, target: step.target, text: step.text, mode: step.mode, to: nil, toApp: nil,
+                    verb: step.verb, target: step.target, text: step.text, mode: step.mode, to: step.to, toApp: nil,
                     seconds: nil, holding: nil, button: nil, scrollAmount: nil, attention: nil,
-                    app: app, expect: stepExpect, carry: carry, commitFollows: commitFollows
+                    app: app, expect: stepExpect, carry: carry, commitFollows: commitFollows, place: step.place
                 )
             }
             // A step may name what the previous one is still bringing up (a
@@ -1798,9 +1826,9 @@ extension MacFourVerbs {
                 await clock.sleep(seconds: 0.4)
                 reply = await Self.$typedJustBefore.withValue(typedBefore) {
                     await actOnce(
-                        verb: step.verb, target: step.target, text: step.text, mode: step.mode, to: nil, toApp: nil,
+                        verb: step.verb, target: step.target, text: step.text, mode: step.mode, to: step.to, toApp: nil,
                         seconds: nil, holding: nil, button: nil, scrollAmount: nil, attention: nil,
-                        app: app, expect: stepExpect, carry: carry, commitFollows: commitFollows
+                        app: app, expect: stepExpect, carry: carry, commitFollows: commitFollows, place: step.place
                     )
                 }
             }

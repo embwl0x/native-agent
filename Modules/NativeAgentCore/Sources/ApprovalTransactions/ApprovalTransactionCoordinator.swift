@@ -510,11 +510,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
     /// Returns how many resolved approvals it re-ran: production kinds, chat
     /// tools and connector actions.
     @discardableResult
-    public func reconcileUnappliedApprovalExecutions() async -> Int {
-        let dataRoot = PersistenceCore.defaultDataRoot()
-        let records = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot)
+    public func reconcileUnappliedApprovalExecutions(
+        dataRoot: URL, records: [ApprovalRecord]
+    ) async -> Int {
         let executed = await Self.reconcileUnappliedApprovalExecutions(
-            dataRoot: dataRoot,
             kinds: productionApprovalReconcileKinds(), records: records)
         let chatTools = await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot, records: records)
         let connectors = await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot, records: records)
@@ -543,9 +542,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
     // an old pending card resolved tomorrow must still cross the cursor.
     // Failed effects/receipts retain explicit retries; they cannot pin history.
     public static func resolvedApprovalsForReconciliation(
-        dataRoot: URL, records: [ApprovalRecord]? = nil
+        dataRoot: URL
     ) async -> [ApprovalRecord] {
-        if let records { return records }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         do {
             try await TelegramPollLoop.importLegacyApprovalContinuations(dataRoot: dataRoot, inbox: inbox)
@@ -619,19 +617,15 @@ public struct ApprovalTransactionCoordinator: Sendable {
         }
     }
 
-    /// Scan core, split out so tests can run it against a fixture root with
-    /// recording executors (the production executors are hardwired to the
-    /// default data root).
+    /// Execute the checked batch in executor order.
     @discardableResult
     public static func reconcileUnappliedApprovalExecutions(
-        dataRoot: URL,
         kinds: [ApprovalExecutionReconcileKind],
-        records: [ApprovalRecord]? = nil
+        records: [ApprovalRecord]
     ) async -> Int {
-        let resolved = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
         var executed = 0
         for kind in kinds {
-            for rec in resolved where rec.executedAction == nil
+            for rec in records where rec.executedAction == nil
                 && ExecutionEventVocabulary.matches(rec.action, kind.action) {
                 guard kind.shouldReconcile(rec) else { continue }
                 nativeLog("[approvalReconcile] reconciling unexecuted resolved \(kind.action) "
@@ -840,8 +834,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
 
     @discardableResult
     public func reconcileUnappliedChatToolApprovalExecutions(
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
-        records: [ApprovalRecord]? = nil,
+        dataRoot: URL,
+        records: [ApprovalRecord],
         continuation: ChatApprovalContinuation? = nil
     ) async -> (executed: Int, failures: Set<String>) {
         let continuation: ChatApprovalContinuation = continuation ?? { root, session, envelope, prompt in
@@ -850,8 +844,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         var failures: Set<String> = []
         var executed = 0
-        let resolved = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
-        for rec in resolved where Self.chatToolApprovalReplay(from: rec) != nil {
+        for rec in records where Self.chatToolApprovalReplay(from: rec) != nil {
             if Self.chatToolApprovalReplayNeedsExecution(rec) {
                 nativeLog("[approvalReconcile] reconciling eligible resolved chat tool approval "
                     + "\(rec.id) action=\(rec.action) decision=\(rec.decision ?? "?")")
@@ -876,13 +869,12 @@ public struct ApprovalTransactionCoordinator: Sendable {
 
     @discardableResult
     public func reconcileUnappliedConnectorActionApprovals(
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
-        records: [ApprovalRecord]? = nil
+        dataRoot: URL,
+        records: [ApprovalRecord]
     ) async -> Int {
-        let resolved = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
         let client = self
         var executed = 0
-        for record in resolved
+        for record in records
         where record.action.hasPrefix("connector.action.") && record.executedAction == nil {
             _ = await client.applyResolvedConnectorAction(from: record, dataRoot: dataRoot)
             executed += 1
@@ -1156,17 +1148,11 @@ public struct ApprovalTransactionCoordinator: Sendable {
             let tools = effects.toolDispatchClient(
                 enforceAppAutonomy: false
             )
-            let trust = SingleApprovedToolAutonomyResolver(
-                dataRoot: dataRoot,
-                approvedTool: replay.toolName,
-                approvedSurface: replay.surface
-            )
             let gated = makeGatedToolDispatchClient(
                 tools: tools,
                 fileAccess: isBuiltInBridge ? "read_only" : "auto",
                 approvalFiler: nil,
                 dataRoot: dataRoot,
-                trust: trust,
                 verifiedSessionId: replay.sessionId,
                 approvedReplay: ApprovedChatToolReplay(
                     approvalID: rec.id,
@@ -1195,14 +1181,21 @@ public struct ApprovalTransactionCoordinator: Sendable {
                                 try await ChatToolSessionContext
                                     .$verifiedSessionId.withValue(replay.sessionId) {
                                         let send: @Sendable () async throws -> JSONValue = {
-                                            try await gated.dispatch(tool: replay.toolName, input: replay.input, surface: replay.surface)
+                                            if let context = await ApprovalLifecycleBus.shared.hostContext(rec) {
+                                                return try await context {
+                                                    try await gated.dispatch(tool: replay.toolName, input: replay.input, surface: replay.surface)
+                                                }
+                                            }
+                                            return try await gated.dispatch(tool: replay.toolName, input: replay.input, surface: replay.surface)
                                         }
                                         if replay.toolName == "agent_message" {
+                                            // The waiting call still owns its conversation exchange.
+                                            let hostReply = await ApprovalLifecycleBus.shared.awaitsHostReply(rec)
                                             let exactProtocol = if case .object(let payload) = rec.payload {
                                                 payload["agentExactProtocol"] == .bool(true)
                                             } else { false }
                                             return try await AgentConversationApproval.replay(id: rec.id, dataRoot: dataRoot,
-                                                exactProtocol: exactProtocol, dispatch: { tool, input in
+                                                exactProtocol: exactProtocol || hostReply, dispatch: { tool, input in
                                                     try await gated.dispatch(tool: tool, input: input, surface: replay.surface)
                                                 }, perform: send)
                                         }
@@ -1223,9 +1216,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
             let receipt = Self.chatToolApprovalExecutionReceipt(
                 toolName: replay.toolName, surface: replay.surface, result: result)
             try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                rec.id,
-                executedAction: receipt.action,
-                detail: "\(replay.toolName) executed after approval: \(receipt.preview)")
+                rec.id, executedAction: receipt.action,
+                detail: "\(replay.toolName) executed after approval: \(receipt.preview)", result: result)
             if let refreshed = try? await SwiftNativeApprovalInbox(root: dataRoot).get(rec.id) {
                 await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot, continuation: continuation)
             }
@@ -1278,6 +1270,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
               let executedAction = rec.executedAction,
               let safeSessionID = NativeAgentChatSessionID.normalizedPathComponent(replay.sessionId)
         else { return true }
+
+        if case .object(let state)? = rec.chatContinuation, state["settlement"] == .string("host_reply") { return true }
 
         // Page-owned ephemeral requests retain their result on the approval
         // itself. There is no conversation to append to or wake with an LLM.
@@ -1447,8 +1441,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
     /// under the steer the card and its queued steps carried: the caller binds
     /// it as `PeerDataTaint.current`, and the host turn keeps it.
     public func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String) async throws {
-        let fileAccess = ChatToolSessionContext.fileAccess
-            ?? UserDefaults.standard.string(forKey: "chatFileAccess") ?? "read_only"
+        // With no turn's own, the chat applies the saved choice itself.
+        let fileAccess = ChatToolSessionContext.fileAccess ?? "auto"
         try await effects.continueChatToolApproval(
             dataRoot: dataRoot, sessionID: sessionID, envelope: envelope, prompt: prompt, fileAccess: fileAccess)
     }
@@ -1903,35 +1897,5 @@ public struct ApprovalTransactionCoordinator: Sendable {
         }
         // The record as the executor left it, execution annotations included.
         return (try? await inbox.get(rec.id)) ?? rec
-    }
-}
-
-private struct SingleApprovedToolAutonomyResolver: AutonomyResolver {
-    let delegate: SwiftNativeTrustCenter
-    let approvedTool: String
-    let approvedSurface: String
-
-    init(dataRoot: URL, approvedTool: String, approvedSurface: String) {
-        self.delegate = SwiftNativeTrustCenter(dataRoot: dataRoot)
-        self.approvedTool = approvedTool
-        self.approvedSurface = approvedSurface
-    }
-
-    func autonomyLevel(forTool toolName: String, surface: String) async throws -> String {
-        // A saved approval cannot override a later Trust revocation.
-        let currentLevel = try await delegate.autonomyLevel(forTool: toolName, surface: surface)
-        if currentLevel == "blocked" || currentLevel == "deny" {
-            return currentLevel
-        }
-        // 2026-09-06: `approvedTool` is the PERSISTED spelling (`save.skill`),
-        // and the gated chain canonicalizes before this resolver is consulted,
-        // so a pre-upgrade dotted approval no longer recognized its own tool.
-        // Compare canonical names on both sides.
-        if CanonicalToolNameDispatcher.canonical(toolName)
-            == CanonicalToolNameDispatcher.canonical(approvedTool),
-           surface == approvedSurface {
-            return "auto"
-        }
-        return currentLevel
     }
 }

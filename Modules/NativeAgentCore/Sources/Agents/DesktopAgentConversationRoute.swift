@@ -158,10 +158,10 @@ public actor DesktopAgentConversationRoute {
     }
 }
 
-/// Request-scoped scope and evidence fence. All surviving actions still enter
-/// the app's existing file, Trust and Mac Control gates. No shell or other-agent
-/// tools can escape this transport, even if page content asks for them.
-actor DesktopConversationTools: ToolDispatchClient {
+/// Request-scoped evidence fence over the transport's own verbs (screen, go,
+/// read, its result pages and act); every call still enters the app's file,
+/// Trust and Mac Control gates, and any other tool is hers here as anywhere.
+package actor DesktopConversationTools: ToolDispatchClient {
     let inner: any ToolDispatchClient
     let bundle: String
     let label: String
@@ -181,25 +181,24 @@ actor DesktopConversationTools: ToolDispatchClient {
     /// Where the route is and the last thing that went wrong, for a stop to name.
     private var stage = "opening the app"
     private var problem = ""
-    static let allowed: Set<String> = ["screen", "go", "act", "read", "tool_result_page"]
 
-    init(inner: any ToolDispatchClient, bundle: String, label: String, message: String,
+    package init(inner: any ToolDispatchClient, bundle: String, label: String, message: String,
          frontmostBundle: @escaping @Sendable () async -> String? = {
              await MainActor.run { NSWorkspace.shared.frontmostApplication?.bundleIdentifier }
          }) {
         self.inner = inner; self.bundle = bundle; self.label = label; self.message = message
         self.frontmostBundle = frontmostBundle
     }
-    func listAvailableTools() async throws -> [String] {
-        try await inner.listAvailableTools().filter { Self.allowed.contains($0) }
+    package func listAvailableTools() async throws -> [String] {
+        try await inner.listAvailableTools()
     }
-    func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await inner.listAvailableToolSchemas().filter { Self.allowed.contains($0.name) }
+    package func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas()
     }
-    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    package func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         if bundle == GrokBotRoute.bundleID { try await GrokRoutineAccessibility.requireChatOnly() }
         calls += 1
-        guard calls <= 24, Self.allowed.contains(tool) else { throw refusal("Desktop conversation tool budget or scope exceeded.") }
+        guard calls <= 24 else { throw refusal("Desktop conversation tool budget exceeded.") }
         var args = input.filter { $0.value != .null }
         var typing = false, submitting = false, selecting = false
         if tool == "screen" {
@@ -222,7 +221,7 @@ actor DesktopConversationTools: ToolDispatchClient {
             let screen = try await inner.dispatch(tool: "screen", input: ["app": .string(bundle), "pixels": .bool(false)], surface: surface)
             observed = String(flatten(screen).prefix(120_000))
             return screen
-        } else {
+        } else if ["read", "tool_result_page", "act"].contains(tool) {
             let front = await frontmostBundle()
             guard front == bundle else { throw refusal("The target app is no longer in front; no action performed.") }
             if tool == "read" {
@@ -282,6 +281,8 @@ actor DesktopConversationTools: ToolDispatchClient {
                 default: throw refusal("This operation is outside desktop conversation scope.")
                 }
             }
+        } else {
+            return try await inner.dispatch(tool: tool, input: input, surface: surface)
         }
         // Only a read taken after the submission counts as evidence of it.
         if submitting { observed = "" }

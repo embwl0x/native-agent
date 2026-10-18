@@ -1,4 +1,5 @@
 import FeedPolicy
+import TurnTrace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -182,7 +183,7 @@ public actor ProviderVitalsSensor {
     /// call's `ttftMs` joins here under the same definition. Nothing is written.
     private struct FirstOutputKey: Hashable { let provider, model: String; let streamKind: String? }
     private var firstOutputs: [FirstOutputKey: [Double]] = [:]
-    /// Lines `traces/events.jsonl` could not decode at launch: their first
+    /// Rows the retained trace sources could not decode at launch: their first
     /// outputs are missing from the sample, and Diagnostics says how many.
     private var unreadableTraceRows = 0
     /// Stream-guard cuts per provider id (`provider.noReply`): not first
@@ -314,10 +315,10 @@ public actor ProviderVitalsSensor {
 
     /// Launch-owned, once: the trace's first outputs and cuts into memory.
     public func readFirstOutputs(
-        dataRoot: URL,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        dataRoot: URL
     ) async throws {
-        let read = try await persistence.readJSONLReporting(dataRoot.appendingPathComponent("traces/events.jsonl"))
+        let read = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
+            .traceEvidence(since: .distantPast)
         unreadableTraceRows = read.report.malformedLineCount
         for case .object(let row) in read.rows {
             guard case .object(let payload)? = row["payload"], case .string(let provider)? = payload["provider"]
@@ -340,7 +341,7 @@ public actor ProviderVitalsSensor {
 
     /// Diagnostics: each provider's first outputs beside its cuts.
     public func firstOutputReport() -> String {
-        "traces/events.jsonl at launch: \(unreadableTraceRows) rows unreadable\n"
+        "Retained traces at launch: \(unreadableTraceRows) rows unreadable\n"
         + Set(firstOutputs.keys.map(\.provider)).union(noReplyCuts.keys).sorted().map { provider in
             "\(provider): \(noReplyCuts[provider] ?? 0) no-reply cuts" + firstOutputs.keys
                 .filter { $0.provider == provider }

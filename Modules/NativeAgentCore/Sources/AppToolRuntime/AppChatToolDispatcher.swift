@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import Agents
 import ChatOrchestration
@@ -14,6 +15,7 @@ import WorkshopExecution
 import StandingBots
 import ToolRegistry
 import Senses
+import PersonaEngine
 
 /// Core's composed gate in front of the tool router on chat surfaces.
 ///
@@ -22,7 +24,7 @@ import Senses
 /// engine's port (`AppToolExecutor`). This owner keeps the composed side of the
 /// call: the Security Center gate, trust on the full catalog, the live-body
 /// routes a result hands back (self-window, desktop and Grok sends), and
-/// the settled-result observers (context prewarm, motor outcomes).
+/// the settled-result motor outcomes.
 public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolValidating, BuiltInAgentLaneProviding, @unchecked Sendable {
     private let interactions: any ToolInteractionResolving
     private let platform: ChatToolPlatformPort
@@ -122,39 +124,42 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         if let taskSession {
             canonicalInput["__session_id"] = .string(taskSession)
         }
-        let host = AppToolExecutor.authoredProgramHost(dataRoot: securityCenter.dataRoot) { id, arguments in
-            if arguments["__authored_primitive"] != nil {
+        let host = AppToolExecutor.authoredProgramHost(dataRoot: securityCenter.dataRoot, reach: { operation, arguments in
+            guard let dispatcher = self.inner as? SwiftToolDispatcher else {
+                throw SenseFailure(code: "unavailable", message: "The originating tool dispatcher is unavailable.")
+            }
+            return try await dispatcher.performReach(operation, arguments: arguments, surface: surface)
+        }) { id, arguments in
+            if AuthoredToolEffects.call?.tool == id {
                 guard let reentry = AppDoorReentry.perform else {
                     return .object(["status": .string("refused"), "effects": .string("none"),
                                     "reason": .string("door_unavailable"), "detail": .string("A primitive needs the originating turn's gate chain.")])
                 }
-                return await AuthoredToolEffects.$admissionOnly.withValue(true) {
-                    do {
-                        let result = try await reentry(id, arguments)
-                        if case .object(let fields) = result, fields["status"] == .string("ok") { return nil }
-                        return result
-                    } catch { return ChatToolOutcome.failure(error: error, tool: id) }
+                let requester = SkillRunContext.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: self.securityCenter.dataRoot))'s \($0)" }
+                return await SkillRunContext.$requester.withValue(requester) {
+                    do { return try await reentry(id, arguments) }
+                    catch { return ChatToolOutcome.failure(error: error, tool: id) }
                 }
             }
             let envelope = await self.securityCenter.evaluateTool(tool: id, input: arguments,
-                origin: Self.securityOrigin(input: arguments, surface: surface), enforceAutonomy: self.enforceAutonomySecurity)
+                origin: Self.securityOrigin(surface: surface), enforceAutonomy: self.enforceAutonomySecurity)
             guard envelope.decision != .block, !self.enforceAutonomySecurity || !envelope.requiresApproval else {
                 return Self.securityGateResponse(envelope)
-            }
-            // The authored dispatcher owns file_ops admission. Full Mac may
-            // still be active on a peer's approved turn without a YOLO origin.
-            guard [.admitted, .untrustedOrigin].contains(envelope.fullMacYoloAuthority) else {
-                return .object(["status": .string("refused"), "effects": .string("none"),
-                                "reason": .string("full_mac_required"), "detail": .string("Authored execution requires Full Mac file access.")])
             }
             return nil
         }
         let result = try await OwnedProgramInvocation.$host.withValue(host) {
-            try await dispatchWithoutOrganismPosture(
-            tool: tool,
-            input: canonicalInput,
-            surface: surface
-            )
+            try await AppDoorReentry.$waitForInteraction.withValue({ need, tool, input in
+                guard let session = ChatToolSessionContext.verifiedSessionId else {
+                    return AppToolExecutor.failure("door_unavailable", "A card needs the originating conversation.")
+                }
+                return await self.interactions.waitForAnswer(need, tool: tool, input: input,
+                    sessionID: session, dataRoot: self.securityCenter.dataRoot)
+            }) {
+                try await dispatchWithoutOrganismPosture(
+                    tool: tool, input: canonicalInput, surface: surface
+                )
+            }
         }
         await observeMotorOutcomeIfNeeded(tool: tool, result: result)
         return result
@@ -175,7 +180,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         let envelope = await securityCenter.evaluateTool(
             tool: tool,
             input: input,
-            origin: Self.securityOrigin(input: input, surface: surface),
+            origin: Self.securityOrigin(surface: surface),
             enforceAutonomy: enforceAutonomySecurity
         )
         try? await securityCenter.record(envelope)
@@ -258,7 +263,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             let envelope = await securityCenter.evaluateTool(
                 tool: name,
                 input: [:],
-                origin: Self.securityOrigin(input: [:], surface: surface),
+                origin: Self.securityOrigin(surface: surface),
                 enforceAutonomy: enforceAutonomySecurity
             )
             let effectiveAutonomy: String
@@ -291,41 +296,12 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         try await inner.listAvailableToolSchemas().sorted { $0.name < $1.name }
     }
 
-    public static func securityOrigin(input: [String: JSONValue], surface: String) -> SecurityOriginContext {
-        let _ = input
-        // Read the per-turn session bound by the authoritative AutonomyGatedDispatcher
-        // upstream (ChatToolSessionContext). Without it this gate hardcoded
-        // sessionId: nil, so a TRUSTED remote surface (allowlisted Telegram) could
-        // not resolve its chatId, failed the allowlist match, and false-blocked an
-        // invoke the upstream gate had already approved. Threading the session lets
-        // this gate resolve the SAME trust. Nil for standalone uses (catalog
-        // refresh), which carry no remote session — correct.
-        let sessionId = ChatToolSessionContext.verifiedSessionId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let usableSessionId = (sessionId?.isEmpty == false) ? sessionId : nil
-        // PARSE SITE 5 of 5, DELETED (one-thread-many-surfaces plan §1.2). The
-        // `telegram:<chatId>` session-string fallback that used to stand here
-        // is gone; the session id is a storage key, not evidence.
-        //
-        // This gate MIRRORS `AutonomyGatedDispatcher.securityOrigin` field for
-        // field, and for the same reason: the projection is the TURN ENVELOPE's,
-        // not the dispatch `surface`'s. An adapter that binds an envelope for a
-        // remote surface while dispatching under the shared "chat" tool surface
-        // must reach the same — remote, allowlist-gated — verdict in BOTH gates,
-        // or the weaker one becomes the way in.
-        let envelope = TurnEnvelope.current(surface: surface)
-        let remote = ConversationSurfaceProfile(envelope.surface).isRemote
-            || envelope.declaredRemote == true
-        return SecurityOriginContext(
-            surface: envelope.surface,
-            sessionId: usableSessionId,
-            userId: envelope.verifiedUserId,
-            chatId: envelope.verifiedChatId,
-            deviceId: nil,
-            source: "app_chat_tool_dispatcher",
-            isRemote: remote,
-            commandSignatureVerified: envelope.commandSignatureVerified
+    public static func securityOrigin(surface: String) -> SecurityOriginContext {
+        var origin = SecurityOriginContext.currentTurn(
+            verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface
         )
+        origin.source = "app_chat_tool_dispatcher"
+        return origin
     }
 
     private static func securityGateResponse(_ envelope: SecurityToolEnvelope) -> JSONValue {

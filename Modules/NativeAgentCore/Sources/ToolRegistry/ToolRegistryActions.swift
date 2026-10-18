@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -13,24 +14,6 @@ public enum ToolRegistryActions {
             }
             if let index { rows[index] = fields } else { rows.append(fields) }
             return (true, ())
-        }
-    }
-
-    public static func recordUse(id: String, version: String, receipt: JSONValue, codeFault: Bool,
-                                 cleanCode: String?, dataRoot root: URL) async throws {
-        try await mutate(id: id, dataRoot: root) { current in
-            guard var row = current else { throw ToolRegistryError.toolNotFound(id) }
-            guard row["codeFingerprint"] == .string(version) else { return row }
-            let count: Int64 = if case .int(let count)? = row["useCount"] { count } else { 0 }
-            let failures: Int64 = if case .int(let count)? = row["failuresInARow"] { count } else { 0 }
-            let fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { [:] }
-            row["lastUsedAt"] = .string(SwiftNativeToolRegistry.isoTimestamp(Date()))
-            row["useCount"] = .int(count + 1)
-            row["lastRunVersion"] = .string(version)
-            row["lastRun"] = .object(fields.filter { ["status", "effects", "version", "calls", "error", "stopped"].contains($0.key) })
-            row["failuresInARow"] = .int(codeFault ? failures + 1 : cleanCode != nil ? 0 : failures)
-            if let cleanCode { row["lastCleanCode"] = .string(cleanCode); row["lastCleanVersion"] = .string(version) }
-            return row
         }
     }
 
@@ -66,12 +49,6 @@ public enum ToolRegistryActions {
             throw ToolRegistryError.registryUnreadable(reason: "abilities must contain tool records")
         }
         return rows
-    }
-
-    public static func updateTool(id: String, autoRun: Bool, dataRoot root: URL, validate: @escaping @Sendable (ToolRecord) throws -> Void) async throws -> ToolRecord {
-        throw NSError(domain: "NativeAgentSwiftOnly", code: -405, userInfo: [
-            NSLocalizedDescriptionKey: "Authored-tool auto-run is unavailable; this setting does not control execution. Turn the tool off to stop it."
-        ])
     }
 
     public static func checkEnable(id: String, dataRoot root: URL) async throws {

@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -44,6 +45,8 @@ public enum InlineInteractionNeed {
         if !interaction.target.isEmpty {
             object["target"] = .string(interaction.target)
         }
+        // The card by id, where a script's call row keeps it.
+        object["card_id"] = .string(interaction.id)
         // A one-line reason so a surface that knows nothing about cards (a
         // log, a bot transport) still says something true.
         let unavailable = interaction.kind == .connector ? "connected" : "allowed"

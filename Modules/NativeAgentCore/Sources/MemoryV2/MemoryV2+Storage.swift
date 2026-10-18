@@ -173,7 +173,6 @@ public actor MemoryStorage {
             })
         }
         let pool = try DatabasePool(path: path.path, configuration: config)
-        try Self.adoptLedgerlessGraphStoreIfNeeded(pool)
         try MemoryStorage.migrator.migrate(pool)
         try pool.read { db in
             try Self.requireSemanticIntegrity(in: db)
@@ -482,8 +481,7 @@ public actor MemoryStorage {
         return saved
     }
 
-    /// The row INSERT, shared by `insertMemory` and `importLegacyMemory` so the
-    /// two cannot drift apart. Runs inside the caller's write transaction.
+    /// Runs inside the caller's write transaction.
     private static func executeMemoryInsert(_ memory: StoredMemory, in db: Database) throws {
         try db.execute(sql: """
             INSERT INTO memories
@@ -506,18 +504,6 @@ public actor MemoryStorage {
         ])
     }
 
-    /// What `importLegacyMemory` did with a legacy row.
-    public enum LegacyImportOutcome: Sendable {
-        case inserted
-        /// The canonical row existed but held no content, so it was refreshed
-        /// from the legacy source.
-        case refreshedEmpty
-        /// The canonical row exists and holds content — the live store wins.
-        case skippedExisting
-
-        public var landed: Bool { self != .skippedExisting }
-    }
-
     static func normalizingPeerMomentOrigin(_ metadata: JSONValue?, source: String?) -> JSONValue? {
         guard let source,
               ["moment-promoter:agent-", "moment-promoter:bot-"].contains(where: {
@@ -528,94 +514,6 @@ public actor MemoryStorage {
               object["lane"] == .string("moment") || object["kind"] == .string("moment") else { return metadata }
         object["author"] = .string("peer")
         return .object(object)
-    }
-
-    /// Land one legacy memory: insert if absent, refresh only if the canonical
-    /// row is empty, otherwise leave the live row alone.
-    ///
-    /// 2026-09-06: MemoryV2Migrator used to decide this OUTSIDE the write —
-    /// check existence, embed, then upsert. Two problems, both fixed here by
-    /// making the decision part of the transaction. (a) The gap between the
-    /// check and the write is real: the app starts the memory coordinator
-    /// before migration runs, so a live writer can land a row that the upsert
-    /// then overwrites with legacy text. (b) A bare existence check has no
-    /// repair path — a blank or half-written canonical row was never refreshed,
-    /// and the one-way completion sentinel made that permanent.
-    public func importLegacyMemory(_ record: MemoryRecord, embedding: [Float]) async throws -> LegacyImportOutcome {
-        let persona: String
-        if case .object(let object)? = record.extras,
-           case .string(let legacyPersona)? = object["legacy_persona"],
-           !legacyPersona.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            persona = legacyPersona.trimmingCharacters(in: .whitespacesAndNewlines)
-        } else {
-            persona = MemoryV2Defaults.personaID
-        }
-        return try await importLegacyMemory(MemoryStorageBridge.toStoredMemory(
-            record, embedding: embedding.isEmpty ? nil : embedding, embeddingEpoch: nil,
-            defaultPersonaID: persona
-        ))
-    }
-
-    public func importLegacyMemory(_ memory: StoredMemory) async throws -> LegacyImportOutcome {
-        var normalized = memory
-        normalized.metadata = Self.normalizingPeerMomentOrigin(memory.metadata, source: memory.source)
-        let memory = normalized
-        let result = try await dbPool.write { db -> (LegacyImportOutcome, [StoredMemory]) in
-            let existing = try Row.fetchOne(
-                db,
-                sql: "SELECT * FROM memories WHERE id = ?",
-                arguments: [memory.id]
-            ).map(Self.decodeMemory)
-            if let existing {
-                guard existing.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    return (.skippedExisting, [])
-                }
-                try Self.validateTemporalEvidence(memory)
-                try Self.requireWritableEpoch(
-                    in: db,
-                    vector: memory.embedding,
-                    epoch: memory.embeddingEpoch
-                )
-                try db.execute(sql: """
-                    UPDATE memories SET
-                      content = ?, persona_id = ?, source = ?, confidence = ?, updated_at = ?,
-                      embedding = ?, embedding_epoch = ?, status = ?, lifecycle = ?,
-                      valid_from = ?, valid_to = ?, observed_at = ?, evidence_json = ?, metadata_json = ?
-                    WHERE id = ?
-                """, arguments: [
-                    memory.content, memory.personaId, memory.source, memory.confidence, memory.updatedAt,
-                    Self.encodeEmbedding(memory.embedding),
-                    memory.embeddingEpoch,
-                    memory.status,
-                    memory.lifecycle, memory.validFrom, memory.validTo, memory.observedAt,
-                    Self.encodeMetadata(memory.evidence),
-                    Self.encodeMetadata(memory.metadata),
-                    memory.id
-                ])
-                return (.refreshedEmpty, [])
-            }
-            try Self.validateTemporalEvidence(memory)
-            try Self.requireWritableEpoch(
-                in: db,
-                vector: memory.embedding,
-                epoch: memory.embeddingEpoch
-            )
-            try Self.executeMemoryInsert(memory, in: db)
-            let evicted = try Self.pruneMemoriesToBound(
-                in: db,
-                limit: memoryLimit,
-                preservingIDs: [memory.id]
-            )
-            return (.inserted, evicted)
-        }
-        guard result.0 != .skippedExisting else { return result.0 }
-        invalidateRecallCache()
-        pokeUserMDRegen(persona: memory.personaId)
-        await pokeProjectionHooks(memory)
-        if !result.1.isEmpty {
-            await handleBoundEvictions(result.1, reason: "insert")
-        }
-        return result.0
     }
 
     public func memory(id: String) async throws -> StoredMemory? {

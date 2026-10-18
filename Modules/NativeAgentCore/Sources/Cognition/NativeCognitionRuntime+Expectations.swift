@@ -197,8 +197,7 @@ extension NativeCognitionRuntime {
                 OrganismHorizonRegister.completeKindsKey:
                     .array(composed.completeKinds.map(JSONValue.string)),
             ],
-            persistSynchronously: false,
-            prewarmContext: false
+            persistSynchronously: false
         )
     }
 

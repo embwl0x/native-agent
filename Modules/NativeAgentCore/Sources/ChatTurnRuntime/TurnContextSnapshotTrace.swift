@@ -26,16 +26,15 @@ extension SwiftNativeTurnEngine {
     /// tied to the current `TurnTraceContext.turnId`; if no turn is bound it is
     /// dropped by `TurnTraceBus.fireFromContext`. An empty recall with no
     /// explicit outcome stays `unknown`; this seam never guesses that a
-    /// swallowed recall failure was a legitimate zero-hit result.
-    ///
-    /// Production callers invoke this immediately before the initial provider
-    /// dispatch, so `provider.requestStarted` remains an honest boundary.
+    /// swallowed recall failure was a legitimate zero-hit result. Returns the
+    /// session id the snapshot was filed under, for the turn's later milestones.
+    @discardableResult
     nonisolated static func fireContextSnapshotEvent(
         surface: String,
         context: TurnContext,
         sessionId: String? = nil,
         runId: String? = nil
-    ) {
+    ) -> String? {
         let segments = context.systemSegments
         let systemPrompt = context.systemPrompt ?? segments?.combined ?? ""
         let stable = segments?.stable ?? ""
@@ -308,17 +307,7 @@ extension SwiftNativeTurnEngine {
             surface: surface,
             payload: .object(payload)
         )
-        TurnLifecycleTelemetry.emit(
-            .providerRequestStarted,
-            surface: surface,
-            sessionId: resolvedSessionId,
-            observedBy: "context.snapshot.return",
-            counts: [
-                "systemBytes": Int64(systemBytes),
-                "toolSchemaParameterBytes": Int64(toolSchemaParameterBytes),
-            ],
-            flags: ["initialRequest": true]
-        )
+        return resolvedSessionId
     }
 
     private nonisolated static func promptFingerprint(

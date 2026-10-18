@@ -20,14 +20,6 @@ public enum PeerTurnEffectPolicy {
         relativeBases: [URL] = [],
         fullMac: Bool = false
     ) -> Bool {
-        if case .object(let primitive)? = input["__authored_primitive"],
-           case .string(let operation)? = primitive["operation"],
-           case .object(let arguments)? = primitive["arguments"] {
-            let effects = AuthoredToolEffects.primitiveEffects(operation, arguments: primitive["arguments"])
-            return requiresPeerApproval(operation, capabilities: Array(Set(capabilities).union(effects)),
-                externalToolIsEffect: { _ in !effects.contains("safe_read") }, input: arguments,
-                workspaceRoot: workspaceRoot, relativeBases: relativeBases, fullMac: fullMac)
-        }
         let name = normalized(tool)
         // These dispatchers own their connection, route and executable checks.
         // A host-backed message may carry a shell capability for its transport;
@@ -50,13 +42,13 @@ public enum PeerTurnEffectPolicy {
             // Folded actions re-enter under their tool's name and keep that
             // call's approval/replay. The outer app call only passes them on.
             let action = string(input["action"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-            let passesThrough = name == "app" && ToolNameAliases.isFoldedAction(action)
-            let appAction = AppActionPolicy.action(tool: name, input: input)
+            let appAction = AppActionBinding.action(tool: name, input: input)
+            let passesThrough = name == "app" && appAction?.folded == true
             // A preview does nothing, so it never cards. An id the table doesn't
             // know can never run (the door refuses it as unknown_action); only
             // before the table is installed does a missing entry card.
             if name == "app", input["preview"] == .bool(true) { return false }
-            if name == "app", !passesThrough, !action.isEmpty, appAction == nil, !AppActionPolicy.isRegistered { return true }
+            if name == "app", !passesThrough, !action.isEmpty, appAction == nil, !AppActionBinding.isRegistered { return true }
             // A delete to trash is reversible, but still belongs on the delete floor.
             if !passesThrough, appAction?.isHis == true || appAction?.irreversible == true
                 || appAction?.lifecycle == .drop { return true }
@@ -295,9 +287,6 @@ public enum PeerTurnEffectPolicy {
         // Name the act itself: through the app door that is the action, not "app".
         var shown = tool
         if tool == "app", case .string(let action)? = input["action"] { shown = action }
-        if case .object(let primitive)? = input["__authored_primitive"], case .string(let operation)? = primitive["operation"] {
-            shown = operation
-        }
         let kind: String
         if ["chat.send"].contains(shown) || tool == "github_mutate" || capabilities.contains("external_send") {
             kind = "a send in your name"

@@ -232,11 +232,19 @@ extension SwiftNativeTrustCenter {
             try Self.loadRawPolicyChecked(at: trustPolicyURL))
         let defaults = defaultTrustPolicy()
         try Self.validateKnownAuthorityPolicyTypes(saved, against: defaults)
+        // Every saved autonomy entry is a level Trust knows, checked on its own:
+        // the code no longer lists per-tool defaults to type-check it against.
         let overrides: [String: JSONValue]
-        if case .object(let value)? = saved["toolAutonomy"] {
+        switch saved["toolAutonomy"] {
+        case nil: overrides = [:]
+        case .object(let value)?:
+            for (tool, level) in value {
+                guard case .string(let name) = level, Self.unifiedPolicyAutonomyLevels.contains(name) else {
+                    throw TrustCenterError.underlying("saved trust policy field toolAutonomy.\(tool) is not an autonomy level")
+                }
+            }
             overrides = value
-        } else {
-            overrides = [:]
+        default: throw TrustCenterError.underlying("saved trust policy field toolAutonomy has the wrong JSON type")
         }
         return TrustPolicyAuthorizationSnapshot(
             // An empty policy file (setup writes `{}` before the person has
@@ -395,18 +403,10 @@ extension SwiftNativeTrustCenter {
             return [:]
         }()
 
-        var normalized = Self.normalizeTrustPolicy(
+        return Self.normalizeTrustPolicy(
             merged,
             defaultProviderPolicy: defaultProviderPolicy
         )
-        // Backfill Workshop-only keys beneath the main defaults and saved values.
-        var toolAutonomy = Self.workshopToolAutonomyAdditions
-        if case .object(let saved)? = normalized["toolAutonomy"] {
-            for (k, v) in saved { toolAutonomy[k] = v }
-        }
-        Self.normalizeBrowserAutonomy(&toolAutonomy)
-        normalized["toolAutonomy"] = .object(toolAutonomy)
-        return normalized
     }
 
     private func failClosedTrustPolicy() -> [String: JSONValue] {
@@ -495,15 +495,6 @@ extension SwiftNativeTrustCenter {
             "criticalRequiresDeveloperMode": .bool(false),  // USER YOLO 2026-08-12
         ])
         return policy
-    }
-
-    private nonisolated static func normalizeBrowserAutonomy(_ toolAutonomy: inout [String: JSONValue]) {
-        for key in ["browser.open_url", "browser_open_url", "browser.navigate", "browser_navigate"] {
-            guard case .string(let value)? = toolAutonomy[key] else { continue }
-            if ["draft_auto", "send_approval", "confirm", "destructive_strong"].contains(value) {
-                toolAutonomy[key] = .string("auto")
-            }
-        }
     }
 
     /// Normalize saved trust policy into the shape expected by Swift gates.

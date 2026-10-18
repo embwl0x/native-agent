@@ -448,11 +448,8 @@ public enum ToolContractWeight {
     }
 }
 
-// Appends ONE `llm.call` row per successful provider call to
-// `<dataRoot>/traces/events.jsonl` — the SAME feed ChatToolDispatchTracer
-// (ChatOrchestration/ChatToolDispatchTrace.swift) writes `tool.dispatch`
-// rows to. PersistenceCore owns the shared path cap and flock so every writer
-// observes one newest-N contract.
+// TurnTrace owns bound model calls; standalone calls use traces/events.jsonl.
+// Session usage receipts remain independently owned by their current writer.
 //
 // PRIVACY (hard constraint, same as the tool tracer): rows carry token
 // COUNTS, timings, model/provider/surface identifiers only — never prompt
@@ -649,6 +646,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             "purpose": .string(purpose),
             "streaming": .bool(streaming),
             "durationMs": .int(Int64(durationMs)),
+            "status": .string(status),
             "turnId": .string(turnId),
         ]
         if let ttftMs { payload["ttftMs"] = .int(Int64(ttftMs)) }
@@ -693,7 +691,6 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         if let stopReason { payload["stopReason"] = .string(stopReason) }
         if let errorDetail {
             payload["error"] = .string(String(ContextSecretContentPolicy.redactedFragment(errorDetail).prefix(4096)))
-            payload["status"] = .string(status)
         }
         if let usage {
             if let v = usage.inputTokens { payload["inputTokens"] = .int(Int64(v)) }
@@ -716,14 +713,14 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             surface: surface,
             payload: .object(payload)
         )
-        let row: JSONValue = .object([
+        let row: JSONValue? = TurnTraceContext.turnId == nil ? .object([
             "id": .string(UUID().uuidString.lowercased()),
             "kind": .string("llm.call"),
             "title": .string(model),
             "status": .string(status),
             "payload": .object(payload),
             "createdAt": .string(recordedAtISO),
-        ])
+        ]) : nil
         let usageReceipt: SessionUsageReceiptWrite? = {
             guard status == "ok",
                   let usage,
@@ -777,6 +774,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             "surface": .string(surface), "turnId": .string(TurnTraceContext.turnId ?? "unknown"),
         ]
         TurnTraceBus.fireFromContext(kind: "provider.noReply", surface: surface, payload: .object(payload))
+        guard TurnTraceContext.turnId == nil else { return }
         await write(.object([
             "id": .string(UUID().uuidString.lowercased()),
             "kind": .string("provider.noReply"),
@@ -787,8 +785,9 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         ]), provider: provider, model: "", usageReceipt: nil)
     }
 
-    private func write(_ row: JSONValue, provider: String, model: String,
+    private func write(_ row: JSONValue?, provider: String, model: String,
                        usageReceipt: SessionUsageReceiptWrite?) async {
+        guard row != nil || usageReceipt != nil else { return }
         let path = tracesPath
         if synchronousWrites {
             await Self.performWrite(
@@ -827,7 +826,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         static let shared = TraceWriteQueue()
 
         func enqueue(
-            row: JSONValue,
+            row: JSONValue?,
             path: URL,
             persistence: SwiftNativePersistenceCore,
             provider: String,
@@ -843,24 +842,26 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
     }
 
     private static func performWrite(
-        row: JSONValue,
+        row: JSONValue?,
         path: URL,
         persistence: SwiftNativePersistenceCore,
         provider: String,
         model: String,
         usageReceipt: SessionUsageReceiptWrite?
     ) async {
-        do {
-            try await appendPathOwnedJSONL(
-                row,
-                to: path,
-                using: persistence,
-                logLabel: "LLMCallTraceRecorder"
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("LLMCallTraceRecorder: trace append failed (\(provider)/\(model)): \(error)\n".utf8)
-            )
+        if let row {
+            do {
+                try await appendPathOwnedJSONL(
+                    row,
+                    to: path,
+                    using: persistence,
+                    logLabel: "LLMCallTraceRecorder"
+                )
+            } catch {
+                FileHandle.standardError.write(
+                    Data("LLMCallTraceRecorder: trace append failed (\(provider)/\(model)): \(error)\n".utf8)
+                )
+            }
         }
         if let usageReceipt {
             await SessionUsageReceiptWriter.shared.write(usageReceipt)

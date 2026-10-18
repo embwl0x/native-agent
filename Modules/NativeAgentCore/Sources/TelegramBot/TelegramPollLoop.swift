@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import ApprovalInbox
 import NativeAgentCore
@@ -1315,6 +1316,14 @@ public struct TelegramPollLoop: LoopRunner {
                     )
                 }
                 await turnCoordinator.endUpdateProcessing(update.updateId)
+                var arrived: [String: JSONValue] = ["text": .string(text), "chat_id": .int(Int64(msg.chatId)),
+                    "user_id": msg.fromUserId.map { .int(Int64($0)) } ?? .null,
+                    "session_id": .string(turnSessionId), "turn_id": .string(turnId.uuidString)]
+                // A sender the owner did not allowlist by user speaks as a stranger.
+                if msg.fromUserId.map({ !allowedUserIds.contains(Int64($0)) }) ?? true {
+                    arrived["agent"] = .string("telegram:" + (msg.fromUserId.map(String.init) ?? "unknown"))
+                }
+                AbilityStore(dataRoot: dataRoot).signal("message.arrived:telegram", arrived)
             }
             let turnOperation: @Sendable (UUID) async -> Void = { turnId in
                 await MacWorkContinuation.$current.withValue(takeover) { await turnBody(turnId) }

@@ -31,7 +31,7 @@ extension NativeCognitionRuntime {
         do {
             try await providerVitalsSensor.readFirstOutputs(dataRoot: dataRoot)
         } catch {
-            nativeLog("Provider first outputs unreadable from traces/events.jsonl (first-output deadlines learn from this run's calls only): %@",
+            nativeLog("Provider first outputs unreadable from retained traces (first-output deadlines learn from this run's calls only): %@",
                       error.localizedDescription)
         }
     }
@@ -128,9 +128,9 @@ extension NativeCognitionRuntime {
 
         guard let signal = CognitiveSomaticSignalAdapter.signal(from: event, id: UUID()) else { return }
         // Provider lifecycle is body evidence, not new semantic context — mirror
-        // the raw provider path: coalesced persistence, no context prewarm.
+        // the raw provider path: coalesced persistence.
         await ingestPreparedOrganismSignal(
-            signal, persistSynchronously: false, prewarmContext: false
+            signal, persistSynchronously: false
         )
     }
 }

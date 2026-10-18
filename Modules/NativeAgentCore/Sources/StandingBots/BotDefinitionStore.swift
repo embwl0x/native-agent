@@ -101,6 +101,18 @@ public struct BotDefinitionStore: Sendable {
     /// Run once at launch to remove deleted definitions and pin the comparison helpers.
     public func migrateLegacyDefinitions() throws {
         try disk.locked {
+            // TIME (User 10-15): the earlier writers filled this Mac's zone into
+            // every cron given none. Nobody chose it, so it goes, once; read-time
+            // folding would pin it again the day the Mac leaves that zone. Not an
+            // edit: the revision stays, so a pending occurrence keeps its place.
+            let zonesPath = disk.root.appendingPathComponent("cron-zones-migrated.json")
+            if try disk.read(Bool.self, at: zonesPath) != true {
+                for bot in try listUnlocked() {
+                    guard case .cron(let expression, let zone?) = bot.cadence, zone == TimeZone.current.identifier else { continue }
+                    try migrate(bot.id) { $0.cadence = .cron(expression: expression, timeZone: nil) }
+                }
+                try disk.write(true, at: zonesPath)
+            }
             let completionPath = disk.root.appendingPathComponent("definitions-migrated.json")
             if let completed = try disk.read(Bool.self, at: completionPath) {
                 guard completed else { throw StandingBotsError.corruptStore("definition migration completion") }
@@ -120,15 +132,18 @@ public struct BotDefinitionStore: Sendable {
                 default:
                     continue
                 }
-                var document = try disk.definition(bot.id)
-                document.definition.modelPinned = true
-                let now = Date()
-                document.definition.updatedAt = try updatedTime(now, after: bot.updatedAt)
-                document.audit.append(BotAuditRow(id: UUID(), at: now, operation: .update, definition: document.definition))
-                try disk.write(document, at: disk.definitionPath(bot.id))
+                try migrate(bot.id) { $0.modelPinned = true; $0.updatedAt = try updatedTime(Date(), after: $0.updatedAt) }
             }
             try disk.write(true, at: completionPath)
         }
+    }
+
+    /// One launch-time rewrite, audited as an update. Caller holds the lock.
+    private func migrate(_ id: UUID, _ edit: (inout BotDefinition) throws -> Void) throws {
+        var document = try disk.definition(id)
+        try edit(&document.definition)
+        document.audit.append(BotAuditRow(id: UUID(), at: Date(), operation: .update, definition: document.definition))
+        try disk.write(document, at: disk.definitionPath(id))
     }
 
     private func updatedTime(_ at: Date, after old: Date) throws -> Date {
@@ -166,11 +181,11 @@ extension BotDefinitionStore {
             case "Daily", "Weekdays", "Weekly":
                 timing = try StandingBotSchedule.parse(when == "Weekly"
                     ? "weekly on \(StandingBotSchedule.weekdays[weekday]) at \(clockText)" : "\(when) at \(clockText)",
-                    timezone: zone.isEmpty ? nil : zone)
+                    timezone: zone)
             case "Every N hours":
                 guard let value = Double(hours), value.isFinite, value > 0 else { throw EditorError.message("Enter the number of hours.") }
                 timing = .interval(seconds: value * 3600)
-            case "Custom": timing = .cron(expression: cron, timeZone: zone)
+            case "Custom": timing = .cron(expression: cron, timeZone: BotCadence.setZone(zone))
             // An event-woken bot keeps no schedule: the event is the occurrence.
             case "On an event": timing = .manual
             default: timing = .manual

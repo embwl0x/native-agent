@@ -9,8 +9,11 @@ import ToolRegistry
 /// type: the writer is a separate task, and the row must be complete before
 /// it leaves the dispatch loop.
 struct ToolReceipt: Sendable {
+    /// Carries execution identity through the existing progress callback to its receipt writer.
+    @TaskLocal static var dispatchedCall: (tool: String, input: [String: JSONValue])?
     let toolName: String
     let inputJSON: String
+    let ranCall: (tool: String, input: [String: JSONValue])?
     let resultJSON: String
     let ok: Bool
     /// What the cognitive tool event is read from — the lane's own choice of
@@ -46,11 +49,12 @@ extension SwiftNativeChatOrchestrationClient {
                 runId: writer.runId,
                 toolName: receipt.toolName,
                 inputJSON: receipt.inputJSON,
+                ranCall: receipt.ranCall,
                 resultSummary: receipt.resultJSON,
                 ok: receipt.ok,
                 // An app call of a folded action is that tool's outcome.
                 cognitiveResult: ChatToolOutcome.cognitiveResult(
-                    tool: ToolNameAliases.shown(receipt.toolName, inputJSON: receipt.inputJSON).name,
+                    tool: receipt.ranCall?.tool ?? ToolNameAliases.shown(receipt.toolName, inputJSON: receipt.inputJSON).name,
                     output: receipt.cognitiveOutput
                 ),
                 source: writer.surface

@@ -487,6 +487,17 @@ public actor SwiftNativeMacControl: MacControlClient {
                     throw WakeAttentionRefusal(result: refusal)
                 }
             }
+            // The screen is awake and uncovered; her own windows get out of the
+            // way of her sight and hands too (Shotgun), from any surface's turn
+            // (User 10-16: she looked at WoW through her own full-screen window).
+            // A call on a named app that does not need it in front (a read of
+            // its window or menus, an accessibility act or menu press on it
+            // behind) works behind anything, so it leaves her window in place.
+            // A hand, the front app and the desktop need the screen.
+            let named = !(body.stringValue("app")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                || body["background"] == .bool(true)
+            let behind = named && body["require_front"] != .bool(true) && body["require_front_pid"] == nil
+            if !behind { await PersonOnlyWindows.stepAsideForScreen() }
             return nil
         } catch let refusal as WakeAttentionRefusal {
             return refusal.result
@@ -534,8 +545,9 @@ public actor SwiftNativeMacControl: MacControlClient {
            let refusal = await attentionActionRefusal(action: normalized, body: body) {
             return refusal
         }
-        // Perception and hands share the desktop-send wake: an inert nudge
-        // only while the saver covers the screen and the person is idle.
+        // Perception, hands and any call that requires the front share the
+        // desktop-send wake: an inert nudge only while the saver covers the
+        // screen and the person is idle.
         if MacObservationMode.current == .passive,
            ["look", "view", "ax_tree", "ax_find"].contains(normalized), MacScreenLock.isCovered() {
             return MacControlResult(ok: false, action: normalized,
@@ -543,7 +555,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 error: "display_obstructed", durationMs: 0)
         }
         if MacObservationMode.current != .passive,
-           ["look", "view", "act", "hand", "menu", "menu_press"].contains(normalized) {
+           ["look", "view", "act", "hand", "menu", "menu_press"].contains(normalized) || body["require_front"] == .bool(true) {
             let started = now()
             do {
                 if let refusal = try await wakeScreenIfCovered(action: normalized, body: body) {

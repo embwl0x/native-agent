@@ -74,8 +74,8 @@ public enum MemoryDataProvenance {
         return .object(fields)
     }
 
-    public static func consume(_ metadata: JSONValue?, dataRoot: URL = PersistenceCore.defaultDataRoot()) {
-        // Retain every recorded principal; the turn gates read current trust.
-        for source in sources(in: metadata, dataRoot: dataRoot) { PeerDataTaint.markConsumed(peer: source) }
-    }
+    // A memory she kept is hers (User, 2026-10-16: "it should know if it's me or
+    // you or whoever, whenever"): recalling it shows who first said it
+    // (`fields(in:)`) and steers nothing. A steer is a peer's words in the
+    // turn's own input: a bridge turn, a reply read now, a room, an arrival.
 }

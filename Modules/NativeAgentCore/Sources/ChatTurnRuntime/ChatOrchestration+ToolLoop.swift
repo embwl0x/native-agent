@@ -49,28 +49,14 @@ extension SwiftNativeTurnEngine {
     /// Shared pre-loop context resolution. Prefer a caller-provided context
     /// (e.g. one already threaded with session history); otherwise build a fresh
     /// per-turn context AND lazy-filter ctx.toolSchemas so the
-    /// no-preBuiltContext path can't expose the full eager catalog. Then fire
-    /// the context-snapshot event.
-    func resolveToolLoopContext(
-        surface: String,
-        userMessage: String,
-        sessionId: String?,
-        runId: String?,
-        preBuiltContext: TurnContext?
-    ) async throws -> TurnContext {
-        if let preBuiltContext {
-            // This is the production structured-chat shape. Its context already
-            // contains the chosen persona, threaded history/session digest, and
-            // cognitive capsule, and has already received its turn-scoped lazy
-            // tool filter. Rebuilding here would silently discard those inputs.
-            Self.fireContextSnapshotEvent(
-                surface: surface,
-                context: preBuiltContext,
-                sessionId: sessionId,
-                runId: runId
-            )
-            return preBuiltContext
-        }
+    /// no-preBuiltContext path can't expose the full eager catalog.
+    func resolveToolLoopContext(surface: String, userMessage: String, sessionId: String?,
+                                preBuiltContext: TurnContext?) async throws -> TurnContext {
+        // This is the production structured-chat shape. Its context already
+        // contains the chosen persona, threaded history/session digest, and
+        // cognitive capsule, and has already received its turn-scoped lazy
+        // tool filter. Rebuilding here would silently discard those inputs.
+        if let preBuiltContext { return preBuiltContext }
         let rawCtx = try await buildTurnContext(
             surface: surface,
             userMessage: userMessage,
@@ -80,25 +66,18 @@ extension SwiftNativeTurnEngine {
             offeredToolNames: SwiftToolDispatcher.normalModelToolNames(activeTools: LLMCallContext.turnActiveTools ?? [])
         )
         // The one lazy filter: always-on core plus this turn's own scope.
-        let ctx = SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
+        return SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
             to: rawCtx,
             activeTools: LLMCallContext.turnActiveTools ?? []
         ) ?? rawCtx
-        Self.fireContextSnapshotEvent(
-            surface: surface,
-            context: ctx,
-            sessionId: sessionId,
-            runId: runId
-        )
-        return ctx
     }
 
     /// Shared terminal for a loop iteration that produced a final reply (no
-    /// executable tool calls): record the completed outcome, run the realtime
-    /// memory-promotion side channel (production chat goes through this loop, so
-    /// without it AdaptiveMemoryPromoter never sees the user/assistant pair), and
-    /// build the TurnEngineResult. `rawLLMResponse` is the turn's accumulated
-    /// raw output.
+    /// executable tool calls): record the completed outcome, run the after-turn
+    /// work when her turn part asked for it (`after`: promises, repeated work,
+    /// the memory-promotion side channel — without it AdaptiveMemoryPromoter
+    /// never sees the user/assistant pair), and build the TurnEngineResult.
+    /// `rawLLMResponse` is the turn's accumulated raw output.
     func finishCompletedTurn(
         reply: String,
         ctx: TurnContext,
@@ -110,28 +89,32 @@ extension SwiftNativeTurnEngine {
         sessionId: String?,
         surface: String,
         workingCommentaryCharacters: Int? = nil,
-        completionState: TurnEngineResult.CompletionState = .completed
+        completionState: TurnEngineResult.CompletionState = .completed,
+        afterTurn: Bool = true
     ) async -> TurnEngineResult {
         let recalledIds = ctx.resolvedRecalledIds
         await ctx.fluidContextTurn?.recordOutcome(.completed)
-        await queuePromises(in: reply, dispatches: dispatches, surface: surface)
-        Self.noticeRepeatedWork(dispatches: dispatches, surface: surface, root: remPinsDataRoot, sessionId: sessionId)
-        // NOT run here (Astra audit 2, finding 4, 2026-09-11): this used to hold
-        // the TurnEngineResult — and therefore the caller's assistant-row persist
-        // and output milestone — for the whole promotion, 8-10 s on live bridge
-        // turns. This only CAPTURES the promotion's inputs; the caller's
-        // `startDeferredMemoryPromotion(ticket:)` starts it once the assistant
-        // row is durable, so the work is deferred behind the append, not dropped.
-        // The ticket rides home on the result: it is what makes the start
-        // per-turn instead of "whatever this actor last captured" (Astra comb 3
-        // review, finding 1, 2026-09-12).
-        let promotionTicket = deferMemoryPromotion(
-            userMessage: userMessage,
-            assistantMessage: reply,
-            toolDispatches: dispatches,
-            sessionId: sessionId,
-            surface: surface
-        )
+        var promotionTicket: UUID?
+        if afterTurn {
+            await queuePromises(in: reply, dispatches: dispatches, surface: surface)
+            Self.noticeRepeatedWork(dispatches: dispatches, surface: surface, root: remPinsDataRoot, sessionId: sessionId)
+            // NOT run here (Astra audit 2, finding 4, 2026-09-11): this used to hold
+            // the TurnEngineResult — and therefore the caller's assistant-row persist
+            // and output milestone — for the whole promotion, 8-10 s on live bridge
+            // turns. This only CAPTURES the promotion's inputs; the caller's
+            // `startDeferredMemoryPromotion(ticket:)` starts it once the assistant
+            // row is durable, so the work is deferred behind the append, not dropped.
+            // The ticket rides home on the result: it is what makes the start
+            // per-turn instead of "whatever this actor last captured" (Astra comb 3
+            // review, finding 1, 2026-09-12).
+            promotionTicket = deferMemoryPromotion(
+                userMessage: userMessage,
+                assistantMessage: reply,
+                toolDispatches: dispatches,
+                sessionId: sessionId,
+                surface: surface
+            )
+        }
         let endNs = DispatchTime.now().uptimeNanoseconds
         let elapsedMs = Int((endNs &- startNs) / 1_000_000)
         return TurnEngineResult(
@@ -327,7 +310,7 @@ extension SwiftNativeTurnEngine {
         LocalToolImage.boundConversation(&conversation)
         // An app chrome.* call is the Chrome tool it ran, with its args as input.
         if iterationRecords.contains(where: {
-            let ran = ToolNameAliases.ranTool($0.name, input: $0.input)
+            let ran = $0.ranCall.tool
             return Self.driverTakeoverReceipt($0.result) != nil
                 || (!MacAttentionSessionStore.shared.currentDriverAllowed
                     && ["act", "go"].contains(ran)
@@ -401,7 +384,7 @@ extension SwiftNativeTurnEngine {
             let result = InlineInteractionNeed.envelope(need)
             ChatTurnExecution.current?.waitForInteraction(need)
             let record = TurnEngineResult.ToolDispatchRecord(name: InlineInteractionWire.toolName,
-                input: input, result: result)
+                input: input, ranCall: (InlineInteractionWire.toolName, input), result: result)
             dispatches.append(record)
             ChatTurnExecution.current?.keepTools([record])
             await progress?(.toolUse(name: record.name, input: .object(input)))

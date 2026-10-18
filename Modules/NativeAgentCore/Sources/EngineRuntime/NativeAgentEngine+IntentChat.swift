@@ -8,7 +8,6 @@ extension NativeAgentEngine {
         // No pick means no pick; the chat surface resolves an empty model.
         let model = UserDefaults.standard.string(forKey: "chatModel") ?? ""
         let reasoningEffort = UserDefaults.standard.string(forKey: "chatReasoningEffort") ?? "high"
-        let fileAccess = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"
         let sessionID = try SwiftNativeChatOrchestrationClient.resolveSessionId(
             ConversationAnchor.currentSessionId() ?? UUID().uuidString
         )
@@ -24,7 +23,8 @@ extension NativeAgentEngine {
                     sessionID: sessionID,
                     model: model,
                     reasoningEffort: reasoningEffort,
-                    fileAccess: fileAccess,
+                    // The saved choice is applied by the chat itself.
+                    fileAccess: "auto",
                     attachments: [],
                     persona: nil,
                     surface: "chat",

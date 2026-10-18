@@ -9,28 +9,16 @@ public enum ToolRegistryError: Error, LocalizedError {
     case invalidRequest(String)
     case toolNotFound(String)
     case registryUnreadable(reason: String)
-    case unavailable
-    case underlying(String)
     /// Record's status/field combination is internally inconsistent — e.g.
     /// status=="active" but activePath is nil. Mirrors Python's hard-raise
     /// on the same shape so we never quarantine the wrong bytes.
     case invalidState(String)
-    /// Quarantine dispatcher returned status=="pending_approval" — the
-    /// receipt envelope is preserved verbatim for the caller.
-    case pendingApproval(receipt: JSONValue)
-    /// Quarantine dispatcher returned status=="blocked" — trust policy
-    /// rejected the action; the reason string carries the human-readable why.
-    case blocked(reason: String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidRequest(let msg): return "invalid request: \(msg)"
         case .toolNotFound(let id): return "tool not found: \(id)"
         case .registryUnreadable(let r): return "registry unreadable: \(r)"
-        case .unavailable: return "native tool registry unavailable"
-        case .underlying(let m): return m
-        case .pendingApproval: return "pending approval"
-        case .blocked(let r): return "blocked: \(r)"
         case .invalidState(let m): return "invalid state: \(m)"
         }
     }
@@ -257,8 +245,9 @@ extension ToolRecord {
     public var autoRun: Bool? { extraBool("autoRun") }
 
     public var language: String? { extraString("language") }
+    public var candidateDigest: String? { extraString("candidateDigest") }
     public var pendingCandidate: Bool {
-        guard let candidate = extraString("candidateDigest") else { return false }
+        guard let candidate = candidateDigest else { return false }
         return candidate != codeFingerprint
     }
 
@@ -286,8 +275,8 @@ extension ToolRecord {
     }
 
     /// The first authored field that does not read as the Tools page reads
-    /// it, or nil when every one does: `description` and `triggers` are
-    /// required, the rest may be absent or null but never of another type. A
+    /// it, or nil when every one does: `description` is required, the rest
+    /// may be absent or null but never of another type. A
     /// record naming one is damaged authority, not a row to render.
     public var authoredFieldProblem: String? {
         func isString(_ value: JSONValue) -> Bool { if case .string = value { return true }; return false }
@@ -304,8 +293,10 @@ extension ToolRecord {
             }
         }
         guard let description = extra("description"), isString(description) else { return "description" }
-        guard let triggers = extra("triggers"), isStrings(triggers) else { return "triggers" }
+        // Triggers are discovery phrases, not identity: a part found by its
+        // description needs none (the seed parts have none).
         let optional: [(String, (JSONValue) -> Bool)] = [
+            ("triggers", isStrings),
             ("language", isString), ("entrypoint", isString), ("permissions", isStrings), ("actions", isStrings),
             ("autoCreated", isBool), ("autoPromote", isBool), ("autoRun", isBool), ("autoPromotable", isBool),
             ("validationErrors", isStrings), ("disabledReason", isString),
@@ -325,19 +316,10 @@ public enum ToolFilter: Sendable, Equatable {
     case status(String)
 }
 
-// MARK: - Protocol
-
-public protocol ToolRegistryProtocol: Sendable {
-    func listTools(filter: ToolFilter) async throws -> [ToolRecord]
-    func getTool(id: String) async throws -> ToolRecord?
-    @discardableResult
-    func quarantine(id: String, reason: String, ownerAuthorized: Bool) async throws -> ToolRecord
-}
-
 // MARK: - SwiftNative impl
 
 /// Checked ability-file reads; mutations use the canonical storage owner.
-public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
+public actor SwiftNativeToolRegistry {
     private let root: URL
     private let clock: @Sendable () -> Date
     public init(
@@ -352,9 +334,14 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
 
     public func listTools(filter: ToolFilter) async throws -> [ToolRecord] {
         let items = try ToolRegistryActions.entries(dataRoot: root)
-        let records = try items.enumerated().map { index, item in
+        // One malformed part never locks the registry: it is named and left out,
+        // and every other part stays usable.
+        let records = items.enumerated().compactMap { index, item -> ToolRecord? in
             guard let record = ToolRecord(json: item) else {
-                throw ToolRegistryError.registryUnreadable(reason: "row \(index + 1) has missing or invalid required fields")
+                var id = ""
+                if case .object(let fields) = item, case .string(let name)? = fields["id"] { id = " (" + name + ")" }
+                nativeLog("ToolRegistry: row %ld%@ has missing or invalid required fields; left out", index + 1, id)
+                return nil
             }
             return record
         }
@@ -407,16 +394,4 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
         }
         return zulu
     }
-
-    // MARK: data root convenience
-
-    public nonisolated static func defaultDataRoot() -> URL {
-        PersistenceCore.defaultDataRoot()
-    }
-}
-
-// MARK: - Factory
-
-public func makeToolRegistry() -> any ToolRegistryProtocol {
-    return SwiftNativeToolRegistry()
 }

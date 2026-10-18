@@ -463,7 +463,12 @@ public final class SwiftNativeLLMClient: LLMClient {
     /// The provider `streamMessages` resolves for this call — the same
     /// snapshot, requested-model and adapter resolution, under the caller's
     /// bound `LLMCallContext`. Nil when the call itself would fail there first.
+    /// An admitted route already names its provider, so it answers without a
+    /// second picker read; dispatch still revalidates it against the snapshot.
     public func servingProviderID(model: String?, surface: String) async -> String? {
+        if let bound = LLMCallContext.providerId?.trimmingCharacters(in: .whitespacesAndNewlines), !bound.isEmpty {
+            return adapterChoice(forProviderId: bound) == nil ? nil : bound
+        }
         guard let routingSnapshot = try? await checkedRoutingSnapshot(),
               let resolvedModel = try? resolveRequestedModel(
                 model, surface: surface, routingSnapshot: routingSnapshot
@@ -821,6 +826,9 @@ public final class SwiftNativeLLMClient: LLMClient {
                             providerLabel: providerLabel,
                             isOutput: { kind.isProviderOutput($0) }
                         )
+                        // The request is sent as the guarded stream is first read.
+                        try Task.checkCancellation()
+                        ProviderStreamContext.dispatched?()
                         for try await event in guardedStream {
                             try Task.checkCancellation()
                             if let budget = LLMCallContext.turnTokenBudget {

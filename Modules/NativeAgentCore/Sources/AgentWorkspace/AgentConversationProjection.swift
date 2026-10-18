@@ -228,6 +228,8 @@ public enum ContactThread {
         public let byPerson: Bool
         public var door: String? = nil
         public var fetched = false
+        /// A reply's send id: the message of hers it answers.
+        public var answers: String? = nil
     }
 
     /// Presentation-only union for Simple and home rows. Route readers use lines.
@@ -278,11 +280,14 @@ public enum ContactThread {
                 let envelope = metadata?["envelope"] as? [String: Any]
                 let run = object["runId"] as? String
                 var said = content
+                let answers = (origin?["replyTo"] as? String).flatMap {
+                    $0.hasPrefix("agent-conversation:") ? String($0.dropFirst("agent-conversation:".count)) : nil
+                }
                 if role == "user" {
                     // A peer's turns come over the agent bridge; a built-in lane's carry its name.
                     guard envelope?["surface"] as? String == "agent-bridge" || origin?["agent"] as? String == owner else { continue }
                     // A reply handed to her, or a pull of Dot's room: her answer stays hers.
-                    let handed = (origin?["replyTo"] as? String)?.hasPrefix("agent-conversation:") == true
+                    let handed = answers != nil
                         || (envelope?["correlationId"] as? String)?.hasPrefix("dot-room:") == true
                     if !handed, let run { started.insert(run) }
                     said = bridgedText(content)
@@ -298,7 +303,8 @@ public enum ContactThread {
                 let at = (object["createdAt"] as? String).flatMap { dates.date(from: $0) } ?? .distantPast
                 found.append((Line(id: id, mine: role == "assistant", text: said, at: at,
                                    byPerson: metadata?["byPerson"] as? Bool == true,
-                                   fetched: role == "assistant" && fetched.contains { $0.session == session && $0.run == run }),
+                                   fetched: role == "assistant" && fetched.contains { $0.session == session && $0.run == run },
+                                   answers: role == "user" ? answers : nil),
                               metadata?["dotClientUserMessageID"] is String ? nil : run))
             }
         }

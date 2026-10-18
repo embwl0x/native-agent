@@ -23,14 +23,14 @@ public enum MemoryApprovalTransactions {
     /// stageIfNeeded re-stages.
     @discardableResult
     public static func reconcileUnappliedMemoryRepairs(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL, records: [ApprovalRecord]
     ) async -> Int {
-        await ApprovalTransactionCoordinator.reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, kinds: [
+        await ApprovalTransactionCoordinator.reconcileUnappliedApprovalExecutions(kinds: [
             ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind(
                 action: MemoryRepairOneShot.action,
                 shouldReconcile: { _ in true },
                 execute: { await MemoryRepairOneShot.applyResolvedMemoryRepair(from: $0, dataRoot: dataRoot) })
-        ])
+        ], records: records)
     }
 
     /// Applies a resolved memory.kind_backfill record (U3 wave-2 item 5 —
@@ -108,14 +108,14 @@ public enum MemoryApprovalTransactions {
     /// execution annotation get the idempotent executor re-run on launch.
     @discardableResult
     public static func reconcileUnappliedKindBackfills(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL, records: [ApprovalRecord]
     ) async -> Int {
-        await ApprovalTransactionCoordinator.reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, kinds: [
+        await ApprovalTransactionCoordinator.reconcileUnappliedApprovalExecutions(kinds: [
             ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind(
                 action: MemoryKindBackfill.action,
                 shouldReconcile: { _ in true },
                 execute: { await applyResolvedKindBackfill(from: $0, dataRoot: dataRoot) })
-        ])
+        ], records: records)
     }
 
     /// Stages the kind-backfill approval card if the legacy kind-less rows

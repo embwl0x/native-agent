@@ -1,4 +1,5 @@
 import Foundation
+import os
 import AgentWorkspace
 import Desk
 import Transcripts
@@ -49,6 +50,20 @@ public actor ChatTurnSteering {
     static let maxPending = 8
 
     private var pending: [String: [Offer]] = [:]
+    /// Which sessions hold an offer, readable without the actor hop: the
+    /// streaming loop asks on every delta and cuts the reply when one waits
+    /// (10-17: a Steer during a words-only reply landed nowhere, since the
+    /// turn only looked before a tool round).
+    nonisolated private static let pendingSessions = OSAllocatedUnfairLock<Set<String>>(initialState: [])
+    nonisolated public static func hasPending(_ sessionId: String) -> Bool {
+        pendingSessions.withLock { $0.contains(sessionId) }
+    }
+    /// Pending AND drainable: while a reservation is unsettled, drain refuses,
+    /// so a cut would only repeat (Sol); the offer waits for the reservation.
+    private func syncPendingFlag(_ sessionId: String) {
+        let waiting = reserved[sessionId] == nil && pending[sessionId]?.isEmpty == false
+        Self.pendingSessions.withLock { if waiting { $0.insert(sessionId) } else { $0.remove(sessionId) } }
+    }
     private var reserved: [String: [Offer]] = [:]
     private var delivered: [String: [Offer]] = [:]
     private var stranded: [String: [Offer]] = [:]
@@ -105,6 +120,7 @@ public actor ChatTurnSteering {
         let offers = (stranded.removeValue(forKey: sessionId) ?? [])
             + (reserved.removeValue(forKey: sessionId) ?? [])
             + (pending.removeValue(forKey: sessionId) ?? [])
+        syncPendingFlag(sessionId)
         for offer in offers.reversed() {
             deliveryHandlers[offer.id] = nil
             if let handler = handlers[offer.id] { await handler(offer) }
@@ -113,7 +129,7 @@ public actor ChatTurnSteering {
 
     /// The person removed this message from the queue before the turn took it.
     public func withdraw(id: String) {
-        for key in pending.keys { pending[key]?.removeAll { $0.id == id } }
+        for key in pending.keys { pending[key]?.removeAll { $0.id == id }; syncPendingFlag(key) }
         for key in stranded.keys { stranded[key]?.removeAll { $0.id == id } }
         deliveryHandlers[id] = nil
         for token in returnHandlers.keys { returnHandlers[token]?[id] = nil }
@@ -185,6 +201,7 @@ public actor ChatTurnSteering {
         guard queue.count < Self.maxPending, !queue.contains(where: { $0.id == offer.id }) else { return false }
         queue.append(offer)
         pending[sessionId] = queue
+        syncPendingFlag(sessionId)
         deliveryHandlers[offer.id] = onDelivered
         returnHandlers[turn.token, default: [:]][offer.id] = onReturned
         return true
@@ -201,6 +218,7 @@ public actor ChatTurnSteering {
               let queue = pending.removeValue(forKey: sessionId), !queue.isEmpty else {
             return []
         }
+        syncPendingFlag(sessionId)
         // The person really did send this message, so the transcript records it
         // as their message, in the order they sent it — before the reply the
         // running turn is still composing. PERSIST FIRST: a message the model
@@ -232,6 +250,7 @@ public actor ChatTurnSteering {
         let taken = reserved[sessionId] ?? []
         guard !taken.isEmpty else {
             if reserved[sessionId]?.isEmpty == true { reserved[sessionId] = nil }
+            syncPendingFlag(sessionId)
             return []
         }
         for index in taken.indices {
@@ -243,6 +262,7 @@ public actor ChatTurnSteering {
                 // Keep their order, including rows saved before this failure.
                 stranded[sessionId, default: []].append(
                     contentsOf: reserved.removeValue(forKey: sessionId) ?? [])
+                syncPendingFlag(sessionId)
                 return []
             }
         }
@@ -263,6 +283,7 @@ public actor ChatTurnSteering {
             delivered[sessionId, default: []].append(offer)
         }
         if reserved[sessionId]?.isEmpty == true { reserved[sessionId] = nil }
+        syncPendingFlag(sessionId)
         return true
     }
 

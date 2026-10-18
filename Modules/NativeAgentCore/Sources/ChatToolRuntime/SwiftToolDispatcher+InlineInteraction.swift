@@ -120,9 +120,6 @@ extension SwiftToolDispatcher {
                 declineConsequence: declineConsequence
             )
         case .permission:
-            if target == "applescript" {
-                return failed("missing_target", "Automation consent is per app. Request permission with target applescript:<bundle_id>.")
-            }
             let access = text("mode", "access").flatMap { InlineInteraction.AccessMode(rawValue: $0) }
             // A chain she can predict is ONE ask. Extra capabilities are
             // canonical ids from the Mac list; anything the registry does not
@@ -133,6 +130,9 @@ extension SwiftToolDispatcher {
                     if case .string(let value) = $0 { return value }
                     return nil
                 }
+            }
+            if capabilities.contains("applescript") || capabilities.contains("automation") {
+                return failed("missing_target", "Automation consent is per app. Request permission with target applescript:<bundle_id>.")
             }
             if capabilities.contains(where: MacIntegrationID.all.contains) {
                 do {
@@ -154,7 +154,7 @@ extension SwiftToolDispatcher {
                     return failed("app_not_installed", "No installed app resolves \(bundleID); install that app before requesting Automation consent.")
                 }
                 automation.append(permission)
-                if fields["state"] == .string("allowed") {
+                if fields["state"] == .string("allowed"), !MacIntegrationID.all.contains(capability) {
                     capabilities.removeAll { $0 == capability }
                 }
             }

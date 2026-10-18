@@ -259,25 +259,4 @@ public struct TrustPolicyActions: Sendable {
             developerMode: developerMode
         )
     }
-
-    public func saveTrustPolicyFull(
-        permissionLevel: String,
-        autonomyDefault: String,
-        requireBackups: Bool,
-        outsideDefault: String,
-        developerMode: Bool = false,
-        dreamScheduler: Bool? = nil
-    ) async throws -> TrustPolicy {
-        var body: [String: Any] = [
-            "permissionLevel": permissionLevel,
-            "autonomyDefault": autonomyDefault,
-            "developerMode": developerMode,
-            "filePolicy": [
-                "requireBackupBeforeWrite": requireBackups,
-                "outsideWorkspaceDefault": outsideDefault
-            ]
-        ]
-        if let dreamScheduler { body["trainingPolicy"] = ["dream_scheduler": dreamScheduler] }
-        return try await postTrustWrite(body: body)
-    }
 }

@@ -19,6 +19,7 @@ struct MacVisualWindowRecord: Sendable, Equatable {
 }
 
 struct MacVisualObstruction: Sendable, Equatable {
+    let ownerPID: Int32
     let ownerName: String
     let coverage: Double
     let frame: MacAXFrame
@@ -75,7 +76,7 @@ struct SystemMacVisualObstructionProbe: Sendable {
             // thresholds hid real obstructions on large displays. Preserve
             // exact overlap geometry, including same-app floating windows.
             guard coverage > 0 else { return nil }
-            return MacVisualObstruction(ownerName: window.ownerName, coverage: coverage, frame: window.frame)
+            return MacVisualObstruction(ownerPID: window.ownerPID, ownerName: window.ownerName, coverage: coverage, frame: window.frame)
         }
     }
 
@@ -126,6 +127,11 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 "semantic_raw_frame": .bool(true),
                 "semantic_focus_visual_surface": .bool(true),
             ]
+            // The view decides the picture from its own AX read: a forced
+            // attachment and the live preview always take one; a `screen`
+            // attachment takes one of a thin window.
+            if pixels?.forced == true || MacScreenPreviewBus.publish != nil { body["pixels"] = .string("always") }
+            else if pixels != nil { body["pixels"] = .string("thin") }
             if let requestedApp { body["app"] = .string(requestedApp) }
             result = try await host.dispatch(action: "view", body: body)
         } catch {
@@ -161,6 +167,13 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                   w > 0, h > 0 else { return nil }
             return MacAXFrame(x: x, y: y, w: w, h: h)
         }()
+        let targetPID = Int32(number(app["pid"]) ?? 0)
+        // Every window over this one, whatever the capture shows (a window-only
+        // capture has no covering pixels). The probe leaves out her Shotgun and
+        // pointer (PersonOnlyWindows); another app's window there would take
+        // her hand, while the app's own sheets, menus and panels are its own.
+        let covering = targetPID > 0 ? (visibleFrame.map { obstructionProbe.obstructions(over: $0, targetPID: targetPID) } ?? []) : []
+        let handObstructions = covering.filter { $0.ownerPID != targetPID }.map(\.frame)
         let structural = structuralSupplement(
             marks: marks,
             menus: array(output["transient_menus"]),
@@ -168,7 +181,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             appName: appName,
             bundleIdentifier: bundleIdentifier,
             visibleFrame: visibleFrame,
-            pointer: pointer
+            pointer: pointer,
+            obstructions: handObstructions
         )
 
         // The chat's live computer pane. The frame is the one this verb ALREADY
@@ -181,12 +195,6 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             await publishPreview(output: output, marks: marks, appName: appName, publish: publish)
         }
 
-        // Pixel perception is the fallback for AX-sparse surfaces. Running OCR
-        // over every richly semantic window would add latency and duplicate
-        // evidence. Browser chrome can be richly semantic while the dominant
-        // page body is one AXImage, so global mark count alone is not enough to
-        // classify a canvas/game/custom renderer.
-        let accessibilityTrusted = bool(output["accessibility_trusted"]) ?? false
         let dominantImageFrame: MacAXFrame? = frame(output["semantic_focus_frame"])
             ?? marks.compactMap { value in
                 let mark = object(value)
@@ -194,28 +202,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                       role == "AXImage" || role == "AXCanvas" else { return nil }
                 return frame(mark["frame"])
             }.max { lhs, rhs in lhs.w * lhs.h < rhs.w * rhs.h }
-        let dominantImageFraction: Double? = {
-            guard let visibleFrame, let dominantImageFrame else { return nil }
-            let visibleArea = visibleFrame.w * visibleFrame.h
-            guard visibleArea > 0 else { return nil }
-            return min(1, (dominantImageFrame.w * dominantImageFrame.h) / visibleArea)
-        }()
-        let targetPID = Int32(number(app["pid"]) ?? 0)
-        // Chromium content belongs to the renderer's AX read, including a
-        // pending/stalled read. Neither a capped visible-text list nor a large
-        // image inside a readable document may replace that read with pixels.
-        let chromium = MacChromiumAccessibility.looksChromium(bundleId: bundleIdentifier, pid: targetPID, snapshot: nil)
-        let thinReason = chromium || output["accessibility_complete"] == .bool(false) ? nil : Self.thinAccessibilityReason(
-            accessibilityTrusted: accessibilityTrusted, marks: marks, texts: array(output["text"]),
-            windowArea: visibleFrame.map { $0.w * $0.h } ?? 0, canvasFraction: dominantImageFraction,
-            sourceTextCount: number(output["accessibility_text_count"]).map(Int.init),
-            sourceTextCharacters: number(output["accessibility_text_characters"]).map(Int.init))
-        let obstructions = (dominantImageFrame ?? visibleFrame).map {
-            // Independent-window capture contains no covering app pixels.
-            // It remains a background observation, not permission to act.
-            targetPID > 0 && output["capture_isolated_window"] != .bool(true)
-                ? obstructionProbe.obstructions(over: $0, targetPID: targetPID) : []
-        } ?? []
+        // The view graded its own AX read (Chromium and incomplete reads are never thin).
+        let thinReason = string(output["thin_accessibility_reason"])
+        // Independent-window capture contains no covering app pixels to exclude.
+        let obstructions = output["capture_isolated_window"] == .bool(true) ? [] : covering
         if let pixels {
             let title = displayText(output["window_title"]) ?? ""
             let windowFrame = visibleFrame.map { "\(Int($0.x)),\(Int($0.y)),\(Int($0.w))x\(Int($0.h))" } ?? ""
@@ -233,13 +223,9 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 window: [bundleIdentifier ?? "", appName ?? "", title, windowFrame].joined(separator: "|")
             )
         }
-        // Chromium renderer content belongs to AX. A pending AX tree is
-        // reported as such; pixels never quietly replace that mechanism.
-        guard !chromium, thinReason != nil, Self.shouldCompilePixelPerception(
-            accessibilityTrusted: accessibilityTrusted,
-            markCount: marks.count,
-            dominantImageFraction: dominantImageFraction
-        ),
+        // Pixel perception is the fallback for AX-sparse surfaces; the view
+        // decided before its capture whether this window earns it.
+        guard output["recognize_pixels"] == .bool(true),
               let encoded = string(output["image"]),
               let data = Data(base64Encoded: encoded),
               let image = VisionImageDecoder.decode(data),
@@ -369,6 +355,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 controls: structural.controls + vision.controls,
                 values: structural.values + visionValues,
                 targets: structural.targets + visionTargets,
+                obstructions: handObstructions,
                 diagnostics: ([
                     "vision_isolated_window": output["capture_isolated_window"] ?? .bool(false),
                     "vision_recognized_strings": .int(Int64(percept.recognizedStrings)),
@@ -416,69 +403,6 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         return formatter.date(from: text) ?? fallback
     }
 
-    static func shouldCompilePixelPerception(
-        accessibilityTrusted: Bool,
-        markCount: Int,
-        dominantImageFraction: Double?
-    ) -> Bool {
-        !accessibilityTrusted
-            || markCount <= 6
-            || (dominantImageFraction ?? 0) >= 0.03
-    }
-
-    /// Her-screen Phase 6 — WHEN WORDS FAIL. Nil means the accessibility read
-    /// carries the window and no pixels are attached. A reason means the
-    /// window is a canvas, a game, video, or an app that publishes almost
-    /// nothing, and one small image of it earns its bytes. Real AppKit
-    /// windows publish named controls or text and never reach a reason.
-    static func thinAccessibilityReason(
-        accessibilityTrusted: Bool,
-        marks: [JSONValue],
-        texts: [JSONValue],
-        windowArea: Double,
-        canvasFraction: Double?,
-        sourceTextCount: Int? = nil,
-        sourceTextCharacters: Int? = nil
-    ) -> String? {
-        guard accessibilityTrusted else { return "no accessibility read" }
-        // A dominant AXImage/AXCanvas (or childless AXWebArea) is unreadable
-        // content even when its surrounding toolbar has plenty of words.
-        // Chromium renderer reads are retained by the caller; window-wide
-        // text counts can only grade windows without a dominant visual body.
-        if (canvasFraction ?? 0) >= 0.5 { return "canvas" }
-        if (sourceTextCharacters ?? 0) >= 80 || (sourceTextCount ?? 0) >= 4 { return nil }
-        let visibleCharacters = texts.reduce(0) { total, value in
-            guard case .object(let item) = value, case .string(let text)? = item["text"] else { return total }
-            return total + text.count
-        }
-        if visibleCharacters >= 80 { return nil }
-        let unnamedRoles: Set<String> = ["AXGroup", "AXScrollArea", "AXSplitGroup",
-                                         "AXLayoutArea", "AXUnknown", "AXWebArea"]
-        let roles = marks.compactMap { value -> (role: String, named: Bool)? in
-            guard case .object(let mark) = value, case .string(let role)? = mark["role"] else { return nil }
-            let labeled: Bool = {
-                switch mark["label"] {
-                case .string(let text)?: return !text.trimmingCharacters(in: .whitespaces).isEmpty
-                case .object?: return true
-                default: return false
-                }
-            }()
-            return (role, labeled && !unnamedRoles.contains(role))
-        }
-        let named = roles.filter(\.named).count
-        let characters = texts.reduce(0) { total, value in
-            guard case .object(let item) = value else { return total }
-            if case .string(let text)? = item["text"] { return total + text.count }
-            return total + 20
-        }
-        // One meaningful thing per ~100k pt² (a 1400×900 window wants ~12),
-        // never fewer than four; any real paragraph of text is not thin.
-        let floor = max(4, Int(windowArea / 100_000))
-        guard named + texts.count < floor, characters < 80 else { return nil }
-        if named == 0, texts.isEmpty { return roles.isEmpty ? "no controls or words" : "only unnamed groups" }
-        return "few controls or words for its size"
-    }
-
     private func structuralSupplement(
         marks: [JSONValue],
         menus: [JSONValue],
@@ -486,7 +410,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         appName: String?,
         bundleIdentifier: String?,
         visibleFrame: MacAXFrame?,
-        pointer: MacPointerPosition?
+        pointer: MacPointerPosition?,
+        obstructions: [MacAXFrame]
     ) -> MacFourVerbsSupplement {
         let rowRoles: Set<String> = ["AXRow", "AXCell", "AXOutlineRow", "AXListItem"]
         var rows: [MacScreenRender.Row] = []
@@ -587,7 +512,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             contents: contents,
             controls: controls,
             values: values,
-            targets: targets
+            targets: targets,
+            obstructions: obstructions
         )
     }
 
@@ -791,6 +717,9 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         return nil
     }
 
+    /// The delivered image's frame fields (MacImageFrames), once `attach` sent one.
+    private(set) var imageFrame: JSONValue?
+
     /// The one line `screen` adds, or nil when nothing about pixels needs
     /// saying (an AX-rich window she did not ask pixels of).
     func attach() -> String? {
@@ -822,17 +751,18 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         guard let data = Data(base64Encoded: png), let image = VisionImageDecoder.decode(data) else {
             return "Pixels (\(why)): the window capture could not be decoded; the words above are all I have."
         }
-        var source = image
+        var source = (image: image, origin: origin, logicalSize: logicalSize)
         if let region, logicalSize.width > 0, logicalSize.height > 0 {
             let padX = max(24, region.frame.w * 0.25), padY = max(24, region.frame.h * 0.25)
-            source = VisionImageCropper.crop(
+            let crop = VisionImageCropper.crop(
                 image,
                 to: MacAXFrame(x: region.frame.x - padX, y: region.frame.y - padY,
                                w: region.frame.w + padX * 2, h: region.frame.h + padY * 2),
                 origin: origin, logicalSize: logicalSize
-            ).image
+            )
+            source = (crop.image, crop.origin, crop.logicalSize)
         }
-        guard let jpeg = Self.boundedJPEG(source) else {
+        guard let jpeg = Self.boundedJPEG(source.image) else {
             return "Pixels (\(why)): the image could not be fitted under \(Self.maxBytes / 1000) KB; none was attached."
         }
         let delivered = LocalToolImage.deliverPNG(jpeg.data, name: "screen-window.jpg",
@@ -842,7 +772,14 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         }
         ChatTurnExecution.current?.notePixelsAttached(window: key, fingerprint: fingerprint)
         let placement = background ? "captured where it sits, nothing raised" : "the front window as shown"
-        return "Pixels attached (\(why)): one \(jpeg.width)×\(jpeg.height) JPEG, \(max(1, jpeg.data.count / 1000)) KB, of \(scope) (\(placement)). It follows this result."
+        let attached = "Pixels attached (\(why)): one \(jpeg.width)×\(jpeg.height) JPEG, \(max(1, jpeg.data.count / 1000)) KB, of \(scope) (\(placement)). It follows this result."
+        // The final size and the screen rect it covers travel together, so a point in it is a place.
+        guard source.logicalSize.width > 0, source.logicalSize.height > 0 else { return attached }
+        let frame = MacImageFrames.remember(MacScreenViewGeometry(
+            bounds: MacAXFrame(x: source.origin.x, y: source.origin.y, w: source.logicalSize.width, h: source.logicalSize.height),
+            pixelWidth: jpeg.width, pixelHeight: jpeg.height))
+        imageFrame = frame.fields
+        return attached + " " + frame.words
     }
 
     /// Long side ≤ 1024 px and ≤ 150 KB: quality steps first, then 3/4 scale.

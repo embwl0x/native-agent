@@ -145,6 +145,9 @@ import TrustPersistence
 
 /// The agent's own hands on a card (card.answer): every settle is `byAgent`.
 @MainActor struct AppToolInteractionResolver: ToolInteractionResolving {
+    func waitForAnswer(_ interaction: InlineInteraction, tool: String, input: [String: JSONValue], sessionID: String, dataRoot: URL) async -> JSONValue {
+        await InlineInteractionResolver.waitForAnswer(interaction, tool: tool, input: input, sessionID: sessionID, dataRoot: dataRoot)
+    }
     func sessionID(ofCard id: String, dataRoot: URL) async -> String? {
         try? await InlineInteractionDelivery.pointer(id: "interaction:\(id)", dataRoot: dataRoot).sessionID
     }

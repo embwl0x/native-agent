@@ -334,7 +334,7 @@ public enum XConnectorActions {
         }
     }
 
-    private static func currentBearer(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> String {
+    public static func currentBearer(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> String {
         let original = try loadOAuth2Token(data: loadOAuth2TokenData(dataRoot: dataRoot))
         let bearer = try await RefreshGate.shared.resolveBearer(path: oauth2TokenPath(dataRoot: dataRoot)) {
             try await XConnectorActions.currentBearerLocked(dataRoot: dataRoot)

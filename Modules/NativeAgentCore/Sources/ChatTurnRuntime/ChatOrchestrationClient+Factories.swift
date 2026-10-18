@@ -9,6 +9,7 @@ import MemoryV2
 import MCPDispatcher
 import ProviderRouting
 import TrustCenter
+import ToolRegistry
 
 
 /// One provider assembly for resident turns and background body work. Routing,
@@ -261,8 +262,6 @@ public func makeChatOrchestrationClient(
 ///   human-in-the-loop). Pass a wired filer to allow async approvals.
 /// - `dataRoot`: exact root used when this factory constructs its default
 ///   TrustCenter, peer naming, approval inbox, security and trace stores.
-/// - `trust`: optional AutonomyResolver override; defaults to a
-///   `SwiftNativeTrustCenter` on `dataRoot`.
 /// - `verifiedSessionId`: optional session id used by SecurityCenter for
 ///   origin attribution; pass nil for stateless callers.
 /// - `approvedReplay`: exact approval evidence for a resolved chat-tool replay.
@@ -273,15 +272,13 @@ public func makeGatedToolDispatchClient(
     approvalFiler: (any ApprovalFiler)? = nil,
     approvalTimeoutSeconds: Double = 30,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
-    trust: (any AutonomyResolver)? = nil,
     verifiedSessionId: String? = nil,
     approvedReplay: ApprovedChatToolReplay? = nil,
     approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil,
     tracePeerTurn: Bool = false,
     allowsFirstConversationExemption: Bool = false
 ) -> any ToolDispatchClient {
-    let resolvedTrust: any AutonomyResolver = trust ?? SwiftNativeTrustCenter(dataRoot: dataRoot)
-    let gate = AutonomyGate(trust: resolvedTrust, approvalFiler: approvalFiler)
+    let gate = AutonomyGate(approvalFiler: approvalFiler)
     let fileAccessGated = FileAccessGatedDispatcher(inner: tools, fileAccess: fileAccess)
     // 2026-09-06: canonicalize the dotted alias OUTSIDE the gates, so the
     // fileAccess blocklist and the Trust Center both judge the name that will
@@ -335,8 +332,7 @@ func peerExternalToolEffectResolver(dataRoot: URL) -> @Sendable (String) -> Bool
         let lowered = name.lowercased()
         if !lowered.hasPrefix("mcp__") {
             guard !SwiftToolDispatcher.reservedBuiltInNames.contains(name) else { return false }
-            guard let files = try? AbilityStore(dataRoot: dataRoot).files(kind: .tool) else { return true }
-            return files.contains { $0.id.lowercased() == lowered }
+            return AppActionBinding.action(input: ["action": .string(ToolNameAliases.authoredAction(lowered))])?.read != true
         }
         guard let descriptor = MCPToolBridge.listMCPTools(dataRoot: dataRoot)
             .first(where: { $0.bridgedName.lowercased() == lowered })

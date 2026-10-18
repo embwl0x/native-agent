@@ -27,7 +27,8 @@ private struct NativeSwarmChatClient: SwarmChatClient {
         let response = try await LLMCallContext.$purpose.withValue("swarm") {
         try await client.runEphemeralToolTurn(
             message: message, model: model, reasoningEffort: reasoningEffort,
-            fileAccess: "auto", providerID: providerID,
+            // Her hands keep the caller's file access (same posture, same fences).
+            fileAccess: ChatToolSessionContext.fileAccess ?? "auto", providerID: providerID,
             serviceTierOverride: serviceTier, verifiedSessionId: sessionID,
             requireCompleted: true, surface: surface
         )

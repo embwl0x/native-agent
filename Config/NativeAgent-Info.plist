@@ -62,6 +62,8 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>NativeAgent uses the local network to connect the Mac app and trusted companion devices.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>NativeAgent uses this Mac's location when you ask for local information such as weather.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>NativeAgent uses your microphone for voice input.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

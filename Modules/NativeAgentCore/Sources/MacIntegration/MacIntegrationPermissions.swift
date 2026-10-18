@@ -4,10 +4,13 @@ import Speech
 import AVFoundation
 import ApplicationServices
 import CoreGraphics
+import CoreLocation
 import EventKit
 import Contacts
 import OSLog
 import PersistenceCore
+import MacControl
+import UserNotifications
 
 // MARK: - Mac Integration permissions
 //
@@ -767,8 +770,10 @@ public enum SystemPermissionCapability: String, CaseIterable, Sendable {
     case speechRecognition
     case microphone
     case accessibility
+    case location
     case fullDiskAccess
     case screenRecording
+    case inputMonitoring
     case automation
     case calendars
     case reminders
@@ -780,8 +785,10 @@ public enum SystemPermissionCapability: String, CaseIterable, Sendable {
         case .speechRecognition: return "Speech Recognition"
         case .microphone: return "Microphone"
         case .accessibility: return "Accessibility"
+        case .location: return "Location Services"
         case .fullDiskAccess: return "Full Disk Access"
         case .screenRecording: return "Screen Recording"
+        case .inputMonitoring: return "Input Monitoring"
         case .automation: return "Automation"
         case .calendars: return "Calendar"
         case .reminders: return "Reminders"
@@ -790,40 +797,21 @@ public enum SystemPermissionCapability: String, CaseIterable, Sendable {
         }
     }
 
-    /// Anchor for the `com.apple.settings.PrivacySecurity.extension` pane.
-    /// The Calendar / Reminders / Contacts values are the same literals
-    /// `MacIntegrationView.FrameworkPermission.settingsAnchor` already uses —
-    /// one vocabulary, not two. `notifications` is nil because it does not live
-    /// under Privacy & Security at all (it has its own Settings extension), and
-    /// returning a bogus Privacy anchor for it would deep-link to the wrong pane.
+    /// macOS Privacy & Security anchor; Notifications has its own pane.
     public var settingsAnchor: String? {
         switch self {
         case .speechRecognition: return "Privacy_SpeechRecognition"
         case .microphone: return "Privacy_Microphone"
         case .accessibility: return "Privacy_Accessibility"
+        case .location: return "Privacy_LocationServices"
         case .fullDiskAccess: return "Privacy_AllFiles"
         case .screenRecording: return "Privacy_ScreenCapture"
+        case .inputMonitoring: return "Privacy_ListenEvent"
         case .automation: return "Privacy_Automation"
         case .calendars: return "Privacy_Calendars"
         case .reminders: return "Privacy_Reminders"
         case .contacts: return "Privacy_Contacts"
         case .notifications: return nil
-        }
-    }
-
-    /// True when a background/headless code path depends on this capability and
-    /// there is NO guarantee an interactive acquisition ever runs. These are the
-    /// grants that can silently stay unacquired forever — exactly the shape of
-    /// the Telegram voice-note bug — so a non-granted state here is worth
-    /// surfacing on a health panel. The rest (microphone, screen recording,
-    /// calendars, reminders, contacts) are only reached from a user-initiated
-    /// in-app action that fires their own prompt at the moment of use.
-    public var isHeadlessLoadBearing: Bool {
-        switch self {
-        case .speechRecognition, .accessibility, .automation, .notifications:
-            return true
-        case .microphone, .screenRecording, .fullDiskAccess, .calendars, .reminders, .contacts:
-            return false
         }
     }
 }
@@ -849,19 +837,52 @@ public struct SystemPermissionSnapshot: Sendable, Equatable {
 }
 
 public enum SystemPermissionPreflight {
+    /// Posted by any permission source that learns of a change in-process (a
+    /// Location answer); the card port re-checks its waiting cards on it.
+    public static let permissionDidChange = Notification.Name("NativeAgent.SystemPermissionPreflight.permissionDidChange")
     private static let logger = Logger(subsystem: "com.nativeagent.app", category: "permission-preflight")
 
     public typealias SpeechAuthorizationRequest = @Sendable (
         @escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void
     ) -> Void
 
-    public static let settingsPanePrefix = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?"
+    public static let settingsPanePrefix = "x-apple.systempreferences:com.apple.preference.security?"
 
-    /// Full System Settings deep link for a capability, or nil when it has no
-    /// Privacy & Security anchor.
+    /// Full System Settings deep link for a capability.
     public static func settingsURL(for capability: SystemPermissionCapability) -> URL? {
+        if capability == .notifications {
+            return URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+        }
         guard let anchor = capability.settingsAnchor else { return nil }
         return URL(string: settingsPanePrefix + anchor)
+    }
+
+    public static func cardSettingsCapability(_ id: String) -> SystemPermissionCapability? {
+        if SystemAppleScriptAdapter.automationTarget(id) != nil { return .automation }
+        switch id {
+        case "calendar": return .calendars
+        case "reminders": return .reminders
+        case "contacts": return .contacts
+        case "accessibility": return .accessibility
+        case "location": return .location
+        case "screen_capture", "screen_recording": return .screenRecording
+        case "input_monitoring": return .inputMonitoring
+        case "full_disk_access", "messages": return .fullDiskAccess
+        case "speech_recognition": return .speechRecognition
+        case "microphone": return .microphone
+        case "notifications", "notify_mac": return .notifications
+        default: return nil
+        }
+    }
+
+    public static func cardSettingsInstructions(_ ids: [String]) -> [String] {
+        let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "NativeAgent"
+        var seen: Set<SystemPermissionCapability> = []
+        return ids.compactMap { id in
+            guard let pane = cardSettingsCapability(id), seen.insert(pane).inserted else { return nil }
+            let section = pane == .notifications ? "" : "Privacy & Security → "
+            return "System Settings → \(section)\(cardPaneName(pane)) → turn on \(app)."
+        }
     }
 
     // MARK: - Non-prompting reads
@@ -900,14 +921,23 @@ public enum SystemPermissionPreflight {
             // AX exposes no notDetermined/restricted distinction — it is a
             // boolean trust bit — so a non-trusted process reads as .denied.
             return AXIsProcessTrusted() ? .granted : .denied
+        case .location:
+            guard CLLocationManager.locationServicesEnabled() else { return .denied }
+            switch MacLocationReader.authorizationStatus {
+            case .authorizedAlways, .authorizedWhenInUse: return .granted
+            case .denied: return .denied
+            case .restricted: return .restricted
+            case .notDetermined: return .notDetermined
+            @unknown default: return .unknown
+            }
         case .fullDiskAccess:
-            // macOS has no safe, universal non-prompting FDA read. Do not
-            // infer authority from a probe of one arbitrary path.
-            return .unknown
+            return MacMessagesHistory.hasAccess ? .granted : .denied
         case .screenRecording:
             // CGPreflightScreenCaptureAccess is the preflight (no prompt);
             // CGRequestScreenCaptureAccess is the prompting sibling.
             return CGPreflightScreenCaptureAccess() ? .granted : .denied
+        case .inputMonitoring:
+            return CGPreflightListenEventAccess() ? .granted : .denied
         case .calendars:
             return mapEKStatus(EKEventStore.authorizationStatus(for: .event))
         case .reminders:
@@ -928,9 +958,6 @@ public enum SystemPermissionPreflight {
             // which prompts. MacIntegrationView owns that per-app probe.
             // Notifications: UNUserNotificationCenter's settings read is async
             // and requires a bundled, registered app.
-            // Reporting .unknown is honest; `healthWarnings` deliberately does
-            // not warn on .unknown so an unreadable state never becomes a
-            // permanent false alarm.
             return .unknown
         }
     }
@@ -955,23 +982,6 @@ public enum SystemPermissionPreflight {
         }
     }
 
-    // MARK: - Pure judgement seam (the tested surface)
-
-    /// The subset of `snapshots` worth telling the human about: a capability a
-    /// headless path depends on that is NOT granted.
-    ///
-    /// `.unknown` is excluded on purpose — it means "we could not read this
-    /// without prompting," not "it is missing." Warning on unreadable state
-    /// would put a permanent, unresolvable card in front of the user (the
-    /// dead-end-alert bug class), which is worse than staying quiet.
-    public static func healthWarnings(from snapshots: [SystemPermissionSnapshot]) -> [SystemPermissionSnapshot] {
-        snapshots.filter { snapshot in
-            snapshot.capability.isHeadlessLoadBearing
-                && snapshot.status != .granted
-                && snapshot.status != .unknown
-        }
-    }
-
     /// User-facing copy for one warning. Names the capability AND the System
     /// Settings pane, because the whole point of the card is that the user can
     /// get from the message to the switch.
@@ -989,8 +999,6 @@ public enum SystemPermissionPreflight {
             return "\(name) is restricted on this Mac (device management or parental controls). "
                 + "Check \(pane)."
         case .granted, .unknown:
-            // Not reachable via healthWarnings; kept total so the function has
-            // no crashing branch if a caller passes an arbitrary snapshot.
             return "\(name) status: \(snapshot.status.rawValue). See \(pane)."
         }
     }
@@ -1058,36 +1066,160 @@ public enum SystemPermissionPreflight {
     }
 }
 
-// MARK: - Setup cards
+/// Where this Mac is: a fact it holds, like the time. Its one location manager,
+/// kept for the app's life, holds the newest fix CoreLocation gave, and a read
+/// answers with it and its age at once. A fix older than `freshness` also asks
+/// CoreLocation for the next read; only with no fix held does a read wait, for
+/// `answer` at most. A manager made per call cold-started CoreLocation each
+/// time and timed out with a grant in place.
+@MainActor
+public final class MacLocationReader: NSObject, @preconcurrency CLLocationManagerDelegate {
+    private static let shared = MacLocationReader()
+    private let manager = CLLocationManager()
+    private var waiters: [CheckedContinuation<JSONValue, Never>] = []
+    private var deadline: Task<Void, Never>?
+    /// macOS is showing its own Location prompt for this request.
+    private var askingMacOS = false
+    /// The kept manager's status, readable from any thread; a manager made per
+    /// read answered notDetermined for a moment after launch.
+    nonisolated(unsafe) private static var knownStatus: CLAuthorizationStatus?
+    public nonisolated static var authorizationStatus: CLAuthorizationStatus {
+        if let knownStatus { return knownStatus }
+        Task { @MainActor in _ = shared }
+        return CLLocationManager().authorizationStatus
+    }
+    /// A held fix this old asks for a fresh one, for the next read.
+    private static let freshness: TimeInterval = 300
+    /// With no fix held: CoreLocation gives one this fast or not at all (measured 0.6–1.4 s).
+    private static let answer: Duration = .seconds(2)
 
-extension SystemPermissionPreflight {
-    /// The macOS privacy switch a card's grant also needs, where a cheap
-    /// non-prompting read exists. The app-side grant alone does not reach it,
-    /// so a card must not settle while macOS still says no.
-    public static func cardGate(_ id: String, mode: InlineInteraction.AccessMode?) -> SystemPermissionCapability? {
-        switch id {
-        case "calendar": return .calendars
-        case "reminders": return .reminders
-        case "contacts": return .contacts
-        case "accessibility": return .accessibility
-        case "screen_capture": return .screenRecording
-        default: return nil
+    override private init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyKilometer
+        Self.knownStatus = manager.authorizationStatus
+    }
+
+    public static func requestAuthorization() {
+        if shared.manager.authorizationStatus == .notDetermined {
+            shared.manager.requestWhenInUseAuthorization()
         }
     }
 
+    public static func read() async -> JSONValue { await shared.read() }
+
+    /// The newest fix CoreLocation gave this Mac.
+    private var held: CLLocation? {
+        guard let fix = manager.location, fix.horizontalAccuracy >= 0 else { return nil }
+        return fix
+    }
+
+    private func read() async -> JSONValue {
+        if let held {
+            if -held.timestamp.timeIntervalSinceNow >= Self.freshness, deadline == nil { request() }
+            return Self.fix(held)
+        }
+        guard !Task.isCancelled else { return Self.failure("cancelled", "The location read was cancelled.") }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+            if waiters.count == 1 { request() }
+        }
+    }
+
+    /// Not yet asked: macOS's own prompt asks, and its answer fetches the first fix.
+    private func request() {
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            manager.requestLocation()
+            deadline?.cancel()
+            deadline = Task {
+                do { try await Task.sleep(for: Self.answer) } catch { return }
+                finish()
+            }
+        case .notDetermined:
+            askingMacOS = true; manager.requestWhenInUseAuthorization()
+            finish(Self.failure("location_not_allowed", "macOS is asking now whether NativeAgent may use Location Services. Once it is allowed, ask again; or try phone.location or give a place."))
+        default: finish(Self.failure("location_not_allowed", "Location Services is off for NativeAgent on this Mac. System Settings → Privacy & Security → Location Services → NativeAgent turns it on; or try phone.location or give a place."))
+        }
+    }
+
+    public func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        Self.knownStatus = manager.authorizationStatus
+        // A card waiting on this permission settles on the answer, whoever gave it.
+        NotificationCenter.default.post(name: SystemPermissionPreflight.permissionDidChange, object: nil)
+        guard askingMacOS, manager.authorizationStatus != .notDetermined else { return }
+        askingMacOS = false
+        request()
+    }
+
+    /// The fix just given is the one the manager now holds.
+    public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) { finish() }
+
+    public func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        finish(Self.noFix(error.localizedDescription))
+    }
+
+    private static func fix(_ location: CLLocation) -> JSONValue {
+        // An answer under a grant settles any card still waiting on it.
+        NotificationCenter.default.post(name: SystemPermissionPreflight.permissionDidChange, object: nil)
+        return .object(["status": .string("ok"), "effects": .string("none"),
+            "latitude": .double(location.coordinate.latitude), "longitude": .double(location.coordinate.longitude),
+            "accuracy_m": .double(location.horizontalAccuracy),
+            "at": .string(ISO8601DateFormatter().string(from: location.timestamp)),
+            "age_seconds": .int(Int64(max(0, -location.timestamp.timeIntervalSinceNow))), "source": .string("this Mac")])
+    }
+
+    private static func noFix(_ why: String) -> JSONValue {
+        failure("location_unavailable", "This Mac has no location fix: \(why) Try phone.location or give a place.")
+    }
+
+    private static func failure(_ reason: String, _ detail: String) -> JSONValue {
+        .object(["status": .string("failed"), "reason": .string(reason), "detail": .string(detail), "effects": .string("none")])
+    }
+
+    /// Every waiting read gets the fix the Mac holds, however old, with its age; with none, why not.
+    private func finish(_ none: JSONValue = MacLocationReader.noFix("CoreLocation gave none.")) {
+        deadline?.cancel()
+        deadline = nil
+        let result = held.map(Self.fix) ?? none
+        let waiting = waiters
+        waiters = []
+        for continuation in waiting { continuation.resume(returning: result) }
+    }
+}
+
+// MARK: - Setup cards
+
+extension SystemPermissionPreflight {
     /// The first macOS switch still off for these ids, as the one sentence of
     /// what to click; nil when macOS has nothing against it.
-    public static func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) -> String? {
+    public static func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> String? {
         for id in ids {
-            guard let gate = cardGate(id, mode: mode) else { continue }
-            let current = cardStatus(gate, mode: mode)
-            if current == .granted { continue }
-            if current == .notDetermined {
-                return "macOS hasn\u{2019}t allowed \(gate.displayName) yet: tap the card and choose Allow when macOS asks."
+            guard let gate = cardSettingsCapability(id) else { continue }
+            if let bundleID = SystemAppleScriptAdapter.automationTarget(id) {
+                let permission = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID)
+                guard case .object(let fields) = permission, fields["state"] == .string("allowed") else {
+                    return (try? permission.serialize(pretty: false)) ?? "Automation consent unavailable."
+                }
+                continue
             }
-            return "macOS is still blocking \(gate.displayName): in System Settings \u{2192} "
-                + "Privacy & Security \u{2192} \(cardPaneName(gate)), turn NativeAgent on"
-                + (gate == .screenRecording ? " (macOS may ask to reopen NativeAgent)." : ".")
+            let current: SystemPermissionStatus
+            if gate == .notifications {
+                let settings = await UNUserNotificationCenter.current().notificationSettings()
+                switch settings.authorizationStatus {
+                case .authorized, .provisional: current = .granted
+                case .notDetermined: current = .notDetermined
+                case .denied: current = .denied
+                default: current = .unknown
+                }
+            } else { current = cardStatus(gate, mode: mode) }
+            if current == .granted { continue }
+            if current == .unknown {
+                return "I can't verify \(gate.displayName) here. "
+                    + cardSettingsInstructions([id]).joined(separator: " ") + " Then try the original action again."
+            }
+            return "macOS hasn't allowed \(gate.displayName) yet. " + cardSettingsInstructions([id]).joined(separator: " ")
+                + (gate == .screenRecording ? " macOS may ask to reopen NativeAgent." : "")
         }
         return nil
     }
@@ -1108,6 +1240,9 @@ extension SystemPermissionPreflight {
 
     private static func cardPaneName(_ capability: SystemPermissionCapability) -> String {
         switch capability {
+        case .accessibility:
+            if #available(macOS 27.0, *) { return "Device Control and Data Access" }
+            return capability.displayName
         case .calendars: return "Calendars"
         case .screenRecording: return "Screen & System Audio Recording"
         default: return capability.displayName

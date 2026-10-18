@@ -48,7 +48,6 @@ struct AppDoctorPort: EngineDoctorPlatformPort {
     func doctorStartBridge(name: String) async {
         switch name {
         case "ClaudeBridge": await ClaudeBridgeRuntime.shared.startServer()
-        case "MacControlBridge": MacControlBridge.shared.start()
         case "BrowserIPC": await BrowserWindowController.shared.startIPCServer()
         default: break
         }
@@ -59,7 +58,6 @@ struct AppDoctorPort: EngineDoctorPlatformPort {
         let browserIPC = await BrowserWindowController.shared.ipcListenerHealth
         let bridges: [(name: String, health: NativeLoopbackListener.Health, expected: Bool)] = [
             ("ClaudeBridge", ClaudeBridgeRuntime.shared.listenerHealth, true),
-            ("MacControlBridge", MacControlBridge.shared.listenerHealth, MacControlBridge.shared.startGateAllows()),
             ("BrowserIPC", browserIPC, true),
         ]
         return bridges.map { ($0.name, ($0.health.failure, $0.health.boundPort, $0.health.isActive, $0.health.port), $0.expected) }

@@ -15,7 +15,7 @@ import Context
 extension SwiftNativeTurnEngine {
     // MARK: - Per-iteration dispatch (shared by both loops; U1 step 6)
 
-    /// One provider call, fully resolved for dispatch. Built up-front so
+    /// One provider call, prepared for dispatch. Built up-front so
     /// task-group children capture only Sendable value types (plus the
     /// Sendable `tools` / `progress` references) — never the conversation
     /// array or any actor state.
@@ -28,6 +28,8 @@ extension SwiftNativeTurnEngine {
         /// receipt, the records and every per-tool rule below read.
         let internalName: String
         let dispatchInput: [String: JSONValue]
+        /// Planning identity; refreshed when execution starts, then carried unchanged.
+        var ranCall: (tool: String, input: [String: JSONValue])
     }
 
     /// Execute ONE iteration's batch of tool calls and return the
@@ -70,15 +72,13 @@ extension SwiftNativeTurnEngine {
                 guard !ToolCallParser.isIgnorableToolName(call.name) else { return nil }
                 let requestedName = providerTools.internalName(forProviderName: call.name)
                 let internalName = CanonicalToolNameDispatcher.canonical(requestedName)
+                let input = Self.inputWithSessionIfNeeded(toolName: internalName, input: call.input, sessionId: sessionId)
                 let prepared = PreparedToolCall(
                     pairedId: i < pairedIds.count ? pairedIds[i] : call.id,
                     requestedName: requestedName,
                     internalName: internalName,
-                    dispatchInput: Self.inputWithSessionIfNeeded(
-                        toolName: internalName,
-                        input: call.input,
-                        sessionId: sessionId
-                    )
+                    dispatchInput: input,
+                    ranCall: ToolNameAliases.ranCall(internalName, input: input)
                 )
                 // A folded, merged or retired tool is app's now: called by
                 // name where this request never declared it, it runs nothing
@@ -111,7 +111,9 @@ extension SwiftNativeTurnEngine {
                     if case .object(let fields) = result, fields["held_for_results"] == .bool(true) {
                         ChatToolDispatchTracer.traceUndispatched(tool: p.internalName, input: p.dispatchInput, surface: surface, result: result)
                     }
-                    await progress?(.toolResult(name: p.internalName, output: result))
+                    await ToolReceipt.$dispatchedCall.withValue(p.ranCall) {
+                        await progress?(.toolResult(name: p.internalName, output: result))
+                    }
                 }
             )
         }
@@ -340,13 +342,13 @@ extension SwiftNativeTurnEngine {
     ) async -> [DispatchedSlot] {
         // A folded `app` action is judged as the tool it runs: its parallel
         // class, its pixels and whether it is a send are that tool's.
-        let ran = prepared.map { ToolNameAliases.ranTool($0.internalName, input: $0.dispatchInput) }
+        let ran = prepared.map { $0.ranCall.tool }
         let baseSafe = ran.map {
             !Self.isConnectorRead($0) && ParallelToolDispatch.isParallelSafe(internalToolName: $0)
         }
         let fleetOverrides = ParallelToolDispatch.fleetParallelOverrides(
             names: ran,
-            inputs: prepared.map { ToolNameAliases.ranInput($0.internalName, input: $0.dispatchInput) }
+            inputs: prepared.map { $0.ranCall.input }
         )
         let groups = ParallelToolDispatch.plan(
             parallelSafe: zip(baseSafe, fleetOverrides).map { $1 ?? $0 },
@@ -406,16 +408,16 @@ extension SwiftNativeTurnEngine {
                     continue
                 }
                 let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink() : nil
-                let (result, isError) = await Self.runSingleDispatch(
+                let (dispatched, result, isError) = await Self.runSingleDispatch(
                     prepared: p, modelId: modelId, surface: surface,
                     personaID: personaID,
                     fluidContextTurn: fluidContextTurn,
                     tools: tools, progress: progress, imageSink: imageSink,
                     cancelFlagPath: cancelFlagPath
                 )
-                await onOutcome(p, result, isError)
+                await onOutcome(dispatched, result, isError)
                 slots.append(DispatchedSlot(
-                    index: idx, prepared: p, result: result, isError: isError,
+                    index: idx, prepared: dispatched, result: result, isError: isError,
                     images: imageSink?.finish(success: !isError && !Task.isCancelled) ?? []
                 ))
 
@@ -426,10 +428,10 @@ extension SwiftNativeTurnEngine {
                 for idx in indices {
                     await onToolUse(prepared[idx])
                 }
-                var outcomes: [Int: (result: JSONValue, isError: Bool, images: [LLMContentBlock])] = [:]
+                var outcomes: [Int: (prepared: PreparedToolCall, result: JSONValue, isError: Bool, images: [LLMContentBlock])] = [:]
                 // Window of maxConcurrentPerIteration: refill on completion.
                 await withTaskGroup(
-                    of: (Int, JSONValue, Bool, [LLMContentBlock]).self
+                    of: (Int, PreparedToolCall, JSONValue, Bool, [LLMContentBlock]).self
                 ) { taskGroup in
                     var iterator = indices.makeIterator()
                     func addNext() -> Bool {
@@ -439,23 +441,23 @@ extension SwiftNativeTurnEngine {
                             // cancelled outcome and keep draining, so no further
                             // dispatch is ever handed to `tools`.
                             if Self.dispatchCancelSignalled(cancelFlagPath) {
-                                outcomes[idx] = (Self.cancelledToolResult(Self.spokenName(p)), true, [])
+                                outcomes[idx] = (p, Self.cancelledToolResult(Self.spokenName(p)), true, [])
                                 continue
                             }
                             if held.contains(idx), let heldResult {
-                                outcomes[idx] = (heldResult, true, [])
+                                outcomes[idx] = (p, heldResult, true, [])
                                 continue
                             }
                             taskGroup.addTask {
                                 let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink() : nil
-                                let (result, isError) = await Self.runSingleDispatch(
+                                let (dispatched, result, isError) = await Self.runSingleDispatch(
                                     prepared: p, modelId: modelId, surface: surface,
                                     personaID: personaID,
                                     fluidContextTurn: fluidContextTurn,
                                     tools: tools, progress: progress, imageSink: imageSink,
                                     cancelFlagPath: cancelFlagPath
                                 )
-                                return (idx, result, isError, imageSink?.finish(success: !isError && !Task.isCancelled) ?? [])
+                                return (idx, dispatched, result, isError, imageSink?.finish(success: !isError && !Task.isCancelled) ?? [])
                             }
                             return true
                         }
@@ -465,8 +467,8 @@ extension SwiftNativeTurnEngine {
                     while started < ParallelToolDispatch.maxConcurrentPerIteration, addNext() {
                         started += 1
                     }
-                    while let (idx, result, isError, images) = await taskGroup.next() {
-                        outcomes[idx] = (result, isError, images)
+                    while let (idx, dispatched, result, isError, images) = await taskGroup.next() {
+                        outcomes[idx] = (dispatched, result, isError, images)
                         _ = addNext()
                     }
                 }
@@ -475,12 +477,13 @@ extension SwiftNativeTurnEngine {
                 // to tool_use blocks by id AND expects consistent ordering.
                 for idx in indices {
                     let outcome = outcomes[idx] ?? (
+                        prepared: prepared[idx],
                         result: JSONValue.object([
                             "error": .string("parallel dispatch produced no result"),
                         ]),
                         isError: true, images: [LLMContentBlock]()
                     )
-                    let p = prepared[idx]
+                    let p = outcome.prepared
                     await onOutcome(p, outcome.result, outcome.isError)
                     slots.append(DispatchedSlot(
                         index: idx, prepared: p,
@@ -495,11 +498,11 @@ extension SwiftNativeTurnEngine {
     nonisolated private static func webReadRecovery(
         _ result: JSONValue, prepared: PreparedToolCall, history: [TurnEngineResult.ToolDispatchRecord]
     ) -> JSONValue {
-        guard ToolNameAliases.ranTool(prepared.internalName, input: prepared.dispatchInput) == "read_page",
+        guard prepared.ranCall.tool == "read_page",
               case .object(var failure) = result, failure["status"] == .string("failed"),
               [.int(402), .int(403)].contains(failure["http_status"] ?? .null),
               case .string(let url)? = failure["url"] else { return result }
-        for call in history.reversed() where ToolNameAliases.ranTool(call.name, input: call.input) == "mcp__searxng-local__search" {
+        for call in history.reversed() where call.ranCall.tool == "mcp__searxng-local__search" {
             guard case .object(let envelope) = call.result, envelope["status"] == .string("ok"),
                   case .object(let search)? = envelope["result"], case .array(let rows)? = search["results"] else { continue }
             let urls = rows.compactMap { row -> String? in
@@ -543,6 +546,7 @@ extension SwiftNativeTurnEngine {
             id: prepared.pairedId,
             name: prepared.internalName,
             input: prepared.dispatchInput,
+            ranCall: prepared.ranCall,
             result: result
         )
         let resultStr: String = {
@@ -558,13 +562,13 @@ extension SwiftNativeTurnEngine {
         }()
         let redactedResultStr = ChatSecretRedactor.redactText(resultStr)
         let providerResultStr = await ProviderToolResultProjection.project(
-            toolName: ToolNameAliases.ranTool(prepared.internalName, input: prepared.dispatchInput),
+            toolName: prepared.ranCall.tool,
             content: redactedResultStr,
             sessionId: sessionId,
             turnId: TurnTraceContext.turnId,
             originalResultClass: ChatToolOutcome.exactResultClass(result),
             query: {
-                let input = ToolNameAliases.ranInput(prepared.internalName, input: prepared.dispatchInput)
+                let input = prepared.ranCall.input
                 if case .string(let query)? = input["query"] { return query }
                 return nil
             }(),
@@ -595,19 +599,21 @@ extension SwiftNativeTurnEngine {
         progress: ChatOrchestrationProgressHandler?,
         imageSink: LocalToolImage.Sink? = nil,
         cancelFlagPath: URL? = nil
-    ) async -> (JSONValue, Bool) {
+    ) async -> (PreparedToolCall, JSONValue, Bool) {
+        var prepared = prepared
+        prepared.ranCall = ToolNameAliases.ranCall(prepared.internalName, input: prepared.dispatchInput)
         let journal = DeskContinuationScope.current
         let step = Self.checkpointStep(prepared)
         do {
             try await journal?.begin(step, peerSources: PeerDataTaint.current?.checkpointSources ?? [])
         } catch {
-            return (.object(["status": .string("failed"), "effects": .string("none"),
+            return (prepared, .object(["status": .string("failed"), "effects": .string("none"),
                 "not_run_status": .string("continuation_refused"), "reason": .string(error.localizedDescription)]), true)
         }
         let outcome = await runCheckpointedDispatchBody(prepared: prepared, modelId: modelId, surface: surface,
             personaID: personaID, fluidContextTurn: fluidContextTurn, tools: tools, progress: progress,
             imageSink: imageSink, cancelFlagPath: cancelFlagPath)
-        guard let journal else { return outcome }
+        guard let journal else { return (prepared, outcome.0, outcome.1) }
         let object: [String: JSONValue]
         if case .object(let fields) = outcome.0 { object = fields } else { object = [:] }
         func text(_ key: String) -> String? {
@@ -615,7 +621,7 @@ extension SwiftNativeTurnEngine {
             return nil
         }
         let owner: String?
-        let ran = ToolNameAliases.ranTool(prepared.internalName, input: prepared.dispatchInput)
+        let ran = prepared.ranCall.tool
         if ran == "bot_run_once", text("requestId") != nil { owner = "helper" }
         else if ran == "workshop_submit", text("id") != nil,
                 ["queued", "running", "pending"].contains(text("status") ?? "") { owner = "workshop" }
@@ -632,10 +638,10 @@ extension SwiftNativeTurnEngine {
                 settled: settled, owner: owner, ownerID: text("id"), requestID: text("requestId"),
                 peerSources: PeerDataTaint.current?.checkpointSources ?? [])
         } catch {
-            return (.object(["status": .string("failed"), "effects": .string("unknown"),
+            return (prepared, .object(["status": .string("failed"), "effects": .string("unknown"),
                 "reason": .string(error.localizedDescription), "receipt": outcome.0]), true)
         }
-        return outcome
+        return (prepared, outcome.0, outcome.1)
     }
 
     /// The checkpoint keeps the same redacted argument summary the transcript
@@ -646,8 +652,8 @@ extension SwiftNativeTurnEngine {
         let input = String(SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(
             tool: prepared.internalName, json: json).prefix(512))
         // app files.write is write_file: its verifier checks the file it wrote.
-        let ran = ToolNameAliases.ranTool(prepared.internalName, input: prepared.dispatchInput)
-        let ranInput = ToolNameAliases.ranInput(prepared.internalName, input: prepared.dispatchInput)
+        let ran = prepared.ranCall.tool
+        let ranInput = prepared.ranCall.input
         var reference: [String: JSONValue]?
         if ran == "write_file", ranInput["append"] != .bool(true),
            case .string(let path)? = ranInput["path"],
@@ -671,8 +677,8 @@ extension SwiftNativeTurnEngine {
         }
         // A folded app action waits as long as the tool it runs.
         let deadlineNanos = ToolDispatchDeadline.timeoutNanos(
-            toolName: ToolNameAliases.ranTool(prepared.internalName, input: prepared.dispatchInput),
-            input: ToolNameAliases.ranInput(prepared.internalName, input: prepared.dispatchInput),
+            toolName: prepared.ranCall.tool,
+            input: prepared.ranCall.input,
             surface: surface
         )
         do {

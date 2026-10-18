@@ -24,8 +24,9 @@ actor TurnCheckpointWriter {
         pendingCalls = record.runningStep == nil ? 0 : 1
     }
 
-    func capture(prose: String, commentaryCharacters: Int, conversation: [LLMMessage],
+    func capture(prose: String, commentaryCharacters: Int, conversation: [LLMMessage], log: [JSONValue],
                  startingCalls: Int = 0) throws {
+        record.log = log
         record.keptProse = prose
         record.workingCommentaryCharacters = commentaryCharacters
         record.workingNotes = conversation.flatMap(\.content).compactMap { block -> String? in

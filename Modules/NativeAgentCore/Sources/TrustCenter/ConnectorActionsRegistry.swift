@@ -56,6 +56,13 @@ public struct ConnectorActionDescriptor: Codable, Sendable, Equatable {
 // though the descriptors were valid.
 public let connectorActionDescriptorsCount: Int = connectorActionDescriptors().count
 
+/// Credential-bearing API destinations. OAuth and login hosts are not API reach.
+public let connectorAPIHosts: [String: Set<String>] = [
+    "gmail": ["gmail.googleapis.com"], "calendar": ["www.googleapis.com", "calendar.googleapis.com"],
+    "notion": ["api.notion.com"], "slack": ["slack.com"],
+    "x": ["api.twitter.com", "api.x.com"], "github": ["api.github.com"],
+]
+
 // MARK: - JSONValue helpers (file-local, schema-building only)
 
 private func schema(_ properties: [(String, JSONValue)], required: [String] = []) -> JSONValue {

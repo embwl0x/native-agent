@@ -317,9 +317,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
     /// holds fails here with the holder's name (clients read the descriptor,
     /// so nothing else would say why they can't connect).
     private func bridgesDoctorCoverageCheck() async -> CheckResult {
-        // `expected`: ClaudeBridge and the browser IPC are always resident;
-        // MacControlBridge only when Mac control is enabled. Expected but
-        // down = its startup failed.
+        // Expected but down means the bridge's startup failed.
         let bridges = await port.doctorBridgeSnapshots()
         var failures: [String] = []
         var warnings: [String] = []

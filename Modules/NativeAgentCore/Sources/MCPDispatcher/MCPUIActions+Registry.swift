@@ -91,8 +91,8 @@ extension MCPUIActions {
 
     /// Live tool list for a server (the shared stdio pool on demand, cached
     /// 60 s). The input schema rides through so the Hub can build its form.
-    public static func listTools(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> [MCPTool] {
-        try await dispatcher.listToolsLive(forServer: serverId).compactMap { entry in
+    public static func listTools(serverId: String, dispatcher: SwiftNativeMCPDispatcher, cached: Bool = true) async throws -> [MCPTool] {
+        try await dispatcher.listToolsLive(forServer: serverId, cached: cached).compactMap { entry in
             guard case .object(let obj) = entry, case .string(let name) = obj["name"] ?? .null else { return nil }
             var desc: String? = nil
             if case .string(let s) = obj["description"] ?? .null { desc = s }
@@ -103,8 +103,8 @@ extension MCPUIActions {
     }
 
     /// Live resource list for a server — the same caching contract as `listTools`.
-    public static func listResources(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> [MCPResource] {
-        try await dispatcher.listResourcesLive(forServer: serverId).compactMap { entry in
+    public static func listResources(serverId: String, dispatcher: SwiftNativeMCPDispatcher, cached: Bool = true) async throws -> [MCPResource] {
+        try await dispatcher.listResourcesLive(forServer: serverId, cached: cached).compactMap { entry in
             guard case .object(let obj) = entry, case .string(let uri) = obj["uri"] ?? .null else { return nil }
             var name: String? = nil
             if case .string(let s) = obj["name"] ?? .null { name = s }
@@ -114,40 +114,53 @@ extension MCPUIActions {
         }
     }
 
-    public static func warmMCPServer(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> MCPSessionStatus {
-        _ = try await dispatcher.listToolsLive(forServer: serverId, cached: false)
-        return try await sessionStatus(serverId: serverId, dispatcher: dispatcher)
-    }
+    public enum ServerCommand: String, Sendable { case warm, restart, refresh }
 
-    public static func restartMCPServer(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> MCPSessionStatus {
-        await dispatcher.stopSubprocess(serverId: serverId)
-        _ = try await dispatcher.listToolsLive(forServer: serverId, cached: false)
-        return try await sessionStatus(serverId: serverId, dispatcher: dispatcher)
-    }
+    public struct ServerCommandResult: Sendable {
+        public let server: MCPServer
+        public let command: ServerCommand
+        public let tools: [MCPTool]
+        public let resources: Result<[MCPResource], Error>
+        public let sessions: Result<[MCPSessionStatus], Error>
 
-    public static func refreshMCPCache(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> MCPSessionStatus {
-        _ = try await dispatcher.listToolsLive(forServer: serverId, cached: false)
-        _ = try? await dispatcher.listResourcesLive(forServer: serverId, cached: false)
-        return try await sessionStatus(serverId: serverId, dispatcher: dispatcher)
-    }
-
-    private static func sessionStatus(serverId: String, dispatcher: SwiftNativeMCPDispatcher) async throws -> MCPSessionStatus {
-        let rows = try await dispatcher.listSessions()
-        if let row = rows.first(where: { $0.serverId == serverId }) {
-            return row
+        public var detail: String {
+            let completed: String
+            switch command {
+            case .warm: completed = "MCP warmed"
+            case .restart: completed = "MCP restarted"
+            case .refresh: completed = "MCP cache refreshed"
+            }
+            if case .success = resources, case .success = sessions {
+                let refreshed = command == .refresh ? "MCP cache" : completed
+                return "\(refreshed) and details refreshed: \(server.name)"
+            }
+            return "\(completed), but details could not refresh: \(server.name)"
         }
-        return MCPSessionStatus(
-            id: serverId,
-            serverId: serverId,
-            serverName: nil,
-            transport: nil,
-            status: "idle",
-            healthStatus: "not_checked",
-            toolCount: 0,
-            resourceCount: 0,
-            lastWarmedAt: nil,
-            lastError: nil
-        )
+
+        public var toolResult: JSONValue {
+            var errors: [String: JSONValue] = [:]
+            if case .failure(let error) = resources { errors["resources"] = .string(error.localizedDescription) }
+            if case .failure(let error) = sessions { errors["sessions"] = .string(error.localizedDescription) }
+            return .object([
+                "server_id": .string(server.id), "command": .string(command.rawValue), "detail": .string(detail),
+                "status": .string(errors.isEmpty ? "ok" : "partial"),
+                "command_completed": .bool(true), "inventory_errors": .object(errors)
+            ])
+        }
+    }
+
+    /// Command completion and inventory reads remain distinct, independent of UI selection.
+    public static func runServerCommand(_ command: ServerCommand, server: MCPServer, dispatcher: SwiftNativeMCPDispatcher) async throws -> ServerCommandResult {
+        let serverId = server.id
+        if command == .restart { await dispatcher.stopSubprocess(serverId: serverId) }
+        let tools = try await listTools(serverId: serverId, dispatcher: dispatcher, cached: false)
+        let resources: Result<[MCPResource], Error>
+        do { resources = .success(try await listResources(serverId: serverId, dispatcher: dispatcher, cached: command != .refresh)) }
+        catch { resources = .failure(error) }
+        let sessions: Result<[MCPSessionStatus], Error>
+        do { sessions = .success(try await dispatcher.listSessions()) }
+        catch { sessions = .failure(error) }
+        return ServerCommandResult(server: server, command: command, tools: tools, resources: resources, sessions: sessions)
     }
 
     public static func revokeConsent(id: String, serverId: String?, toolName: String?, dispatcher: SwiftNativeMCPDispatcher) async throws -> MCPConsentRecord {

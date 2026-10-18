@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import ChatOrchestration
 import MacIntegration
@@ -95,6 +96,7 @@ public enum InlineInteractionResolver {
     /// none, which is what makes a leftover `.claimed` on disk provably
     /// stranded rather than possibly live.
     private static var resumesInFlight: Set<String> = []
+    private static var waitingHosts: Set<String> = []
     /// Continuations whose blocked call this PROCESS has already replayed,
     /// keyed on `resumeRunId`. The durable checkpoint on the row is the
     /// authority across launches; this is what makes the window between the
@@ -186,6 +188,26 @@ public enum InlineInteractionResolver {
         await interactions(sessionID: sessionID, dataRoot: dataRoot).first { $0.id == id }
     }
 
+    /// The session a card lives in: the one given, or, when that session only
+    /// holds a mirror of the card (the inbox names the mirror's session), the
+    /// session the mirror points back to. Settling writes there and nowhere else.
+    public static func homeSession(
+        id: String,
+        sessionID: String,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> String {
+        guard let rows = try? await checkedRows(sessionID, dataRoot) else { return sessionID }
+        if rows.contains(where: { interaction(in: $0)?.id == id }) { return sessionID }
+        for row in rows {
+            guard case .object(let object) = row, case .object(let metadata)? = object["metadata"],
+                  metadata["kind"] == .string("interaction_mirror"), metadata["interactionId"] == .string(id),
+                  case .string(let home)? = metadata["interactionSessionId"], !home.isEmpty, home != sessionID
+            else { continue }
+            return home
+        }
+        return sessionID
+    }
+
     /// Every interaction in a session PAIRED WITH THE TRANSCRIPT ROW it was
     /// raised on. The card belongs under that row and nowhere else, so the
     /// renderer needs the row identity the reader is scrolling past — not just
@@ -239,6 +261,65 @@ public enum InlineInteractionResolver {
 
     // MARK: - Raising without a turn
 
+    /// The same card, with its answer returned to the part already running.
+    public static func waitForAnswer(_ interaction: InlineInteraction, tool: String, input: [String: JSONValue],
+                                     sessionID: String, dataRoot: URL) async -> JSONValue {
+        waitingHosts.insert(interaction.id)
+        defer { waitingHosts.remove(interaction.id) }
+        let changes = NotificationCenter.default.notifications(named: InlineInteractionWire.changedNotification)
+            .compactMap { $0.object as? String }
+        var card = interaction
+        // Titled once, when first raised: an outer layer seeing the same card keeps its title.
+        if let requester = SkillRunContext.requester,
+           await Self.interaction(id: interaction.id, sessionID: sessionID, dataRoot: dataRoot) == nil {
+            card.title = "\(requester) wants to ask: \(card.title)"
+        }
+        let blocked = InlineInteractionNeed.blocksTurn(interaction)
+            && ToolNameAliases.ranTool(tool, input: input) != InlineInteractionWire.toolName
+        let arguments = try? JSONValue.object(input).serialize(pretty: false)
+        guard !blocked || arguments.map({
+            SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(tool: tool, json: $0) == $0
+        }) == true else {
+            return .object(["status": .string("failed"), "reason": .string("invalid_args"), "effects": .string("none"),
+                "detail": .string("This card holds the turn and replays the call once answered, and the call's arguments would not be saved whole: they carry a secret or run past 4,000 characters. Nothing was asked; call again with no secret in the arguments and under that length.")])
+        }
+        guard let raised = await raise(card, sessionID: sessionID, resumable: blocked,
+            toolName: blocked ? tool : nil, toolArgumentsJSON: blocked ? arguments : nil,
+            toolCallId: blocked ? UUID().uuidString : nil,
+            origin: TurnEnvelope.current(surface: ChatToolSessionContext.envelope?.surface ?? "chat"), dataRoot: dataRoot) else {
+            return .object(["status": .string("failed"), "reason": .string("card_unavailable"),
+                "detail": .string("The card could not be saved; nothing was answered.")])
+        }
+        if !InlineInteractionNeed.blocksTurn(raised) { return InlineInteractionNeed.envelope(raised) }
+        func answer() async -> InlineInteraction? {
+            guard let current = await Self.interaction(id: raised.id, sessionID: sessionID, dataRoot: dataRoot),
+                  current.state.isTerminal, current.state.failureReason == nil else { return nil }
+            return current
+        }
+        let current: InlineInteraction? = await TurnDeadline.withHumanWait {
+            if let result = await answer() { return result }
+            for await changed in changes where changed == sessionID {
+                if let result = await answer() { return result }
+            }
+            return InlineInteraction?.none
+        }
+        guard let current, !Task.isCancelled else {
+            await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: dataRoot)
+            return .object(["status": .string("failed"), "reason": .string("cancelled"),
+                "detail": .string("The turn stopped while waiting for the card.")])
+        }
+        if blocked, current.state.outcome != nil {
+            return await resumeUnderPeerProvenance(current, sessionID: sessionID, dataRoot: dataRoot)
+                ?? .object(["status": .string("failed"), "reason": .string("continuation_refused"),
+                    "detail": .string("The blocked call could not resume; check its card before continuing.")])
+        }
+        if blocked { await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: dataRoot) }
+        guard case .object(var receipt) = receiptEnvelope(current) else { return receiptEnvelope(current) }
+        if case .declined = current.state { receipt["reason"] = .string("declined"); receipt["effects"] = .string("none") }
+        if let choice = current.state.outcome?.selection { receipt["answer"] = .string(choice) }
+        return .object(receipt)
+    }
+
     /// Persist a card for a request that never reached the engine.
     ///
     /// Every other need is raised BY a tool, so the tool-receipt writer puts
@@ -262,17 +343,23 @@ public enum InlineInteractionResolver {
         sessionID: String,
         resumeText: String? = nil,
         resumable: Bool = true,
+        toolName: String? = nil,
+        toolArgumentsJSON: String? = nil,
+        toolCallId: String? = nil,
+        origin: TurnEnvelope? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> InlineInteraction? {
-        var stamped = interaction
+        var stamped = SwiftNativeChatOrchestrationClient.scrubbedCardDisplay(interaction)
         let resumeRunId = "interaction-\(stamped.id)"
         let steer = PeerDataTaint.carried(
             peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: ChatToolSessionContext.envelope?.surface ?? "chat"),
             peerID: ChatToolSessionContext.envelope?.verifiedUserId
         )
         var continuation = InlineInteraction.Continuation(
-            toolName: nil,
-            mode: .continueTurn,
+            toolCallId: toolCallId,
+            toolName: toolName,
+            toolArgumentsJSON: toolArgumentsJSON,
+            mode: toolName == nil ? .continueTurn : .retryBlockedTool,
             state: resumable ? .waiting : .invalidated,
             resumeRunId: resumeRunId,
             resumeText: resumeText,
@@ -289,14 +376,14 @@ public enum InlineInteractionResolver {
                 sessionID: sessionID,
                 interactionID: stamped.id,
                 continuation: continuation,
-                originEnvelope: nil,
+                originEnvelope: origin,
                 interaction: stamped
             )
         )
         stamped.continuation = continuation
         guard let encoded = InlineInteractionNeed.encode(stamped) else { return nil }
         let envelope = receiptEnvelope(stamped)
-        let metadata: [String: JSONValue] = [
+        var metadata: [String: JSONValue] = [
             "kind": .string(InlineInteractionWire.transcriptKind),
             "toolName": .string(InlineInteractionWire.toolName),
             "inputJSON": .string("{}"),
@@ -306,6 +393,7 @@ public enum InlineInteractionResolver {
             InlineInteractionWire.metadataKey: encoded,
             "interactionId": .string(stamped.id),
         ]
+        if let origin { metadata["envelope"] = origin.persistedMetadata() }
         let row: JSONValue = .object([
             "id": .string(UUID().uuidString.lowercased()),
             "sessionId": .string(sessionID),
@@ -713,16 +801,8 @@ public enum InlineInteractionResolver {
             let granted = (try? await store.currentChecked()) ?? [:]
             var missing: [String] = []
             for capability in interaction.allTargets {
-                if capability == "applescript" {
+                if capability == "applescript" || capability == "automation" {
                     return .failure("Automation consent is per app. Request permission with target applescript:<bundle_id>.")
-                }
-                if let bundleID = SystemAppleScriptAdapter.automationTarget(capability) {
-                    let permission = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID)
-                    if case .object(let fields) = permission, fields["state"] == .string("allowed") {
-                        continue
-                    } else {
-                        return .failure((try? permission.serialize(pretty: false)) ?? "Automation consent unavailable.")
-                    }
                 }
                 if InlineInteractionRegistry.isMacControlCategory(capability) {
                     if !InlineInteractionRegistry.macControlCategoryAllowed(
@@ -732,6 +812,8 @@ public enum InlineInteractionResolver {
                     }
                     continue
                 }
+                if !MacIntegrationID.all.contains(capability),
+                   SystemPermissionPreflight.cardSettingsCapability(capability) != nil { continue }
                 let permission = granted[capability]
                 // Only the axis that was asked for. A read need settles on
                 // read; it does not wait for a write the card never requested,
@@ -761,7 +843,7 @@ public enum InlineInteractionResolver {
                     "Still not allowed: \(InlineInteractionRegistry.englishList(names))."
                 )
             }
-            if let blocked = platform.cardBlockReason(interaction.allTargets, mode: interaction.mode) {
+            if let blocked = await platform.cardBlockReason(interaction.allTargets, mode: interaction.mode) {
                 return .failure(blocked)
             }
             let names = interaction.allTargets.map {
@@ -848,7 +930,7 @@ public enum InlineInteractionResolver {
             else {
                 return .failure("\(flag.displayName) is still off.")
             }
-            if let blocked = platform.cardBlockReason([flag.id], mode: nil) {
+            if let blocked = await platform.cardBlockReason([flag.id], mode: nil) {
                 return .failure(blocked)
             }
             return .success(.init(
@@ -882,7 +964,9 @@ public enum InlineInteractionResolver {
         sessionID: String,
         dataRoot: URL
     ) async {
-        guard interaction.continuation?.state == .waiting,
+        // A live host claims its own continuation in the originating task.
+        guard !waitingHosts.contains(interaction.id),
+              interaction.continuation?.state == .waiting,
               interaction.continuation?.resumedByTurnId == nil,
               !resumesInFlight.contains(interaction.id) else { return }
         let sources = interaction.continuation?.peerSources ?? [PeerDataTaint.unrecorded]
@@ -894,7 +978,7 @@ public enum InlineInteractionResolver {
         for source in sources { taint.mark(peer: source) }
         for source in elevated { taint.markElevated(peer: source) }
         await PeerDataTaint.$current.withValue(taint) {
-            await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot)
+            _ = await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot)
         }
     }
 
@@ -902,8 +986,8 @@ public enum InlineInteractionResolver {
         _ interaction: InlineInteraction,
         sessionID: String,
         dataRoot: URL
-    ) async {
-        guard var continuation = interaction.continuation else { return }
+    ) async -> JSONValue? {
+        guard var continuation = interaction.continuation else { return nil }
         // One continuation, one resume — whichever half of the fork took it.
         // `.waiting` is the durable claim; `resumedByTurnId` is the hand-back's
         // own mark (a turn already carries this card, so nothing may start a
@@ -912,7 +996,7 @@ public enum InlineInteractionResolver {
         guard continuation.state == .waiting,
               continuation.resumedByTurnId == nil,
               !resumesInFlight.contains(interaction.id)
-        else { return }
+        else { return nil }
 
         // Reserved BEFORE the first await. The check above and this insert ran
         // in one main-actor step, so a second caller holding the same stale row
@@ -939,7 +1023,7 @@ public enum InlineInteractionResolver {
             )
         } catch {
             nativeLog("[interaction] resume claim failed for \(interaction.id): \(error)")
-            return
+            return nil
         }
 
         // The envelope of the turn that raised the card. Both halves of the
@@ -977,7 +1061,7 @@ public enum InlineInteractionResolver {
                         + "Sign in from the phone again, then Try again.",
                     dataRoot: dataRoot
                 )
-                return
+                return nil
             }
             origin = origin.map {
                 TurnEnvelope(
@@ -1005,6 +1089,7 @@ public enum InlineInteractionResolver {
         // to `waiting` so the person can tap again — without the checkpoint,
         // that second tap would make the same call to the world a second time.
         var replayedResult: String? = claimed.continuation?.replayedResult
+        var hostResult: JSONValue?
         var replayed = claimed.continuation?.replayedAt != nil
         if !replayed,
            claimed.state.outcome != nil,
@@ -1049,11 +1134,12 @@ public enum InlineInteractionResolver {
                     reason: "Couldn't record that the \(toolName) call was about to run, so it wasn't made. Try again.",
                     dataRoot: dataRoot
                 )
-                return
+                return nil
             }
             if let resumeRunId { replayedResumeRunIds.insert(resumeRunId) }
             switch await replayBlockedTool(toolName, arguments, sessionID, origin) {
             case .dispatched(let result):
+                hostResult = result.flatMap { try? JSONValue.parse(Data($0.utf8)) }
                 // The SAME redaction and bound the transcript's own tool
                 // receipt gets. This result is persisted on the card's
                 // continuation and fed to the resumed turn's prompt, and a
@@ -1084,7 +1170,7 @@ public enum InlineInteractionResolver {
                         reason: "The \(toolName) call ran, but recording it failed. Try again.",
                         dataRoot: dataRoot
                     )
-                    return
+                    return nil
                 }
             case .failed(let reason):
                 // Nothing ran, so the in-process guard is released too, and
@@ -1108,6 +1194,20 @@ public enum InlineInteractionResolver {
                 // is free to replay it for real.
                 nativeLog("[interaction] replay of \(toolName) did not run for \(interaction.id): \(reason)")
             }
+            }
+        }
+
+        if waitingHosts.contains(claimed.id) {
+            guard replayed, let hostResult else { return nil }
+            var handed = claimed
+            handed.continuation?.state = .resumed
+            handed.continuation?.resumedByTurnId = TurnTraceContext.turnId
+            do {
+                try await persistTransition(handed, from: .claimed, sessionID: sessionID, dataRoot: dataRoot)
+                return hostResult
+            } catch {
+                nativeLog("[interaction] host reply record failed for \(interaction.id): \(error)")
+                return nil
             }
         }
 
@@ -1181,15 +1281,15 @@ public enum InlineInteractionResolver {
                         + "running, so it wasn't. Try again.",
                     dataRoot: dataRoot
                 )
-                return
+                return nil
             }
             handBacks[interaction.id] = prompt
-            return
+            return nil
         }
 
         guard let startTurn else {
             nativeLog("[interaction] no turn starter installed; \(interaction.id) settled without resuming")
-            return
+            return nil
         }
         // The pre-admission marker, written DURABLY before the turn starts —
         // the SAME `.replaying` marker used before a dispatch, and for the
@@ -1215,7 +1315,7 @@ public enum InlineInteractionResolver {
                     + "Try again.",
                 dataRoot: dataRoot
             )
-            return
+            return nil
         }
         let admitted = await InlineInteractionModelOverride.$current.withValue(binding) {
             // Ordinary turn admission, ordinary gate. Nothing about having
@@ -1258,7 +1358,7 @@ public enum InlineInteractionResolver {
                 reason: "That couldn't be continued just now. Try again.",
                 dataRoot: dataRoot
             )
-            return
+            return nil
         }
         // `resumed` is a claim about the world, so it is written only when the
         // world agrees.
@@ -1280,6 +1380,7 @@ public enum InlineInteractionResolver {
                 dataRoot: dataRoot
             )
         }
+        return nil
     }
 
     /// A `.claimed` continuation that never reached `.resumed` is stranded: the

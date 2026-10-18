@@ -30,16 +30,8 @@ extension MacAppleScriptBridge {
                 return .object(["status": .string("completed"), "count": .int(1),
                     "messages": .array([.object(row)]), "scope": .string(scope), "detail": .bool(true)])
             }
-            let script = mailWorkspaceScript(input: input)
-            let raw: String
-            do {
-                try Task.checkCancellation()
-                raw = try await runAppleScript(script, bundleID: "com.apple.mail")
-            } catch let error as NSError where error.domain == "NativeAgentAppleScript" && [-1712, -1001, SystemAppleScriptAdapter.appleScriptOutcomeUnknownCode].contains(error.code) {
-                // Only this read retries, once, with the same paired identity and time bounds.
-                try Task.checkCancellation()
-                raw = try await runAppleScript(script, bundleID: "com.apple.mail")
-            }
+            try Task.checkCancellation()
+            let raw = try await runAppleScript(mailWorkspaceScript(input: input), bundleID: "com.apple.mail")
             if let setup = readSetupEnvelope(raw: raw, integration: "mail") { return setup }
             if raw == "__MESSAGE_CHANGED__" {
                 return .object(["status": .string("failed"), "integration": .string("mail"),
@@ -60,8 +52,11 @@ extension MacAppleScriptBridge {
             return deniedEnvelope(integration: "mail", app: app)
         } catch let error as NSError where error.domain == "NativeAgentAppleScript" && [-1712, -1001, SystemAppleScriptAdapter.appleScriptOutcomeUnknownCode].contains(error.code) {
             // A read changes nothing, so the "outcome unknown" caution for sends does not apply.
+            // One attempt per request: an immediate rerun would wait on the same dialog or busy Mail.
+            let observed = (error.userInfo["observation"] as? String).map { " " + $0 } ?? ""
             return .object(["status": .string("failed"), "integration": .string("mail"), "error_code": .int(Int64(error.code)),
-                "error": .string("Mail did not answer within two bounded read attempts (it may be busy syncing). Nothing was changed. Let Mail finish syncing, then call mail_list_recent again; for a message body, use the scope, identifiers and position from a fresh row.")])
+                "reason": .string(error.userInfo["state"] as? String ?? "app_timeout"),
+                "error": .string("Mail did not answer this read in time (it may be showing a dialog or busy syncing).\(observed) Nothing was changed. When Mail is ready, call mail_list_recent again; for a message body, use the scope, identifiers and position from a fresh row.")])
         } catch { return failedEnvelope(integration: "mail", error: error) }
     }
 

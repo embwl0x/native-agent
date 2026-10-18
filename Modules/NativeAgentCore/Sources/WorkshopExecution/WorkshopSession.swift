@@ -238,44 +238,6 @@ public struct WorkshopSession: Sendable {
     }
 }
 
-/// Workshop-local autonomy policy. The ordinary SecurityCenter and file-access
-/// wrappers remain active; this resolver only prevents the generic chat policy
-/// from reclassifying the already-hard-ceilinged profile as an approval lane.
-/// A future tool remains denied until it is deliberately added to the profile.
-public struct WorkshopAutonomyResolver: AutonomyResolver {
-    let base: any AutonomyResolver
-
-    public init(base: any AutonomyResolver) {
-        self.base = base
-    }
-
-    public func autonomyLevel(forTool toolName: String, surface: String) async throws -> String {
-        // Reader seam: a turn may still arrive carrying the 0.3.x `missions`
-        // surface. Deny-by-default here means an unfolded spelling would refuse
-        // every Workshop tool, so fold before the membership test.
-        guard WorkshopSurfaceVocabulary.isWorkshopSurface(surface),
-              WorkshopToolProfile.isPermitted(toolName) else {
-            return "deny"
-        }
-        // These three capabilities are implemented entirely inside the
-        // handle-scoped Workshop profile. They never reach the generic
-        // dispatcher, so an owner policy that quite correctly denies unknown
-        // global tool names must not make the private membrane unusable.
-        if [
-            WorkshopToolProfile.artifactToolName,
-            WorkshopToolProfile.artifactReadToolName,
-            WorkshopToolProfile.progressToolName,
-        ].contains(toolName) {
-            return "auto"
-        }
-        let ownerPolicy = try await base.autonomyLevel(forTool: toolName, surface: surface)
-        if ownerPolicy == "deny" || ownerPolicy == "blocked" {
-            return ownerPolicy
-        }
-        return "auto"
-    }
-}
-
 /// Cross-process, one-shot authorization claim for a Desk work reservation.
 /// The file's existence is the authorization ledger: creation is atomic and
 /// its payload is fsync'd before the LLM boundary. Malformed/pre-existing files

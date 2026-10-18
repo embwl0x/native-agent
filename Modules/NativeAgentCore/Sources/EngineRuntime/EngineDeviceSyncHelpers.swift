@@ -72,7 +72,7 @@ extension NativeAgentEngine {
             case "interval":
                 guard let hours = Double(edit.hours), hours.isFinite, hours > 0 else { throw HelperRemoteError.invalid }
                 bot.cadence = .interval(seconds: hours * 3600)
-            case "cron": bot.cadence = .cron(expression: edit.cron, timeZone: edit.timeZone)
+            case "cron": bot.cadence = .cron(expression: edit.cron, timeZone: BotCadence.setZone(edit.timeZone))
             case "event":
                 guard let source = BotEventSource(rawValue: edit.eventSource),
                       !edit.eventFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HelperRemoteError.invalid }
@@ -130,7 +130,7 @@ extension NativeAgentEngine {
         switch bot.cadence {
         case .manual: edit.timing = "manual"
         case .interval(let seconds): edit.timing = "interval"; edit.hours = String(seconds / 3600)
-        case .cron(let expression, let zone): edit.timing = "cron"; edit.cron = expression; edit.timeZone = zone
+        case .cron(let expression, let zone): edit.timing = "cron"; edit.cron = expression; edit.timeZone = zone ?? ""
         }
         if let trigger = bot.eventTrigger {
             edit.timing = "event"; edit.eventSource = trigger.source.rawValue

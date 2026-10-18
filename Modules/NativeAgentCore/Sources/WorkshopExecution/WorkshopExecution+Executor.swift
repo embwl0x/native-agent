@@ -5,6 +5,8 @@ import NativeAgentCore
 import Desk
 import ApprovalInbox
 import TrustCenter
+import MacIntegration
+import ToolRegistry
 
 // MISSIONS EXECUTOR PORT (2026-06-10) — docs/build_plans/missions-executor-port.md
 //
@@ -884,39 +886,51 @@ public actor WorkshopExecutorLoop {
 
     // MARK: step execution (port of execute_step + _dispatch_step)
 
+    /// Step kinds that are a model turn, not a tool call; their own tool calls
+    /// pass the gated chain one by one.
+    static let llmStepKinds: Set<String> = ["chat.synthesize", "llm", "report"]
+
     /// `bypassApproval` is the resume-after-approval path's "user approved
     /// this exact step" replay — the only caller that may skip the gate.
     private func executeStep(execution: WorkshopExecutionRecord, step: WorkshopExecutionStep, bypassApproval: Bool) async -> WorkshopStepOutcome {
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
-        // Approval gate (v1 reduced rule per the build plan): the execution's
-        // trustRequired escalates every step; a step may also mark itself.
-        // YOLO: under wide-open trust stepApprovalEnforced() is false, so the
-        // planner, intrinsic tool tier, and explicit per-execution
-        // trustRequired do NOT gate. Hard domain/tool refusals still happen in
-        // the injected dispatcher at effect time.
+        // Approval gate: the permission law answers this step's tool as it
+        // answers chat, so a step it asks for waits on a card here, a
+        // destructive one even under Full Mac. Below Full Mac the execution's
+        // trustRequired and a step's own needs_approval also ask; under
+        // wide-open trust stepApprovalEnforced() is false and they do not.
+        // Hard domain/tool refusals still happen in the injected dispatcher at
+        // effect time.
         let enforceStepAutonomy = await stepApprovalEnforced()
-        // Non-yolo: the planner's per-step autonomy_hint must NOT be able to
-        // downgrade a tool that intrinsically needs approval. A sloppy/compromised
-        // planner marking email.send / calendar.cancel_event / *.send as "auto"
-        // would otherwise fire it unattended. Enforce the tool's intrinsic
-        // autonomy from DefaultToolAutonomy — but ONLY for KNOWN tools (explicit
-        // map entry/glob). Unknown tools are left to reach dispatch and fail
-        // honestly (no dispatcher → "no tool dispatcher wired"), which is why the
-        // earlier blanket version was reverted: resolve() returns send_approval
-        // for the "default" fallback, so it force-gated every unknown tool.
-        // YOLO (enforceStepAutonomy == false) is exempt by design — "she does
-        // everything" unattended (2026-06-15, re-applies the reverted HIGH).
-        let toolIntrinsicGate: Bool = {
-            guard enforceStepAutonomy else { return false }
-            guard DefaultToolAutonomy.hasKnownEntry(step.toolOrAction) else { return false }
-            return DefaultToolAutonomy.needsApproval(
-                DefaultToolAutonomy.resolve(toolId: step.toolOrAction))
-        }()
-        let needsApproval = !bypassApproval && enforceStepAutonomy
-            && (execution.trustRequired != "none"
-                || step.autonomy == "needs_approval"
-                || toolIntrinsicGate)
+        var law = "auto"
+        let stepArgs: [String: JSONValue] = if case .object(let args) = Self.resolveStepReferences(in: step.args, execution: execution) { args } else { [:] }
+        // The call that actually runs: a folded door action is its tool, as
+        // the gate resolves it. It is judged, carded and replayed as itself.
+        let call = ToolNameAliases.ranCall(step.toolOrAction, input: stepArgs)
+        if !bypassApproval, !Self.llmStepKinds.contains(step.toolOrAction) {
+            do {
+                law = try await SwiftNativeTrustCenter(dataRoot: root).autonomyLevel(forTool: call.tool, input: call.input)
+            } catch {
+                return WorkshopStepOutcome(stepId: step.id, status: "failed",
+                    error: "Trust could not be read, so \(step.toolOrAction) did not run: \(error.localizedDescription)", executedAt: nowStr)
+            }
+        }
+        if ["blocked", "deny"].contains(law) {
+            return WorkshopStepOutcome(stepId: step.id, status: "failed",
+                error: "Trust refuses \(step.toolOrAction) in User's current posture; nothing ran.", executedAt: nowStr)
+        }
+        let needsApproval = !bypassApproval
+            && (law != "auto" || enforceStepAutonomy && (execution.trustRequired != "none" || step.autonomy == "needs_approval"))
         if needsApproval {
+            // A switch User turned off refuses before any card, as the chat gate does.
+            do {
+                if let refusal = try await MacIntegrationGates.refusal(tool: call.tool, dataRoot: root) {
+                    return WorkshopStepOutcome(stepId: step.id, status: "failed", error: refusal, executedAt: nowStr)
+                }
+            } catch {
+                return WorkshopStepOutcome(stepId: step.id, status: "failed",
+                    error: "Mac Integration could not be read, so \(step.toolOrAction) did not run: \(error.localizedDescription)", executedAt: nowStr)
+            }
             guard let stageApproval else {
                 // No stager injected → FAIL honestly. Blocking forever on an
                 // approval that was never filed is the dead-end the W6 audit
@@ -933,9 +947,9 @@ public actor WorkshopExecutorLoop {
                 taskTitle: execution.title,
                 actionDescription: step.description,
                 title: "Workshop step approval: \(step.description)",
-                tool: step.toolOrAction,
-                reason: "Workshop trust=\(execution.trustRequired); step autonomy=\(step.autonomy); tool=\(step.toolOrAction)",
-                args: Self.resolveStepReferences(in: step.args, execution: execution)
+                tool: call.tool,
+                reason: "Workshop trust=\(execution.trustRequired); step autonomy=\(step.autonomy); tool=\(call.tool)",
+                args: .object(call.input)
             )
             guard let approvalId = await stageApproval(request) else {
                 return WorkshopStepOutcome(
@@ -1070,13 +1084,18 @@ public actor WorkshopExecutorLoop {
                     // (or a literal "<...>" placeholder) lands in the file
                     // verbatim (2026-06-15). Pure on the no-token path.
                     let result: JSONValue
+                    var call = (tool: tool, args: resolvedArgs)
+                    if case .object(let fields) = resolvedArgs {
+                        let ran = ToolNameAliases.ranCall(tool, input: fields)
+                        call = (ran.tool, .object(ran.input))
+                    }
                     if let approvalId {
                         guard let approvedToolDispatch else {
                             throw WorkshopExecutionError.forbidden("approved tool dispatcher unavailable")
                         }
-                        result = try await approvedToolDispatch(tool, resolvedArgs, approvalId)
+                        result = try await approvedToolDispatch(call.tool, call.args, approvalId)
                     } else {
-                        result = try await toolDispatch(tool, resolvedArgs)
+                        result = try await toolDispatch(call.tool, call.args)
                     }
                     try binding?.validateAfterDispatch(tool: tool, result: result)
                     let resultState = Self.toolStepResultState(result)
@@ -1165,7 +1184,7 @@ public actor WorkshopExecutorLoop {
         executionId: String, step: WorkshopExecutionStep, outcome: WorkshopStepOutcome
     ) async {
         let tool = step.toolOrAction
-        guard tool == "chat.synthesize" || tool == "llm" || tool == "report" else { return }
+        guard Self.llmStepKinds.contains(tool) else { return }
         let ts = SwiftNativeWorkshopRunner.isoTimestamp(now())
         if outcome.status == "failed",
            case .object(let o) = outcome.output,

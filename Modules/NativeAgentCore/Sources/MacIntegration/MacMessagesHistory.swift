@@ -1,10 +1,18 @@
 import Foundation
+import Darwin
 import SQLite3
 import PersistenceCore
 
 /// A small, read-only window into Messages' own conversations and history.
 /// No transcript cache, database copy, background scan or archived-object instantiation.
 enum MacMessagesHistory {
+    static var hasAccess: Bool {
+        let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Messages").path
+        guard let directory = opendir(path) else { return false }
+        defer { closedir(directory) }
+        return true
+    }
+
     /// chat.db opened read-only for one read, with a 2 s budget that
     /// interrupts any statement still running past it.
     private final class Budget {

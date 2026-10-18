@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import AgentWorkspace
 import ChatToolParsing
 import Foundation
@@ -40,7 +41,7 @@ public enum ToolArguments {
         "mail_reply": ["message_id", "position"], "mail_draft": ["message_id", "position"], "messages_recent_threads": ["before_message_id"],
     ]
 
-    public static func normalized(_ input: [String: JSONValue], schema: JSONValue, positiveOnly: Set<String> = []) -> [String: JSONValue] {
+    public static func normalized(_ input: [String: JSONValue], schema: JSONValue, positiveOnly: Set<String> = [], preserving: Set<String> = []) -> [String: JSONValue] {
         guard case .object(let schema) = schema,
               case .object(let properties)? = schema["properties"] else { return input }
         let required: [JSONValue]
@@ -53,6 +54,7 @@ public enum ToolArguments {
         // valid 0 stay.
         for (key, value) in input {
             guard let field = properties[key] else { continue }
+            if preserving.contains(key), case .object(let shape) = field, shape["type"] == nil { continue }
             let normalized = normalizedValue(value, schema: field)
             if !required.contains(.string(key)), value == .null || value == .string("")
             || ((normalized == .int(0) || normalized == .double(0)) && (positiveOnly.contains(key) || positiveMinimum(field))) {
@@ -146,8 +148,9 @@ public extension ToolDispatchClient {
             return try await body(input)
         }
         let schema = schemas.first { $0.name == canonical || $0.name.replacingOccurrences(of: ".", with: "_") == canonical }
+        let authoring = ["save_skill", "sense_make"].contains(canonical) || (canonical == "skill_manage" && input["verb"] == .string("tool_propose"))
         let normalized = schema.flatMap { try? JSONValue.parse($0.parametersJSON) }
-            .map { ToolArguments.normalized(input, schema: $0, positiveOnly: ToolArguments.positiveOnly[canonical] ?? []) } ?? input
+            .map { ToolArguments.normalized(input, schema: $0, positiveOnly: ToolArguments.positiveOnly[canonical] ?? [], preserving: authoring ? ["learned", "choices"] : []) } ?? input
         return try await ToolArguments.$current.withValue((identity, normalized)) { try await body(normalized) }
     }
 }
@@ -328,13 +331,14 @@ extension SwiftToolDispatcher {
                 ) else { throw error }
                 return need
             }
-        case "list_dir":
-            input = Self.listDirInput(input)
+        case "list_dir", "file_info":
+            if tool == "list_dir" { input = Self.listDirInput(input) }
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
-                return try await impl_full_mac_list_dir(input: input, surface: surface)
+                return tool == "list_dir" ? try await impl_full_mac_list_dir(input: input, surface: surface)
+                    : try await impl_local_connector_tool(tool: tool, input: input, surface: surface)
             }
             do {
-                return try await impl_list_dir(input: input)
+                return try await impl_file_metadata(tool: tool, input: input)
             } catch {
                 guard let need = fileOpsNeedEnvelope(
                     tool: tool, mode: .read, path: jsonString(input["path"]), error: error
@@ -343,10 +347,10 @@ extension SwiftToolDispatcher {
             }
         case "write_file", "move_file", "copy_file", "trash_file":
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
-                return try await impl_local_connector_tool(tool: tool, input: input, surface: surface)
+                return partWrote(try await impl_local_connector_tool(tool: tool, input: input, surface: surface), input: input)
             }
             do {
-                return try await impl_trusted_file_mutation(tool: tool, input: input)
+                return partWrote(try await impl_trusted_file_mutation(tool: tool, input: input), input: input)
             } catch {
                 guard let need = fileOpsNeedEnvelope(
                     tool: tool, mode: .write, path: jsonString(input["path"]), error: error
@@ -431,8 +435,7 @@ extension SwiftToolDispatcher {
         case "persona_read": return try await impl_persona_read(input: input)
         case "persona_write": return try await impl_persona_write(input: input)
         case "persona_append_section": return try await impl_persona_append_section(input: input)
-        case "agent_introspect": return try await impl_agent_introspect(input: input, invokedAs: tool)
-        case "daemon_introspect": return try await impl_agent_introspect(input: input, invokedAs: tool)
+        case "agent_introspect": return try await impl_agent_introspect(input: input)
         case "tool_result_page": return await impl_tool_result_page(input: input)
         case "request_interaction": return await impl_request_interaction(input: input)
         case "list_skills":     return try await impl_list_skills(input: input)
@@ -739,6 +742,18 @@ extension SwiftToolDispatcher {
                 launch: await Self.drivenAgentLaunch(
                 tool: tool, surface: surface, contact: Self.drivenAgentContact(host: "codex", dataRoot: dataRoot),
                 name: "Codex", dataRoot: dataRoot)), agent: "codex", dataRoot: dataRoot)
+        case "mac_location":
+            // The fix the Mac holds answers first, whatever the permission now.
+            // Not yet asked: macOS's own prompt is the ask (the reader raises it);
+            // the Settings-row card is for a denial with nothing held.
+            let held = await MacLocationReader.read()
+            guard case .object(let fields) = held, fields["status"] != .string("ok"),
+                  [.denied, .restricted].contains(SystemPermissionPreflight.status(.location)) else { return held }
+            return await Self.requestedInteraction(input: [
+                "kind": .string("permission"), "target": .string("location"), "mode": .string("read"),
+                "why": .string("I need Location Services to read where this Mac is."),
+                "decline_consequence": .string("I can ask the paired iPhone for location or use a place you give me.")
+            ], dataRoot: dataRoot)
         case "phone_request":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
@@ -1161,14 +1176,6 @@ extension SwiftToolDispatcher {
             // Reserved built-in names never reach here (the switch matches
             // them first), so this route only ever executes genuine customs.
             if let record = registryToolRecord(tool) {
-                // Review blocker fix: a registry tool executes self-authored
-                // code in a subprocess — shell-class. Same Full-Mac file_ops
-                // gate as shell/bash/builder tools. Capability-ADD with the
-                // existing seatbelt: customs were never chat-dispatchable
-                // before R9, so this locks nothing down.
-                if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                    return builderFullMacRequired(tool: tool)
-                }
                 // Review finding 3 fix: runTool only VERIFIES a fingerprint
                 // when one exists. The chat lane fails closed on unsigned
                 // tools rather than silently weakening the invariant.
@@ -1186,7 +1193,7 @@ extension SwiftToolDispatcher {
                 // fingerprintMismatch instead of downgrading to unverified
                 // (review round-2 TOCTOU finding).
                 return try await SwiftNativeToolExecution(root: dataRoot)
-                    .runTool(id: tool, input: .object(input), requiredFingerprint: fingerprint)
+                    .runTool(id: tool, input: .object(input.filter { $0.key != "__session_id" }), requiredFingerprint: fingerprint)
             }
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' is not in the dispatch table"
@@ -1317,5 +1324,17 @@ extension SwiftToolDispatcher: PureToolArgumentValidating {
             }
         }
         return await (macIntegrationBridge as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
+    }
+}
+
+extension SwiftToolDispatcher {
+    /// A part's own file write, told to its run as it stands right after the write.
+    func partWrote(_ result: JSONValue, input: [String: JSONValue]) -> JSONValue {
+        guard let wrote = SkillRunContext.wrote, ChatToolOutcome.outputLooksSuccessful(result) else { return result }
+        let resolved: String? = if case .object(let fields) = result, case .string(let path)? = fields["path"] { path } else { nil }
+        if let path = resolved ?? jsonString(input["path"]) {
+            wrote(URL(fileURLWithPath: NSString(string: path).expandingTildeInPath))
+        }
+        return result
     }
 }

@@ -58,6 +58,7 @@ struct CompactActionReceipt: Equatable, Sendable {
         durationMs: Int,
         argKeyCount: Int,
         risk: String,
+        tracePath: String,
         errorClass: String? = nil,
         errorDetail: String? = nil
     ) -> CompactActionReceipt {
@@ -79,14 +80,17 @@ struct CompactActionReceipt: Equatable, Sendable {
                 : (waiting ? "waiting on you" : "tool dispatch failed"),
             changedFields: [],
             proof: [
-                "events.jsonl:tool.dispatch",
+                tracePath == "data/traces/events.jsonl"
+                    ? "events.jsonl:tool.dispatch" : "\(tracePath.dropFirst(5)):tool.dispatch",
                 "status:\(status)",
                 "duration_ms:\(durationMs)",
                 "arg_key_count:\(argKeyCount)",
                 // The trace is bounded to a tail window, so it proves only
                 // that this dispatch was recorded here — never that its effect
                 // persists or settled outside this file.
-                "permanence_source:events_jsonl_tail_retention",
+                tracePath == "data/traces/events.jsonl"
+                    ? "permanence_source:events_jsonl_tail_retention"
+                    : "permanence_source:turn_trace_retention",
                 // Risk comes from the same pure SecurityCenter profile used by
                 // authorization, not an advisory tracer-local name table.
                 "risk_source:security_center.canonical_tool_risk",
@@ -95,7 +99,7 @@ struct CompactActionReceipt: Equatable, Sendable {
             risk: risk,
             errorClass: ok || waiting ? nil : errorClass,
             errorDetail: ok || waiting ? nil : errorDetail,
-            tracePath: "data/traces/events.jsonl"
+            tracePath: tracePath
         )
     }
 }

@@ -138,7 +138,7 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
                     for (handle, kind) in signals {
                         await self?.ingestOrganismSignal(kind: kind, sourceOrgan: "carry." + handle,
                             metadata: ["predictionCorrelationId": .string(handle)],
-                            persistSynchronously: false, prewarmContext: false)
+                            persistSynchronously: false)
                     }
                     await self?.rescheduleResidualRepairDeadline()
                 }

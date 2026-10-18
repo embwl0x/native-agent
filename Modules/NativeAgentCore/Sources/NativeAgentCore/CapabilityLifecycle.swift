@@ -31,6 +31,13 @@ public enum CapabilityLifecycle {
     }
     nonisolated(unsafe) private static var peerTrust: @Sendable (String) -> Bool = { _ in false }
 
+    /// The engine binds the checked Trust reader; publication supplies its own root.
+    public static var keepAuthority: @Sendable (URL) -> Bool {
+        get { provenanceLock.withLock { keepTrust } }
+        set { provenanceLock.withLock { keepTrust = newValue } }
+    }
+    nonisolated(unsafe) private static var keepTrust: @Sendable (URL) -> Bool = { _ in false }
+
     public static var writeRefusal: String? { turnWriteCheck()() }
 
     public static func peerRefusal(_ who: String) -> String {
@@ -40,6 +47,14 @@ public enum CapabilityLifecycle {
     public static func requireWrite() throws {
         if let refusal = writeRefusal {
             throw NSError(domain: "CapabilityLifecycle", code: 403, userInfo: [NSLocalizedDescriptionKey: refusal])
+        }
+    }
+
+    /// Admission of code is separate from the owner's off-switch.
+    public static func requireKeep(ownerAuthorized: Bool) throws {
+        guard ownerAuthorized else {
+            throw NSError(domain: "CapabilityLifecycle", code: 403, userInfo: [NSLocalizedDescriptionKey:
+                "Below Full Mac, keeping a part is the owner's"])
         }
     }
 
@@ -65,11 +80,6 @@ public enum CapabilityLifecycle {
     public static func repeatedStop(_ runs: [String]) -> String? {
         let last = runs.suffix(3).filter { worldStops.contains(String($0.split(separator: "@").first ?? "")) }
         return Dictionary(grouping: last, by: { $0 }).first { $0.value.count >= 2 }?.key
-    }
-
-    /// A new version that faults offers the last clean one back.
-    public static func offersRollback(digest: String, faulted: Bool, lastClean: String?) -> Bool {
-        faulted && lastClean != nil && lastClean != digest
     }
 
     /// The ladder's distinct inputs a row keeps.

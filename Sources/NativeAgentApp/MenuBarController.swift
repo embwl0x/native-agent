@@ -14,10 +14,6 @@ final class GlobalHotkeyManager: NSObject {
         case none, register, unregister
     }
 
-    enum VoiceReleaseAction: Equatable, Sendable {
-        case endVoice, openWindow
-    }
-
     static let shared = GlobalHotkeyManager()
 
     private var hotKeyRef: EventHotKeyRef?
@@ -44,16 +40,6 @@ final class GlobalHotkeyManager: NSObject {
         case (false, true): .unregister
         case (true, true), (false, false): .none
         }
-    }
-
-    /// The release decision is deliberately value-only: press timing and the
-    /// asynchronous arm task are owned above it, while this one rule decides
-    /// whether an armed microphone is released or a tap opens chat.
-    static func voiceReleaseAction(
-        heldSeconds: TimeInterval,
-        voiceHoldActive: Bool
-    ) -> VoiceReleaseAction {
-        heldSeconds >= 0.2 && voiceHoldActive ? .endVoice : .openWindow
     }
 
     func setEnabled(_ enabled: Bool) {

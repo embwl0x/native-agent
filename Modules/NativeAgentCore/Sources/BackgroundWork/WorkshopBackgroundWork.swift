@@ -27,30 +27,24 @@ public enum WorkshopBackgroundWork {
         // TOOL-CAPABLE synthesize turn (synthesize-quality fix, 2026-06-11).
         // Found live by Agent on execution 752636c5: a bare completion has no
         // tool access, so the synthesize model refused ("I can't access your
-        // filesystem") and the refusal scored `succeeded`. Route synthesize
-        // steps through the production chat tool loop over a RESTRICTED,
-        // READ-ONLY dispatcher (WorkshopSynthesizeReadOnlyToolDispatcher) so
-        // the model can actually read what it's asked to synthesize. The
-        // autonomy gate still governs the surviving read tools (the chat
-        // client wires AutonomyGatedDispatcher internally). fileAccess
-        // "read_only" blocks write-class tools at the FileAccess layer too —
-        // belt-and-suspenders with the name allowlist. surface "missions"
-        // resolves the per-surface model via the same picker the planner uses.
-        // This is an EPHEMERAL execution turn: it does not mint a random chat
-        // session, read chat history, autocompact, or append transcript state.
-        // Model, provider, Think, and Fast all resolve from the executions surface.
+        // filesystem") and the refusal scored `succeeded`. Synthesize steps go
+        // through the production chat tool loop and its gated chain, under
+        // User's posture like every other turn (the permission law). surface
+        // "missions" resolves the per-surface model via the same picker the
+        // planner uses. This is an EPHEMERAL execution turn: it does not mint a
+        // random chat session, read chat history, autocompact, or append
+        // transcript state. Model, provider, Think, and Fast all resolve from
+        // the executions surface.
         let measuredTooledLLMStep: WorkshopStepMeasuredLLM = { prompt in
-            let restricted = WorkshopSynthesizeReadOnlyToolDispatcher(
-                inner: SwiftToolDispatcher(
-                    dataRoot: dataRoot,
-                    allowProcessGlobalTools: usesLiveAppBody,
-                    agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
-                ))
-            let client = chatClient(restricted)
+            let client = chatClient(SwiftToolDispatcher(
+                dataRoot: dataRoot,
+                allowProcessGlobalTools: usesLiveAppBody,
+                agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+            ))
             let response = try await LLMCallContext.$purpose.withValue("workshop") {
             try await client.runEphemeralToolTurn(
                 message: prompt,
-                fileAccess: "read_only",
+                fileAccess: "auto",
                 requireCompleted: true,
                 surface: WorkshopSurfaceVocabulary.canonical
             )

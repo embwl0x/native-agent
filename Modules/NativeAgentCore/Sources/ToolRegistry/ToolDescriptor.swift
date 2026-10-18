@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import os
 
 // MARK: - Tool descriptors (S9, 2026-09-26)
 
@@ -81,4 +82,150 @@ public protocol ToolExecutor: Sendable {
     func execute(
         tool: String, input: [String: JSONValue], surface: String
     ) async throws -> JSONValue
+}
+
+/// The app action's declared call and policy, shared without importing its executor.
+public struct AppActionBinding: Sendable {
+    public let tool: String
+    public let fixedInput: [String: JSONValue]
+    public let rename: [String: String]
+    public let folded: Bool
+    public let descriptor: ToolDescriptor?
+    public let isHis: Bool
+    public let irreversible: Bool
+    public var read: Bool
+    public let readWhen: [String: JSONValue]
+    public let secretArgs: [String]
+    public let lifecycle: CapabilityLifecycle.Action?
+    public let savedTrustKeys: [String]
+    /// What the action is when it does not read (`read`/`readWhen` say when it does).
+    public let toolClass: ToolClass
+    /// For one of her parts: whether it reaches User's side, from the same
+    /// manifest and dependencies its class reads. Nil for every other action.
+    public let reachesHim: Bool?
+
+    public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
+                lifecycle: CapabilityLifecycle.Action? = nil, savedTrustKeys: [String] = [],
+                tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
+                folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write, reachesHim: Bool? = nil) {
+        self.tool = tool; self.fixedInput = fixedInput; self.rename = rename; self.folded = folded; self.descriptor = descriptor
+        self.isHis = isHis; self.irreversible = irreversible; self.read = read
+        self.secretArgs = secretArgs; self.readWhen = readWhen
+        self.lifecycle = lifecycle
+        self.savedTrustKeys = savedTrustKeys
+        self.toolClass = toolClass
+        self.reachesHim = reachesHim
+    }
+
+    public func readOnly(args: [String: JSONValue]) -> Bool {
+        read || (!readWhen.isEmpty && readWhen.allSatisfy { (args[$0.key] ?? .null) == $0.value })
+    }
+
+    /// The two resolvers an executor installs, held by reference. A closure
+    /// stored inside the lock's generic state is wrapped in a reabstraction
+    /// thunk pair on every mutation of that state: after hours of chain
+    /// builds the part resolver sat under hundreds of nested thunks, and the
+    /// first unregistered action name overran a cooperative thread's 512 KB
+    /// stack (Agent's 18:58Z crash, 10-17; the same on the test copy after
+    /// ninety seconds). A class's stored closure keeps one shape.
+    private final class Resolvers: Sendable {
+        let authorableToolName: @Sendable (String) -> Bool
+        let part: @Sendable (String) -> AppActionBinding?
+        init(authorableToolName: @escaping @Sendable (String) -> Bool, part: @escaping @Sendable (String) -> AppActionBinding?) {
+            self.authorableToolName = authorableToolName
+            self.part = part
+        }
+    }
+
+    // Installed from AppActions at executor assembly, before any app call or
+    // receipt. No static initializer here reaches back into the app schemas.
+    private static let registry = OSAllocatedUnfairLock(initialState: (
+        actions: [String: AppActionBinding](), tools: [String: ToolDescriptor](),
+        resolvers: Resolvers(authorableToolName: { _ in false }, part: { _ in nil })))
+
+    public static func register(_ actions: [String: AppActionBinding], tools: [ToolDescriptor], authorableToolName: @escaping @Sendable (String) -> Bool, partPolicy: @escaping @Sendable (String) -> AppActionBinding?) {
+        registerTools(tools)
+        let resolvers = Resolvers(authorableToolName: authorableToolName, part: partPolicy)
+        registry.withLock { $0 = (actions, $0.tools, resolvers) }
+    }
+
+    /// The core dispatcher's own tool names, registered where the dispatcher is
+    /// assembled, so a chain with no app executor (core-only, no body) still
+    /// knows shell and git as built-ins; an executor's descriptors join them.
+    public static func registerTools(_ tools: [ToolDescriptor]) {
+        let tools = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
+        registry.withLock { state in
+            state.tools.merge(tools) { existing, registered in
+                precondition(existing.bucket == registered.bucket && existing.schema.description == registered.schema.description
+                    && existing.schema.parametersJSON == registered.schema.parametersJSON, "Conflicting registered tool descriptors.")
+                return existing
+            }
+        }
+    }
+
+    public static func builtInToolName(_ tool: String) -> Bool {
+        registry.withLock { $0.tools[tool] != nil }
+    }
+
+    /// How many tool names are reserved; the table only grows, so a reader
+    /// that derived something from the namespace can key on it.
+    public static var registeredToolCount: Int { registry.withLock { $0.tools.count } }
+
+    /// The class a registered tool's declaration gives it.
+    public static func declaredClass(_ tool: String) -> ToolClass? {
+        registry.withLock { $0.tools[tool]?.schema.toolClass }
+    }
+
+    /// The catalog bucket a registered tool is filed under.
+    public static func declaredBucket(_ tool: String) -> ChatToolCatalogBucket? {
+        registry.withLock { $0.tools[tool]?.bucket }
+    }
+
+    public static func authorableToolName(_ tool: String) -> Bool {
+        registry.withLock { $0.resolvers }.authorableToolName(tool)
+    }
+
+    public static func action(tool: String = "app", input: [String: JSONValue]) -> AppActionBinding? {
+        let id: String
+        if tool == "app", case .string(let action)? = input["action"] { id = action }
+        else if let action = ToolNameAliases.appAction(tool, input: input) { id = action }
+        else { return nil }
+        let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard var policy = binding(key) else {
+            return tool == "app" && ToolNameAliases.appFindQuery(input) != nil
+                ? AppActionBinding(isHis: false, irreversible: false, read: true, secretArgs: []) : nil
+        }
+        let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
+        policy.read = policy.readOnly(args: args)
+        return policy
+    }
+
+    public func arguments(_ args: [String: JSONValue]) -> [String: JSONValue] {
+        var call = folded ? ToolNameAliases.hostArgs(tool, args) : [:]
+        if !folded { for (key, value) in args { call[rename[key] ?? key] = value } }
+        return call.merging(fixedInput) { _, fixed in fixed }
+    }
+
+    public static func binding(_ id: String) -> AppActionBinding? {
+        let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !key.isEmpty else { return nil }
+        let (saved, resolvers) = registry.withLock { ($0.actions[key], $0.resolvers) }
+        return saved ?? resolvers.part(key)
+    }
+
+    static func actionID(tool: String, input: [String: JSONValue]) -> String? {
+        let matches = registry.withLock { $0.actions }.filter { _, binding in
+            binding.tool == tool && binding.fixedInput.allSatisfy { input[$0.key] == $0.value }
+        }
+        guard let count = matches.values.map({ $0.fixedInput.count }).max() else { return nil }
+        let selected = matches.filter { $0.value.fixedInput.count == count }
+        return selected.count == 1 ? selected.first?.key : nil
+    }
+
+    /// Whether the table is installed yet: before assembly nothing is known.
+    public static var isRegistered: Bool { registry.withLock { !$0.actions.isEmpty } }
+
+    public static var secretActionIDs: [String] {
+        registry.withLock { $0.actions.compactMap { $0.value.secretArgs.isEmpty ? nil : $0.key } }
+    }
 }

@@ -32,11 +32,9 @@ enum SensesAssembly {
                         throw SenseFailure(code: "read_only", message: "A sense reads only its declared apps using dictionary or standard core read events.")
                     }
                     let admission = try await AuthoredToolEffects.$admissionOnly.withValue(true) {
-                        try await rawRead(tool: "read", input: ["__authored_primitive": .object([
-                            "operation": .string("apps.call"), "arguments": arguments
-                        ])], dataRoot: dataRoot)
+                        try await rawRead(tool: "apps.call", input: args, dataRoot: dataRoot)
                     }
-                    guard case .object(let fields) = admission, fields["status"] == .string("ok") else {
+                    guard case .object(let fields) = admission, fields["status"] == .string("admitted") else {
                         throw SenseFailure(code: "trust_refused", message: "App read refused by Trust: \(try admission.serialize(pretty: false))")
                     }
                     return try await SystemAppleScriptAdapter().callApp(arguments, targets: targets)

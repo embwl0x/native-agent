@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import AppKit
 import CoreGraphics
 import Foundation
@@ -777,6 +778,16 @@ package enum HerScreen {
         rows.append("just changed: " + (changes.isEmpty ? "nothing recent" : changes.joined(separator: " · ")))
         rows += all.filter { $0.status == .unavailable }.prefix(full ? all.count : 2).map {
             "unavailable: \($0.corner.key) · \($0.unavailableReason ?? "repair the sense and switch it on to retry")"
+        }
+        if full {
+            do {
+                let files = try AbilityStore(dataRoot: dataRoot).files(kind: .sense)
+                rows += files.map(\.partLine)
+                for record in all where !files.contains(where: { $0.id == record.id }) {
+                    let part = try AbilityStore.partHeader(["reach": try .fromEncodable(record.reach)])
+                    rows.append(AbilityStore.File(id: record.id, kind: .sense, metadata: part, body: "", pathExtension: "js").partLine)
+                }
+            } catch { rows.append("parts unavailable · \(error.localizedDescription)") }
         }
         return rows
     }

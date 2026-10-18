@@ -125,7 +125,8 @@ public final class PeerDataTaint: @unchecked Sendable {
             .compactMap { $0 }.contains(where: ownerTrusts)
     }
 
-    public static var abilityWriteCheck: @Sendable () -> String? {
+    /// The same principals follow ability writes and error text quoted later.
+    public static var abilitySources: [String] {
         let origin = ChatPersistenceContext.originProvenance
         var sources = (current?.checkpointSources ?? [])
             + (origin?.peerSources ?? []) + (origin?.elevatedPeerSources ?? [])
@@ -137,7 +138,11 @@ public final class PeerDataTaint: @unchecked Sendable {
                     ?? (["agent", "peer"].contains(agent) ? "another agent" : agent))
             }
         }
-        let peers = Set(sources.filter { $0 != "self" && !$0.hasPrefix("bot:") && isAgent($0) })
+        return Array(Set(sources.filter { $0 != "self" && !$0.hasPrefix("bot:") && isAgent($0) })).sorted()
+    }
+
+    public static var abilityWriteCheck: @Sendable () -> String? {
+        let peers = abilitySources
         return {
             let untrusted = peers.filter { !ownerTrusts($0) }.sorted()
             return untrusted.isEmpty ? nil : CapabilityLifecycle.peerRefusal(untrusted.joined(separator: ", "))

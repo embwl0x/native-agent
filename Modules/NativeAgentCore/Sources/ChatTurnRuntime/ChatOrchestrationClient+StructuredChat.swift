@@ -91,7 +91,7 @@ extension SwiftNativeChatOrchestrationClient {
                 && !ToolLoopTraceObservation.wasStopped($0.result)
                 && !ChatToolOutcome.isWaitingOnPerson($0.result)
         }.count
-        let expansions = result.toolDispatches.filter { ToolNameAliases.ranTool($0.name, input: $0.input) == "context_expand" }.count
+        let expansions = result.toolDispatches.filter { $0.ranCall.tool == "context_expand" }.count
         // Discovery is `app {find}`: the rounds spent finding an action.
         let discovery = result.toolDispatches.filter {
             $0.name == "app" && $0.input["find"] != nil && $0.input["action"] == nil
@@ -382,8 +382,9 @@ extension SwiftNativeChatOrchestrationClient {
         // carries this the same way; discarding the outcome here let compaction
         // and a cursor advance both reshape the prefix on the same turn.
         var compactionRanThisTurn = false
+        var transcript: Data?
         do {
-            compactionRanThisTurn = try await prepareSessionHistoryForTurn(
+            (compactionRanThisTurn, transcript) = try await prepareSessionHistoryForTurn(
                 sessionId: resolvedSession,
                 model: model,
                 surface: surface,
@@ -420,8 +421,7 @@ extension SwiftNativeChatOrchestrationClient {
             message: message,
             surface: surface,
             sessionId: resolvedSession,
-            runId: runId,
-            fileAccess: fileAccess
+            runId: runId
         )
 
         // Pre-resolve the context with history threading so the engine call
@@ -456,7 +456,8 @@ extension SwiftNativeChatOrchestrationClient {
                     // the existing transcript and admitted provider route.
                     sessionDigest: SessionDigestProvider(dataRoot: history.dataRoot, llm: llm),
                     imageBlocks: imageBlocks,
-                    queryUserMessage: attachmentInput.queryUserMessage
+                    queryUserMessage: attachmentInput.queryUserMessage,
+                    transcript: transcript
                 )
             }
             }
@@ -496,11 +497,10 @@ extension SwiftNativeChatOrchestrationClient {
             reasoningEffort: reasoningEffort
         )
         if let turnPlan {
-            await TurnPlanTraceRecorder.append(
+            TurnPlanTraceRecorder.append(
                 turnPlan,
                 runId: runId,
                 surface: surface,
-                dataRoot: dataRoot,
                 turnId: boundTurnId,
                 turnTraceBus: turnTraceBus
             )
@@ -533,6 +533,7 @@ extension SwiftNativeChatOrchestrationClient {
                 await receiptWriter.write(ToolReceipt(
                     toolName: record.name,
                     inputJSON: (try? ChatSecretRedactor.redactValue(record.input).serialize(pretty: false)) ?? "{}",
+                    ranCall: ToolReceipt.dispatchedCall,
                     resultJSON: (try? ChatSecretRedactor.redactValue(record.output).serialize(pretty: false)) ?? "null",
                     ok: record.ok,
                     cognitiveOutput: record.output
@@ -1005,14 +1006,12 @@ extension SwiftNativeChatOrchestrationClient {
         message: String,
         surface: String,
         sessionId: String,
-        runId: String,
-        fileAccess: String
+        runId: String
     ) async -> ResidentTurnPreparation {
         async let turnPlanTask = makeTurnPlan(
             message: message,
             surface: surface,
-            sessionId: sessionId,
-            fileAccess: fileAccess
+            sessionId: sessionId
         )
         async let cognitiveProjectionTask = prepareCognitiveTurnProjection(
             surface: surface,
@@ -1212,17 +1211,10 @@ extension SwiftNativeChatOrchestrationClient {
     func makeTurnPlan(
         message: String,
         surface: String,
-        sessionId: String,
-        fileAccess: String
+        sessionId: String
     ) async -> TurnPlan? {
         do {
-            return try await TurnPlanner(dataRoot: dataRoot).plan(
-                message: message,
-                surface: surface,
-                sessionId: sessionId,
-                fileAccess: fileAccess,
-                approvalAvailable: true
-            )
+            return try await TurnPlanner().plan(message: message)
         } catch {
             FileHandle.standardError.write(
                 Data("TurnPlanner: plan failed (\(surface)/\(sessionId)): \(error)\n".utf8)

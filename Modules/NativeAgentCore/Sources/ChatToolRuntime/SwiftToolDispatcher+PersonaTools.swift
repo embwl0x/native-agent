@@ -187,7 +187,7 @@ extension SwiftToolDispatcher {
         }
     }
 
-    func impl_agent_introspect(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
+    func impl_agent_introspect(input: [String: JSONValue]) async throws -> JSONValue {
         let sessionId = Self.extractSessionId(from: input)
         let fullDetail = (jsonString(input["detail"]) ?? "compact")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -198,7 +198,7 @@ extension SwiftToolDispatcher {
         var response: [String: JSONValue] = [
             "status": .string("ok"),
             "detail": .string(fullDetail ? "full" : "compact"),
-            "invoked_as": .string(invokedAs),
+            "invoked_as": .string("agent_introspect"),
             "runtime": .string("swift-native"),
             "python_daemon": .string("retired"),
             "provider": provider,
@@ -267,7 +267,6 @@ extension SwiftToolDispatcher {
         response["mcp_tool_count"] = .int(Int64(mcpTools.count))
         response["mcp_tools"] = .array(mcpTools.map { .string(ToolNameAliases.appAction($0) ?? $0) })
         response["compatibility"] = .object([
-            "daemon_introspect": .string("alias_for_agent_introspect"),
             "recall_search": .string("alias_for_recall_memory"),
         ])
         response["build"] = Self.buildStamp(identity: .current, pid: pid)

@@ -5,6 +5,13 @@ import Foundation
 /// feature on; users switch off what they want), off in one flip, and the same
 /// key the agent reads and writes through `app_settings_list` /
 /// `app_setting_set`.
+/// Shotgun (User, 10-04): when she starts driving the Mac in the chat on
+/// screen, the main window steps aside into a small floating chat. One key,
+/// read by the composer's switch, the panel and her own settings page.
+public enum ShotgunPreference {
+    public static let enabledKey = "NativeAgent.shotgun.enabled"
+}
+
 public enum MoodTintPreference {
     public static let key = "uiMoodTint"
 

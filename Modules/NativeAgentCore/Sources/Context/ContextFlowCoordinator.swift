@@ -30,12 +30,6 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
     public let registeredSourceCount: Int
     public let degradedSourceCount: Int
     public let arenaMetrics: ContextArenaMetrics
-    public let pendingPrewarmHints: Int
-    /// Plans retained by the coordinator while awaiting their matching turn.
-    /// This is separate from the planner's pending queue: a planned item has
-    /// left that queue but can still retain a session/workshop scope here.
-    public let trackedPrewarmPlanCount: Int
-    public let prewarmUsefulnessReceipts: Int
     /// Bounded rebuildable feedback retained across a coordinator restart.
     /// This health gauge never grants authority.
     public let feedbackEventCount: Int
@@ -53,9 +47,6 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
         registeredSourceCount: Int,
         degradedSourceCount: Int,
         arenaMetrics: ContextArenaMetrics,
-        pendingPrewarmHints: Int,
-        trackedPrewarmPlanCount: Int,
-        prewarmUsefulnessReceipts: Int,
         feedbackEventCount: Int = 0,
         newestFeedbackEventID: String? = nil,
         lastReconciledAt: Date?,
@@ -68,9 +59,6 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
         self.registeredSourceCount = registeredSourceCount
         self.degradedSourceCount = degradedSourceCount
         self.arenaMetrics = arenaMetrics
-        self.pendingPrewarmHints = pendingPrewarmHints
-        self.trackedPrewarmPlanCount = trackedPrewarmPlanCount
-        self.prewarmUsefulnessReceipts = prewarmUsefulnessReceipts
         self.feedbackEventCount = feedbackEventCount
         self.newestFeedbackEventID = newestFeedbackEventID
         self.lastReconciledAt = lastReconciledAt
@@ -147,9 +135,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     /// Bounded USER.md precoverage outcome reporting — one line per distinct
     /// state (success, non-application, failure) instead of one per turn.
     private var precoverageReporter = PrecoverageOutcomeReporter()
-    private let prewarmPlanner = ContextPrewarmPlanner()
-    private var prewarmPlans: [ContextPrewarmScope: ContextPrewarmPlan] = [:]
-    private var prewarmRevision: Int64 = 0
     // Newer batches include every unacknowledged request. Compilation may
     // overlap, but only the freshest batch can enter the publication gate.
     private var nextReconciliationRequestID: UInt64 = 0
@@ -311,14 +296,12 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         activeStoredGeneration = nil
         activeCompiledSources.removeAll()
         cachedFeedback = nil
-        prewarmPlans.removeAll()
         invalidateGenerationDerivedCache()
     }
 
     public func reconcileAfterWake() async {
         guard mode != .off else { return }
         _ = try? arena.applyMemoryPressure(.normal)
-        await prewarmPlanner.setResourcePressure(.normal)
         await reconcileAll(reason: "wake")
         await refreshWatchedDirectories()
     }
@@ -400,19 +383,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
 
     public func applyMemoryPressure(_ pressure: ContextArenaPressure) async throws -> ContextArenaTrimReceipt {
         let receipt = try arena.applyMemoryPressure(pressure)
-        await prewarmPlanner.setResourcePressure(pressure)
-        if pressure != .normal { prewarmPlans.removeAll() }
-        try? await store.recordReceipt(ContextStoreReceipt(
-            kind: .pressure,
-            generationID: arena.currentSnapshot()?.generationID,
-            summary: "context arena memory pressure",
-            details: [
-                "pressure": pressure.rawValue,
-                "before_bytes": String(receipt.beforeLogicalBytes),
-                "after_bytes": String(receipt.afterLogicalBytes),
-                "evicted": String(receipt.evictedWarmEntryKeys.count),
-            ]
-        ))
         if pressure == .normal {
             await reconcileAll(reason: "pressure_normal")
         }
@@ -564,7 +534,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 || activeStoredGeneration.generation.sourceFingerprint
                     != stored.generation.sourceFingerprint {
             invalidateGenerationDerivedCache()
-            prewarmPlans.removeAll()
         }
         activeStoredGeneration = stored
     }
@@ -801,45 +770,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     generationID: generation.generation.id
                 )
             }
-            Task { [weak self] in
-                await self?.observePrewarmContinuity(
-                    request: request,
-                    packet: packet,
-                    generation: generation,
-                    snapshot: lease.snapshot
-                )
-            }
-            let store = self.store
-            let selectionReceipt = ContextStoreReceipt(
-                kind: .selection,
-                generationID: packet.generationID,
-                summary: "context selection",
-                details: [
-                    "receipt_id": packet.receipt.id,
-                    "surface": request.surface.rawValue,
-                    "selected": String(packet.selectedItems.count),
-                    "pointers": String(packet.expandablePointers.count),
-                    "mandatory_coverage": String(packet.receipt.mandatoryCoverage),
-                    "characters": String(packet.characterCount),
-                    "budget_expanded": budgetExpansion.map { _ in "true" } ?? "false",
-                    "requested_character_budget": String(request.characterBudget),
-                    "effective_character_budget": String(need.characterBudget),
-                    "maximum_character_budget": String(request.maximumCharacterBudget),
-                    "granted_post_mandatory_reserve": String(
-                        budgetExpansion?.grantedPostMandatoryReserve ?? 0
-                    ),
-                    // Absence is evidence. Do not serialize it as 0:
-                    // a missing/non-monotonic latency sample is not a
-                    // fast selection and must stay out of live windows.
-                    "selection_microseconds": packet.receipt.measuredSelectionMicroseconds
-                        .map { String($0) } ?? "absent",
-                    "selection_latency_provenance": packet.receipt.selectionLatencyProvenance?
-                        .rawValue ?? ContextSelectionLatencyProvenance.unavailable.rawValue,
-                ]
-            )
-            Task.detached(priority: .background) {
-                try? await store.recordReceipt(selectionReceipt)
-            }
             let feedbackHandler: (@Sendable (
                 ContextFeedbackSignal,
                 [ContextAtomID],
@@ -890,222 +820,11 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             registeredSourceCount: await registry.allRegistrations().count,
             degradedSourceCount: storeHealth?.degradedSources ?? 0,
             arenaMetrics: metrics,
-            pendingPrewarmHints: await prewarmPlanner.pendingHintCount(),
-            trackedPrewarmPlanCount: prewarmPlans.count,
-            prewarmUsefulnessReceipts: await prewarmPlanner.usefulnessReceiptCount(),
             feedbackEventCount: feedbackEvents.count,
             newestFeedbackEventID: feedbackEvents.last?.id,
             lastReconciledAt: lastReconciledAt,
             lastError: lastError
         )
-    }
-
-    @discardableResult
-    public func submitPrewarm(_ event: ContextPrewarmEvent) async -> ContextPrewarmPlanningReceipt {
-        let submission = await prewarmPlanner.submit(event)
-        let planning = await prewarmPlanner.processNext()
-        if let plan = planning.plan {
-            for scope in Set(plan.items.map(\.cause)) {
-                prewarmPlans[scope] = plan
-            }
-        }
-        await prunePrewarmPlans()
-        let receipt = ContextStoreReceipt(
-            kind: .prewarm,
-            generationID: planning.plan?.items.first?.candidate.generationID,
-            summary: "context prewarm planning",
-            details: [
-                "submission": String(describing: submission),
-                "outcome": String(describing: planning.outcome),
-                "considered": String(planning.consideredAtomCount),
-                "dropped": String(planning.droppedAtomCount),
-                "planned": String(planning.plan?.items.count ?? 0),
-            ]
-        )
-        let store = self.store
-        Task.detached(priority: .background) {
-            try? await store.recordReceipt(receipt)
-        }
-        return planning
-    }
-
-    private func prunePrewarmPlans() async {
-        let plans = prewarmPlans
-        let validIDs = await prewarmPlanner.validPlanIDs(Array(plans.values))
-        for (scope, plan) in plans {
-            let currentGeneration = activeStoredGeneration?.generation
-            let obsolete = plan.items.contains {
-                $0.candidate.generationID != currentGeneration?.id
-                    || $0.candidate.sourceFingerprint != currentGeneration?.sourceFingerprint
-            }
-            if (!validIDs.contains(plan.id) || obsolete), prewarmPlans[scope]?.id == plan.id {
-                prewarmPlans[scope] = nil
-            }
-        }
-    }
-
-    @discardableResult
-    public func submitPrewarm(
-        kind: ContextPrewarmHintKind,
-        id: String,
-        terms: [String],
-        revision: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
-    ) async -> ContextPrewarmPlanningReceipt {
-        let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let generation = activeStoredGeneration, !normalizedID.isEmpty else {
-            return ContextPrewarmPlanningReceipt(
-                outcome: .empty,
-                plan: nil,
-                consideredAtomCount: 0,
-                droppedAtomCount: 0,
-                elapsedNanoseconds: 0,
-                remainingQueueCount: await prewarmPlanner.pendingHintCount()
-            )
-        }
-        let tokens = Self.prewarmTokens(terms.joined(separator: " "))
-        let ranked = generation.atoms.compactMap { atom -> (ContextStoredAtom, Int)? in
-            guard atom.validToGeneration == nil,
-                  atom.draft.injectionPolicy != .neverInject else {
-                return nil
-            }
-            let searchable = (
-                atom.draft.headingPath.joined(separator: " ") + " "
-                + atom.draft.triggers.joined(separator: " ") + " "
-                + atom.draft.body
-            ).lowercased()
-            let overlap = tokens.reduce(into: 0) { count, token in
-                if searchable.contains(token) { count += 1 }
-            }
-            guard overlap > 0 || tokens.isEmpty else { return nil }
-            return (atom, overlap)
-        }.sorted {
-            if $0.1 != $1.1 { return $0.1 > $1.1 }
-            if $0.0.draft.authority.rank != $1.0.draft.authority.rank {
-                return $0.0.draft.authority.rank > $1.0.draft.authority.rank
-            }
-            return $0.0.draft.id < $1.0.draft.id
-        }.prefix(32)
-        let candidates = ranked.map { atom, overlap in
-            ContextPrewarmCandidate(
-                atomID: atom.draft.id,
-                generationID: generation.generation.id,
-                sourceFingerprint: generation.generation.sourceFingerprint,
-                estimatedByteCount: atom.draft.body.utf8.count
-                    + ((atom.draft.embedding?.values.count ?? 0) * MemoryLayout<Float>.stride),
-                likelihood: min(1, 0.25 + (Double(overlap) * 0.15))
-            )
-        }
-        let eventID = ContextStableID.digest(parts: [
-            "context-owner-prewarm-v1",
-            kind.rawValue,
-            normalizedID,
-            String(revision),
-        ] + candidates.map { $0.atomID.rawValue })
-        return await submitPrewarm(.hint(ContextPrewarmHintMetadata(
-            scope: ContextPrewarmScope(kind: kind, id: normalizedID),
-            eventID: eventID,
-            revision: revision,
-            candidates: candidates
-        )))
-    }
-
-    private func observePrewarmContinuity(
-        request: ContextTurnRequest,
-        packet: ContextPacket,
-        generation: ContextStoredGeneration,
-        snapshot: ContextGenerationSnapshot
-    ) async {
-        let selectedIDs = Set(packet.receipt.selectedAtomIDs)
-        // A somatic signal's plan has no turn scope of its own; any turn may use it.
-        let organismScopes = prewarmPlans.keys.filter { $0.kind == .organism }
-        let relevantScopes = Array(Set(prewarmScopes(for: request) + organismScopes)).sorted()
-        guard relevantScopes.contains(where: { prewarmPlans[$0] != nil }) else { return }
-        let residentIDs = Set([snapshot.hotEntries, snapshot.warmEntries].joined().map { $0.key.id })
-        for scope in relevantScopes {
-            guard let plan = prewarmPlans.removeValue(forKey: scope) else { continue }
-            let validation = await prewarmPlanner.validate(plan)
-            let warmed = Set(validation.compactMap { item -> ContextAtomID? in
-                let atomID = item.candidate.atomID
-                return residentIDs.contains(atomID.rawValue) ? atomID : nil
-            })
-            let usefulness = await prewarmPlanner.recordUsefulness(
-                for: plan,
-                warmedAtomIDs: warmed,
-                independentlySelectedAtomIDs: selectedIDs
-            )
-            let receipt = ContextStoreReceipt(
-                kind: .prewarm,
-                generationID: generation.generation.id,
-                summary: "context prewarm usefulness",
-                details: [
-                    "scope": "\(scope.kind.rawValue):\(scope.id)",
-                    "requested": String(usefulness.requestedAtomCount),
-                    "warmed": String(usefulness.warmedAtomCount),
-                    "useful": String(usefulness.usefulAtomCount),
-                    "usefulness": String(usefulness.usefulness),
-                    "authority_granted": "false",
-                ]
-            )
-            let store = self.store
-            Task.detached(priority: .background) {
-                try? await store.recordReceipt(receipt)
-            }
-        }
-
-        let atomByID = Dictionary(generation.atoms.map {
-            ($0.draft.id, $0.draft)
-        }, uniquingKeysWith: { first, _ in first })
-        let candidateIDs = Array(Set(
-            packet.receipt.selectedAtomIDs + packet.receipt.pointerAtomIDs
-        )).sorted()
-        let candidates = candidateIDs.compactMap { atomID -> ContextPrewarmCandidate? in
-            guard let atom = atomByID[atomID] else { return nil }
-            return ContextPrewarmCandidate(
-                atomID: atomID,
-                generationID: generation.generation.id,
-                sourceFingerprint: generation.generation.sourceFingerprint,
-                estimatedByteCount: atom.body.utf8.count
-                    + ((atom.embedding?.values.count ?? 0) * MemoryLayout<Float>.stride),
-                likelihood: selectedIDs.contains(atomID) ? 1 : 0.5
-            )
-        }
-        guard !candidates.isEmpty else { return }
-        for scope in relevantScopes {
-            prewarmRevision &+= 1
-            let eventID = ContextStableID.digest(parts: [
-                "context-prewarm-v1",
-                scope.kind.rawValue,
-                scope.id,
-                packet.receipt.id,
-                String(prewarmRevision),
-            ])
-            guard scope.kind != .organism else { continue }
-            _ = await submitPrewarm(.hint(ContextPrewarmHintMetadata(
-                scope: scope,
-                eventID: eventID,
-                revision: prewarmRevision,
-                candidates: candidates
-            )))
-        }
-    }
-
-    private func prewarmScopes(for request: ContextTurnRequest) -> [ContextPrewarmScope] {
-        var scopes: [ContextPrewarmScope] = []
-        if let sessionID = request.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !sessionID.isEmpty {
-            scopes.append(ContextPrewarmScope(kind: .session, id: sessionID))
-        }
-        if request.surface == .workshop {
-            let executionID = request.activeTask?.trimmingCharacters(in: .whitespacesAndNewlines)
-            scopes.append(ContextPrewarmScope(
-                kind: .workshopExecution,
-                id: executionID?.isEmpty == false ? executionID! : "missions"
-            ))
-        }
-        if !request.cognitiveActivation.isEmpty {
-            scopes.append(ContextPrewarmScope(kind: .cognitive, id: "active-workspace"))
-        }
-        return Array(Set(scopes)).sorted()
     }
 
     private func feedbackSnapshot(
@@ -1187,21 +906,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             lastError = "context feedback persistence failed: \(error)"
             diagnostics("[context-flow] \(lastError ?? "context feedback persistence failed")")
             return
-        }
-        let receipt = ContextStoreReceipt(
-            kind: .feedback,
-            generationID: generationID,
-            summary: "context feedback",
-            details: [
-                "event_id": event.id,
-                "signal": Self.feedbackSignalName(signal),
-                "atoms": String(ids.count),
-                "time_bucket": String(bucket),
-            ]
-        )
-        let store = self.store
-        Task.detached(priority: .background) {
-            try? await store.recordReceipt(receipt)
         }
     }
 
@@ -1537,13 +1241,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             facts.insert(fact)
         }
         return facts
-    }
-
-    private static func prewarmTokens(_ text: String) -> Set<String> {
-        Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }.compactMap {
-            let token = String($0)
-            return token.count >= 2 ? token : nil
-        })
     }
 
     private static func feedbackSignalName(_ signal: ContextFeedbackSignal) -> String {
@@ -1916,7 +1613,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             return !Task.isCancelled
         } catch is CancellationError {
             // A cancelled caller must not mint an orange health incident or a
-            // durable degradation receipt. Pending demand remains retryable.
+            // persistent degradation. Pending demand remains retryable.
             return false
         } catch {
             recordReconciliationFailure(error)
@@ -1924,11 +1621,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
     }
 
-    /// 2026-07-21 audit fix: bound context.sqlite. store.prune() existed but
-    /// had zero production callers — generations, atom/source versions,
-    /// embeddings, FTS rows, and per-turn receipts accumulated forever. Runs
-    /// after successful commits at most once per pruneInterval; failures are
-    /// deliberately non-fatal (the next successful commit retries).
+    /// Bound retained generations and versions after successful commits.
+    /// Maintenance failures remain non-fatal; the next due commit retries.
     private func pruneStoreIfDue(now: Date = Date()) async {
         if let lastPruneAt, now.timeIntervalSince(lastPruneAt) < pruneInterval { return }
         do {
@@ -2023,17 +1717,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         lastError = String(describing: error)
         // Leave failed demand pending. A later external reconciliation will
         // coalesce and retry it without scheduling an immediate retry loop.
-        let store = self.store
-        let generationID = arena.currentSnapshot()?.generationID
-        let errorType = String(reflecting: type(of: error))
-        Task.detached(priority: .background) {
-            try? await store.recordReceipt(ContextStoreReceipt(
-                kind: .degraded,
-                generationID: generationID,
-                summary: "context reconciliation failed",
-                details: ["error_type": errorType]
-            ))
-        }
     }
 
     private func refreshWatchedDirectories() async {

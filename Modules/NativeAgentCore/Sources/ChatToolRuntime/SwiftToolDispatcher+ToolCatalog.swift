@@ -36,10 +36,10 @@ extension SwiftToolDispatcher {
     static let builtInToolNames: [String] = [
         "agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel",
         "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
-        "read_page", "maps_route", "maps_search", "read_file", "list_dir", "write_file", "move_file", "copy_file", "trash_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
+        "read_page", "maps_route", "maps_search", "read_file", "list_dir", "file_info", "write_file", "move_file", "copy_file", "trash_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
         "search_chat_history", "session_search", "workspace", "work_context", "artifact_find",
         "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
-        "agent_introspect", "daemon_introspect",
+        "agent_introspect",
         "tool_result_page", "request_interaction", "list_skills", "read_skill", "save_skill",
         "context_lookup", "context_expand", "scratchpad_read", "recent_trace_summary",
         // 2026-06-08: time_now + Claude-bridge return-channel tools were
@@ -83,7 +83,7 @@ extension SwiftToolDispatcher {
         // channels the user trusts (mac.notify + mobile.notify). Phase 1 — read-only macs;
         // Contacts/Mail/Messages/Notes/Music adapters come in Phase 2.
         "mac_calendar_list_upcoming", "mac_calendar_calendars", "mac_calendar_free_busy", "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mac_reminders_update",
-        "mac_notify", "mobile_notify", "phone_request", "mac_spotlight_search",
+        "mac_notify", "mobile_notify", "phone_request", "mac_location", "mac_spotlight_search",
         // 2026-06-07 Phase 2 — Contacts + AppleScript backends. Gated through
         // MacIntegrationPermissionStore. Write-default-OFF for the sensitive 5
         // (mail/messages/notes send + contacts create) — the user wants explicit toggle
@@ -429,22 +429,23 @@ extension SwiftToolDispatcher {
     /// surfaces. Dynamic registry and MCP tools are catalog rows too, but are
     /// intentionally not claimed here because this static dispatcher cannot
     /// vouch for their registration lifecycle.
-    public static let catalogRegisteredToolNames: Set<String> = Set(
-            builtInToolNames
-            + fullMacFileToolNames
-            + fullMacSystemToolNames
-            + fullMacAccessibilityReadToolNames
-            + activityQueryToolNames
-            + fullMacAccessibilityInjectionToolNames
-            + fullMacBuilderToolNames
-            + fullMacRestartToolNames
-        )
+    package static let nativeToolDescriptors: [String: ToolDescriptor] = Dictionary(uniqueKeysWithValues:
+        BuiltInToolSchemaFactory(requestedNames: nil).schemas(
+            includeFullMacFileTools: true, includeFullMacSystemTools: true,
+            includeFullMacAccessibilityReadTools: true, includeFullMacAccessibilityInjectionTools: true,
+            includeActivityQueryTool: true
+        ).map { ($0.name, ToolDescriptor(schema: $0, bucket: nativeBucket($0.name))) })
+
+    public static let catalogRegisteredToolNames = Set(nativeToolDescriptors.keys)
 
     /// Returns nil deliberately for a name without an explicit reviewed
     /// category. Callers must present that condition visibly instead of
     /// treating an arbitrary runtime name as a reviewed category.
     public static func catalogBucket(forRegisteredToolNamed name: String) -> ChatToolCatalogBucket? {
-        guard catalogRegisteredToolNames.contains(name) else { return nil }
+        nativeToolDescriptors[name]?.bucket
+    }
+
+    private static func nativeBucket(_ name: String) -> ChatToolCatalogBucket {
         if Self.fullMacBuilderToolNames.contains(name)
             || Self.fullMacRestartToolNames.contains(name) {
             return .shell
@@ -456,17 +457,19 @@ extension SwiftToolDispatcher {
             return .system
         }
         if Self.fullMacAccessibilityReadToolNames.contains(name)
-            || Self.fullMacAccessibilityInjectionToolNames.contains(name) {
+            || Self.fullMacAccessibilityInjectionToolNames.contains(name)
+            || Self.macClipboardToolNames.contains(name) || Self.macMenuToolNames.contains(name)
+            || Self.macReadToolNames.contains(name) {
             return .macControl
         }
         if Self.macIntegrationToolNames.contains(name) {
             return .macIntegration
         }
-        return Self.coreCatalogToolNames.contains(name) ? .core : nil
+        return Self.coreCatalogToolNames.contains(name) ? .core : .unclassified
     }
 
     private static let standardFileToolNames: Set<String> = [
-        "read_file", "list_dir", "write_file", "move_file", "copy_file", "trash_file", "mail_save_attachment",
+        "read_file", "list_dir", "file_info", "write_file", "move_file", "copy_file", "trash_file", "mail_save_attachment",
     ]
 
     private static let macIntegrationToolNames: Set<String> = [

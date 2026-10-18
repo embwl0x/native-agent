@@ -183,8 +183,7 @@ public struct AgentConversationContinuation: Sendable {
     public func tick() async throws {
         resumeQueues()
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
-        // Discovery at launch and after an install: no scan unless one is due.
-        Task.detached(priority: .utility) { await AgentDiscoverySession.shared.refreshIfInstallsChanged(dataRoot: dataRoot) }
+        Task.detached(priority: .utility) { await AgentDiscoverySession.shared.watchInstalls(dataRoot: dataRoot) }
         // Her wake is this tick's one full turn; the reads wait a second.
         if try await wakeHer() { return }
         let now = Date()

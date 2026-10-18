@@ -16,12 +16,14 @@ package struct BuiltInToolSchemaFactory {
 
     func requestedSchema(
         name: String,
+        toolClass: ToolClass,
         description: @autoclosure () -> String,
         parametersJSON: @autoclosure () -> Data
     ) -> LLMToolSchema? {
         guard requestedNames?.contains(name) != false else { return nil }
         return LLMToolSchema(
             name: name,
+            toolClass: toolClass,
             description: description(),
             parametersJSON: parametersJSON()
         )

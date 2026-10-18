@@ -239,8 +239,16 @@ public actor AgentContactTasks {
         return worker
     }
 
+    /// A resumed turn settles its reply to the conversation, never to the
+    /// connection that asked: that died with the process. A route that names
+    /// a retained task (a contact's send) resumes inside it, and the worker
+    /// reads the reply back from the transcript. A caller-result route with
+    /// no task locator at all (a /claude/message turn, whose caller reads the
+    /// conversation) resumes plainly; a route that names a task it cannot
+    /// find is still a failure.
     public func resume(_ route: AgentBridgeCompletionRoute, runID: String,
                        operation: @escaping @Sendable () async throws -> Void) async throws {
+        if route.threadId == nil, route.correlationId == nil { try await operation(); return }
         let task = try callerResultTarget(route)
         guard let session = route.sessionId, task.canonicalRunID == runID else { throw AgentContactFailure.missing }
         if task.state.terminal {

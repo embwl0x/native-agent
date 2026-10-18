@@ -75,13 +75,9 @@ public enum ChatSurfaceBackgroundWork {
                 threadId: destination.threadId.map(String.init),
                 requesterUserId: context.fromUserId.map(String.init)
             )
-            // Downloaded Telegram files use the same attachment types as Mac
+            // Downloaded Telegram files use the same attachment type as Mac
             // chat, so document ingestion and its Trust policy stay in Core.
-            // Qualify as ChatOrchestration.MultimodalAttachment: an unqualified
-            // `MultimodalAttachment` resolves to NativeAgentShared's same-named
-            // type, which `client.chat` does NOT accept (mirrors NativeClient's
-            // explicit qualification at its chat call site).
-            let chatAttachments: [ChatOrchestration.MultimodalAttachment] = mediaAttachments.compactMap { media in
+            let chatAttachments: [MultimodalAttachment] = mediaAttachments.compactMap { media in
                 guard let bytes = media.bytes, !bytes.isEmpty else { return nil }
                 guard let resolved = media.chatTypeAndMime else { return nil }
                 return ChatOrchestration.MultimodalAttachment(

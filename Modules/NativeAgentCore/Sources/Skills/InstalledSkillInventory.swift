@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import CryptoKit
 import Foundation
 import NativeAgentCore
@@ -212,13 +213,25 @@ public enum InstalledSkillInventory {
 /// here fails closed: missing or malformed means not runnable.
 public enum SkillScript {
     public static let interpreterRevision = 2
-    public static let sourceLimit = 8 * 1024
+    public static let sourceLimit = AbilityStore.sourceLimit
     public static let stepLimit = 50
     public static let actionLimit = 50
     static let types: Set<String> = ["string", "int", "number", "bool", "list", "object"]
     static let verbs: Set<String> = ["read", "find", "log", "expect", "expect_fail", "decide", "step"]
     /// A script whose origin no record names counts as a peer's.
     static let unrecorded = "unrecorded"
+
+    /// A runner verb (read, app.find…), which actions never lists.
+    public static func isVerb(_ spelled: String) -> Bool {
+        let id = spelled.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return verbs.contains(id.hasPrefix("app.") ? String(id.dropFirst(4)) : id)
+    }
+
+    /// The action id an `actions` entry spells; nil for a runner verb or no id's shape.
+    public static func dependencyID(_ spelled: String) -> String? {
+        let id = spelled.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !isVerb(id) && id.range(of: "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$", options: .regularExpression) != nil ? id : nil
+    }
 
     /// The stored form of a save's `script`, or why it is refused.
     public static func normalized(_ value: JSONValue?) throws -> JSONValue {
@@ -258,9 +271,7 @@ public enum SkillScript {
         var actions: [String] = []
         for item in listed {
             guard case .string(let spelled) = item else { throw refuse("each action is an app action id, like memory.recall.") }
-            let id = spelled.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard !verbs.contains(id.hasPrefix("app.") ? String(id.dropFirst(4)) : id),
-                  id.range(of: "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$", options: .regularExpression) != nil else {
+            guard let id = dependencyID(spelled) else {
                 throw refuse("\(spelled) is not an app action dependency. actions lists IDs such as memory.recall; "
                     + "app.read, app.find, app.log, app.expect, app.expect_fail, app.decide and app.step are built in. Use actions:[] for helpers alone.")
             }
@@ -424,10 +435,14 @@ public enum SkillScript {
         if case .object(let given)? = fields["params"] {
             params = given.keys.sorted().map { "input.\($0): \(parameterType(given[$0]) ?? "?")" }
         }
-        let actions = actions(script)
+        let called = actions(script)
+        let reads = called.filter { $0.hasPrefix("read ") || $0 == "app.read" }.map { $0 == "app.read" ? $0 : String($0.dropFirst(5)) }
+        let actions = called.filter { !$0.hasPrefix("read ") && $0 != "app.read" }
         let of = if case .int(let n)? = fields["of"] { n } else { Int64(0) }
+        // In the header's own words: `actions` are the app actions it calls; reads are built in.
         return "run {\(params.joined(separator: ", "))} · \(of) step\(of == 1 ? "" : "s")"
-            + (actions.isEmpty ? "" : " · calls \(actions.joined(separator: ", "))")
+            + (actions.isEmpty ? "" : " · actions \(actions.joined(separator: ", "))")
+            + (reads.isEmpty ? "" : " · reads \(reads.joined(separator: ", "))")
     }
 
     /// Who steered the turn that wrote it: hers, or the peers that did

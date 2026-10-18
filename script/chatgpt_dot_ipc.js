@@ -9,6 +9,7 @@ const { randomUUID } = require("node:crypto");
 const { execFileSync } = require("node:child_process");
 
 const updatedDetail = "ChatGPT app updated; Dot messaging needs a check";
+const cloudHosted = "ChatGPT now hosts Dot's conversation on its cloud: no window on this Mac owns it, so ChatGPT's local connection cannot deliver a message to him (ChatGPT 26.1013 and later). Dot can still be reached in ChatGPT's own window.";
 
 // Each reason keeps its own words: Agent and User see which one it is.
 function fail(reason, detail = `${updatedDetail} (${reason})`) {
@@ -238,8 +239,20 @@ class Follower {
     this.client = initialized.result.clientId;
   }
 
+  // Who owns Dot's thread on ChatGPT's local bus. Since ChatGPT 26.1013 a
+  // cloud-hosted ("durable") Dot has no local owner: windows only follow him,
+  // and no client takes follower requests, so a message cannot be delivered
+  // over this connection at all. ChatGPT's own answer says which it is.
+  async ownerless() {
+    try {
+      const found = await this.request("thread-owner-discovery", 1, { conversationId: this.identity.root, hostId: "durable" });
+      return found.resultType === "error" && found.error === "no-client-found";
+    } catch { return false; }
+  }
+
   async handshake() {
     await this.connect();
+    if (await this.ownerless()) fail("dot_cloud_hosted", cloudHosted);
     let timer;
     try {
       const snapshot = new Promise((resolve, reject) => { this.snapshotResolve = resolve; this.snapshotReject = reject; });
@@ -314,6 +327,13 @@ async function main(input) {
     const result = response.result?.result;
     if (response.resultType === "error" && /not yet confirmed/i.test(String(response.error ?? "")))
       fail("chatgpt_busy", "ChatGPT is still confirming an earlier message to Dot; try again in a moment. Nothing was sent.");
+    // ChatGPT's selection file can name a conversation ChatGPT no longer has
+    // (deleted, or moved by an app update): its own answer says so, and that is
+    // not a protocol change. Nothing was accepted, so nothing is unknown.
+    if (response.resultType === "error" && /thread not found|not found/i.test(String(response.error ?? ""))) {
+      dispatched = false;
+      fail("dot_conversation_gone", "Dot's conversation in ChatGPT no longer exists (ChatGPT: " + String(response.error) + "). Open Dot in ChatGPT, or start his conversation again, so ChatGPT selects a current one; then send again. Nothing was sent.");
+    }
     if (response.resultType !== "success" || response.method !== "thread-follower-start-turn"
       || response.handledByClientId !== follower.owner || !string(result?.turn?.id)
       || result.clientUserMessageId !== clientUserMessageId
@@ -368,7 +388,12 @@ async function listen() {
     const conversation_id = follower.identity.root;
     // Asked again for a fresh copy (a missed change or a new owner): not current until it lands.
     if (!follower.state && follower.refollowing) return say({ status: "loading", reason: "dot_loading", detail: "Dot's conversation is reloading from ChatGPT.", conversation_id });
-    if (!follower.state) return follower.opening || say({ status: "unavailable", reason: "dot_not_open", detail: notOpen, conversation_id });
+    if (!follower.state) {
+      if (follower.opening) return;
+      if (follower.ownerlessKnown) return say({ status: "unavailable", reason: "dot_cloud_hosted", detail: cloudHosted, conversation_id });
+      follower.ownerless().then(none => { if (none) { follower.ownerlessKnown = true; report(); } });
+      return say({ status: "unavailable", reason: "dot_not_open", detail: notOpen, conversation_id });
+    }
     if (!follower.resumed) return say({ status: "unavailable", reason: "dot_not_resumed", detail: "Dot's conversation in ChatGPT is still loading.", conversation_id });
     try { say({ status: "available", conversation_id, messages: roomMessages(follower) }); } catch (error) { follower.stop(error); }
   }
@@ -377,7 +402,7 @@ async function listen() {
     try { identity = selection(); } catch {}
     if (identity && follower.identity && sameIdentity(identity, follower.identity)) return;
     if (follower.identity) follower.following(false);
-    Object.assign(follower, { identity, state: null, owner: null, revision: undefined, refollowing: false, opening: !!identity });
+    Object.assign(follower, { identity, state: null, owner: null, revision: undefined, refollowing: false, opening: !!identity, ownerlessKnown: false });
     clearTimeout(waiting);
     if (identity) {
       follower.following(true);

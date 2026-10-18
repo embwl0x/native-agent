@@ -1,3 +1,4 @@
+import AuthoredCapabilities
 import Foundation
 import StandingBots
 import Research
@@ -74,11 +75,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// Tools an owner outside Core contributes (the app's browser, pages,
     /// health reads): registered in this one catalog and
     /// executed there. nil in headless bodies, which then have none of them.
-    private let appToolPort: (any ToolExecutor)?
-    /// A swarm worker sees Core's own catalog only, as it did before the
-    /// app's tools joined it (`AgentSwarmInheritedToolScope`).
-    @TaskLocal static var withoutAppTools = false
-    var appTools: (any ToolExecutor)? { Self.withoutAppTools ? nil : appToolPort }
+    let appTools: (any ToolExecutor)?
+    private let executorDescriptors: [String: ToolDescriptor]
     let agentBridgeConfigRoot: URL?
     let a2aPushConfiguration: (@Sendable (AgentPeerContact) async -> JSONValue?)?
     /// Rebuildable temporal continuity for the agent-readable screen. This is
@@ -133,6 +131,15 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         standingBotSession: BotRunnerSession? = nil,
         swarmChatFactory: any SwarmChatClientFactory
     ) {
+        _ = Self.builtInsRegistered
+        let descriptors = appTools?.descriptors ?? []
+        precondition(Set(descriptors.map(\.name)).isDisjoint(with: Self.nativeCanonicalToolNames),
+                     "Contributed tools must not shadow Core tools; declare replacements instead.")
+        let replacements = appTools?.replacesCoreTools ?? []
+        precondition(replacements.isSubset(of: Self.nativeCanonicalToolNames), "Only registered Core tools can be replaced.")
+        self.executorDescriptors = Dictionary(uniqueKeysWithValues:
+            (descriptors + replacements.compactMap { Self.nativeToolDescriptors[$0] }).map { ($0.name, $0) })
+        AppActionBinding.registerTools(descriptors)
         self.dataRoot = dataRoot
         self.pageReader = SwiftNativeResearchClient(dataRoot: dataRoot)
         self.standingBotRunEnqueue = standingBotRunEnqueue
@@ -151,7 +158,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             ?? (dataRoot == PersistenceCore.defaultDataRoot()
                 ? .shared
                 : MacIntegrationPermissionStore(dataRoot: dataRoot))
-        self.appToolPort = appTools
+        self.appTools = appTools
         self.agentBridgeConfigRoot = agentBridgeConfigRoot ?? InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         self.a2aPushConfiguration = a2aPushConfiguration
     }
@@ -218,7 +225,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     // result instead of a whole prefix rewrite.
     public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
         if names == ["app"] {
-            return appTools?.descriptors.filter { names.contains($0.name) }.map(\.schema) ?? []
+            return appTools == nil ? [] : executorDescriptors.values.filter { names.contains($0.name) }.map(\.schema)
         }
         return await catalogSnapshot(includeSchemas: true, schemaNames: names).schemas
     }
@@ -243,9 +250,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
                 includeFullMacAccessibilityInjectionTools: access.accessibilityAllowed,
                 includeActivityQueryTool: activity,
                 requestedNames: schemaNames
-            )
-            let builtInNames = Set(builtIn.map(\.name))
-            let registry = Self.authoredTools(records: records, named: schemaNames).map(\.schema).filter { !builtInNames.contains($0.name) }
+            ).map { executorDescriptors[$0.name]?.schema ?? $0 }
+            let registry = Self.authoredTools(records: records, named: schemaNames).map(\.schema)
             let combined = builtIn + registry + Self.mcpToolSchemas(mcp.filter {
                 $0.serverId != "nativeagent-internal" && schemaNames?.contains($0.bridgedName) != false
             })
@@ -257,23 +263,23 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
                 mcp.filter { $0.serverId != "nativeagent-internal" }.map(\.bridgedName))
     }
 
-    /// Contributed schemas follow Core's own, and a Core, registry or MCP
-    /// name always wins: one name, one tool.
+    /// Assembly and authored admission reserve every executor-owned name.
     private func withContributedSchemas(_ native: [LLMToolSchema], named names: Set<String>?) -> [LLMToolSchema] {
-        guard let appTools else { return native }
-        let existing = Set(native.map(\.name))
-        return native + appTools.descriptors.filter { !existing.contains($0.name) && names?.contains($0.name) != false }.map(\.schema)
+        guard appTools != nil else { return native }
+        precondition(Set(native.map(\.name)).isDisjoint(with: contributedToolNames), "Tool ownership collision in catalog.")
+        return native + executorDescriptors.values.filter { contributedToolNames.contains($0.name) && names?.contains($0.name) != false }
+            .sorted { $0.name < $1.name }.map(\.schema)
     }
 
     /// Names of the contributed tools this catalog actually offers.
     var contributedToolNames: Set<String> {
-        Set(appTools?.descriptors.map(\.name) ?? [])
+        executorOwnedToolNames.subtracting(Self.nativeCanonicalToolNames)
     }
 
     /// Every name an executor answers: its own tools and the Core tools it
     /// runs in their place.
     var executorOwnedToolNames: Set<String> {
-        contributedToolNames.union(appTools?.replacesCoreTools ?? [])
+        appTools == nil ? [] : Set(executorDescriptors.keys)
     }
 
     static func extractSessionId(from input: [String: JSONValue]) -> String {
@@ -299,10 +305,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         var names = records
             .filter { $0.fields["status"] == .string("active") }
             .compactMap { (try? $0.string("id")) ?? (try? $0.string("name")) }
-            .sorted().filter {
-                !Self.registryReservedNames.contains($0) && !$0.hasPrefix("mcp__")
-                    && CanonicalToolNameDispatcher.canonical($0) == $0
-            }
+            .sorted().filter(Self.isAuthorableToolName)
         // Built-in Swift dispatch-table names always surface, even if
         // No authored ability files exist on fresh installs.
         let existing0 = Set(names)
@@ -407,26 +410,11 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// Canonical native names: kept as given by alias resolution, and their
     /// dotted spellings are reserved from registry names so a custom `desk.read`
     /// can never sit beside the built-in `desk_read` as a look-alike.
-    static let nativeCanonicalToolNames: Set<String> = Set(builtInToolNames)
-        .union(fullMacAccessibilityReadToolNames)
-        .union(activityQueryToolNames)
-        .union(fullMacAccessibilityInjectionToolNames)
-        .union(macClipboardToolNames)
-        .union(macMenuToolNames)
-        .union(macReadToolNames)
+    static let nativeCanonicalToolNames = Set(nativeToolDescriptors.keys)
 
-    package static let reservedBuiltInNames: Set<String> = Set(builtInToolNames)
-        .union(alwaysOnCoreNames)
-        .union(fullMacFileToolNames)
-        .union(fullMacSystemToolNames)
-        .union(fullMacAccessibilityReadToolNames)
-        .union(activityQueryToolNames)
-        .union(fullMacAccessibilityInjectionToolNames)
-        .union(fullMacBuilderToolNames)
-        .union(fullMacRestartToolNames)
-        .union(macClipboardToolNames)
-        .union(macMenuToolNames)
-        .union(macReadToolNames)
+    /// Registered with the policy registry once, the first time a dispatcher is made.
+    private static let builtInsRegistered: Void = AppActionBinding.registerTools(Array(nativeToolDescriptors.values))
+    package static let reservedBuiltInNames = nativeCanonicalToolNames.union(alwaysOnCoreNames)
 
     /// Registry ownership must also reserve accepted alias spellings, but the
     /// public built-in inventory remains canonical so catalogs and eval-ledger
@@ -442,19 +430,43 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// A name a tool she writes may take: no built-in's (or its dotted
     /// spelling), no `mcp__` bridge name, nothing an alias rewrites.
     public static func isAuthorableToolName(_ id: String) -> Bool {
-        !registryReservedNames.contains(id) && !id.hasPrefix("mcp__") && CanonicalToolNameDispatcher.canonical(id) == id
+        !registryReservedNames.contains(id) && !AppActionBinding.builtInToolName(id)
+            && !id.hasPrefix("mcp__") && CanonicalToolNameDispatcher.canonical(id) == id
     }
 
     /// The same, for the `app` door's generated `authored.<id>` actions, with
     /// the primitive permissions and app dependencies each declares.
-    package static func authoredTools(dataRoot: URL) -> [(schema: LLMToolSchema, permissions: [String], actions: [String])] {
-        authoredTools(records: readRegistryRecords(dataRoot: dataRoot))
+    /// Memoized per data root until the ability store writes (its
+    /// `generation`) or the reserved tool namespace grows: a binding miss on
+    /// any route (a historical call shown back, receipt redaction, trace
+    /// ranking, policy) resolves her parts from memory instead of re-reading
+    /// and migrating the store per call. (10-17: the crash itself was the
+    /// thunk accumulation fixed in AppActionBinding; this walk ran once per
+    /// row of a chat-history search and is simply too much work per miss.)
+    /// The store's own lock guards the read and the memo (it is recursive,
+    /// and a store write that reaches a part lookup already holds it); a
+    /// failed read is not memoized; the key is the one read before the walk.
+    package static func authoredTools(dataRoot: URL) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
+        AbilityStore.withLock {
+            let key = (dataRoot.path, AbilityStore.generation, AppActionBinding.registeredToolCount)
+            if let memo = authoredToolsMemo, memo.key == key { return memo.tools }
+            guard case .array(let rows)? = try? AbilityStore(dataRoot: dataRoot).registry(kind: .tool) else { return [] }
+            let records = rows.compactMap { try? JSONRow($0) }
+            guard records.count == rows.count else { return [] }
+            let tools = authoredTools(records: records)
+            authoredToolsMemo = (key, tools)
+            return tools
+        }
     }
+    /// Keyed by root, the store's generation and the reserved tool namespace
+    /// (a built-in registered later may take an authored name).
+    nonisolated(unsafe) private static var authoredToolsMemo: (key: (String, UInt64, Int),
+        tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)])?
 
-    private static func authoredTools(records: [JSONRow], named names: Set<String>? = nil) -> [(schema: LLMToolSchema, permissions: [String], actions: [String])] {
+    private static func authoredTools(records: [JSONRow], named names: Set<String>? = nil) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
         let active = records
             .filter { $0.fields["status"] == .string("active") && $0.fields["disabledBy"] != .string("owner") }
-        var tools: [(schema: LLMToolSchema, permissions: [String], actions: [String])] = []
+        var tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] = []
         // mcp__-prefixed ids are excluded too: dispatch's default case parses
         // that prefix as an MCP bridge name BEFORE consulting the registry, so
         // a registry schema under it would advertise a route that never fires.
@@ -473,8 +485,11 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
                                                                options: [.sortedKeys]) else {
                 continue
             }
+            let page: String? = if case .object(let face)? = row.fields["face"], case .string(let page)? = face["page"] { page } else { nil }
+            let action: String? = if case .object(let face)? = row.fields["face"], case .string(let action)? = face["action"] { action } else { nil }
             tools.append((LLMToolSchema(name: id, description: description, parametersJSON: schemaData),
-                          (try? row.strings("permissions")) ?? [], (try? row.strings("actions")) ?? []))
+                          (try? row.strings("permissions")) ?? [], (try? row.strings("actions")) ?? [],
+                          page, action))
         }
         return tools.sorted { $0.schema.name < $1.schema.name }
     }

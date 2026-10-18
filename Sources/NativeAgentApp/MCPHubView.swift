@@ -255,15 +255,15 @@ struct MCPHubView: View {
 
             HStack(spacing: 8) {
                 Button("Warm") {
-                    Task { await appModel.warmMCPServer(server) }
+                    Task { await appModel.runMCPCommand(.warm, server: server) }
                 }
                 .accessibilityIdentifier("mcp.server.warm.\(server.id)")
                 Button("Restart") {
-                    Task { await appModel.restartMCPServer(server) }
+                    Task { await appModel.runMCPCommand(.restart, server: server) }
                 }
                 .accessibilityIdentifier("mcp.server.restart.\(server.id)")
                 Button("Refresh") {
-                    Task { await appModel.refreshMCPCache(server) }
+                    Task { await appModel.runMCPCommand(.refresh, server: server) }
                 }
                 Spacer(minLength: 0)
                 if !server.updatedAt.isEmpty {
@@ -827,127 +827,50 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func warmMCPServer(_ server: MCPServer) async {
-        // gpt-5.5 review-2 race-safety: same late-arrival guard as
-        // loadMCPDetails. Warm A then tap B before A's awaits return would
-        // otherwise overwrite B's inventories with A's. Capture pendingId
-        // up-front and only adopt fetched arrays when the user is still on
-        // this server.
-        let pendingId = server.id
-        do {
-            selectedMCPServerId = pendingId
-            _ = try await MCPUIActions.warmMCPServer(serverId: pendingId, dispatcher: engine.tools.mcp)
-            let fetchedSessions = (try? await engine.tools.listMCPSessions())
-            if selectedMCPServerId == pendingId {
-                mcpToolReadState = .loading
-            }
-            let fetchedTools: [MCPTool]?
-            do {
-                fetchedTools = try await MCPUIActions.listTools(serverId: pendingId, dispatcher: engine.tools.mcp)
-            } catch {
-                fetchedTools = nil
-                if selectedMCPServerId == pendingId {
-                    mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
-                }
-            }
-            if selectedMCPServerId == pendingId {
-                mcpResourceReadState = .loading
-            }
-            let fetchedResources: [MCPResource]?
-            do {
-                fetchedResources = try await MCPUIActions.listResources(serverId: pendingId, dispatcher: engine.tools.mcp)
-            } catch {
-                fetchedResources = nil
-                if selectedMCPServerId == pendingId {
-                    mcpResources = []
-                    mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
-                }
-            }
-            // Sessions are server-list-wide, safe to apply unconditionally.
-            if let s = fetchedSessions { engine.tools.mcpSessions = s }
-            // Tools / resources are server-scoped — guard on still-selected.
-            if selectedMCPServerId == pendingId {
-                if let t = fetchedTools { mcpTools = t }
-                if fetchedTools != nil { mcpToolReadState = .current }
-                if let r = fetchedResources {
-                    mcpResources = r
-                    mcpResourceReadState = .current
-                }
-            }
-            if selectedMCPServerId == pendingId {
-                disabledFeature = nil
-                if case .current = mcpResourceReadState {
-                    statusText = "MCP warmed and details refreshed: \(server.name)"
-                } else {
-                    statusText = "MCP warmed, but details could not refresh: \(server.name)"
-                }
-            }
-        } catch let err as NSError where AppModel.isNotImplemented(err) {
-            guard selectedMCPServerId == pendingId else { return }
-            disabledFeature = AppModel.disabledBadge(for: "MCP warm", error: err)
-            statusText = disabledFeature ?? "MCP warm disabled"
-        } catch {
-            guard selectedMCPServerId == pendingId else { return }
-            setFailureStatus("Warming the MCP server failed. " + UserFacingError.cause(error, action: "warm the MCP server"), cause: error)
-        }
-    }
-
-    @MainActor
-    func restartMCPServer(_ server: MCPServer) async {
-        let pendingId = server.id
-        do {
-            selectedMCPServerId = pendingId
-            _ = try await MCPUIActions.restartMCPServer(serverId: pendingId, dispatcher: engine.tools.mcp)
-            engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
-            // Restart replaces the live child. Refresh the selected inventory
-            // through the same owner before declaring completion; otherwise
-            // the Hub can show tools/resources from the pre-restart session.
-            guard selectedMCPServerId == pendingId else { return }
-            await loadMCPDetails(server)
-            guard selectedMCPServerId == pendingId else { return }
-            if case .current = mcpResourceReadState {
-                statusText = "MCP restarted and details refreshed: \(server.name)"
-            } else {
-                statusText = "MCP restarted, but details could not refresh: \(server.name)"
-            }
-        } catch {
-            guard selectedMCPServerId == pendingId else { return }
-            setFailureStatus("Restarting the MCP server failed. " + UserFacingError.cause(error, action: "restart the MCP server"), cause: error)
-        }
-    }
-
-    @MainActor
-    func refreshMCPCache(_ server: MCPServer) async {
+    @discardableResult
+    func runMCPCommand(_ command: MCPUIActions.ServerCommand, server: MCPServer) async -> JSONValue {
         let pendingId = server.id
         selectedMCPServerId = pendingId
         mcpTools = []
         mcpToolReadState = .loading
         mcpResources = []
         mcpResourceReadState = .loading
+        let label = command == .refresh ? "MCP cache refresh" : "MCP \(command.rawValue)"
         do {
-            _ = try await MCPUIActions.refreshMCPCache(serverId: pendingId, dispatcher: engine.tools.mcp)
-            engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
-            guard selectedMCPServerId == pendingId else { return }
-            await loadMCPDetails(server)
-            guard selectedMCPServerId == pendingId else { return }
-            disabledFeature = nil
-            if case .current = mcpToolReadState, case .current = mcpResourceReadState {
-                statusText = "MCP cache and details refreshed: \(server.name)"
-            } else {
-                statusText = "MCP cache refreshed, but details could not refresh: \(server.name)"
+            let result = try await MCPUIActions.runServerCommand(command, server: server, dispatcher: engine.tools.mcp)
+            if case .success(let sessions) = result.sessions { engine.tools.mcpSessions = sessions }
+            if selectedMCPServerId == pendingId {
+                mcpTools = result.tools
+                mcpToolReadState = .current
+                switch result.resources {
+                case .success(let resources):
+                    mcpResources = resources
+                    mcpResourceReadState = .current
+                case .failure(let error):
+                    mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
+                }
             }
-        } catch let err as NSError where AppModel.isNotImplemented(err) {
-            guard selectedMCPServerId == pendingId else { return }
-            mcpToolReadState = .unavailable(UserFacingError.cause(err, action: "read the MCP tools"))
-            mcpResourceReadState = .unavailable(UserFacingError.cause(err, action: "read the MCP resources"))
-            disabledFeature = AppModel.disabledBadge(for: "MCP cache refresh", error: err)
-            statusText = disabledFeature ?? "MCP cache refresh disabled"
+            disabledFeature = nil
+            statusText = result.detail
+            return result.toolResult
         } catch {
-            guard selectedMCPServerId == pendingId else { return }
-            mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
-            mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
-            setFailureStatus("Refreshing the MCP cache failed. " + UserFacingError.cause(error, action: "refresh the MCP cache"), cause: error)
+            if selectedMCPServerId == pendingId {
+                mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
+                mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
+            }
+            let line: String
+            if AppModel.isNotImplemented(error as NSError) {
+                line = AppModel.disabledBadge(for: label, error: error as NSError)
+                disabledFeature = line
+            } else {
+                line = UserFacingError.message(error, action: command == .refresh ? "refresh the MCP cache" : "\(command.rawValue) the MCP server")
+            }
+            setFailureStatus(line, cause: error)
+            return .object([
+                "server_id": .string(pendingId), "command": .string(command.rawValue),
+                "status": .string("failed"), "command_completed": .bool(false),
+                "detail": .string(UserFacingError.forAgent(line, cause: error.localizedDescription))
+            ])
         }
     }
 

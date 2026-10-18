@@ -57,13 +57,15 @@ public enum QuietComposerCommands {
     public static func state<Host: QuietComposerCommandPort>(appModel: Host, sessionId: String = "") async -> [String: JSONValue] {
         var sessionID = appModel.activeChatSessionId
         if !sessionId.isEmpty {
-            guard case .success(let found) = QuietChatSessionCommands.resolve(sessionId, appModel: appModel) else {
-                return [
-                    "status": .string("failed"), "effects": .string("none"), "reason": .string("unknown_session"),
-                    "detail": .string("No open conversation has that id or title. chat.list lists them with their ids."),
-                ]
+            switch QuietChatSessionCommands.resolve(sessionId, appModel: appModel) {
+            case .success(let found): sessionID = found.id
+            case .failure(let refusal):
+                // The resolver's own why; a name no conversation has is not_found.
+                var fields: [String: JSONValue] = if case .object(let fields) = refusal.json { fields } else { [:] }
+                if fields["reason"] == .string("unknown_session") { fields["status"] = .string("not_found") }
+                fields["effects"] = .string("none")
+                return fields
             }
-            sessionID = found.id
         }
         let draft = appModel.quietComposerDraft(sessionID)
         var body: [String: JSONValue] = [

@@ -175,25 +175,15 @@ extension AppDelegate {
         Task { @MainActor in
             BrowserWindowController.shared.startIPCServer()
         }
-        // PATCH-2026-05-07: mac-control-bridge Start Mac Control bridge on its
-        // fixed port (8770), so local mac-control calls execute under NativeAgent.app's bundle
-        // identity (TCC attributes Automation/Accessibility/etc. to NativeAgent).
-        // PATCH-2026-05-07: bridge-off-main Start on a background queue so
-        // we don't compete with iCloudBridge.setup()'s synchronous-but-slow
-        // ubiquity container query for MainActor time.
-        DispatchQueue.global(qos: .userInitiated).async {
-            MacControlBridge.shared.start()
-        }
         // ClaudeBridge: localhost HTTP on 8771 so Claude (Claude Code
         // CLI) can query Agent's state, fire chat turns, and run tools
-        // without UI click-through. Sibling of MacControlBridge — started
+        // without UI click-through. Started
         // in the SAME lifecycle hook so menu-bar/background launches
         // (which never show the main window and never fire SwiftUI .task
         // modifiers) still bring the bridge up. (Previously wired in
         // MainWindowContent's .task — silently never fired.) Synchronous
         // DispatchQueue dispatch (not Task.detached) so the actor isolation
-        // can't defer it past application launch finish — mirrors
-        // MacControlBridge above.
+        // can't defer it past application launch finish.
         ModuleLog.app("[claude-bootstrap] dispatching ClaudeBridge.startServer on dispatch queue")
         DispatchQueue.global(qos: .userInitiated).async {
             ClaudeBridgeRuntime.shared.startSyncForBootstrap()
@@ -318,7 +308,6 @@ extension AppDelegate {
         // land mid-drain and no stale credential outlives the process.
         NativeAgentA2AGRPCListener.shared.stop()
         ClaudeBridgeRuntime.shared.stop()
-        MacControlBridge.shared.stop()
         MainActor.assumeIsolated {
             BrowserWindowController.shared.stopIPCServer()
             MoodTintWeather.shared.stop()

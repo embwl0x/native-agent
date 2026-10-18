@@ -89,8 +89,8 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
         }
     }
 
-    func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) -> String? {
-        SystemPermissionPreflight.cardBlockReason(ids, mode: mode)
+    func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> String? {
+        await SystemPermissionPreflight.cardBlockReason(ids, mode: mode)
     }
 }
 
@@ -176,13 +176,46 @@ struct AppInlineInteractionControlPort: InlineInteractionControlPort {
 }
 
 extension AppInlineInteractionPlatformPort {
-    var applicationIsActive: Bool { NSApp.isActive }
+    func permissionChanges() -> AsyncStream<Void> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let center = NSWorkspace.shared.notificationCenter
+            // Tokens are immutable; NotificationCenter can remove them from any thread.
+            nonisolated(unsafe) let active = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+            ) { _ in continuation.yield(()) }
+            nonisolated(unsafe) let changed = NotificationCenter.default.addObserver(
+                forName: SystemPermissionPreflight.permissionDidChange, object: nil, queue: .main
+            ) { _ in continuation.yield(()) }
+            nonisolated(unsafe) let quit = center.addObserver(
+                forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
+            ) { notification in
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      app.bundleIdentifier == "com.apple.systempreferences" else { return }
+                continuation.yield(())
+            }
+            continuation.onTermination = { _ in
+                NotificationCenter.default.removeObserver(active)
+                NotificationCenter.default.removeObserver(changed)
+                center.removeObserver(quit)
+            }
+            continuation.yield(())
+        }
+    }
 
     func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool {
         await SystemPermissionPreflight.askMacOSForCard(ids, mode: mode)
     }
 
     func writeInteractionSnapshots() async { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
+
+    func openInteractionCards() async -> [(id: String, sessionID: String)] {
+        let rows = (try? await NativeAgentEngine.live.inbox.list()) ?? []
+        return rows.compactMap { row in
+            guard row.id.hasPrefix("interaction:"), ["unread", "read"].contains(row.status),
+                  let session = row.chat_session_id, !session.isEmpty else { return nil }
+            return (id: String(row.id.dropFirst("interaction:".count)), sessionID: session)
+        }
+    }
 
     func refreshInteractionInbox() async {
         do {

@@ -978,6 +978,11 @@ var effect: [String: JSONValue] = [
         }
         output["effect"] = .object(effect)
 
+        // The verb's reply look reads this same post-effect walk (a timed-out walk is read afresh).
+        if frame.completeWindow, !read.snapshot.truncationReasons.contains("time_budget") {
+            MacSightCaptureBinding.current?.walked = (read, seam)
+        }
+
         // 10. A NEW FRAME, so the next verb continues from the state the act
         //     produced instead of from a description of the screen before it.
         let capturedAt = now()

@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
@@ -123,37 +124,7 @@ extension ChatMessage: Equatable {
     }
 }
 
-/// Mirrors `MultimodalAttachment` in NativeAgentShared (which this package
-/// cannot import — would cycle the dep graph). Same field shape on the wire.
-public struct MultimodalAttachment: Sendable, Codable, Equatable {
-    public var id: String
-    public var type: String
-    public var base64: String
-    public var mime: String
-    public var name: String?
-    public var byteSize: Int
-    /// Local filesystem path for app-generated output artifacts. Input
-    /// attachments keep this nil and carry bytes in `base64`.
-    public var path: String?
-
-    public init(
-        id: String = UUID().uuidString,
-        type: String,
-        base64: String,
-        mime: String,
-        name: String? = nil,
-        byteSize: Int = 0,
-        path: String? = nil
-    ) {
-        self.id = id
-        self.type = type
-        self.base64 = base64
-        self.mime = mime
-        self.name = name
-        self.byteSize = byteSize
-        self.path = path
-    }
-}
+public typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
 
 public typealias ChatOrchestrationProgressHandler = @Sendable (TurnStreamEvent) async -> Void
 

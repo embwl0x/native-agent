@@ -223,10 +223,6 @@ extension InlineInteractionResolver {
         let mode = interaction.mode
         var categories: [String] = []
         for capability in interaction.allTargets {
-            if let bundleID = SystemAppleScriptAdapter.automationTarget(capability) {
-                _ = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID, ask: true)
-                continue
-            }
             if InlineInteractionRegistry.isMacControlCategory(capability) {
                 categories.append(capability)
                 continue
@@ -257,7 +253,10 @@ extension InlineInteractionResolver {
         // write refused outside Full Mac never leads to a macOS prompt.
         let granted = (try? await MacIntegrationPermissionStore.shared.currentChecked()) ?? [:]
         let allowed = interaction.allTargets.filter { capability in
-            InlineInteractionRegistry.isMacControlCategory(capability)
+            if !MacIntegrationID.all.contains(capability), !InlineInteractionRegistry.isMacControlCategory(capability) {
+                return SystemPermissionPreflight.cardSettingsCapability(capability) != nil
+            }
+            return InlineInteractionRegistry.isMacControlCategory(capability)
                 ? InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
                 : (granted[capability]?.read ?? false) || (granted[capability]?.write ?? false)
         }
@@ -358,58 +357,62 @@ extension InlineInteractionResolver {
 }
 
 extension InlineInteractionResolver {
+    /// Every open permission card settles by itself the moment its permission
+    /// is there: on launch, when the app becomes active, when System Settings
+    /// quits, or when a permission source learns of a grant in-process (a
+    /// Location answer). The cards come from the inbox on disk, so a card
+    /// filed under an earlier build or never touched settles like any other.
     @MainActor
     public final class GrantWatch {
+        public static let shared = GrantWatch()
         public init() {}
         private var dataRoot: URL { PersistenceCore.defaultDataRoot() }
         private var grantWatches: [String: String] = [:]
+        private var refreshers: [@MainActor () async -> Void] = []
         private var grantWatchTask: Task<Void, Never>?
 
-        /// A card that sent the person to System Settings settles by itself when
-        /// the grant lands: re-checked the moment the app becomes active again and
-        /// every few seconds while it waits, for two minutes. Nothing is written
-        /// until the owner says yes; at the cap the card is completed once, which
-        /// fails it honestly, with its retry, if the grant never came.
-        public func watchUntilGranted(_ id: String, sessionID: String, refresh: @escaping @MainActor () async -> Void) {
-            grantWatches[id] = sessionID
+        /// Begin the resident watch; the first tick rechecks at once.
+        public func start() {
             guard grantWatchTask == nil else { return }
             grantWatchTask = Task { [weak self] in
-                var wasActive = InlineInteractionResolver.platform.applicationIsActive
-                for tick in 1...120 {
-                    try? await Task.sleep(for: .seconds(1))
+                for await _ in InlineInteractionResolver.platform.permissionChanges() {
                     guard let self, !Task.isCancelled else { return }
-                    let active = InlineInteractionResolver.platform.applicationIsActive
-                    let cameBack = active && !wasActive
-                    wasActive = active
-                    guard cameBack || tick % 3 == 0 else { continue }
-                    if await self.recheckGrants(final: false, refresh: refresh) {
-                        self.grantWatchTask = nil
-                        return
-                    }
+                    await self.recheckGrants()
                 }
-                await self?.recheckGrants(final: true, refresh: refresh)
                 self?.grantWatchTask = nil
             }
         }
 
-        /// True when nothing is left waiting.
-        @discardableResult
-        private func recheckGrants(final: Bool, refresh: @MainActor () async -> Void) async -> Bool {
-            for (id, sessionID) in grantWatches {
-                if final {
-                    _ = try? await InlineInteractionResolver.complete(
-                        id: id, sessionID: sessionID, dataRoot: dataRoot
-                    )
-                    grantWatches[id] = nil
-                } else if await InlineInteractionResolver.completeIfVerified(
-                    id: id, sessionID: sessionID, dataRoot: dataRoot
-                ) {
-                    grantWatches[id] = nil
-                }
-            }
-            await refresh()
-            return grantWatches.isEmpty
+        /// A card the person just acted on, with the view to refresh when it settles.
+        public func watchUntilGranted(_ id: String, sessionID: String, refresh: @escaping @MainActor () async -> Void) {
+            grantWatches[id] = sessionID
+            refreshers.append(refresh)
+            start()
+            Task { await recheckGrants() }
         }
 
+        deinit { grantWatchTask?.cancel() }
+
+        private func recheckGrants() async {
+            var waiting = grantWatches
+            for card in await InlineInteractionResolver.platform.openInteractionCards() where waiting[card.id] == nil {
+                // The inbox names the session it showed the card in; the card lives in its home session.
+                let home = await InlineInteractionResolver.homeSession(id: card.id, sessionID: card.sessionID, dataRoot: dataRoot)
+                guard let current = await InlineInteractionResolver.interaction(id: card.id, sessionID: home, dataRoot: dataRoot),
+                      current.kind == .permission, current.state.isOpen else { continue }
+                waiting[card.id] = home
+            }
+            var settled = false
+            for (id, sessionID) in waiting {
+                if await InlineInteractionResolver.completeIfVerified(id: id, sessionID: sessionID, dataRoot: dataRoot) {
+                    grantWatches[id] = nil
+                    settled = true
+                }
+            }
+            guard settled else { return }
+            await InlineInteractionResolver.platform.refreshInteractionInbox()
+            for refresh in refreshers { await refresh() }
+            if grantWatches.isEmpty { refreshers = [] }
+        }
     }
 }

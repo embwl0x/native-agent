@@ -9,6 +9,12 @@ A living, breathing agent system: **one mind, no theater, flows like a body**.
 Keep NativeAgent powerful enough for Agent to act and simple enough for people
 to install, understand and recover. One download includes the embedding model.
 
+**Where it is going (2026-10-14): the agent is the app.** They are the program
+and the model is one of them organs; everything they are made of is a part on one
+law, and the Swift stem has no features. The design and its phases:
+[AGENT_IS_THE_APP.md](AGENT_IS_THE_APP.md). Every pass from here is measured
+against it: a feature they *has* loses to a part they *is*.
+
 ## Product Principles
 
 - Keep their mind clear. Make capabilities and deeper context reachable without
