@@ -73,10 +73,39 @@ func scanCopy(_ input: Data) throws -> Data {
                 }
             }
         }
+        if kind == 0x1d { // LC_CODE_SIGNATURE: its page hashes are digests, never text
+            guard size >= 16 else { throw ScanError.malformed("truncated code signature command") }
+            try maskSignatureHashes(&bytes, at: Int(try integer(command + 8, 4)), length: Int(try integer(command + 12, 4)))
+        }
         command += size
     }
     guard command == end else { throw ScanError.malformed("load-command size mismatch") }
     return bytes
+}
+
+// The embedded signature (SuperBlob) holds CodeDirectories whose hash slots are
+// digests of every page; they change on each signing and can spell anything.
+// Only those slots are zeroed: the identifier, entitlements and CMS stay scanned.
+func maskSignatureHashes(_ bytes: inout Data, at start: Int, length: Int) throws {
+    func big(_ offset: Int) throws -> Int {
+        guard offset >= start, offset <= start + length - 4 else { throw ScanError.malformed("code signature read out of bounds") }
+        return (0..<4).reduce(0) { $0 << 8 | Int(bytes[offset + $1]) }
+    }
+    guard start >= 0, length >= 12, start <= bytes.count - length else { throw ScanError.malformed("code signature exceeds file") }
+    guard try big(start) == 0xfade0cc0 else { throw ScanError.malformed("code signature is not a SuperBlob") }
+    let blobs = try big(start + 8)
+    guard blobs <= (length - 12) / 8 else { throw ScanError.malformed("invalid code signature blob count") }
+    for index in 0..<blobs {
+        let blob = start + (try big(start + 16 + index * 8))
+        guard try big(blob) == 0xfade0c02 else { continue } // CodeDirectory
+        let blobLength = try big(blob + 4)
+        guard blobLength >= 40, blob <= start + length - blobLength else { throw ScanError.malformed("invalid CodeDirectory length") }
+        let hashOffset = try big(blob + 16), special = try big(blob + 24), code = try big(blob + 28)
+        let hashSize = Int(bytes[blob + 36])
+        let first = hashOffset - special * hashSize, last = hashOffset + code * hashSize
+        guard hashSize > 0, first >= 40, last <= blobLength else { throw ScanError.malformed("CodeDirectory hash slots exceed the blob") }
+        bytes.replaceSubrange((blob + first)..<(blob + last), with: repeatElement(0, count: last - first))
+    }
 }
 
 func selfTest() throws {
@@ -112,6 +141,27 @@ func selfTest() throws {
         _ = try scanCopy(fixture([2, 65]))
         throw ScanError.malformed("truncated reference accepted")
     } catch ScanError.malformed(let reason) where reason == "truncated symbolic reference" {}
+    var signed = fixture([])
+    let signatureStart = signed.count
+    func be(_ value: Int) -> [UInt8] { (0..<4).map { UInt8(truncatingIfNeeded: value >> (8 * (3 - $0))) } }
+    let identifier = Array("Qzx.ident".utf8) + [0], digest = Array("QzxDIGEST".utf8) + Array(repeating: 0x51, count: 11)
+    var directory = be(0xfade0c02) + be(0) + be(0x20400) + be(0) + be(48 + identifier.count + 20) + be(48)
+        + be(1) + be(0) + be(0) + [20, 1, 0, 12] + be(0) + be(0)
+    directory += identifier + digest
+    directory.replaceSubrange(4..<8, with: be(directory.count))
+    let superBlob = be(0xfade0cc0) + be(20 + directory.count) + be(1) + be(0) + be(20) + directory
+    signed.append(contentsOf: superBlob)
+    signed[16] = 2; signed[20] = 168
+    var load = Data(repeating: 0, count: 16)
+    for (i, v) in [0x1d, 16, signatureStart + 16, superBlob.count].enumerated() {
+        for b in 0..<4 { load[i * 4 + b] = UInt8(truncatingIfNeeded: v >> (8 * b)) }
+    }
+    signed.insert(contentsOf: load, at: 184)
+    signed[152] = 200
+    let masked = try scanCopy(signed)
+    guard masked.range(of: Data("QzxDIGEST".utf8)) == nil, masked.range(of: Data("Qzx.ident".utf8)) != nil else {
+        throw ScanError.malformed("signature hash slots were not masked, or its identifier was hidden")
+    }
     let plain = Data("ordinary private_fixture_identity".utf8)
     guard try scanCopy(plain) == plain else { throw ScanError.malformed("plain executable changed") }
     print("Mach-O identity scan-copy tests passed")
